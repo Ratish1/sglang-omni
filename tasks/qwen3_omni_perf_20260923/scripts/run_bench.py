@@ -39,6 +39,7 @@ ARMS = (
     "seedtts_zh",
     "transcribe_en",
     "transcribe_zh",
+    "chat_parts",
     "mmmu",
     "mmmu_talker",
     "mmsu",
@@ -268,6 +269,116 @@ async def transcribe_seedtts_references(
     return results
 
 
+async def chat_parts_smoke(port: int, out: str) -> dict:
+    """The same image, audio and video requests as top-level fields and as content parts
+    (audio also as input_audio), greedy: prompt tokens and answers must match; an unknown
+    part must be a 400."""
+    import base64
+
+    import aiohttp
+
+    question = "Answer the question in the audio."
+    wav = base64.b64encode(Path("tests/data/query_to_cars.wav").read_bytes()).decode()
+    requests = {
+        "image_audio_top_level": {
+            "messages": [{"role": "user", "content": question}],
+            "images": ["tests/data/cars.jpg"],
+            "audios": ["tests/data/query_to_cars.wav"],
+        },
+        "image_audio_parts": {
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": "tests/data/cars.jpg"},
+                        },
+                        {
+                            "type": "audio_url",
+                            "audio_url": {"url": "tests/data/query_to_cars.wav"},
+                        },
+                        {"type": "text", "text": question},
+                    ],
+                }
+            ]
+        },
+        "image_input_audio_parts": {
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": "tests/data/cars.jpg"},
+                        },
+                        {
+                            "type": "input_audio",
+                            "input_audio": {"data": wav, "format": "wav"},
+                        },
+                        {"type": "text", "text": question},
+                    ],
+                }
+            ]
+        },
+        "video_audio_top_level": {
+            "messages": [{"role": "user", "content": question}],
+            "videos": ["tests/data/draw.mp4"],
+            "audios": ["tests/data/query_to_draw.wav"],
+        },
+        "video_audio_parts": {
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "video_url",
+                            "video_url": {"url": "tests/data/draw.mp4"},
+                        },
+                        {
+                            "type": "audio_url",
+                            "audio_url": {"url": "tests/data/query_to_draw.wav"},
+                        },
+                        {"type": "text", "text": question},
+                    ],
+                }
+            ]
+        },
+        "unknown_part": {
+            "messages": [
+                {"role": "user", "content": [{"type": "model_private", "x": 1}]}
+            ]
+        },
+    }
+    results = {}
+    async with aiohttp.ClientSession() as session:
+        for name, inputs in requests.items():
+            payload = {
+                "model": MODEL,
+                **inputs,
+                "modalities": ["text"],
+                "temperature": 0.0,
+                "max_tokens": 64,
+                "stream": False,
+            }
+            async with session.post(
+                f"http://127.0.0.1:{port}/v1/chat/completions", json=payload
+            ) as response:
+                body = await response.json()
+            results[name] = {
+                "status": response.status,
+                "prompt_tokens": body.get("usage", {}).get("prompt_tokens"),
+                "text": (body.get("choices") or [{}])[0]
+                .get("message", {})
+                .get("content"),
+                "error": body.get("error") or body.get("detail"),
+            }
+    (Path(out) / "chat_parts_results.json").write_text(
+        json.dumps(results, indent=1, ensure_ascii=False)
+    )
+    return results
+
+
 async def generate(
     arm: str,
     port: int,
@@ -278,6 +389,8 @@ async def generate(
 ) -> dict:
     if arm == "speech_identity":
         return await seeded_speech_requests(port, out, max_samples or 5)
+    if arm == "chat_parts":
+        return await chat_parts_smoke(port, out)
     if arm in ("transcribe_en", "transcribe_zh"):
         return await transcribe_seedtts_references(port, out, concurrency, arm[-2:])
     talker = arm.endswith("_talker")
