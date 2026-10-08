@@ -37,6 +37,8 @@ ARMS = (
     "seedtts_en_nostream",
     "seedtts_en_seeded",
     "seedtts_zh",
+    "transcribe_en",
+    "transcribe_zh",
     "mmmu",
     "mmmu_talker",
     "mmsu",
@@ -212,6 +214,60 @@ def install_sample_skip(skip: int) -> None:
     skip_first_samples(mmmu_benchmark, "load_mmmu_samples", skip)
 
 
+async def transcribe_seedtts_references(
+    port: int, out: str, concurrency: int, lang: str
+) -> dict:
+    """Every SeedTTS reference clip of one language through /v1/audio/transcriptions,
+    scored against the clip's own text with the SeedTTS WER normalizer."""
+    import aiohttp
+
+    from benchmarks.dataset.seedtts import load_seedtts_samples
+    from benchmarks.metrics.wer import SampleOutput, calculate_wer_metrics
+    from benchmarks.tasks.asr import apply_wer
+
+    clips = {
+        sample.ref_audio: sample.ref_text
+        for sample in load_seedtts_samples(SEEDTTS_META, None, split=lang)
+    }
+    url = f"http://127.0.0.1:{port}/v1/audio/transcriptions"
+    slots = asyncio.Semaphore(concurrency)
+
+    async def transcribe(session: aiohttp.ClientSession, path: str, text: str):
+        output = SampleOutput(sample_id=Path(path).name, target_text=text)
+        form = aiohttp.FormData()
+        form.add_field(
+            "file",
+            Path(path).read_bytes(),
+            filename=Path(path).name,
+            content_type="audio/wav",
+        )
+        form.add_field("model", MODEL)
+        form.add_field("language", lang)
+        async with slots:
+            began = time.perf_counter()
+            async with session.post(url, data=form) as response:
+                body = await response.json()
+            output.latency_s = time.perf_counter() - began
+        if response.status == 200:
+            return apply_wer(output, body.get("text", ""), lang)
+        else:
+            output.error = f"HTTP {response.status}: {str(body)[:200]}"
+            return output
+
+    async with aiohttp.ClientSession() as session:
+        outputs = await asyncio.gather(
+            *(transcribe(session, path, text) for path, text in clips.items())
+        )
+    results = {
+        "summary": calculate_wer_metrics(list(outputs), lang),
+        "per_sample": [dataclasses.asdict(output) for output in outputs],
+    }
+    (Path(out) / "transcription_results.json").write_text(
+        json.dumps(results, indent=1, ensure_ascii=False)
+    )
+    return results
+
+
 async def generate(
     arm: str,
     port: int,
@@ -222,6 +278,8 @@ async def generate(
 ) -> dict:
     if arm == "speech_identity":
         return await seeded_speech_requests(port, out, max_samples or 5)
+    if arm in ("transcribe_en", "transcribe_zh"):
+        return await transcribe_seedtts_references(port, out, concurrency, arm[-2:])
     talker = arm.endswith("_talker")
     if arm in ("seedtts_en", "seedtts_en_nostream", "seedtts_en_seeded", "seedtts_zh"):
         from benchmarks.eval.benchmark_omni_seedtts import (
