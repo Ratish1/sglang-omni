@@ -54,6 +54,10 @@ CASES = {
     "hiftstep_hop16": ("hiftstep", 16, (150, 92, False)),
     "hiftstep_final1": ("hiftstep", 1, (250, 192, True)),
     "hiftstep_final16": ("hiftstep", 16, (250, 192, True)),
+    # finals over long histories, where F0 and the sine source still run over the whole
+    # history while the decode runs over the window: 16 rows of 15 s, one row of 60 s
+    "hiftstep_final16_long": ("hiftstep", 16, (750, 692, True)),
+    "hiftstep_final1_long": ("hiftstep", 1, (3000, 2900, True)),
 }
 
 
