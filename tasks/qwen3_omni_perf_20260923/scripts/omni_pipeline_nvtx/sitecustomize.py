@@ -38,6 +38,7 @@ Names (rid = request id; the first word is the kind the census groups by):
   sched.result, sched.recv, sched.input n=N, sched.pick, sched.idle, sched.emit
   sched.build rid=R                          request build
   mark sched.admit rid=R, sched.prefill rid=R
+  mark sched.rows n=N rids=R,R,...           every request of one engine step, inside its range
   mr.*                                       model runner phases inside a forward
   tk.build rid=R chunks=C done=D, tk.text_chunk
                                              talker prompt build from the thinker stream
@@ -436,11 +437,19 @@ def batch_label(prefix, batch):
     return label
 
 
+def mark_rows(batch):
+    """Every request of one engine step, so a gap can be split into the steps it rode."""
+    mark(
+        f"sched.rows n={len(batch.reqs)} rids={','.join(req.rid for req in batch.reqs)}"
+    )
+
+
 def patch_scheduler(module):
     scheduler = module.OmniScheduler
     run_batch = scheduler._run_batch
 
     def run_batch_marked(self, batch, pp_proxy_tensors=None):
+        mark_rows(batch)
         if batch.forward_mode.is_extend():
             for req in batch.reqs:
                 mark(f"sched.prefill rid={req.rid}")
@@ -453,6 +462,7 @@ def patch_scheduler(module):
     run_launch = scheduler.run_batch_launch
 
     def run_launch_marked(self, batch):
+        mark_rows(batch)
         if batch.forward_mode.is_extend():
             for req in batch.reqs:
                 mark(f"sched.prefill rid={req.rid}")
