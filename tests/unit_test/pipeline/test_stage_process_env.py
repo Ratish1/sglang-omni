@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import logging
 import os
+import subprocess
+import sys
 from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
@@ -625,3 +627,42 @@ def test_stage_process_asks_to_die_with_its_parent(monkeypatch) -> None:
         stage_workers.stage_process_main(spec, None)
 
     assert calls == [1]
+
+
+# note (Richard Wang): the worker spawned below runs this once its parent is
+# gone, so the parent dies before the worker registers its death signal. The
+# worker inherits the output pipes, so the run returns once it exits.
+STAGE_PROCESS_AFTER_PARENT_DIED = """
+import multiprocessing, time
+from pathlib import Path
+from types import SimpleNamespace
+from sglang_omni.pipeline import stage_workers
+parent = multiprocessing.parent_process()
+while parent.is_alive():
+    time.sleep(0.01)
+try:
+    stage_workers.stage_process_main(
+        SimpleNamespace(log_level=20, stage_specs=[], process_name="p"), None
+    )
+except ValueError:
+    Path(marker_dir, "built").touch()
+finally:
+    Path(marker_dir, "exited").touch()
+"""
+
+
+def test_stage_process_exits_when_its_parent_died_before_it_started(
+    tmp_path: Path,
+) -> None:
+    spawn_and_die = (
+        "import multiprocessing, os, sys\n"
+        "multiprocessing.get_context('spawn').Process(target=exec, args=("
+        "sys.argv[1], {'marker_dir': sys.argv[2]})).start()\n"
+        "os._exit(0)\n"
+    )
+    command = [sys.executable, "-c", spawn_and_die, STAGE_PROCESS_AFTER_PARENT_DIED]
+
+    subprocess.run([*command, str(tmp_path)], capture_output=True, timeout=300)
+
+    assert (tmp_path / "exited").exists()
+    assert not (tmp_path / "built").exists()

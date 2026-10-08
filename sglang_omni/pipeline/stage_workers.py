@@ -491,8 +491,14 @@ def stage_process_main(
     from sglang.srt.utils import kill_itself_when_parent_died
 
     # note (Richard Wang): exit with the parent, so a killed server does not
-    # leave its stage workers holding the GPUs.
+    # leave its stage workers holding the GPUs. A parent that died before the
+    # signal was registered sends none, so check it once registered.
     kill_itself_when_parent_died()
+    parent = multiprocessing.parent_process()
+    if parent is not None and not parent.is_alive():
+        raise SystemExit(1)
+    else:
+        pass
     # note (Dayuxiaoshui): a spawned process starts with fresh logging, and
     # importing sglang already installs a root handler at INFO, which turns
     # basicConfig into a no-op. Set the level explicitly so the stage follows
