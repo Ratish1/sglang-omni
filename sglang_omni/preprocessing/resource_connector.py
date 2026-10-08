@@ -647,6 +647,7 @@ class MultiModalResourceConnector:
         audio_url: str,
         *,
         target_sr: int = 16000,
+        band_limited: bool = False,
         timeout: float = 30.0,
     ) -> tuple[npt.NDArray[np.float32], float]:
         """Asynchronously fetch audio from a URL.
@@ -654,6 +655,7 @@ class MultiModalResourceConnector:
         Args:
             audio_url: URL to the audio file.
             target_sr: Target sample rate for resampling.
+            band_limited: Resample through an anti-aliasing filter.
             timeout: Timeout for HTTP requests in seconds.
 
         Returns:
@@ -662,7 +664,9 @@ class MultiModalResourceConnector:
         from .audio import AudioMediaIO
 
         audio_io = AudioMediaIO(
-            target_sr=target_sr, **self.media_io_kwargs.get("audio", {})
+            target_sr=target_sr,
+            band_limited=band_limited,
+            **self.media_io_kwargs.get("audio", {}),
         )
 
         return await self.load_resource_async(audio_url, audio_io, timeout=timeout)

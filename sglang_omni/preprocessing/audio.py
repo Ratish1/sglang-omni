@@ -11,6 +11,7 @@ from collections.abc import Mapping
 from pathlib import Path
 
 import av
+import librosa
 import numpy as np
 import numpy.typing as npt
 import soundfile
@@ -225,34 +226,59 @@ def resample_linear(
     return np.interp(new_idx, old_idx, audio).astype(np.float32)
 
 
+def resample_band_limited(
+    audio: np.ndarray, orig_sr: int, target_sr: int
+) -> npt.NDArray[np.float32]:
+    """Resample through soxr's high quality anti-aliasing filter, as librosa.load does."""
+    if orig_sr == target_sr or audio.size == 0:
+        return audio.astype(np.float32, copy=False)
+    else:
+        pass
+    return librosa.resample(
+        audio, orig_sr=orig_sr, target_sr=target_sr, res_type="soxr_hq"
+    ).astype(np.float32, copy=False)
+
+
 def load_audio_path(
-    path: str | Path, *, target_sr: int = 16000
+    path: str | Path, *, target_sr: int = 16000, band_limited: bool = False
 ) -> npt.NDArray[np.float32]:
     with open(path, "rb") as f:
         data = f.read()
     audio, sample_rate = decode_audio_bytes(data)
-    return resample_linear(audio, sample_rate, target_sr)
+    if band_limited:
+        return resample_band_limited(audio, sample_rate, target_sr)
+    else:
+        return resample_linear(audio, sample_rate, target_sr)
 
 
 class AudioMediaIO(MediaIO[tuple[npt.NDArray[np.float32], float]]):
     """MediaIO implementation for audio files."""
 
-    def __init__(self, *, target_sr: int = 16000, **kwargs) -> None:
+    def __init__(
+        self, *, target_sr: int = 16000, band_limited: bool = False, **kwargs
+    ) -> None:
         """Initialize AudioMediaIO.
 
         Args:
             target_sr: Target sample rate for resampling.
+            band_limited: Resample through an anti-aliasing filter instead of linear interpolation.
             **kwargs: Additional arguments (for compatibility with MultiModalResourceConnector).
         """
         super().__init__()
         self.target_sr = target_sr
+        self.band_limited = band_limited
         self.kwargs = kwargs
+
+    def resample(self, audio: np.ndarray, sr: int) -> npt.NDArray[np.float32]:
+        if self.band_limited:
+            return resample_band_limited(audio, sr, self.target_sr)
+        else:
+            return resample_linear(audio, sr, self.target_sr)
 
     def load_bytes(self, data: bytes) -> tuple[npt.NDArray[np.float32], float]:
         """Load audio from raw bytes (WAV, WebM/Opus, MP3, OGG, FLAC, etc.)."""
         audio, sample_rate = decode_audio_bytes(data)
-        resampled = resample_linear(audio, sample_rate, self.target_sr)
-        return resampled, float(self.target_sr)
+        return self.resample(audio, sample_rate), float(self.target_sr)
 
     def load_base64(
         self,
@@ -267,14 +293,14 @@ class AudioMediaIO(MediaIO[tuple[npt.NDArray[np.float32], float]]):
         with open(filepath, "rb") as f:
             data = f.read()
         audio, sample_rate = decode_audio_bytes(data)
-        resampled = resample_linear(audio, sample_rate, self.target_sr)
-        return resampled, float(self.target_sr)
+        return self.resample(audio, sample_rate), float(self.target_sr)
 
 
 async def ensure_audio_list_async(
     audios: object,
     *,
     target_sr: int = 16000,
+    band_limited: bool = False,
     resource_connector: MultiModalResourceConnector | None = None,
 ) -> list[object]:
     """Asynchronously normalize audio inputs into a list.
@@ -282,6 +308,7 @@ async def ensure_audio_list_async(
     Args:
         audios: Audio input(s) - can be a path, URL, numpy array, or list.
         target_sr: Target sample rate for resampling.
+        band_limited: Resample loaded audio through an anti-aliasing filter.
         media_connector: Optional MultiModalResourceConnector instance. If None, uses
                         the global connector.
 
@@ -314,7 +341,7 @@ async def ensure_audio_list_async(
                 if is_url(item):
                     # note (Teery): Create coroutine for async URL fetching
                     coro = resource_connector.fetch_audio_async(
-                        str(item), target_sr=target_sr
+                        str(item), target_sr=target_sr, band_limited=band_limited
                     )
                     task = asyncio.create_task(coro)
                     coroutines.append(task)
@@ -323,7 +350,11 @@ async def ensure_audio_list_async(
                 else:
                     # note (Teery): Local path - can be loaded synchronously
                     path = resource_connector.local_media_path(item)
-                    normalized.append(load_audio_path(path, target_sr=target_sr))
+                    normalized.append(
+                        load_audio_path(
+                            path, target_sr=target_sr, band_limited=band_limited
+                        )
+                    )
             else:
                 # note (Teery): Already processed (numpy array, etc.)
                 normalized.append(item)
