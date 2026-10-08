@@ -96,7 +96,12 @@ def main() -> None:
     ):
         label = text if text is not None else strings.get(text_id, "")
         if kind == PUSH_POP:
-            if end is not None and label:
+            # note: nsys writes the python-gil trace as ranges too; one held across a step would hide the step
+            if (
+                end is not None
+                and label
+                and not label.startswith(("Holding GIL", "Waiting for GIL"))
+            ):
                 ranges[tid].append((start, end, label))
             else:
                 pass
