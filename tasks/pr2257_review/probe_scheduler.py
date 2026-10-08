@@ -15,7 +15,8 @@ from sglang_omni.scheduling.dllm_scheduler import DllmForwardBatch
 def main() -> None:
     scheduler = create_sglang_dllm_thinker_executor_from_config(
         "inclusionAI/LLaDA2.0-Uni",
-        device="cuda:0",
+        device="cuda",
+        gpu_id=0,
         max_seq_len=512,
         dllm_algorithm="LowConfidenceCFG",
         server_args_overrides={

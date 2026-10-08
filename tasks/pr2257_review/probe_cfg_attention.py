@@ -21,6 +21,7 @@ device = "cuda"
 heads, dimension, block_size, capacity = 2, 128, 32, 160
 workspace = torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device=device)
 backend = object.__new__(LLaDA2CFGFlashInferAttnBackend)
+backend.num_wrappers = 1
 backend.workspace_buffer = workspace
 backend.cfg_prefill_wrapper_ragged = BatchPrefillWithRaggedKVCacheWrapper(
     workspace, "NHD", backend="fa2"
