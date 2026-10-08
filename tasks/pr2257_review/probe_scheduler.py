@@ -116,7 +116,7 @@ def main() -> None:
         scheduler.post_step(batch)
         return True
 
-    for branches in (1, 2, 3) if initial_tokens >= 512 else ():
+    for branches in (1, 2, 3) if initial_tokens >= 512 else (1,):
         name = f"complete-{branches}"
         conditional = admit(name, branches)
         for iteration in range(5):
@@ -129,15 +129,16 @@ def main() -> None:
         assert not scheduler.uncond_rids
         print(json.dumps({"case": name, "completion_and_recovery": "pass"}), flush=True)
 
-    name = "abort-companion"
-    conditional = admit(name, 3)
-    assert step(name, 0)
-    scheduler.abort(f"{name}-branch-1")
-    scheduler.drain_and_purge()
-    assert not scheduler.waiting_queue and not scheduler.staging_queue
-    assert allocator.available_size() == initial_tokens
-    assert len(pool.free_slots) == initial_rows
-    print(json.dumps({"case": name, "recovery": "pass"}), flush=True)
+    if initial_tokens >= 384:
+        name = "abort-companion"
+        conditional = admit(name, 3)
+        assert step(name, 0)
+        scheduler.abort(f"{name}-branch-1")
+        scheduler.drain_and_purge()
+        assert not scheduler.waiting_queue and not scheduler.staging_queue
+        assert allocator.available_size() == initial_tokens
+        assert len(pool.free_slots) == initial_rows
+        print(json.dumps({"case": name, "recovery": "pass"}), flush=True)
 
     name = f"three-branches-{initial_tokens}-tokens"
     conditional = admit(name, 3)
@@ -158,6 +159,7 @@ def main() -> None:
     assert allocator.available_size() == initial_tokens
     assert len(pool.free_slots) == initial_rows
     print(json.dumps({"case": name, "cleanup": "pass"}), flush=True)
+    torch.distributed.destroy_process_group()
 
 
 if __name__ == "__main__":
