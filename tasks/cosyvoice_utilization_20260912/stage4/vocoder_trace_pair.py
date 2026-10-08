@@ -14,6 +14,7 @@ analyze_llm_torch_profile.py --mapping-input --formal-input reads.
 from __future__ import annotations
 
 import argparse
+import inspect
 import sys
 from pathlib import Path
 
@@ -37,6 +38,10 @@ CASES = {
     "hop16": ("hop", 16, 25 + LOOKAHEAD),
     "final1": ("final", 1, 100),
     "final16": ("final", 16, 100),
+    # finals inside the final graph tiers (4,096 frames per CFG half at most): 8 rows of
+    # 350 frames, 16 rows of 250
+    "final8": ("final", 8, 100),
+    "final16_fit": ("final", 16, 50),
     "buffered_small": ("buffered", 1, 416 // 2 - PROMPT_TOKENS),
     "buffered_large": ("buffered", 16, 576 // 2 - PROMPT_TOKENS),
     "buffered_miss8": ("buffered", 8, 80),
@@ -83,6 +88,12 @@ def main() -> None:
     from omni_trace_pair import capture
 
     serving = args.side == "formal"
+    # trees with the final graphs take their switch as a required argument
+    final_graph_switch = {
+        name: serving
+        for name in ("enable_flow_final_cuda_graph",)
+        if name in inspect.signature(stages.create_vocoder_executor).parameters
+    }
     scheduler = stages.create_vocoder_executor(
         args.model,
         device="cuda",
@@ -92,6 +103,7 @@ def main() -> None:
         enable_flow_prefix_cuda_graph=serving,
         flow_cuda_graph_capture_shapes=FUN_COSYVOICE3_DEFAULT_FLOW_CUDA_GRAPH_CAPTURE_SHAPES,
         flow_prefix_cache_gb=24.0,
+        **final_graph_switch,
     )
     vocoder = scheduler.vocoder
     for case in args.cases:
