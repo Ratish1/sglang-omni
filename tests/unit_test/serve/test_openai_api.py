@@ -1122,20 +1122,29 @@ def test_chat_stream_failure_reports_error_before_done_sentinel() -> None:
 
 
 class TextDeltaCoordinator:
-    """Answer chat with fixed text: whole when buffered, as deltas when streamed."""
+    """Answer chat with fixed text: whole when buffered, as deltas when streamed.
 
-    def __init__(self, deltas: list[str]) -> None:
+    A None delta is an audio chunk that finishes the audio.
+    """
+
+    def __init__(self, deltas: list[str | None]) -> None:
         self.deltas = deltas
 
     async def submit(self, request_id: str, omni_request: OmniRequest) -> object:
-        return {"text": "".join(self.deltas), "finish_reason": "stop"}
+        text = "".join(delta for delta in self.deltas if delta is not None)
+        return {"text": text, "finish_reason": "stop"}
 
     async def stream(
         self, request_id: str, omni_request: OmniRequest
     ) -> AsyncIterator[StreamMessage]:
         for index, delta in enumerate(self.deltas):
-            chunk: dict[str, object] = {"text": delta, "modality": "text"}
-            if index == len(self.deltas) - 1:
+            modality = "audio" if delta is None else "text"
+            chunk: dict[str, object] = {"modality": modality}
+            if delta is not None:
+                chunk["text"] = delta
+            else:
+                pass
+            if delta is None or index == len(self.deltas) - 1:
                 chunk["finish_reason"] = "stop"
             else:
                 pass
@@ -1144,7 +1153,7 @@ class TextDeltaCoordinator:
                 from_stage="decode",
                 chunk=chunk,
                 stage_name="decode",
-                modality="text",
+                modality=modality,
             )
 
 
@@ -1165,10 +1174,12 @@ def test_chat_answer_excludes_the_matched_stop_string() -> None:
         pytest.param(["1, 2", ", 3"], [", 3"], "1, 2", id="whole"),
         pytest.param(["a", "\n", "b\n", "\nc"], ["\n\n"], "a\nb", id="across-deltas"),
         pytest.param(["a", "\n"], ["\n\n"], "a\n", id="never-completed"),
+        pytest.param(["a", "\n", None, "\nb"], ["\n\n"], "a", id="audio-ends-mid-stop"),
+        pytest.param(["a", "\n", None], ["\n\n"], "a\n", id="text-never-ends"),
     ],
 )
 def test_chat_stream_never_sends_a_stop_string(
-    deltas: list[str], stop: list[str], expected: str
+    deltas: list[str | None], stop: list[str], expected: str
 ) -> None:
     app = create_app(Client(TextDeltaCoordinator(deltas)), model_name="qwen3-omni")
     body = {

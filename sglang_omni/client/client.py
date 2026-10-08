@@ -88,7 +88,9 @@ class StreamedStopTrimmer:
             (
                 prefix_length
                 for stop_string in self.stop
-                for prefix_length in range(1, len(stop_string))
+                for prefix_length in range(
+                    1, min(len(self.held_text), len(stop_string) - 1) + 1
+                )
                 if self.held_text.endswith(stop_string[:prefix_length])
             ),
             default=0,
@@ -331,18 +333,16 @@ class Client:
                     text = stop_trimmer.push(text) or None
                 else:
                     pass
-                # A stop string that never completed releases its held text at the end.
+                # A stop string that never completed releases its held text when the text ends.
                 held_text = (
                     stop_trimmer.finish()
-                    if stop_trimmer is not None and chunk.finish_reason is not None
+                    if stop_trimmer is not None
+                    and chunk.modality == "text"
+                    and chunk.finish_reason is not None
                     else ""
                 )
-                if held_text and chunk.modality == "text":
+                if held_text:
                     text = (text or "") + held_text
-                elif held_text:
-                    yield CompletionStreamChunk(
-                        request_id=request_id, text=held_text, modality="text"
-                    )
                 else:
                     pass
 
@@ -355,6 +355,13 @@ class Client:
                     usage=chunk.usage,
                     stage_name=chunk.stage_name,
                 )
+            held_text = stop_trimmer.finish() if stop_trimmer is not None else ""
+            if held_text:
+                yield CompletionStreamChunk(
+                    request_id=request_id, text=held_text, modality="text"
+                )
+            else:
+                pass
 
     # ------------------------------------------------------------------
     # High-level: text-to-speech
