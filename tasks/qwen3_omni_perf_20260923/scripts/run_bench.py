@@ -9,6 +9,9 @@ score: WER of a talker arm or of seed-tts against a Qwen3-ASR server on --asr-po
        after the omni server is stopped.
 sim:   seed-tts speaker similarity on --device; run after the ASR server is stopped too.
 
+THINKER_TEMPERATURE=T sends that thinker temperature with the mmsu and seed-tts arms in place of
+their defaults (0.0 and 0.7), to compare sampling defaults at equal load.
+
 --skip-samples K drops the corpus's first K samples (gen only), so a warm pass over the first
 K samples and a measured pass over the next ones share no prompt (the thinker keeps its radix
 cache): the loaders the benchmarks bound at import are wrapped to load K more and drop them.
@@ -25,6 +28,7 @@ import dataclasses
 import functools
 import inspect
 import json
+import os
 import time
 from pathlib import Path
 
@@ -81,7 +85,7 @@ def mmsu_args(
         categories=None,
         prompt=MMSU_TTS_PROMPT if talker else None,
         max_tokens=32,
-        temperature=0.0,
+        temperature=float(os.environ.get("THINKER_TEMPERATURE", 0.0)),
         warmup=1,
         max_concurrency=concurrency,
         request_rate=request_rate,
@@ -239,6 +243,7 @@ async def generate(
             max_samples=max_samples,
             disable_tqdm=True,
             seed=SPEECH_IDENTITY_SEED if arm == "seedtts_en_seeded" else None,
+            temperature=float(os.environ.get("THINKER_TEMPERATURE", 0.7)),
         )
         return await run_omni_seedtts_benchmark(config)
     if arm.startswith("mmmu"):
