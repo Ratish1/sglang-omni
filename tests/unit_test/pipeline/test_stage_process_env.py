@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import logging
+import multiprocessing
 import os
 from contextlib import contextmanager
 from pathlib import Path
@@ -19,6 +20,7 @@ from sglang_omni.pipeline.stage_workers import (
 from sglang_omni.platforms.cuda import CUDAOmniPlatform
 from sglang_omni.platforms.rocm import ROCMOmniPlatform
 from sglang_omni.utils.gpu_memory import get_gpu_startup_lock_path
+from tests.unit_test.fixtures import affinity_probe
 from tests.unit_test.fixtures.pipeline_fakes import FakeScheduler, fake_factory_path
 
 cuda_platform = CUDAOmniPlatform()
@@ -104,41 +106,28 @@ def test_spawn_env_cpu_plan_preserves_configured_omp(
     assert "SGLANG_OMNI_OMP_FROM_CPU_PLAN" not in os.environ
 
 
-@pytest.mark.parametrize(
-    ("extra_env", "expected"), [(None, "72"), ({"OMP_NUM_THREADS": "144"}, "144")]
+@pytest.mark.skipif(
+    not hasattr(os, "sched_setaffinity") or len(os.sched_getaffinity(0)) < 2,
+    reason="needs control over the CPU mask of two or more CPUs",
 )
-def test_spawn_env_caps_a_default_pool_at_the_bound_cpus(
-    monkeypatch: pytest.MonkeyPatch, extra_env: dict[str, str] | None, expected: str
+def test_spawned_process_threads_start_on_the_planned_cpus(
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.delenv("OMP_NUM_THREADS", raising=False)
-    spec = worker_spec(
-        StageLaunchConfig(
-            stage_name="preprocess", env_defaults={"OMP_NUM_THREADS": "144"}
-        )
-    )
-    spec.cpu_affinity = frozenset(range(72))
-
-    with patched_spawn_env(spec, extra_env=extra_env):
-        assert os.environ["OMP_NUM_THREADS"] == expected
-
-
-def test_stage_process_binds_to_its_planned_cpus(monkeypatch) -> None:
-    bound = []
-    monkeypatch.setattr(
-        stage_workers.os, "sched_setaffinity", lambda pid, cpus: bound.append(cpus)
-    )
-
-    def stop(*_args):
-        raise RuntimeError("stop after binding")
-
-    monkeypatch.setattr(stage_workers, "prepare_accelerator_environment", stop)
+    launcher_cpus = os.sched_getaffinity(0)
     spec = worker_spec(StageLaunchConfig(stage_name="preprocess"))
-    spec.cpu_affinity = frozenset({1, 2})
+    spec.cpu_affinity = frozenset({min(launcher_cpus)})
+    monkeypatch.setattr(
+        stage_workers, "stage_process_main", affinity_probe.report_thread_cpus
+    )
+    group = stage_workers.StageGroup("probe", [spec])
 
-    with pytest.raises(SystemExit):
-        stage_workers.stage_process_main(spec, None)
+    group.spawn(multiprocessing.get_context("spawn"))
+    thread_cpus = group.startup_error_channels[0].get(timeout=120)
+    group.processes[0].join(timeout=30)
 
-    assert bound == [frozenset({1, 2})]
+    assert os.sched_getaffinity(0) == launcher_cpus
+    assert len(thread_cpus) >= 2
+    assert all(cpus == sorted(spec.cpu_affinity) for cpus in thread_cpus)
 
 
 def test_tp_process_env_maps_logical_gpu_through_visible_devices() -> None:

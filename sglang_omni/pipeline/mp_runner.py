@@ -104,6 +104,7 @@ class StageLaunchKwargs(TypedDict):
     route_fn: str | None
     is_terminal: bool
     env_defaults: dict[str, str]
+    written_env: frozenset[str]
     wait_for: list[str] | None
     wait_for_fn: str | None
     merge_fn: str | None
@@ -202,6 +203,8 @@ def build_stage_groups(
             route_fn=stage_cfg.route_fn,
             is_terminal=stage_cfg.terminal,
             env_defaults=config.resolved_stage_env_defaults(logical_stage_name),
+            written_env=frozenset(config.env_defaults)
+            | frozenset(config.stage_named(logical_stage_name).env),
             wait_for=stage_cfg.wait_for,
             wait_for_fn=stage_cfg.wait_for_fn,
             merge_fn=stage_cfg.merge_fn,
@@ -298,10 +301,16 @@ def apply_cpu_thread_plan(groups: list[StageGroup]) -> dict[str, int]:
     process_count = len(process_specs)
     threads_per_process = max(1, cpu_budget // process_count)
     plan = {}
+    # note (Richard Wang): CPU-only processes stay near the GPUs the pipeline
+    # uses, not every visible one, and are left alone when it uses none.
+    pipeline_gpu_ids = sorted(
+        {gpu_id for spec in process_specs for gpu_id in stage_gpu_ids(spec.stage_specs)}
+    )
     for spec in process_specs:
         # note (Richard Wang): a process bound near its GPUs gets at most one
         # thread per bound CPU, so a share of the whole host cannot oversubscribe.
-        spec.cpu_affinity = gpu_local_affinity(stage_gpu_ids(spec.stage_specs))
+        gpu_ids = stage_gpu_ids(spec.stage_specs) or pipeline_gpu_ids
+        spec.cpu_affinity = gpu_local_affinity(gpu_ids) if gpu_ids else None
         spec.cpu_threads = (
             threads_per_process
             if spec.cpu_affinity is None

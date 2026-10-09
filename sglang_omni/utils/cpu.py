@@ -9,6 +9,14 @@ import os
 from collections.abc import Iterable
 from pathlib import Path
 
+from sglang_omni.utils.gpu_memory import (
+    get_device_handle,
+    parse_cuda_visible_devices,
+    resolve_visible_device_id,
+    shutdown_nvml,
+    try_import_pynvml,
+)
+
 logger = logging.getLogger(__name__)
 
 GPU_LOCAL_CPUS_ENV = "SGLANG_OMNI_BIND_GPU_LOCAL_CPUS"
@@ -173,19 +181,7 @@ def bounded_intraop_threads(*, worker_count: int, max_threads: int) -> int:
 
 
 def gpu_local_cpus(logical_gpu_ids: Iterable[int]) -> set[int]:
-    """CPUs NVML reports as closest to the given logical GPUs, empty when unknown.
-
-    With no GPU ids, every GPU this process can see counts, so a CPU-only stage
-    process stays near the deployment's GPUs.
-    """
-    from sglang_omni.utils.gpu_memory import (
-        get_device_handle,
-        parse_cuda_visible_devices,
-        resolve_visible_device_id,
-        shutdown_nvml,
-        try_import_pynvml,
-    )
-
+    """CPUs NVML reports as closest to the given logical GPUs, empty when unknown."""
     pynvml = try_import_pynvml()
     if pynvml is None:
         return set()
@@ -196,10 +192,7 @@ def gpu_local_cpus(logical_gpu_ids: Iterable[int]) -> set[int]:
     words = ((os.cpu_count() or 1) + 63) // 64
     try:
         pynvml.nvmlInit()
-        ids = list(logical_gpu_ids) or list(
-            range(len(visible) or pynvml.nvmlDeviceGetCount())
-        )
-        for gpu_id in ids:
+        for gpu_id in logical_gpu_ids:
             handle = get_device_handle(
                 pynvml, resolve_visible_device_id(gpu_id, visible)
             )
@@ -211,7 +204,7 @@ def gpu_local_cpus(logical_gpu_ids: Iterable[int]) -> set[int]:
                 )
     except Exception as exc:
         logger.debug(
-            "NVML CPU affinity query failed for gpus=%s: %s", logical_gpu_ids, exc
+            f"NVML CPU affinity query failed for gpus={logical_gpu_ids}: {exc}"
         )
         return set()
     finally:

@@ -110,7 +110,11 @@ def test_bounded_intraop_threads_accounts_for_outer_workers(
     ],
 )
 def test_gpu_local_affinity(
-    monkeypatch: pytest.MonkeyPatch, current, near, switch: str, expected
+    monkeypatch: pytest.MonkeyPatch,
+    current: range,
+    near: range | list[int],
+    switch: str,
+    expected: frozenset[int] | None,
 ) -> None:
     monkeypatch.setattr(cpu.os, "sched_getaffinity", lambda _pid: set(current))
     monkeypatch.setattr(cpu, "gpu_local_cpus", lambda _ids: set(near))
