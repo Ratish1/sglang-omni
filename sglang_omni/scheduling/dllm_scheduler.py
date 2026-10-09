@@ -35,7 +35,10 @@ from sglang_omni.model_runner.base import resolve_deferred_prefill_inputs
 from sglang_omni.model_runner.model_worker import ModelWorker
 from sglang_omni.proto.request import StagePayload
 from sglang_omni.scheduling.message import IncomingMessage, OutgoingMessage
-from sglang_omni.scheduling.sglang_backend.request_data import SGLangDLLMRequestData
+from sglang_omni.scheduling.sglang_backend.request_data import (
+    DllmRequest,
+    SGLangDLLMRequestData,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import GenerationBatchResult
@@ -50,7 +53,7 @@ logger = logging.getLogger(__name__)
 class DllmForwardBatch(ForwardBatch):
     """Keep DLLM metadata through the eager runner's dataclass batch rebuilds."""
 
-    reqs: list[Req] = field(default_factory=list)
+    reqs: list[DllmRequest] = field(default_factory=list)
     dllm_left_pad_lens_cpu: list[int] = field(default_factory=list)
 
 
@@ -102,8 +105,8 @@ class DllmScheduler:
         self.abort_lock = threading.Lock()
         self.aborted_request_ids: set[str] = set()
         self.rid_to_req_data: dict[str, SGLangDLLMRequestData] = {}
-        self.waiting_queue: list[Req] = []
-        self.staging_queue: list[Req] = []
+        self.waiting_queue: list[DllmRequest] = []
+        self.staging_queue: list[DllmRequest] = []
 
         self.cond_to_unconds: dict[str, list[str]] = {}
         self.uncond_to_cond: dict[str, str] = {}
@@ -191,25 +194,25 @@ class DllmScheduler:
                 self.rid_to_req_data[req.rid] = req_data
                 self.waiting_queue.append(req)
 
-                uncond_ids = getattr(
-                    req, "_uncond_input_ids", None
+                uncond_ids = (
+                    req._uncond_input_ids
                 )  # noqa: leading-underscore  # DLLM protocol
                 if uncond_ids is not None:
                     self.create_uncond_companion(  # noqa: leading-underscore  # DLLM protocol
                         req,
                         uncond_ids,
-                        getattr(req, "_uncond_left_pad_len", 0),
+                        req._uncond_left_pad_len,
                         "-uncond",
                         mark_img=False,
                     )
-                    uncond_img_ids = getattr(
-                        req, "_uncond_img_input_ids", None
+                    uncond_img_ids = (
+                        req._uncond_img_input_ids
                     )  # noqa: leading-underscore  # DLLM protocol
                     if uncond_img_ids is not None:
                         self.create_uncond_companion(  # noqa: leading-underscore  # DLLM protocol
                             req,
                             uncond_img_ids,
-                            getattr(req, "_uncond_img_left_pad_len", 0),
+                            req._uncond_img_left_pad_len,
                             "-uncond-img",
                             mark_img=True,
                         )
@@ -268,7 +271,7 @@ class DllmScheduler:
 
     def create_uncond_companion(
         self,
-        cond_req: Req,
+        cond_req: DllmRequest,
         uncond_input_ids: list[int],
         left_pad_len: int,
         rid_suffix: str,
@@ -295,7 +298,7 @@ class DllmScheduler:
         )
         uncond_sampling_params.normalize(None)
         uncond_sampling_params.verify(cond_req.vocab_size)
-        uncond_req = Req(
+        uncond_req = DllmRequest(
             rid=uncond_rid,
             origin_input_text="",
             origin_input_ids=array("q", uncond_input_ids),
@@ -315,12 +318,9 @@ class DllmScheduler:
         uncond_req._cfg_group_rid = (
             cond_req.rid
         )  # noqa: leading-underscore  # DLLM protocol
-        if mark_img:
-            uncond_req._is_uncond_img = (
-                True  # noqa: leading-underscore  # DLLM protocol
-            )
-        else:
-            pass
+        uncond_req._is_uncond_img = (
+            mark_img  # noqa: leading-underscore  # DLLM protocol
+        )
 
         self.waiting_queue.append(uncond_req)
         self.cond_to_unconds.setdefault(cond_req.rid, []).append(uncond_rid)
@@ -357,7 +357,7 @@ class DllmScheduler:
     ) -> None:
         """Apply mask and position metadata for mask-padded CFG branches."""
         left_pad_lengths = [  # noqa: leading-underscore  # DLLM protocol
-            int(getattr(req, "_dllm_left_pad_len", 0)) for req in batch.reqs
+            req._dllm_left_pad_len for req in batch.reqs
         ]
         forward_batch.dllm_left_pad_lens_cpu = left_pad_lengths
         if not any(left_pad_lengths):
@@ -401,28 +401,26 @@ class DllmScheduler:
         else:
             pass
 
-    def synchronize_cfg_phases(self, reqs: list[Req]) -> None:
+    def synchronize_cfg_phases(self, reqs: list[DllmRequest]) -> None:
         """Keep CFG companions in the conditional request's DLLM phase."""
         if len(reqs) < 2:
             return
         else:
             pass
         cond_req = next(  # noqa: leading-underscore  # DLLM protocol
-            (req for req in reqs if not getattr(req, "_is_uncond", False)), None
+            (req for req in reqs if not req._is_uncond), None
         )
         if cond_req is None:
             return
         else:
             pass
         for req in reqs:
-            if getattr(
-                req, "_is_uncond", False
-            ):  # noqa: leading-underscore  # DLLM protocol
+            if req._is_uncond:  # noqa: leading-underscore  # DLLM protocol
                 req.dllm_phase = cond_req.dllm_phase
             else:
                 pass
 
-    def get_request_group(self, queue: list[Req]) -> list[Req]:
+    def get_request_group(self, queue: list[DllmRequest]) -> list[DllmRequest]:
         """Return the complete logical request group at the head of a queue."""
         if not queue:
             return []
@@ -445,7 +443,7 @@ class DllmScheduler:
             pass
         return [reqs_by_rid[rid] for rid in expected_rids]
 
-    def validate_request_group_capacity(self, reqs: list[Req]) -> None:
+    def validate_request_group_capacity(self, reqs: list[DllmRequest]) -> None:
         if len(reqs) <= 1:
             return
         else:

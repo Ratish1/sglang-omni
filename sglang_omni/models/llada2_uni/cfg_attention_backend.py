@@ -47,8 +47,12 @@ class LLaDA2CFGFlashInferAttnBackend(FlashInferAttnBackend):
     def init_forward_metadata(self, forward_batch: ForwardBatch) -> None:
         self.cfg_local_left_pad_active = False
         # note (Anmuliar): FlashInfer retains custom masks between wrapper plans.
-        for attr in ("_custom_mask_buf", "_mask_indptr_buf"):
-            setattr(self.cfg_prefill_wrapper_ragged, attr, None)
+        self.cfg_prefill_wrapper_ragged._custom_mask_buf = (
+            None  # noqa: leading-underscore  # FlashInfer API
+        )
+        self.cfg_prefill_wrapper_ragged._mask_indptr_buf = (
+            None  # noqa: leading-underscore  # FlashInfer API
+        )
         if not forward_batch.forward_mode.is_dllm_extend():
             return super().init_forward_metadata(forward_batch)
         else:

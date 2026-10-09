@@ -3,7 +3,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from array import array
 from types import SimpleNamespace as NS
 from unittest.mock import create_autospec
 
@@ -14,6 +14,7 @@ from flashinfer.prefill import (
     BatchPrefillWithRaggedKVCacheWrapper,
 )
 from sglang.srt.dllm.config import DllmConfig
+from sglang.srt.dllm.mixin.req import DllmReqPhase
 from sglang.srt.layers.attention.flashinfer_backend import (
     FlashInferIndicesUpdaterPrefill,
 )
@@ -22,23 +23,12 @@ from sglang.srt.mem_cache.allocator import TokenToKVPoolAllocator
 from sglang.srt.mem_cache.kv_index_translator import KVIndexTranslator
 from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool, ReqToTokenPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sglang.srt.sampling.sampling_params import SamplingParams
 
 import sglang_omni.models.llada2_uni.cfg_attention_backend as cfg_attention_backend
 from sglang_omni.models.llada2_uni.low_confidence_cfg import LowConfidenceCFG
+from sglang_omni.models.llada2_uni.request_builders import LLaDA2UniRequest
 from sglang_omni.scheduling.dllm_scheduler import DllmScheduler
-
-
-@dataclass
-class RequestStub:
-    rid: str
-    dllm_phase: str = "decode"
-    _is_uncond: bool = False
-    _is_uncond_img: bool = False
-    _cfg_group_rid: str | None = None
-    _dllm_left_pad_len: int = 0
-
-    def is_dllm_prefill(self) -> bool:
-        return self.dllm_phase == "prefill"
 
 
 class RaggedWrapperStub:
@@ -64,16 +54,20 @@ def make_config(*, fdfo: bool = False) -> DllmConfig:
     )
 
 
-def make_cfg_group(size: int) -> list[RequestStub]:
-    requests = [RequestStub("cond")]
-    for index in range(1, size):
-        requests.append(
-            RequestStub(
-                f"cond-u{index}",
-                _is_uncond=True,
-                _is_uncond_img=index == 2,
-            )
+def make_cfg_group(size: int) -> list[LLaDA2UniRequest]:
+    requests = []
+    for index in range(size):
+        request = LLaDA2UniRequest(
+            rid=f"cond-u{index}" if index else "cond",
+            origin_input_text="",
+            origin_input_ids=array("q", [1, 2, 3, 4]),
+            sampling_params=SamplingParams(max_new_tokens=4, temperature=0.0),
+            dllm_config=make_config(),
         )
+        request.dllm_phase = DllmReqPhase.INCOMING_DECODE
+        request._is_uncond = index > 0  # noqa: leading-underscore  # DLLM protocol
+        request._is_uncond_img = index == 2  # noqa: leading-underscore  # DLLM protocol
+        requests.append(request)
     if size > 1:
         for request in requests:
             request._cfg_group_rid = "cond"  # noqa: leading-underscore  # DLLM protocol
@@ -145,7 +139,7 @@ def test_cfg_prefill_only_builds_kv_state() -> None:
     algorithm = LowConfidenceCFG(make_config())
     requests = make_cfg_group(2)
     for request in requests:
-        request.dllm_phase = "prefill"
+        request.dllm_phase = DllmReqPhase.INCOMING_PREFILL
     input_ids = torch.tensor([1, 2, 3, 4, 9, 9, 3, 4])
     original = input_ids.clone()
     calls = 0

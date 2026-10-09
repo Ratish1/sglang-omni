@@ -9,7 +9,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 from sglang.srt.dllm.config import DllmConfig
-from sglang.srt.managers.schedule_batch import Req, ReqKvInfo
+from sglang.srt.managers.schedule_batch import ReqKvInfo
 from sglang.srt.mem_cache.allocator.token import TokenToKVPoolAllocator
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.chunk_cache import ChunkCache
@@ -21,9 +21,14 @@ from sglang_omni.model_runner.model_worker import ModelWorker
 from sglang_omni.scheduling import dllm_scheduler as dllm_scheduler_module
 from sglang_omni.scheduling.dllm_scheduler import DllmScheduler
 from sglang_omni.scheduling.message import IncomingMessage
+from sglang_omni.scheduling.sglang_backend.request_data import DllmRequest
 
 
 class ReqDouble:
+    _uncond_input_ids: list[int] | None = (
+        None  # noqa: leading-underscore  # DLLM protocol
+    )
+
     def __init__(self, *, rid: str = "req", block_size: int = 4) -> None:
         self.rid = rid
         self.dllm_incomplete_ids = array("q")
@@ -401,7 +406,7 @@ def chunked_scheduler() -> DllmScheduler:
         params = SamplingParams(max_new_tokens=32, temperature=0.0)
         params.normalize(None)
         scheduler.waiting_queue.append(
-            Req(
+            DllmRequest(
                 rid,
                 "",
                 array("q", [1] * 128),

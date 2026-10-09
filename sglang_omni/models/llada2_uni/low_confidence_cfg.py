@@ -10,18 +10,8 @@ import torch.nn.functional as F
 from sglang.srt.dllm.algorithm.base import DllmAlgorithm, DllmRunOutput
 from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
-from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.model_runner import ModelRunner
-
-
-def finite_cfg_value(req: Req, name: str, default: float) -> float:
-    value = float(getattr(req, name, default))
-    if not math.isfinite(value):
-        raise ValueError(f"{name} must be finite")
-    else:
-        pass
-    return value
 
 
 class LowConfidenceCFG(DllmAlgorithm):
@@ -73,20 +63,15 @@ class LowConfidenceCFG(DllmAlgorithm):
         else:
             pass
 
-        req = reqs[cond_idx] if reqs else None
+        req = reqs[cond_idx]
         steps = (
-            getattr(req, "_dllm_steps", None) or self.block_size
+            req._dllm_steps or self.block_size
         )  # noqa: leading-underscore  # DLLM protocol
         steps = min(max(steps, 1), self.block_size)
         base, remainder = divmod(self.block_size, steps)
-        force_image_only = getattr(
-            req, "_task_kind", "chat"
-        ) in (  # noqa: leading-underscore  # DLLM protocol
-            "t2i",
-            "edit",
-        ) and not getattr(
-            req, "_is_thinking_phase1", False
-        )
+        force_image_only = (
+            req._task_kind in ("t2i", "edit") and not req._is_thinking_phase1
+        )  # noqa: leading-underscore  # DLLM protocol
         active_ids = ids[cond_idx : cond_idx + 1] if is_cfg else ids
 
         for step in range(steps):
@@ -174,22 +159,19 @@ class LowConfidenceCFG(DllmAlgorithm):
         batch_size = forward_batch.batch_size
 
         cfg_marked = bool(reqs) and any(  # noqa: leading-underscore  # DLLM protocol
-            getattr(req, "_is_uncond", False)
-            or getattr(req, "_cfg_group_rid", None) is not None
-            for req in reqs
+            req._is_uncond or req._cfg_group_rid is not None for req in reqs
         )
         if cfg_marked:
             cond_indices = [  # noqa: leading-underscore  # DLLM protocol
-                i for i, req in enumerate(reqs) if not getattr(req, "_is_uncond", False)
+                i for i, req in enumerate(reqs) if not req._is_uncond
             ]
             uncond_text_indices = [  # noqa: leading-underscore  # DLLM protocol
                 i
                 for i, req in enumerate(reqs)
-                if getattr(req, "_is_uncond", False)
-                and not getattr(req, "_is_uncond_img", False)
+                if req._is_uncond and not req._is_uncond_img
             ]
             uncond_img_indices = [  # noqa: leading-underscore  # DLLM protocol
-                i for i, req in enumerate(reqs) if getattr(req, "_is_uncond_img", False)
+                i for i, req in enumerate(reqs) if req._is_uncond_img
             ]
             valid_roles = (
                 len(reqs) == batch_size
@@ -205,7 +187,7 @@ class LowConfidenceCFG(DllmAlgorithm):
             valid_group = (
                 cond_rid is not None
                 and all(  # noqa: leading-underscore  # DLLM protocol
-                    getattr(req, "_cfg_group_rid", None) == cond_rid for req in reqs
+                    req._cfg_group_rid == cond_rid for req in reqs
                 )
             )
             if not valid_roles or not valid_group:
@@ -219,14 +201,29 @@ class LowConfidenceCFG(DllmAlgorithm):
 
             cond_req = reqs[cond_idx]
             uncond_text_idx = uncond_text_indices[0]
-            cfg_text_scale = finite_cfg_value(cond_req, "_cfg_scale", 4.0)
-            cfg_rescale = finite_cfg_value(cond_req, "_cfg_rescale", 0.7)
+            cfg_text_scale = float(
+                cond_req._cfg_scale
+            )  # noqa: leading-underscore  # DLLM protocol
+            cfg_rescale = float(
+                cond_req._cfg_rescale
+            )  # noqa: leading-underscore  # DLLM protocol
             uncond_img_idx = uncond_img_indices[0] if uncond_img_indices else None
             cfg_image_scale = (
-                finite_cfg_value(cond_req, "_cfg_image_scale", 0.0)
+                float(
+                    cond_req._cfg_image_scale
+                )  # noqa: leading-underscore  # DLLM protocol
                 if uncond_img_idx is not None
                 else 0.0
             )
+            for name, value in (
+                ("_cfg_scale", cfg_text_scale),
+                ("_cfg_rescale", cfg_rescale),
+                ("_cfg_image_scale", cfg_image_scale),
+            ):
+                if not math.isfinite(value):
+                    raise ValueError(f"{name} must be finite")
+                else:
+                    pass
             result = self.run_block(
                 model_runner,
                 forward_batch,
