@@ -621,6 +621,48 @@ def test_qwen_accepts_miles_audio_video_processor_tensors() -> None:
     )
 
 
+def test_qwen_preprocessor_limit_is_the_checkpoint_thinker_context(
+    tmp_path, monkeypatch
+) -> None:
+    """Without an explicit max_seq_len the prompt check uses the thinker context sglang
+    derives from the checkpoint."""
+    import json
+
+    from sglang_omni.models.qwen3_omni.components import (
+        preprocessor as preprocessor_mod,
+    )
+
+    (tmp_path / "config.json").write_text(
+        json.dumps(
+            {
+                "model_type": "qwen3_omni_moe",
+                "thinker_config": {"text_config": {"max_position_embeddings": 65536}},
+            }
+        )
+    )
+    monkeypatch.setattr(
+        preprocessor_mod.Qwen3OmniMoeProcessor,
+        "from_pretrained",
+        lambda model_dir, **kwargs: SimpleNamespace(
+            tokenizer=SimpleNamespace(
+                chat_template=None,
+                get_vocab=lambda: {"token": 0},
+                backend_tokenizer=SimpleNamespace(normalizer=NFC()),
+            ),
+            chat_template=None,
+        ),
+    )
+    monkeypatch.setattr(preprocessor_mod, "ensure_chat_template", lambda *_, **__: None)
+
+    assert preprocessor_mod.Qwen3OmniPreprocessor(str(tmp_path)).max_seq_len == 65536
+    assert (
+        preprocessor_mod.Qwen3OmniPreprocessor(
+            str(tmp_path), max_seq_len=4096
+        ).max_seq_len
+        == 4096
+    )
+
+
 def test_qwen_preprocessor_retries_without_special_token_compat(
     tmp_path, monkeypatch
 ) -> None:
@@ -653,7 +695,7 @@ def test_qwen_preprocessor_retries_without_special_token_compat(
     )
     monkeypatch.setattr(preprocessor_mod, "ensure_chat_template", lambda *_, **__: None)
 
-    preprocessor_mod.Qwen3OmniPreprocessor(str(tmp_path))
+    preprocessor_mod.Qwen3OmniPreprocessor(str(tmp_path), max_seq_len=8192)
 
     assert calls[0]["extra_special_tokens"] == {
         "image_token": "<|image_pad|>",

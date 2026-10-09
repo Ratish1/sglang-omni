@@ -61,7 +61,7 @@ def preprocessing_stage(*, process: str, speech_enabled: bool = False) -> StageC
         name="preprocessing",
         process=process,
         factory_path=f"{_PKG}.stages.create_preprocessing_executor",
-        factory=FactoryArgs(max_seq_len=8192),
+        factory=FactoryArgs(),
         next=next_stages,
         route_fn=route_fn,
         project_payload={
@@ -144,11 +144,9 @@ def aggregate_stage(*, process: str, gpu: int) -> StageConfig:
 def thinker_stage(*, gpu: int, speech_enabled: bool, process: str) -> StageConfig:
     # note (jiaxin deng): async decode defaults on;
     # --thinker.factory.enable_async_decode false overrides it.
-    factory_group = FactoryArgs(max_seq_len=8192, enable_async_decode=True)
+    factory_group = FactoryArgs(enable_async_decode=True)
     if speech_enabled:
-        factory_group = FactoryArgs(
-            max_seq_len=8192, enable_async_decode=True, speech_enabled=True
-        )
+        factory_group = FactoryArgs(enable_async_decode=True, speech_enabled=True)
     else:
         pass
     join_kwargs: dict = {}

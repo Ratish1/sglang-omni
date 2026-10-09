@@ -1197,7 +1197,7 @@ def create_sglang_thinker_executor_from_config(
     tp_rank: int = 0,
     tp_size: int = 1,
     nccl_port: int | None = None,
-    max_seq_len: int = 8192,
+    max_seq_len: int | None = None,
     server_args_overrides: Mapping[str, object] | None = None,
     encoder_mem_reserve: float = 0.05,
     speech_enabled: bool = False,
