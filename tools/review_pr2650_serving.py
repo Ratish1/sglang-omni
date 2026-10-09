@@ -25,7 +25,7 @@ async def request_reply(
 ) -> tuple[float, bytes, str]:
     case = CASES[case_name]
     payload = {
-        "model": "personaplex",
+        "model": "nvidia/personaplex-7b-v1",
         "messages": [{"role": "user", "content": ""}],
         "audios": [str(assets / case.input_wav)],
         "modalities": ["text", "audio"],
