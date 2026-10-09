@@ -676,7 +676,7 @@ The table below lists all parameters accepted by the `/v1/audio/speech` endpoint
 | `ref_audio` | string | `null` | Reference audio path / URL / base64 string. Equivalent to `references[0].audio_path` |
 | `ref_text` | string | `null` | Transcript for `ref_audio`. Equivalent to `references[0].text` |
 | `language` | string | `null` | Language hint: `Auto`, `Chinese`, `English`, `Japanese`, `Korean`, `German`, `French`, `Russian`, `Portuguese`, `Spanish`, or `Italian` |
-| `task_type` | string | `null` | Qwen3-TTS task type: `Base`, `CustomVoice`, or `VoiceDesign`. Inferred as `Base` when reference audio/text is present, otherwise `CustomVoice` |
+| `task_type` | string | `null` | Qwen3-TTS task type: `Base`, `CustomVoice`, or `VoiceDesign`. Inferred as `Base` when reference audio/text or `speaker_embedding` is present, otherwise `CustomVoice` |
 | `instructions` | string | `null` | Qwen3-TTS style or VoiceDesign instructions |
 | `max_new_tokens` | int | `null` | Maximum number of generated tokens |
 | `token_count` | int | `null` | Model-specific duration token target |

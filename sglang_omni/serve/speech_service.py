@@ -357,7 +357,7 @@ class SpeechRequestValidator:
         else:
             pass
         self.validate_custom_voice_request(request, task_type=updates.get("task_type"))
-        self.validate_speaker_embedding(request)
+        self.validate_speaker_embedding(request, task_type=updates.get("task_type"))
         if request.language is not None:
             updates["language"] = self.normalize_language(request.language)
         else:
@@ -414,7 +414,12 @@ class SpeechRequestValidator:
             param="voice",
         )
 
-    def validate_speaker_embedding(self, request: CreateSpeechRequest) -> None:
+    def validate_speaker_embedding(
+        self,
+        request: CreateSpeechRequest,
+        *,
+        task_type: str | None,
+    ) -> None:
         if request.speaker_embedding is None:
             return
         else:
@@ -446,6 +451,13 @@ class SpeechRequestValidator:
                 "speaker_embedding implies x-vector-only mode; omit "
                 "x_vector_only_mode or set it to true",
                 param="x_vector_only_mode",
+            )
+        else:
+            pass
+        if task_type is not None and task_type != "Base":
+            raise bad_request(
+                "speaker_embedding is only supported for the Base task",
+                param="task_type",
             )
         else:
             pass
@@ -1154,6 +1166,9 @@ def build_tts_params(
         pass
     if request.speaker_embedding is not None:
         tts_params["speaker_embedding"] = request.speaker_embedding
+        # Embedding-only requests carry no reference audio, so task_type
+        # inference would otherwise land on CustomVoice.
+        tts_params["task_type"] = "Base"
     else:
         pass
     if request.stream_codec_output is not None:

@@ -3,6 +3,9 @@
 
 from __future__ import annotations
 
+import json
+from pathlib import Path
+
 import pytest
 
 from sglang_omni.config import PipelineConfig, StageConfig
@@ -28,92 +31,82 @@ def make_validator(**overrides: object) -> SpeechRequestValidator:
     return SpeechRequestValidator(**kwargs)
 
 
+@pytest.mark.parametrize(
+    ("payload_extra", "validator_kwargs", "expected_param", "expected_fragment"),
+    [
+        ({"speaker_embedding": []}, {}, "speaker_embedding", None),
+        ({"speaker_embedding": [0.01, "x"]}, {}, "speaker_embedding", None),
+        (
+            {"speaker_embedding": EMBEDDING[:-1]},
+            {},
+            "speaker_embedding",
+            "must contain 1024 values",
+        ),
+        (
+            {"speaker_embedding": EMBEDDING, "x_vector_only_mode": False},
+            {},
+            "x_vector_only_mode",
+            None,
+        ),
+        (
+            {"speaker_embedding": EMBEDDING, "task_type": "CustomVoice"},
+            {},
+            "task_type",
+            None,
+        ),
+        (
+            {"speaker_embedding": EMBEDDING},
+            {"speaker_embedding_dim": None},
+            "speaker_embedding",
+            None,
+        ),
+    ],
+)
+def test_speaker_embedding_rejections(
+    payload_extra: dict,
+    validator_kwargs: dict,
+    expected_param: str,
+    expected_fragment: str | None,
+) -> None:
+    validator = make_validator(**validator_kwargs)
+    with pytest.raises(SpeechAPIError) as exc_info:
+        validator.parse_request({**BASE_REQUEST, **payload_extra})
+    assert exc_info.value.status_code == 400
+    assert exc_info.value.param == expected_param
+    if expected_fragment is not None:
+        assert expected_fragment in exc_info.value.message
+
+
 def test_valid_speaker_embedding_lowers_into_tts_params() -> None:
     validator = make_validator()
     request = validator.parse_request({**BASE_REQUEST, "speaker_embedding": EMBEDDING})
     tts_params = build_tts_params(request)
     assert tts_params["speaker_embedding"] == EMBEDDING
+    assert tts_params["task_type"] == "Base"
+    explicit = validator.parse_request(
+        {**BASE_REQUEST, "speaker_embedding": EMBEDDING, "x_vector_only_mode": True}
+    )
+    assert build_tts_params(explicit)["x_vector_only_mode"] is True
 
 
-def test_speaker_embedding_requires_non_empty_list() -> None:
-    validator = make_validator()
-    with pytest.raises(SpeechAPIError) as exc_info:
-        validator.parse_request({**BASE_REQUEST, "speaker_embedding": []})
-    assert exc_info.value.status_code == 400
-    assert exc_info.value.param == "speaker_embedding"
-
-
-def test_speaker_embedding_rejects_non_number_entries() -> None:
-    validator = make_validator()
-    with pytest.raises(SpeechAPIError) as exc_info:
-        validator.parse_request({**BASE_REQUEST, "speaker_embedding": [0.01, "x"]})
-    assert exc_info.value.status_code == 400
-    assert exc_info.value.param == "speaker_embedding"
-
-
-def test_speaker_embedding_rejects_wrong_dimension() -> None:
-    validator = make_validator()
-    with pytest.raises(SpeechAPIError) as exc_info:
-        validator.parse_request({**BASE_REQUEST, "speaker_embedding": EMBEDDING[:-1]})
-    assert exc_info.value.status_code == 400
-    assert str(DIM) in exc_info.value.message
-
-
-def test_speaker_embedding_rejects_explicit_x_vector_false() -> None:
-    validator = make_validator()
-    payload = {
-        **BASE_REQUEST,
-        "speaker_embedding": EMBEDDING,
-        "x_vector_only_mode": False,
-    }
-    with pytest.raises(SpeechAPIError) as exc_info:
-        validator.parse_request(payload)
-    assert exc_info.value.status_code == 400
-    assert exc_info.value.param == "x_vector_only_mode"
-
-
-def test_speaker_embedding_allows_explicit_x_vector_true() -> None:
-    validator = make_validator()
-    payload = {
-        **BASE_REQUEST,
-        "speaker_embedding": EMBEDDING,
-        "x_vector_only_mode": True,
-    }
-    request = validator.parse_request(payload)
-    assert build_tts_params(request)["x_vector_only_mode"] is True
-
-
-def test_speaker_embedding_rejected_on_unsupported_model() -> None:
-    validator = make_validator(speaker_embedding_dim=None)
-    with pytest.raises(SpeechAPIError) as exc_info:
-        validator.parse_request({**BASE_REQUEST, "speaker_embedding": EMBEDDING})
-    assert exc_info.value.status_code == 400
-    assert exc_info.value.param == "speaker_embedding"
-
-
-def test_speaker_embedding_conflicts_with_ref_audio() -> None:
+@pytest.mark.parametrize(
+    "conflict",
+    [{"ref_audio": "/tmp/ref.wav"}, {"references": [{"text": "transcript"}]}],
+)
+def test_speaker_embedding_conflicts_with_reference_audio(conflict: dict) -> None:
     validator = make_validator()
     request = validator.parse_request({**BASE_REQUEST, "speaker_embedding": EMBEDDING})
-    request = request.model_copy(update={"ref_audio": "/tmp/ref.wav"})
     prepared = PreparedSpeechReferences(request_updates={}, reference_descriptors=[])
     with pytest.raises(SpeechAPIError) as exc_info:
-        validator.validate_speech_references(request, prepared)
+        validator.validate_speech_references(
+            request.model_copy(update=conflict), prepared
+        )
     assert exc_info.value.status_code == 400
     assert exc_info.value.param == "speaker_embedding"
 
 
-def test_speaker_embedding_conflicts_with_references() -> None:
-    validator = make_validator()
-    request = validator.parse_request({**BASE_REQUEST, "speaker_embedding": EMBEDDING})
-    request = request.model_copy(update={"references": [{"text": "transcript"}]})
-    prepared = PreparedSpeechReferences(request_updates={}, reference_descriptors=[])
-    with pytest.raises(SpeechAPIError) as exc_info:
-        validator.validate_speech_references(request, prepared)
-    assert exc_info.value.status_code == 400
-
-
-def test_base_pipeline_config_rejects_speaker_embedding() -> None:
-    config = PipelineConfig(
+def test_speaker_embedding_dim_resolution(tmp_path: Path) -> None:
+    base = PipelineConfig(
         model_path="/tmp/unused",
         stages=[
             StageConfig(
@@ -124,41 +117,17 @@ def test_base_pipeline_config_rejects_speaker_embedding() -> None:
             )
         ],
     )
-    assert config.resolve_speaker_embedding_dim() is None
+    assert base.resolve_speaker_embedding_dim() is None
 
+    def checkpoint_config(name: str, config: dict) -> Qwen3TTSPipelineConfig:
+        path = Path(tmp_path) / name
+        path.mkdir()
+        path.joinpath("config.json").write_text(json.dumps(config), encoding="utf-8")
+        return Qwen3TTSPipelineConfig(model_path=str(path))
 
-def test_qwen3_tts_resolves_dim_from_checkpoint_config(
-    tmp_path: object,
-) -> None:
-    import json
-    from pathlib import Path
-
-    checkpoint = Path(tmp_path) / "qwen3-tts-base"
-    checkpoint.mkdir()
-    checkpoint.joinpath("config.json").write_text(
-        json.dumps(
-            {
-                "tts_model_type": "base",
-                "speaker_encoder_config": {"enc_dim": 1024},
-            }
-        ),
-        encoding="utf-8",
+    base_checkpoint = checkpoint_config(
+        "base", {"tts_model_type": "base", "speaker_encoder_config": {"enc_dim": 1024}}
     )
-    config = Qwen3TTSPipelineConfig(model_path=str(checkpoint))
-    assert config.resolve_speaker_embedding_dim() == 1024
-
-
-def test_qwen3_tts_custom_voice_checkpoint_rejects_speaker_embedding(
-    tmp_path: object,
-) -> None:
-    import json
-    from pathlib import Path
-
-    checkpoint = Path(tmp_path) / "qwen3-tts-custom-voice"
-    checkpoint.mkdir()
-    checkpoint.joinpath("config.json").write_text(
-        json.dumps({"tts_model_type": "custom_voice"}),
-        encoding="utf-8",
-    )
-    config = Qwen3TTSPipelineConfig(model_path=str(checkpoint))
-    assert config.resolve_speaker_embedding_dim() is None
+    assert base_checkpoint.resolve_speaker_embedding_dim() == 1024
+    custom_checkpoint = checkpoint_config("custom", {"tts_model_type": "custom_voice"})
+    assert custom_checkpoint.resolve_speaker_embedding_dim() is None
