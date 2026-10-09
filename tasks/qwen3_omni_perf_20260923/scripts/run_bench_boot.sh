@@ -10,7 +10,7 @@
 # diagnostic at equal load between two arms; unset is closed loop.
 # minicpmo serves MiniCPM-o-4.5 with the Omni CI speech worker args (tests/test_model/conftest.py).
 # SERVER_PYTHONPATH is prepended for the omni server only (memdiag/ loads the memory diagnostics).
-# usage: run_bench_boot.sh <tree> <out dir> <card> <port> <bf16|fp8|h200|h200text|minicpmo> <concurrency> "<arm> <arm> ..."
+# usage: run_bench_boot.sh <tree> <out dir> <card> <port> <bf16|fp8|h200|h200text|minicpmo|asr> <concurrency> "<arm> <arm> ..."
 set -u
 TREE=$1 OUT=$2 CARD=$3 PORT=$4 DTYPE=$5 CONC=$6 ARMS=$7
 S=$(cd "$(dirname "$0")" && pwd)
@@ -28,7 +28,10 @@ case $DTYPE in
     SERVE_ARGS="--config examples/configs/qwen3_omni_mmmu.yaml" ;;
   minicpmo) MODEL=openbmb/MiniCPM-o-4_5
     SERVE_ARGS="--thinker.factory.max_seq_len 8192 --thinker.engine.mem_fraction_static 0.55 --talker.engine.mem_fraction_static 0.15" ;;
-  *) echo "dtype must be bf16, fp8, h200, h200text or minicpmo"; exit 1 ;;
+  # asr: the scorer's Qwen3-ASR server as the server under test (the upload transcription path)
+  asr) MODEL=Qwen/Qwen3-ASR-1.7B
+    SERVE_ARGS="" ;;
+  *) echo "dtype must be bf16, fp8, h200, h200text, minicpmo or asr"; exit 1 ;;
 esac
 SERVE_ARGS="$SERVE_ARGS ${EXTRA_SERVE_ARGS:-}"
 ASR_MODEL=Qwen/Qwen3-ASR-1.7B

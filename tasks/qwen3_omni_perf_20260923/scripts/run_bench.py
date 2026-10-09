@@ -408,7 +408,7 @@ async def chat_parts_smoke(port: int, out: str) -> dict:
 
 async def audio_formats(port: int, out: str) -> dict:
     """Every input of AUDIO_CASES_DIR's manifest (q62_audio_decode.py make) as the request audio of
-    a greedy transcription request by local path: status, prompt tokens, the answer or the error.
+    a greedy transcription request (the card's ASR prompt) by local path: status, prompt tokens, the answer or the error.
     """
     import aiohttp
 
@@ -418,7 +418,12 @@ async def audio_formats(port: int, out: str) -> dict:
         for case in json.loads((cases / "manifest.json").read_text()):
             payload = {
                 "model": MODEL,
-                "messages": [{"role": "user", "content": "Transcribe the audio."}],
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": "Transcribe the English audio into text.",
+                    }
+                ],
                 "audios": [str(cases / case["name"])],
                 "modalities": ["text"],
                 "temperature": 0.0,
