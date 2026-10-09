@@ -466,7 +466,7 @@ class OmniScheduler(Generic[RequestDataT]):
         self.max_queued_requests = server_args.max_queued_requests
         effective_max_total_num_tokens = mr.effective_max_total_num_tokens
         self.max_req_len = min(
-            server_args.context_length - 1,
+            model_config.context_len - 1,
             effective_max_total_num_tokens - 1,
         )
         self.max_req_input_len = self.max_req_len - 1
@@ -1622,7 +1622,7 @@ class OmniScheduler(Generic[RequestDataT]):
                 if session_unit is not None:
                     error = ContextExhaustedError(
                         f"{ContextExhaustedError.CODE}: thinker context length "
-                        f"{self.server_args.context_length} tokens exhausted "
+                        f"{self.model_config.context_len} tokens exhausted "
                         f"(effective input limit={self.max_req_input_len}). {error_msg}"
                     )
                 else:
