@@ -451,11 +451,7 @@ class DllmScheduler:
         else:
             pass
 
-        max_running_requests = getattr(
-            self.dllm_config,
-            "max_running_requests",
-            None,
-        )
+        max_running_requests = self.dllm_config.max_running_requests
         if max_running_requests is not None and max_running_requests < len(reqs):
             raise RuntimeError(
                 "CFG request group requires "

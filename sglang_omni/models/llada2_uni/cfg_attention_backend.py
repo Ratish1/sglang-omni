@@ -4,12 +4,12 @@
 from __future__ import annotations
 
 import torch
+from flashinfer.cascade import merge_state
 from flashinfer.prefill import BatchPrefillWithRaggedKVCacheWrapper
 from sglang.srt.layers.attention.attention_registry import ATTENTION_BACKENDS
 from sglang.srt.layers.attention.flashinfer_backend import (
     FlashInferAttnBackend,
     PrefillMetadata,
-    merge_state,
 )
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc

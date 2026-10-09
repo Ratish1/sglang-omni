@@ -170,7 +170,7 @@ class LowConfidenceCFG(DllmAlgorithm):
             raise ValueError("LowConfidenceCFG does not accept carried FDFO state")
         else:
             pass
-        reqs = getattr(forward_batch, "reqs", None)
+        reqs = forward_batch.reqs
         batch_size = forward_batch.batch_size
 
         cfg_marked = bool(reqs) and any(  # noqa: leading-underscore  # DLLM protocol

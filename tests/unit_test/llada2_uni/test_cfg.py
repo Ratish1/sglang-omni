@@ -249,6 +249,7 @@ def test_attention_masks_local_and_cached_padding() -> None:
     assert begin_forward.call_args.args[3].tolist() == [8, 2]
 
 
+@pytest.mark.accelerator
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="FlashInfer requires CUDA")
 @pytest.mark.parametrize("initial_prefix", [0, 4])
 def test_attention_matches_dense_across_padding_boundary(initial_prefix: int) -> None:

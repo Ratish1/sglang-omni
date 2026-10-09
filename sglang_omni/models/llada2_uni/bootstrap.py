@@ -53,10 +53,7 @@ def validate_cfg(server_args: ServerArgs) -> None:
     )
 
     if any(backend != CFG_ATTENTION_BACKEND for backend in attention_backends_of(cfg)):
-        raise ValueError(
-            "LowConfidenceCFG requires llada2_uni_cfg_flashinfer (DLLM pad masking), "
-            "not the upstream llada2_cfg_flashinfer text-condition mask backend"
-        )
+        raise ValueError("LowConfidenceCFG requires llada2_uni_cfg_flashinfer")
     else:
         pass
     if cfg.dllm_fdfo:
