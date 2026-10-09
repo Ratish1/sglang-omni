@@ -1350,6 +1350,51 @@ def test_tail_graph_replays_match_eager_tail_decodes_and_reuse_their_buffers(
     assert torch.count_nonzero(untouched.transformer_keys[0]).item() == 0
 
 
+@pytest.mark.accelerator
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_tail_graph_runner_keeps_only_widths_that_hold_a_tail() -> None:
+    device = torch.device("cuda", torch.cuda.current_device())
+    incremental = Qwen3TTSIncrementalDecoder(Decoder().to(device).eval())
+    arena = Qwen3TTSCodecStateArena(
+        incremental, num_slots=2, device=device, dtype=torch.float32
+    )
+    emit_frames = 4
+    tail_frames = incremental.tail_frames(emit_frames)
+
+    def tail_runner(widths: tuple[int, ...]) -> Qwen3TTSIncrementalCodecCudaGraphRunner:
+        return Qwen3TTSIncrementalCodecCudaGraphRunner(
+            incremental,
+            device=device,
+            dtype=torch.float32,
+            num_quantizers=2,
+            mode="tail",
+            fresh_frames=widths,
+            batch_sizes=(1,),
+            min_free_gb=0.0,
+            arena=arena,
+            graph_pool=IncrementalCodecGraphPool(stream_priority=0),
+            emit_frames=emit_frames,
+        )
+
+    some_fit = tail_runner((tail_frames - 1, tail_frames, tail_frames + 4))
+    assert some_fit.fresh_frames == (tail_frames, tail_frames + 4)
+    assert some_fit.configured
+
+    none_fit = tail_runner((tail_frames - 2, tail_frames - 1))
+    none_fit.capture()
+    assert none_fit.fresh_frames == ()
+    assert not none_fit.configured
+    assert not none_fit.enabled
+    assert (
+        none_fit.decode_slots(
+            torch.zeros((1, 2, tail_frames), dtype=torch.long, device=device),
+            [0],
+            valid_frames=[tail_frames],
+        )
+        is None
+    )
+
+
 @pytest.mark.benchmark
 @pytest.mark.accelerator
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")

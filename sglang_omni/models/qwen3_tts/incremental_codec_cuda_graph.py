@@ -166,12 +166,10 @@ class Qwen3TTSIncrementalCodecCudaGraphRunner:
             else:
                 pass
             self.tail_frames = decoder.tail_frames(self.emit_frames)
-            if self.fresh_frames and self.fresh_frames[0] < self.tail_frames:
-                raise ValueError(
-                    f"tail incremental Codec graph widths must be >= {self.tail_frames}, got {self.fresh_frames}"
-                )
-            else:
-                pass
+            # note (ratish): a width below tail_frames can never hold a first chunk's tail.
+            self.fresh_frames = tuple(
+                frames for frames in self.fresh_frames if frames >= self.tail_frames
+            )
         else:
             self.tail_frames = 0
         self.batch_sizes = tuple(

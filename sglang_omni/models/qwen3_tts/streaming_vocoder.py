@@ -1033,8 +1033,8 @@ class Qwen3TTSStreamingVocoderScheduler(
             if window_frames
             else None
         )
-        # note (ratish): reference codes come at the reference encoder's lengths, so the
-        # first chunks they prefix pad to that ladder; padding costs only the frame part.
+        # note (ratish): a first chunk pads up to the next of these widths; padding costs
+        # only the frame part, never the conv stack.
         tail = (
             Qwen3TTSIncrementalCodecCudaGraphRunner(
                 self.incremental_decoder,
