@@ -44,6 +44,7 @@ ARMS = (
     "transcribe_zh",
     "chat_parts",
     "seeded_text_identity",
+    "audio_formats",
     "mmmu",
     "mmmu_talker",
     "mmsu",
@@ -383,6 +384,43 @@ async def chat_parts_smoke(port: int, out: str) -> dict:
     return results
 
 
+async def audio_formats(port: int, out: str) -> dict:
+    """Every input of AUDIO_CASES_DIR's manifest (q62_audio_decode.py make) as the request audio of
+    a greedy transcription request by local path: status, prompt tokens, the answer or the error.
+    """
+    import aiohttp
+
+    cases = Path(os.environ["AUDIO_CASES_DIR"])
+    results = {}
+    async with aiohttp.ClientSession() as session:
+        for case in json.loads((cases / "manifest.json").read_text()):
+            payload = {
+                "model": MODEL,
+                "messages": [{"role": "user", "content": "Transcribe the audio."}],
+                "audios": [str(cases / case["name"])],
+                "modalities": ["text"],
+                "temperature": 0.0,
+                "max_tokens": 96,
+                "stream": False,
+            }
+            async with session.post(
+                f"http://127.0.0.1:{port}/v1/chat/completions", json=payload
+            ) as response:
+                body = await response.json(content_type=None)
+            results[case["name"]] = {
+                "status": response.status,
+                "prompt_tokens": body.get("usage", {}).get("prompt_tokens"),
+                "text": (body.get("choices") or [{}])[0]
+                .get("message", {})
+                .get("content"),
+                "error": body.get("error") or body.get("detail"),
+            }
+    (Path(out) / "audio_formats_results.json").write_text(
+        json.dumps(results, indent=1, ensure_ascii=False)
+    )
+    return {name: value["status"] for name, value in results.items()}
+
+
 async def seeded_text_identity(port: int, out: str) -> dict:
     """Eight identical sampled text requests at once (the thinker decodes them as one batch, on
     the async path when the runner allows it), once with a seed and once without: a seed that
@@ -435,6 +473,8 @@ async def generate(
         return await chat_parts_smoke(port, out)
     if arm == "seeded_text_identity":
         return await seeded_text_identity(port, out)
+    if arm == "audio_formats":
+        return await audio_formats(port, out)
     if arm in ("transcribe_en", "transcribe_zh"):
         return await transcribe_seedtts_references(port, out, concurrency, arm[-2:])
     talker = arm.endswith("_talker")
