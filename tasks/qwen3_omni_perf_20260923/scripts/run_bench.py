@@ -45,6 +45,7 @@ ARMS = (
     "chat_parts",
     "seeded_text_identity",
     "audio_formats",
+    "transcribe_uploads",
     "mmmu",
     "mmmu_talker",
     "mmsu",
@@ -354,6 +355,27 @@ async def chat_parts_smoke(port: int, out: str) -> dict:
                 {"role": "user", "content": [{"type": "model_private", "x": 1}]}
             ]
         },
+        "text_part_with_top_level_media": {
+            "messages": [
+                {"role": "user", "content": [{"type": "text", "text": question}]}
+            ],
+            "images": ["tests/data/cars.jpg"],
+            "audios": ["tests/data/query_to_cars.wav"],
+        },
+        "null_content_history": {
+            "messages": [
+                {"role": "user", "content": "Hello."},
+                {"role": "assistant", "content": None},
+                {"role": "user", "content": question},
+            ],
+            "images": ["tests/data/cars.jpg"],
+            "audios": ["tests/data/query_to_cars.wav"],
+        },
+        "content_object": {
+            "messages": [
+                {"role": "user", "content": {"type": "text", "text": question}}
+            ]
+        },
     }
     results = {}
     async with aiohttp.ClientSession() as session:
@@ -421,6 +443,42 @@ async def audio_formats(port: int, out: str) -> dict:
     return {name: value["status"] for name, value in results.items()}
 
 
+async def transcribe_uploads(port: int, out: str) -> dict:
+    """Every input of AUDIO_CASES_DIR's manifest uploaded to /v1/audio/transcriptions (json):
+    status, the usage seconds the endpoint probes from the upload, the text or the error.
+    """
+    import aiohttp
+
+    cases = Path(os.environ["AUDIO_CASES_DIR"])
+    results = {}
+    async with aiohttp.ClientSession() as session:
+        for case in json.loads((cases / "manifest.json").read_text()):
+            form = aiohttp.FormData()
+            form.add_field(
+                "file",
+                (cases / case["name"]).read_bytes(),
+                filename=case["name"],
+                content_type="application/octet-stream",
+            )
+            form.add_field("model", MODEL)
+            form.add_field("language", "en")
+            form.add_field("response_format", "json")
+            async with session.post(
+                f"http://127.0.0.1:{port}/v1/audio/transcriptions", data=form
+            ) as response:
+                body = await response.json(content_type=None)
+            results[case["name"]] = {
+                "status": response.status,
+                "usage": body.get("usage"),
+                "text": body.get("text"),
+                "error": body.get("error") or body.get("detail"),
+            }
+    (Path(out) / "transcribe_uploads_results.json").write_text(
+        json.dumps(results, indent=1, ensure_ascii=False)
+    )
+    return {name: value["status"] for name, value in results.items()}
+
+
 async def seeded_text_identity(port: int, out: str) -> dict:
     """Eight identical sampled text requests at once (the thinker decodes them as one batch, on
     the async path when the runner allows it), once with a seed and once without: a seed that
@@ -475,6 +533,8 @@ async def generate(
         return await seeded_text_identity(port, out)
     if arm == "audio_formats":
         return await audio_formats(port, out)
+    if arm == "transcribe_uploads":
+        return await transcribe_uploads(port, out)
     if arm in ("transcribe_en", "transcribe_zh"):
         return await transcribe_seedtts_references(port, out, concurrency, arm[-2:])
     talker = arm.endswith("_talker")
