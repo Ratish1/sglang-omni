@@ -3074,8 +3074,6 @@ def test_qwen3_tts_windowed_cohorts_split_at_the_window_runner_bucket(
 
 
 class FakeTailRunner:
-    """Tail graphs that decode against the real arena on the CPU."""
-
     def __init__(
         self,
         scheduler: Qwen3TTSStreamingVocoderScheduler,

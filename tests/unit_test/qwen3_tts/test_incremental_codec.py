@@ -637,12 +637,6 @@ def test_arena_cohort_matches_per_stream_decodes() -> None:
 
 
 def test_tail_frames_bounds_what_the_kept_samples_and_state_read() -> None:
-    """A change one frame before the tail leaves the kept samples and the conv-stack
-    state bit for bit; a change to the tail's first frame reaches the kept samples.
-
-    In float64: the first tail frame reaches them through the earliest tap of every
-    conv, an effect below float32 resolution.
-    """
     torch.manual_seed(41)
     decoder = Decoder().double()
     incremental = Qwen3TTSIncrementalDecoder(decoder)
@@ -670,15 +664,16 @@ def test_tail_frames_bounds_what_the_kept_samples_and_state_read() -> None:
     first_waveform, _ = run_conv_stack(frames - tail_frames)
 
     assert torch.equal(before_waveform, baseline_waveform)
-    for name in ("conv_histories", "transconv_overlaps"):
-        for key, value in getattr(baseline_state, name).items():
-            assert torch.equal(getattr(before_state, name)[key], value), key
+    for actual, expected in (
+        (before_state.conv_histories, baseline_state.conv_histories),
+        (before_state.transconv_overlaps, baseline_state.transconv_overlaps),
+    ):
+        for key, value in expected.items():
+            assert torch.equal(actual[key], value), key
     assert not torch.equal(first_waveform, baseline_waveform)
 
 
 def test_tail_decode_matches_each_row_decoded_whole() -> None:
-    """Rows of different widths padded into one tail decode keep each row's emitted
-    samples, every state tensor and its next decode, as the row decoded alone does."""
     torch.manual_seed(42)
     decoder = Decoder()
     incremental, arena = make_arena(decoder, slots=6)
@@ -707,16 +702,14 @@ def test_tail_decode_matches_each_row_decoded_whole() -> None:
         tail_state = arena.gather([tail_slot])
         alone_state = arena.gather([alone_slot])
         assert tail_state.frame_positions.tolist() == [width]
-        for name in (
-            "conv_histories",
-            "transconv_overlaps",
-            "transformer_keys",
-            "transformer_values",
+        for actual, expected in (
+            (tail_state.conv_histories, alone_state.conv_histories),
+            (tail_state.transconv_overlaps, alone_state.transconv_overlaps),
+            (tail_state.transformer_keys, alone_state.transformer_keys),
+            (tail_state.transformer_values, alone_state.transformer_values),
         ):
-            for key, value in getattr(alone_state, name).items():
-                torch.testing.assert_close(
-                    getattr(tail_state, name)[key], value, rtol=2e-5, atol=2e-6
-                )
+            for key, value in expected.items():
+                torch.testing.assert_close(actual[key], value, rtol=2e-5, atol=2e-6)
         torch.testing.assert_close(
             arena_decode(incremental, arena, [tail_slot], [width], follow_codes),
             arena_decode(incremental, arena, [alone_slot], [width], follow_codes),
@@ -1287,9 +1280,6 @@ def test_windowed_replays_match_one_eager_decode_and_its_arena_state(
 def test_tail_graph_replays_match_eager_tail_decodes_and_reuse_their_buffers(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Captured tail widths serve rows of different widths, replay after replay, and
-    leave the arena rows where the eager tail decode does; pad rows touch only scratch.
-    """
     torch.manual_seed(43)
     monkeypatch.setattr(torch.backends.cudnn, "allow_tf32", False)
     device = torch.device("cuda", torch.cuda.current_device())
@@ -1333,16 +1323,14 @@ def test_tail_graph_replays_match_eager_tail_decodes_and_reuse_their_buffers(
         graph_state = arena.gather(slots)
         eager_state = arena.gather(reference_slots)
         assert graph_state.frame_positions.tolist() == widths
-        for name in (
-            "conv_histories",
-            "transconv_overlaps",
-            "transformer_keys",
-            "transformer_values",
+        for actual, expected in (
+            (graph_state.conv_histories, eager_state.conv_histories),
+            (graph_state.transconv_overlaps, eager_state.transconv_overlaps),
+            (graph_state.transformer_keys, eager_state.transformer_keys),
+            (graph_state.transformer_values, eager_state.transformer_values),
         ):
-            for key, value in getattr(eager_state, name).items():
-                torch.testing.assert_close(
-                    getattr(graph_state, name)[key], value, rtol=2e-4, atol=2e-5
-                )
+            for key, value in expected.items():
+                torch.testing.assert_close(actual[key], value, rtol=2e-4, atol=2e-5)
 
     assert runner.stats()["runtime"]["replays"] == 2
     untouched = arena.gather([bystander])

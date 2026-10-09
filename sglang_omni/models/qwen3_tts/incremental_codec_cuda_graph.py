@@ -76,11 +76,8 @@ class CaptureResourceSet:
 
 @dataclass(slots=True)
 class IncrementalCodecGraphPool:
-    """One graph memory pool and capture stream for runners that replay on one stream.
-
-    Graphs captured on one stream into one pool reuse each other's intermediate
-    memory, which is safe only while each replay's output is copied out on that
-    stream before the next replay. The first capture creates the pool and stream.
+    """A graph pool and capture stream shared by runners that replay on one stream; safe
+    only while each replay's output is copied out on that stream before the next replay.
     """
 
     stream_priority: int

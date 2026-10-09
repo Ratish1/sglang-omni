@@ -902,11 +902,9 @@ class Qwen3TTSIncrementalDecoder:
         return waveform
 
     def tail_frames(self, emit_frames: int) -> int:
-        """Transformer outputs that the samples of the last emit_frames frames, and the
-        conv-stack state after them, depend on.
-
-        Walked back from the waveform: a causal conv adds its history, a transposed conv
-        of kernel k and stride s maps n emitted samples to (n + k - 1) // s inputs.
+        """How many transformer outputs the last emit_frames frames' samples and the conv-stack
+        state depend on, walked back from the waveform: a causal conv adds its history, and a
+        transposed conv of kernel k and stride s maps n samples to (n + k - 1) // s inputs.
         """
         decoder = self.decoder
         samples = int(emit_frames) * self.total_upsample + int(
@@ -937,14 +935,9 @@ class Qwen3TTSIncrementalDecoder:
         state: Qwen3TTSIncrementalCodecState,
         emit_frames: int,
     ) -> torch.Tensor:
-        """Decode valid_frames[i] frames of row i of codes and return the samples of each
-        row's last emit_frames frames, shaped (B, 1, emit_frames * total_upsample).
-
-        For a first chunk whose earlier frames are a reference prefix nobody hears. The
-        conv stack runs on the last tail_frames(emit_frames) transformer outputs only,
-        which leaves the kept samples and every state tensor exact, since nothing they
-        depend on lies earlier. Needs arena state (per-row positions, full K/V buffers)
-        and tail_frames(emit_frames) <= valid_frames[i] <= codes width.
+        """Decode row i's valid_frames[i] frames with the conv stack on the last
+        tail_frames(emit_frames) outputs only, and return the last emit_frames frames' samples.
+        Needs arena state (per-row positions, full-width K/V), tail_frames <= valid_frames[i].
         """
         if state.frame_positions is None:
             raise ValueError("Qwen3-TTS tail decoding needs per-row frame positions")
@@ -980,11 +973,8 @@ class Qwen3TTSIncrementalDecoder:
         state: Qwen3TTSIncrementalCodecState,
         valid_frames: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Quantizer, pre_conv and transformer, returned in the decoder's layout.
-
-        With valid_frames, row i's real frames end at valid_frames[i] and its pre_conv
-        history and kept K/V are the ones ending there.
-        """
+        """Quantizer, pre_conv and transformer in the decoder's layout; with valid_frames,
+        row i's pre_conv history and kept K/V end at valid_frames[i]."""
         channels_last_weights = self.channels_last_weights
         is_channels_last = channels_last_weights is not None
         hidden_states = self.decoder.quantizer.decode(codes)

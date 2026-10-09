@@ -29,9 +29,6 @@ from sglang_omni.models.qwen3_tts.incremental_codec_cuda_graph import (
     Qwen3TTSIncrementalCodecCudaGraphRunner,
 )
 from sglang_omni.models.qwen3_tts.payload_types import Qwen3TTSState
-from sglang_omni.models.qwen3_tts.reference_encoder_cuda_graph import (
-    DEFAULT_QWEN3_TTS_REFERENCE_ENCODER_BUCKET_FRAMES,
-)
 from sglang_omni.platforms import current_platform
 from sglang_omni.platforms.device_graph import DeviceGraphBackend, ReplayableGraph
 from sglang_omni.profiler.event_recorder import (
@@ -71,6 +68,8 @@ DEFAULT_QWEN3_TTS_STREAM_CHUNK_RAMP = (1, 2, 4)
 DEFAULT_QWEN3_TTS_LEFT_CONTEXT_FRAMES = 16
 DEFAULT_QWEN3_TTS_CODEC_STATE_SLOTS = 64
 DEFAULT_QWEN3_TTS_INCREMENTAL_WINDOW_FRAMES = (1, 2, 4, 8, 16, 32, 64)
+# note (ratish): first-chunk widths with tail graphs; longer first chunks use the window graphs.
+QWEN3_TTS_TAIL_GRAPH_FRAMES = (32, 48, 64, 96, 128, 192, 256)
 _CODEC_STATS_LOG_INTERVAL_S = 60.0
 _QWEN3_TTS_INCREMENTAL_CODEC_WARM_GRAPH_BATCH_SIZES = (1, 2, 4, 8)
 _QWEN3_TTS_CODEBOOK_SIZE = 2048
@@ -194,11 +193,8 @@ class IncrementalDecodePlan:
 
 @dataclass(eq=False)
 class IncrementalDecodeBatch:
-    """Cohort-wide arena bookkeeping for one incremental launch.
-
-    A cohort with a tail_runner holds reference-prefixed first chunks of different
-    widths, decoded by one decode_tail replay.
-    """
+    """Cohort-wide arena bookkeeping for one incremental launch; a cohort with a tail_runner
+    holds reference-prefixed first chunks of different widths, decoded in one replay."""
 
     decoder: Qwen3TTSIncrementalDecoder
     arena: Qwen3TTSCodecStateArena
@@ -1033,8 +1029,6 @@ class Qwen3TTSStreamingVocoderScheduler(
             if window_frames
             else None
         )
-        # note (ratish): a first chunk pads up to the next of these widths; padding costs
-        # only the frame part, never the conv stack.
         tail = (
             Qwen3TTSIncrementalCodecCudaGraphRunner(
                 self.incremental_decoder,
@@ -1042,7 +1036,7 @@ class Qwen3TTSStreamingVocoderScheduler(
                 dtype=dtype,
                 num_quantizers=num_quantizers,
                 mode="tail",
-                fresh_frames=DEFAULT_QWEN3_TTS_REFERENCE_ENCODER_BUCKET_FRAMES,
+                fresh_frames=QWEN3_TTS_TAIL_GRAPH_FRAMES,
                 batch_sizes=graph_batch_sizes,
                 min_free_gb=min_free_gb,
                 enabled=graph_enabled,

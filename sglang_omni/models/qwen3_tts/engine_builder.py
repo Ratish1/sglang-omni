@@ -385,8 +385,8 @@ class Qwen3TtsEngineBuilder(TtsEngineBuilder[Qwen3TTSSGLangRequestData]):
         return request_builder, result_adapter
 
     def extra_scheduler_kwargs(self) -> SchedulerExtras[Qwen3TTSSGLangRequestData]:
-        # note (ratish): requests build on the scheduler thread: the build is host-only and
-        # short, and a pooled build that misses the pass waits a whole engine step for admission.
+        # note (ratish): requests build on the scheduler thread: preprocessing already did the
+        # model work, and a pooled build that misses the pass waits a whole engine step for admission.
         return {
             "stream_output_builder": self.stream_output_builder,
             "prefill_coalesce_requests": self.prefill_coalesce_requests,
