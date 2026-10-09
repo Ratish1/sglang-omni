@@ -12,6 +12,9 @@ sim:   seed-tts speaker similarity on --device; run after the ASR server is stop
 THINKER_TEMPERATURE=T sends that thinker temperature with the mmsu and seed-tts arms in place of
 their defaults (0.0 and 0.7), to compare sampling defaults at equal load.
 
+REQUEST_SEED=S sends that seed on every mmsu and mmmu request (the mmsu benchmark also shuffles
+its corpus with it), for a change to the seeded thinker path; unset, the arms send none.
+
 --skip-samples K drops the corpus's first K samples (gen only), so a warm pass over the first
 K samples and a measured pass over the next ones share no prompt (the thinker keeps its radix
 cache): the loaders the benchmarks bound at import are wrapped to load K more and drop them.
@@ -40,6 +43,7 @@ ARMS = (
     "transcribe_en",
     "transcribe_zh",
     "chat_parts",
+    "seeded_text_identity",
     "mmmu",
     "mmmu_talker",
     "mmsu",
@@ -95,7 +99,7 @@ def mmsu_args(
         request_rate=request_rate,
         save_audio=talker,
         disable_tqdm=True,
-        seed=None,
+        seed=int(os.environ["REQUEST_SEED"]) if "REQUEST_SEED" in os.environ else None,
         repo_id=None,
         lang="en",
         asr_device="cuda:0",
@@ -379,6 +383,44 @@ async def chat_parts_smoke(port: int, out: str) -> dict:
     return results
 
 
+async def seeded_text_identity(port: int, out: str) -> dict:
+    """Eight identical sampled text requests at once (the thinker decodes them as one batch, on
+    the async path when the runner allows it), once with a seed and once without: a seed that
+    reaches the sampler gives one distinct answer, no seed gives up to eight."""
+    import aiohttp
+
+    payload = {
+        "model": MODEL,
+        "messages": [
+            {
+                "role": "user",
+                "content": "Write a short story about a lighthouse keeper.",
+            }
+        ],
+        "modalities": ["text"],
+        "temperature": 0.7,
+        "max_tokens": 128,
+        "stream": False,
+    }
+    results = {}
+    async with aiohttp.ClientSession() as session:
+
+        async def answer(seed: int | None) -> str:
+            body = {**payload, **({"seed": seed} if seed is not None else {})}
+            async with session.post(
+                f"http://127.0.0.1:{port}/v1/chat/completions", json=body
+            ) as response:
+                return (await response.json())["choices"][0]["message"]["content"]
+
+        for name, seed in (("seeded", SPEECH_IDENTITY_SEED), ("unseeded", None)):
+            texts = await asyncio.gather(*(answer(seed) for _ in range(8)))
+            results[name] = {"distinct": len(set(texts)), "texts": texts}
+    (Path(out) / "seeded_text_identity.json").write_text(
+        json.dumps(results, indent=1, ensure_ascii=False)
+    )
+    return {name: value["distinct"] for name, value in results.items()}
+
+
 async def generate(
     arm: str,
     port: int,
@@ -391,6 +433,8 @@ async def generate(
         return await seeded_speech_requests(port, out, max_samples or 5)
     if arm == "chat_parts":
         return await chat_parts_smoke(port, out)
+    if arm == "seeded_text_identity":
+        return await seeded_text_identity(port, out)
     if arm in ("transcribe_en", "transcribe_zh"):
         return await transcribe_seedtts_references(port, out, concurrency, arm[-2:])
     talker = arm.endswith("_talker")
@@ -433,6 +477,11 @@ async def generate(
             enable_audio=talker,
             prompt_override=MMMU_TTS_PROMPT if talker else None,
             max_samples=max_samples,
+            seed=(
+                int(os.environ["REQUEST_SEED"])
+                if "REQUEST_SEED" in os.environ
+                else None
+            ),
         )
         return await run_mmmu_eval(config, compute_wer=False)
     if arm.startswith("mmsu"):
