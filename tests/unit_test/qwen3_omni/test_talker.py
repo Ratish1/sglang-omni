@@ -2704,6 +2704,48 @@ def test_talker_prefill_forward_invalidates_next_decode_reuse() -> None:
     assert float(fake.sampling_temperatures[0, 0]) == pytest.approx(0.8)
 
 
+def test_talker_samples_from_fp32_logits() -> None:
+    """Both logits paths hand the sampler fp32, and the repetition penalty and the
+    suppression run on it in fp32, as the reference samples."""
+    fake = talker_seed_self(max_bs=2, vocab=4)
+    head = nn.Linear(3, 4, bias=False).to(torch.bfloat16)
+    fake.codec_head = lambda states: (head(states), None)
+    fake.extend_last_index = lambda forward_batch, device: torch.tensor([1, 3])
+    hidden = torch.randn(4, 3, dtype=torch.bfloat16)
+
+    extend = Qwen3OmniTalker.manual_extend_logits(fake, hidden, SimpleNamespace())
+    decode = Qwen3OmniTalker.manual_decode_logits(fake, hidden[:2])
+
+    assert extend.next_token_logits.dtype == torch.float32
+    assert decode.next_token_logits.dtype == torch.float32
+
+    logits = torch.tensor([[2.0, -1.0, 0.5, 1.9], [0.1, 0.2, 0.3, -3.0]])
+    fake.repetition_penalties[:2, 0] = torch.tensor([1.05, 2.0])
+    fake.repetition_mask[0, 0] = True
+    fake.repetition_mask[1, 3] = True
+    fake.suppress_mask[1, 2] = True
+    seen: dict[str, torch.Tensor] = {}
+
+    def sampler(logits_output, *args):
+        seen["logits"] = logits_output.next_token_logits.clone()
+        return logits_output.next_token_logits.argmax(dim=-1)
+
+    fake.sampler = sampler
+    fake.build_static_sampling_info = lambda batch_size: None
+
+    tokens = Qwen3OmniTalker.sample_decode_tokens(
+        fake, logits, SimpleNamespace(positions=None)
+    )
+
+    expected = logits.double()
+    expected[0, 0] /= 1.05
+    expected[1, 3] *= 2.0
+    expected[1, 2] = float("-inf")
+    assert seen["logits"].dtype == torch.float32
+    torch.testing.assert_close(seen["logits"].double(), expected, rtol=0, atol=1e-6)
+    assert tokens.tolist() == [0, 1]
+
+
 @pytest.mark.parametrize(("is_rocm", "expected"), [(True, False), (False, True)])
 def test_qwen_predictor_decode_graph_skips_outer_sglang_capture_on_rocm(
     monkeypatch: pytest.MonkeyPatch, is_rocm: bool, expected: bool
