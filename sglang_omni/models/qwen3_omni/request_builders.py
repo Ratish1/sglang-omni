@@ -22,7 +22,7 @@ from sglang_omni.models.qwen3_omni.payload_types import (
     ThinkerOutput,
 )
 from sglang_omni.pipeline.stage.stream_queue import StreamItem
-from sglang_omni.proto import OmniRequest, StagePayload
+from sglang_omni.proto import EXPLICIT_GENERATION_PARAMS_KEY, OmniRequest, StagePayload
 from sglang_omni.scheduling.message import OutgoingMessage
 from sglang_omni.scheduling.pending_text_queue import (
     PendingTextTensorQueue,
@@ -1107,7 +1107,16 @@ def make_thinker_scheduler_adapters(
 
     def request_builder(payload: StagePayload) -> SGLangARRequestData:
         state = Qwen3OmniPipelineState.from_dict(payload.data)
-        params = payload.request.params or {}
+        params = dict(payload.request.params or {})
+        explicit_fields = (
+            payload.request.metadata.get(EXPLICIT_GENERATION_PARAMS_KEY) or ()
+        )
+        # note (ratish): the model card evaluates greedily, so a temperature the caller did not
+        # set (the API layer fills in the OpenAI default) gives way to the thinker's default.
+        if "temperature" not in explicit_fields:
+            params.pop("temperature", None)
+        else:
+            pass
         req_data = build_sglang_thinker_request(
             state,
             params=params,

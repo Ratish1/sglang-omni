@@ -2611,3 +2611,49 @@ def test_threaded_preprocessing_loads_repeated_remote_images(monkeypatch):
         server.server_close()
         http_worker.join(timeout=3)
     assert not worker.is_alive()
+
+
+@pytest.mark.parametrize(
+    ("explicit_fields", "params", "expected_temperature"),
+    [
+        (["max_new_tokens"], {"temperature": 1.0}, None),
+        (["temperature"], {"temperature": 0.7}, 0.7),
+        (None, {"temperature": 1.0}, None),
+    ],
+)
+def test_qwen_thinker_temperature_is_greedy_unless_the_caller_sets_it(
+    monkeypatch, explicit_fields, params, expected_temperature
+) -> None:
+    """A temperature the caller did not set gives way to the thinker's greedy default,
+    with or without other explicit fields; the caller's own value passes through."""
+    from sglang_omni.models.qwen3_omni import request_builders
+    from sglang_omni.proto import EXPLICIT_GENERATION_PARAMS_KEY
+
+    seen: dict[str, object] = {}
+
+    def build(state, *, params, **kwargs):
+        seen.update(params)
+        return SimpleNamespace(stage_payload=None)
+
+    monkeypatch.setattr(request_builders, "build_sglang_thinker_request", build)
+    monkeypatch.setattr(
+        request_builders.Qwen3OmniPipelineState, "from_dict", lambda data: None
+    )
+    request_builder, _ = request_builders.make_thinker_scheduler_adapters(
+        tokenizer=None, vocab_size=16
+    )
+    metadata = (
+        {EXPLICIT_GENERATION_PARAMS_KEY: explicit_fields}
+        if explicit_fields is not None
+        else {}
+    )
+
+    request_builder(
+        StagePayload(
+            request_id="greedy-default",
+            request=OmniRequest(inputs=None, params=params, metadata=metadata),
+            data={},
+        )
+    )
+
+    assert seen.get("temperature") == expected_temperature
