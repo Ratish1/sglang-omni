@@ -476,11 +476,10 @@ async def warm_up_server(
     request: ChatCompletionRequest | None,
     timeout_s: float,
 ) -> None:
-    """Report the server up once one request has crossed every stage.
+    """Mark the server up once one request has crossed every stage.
 
-    The first request through a fresh process builds kernels the startup
-    capture never touched; without this the first user requests wait on those
-    builds. A failed warmup stops the server and raises.
+    A fresh process builds kernels on its first request; this keeps that cost
+    off user requests. A failed warmup stops the server and raises.
     """
     while not server.started:
         await asyncio.sleep(SERVER_START_POLL_S)
