@@ -380,7 +380,7 @@ def serve(
         typer.Option(
             "--skip-server-warmup",
             "--skip_server_warmup",
-            help="Report ready without sending the pipeline's warmup request first.",
+            help="Report ready without sending the pipeline's warmup requests first.",
         ),
     ] = False,
 ) -> None:

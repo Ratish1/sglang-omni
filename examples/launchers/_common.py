@@ -79,7 +79,7 @@ def add_server_args(
     target.add_argument(
         "--skip-server-warmup",
         action="store_true",
-        help="Report ready without sending the pipeline's warmup request first.",
+        help="Report ready without sending the pipeline's warmup requests first.",
     )
 
 

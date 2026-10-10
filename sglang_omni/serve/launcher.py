@@ -756,7 +756,7 @@ def launch_server(
         tts_batch_max_items: Maximum items accepted by
             ``/v1/audio/speech/batch``.
         skip_server_warmup: Report ready without sending the pipeline's
-            warmup request first.
+            warmup requests first.
     """
     apply_gpu_compat_env_defaults()
     sigterm_received = False
