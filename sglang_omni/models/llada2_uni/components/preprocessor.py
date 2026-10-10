@@ -201,7 +201,7 @@ def resize_images(
 def preprocess_image_edit(images: list[Image.Image], factor: int) -> list[Image.Image]:
     """Resize and center-crop edit inputs to a supported grid without padding."""
     num_patches = (512 // factor) ** 2
-    candidates = []
+    candidates: list[tuple[int, int]] = []
     wp, hp = num_patches, 1
     while wp > 0:
         if max(wp, hp) / min(wp, hp) <= 4.0:
@@ -244,11 +244,12 @@ def edit_image_pixel_values(
     image_mean: list[float],
     image_std: list[float],
     rescale_factor: float,
-) -> dict[str, torch.Tensor]:
-    """Patchify edit inputs with the reference's float32 normalization order."""
+) -> ImageEncoderInputs:
+    """Patchify edit inputs with float32 normalization before temporal expansion."""
     import numpy as np
 
-    patches, grids = [], []
+    patches: list[torch.Tensor] = []
+    grids: list[list[int]] = []
     mean = torch.tensor(image_mean, dtype=torch.float32).view(-1, 1, 1)
     std = torch.tensor(image_std, dtype=torch.float32).view(-1, 1, 1)
     for img in images:

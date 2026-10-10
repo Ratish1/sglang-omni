@@ -154,10 +154,10 @@ def build_dllm_thinker_request(
         pass
 
     input_ids_array = array("q", input_ids.to(dtype=torch.long).flatten().tolist())
-    ss = state.stream_state
+    stream_state = state.stream_state
     max_new_tokens = params.get("max_new_tokens", DEFAULT_THINKER_MAX_NEW_TOKENS)
     if state.task_kind in ("t2i", "edit"):
-        image_info = ss.get("image_info", [])
+        image_info = stream_state.get("image_info", [])
         if not image_info:
             raise ValueError("Image generation is missing its output grid")
         else:
@@ -203,24 +203,29 @@ def build_dllm_thinker_request(
     req.omni_model_inputs = None
     req._omni_consumed = None  # noqa: leading-underscore  # upstream spelling, or the public name is already taken
     req._task_kind = state.task_kind  # noqa: leading-underscore  # DLLM protocol
-    if ss.get("dllm_steps") is not None:
+    if stream_state.get("dllm_steps") is not None:
         req._dllm_steps = int(
-            ss["dllm_steps"]
+            stream_state["dllm_steps"]
         )  # noqa: leading-underscore  # DLLM protocol
     else:
         pass
 
-    uncond_ids = ss.get("uncond_input_ids")
+    uncond_ids = stream_state.get("uncond_input_ids")
     if uncond_ids is not None:
-        ig = state.request_metadata.get("image_generation", {})
+        image_generation = state.request_metadata.get("image_generation", {})
         req._cfg_scale = float(  # noqa: leading-underscore  # DLLM protocol
-            ss.get("cfg_scale", ig.get("cfg_text_scale", ig.get("cfg_scale", 1.0)))
+            stream_state.get(
+                "cfg_scale",
+                image_generation.get(
+                    "cfg_text_scale", image_generation.get("cfg_scale", 1.0)
+                ),
+            )
         )
         req._cfg_rescale = float(
-            ss.get("cfg_rescale", ig.get("cfg_rescale", 0.7))
+            stream_state.get("cfg_rescale", image_generation.get("cfg_rescale", 0.7))
         )  # noqa: leading-underscore  # DLLM protocol
         for branch in ("uncond", "uncond_img"):
-            branch_ids = ss.get(f"{branch}_input_ids")
+            branch_ids = stream_state.get(f"{branch}_input_ids")
             if branch_ids is None:
                 continue
             else:
@@ -229,7 +234,7 @@ def build_dllm_thinker_request(
                 raise ValueError("CFG branches must have equal physical lengths")
             else:
                 pass
-            pad_len = int(ss.get(f"{branch}_left_pad_len", 0))
+            pad_len = int(stream_state.get(f"{branch}_left_pad_len", 0))
             if not 0 <= pad_len <= len(branch_ids):
                 raise ValueError(f"Invalid CFG {branch} left-pad length: {pad_len}")
             else:
@@ -248,9 +253,11 @@ def build_dllm_thinker_request(
                 req._uncond_img_left_pad_len = (
                     pad_len  # noqa: leading-underscore  # DLLM protocol
                 )
-        if ss.get("uncond_img_input_ids") is not None:
+        if stream_state.get("uncond_img_input_ids") is not None:
             req._cfg_image_scale = float(  # noqa: leading-underscore  # DLLM protocol
-                ss.get("cfg_image_scale", ig.get("cfg_image_scale", 0.0))
+                stream_state.get(
+                    "cfg_image_scale", image_generation.get("cfg_image_scale", 0.0)
+                )
             )
         else:
             pass

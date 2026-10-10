@@ -316,15 +316,15 @@ def create_image_decode_executor(
         else:
             pass
 
-        vq_tokens, h, w, params = result
+        vq_tokens, grid_height, grid_width, generation_params = result
         call_kwargs = {
-            target: params[source]
+            target: generation_params[source]
             for source, target in (
                 ("decode_mode", "decode_mode"),
                 ("decoder_steps", "num_steps"),
                 ("seed", "seed"),
             )
-            if params.get(source) is not None
+            if generation_params.get(source) is not None
         }
         if (
             call_kwargs.get("decode_mode") == "decoder-turbo"
@@ -334,10 +334,10 @@ def create_image_decode_executor(
         else:
             pass
         with runtime.compute_context() if runtime else nullcontext():
-            image = decoder.decode(vq_tokens, h, w, **call_kwargs)
-        buf = io.BytesIO()
-        image.save(buf, format="PNG")
-        image_b64 = base64.b64encode(buf.getvalue()).decode("ascii")
+            image = decoder.decode(vq_tokens, grid_height, grid_width, **call_kwargs)
+        image_buffer = io.BytesIO()
+        image.save(image_buffer, format="PNG")
+        image_b64 = base64.b64encode(image_buffer.getvalue()).decode("ascii")
         event = LLaDA2UniEvent(
             type="image_final",
             modality="image",
