@@ -3,8 +3,12 @@
 
 from __future__ import annotations
 
+import base64
+import io
 from typing import ClassVar
 
+import numpy as np
+import soundfile
 from pydantic import Field
 
 from sglang_omni.config import (
@@ -15,6 +19,7 @@ from sglang_omni.config import (
     StageConfig,
 )
 from sglang_omni.platforms import current_platform
+from sglang_omni.serve.protocol import ChatCompletionRequest, ChatMessage
 from sglang_omni.utils.cpu import effective_cpu_count
 
 _PKG = "sglang_omni.models.qwen3_omni"
@@ -323,9 +328,63 @@ SPEECH_DEFAULT_PROCESSES = {
 # of waiting for its own turn.
 COLOCATED_SPEECH_PROCESSES = {**SPEECH_DEFAULT_PROCESSES, "code2wav": "talker_ar"}
 
+WARMUP_AUDIO_SAMPLE_RATE = 16000
+WARMUP_TONE_HZ = 440.0
+WARMUP_TONE_AMPLITUDE = 0.1
+WARMUP_MAX_TOKENS = 8
+WARMUP_IMAGE_PNG_BASE64 = (
+    "iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAYAAABzenr0AAAACXBIWXMAAA7EAAAOxAGVKw4bAAAA"
+    "bUlEQVRYhe3VsQ2AMAxE0Y/lIgNQULD/OqyCMgCihCKSG4yRuKuiNH6JLsoEbMACOGBcua9HOR7Y"
+    "6w6swBwMy0qLTpkeI77qdEBpBFAHBBDAGH8WrwJKI4AAegUCfAKgEgpQDvh3CR3oQCuav58qlAw7"
+    "3kKCSgAAAABJRU5ErkJggg=="
+)
+
+
+def build_server_warmup_request(
+    pipeline_config: PipelineConfig,
+) -> ChatCompletionRequest:
+    """An image, a second of audio and a short instruction through every stage."""
+    sample_times_s = np.arange(WARMUP_AUDIO_SAMPLE_RATE) / WARMUP_AUDIO_SAMPLE_RATE
+    tone = WARMUP_TONE_AMPLITUDE * np.sin(2 * np.pi * WARMUP_TONE_HZ * sample_times_s)
+    wav = io.BytesIO()
+    soundfile.write(wav, tone, WARMUP_AUDIO_SAMPLE_RATE, format="WAV", subtype="PCM_16")
+    if pipeline_config.code2wav_stage() is None:
+        modalities = ["text"]
+    else:
+        modalities = ["text", "audio"]
+    return ChatCompletionRequest(
+        messages=[
+            ChatMessage(
+                role="user",
+                content=[
+                    {
+                        "type": "image_url",
+                        "image_url": {
+                            "url": f"data:image/png;base64,{WARMUP_IMAGE_PNG_BASE64}"
+                        },
+                    },
+                    {
+                        "type": "input_audio",
+                        "input_audio": {
+                            "data": base64.b64encode(wav.getvalue()).decode("ascii"),
+                            "format": "wav",
+                        },
+                    },
+                    {"type": "text", "text": "Describe the image and the audio."},
+                ],
+            )
+        ],
+        modalities=modalities,
+        max_tokens=WARMUP_MAX_TOKENS,
+        temperature=0.0,
+    )
+
 
 class Qwen3OmniBasePipelineConfig(PipelineConfig):
     architecture: ClassVar[str] = "Qwen3OmniMoeForConditionalGeneration"
+    server_warmup_request_factory: ClassVar[str] = (
+        f"{_PKG}.config.build_server_warmup_request"
+    )
     tensor_parallel_disable_custom_all_reduce_stages: ClassVar[tuple[str, ...]] = (
         THINKER_STAGE,
     )

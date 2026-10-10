@@ -28,6 +28,7 @@ import time
 import uuid
 from contextlib import aclosing, suppress
 from dataclasses import asdict
+from enum import Enum
 from typing import AsyncGenerator, AsyncIterator, Literal
 
 from fastapi import (
@@ -142,6 +143,13 @@ from sglang_omni.serve.translations import register_translations
 logger = logging.getLogger(__name__)
 HTTP_DISCONNECT_POLL_INTERVAL_S = 0.05
 HTTP_DISCONNECT_CANCEL_TIMEOUT_S = 0.1
+
+
+class ServerStatus(Enum):
+    """Readiness the launcher holds at STARTING until its warmup request completes."""
+
+    STARTING = "starting"
+    UP = "up"
 
 
 class RequestBodyTooLarge(Exception):
@@ -279,6 +287,7 @@ def create_app(
 
     # Store references in app state for access from route handlers
     app.state.client = client
+    app.state.server_status = ServerStatus.UP
     app.state.model_name = model_name or "sglang-omni"
     app.state.architectures = [a for a in (architectures or []) if a]
     app.state.supports_audio_translation = supports_audio_translation
@@ -467,14 +476,15 @@ def register_health(app: FastAPI) -> None:
         """Health check endpoint (includes filesystem browse info)."""
         client: Client = app.state.client
         info = client.health()
-        is_running = info.get("running", False)
-        status_code = 200 if is_running else 503
+        if app.state.server_status is ServerStatus.STARTING:
+            status = "starting"
+        elif info.get("running", False):
+            status = "healthy"
+        else:
+            status = "unhealthy"
         return JSONResponse(
-            content={
-                "status": "healthy" if is_running else "unhealthy",
-                **info,
-            },
-            status_code=status_code,
+            content={"status": status, **info},
+            status_code=200 if status == "healthy" else 503,
         )
 
 

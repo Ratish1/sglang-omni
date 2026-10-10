@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import signal
 from pathlib import Path
 from traceback import format_exception
 from types import FrameType, SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
+import httpx
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
@@ -23,6 +25,9 @@ from sglang_omni.config.schema import (
 )
 from sglang_omni.pipeline.stage_workers import StageLaunchConfig, StageWorkerProcessSpec
 from sglang_omni.profiler.event_recorder import get_recorder
+from sglang_omni.serve import launcher
+from sglang_omni.serve.openai_api import ServerStatus
+from sglang_omni.serve.protocol import ChatCompletionRequest, ChatMessage
 from tests.unit_test.fixtures.pipeline_fakes import FakeMpContext, FakeRelay
 
 
@@ -526,6 +531,62 @@ async def test_launcher_passes_moss_tts_speech_input_limit(
     )
 
     assert app.state.create_app_kwargs["max_speech_input_chars"] is None
+
+
+def answer_warmup_with(
+    monkeypatch: pytest.MonkeyPatch, status_code: int, posted: list[object]
+) -> None:
+    def respond(request: httpx.Request) -> httpx.Response:
+        posted.append(json.loads(request.content))
+        return httpx.Response(status_code, text="warmup answer")
+
+    real_client = httpx.AsyncClient
+    monkeypatch.setattr(
+        launcher.httpx,
+        "AsyncClient",
+        lambda **kwargs: real_client(transport=httpx.MockTransport(respond), **kwargs),
+    )
+
+
+@pytest.mark.asyncio
+async def test_server_reports_up_after_its_warmup_request_succeeds(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    posted: list[object] = []
+    answer_warmup_with(monkeypatch, 200, posted)
+    server = SimpleNamespace(started=True, should_exit=False)
+    app = FastAPI()
+    app.state.server_status = ServerStatus.STARTING
+    request = ChatCompletionRequest(
+        messages=[ChatMessage(role="user", content="Hi")], max_tokens=8
+    )
+
+    await launcher.warm_up_server(
+        server, app, base_url="http://127.0.0.1:8000", request=request, timeout_s=5
+    )
+
+    assert app.state.server_status is ServerStatus.UP
+    assert posted == [request.model_dump(exclude_none=True)]
+    assert server.should_exit is False
+
+
+@pytest.mark.asyncio
+async def test_failed_warmup_stops_the_server_before_it_reports_up(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    answer_warmup_with(monkeypatch, 500, [])
+    server = SimpleNamespace(started=True, should_exit=False)
+    app = FastAPI()
+    app.state.server_status = ServerStatus.STARTING
+    request = ChatCompletionRequest(messages=[ChatMessage(role="user", content="Hi")])
+
+    with pytest.raises(RuntimeError, match="status 500: warmup answer"):
+        await launcher.warm_up_server(
+            server, app, base_url="http://127.0.0.1:8000", request=request, timeout_s=5
+        )
+
+    assert app.state.server_status is ServerStatus.STARTING
+    assert server.should_exit is True
 
 
 @pytest.mark.asyncio

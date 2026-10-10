@@ -590,6 +590,9 @@ class PipelineConfig(BaseModel):
     additional_speech_languages: ClassVar[frozenset[str]] = frozenset()
     realtime_transcription: ClassVar[RealtimeTranscriptionConfig | None] = None
     realtime_deployment_factory: ClassVar[str | None] = None
+    # Import path of a function from this config to the chat request the server
+    # sends itself before it reports ready; None reports ready without one.
+    server_warmup_request_factory: ClassVar[str | None] = None
     allow_audio_chunking: ClassVar[bool] = False
     max_native_clip_s: ClassVar[float | None] = None
     min_tail_s: ClassVar[float] = 0.5

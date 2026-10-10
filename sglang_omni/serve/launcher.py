@@ -37,8 +37,9 @@ from contextlib import contextmanager, suppress
 from types import FrameType
 from typing import TypedDict
 
+import httpx
 import uvicorn
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, FastAPI, HTTPException
 from pydantic import BaseModel
 
 from sglang_omni.client import Client
@@ -51,8 +52,11 @@ from sglang_omni.preprocessing.resource_connector import export_media_policy
 from sglang_omni.profiler.event_recorder import get_recorder as _get_event_recorder
 from sglang_omni.profiler.profiler_control import ProfilerControlClient
 from sglang_omni.proto.messages import StreamMessage
-from sglang_omni.serve.openai_api import create_app
-from sglang_omni.serve.protocol import DEFAULT_TTS_BATCH_MAX_ITEMS
+from sglang_omni.serve.openai_api import ServerStatus, create_app
+from sglang_omni.serve.protocol import (
+    DEFAULT_TTS_BATCH_MAX_ITEMS,
+    ChatCompletionRequest,
+)
 from sglang_omni.serve.realtime.manager import RealtimeDeployment
 from sglang_omni.utils.gpu_compat import apply_gpu_compat_env_defaults
 from sglang_omni.utils.gpu_memory import (
@@ -65,6 +69,7 @@ from sglang_omni.utils.imports import import_string
 logger = logging.getLogger(__name__)
 
 _HANDLED_SIGNALS = (signal.SIGINT, signal.SIGTERM)
+SERVER_START_POLL_S = 0.1
 
 
 class ClientOptions(TypedDict, total=False):
@@ -463,6 +468,52 @@ def mount_profiler_routes(
     app.include_router(router)
 
 
+async def warm_up_server(
+    server: uvicorn.Server,
+    app: FastAPI,
+    *,
+    base_url: str,
+    request: ChatCompletionRequest | None,
+    timeout_s: float,
+) -> None:
+    """Report the server up once one request has crossed every stage.
+
+    The first request through a fresh process builds kernels the startup
+    capture never touched; without this the first user requests wait on those
+    builds. A failed warmup stops the server and raises.
+    """
+    while not server.started:
+        await asyncio.sleep(SERVER_START_POLL_S)
+    if request is None:
+        app.state.server_status = ServerStatus.UP
+        return
+    else:
+        pass
+    start = time.perf_counter()
+    try:
+        async with httpx.AsyncClient(
+            base_url=base_url, timeout=timeout_s, trust_env=False
+        ) as http_client:
+            response = await http_client.post(
+                "/v1/chat/completions", json=request.model_dump(exclude_none=True)
+            )
+        if response.status_code != 200:
+            raise RuntimeError(
+                f"Server warmup failed with status {response.status_code}: "
+                f"{response.text}"
+            )
+        else:
+            pass
+    except (httpx.HTTPError, RuntimeError):
+        server.should_exit = True
+        raise
+    app.state.server_status = ServerStatus.UP
+    logger.info(
+        f"Server warmup finished in {time.perf_counter() - start:.1f} s; "
+        "the server is ready"
+    )
+
+
 async def run_server(
     pipeline_config: PipelineConfig,
     *,
@@ -475,6 +526,7 @@ async def run_server(
     allowed_local_media_path: str | None = None,
     allowed_media_domains: list[str] | None = None,
     tts_batch_max_items: int = DEFAULT_TTS_BATCH_MAX_ITEMS,
+    skip_server_warmup: bool = False,
 ) -> None:
     """Start the pipeline and run the OpenAI server.
 
@@ -511,6 +563,11 @@ async def run_server(
     )
 
     try:
+        warmup_factory = type(pipeline_config).server_warmup_request_factory
+        if skip_server_warmup or warmup_factory is None:
+            warmup_request = None
+        else:
+            warmup_request = import_string(warmup_factory)(pipeline_config)
         cl_kwargs = client_kwargs or {}
         client = Client(coordinator, **cl_kwargs)
         deployment_factory = type(pipeline_config).realtime_deployment_factory
@@ -557,6 +614,7 @@ async def run_server(
         profiler_dir = os.environ.get("SGLANG_TORCH_PROFILER_DIR")
         profiler_ctl = ProfilerControlClient(mp_runner.stage_control_endpoints)
         mount_profiler_routes(app, profiler_ctl, profiler_dir)
+        app.state.server_status = ServerStatus.STARTING
 
         config = uvicorn.Config(
             app,
@@ -566,7 +624,28 @@ async def run_server(
             timeout_keep_alive=120,
         )
         server = PipelineUvicornServer(config)
-        await serve_with_failure_watch(server, [mp_runner.wait_failed()])
+        # note (ratish): a wildcard bind address is not a destination, so the
+        # server reaches itself on loopback.
+        loopback_host = {"0.0.0.0": "127.0.0.1", "::": "::1"}.get(host, host)
+        if ":" in loopback_host:
+            base_url = f"http://[{loopback_host}]:{port}"
+        else:
+            base_url = f"http://{loopback_host}:{port}"
+        warmup_task = asyncio.create_task(
+            warm_up_server(
+                server,
+                app,
+                base_url=base_url,
+                request=warmup_request,
+                timeout_s=float(os.environ.get("SGLANG_OMNI_WARMUP_TIMEOUT", "600")),
+            )
+        )
+        try:
+            await serve_with_failure_watch(server, [mp_runner.wait_failed()])
+        finally:
+            warmup_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await warmup_task
     finally:
         logger.info("Shutting down pipeline …")
         await mp_runner.stop()
@@ -639,6 +718,7 @@ def launch_server(
     allowed_local_media_path: str | None = None,
     allowed_media_domains: list[str] | None = None,
     tts_batch_max_items: int = DEFAULT_TTS_BATCH_MAX_ITEMS,
+    skip_server_warmup: bool = False,
 ) -> None:
     """Blocking helper: start the pipeline and OpenAI-compatible server.
 
@@ -660,6 +740,8 @@ def launch_server(
         allowed_media_domains: Domains allowed for remote TTS reference audio.
         tts_batch_max_items: Maximum items accepted by
             ``/v1/audio/speech/batch``.
+        skip_server_warmup: Report ready without sending the pipeline's
+            warmup request first.
     """
     apply_gpu_compat_env_defaults()
     sigterm_received = False
@@ -683,6 +765,7 @@ def launch_server(
             allowed_local_media_path=allowed_local_media_path,
             allowed_media_domains=allowed_media_domains,
             tts_batch_max_items=tts_batch_max_items,
+            skip_server_warmup=skip_server_warmup,
         )
         previous_handler = signal.getsignal(signal.SIGTERM)
         if (

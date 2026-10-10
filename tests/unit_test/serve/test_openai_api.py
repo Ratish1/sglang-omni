@@ -26,6 +26,7 @@ from sglang_omni.proto import (
 )
 from sglang_omni.serve import create_app
 from sglang_omni.serve.openai_api import (
+    ServerStatus,
     _ClosableStreamingResponse,
     await_speech_response,
     build_chat_generate_request,
@@ -926,6 +927,24 @@ def test_create_app_passes_model_specific_speech_input_limit() -> None:
     )
 
     assert app.state.speech_service.max_speech_input_chars is None
+
+
+def test_health_reports_starting_until_the_launcher_marks_the_server_up() -> None:
+    client, coordinator, _ = streaming_client()
+    app = create_app(client)
+    http_client = TestClient(app)
+
+    coordinator.running = True
+    app.state.server_status = ServerStatus.STARTING
+    starting = http_client.get("/health")
+    app.state.server_status = ServerStatus.UP
+    healthy = http_client.get("/health")
+    coordinator.running = False
+    stopped = http_client.get("/health")
+
+    assert (starting.status_code, starting.json()["status"]) == (503, "starting")
+    assert (healthy.status_code, healthy.json()["status"]) == (200, "healthy")
+    assert (stopped.status_code, stopped.json()["status"]) == (503, "unhealthy")
 
 
 @pytest.mark.parametrize("stream", [False, True])
