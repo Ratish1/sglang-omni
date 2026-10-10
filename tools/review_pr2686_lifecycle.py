@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import ClassVar, Literal
 
 import httpx
+import psutil
 
 from sglang_omni.config.schema import (
     EngineStageConfig,
@@ -92,11 +93,15 @@ async def run_probe(args: argparse.Namespace) -> None:
                 name="compute",
                 process="compute",
                 factory_path=f"{PROBE_MODULE}.create_probe_scheduler",
-                factory=FactoryArgs(directory=str(root), label="compute", case=args.case),
+                factory=FactoryArgs(
+                    directory=str(root), label="compute", case=args.case
+                ),
                 terminal=True,
             ),
         ],
-        processes={"input": ProcessConfig(num_replicas=2 if args.case == "capacity" else 1)},
+        processes={
+            "input": ProcessConfig(num_replicas=2 if args.case == "capacity" else 1)
+        },
     )
     task = asyncio.create_task(run_server(config, host="127.0.0.1", port=args.port))
     observations: list[dict[str, str | int | float]] = []
@@ -121,6 +126,14 @@ async def run_probe(args: argparse.Namespace) -> None:
                         }
                     )
                     if response.status_code == 200:
+                        ordinary = await client.post(
+                            f"http://127.0.0.1:{args.port}/v1/chat/completions",
+                            json=warmup_request(config).model_dump(exclude_none=True),
+                            timeout=5,
+                        )
+                        observations.append(
+                            {"ordinary_status_code": ordinary.status_code}
+                        )
                         break
                     else:
                         pass
@@ -130,11 +143,13 @@ async def run_probe(args: argparse.Namespace) -> None:
                     await asyncio.sleep(2)
                     blocked_after_timeout = not task.done()
                     (root / "release").touch()
+                    await asyncio.wait({task}, timeout=5)
                 elif args.case == "signal" and list(root.glob("compute-*.json")):
                     os.kill(os.getpid(), 15)
                     await asyncio.sleep(0.5)
                     blocked_after_timeout = not task.done()
                     (root / "release").touch()
+                    await asyncio.wait({task}, timeout=5)
                 else:
                     pass
                 await asyncio.sleep(0.01)
@@ -151,6 +166,9 @@ async def run_probe(args: argparse.Namespace) -> None:
         "outcome": [type(value).__name__ + ": " + str(value) for value in outcome],
         "blocked_after_timeout_or_signal": blocked_after_timeout,
         "worker_requests": workers,
+        "worker_pids_alive_after_stop": [
+            worker["pid"] for worker in workers if psutil.pid_exists(worker["pid"])
+        ],
     }
     (root / "receipt.json").write_text(json.dumps(receipt, indent=2))
     print(json.dumps(receipt, indent=2))
@@ -158,7 +176,11 @@ async def run_probe(args: argparse.Namespace) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--case", choices=["success", "failure", "capacity", "timeout", "signal"], required=True)
+    parser.add_argument(
+        "--case",
+        choices=["success", "failure", "capacity", "timeout", "signal"],
+        required=True,
+    )
     parser.add_argument("--output", required=True)
     parser.add_argument("--port", required=True, type=int)
     args = parser.parse_args()
