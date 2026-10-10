@@ -340,8 +340,10 @@ def build_server_warmup_request(
     """An image, a second of audio and a short instruction through every stage."""
     if pipeline_config.code2wav_stage() is None:
         modalities = ["text"]
+        talker_max_new_tokens = None
     else:
         modalities = ["text", "audio"]
+        talker_max_new_tokens = WARMUP_MAX_TOKENS
     return ChatCompletionRequest(
         messages=[
             ChatMessage(
@@ -368,6 +370,7 @@ def build_server_warmup_request(
         ],
         modalities=modalities,
         max_tokens=WARMUP_MAX_TOKENS,
+        talker_max_new_tokens=talker_max_new_tokens,
         temperature=0.0,
     )
 

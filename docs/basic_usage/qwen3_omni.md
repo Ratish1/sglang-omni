@@ -10,7 +10,8 @@ Install `sglang-omni` by following [Installation](../get_started/installation.md
 
 Before it reports ready, the server sends itself a chat request with a small
 image, one second of audio and a short instruction (text and audio output in
-speech mode, text output in text-only mode), once per replica of its most
+speech mode, text output in text-only mode, at most 8 new tokens from each
+stage that generates tokens), once per replica of its most
 replicated process, one after another, so that every replica serves one.
 `/health` returns 503 with status `starting` until these requests have passed
 through every stage, so the one-time kernel builds of that request path happen
