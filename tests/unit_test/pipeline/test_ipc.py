@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import signal
+from collections.abc import Coroutine
 from pathlib import Path
 from traceback import format_exception
 from types import FrameType, SimpleNamespace
@@ -12,6 +13,7 @@ from unittest.mock import AsyncMock, Mock
 
 import httpx
 import pytest
+import uvicorn
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
@@ -547,15 +549,21 @@ def answer_warmup_with(
         return httpx.Response(status_code, text="warmup answer")
 
     real_client = httpx.AsyncClient
-    monkeypatch.setattr(
-        launcher.httpx,
-        "AsyncClient",
-        lambda **kwargs: real_client(transport=httpx.MockTransport(respond), **kwargs),
-    )
+
+    def mock_client(
+        *, base_url: str, timeout: float, trust_env: bool
+    ) -> httpx.AsyncClient:
+        return real_client(
+            base_url=base_url,
+            timeout=timeout,
+            trust_env=trust_env,
+            transport=httpx.MockTransport(respond),
+        )
+
+    monkeypatch.setattr(launcher.httpx, "AsyncClient", mock_client)
 
 
 def build_test_warmup_request(pipeline_config: PipelineConfig) -> ChatCompletionRequest:
-    del pipeline_config
     return ChatCompletionRequest(
         messages=[ChatMessage(role="user", content="Hi")], max_tokens=8
     )
@@ -597,11 +605,17 @@ async def test_launcher_sends_one_warmup_request_per_replica_of_the_most_replica
         "server_warmup_request_factory",
         f"{__name__}.build_test_warmup_request",
     )
-    warmups: list[dict[str, object]] = []
+    warmup_requests: list[list[ChatCompletionRequest]] = []
 
-    def record_warmup(server, app, **kwargs):
-        del server, app
-        warmups.append(kwargs)
+    def record_warmup(
+        server: uvicorn.Server,
+        app: FastAPI,
+        *,
+        base_url: str,
+        requests: list[ChatCompletionRequest],
+        timeout_s: float,
+    ) -> Coroutine[None, None, None]:
+        warmup_requests.append(requests)
         return asyncio.sleep(0)
 
     monkeypatch.setattr(launcher, "warm_up_server", record_warmup)
@@ -612,9 +626,7 @@ async def test_launcher_sends_one_warmup_request_per_replica_of_the_most_replica
         replica_counts=(1, 3, 2),
     )
 
-    assert (
-        warmups[0]["requests"] == [build_test_warmup_request(make_config(tmp_path))] * 3
-    )
+    assert warmup_requests == [[build_test_warmup_request(make_config(tmp_path))] * 3]
 
 
 @pytest.mark.asyncio

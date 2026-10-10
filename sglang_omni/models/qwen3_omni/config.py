@@ -346,8 +346,10 @@ def build_server_warmup_request(
     """An image, a second of audio and a short instruction through every stage."""
     sample_times_s = np.arange(WARMUP_AUDIO_SAMPLE_RATE) / WARMUP_AUDIO_SAMPLE_RATE
     tone = WARMUP_TONE_AMPLITUDE * np.sin(2 * np.pi * WARMUP_TONE_HZ * sample_times_s)
-    wav = io.BytesIO()
-    soundfile.write(wav, tone, WARMUP_AUDIO_SAMPLE_RATE, format="WAV", subtype="PCM_16")
+    wav_buffer = io.BytesIO()
+    soundfile.write(
+        wav_buffer, tone, WARMUP_AUDIO_SAMPLE_RATE, format="WAV", subtype="PCM_16"
+    )
     if pipeline_config.code2wav_stage() is None:
         modalities = ["text"]
     else:
@@ -366,7 +368,9 @@ def build_server_warmup_request(
                     {
                         "type": "input_audio",
                         "input_audio": {
-                            "data": base64.b64encode(wav.getvalue()).decode("ascii"),
+                            "data": base64.b64encode(wav_buffer.getvalue()).decode(
+                                "ascii"
+                            ),
                             "format": "wav",
                         },
                     },
