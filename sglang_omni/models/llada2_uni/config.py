@@ -85,6 +85,8 @@ class LLaDA2UniPipelineConfig(PipelineConfig):
 class LLaDA2UniOmniPipelineConfig(LLaDA2UniPipelineConfig):
     """LLaDA text, image generation and editing with a shared thinker."""
 
+    supports_image_api: ClassVar[bool] = True
+
     stage_config_types: ClassVar[dict[str, type[StageConfig]]] = {
         **LLaDA2UniPipelineConfig.stage_config_types,
         IMAGE_DECODE_STAGE: LLaDA2ImageDecoderStageConfig,
@@ -133,7 +135,7 @@ class LLaDA2UniOmniPipelineConfig(LLaDA2UniPipelineConfig):
     ]
 
 
-EntryClass = LLaDA2UniPipelineConfig
+EntryClass = LLaDA2UniOmniPipelineConfig
 
 Variants = {
     "text": LLaDA2UniPipelineConfig,
