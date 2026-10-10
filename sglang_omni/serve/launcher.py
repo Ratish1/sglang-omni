@@ -32,7 +32,7 @@ import signal
 import socket
 import threading
 import time
-from collections.abc import Callable, Generator
+from collections.abc import Callable, Coroutine, Generator
 from contextlib import contextmanager, suppress
 from types import FrameType
 from typing import TypedDict
@@ -59,6 +59,8 @@ from sglang_omni.serve.protocol import (
     ChatCompletionRequest,
 )
 from sglang_omni.serve.realtime.manager import RealtimeDeployment
+from sglang_omni.serve.server_warmup import TranscriptionWarmupRequest
+from sglang_omni.serve.transcriptions import TRANSCRIPTIONS_ENDPOINT
 from sglang_omni.utils.gpu_compat import apply_gpu_compat_env_defaults
 from sglang_omni.utils.gpu_memory import (
     GpuDeviceInfo,
@@ -474,7 +476,7 @@ async def warm_up_server(
     app: FastAPI,
     *,
     base_url: str,
-    requests: list[ChatCompletionRequest],
+    requests: list[ChatCompletionRequest | TranscriptionWarmupRequest],
     timeout_s: float,
 ) -> None:
     """Mark the server up once its warmup requests have crossed every stage.
@@ -494,15 +496,26 @@ async def warm_up_server(
         async with httpx.AsyncClient(
             base_url=base_url, timeout=timeout_s, trust_env=False
         ) as http_client:
-            responses = await asyncio.gather(
-                *(
-                    http_client.post(
-                        "/v1/chat/completions",
-                        json=request.model_dump(exclude_none=True),
+            posts: list[Coroutine[None, None, httpx.Response]] = []
+            for request in requests:
+                if isinstance(request, ChatCompletionRequest):
+                    posts.append(
+                        http_client.post(
+                            "/v1/chat/completions",
+                            json=request.model_dump(exclude_none=True),
+                        )
                     )
-                    for request in requests
-                )
-            )
+                else:
+                    posts.append(
+                        http_client.post(
+                            TRANSCRIPTIONS_ENDPOINT,
+                            data={"max_new_tokens": str(request.max_new_tokens)},
+                            files={
+                                "file": ("warmup.wav", request.wav_bytes, "audio/wav")
+                            },
+                        )
+                    )
+            responses = await asyncio.gather(*posts)
         for response in responses:
             if response.status_code != 200:
                 raise RuntimeError(

@@ -14,7 +14,7 @@ from unittest.mock import AsyncMock, Mock
 import httpx
 import pytest
 import uvicorn
-from fastapi import FastAPI
+from fastapi import Depends, FastAPI
 from fastapi.testclient import TestClient
 
 import sglang_omni.pipeline.mp_runner as mp_runner
@@ -30,6 +30,12 @@ from sglang_omni.profiler.event_recorder import get_recorder
 from sglang_omni.serve import launcher
 from sglang_omni.serve.openai_api import ServerStatus
 from sglang_omni.serve.protocol import ChatCompletionRequest, ChatMessage
+from sglang_omni.serve.server_warmup import (
+    TranscriptionWarmupRequest,
+    warmup_tone_wav_bytes,
+)
+from sglang_omni.serve.speech_to_text import SpeechToTextForm, parse_speech_to_text_form
+from sglang_omni.serve.transcriptions import TRANSCRIPTIONS_ENDPOINT
 from tests.unit_test.fixtures.pipeline_fakes import FakeMpContext, FakeRelay
 
 
@@ -542,6 +548,24 @@ async def test_launcher_passes_moss_tts_speech_input_limit(
     assert app.state.create_app_kwargs["max_speech_input_chars"] is None
 
 
+def route_warmup_to(
+    monkeypatch: pytest.MonkeyPatch, transport: httpx.AsyncBaseTransport
+) -> None:
+    real_client = httpx.AsyncClient
+
+    def routed_client(
+        *, base_url: str, timeout: float, trust_env: bool
+    ) -> httpx.AsyncClient:
+        return real_client(
+            base_url=base_url,
+            timeout=timeout,
+            trust_env=trust_env,
+            transport=transport,
+        )
+
+    monkeypatch.setattr(launcher.httpx, "AsyncClient", routed_client)
+
+
 def answer_warmup_with(
     monkeypatch: pytest.MonkeyPatch, status_code: int, posted: list[object]
 ) -> None:
@@ -549,19 +573,7 @@ def answer_warmup_with(
         posted.append(json.loads(request.content))
         return httpx.Response(status_code, text="warmup answer")
 
-    real_client = httpx.AsyncClient
-
-    def mock_client(
-        *, base_url: str, timeout: float, trust_env: bool
-    ) -> httpx.AsyncClient:
-        return real_client(
-            base_url=base_url,
-            timeout=timeout,
-            trust_env=trust_env,
-            transport=httpx.MockTransport(respond),
-        )
-
-    monkeypatch.setattr(launcher.httpx, "AsyncClient", mock_client)
+    route_warmup_to(monkeypatch, httpx.MockTransport(respond))
 
 
 def build_test_warmup_request(pipeline_config: PipelineConfig) -> ChatCompletionRequest:
@@ -594,6 +606,47 @@ async def test_server_reports_up_after_its_warmup_requests_succeed(
     assert app.state.server_status is ServerStatus.UP
     assert posted == [request.model_dump(exclude_none=True)] * 2
     assert server.should_exit is False
+
+
+@pytest.mark.asyncio
+async def test_transcription_warmup_uploads_a_form_the_transcription_route_parses(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    forms: list[SpeechToTextForm] = []
+    uploaded_wavs: list[bytes] = []
+    route_app = FastAPI()
+
+    @route_app.post(TRANSCRIPTIONS_ENDPOINT)
+    async def transcribe(
+        form: SpeechToTextForm = Depends(parse_speech_to_text_form),
+    ) -> dict[str, str]:
+        forms.append(form)
+        uploaded_wavs.append(await form.file.read())
+        return {"text": ""}
+
+    route_warmup_to(monkeypatch, httpx.ASGITransport(app=route_app))
+    server = SimpleNamespace(started=True, should_exit=False)
+    app = FastAPI()
+    app.state.server_status = ServerStatus.STARTING
+    request = TranscriptionWarmupRequest(
+        wav_bytes=warmup_tone_wav_bytes(), max_new_tokens=8
+    )
+
+    await launcher.warm_up_server(
+        server,
+        app,
+        base_url="http://127.0.0.1:8000",
+        requests=[request],
+        timeout_s=5,
+    )
+
+    assert app.state.server_status is ServerStatus.UP
+    assert uploaded_wavs == [request.wav_bytes]
+    assert (forms[0].max_new_tokens, forms[0].response_format, forms[0].stream) == (
+        8,
+        "json",
+        False,
+    )
 
 
 @pytest.mark.asyncio
