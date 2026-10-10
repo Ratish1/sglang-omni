@@ -51,7 +51,9 @@ def create_probe_scheduler(
     *,
     directory: str,
     label: str,
-    case: Literal["success", "failure", "capacity", "timeout", "signal"],
+    case: Literal[
+        "success", "failure", "capacity", "timeout", "signal", "worker-death"
+    ],
 ) -> SimpleScheduler[StagePayload, StagePayload]:
     root = Path(directory)
 
@@ -62,6 +64,8 @@ def create_probe_scheduler(
         if label == "compute":
             if case == "failure":
                 raise ValueError("probe compute failure")
+            elif case == "worker-death":
+                os._exit(9)
             elif case in {"timeout", "signal"}:
                 while not (root / "release").exists():
                     await asyncio.sleep(0.01)
@@ -178,7 +182,7 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--case",
-        choices=["success", "failure", "capacity", "timeout", "signal"],
+        choices=["success", "failure", "capacity", "timeout", "signal", "worker-death"],
         required=True,
     )
     parser.add_argument("--output", required=True)
