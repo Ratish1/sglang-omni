@@ -40,6 +40,10 @@ class ProbePipelineConfig(PipelineConfig):
         return {"max_running_requests": 1, "max_queued_requests": 0}
 
 
+class NoWarmupPipelineConfig(ProbePipelineConfig):
+    server_warmup_request_factory: ClassVar[None] = None
+
+
 def warmup_request(pipeline_config: PipelineConfig) -> ChatCompletionRequest:
     return ChatCompletionRequest(
         messages=[ChatMessage(role="user", content=pipeline_config.name)],
@@ -82,7 +86,10 @@ def create_probe_scheduler(
 async def run_probe(args: argparse.Namespace) -> None:
     root = Path(args.output)
     root.mkdir(parents=True, exist_ok=False)
-    config = ProbePipelineConfig(
+    config_cls = (
+        NoWarmupPipelineConfig if args.no_warmup_factory else ProbePipelineConfig
+    )
+    config = config_cls(
         model_path="review-no-weights",
         name=f"probe-{args.case}",
         stages=[
@@ -107,10 +114,18 @@ async def run_probe(args: argparse.Namespace) -> None:
             "input": ProcessConfig(num_replicas=2 if args.case == "capacity" else 1)
         },
     )
-    task = asyncio.create_task(run_server(config, host="127.0.0.1", port=args.port))
+    task = asyncio.create_task(
+        run_server(
+            config,
+            host="127.0.0.1",
+            port=args.port,
+            skip_server_warmup=args.skip_server_warmup,
+        )
+    )
     observations: list[dict[str, str | int | float]] = []
     start = time.monotonic()
     blocked_after_timeout = False
+    worker_requests_before_ready: int | None = None
     async with httpx.AsyncClient(trust_env=False) as client:
         try:
             while not task.done():
@@ -130,6 +145,7 @@ async def run_probe(args: argparse.Namespace) -> None:
                         }
                     )
                     if response.status_code == 200:
+                        worker_requests_before_ready = len(list(root.glob("*-*.json")))
                         ordinary = await client.post(
                             f"http://127.0.0.1:{args.port}/v1/chat/completions",
                             json=warmup_request(config).model_dump(exclude_none=True),
@@ -170,6 +186,7 @@ async def run_probe(args: argparse.Namespace) -> None:
         "outcome": [type(value).__name__ + ": " + str(value) for value in outcome],
         "blocked_after_timeout_or_signal": blocked_after_timeout,
         "worker_requests": workers,
+        "worker_requests_before_ready": worker_requests_before_ready,
         "worker_pids_alive_after_stop": [
             worker["pid"] for worker in workers if psutil.pid_exists(worker["pid"])
         ],
@@ -187,6 +204,8 @@ def main() -> None:
     )
     parser.add_argument("--output", required=True)
     parser.add_argument("--port", required=True, type=int)
+    parser.add_argument("--skip-server-warmup", action="store_true")
+    parser.add_argument("--no-warmup-factory", action="store_true")
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO)
     asyncio.run(run_probe(args))
