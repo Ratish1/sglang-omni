@@ -12,8 +12,9 @@ Before it reports ready, the server sends itself one chat request with a small
 image, one second of audio and a short instruction (text and audio output in
 speech mode, text output in text-only mode). `/health` returns 503 with status
 `starting` until that request has passed through every stage, so the first
-user requests do not wait on one-time kernel builds. Pass
-`--skip-server-warmup` to report ready without it.
+user requests do not wait on one-time kernel builds. A failed warmup stops the
+server. `SGLANG_OMNI_WARMUP_TIMEOUT` (seconds, default 600) bounds the request,
+and `--skip-server-warmup` reports ready without it.
 
 ## Text-Only Mode
 
