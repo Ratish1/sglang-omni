@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""PR3 terminal image results without interleaved or image-stream support."""
+"""Non-streaming terminal image results and merged audio compatibility."""
 
 from __future__ import annotations
 
@@ -83,7 +83,7 @@ def test_empty_image_terminal_preserves_text(image_result):
     assert chunk.modality == "text"
 
 
-def test_custom_image_chunk_completes():
+def test_custom_image_chunk_completes() -> None:
     chunk = GenerateChunk(request_id="original", image="cG5n", modality="image")
     client = Client(RecordingCoordinator(chunk))
     result = asyncio.run(

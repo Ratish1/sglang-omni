@@ -19,7 +19,7 @@ from sglang_omni.serve.protocol import ChatCompletionRequest, ImageGenerationPar
 
 
 class RecordingCoordinator:
-    def __init__(self):
+    def __init__(self) -> None:
         self.requests = []
 
     async def submit(self, request_id, request):
@@ -128,7 +128,7 @@ def test_invalid_image_parameters(params):
         ImageGenerationParams(**params)
 
 
-def test_image_config_and_modalities_reach_omni_request():
+def test_image_config_and_modalities_reach_omni_request() -> None:
     modalities = ["text", "image"]
     image_config = {"cfg_scale": 1.0, "cfg_text_scale": 0.0}
     req = ChatCompletionRequest(
@@ -158,7 +158,7 @@ def test_image_config_and_modalities_reach_omni_request():
     assert omni.params["temperature"] == 1.0
 
 
-def test_all_image_controls_preserve_explicit_values():
+def test_all_image_controls_preserve_explicit_values() -> None:
     messages = [{"role": "user", "content": "Draw a square"}]
     config = {
         "mode": "normal",

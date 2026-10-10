@@ -215,7 +215,7 @@ class Client:
         omni_rollout: dict[str, object] | None = None
         weight_version: str | None = None
         language: str | None = None
-        image_b64: str | None = None
+        image_base64: str | None = None
 
         async for chunk in self.generate(request, request_id=request_id):
             last_chunk = chunk
@@ -232,7 +232,7 @@ class Client:
             else:
                 pass
             if chunk.image is not None:
-                image_b64 = chunk.image
+                image_base64 = chunk.image
             else:
                 pass
             if chunk.finish_reason is not None:
@@ -303,7 +303,7 @@ class Client:
             weight_version=weight_version,
             language=language,
             diarization=last_chunk.diarization,
-            image=image_b64,
+            image=image_base64,
         )
 
     # ------------------------------------------------------------------
@@ -918,6 +918,7 @@ class Client:
 
 
 def validate_image_streaming(request: GenerateRequest) -> None:
+    """Reject image output on the streaming client path."""
     modalities = (
         request.output_modalities
         if request.output_modalities is not None
