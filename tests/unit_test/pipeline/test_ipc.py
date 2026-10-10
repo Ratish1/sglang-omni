@@ -426,6 +426,7 @@ async def run_launcher_with_fake_runner(
     serve_mock: AsyncMock | None,
     monkeypatch: pytest.MonkeyPatch,
     replica_counts: tuple[int, ...] = (1,),
+    host: str = "0.0.0.0",
 ) -> tuple[object, FastAPI, SimpleNamespace]:
     app = FastAPI()
     profiler_calls = SimpleNamespace(starts=[], stops=[])
@@ -494,7 +495,7 @@ async def run_launcher_with_fake_runner(
     if serve_mock is not None:
         monkeypatch.setattr(launcher.uvicorn.Server, "serve", serve_mock)
 
-    await launcher.run_server(config, port=8000)
+    await launcher.run_server(config, host=host, port=8000)
     assert runner_ref is not None
     return runner_ref, app, profiler_calls
 
@@ -627,6 +628,47 @@ async def test_launcher_sends_one_warmup_request_per_replica_of_the_most_replica
     )
 
     assert warmup_requests == [[build_test_warmup_request(make_config(tmp_path))] * 3]
+
+
+@pytest.mark.parametrize(
+    ("host", "base_url"),
+    [
+        ("0.0.0.0", "http://127.0.0.1:8000"),
+        ("", "http://127.0.0.1:8000"),
+        ("::", "http://[::1]:8000"),
+        ("::1", "http://[::1]:8000"),
+        ("10.1.2.3", "http://10.1.2.3:8000"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_launcher_warms_up_through_the_bind_host_or_loopback_for_a_wildcard(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    host: str,
+    base_url: str,
+) -> None:
+    warmup_base_urls: list[str] = []
+
+    def record_warmup(
+        server: uvicorn.Server,
+        app: FastAPI,
+        *,
+        base_url: str,
+        requests: list[ChatCompletionRequest],
+        timeout_s: float,
+    ) -> Coroutine[None, None, None]:
+        warmup_base_urls.append(base_url)
+        return asyncio.sleep(0)
+
+    monkeypatch.setattr(launcher, "warm_up_server", record_warmup)
+    await run_launcher_with_fake_runner(
+        config=make_config(tmp_path),
+        serve_mock=AsyncMock(return_value=None),
+        monkeypatch=monkeypatch,
+        host=host,
+    )
+
+    assert warmup_base_urls == [base_url]
 
 
 @pytest.mark.asyncio

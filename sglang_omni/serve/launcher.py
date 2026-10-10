@@ -41,6 +41,7 @@ import httpx
 import uvicorn
 from fastapi import APIRouter, Depends, FastAPI, HTTPException
 from pydantic import BaseModel
+from sglang.srt.utils.network import NetworkAddress
 
 from sglang_omni.client import Client
 from sglang_omni.client.types import GenerateChunk
@@ -645,11 +646,13 @@ async def run_server(
         server = PipelineUvicornServer(config)
         # note (ratish): a wildcard bind address is not a destination, so the
         # server reaches itself on loopback.
-        loopback_host = {"0.0.0.0": "127.0.0.1", "::": "::1"}.get(host, host)
-        if ":" in loopback_host:
-            base_url = f"http://[{loopback_host}]:{port}"
+        if not host or host == "0.0.0.0":
+            loopback_host = "127.0.0.1"
+        elif host == "::":
+            loopback_host = "::1"
         else:
-            base_url = f"http://{loopback_host}:{port}"
+            loopback_host = host
+        base_url = NetworkAddress(loopback_host, port).to_url()
         warmup_task = asyncio.create_task(
             warm_up_server(
                 server,
