@@ -14,8 +14,6 @@ from sglang_omni.config import PipelineConfig
 WARMUP_AUDIO_SAMPLE_RATE = 16000
 WARMUP_TONE_HZ = 440.0
 WARMUP_TONE_AMPLITUDE = 0.1
-# note (ratish): the budget of every stage that generates tokens, so the warmup
-# reserves no more than the smallest request each stage admits.
 WARMUP_MAX_TOKENS = 8
 
 
