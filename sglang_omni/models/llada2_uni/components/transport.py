@@ -28,7 +28,7 @@ def sample_velocity(
         timesteps = timesteps / (timesteps + 6 - 6 * timesteps)
 
         def velocity(timestep: torch.Tensor, latents: torch.Tensor) -> torch.Tensor:
-            batch_time = torch.ones(latents.size(0)).to(latents.device) * timestep
+            batch_time = torch.ones(latents.size(0), device=latents.device) * timestep
             return model(latents, batch_time).float()
 
         return odeint(
