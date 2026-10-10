@@ -37,7 +37,7 @@ class ProbePipelineConfig(PipelineConfig):
 
     @classmethod
     def generation_admission_defaults(cls) -> dict[str, int]:
-        return {"max_running_requests": 1, "max_queued_requests": 0}
+        return {"max_running_requests": 1, "max_queued_requests": 1}
 
 
 class NoWarmupPipelineConfig(ProbePipelineConfig):
@@ -111,7 +111,7 @@ async def run_probe(args: argparse.Namespace) -> None:
             ),
         ],
         processes={
-            "input": ProcessConfig(num_replicas=2 if args.case == "capacity" else 1)
+            "input": ProcessConfig(num_replicas=3 if args.case == "capacity" else 1)
         },
     )
     task = asyncio.create_task(
