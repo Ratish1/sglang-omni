@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import signal
 from collections.abc import Coroutine
 from pathlib import Path
@@ -567,10 +566,12 @@ def route_warmup_to(
 
 
 def answer_warmup_with(
-    monkeypatch: pytest.MonkeyPatch, status_code: int, posted: list[object]
+    monkeypatch: pytest.MonkeyPatch,
+    status_code: int,
+    posted: list[ChatCompletionRequest],
 ) -> None:
     def respond(request: httpx.Request) -> httpx.Response:
-        posted.append(json.loads(request.content))
+        posted.append(ChatCompletionRequest.model_validate_json(request.content))
         return httpx.Response(status_code, text="warmup answer")
 
     route_warmup_to(monkeypatch, httpx.MockTransport(respond))
@@ -586,7 +587,7 @@ def build_test_warmup_request(pipeline_config: PipelineConfig) -> ChatCompletion
 async def test_server_reports_up_after_its_warmup_requests_succeed(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    posted: list[object] = []
+    posted: list[ChatCompletionRequest] = []
     answer_warmup_with(monkeypatch, 200, posted)
     server = SimpleNamespace(started=True, should_exit=False)
     app = FastAPI()
@@ -604,8 +605,79 @@ async def test_server_reports_up_after_its_warmup_requests_succeed(
     )
 
     assert app.state.server_status is ServerStatus.UP
-    assert posted == [request.model_dump(exclude_none=True)] * 2
+    assert posted == [request, request]
     assert server.should_exit is False
+
+
+@pytest.mark.asyncio
+async def test_warmup_sends_its_requests_one_at_a_time(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    in_flight_counts: list[int] = []
+    in_flight: list[httpx.Request] = []
+
+    async def respond(request: httpx.Request) -> httpx.Response:
+        in_flight.append(request)
+        in_flight_counts.append(len(in_flight))
+        await asyncio.sleep(0.01)
+        in_flight.remove(request)
+        return httpx.Response(200)
+
+    route_warmup_to(monkeypatch, httpx.MockTransport(respond))
+    server = SimpleNamespace(started=True, should_exit=False)
+    app = FastAPI()
+    app.state.server_status = ServerStatus.STARTING
+    request = ChatCompletionRequest(messages=[ChatMessage(role="user", content="Hi")])
+
+    await launcher.warm_up_server(
+        server,
+        app,
+        base_url="http://127.0.0.1:8000",
+        requests=[request] * 3,
+        timeout_s=5,
+    )
+
+    assert in_flight_counts == [1, 1, 1]
+    assert app.state.server_status is ServerStatus.UP
+
+
+@pytest.mark.asyncio
+async def test_warmup_drops_its_request_when_the_server_starts_shutting_down(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    started = asyncio.Event()
+    cancelled: list[bool] = []
+
+    async def hold(request: httpx.Request) -> httpx.Response:
+        started.set()
+        try:
+            await asyncio.Future()
+        except asyncio.CancelledError:
+            cancelled.append(True)
+            raise
+        return httpx.Response(200)
+
+    route_warmup_to(monkeypatch, httpx.MockTransport(hold))
+    server = SimpleNamespace(started=True, should_exit=False)
+    app = FastAPI()
+    app.state.server_status = ServerStatus.STARTING
+    request = ChatCompletionRequest(messages=[ChatMessage(role="user", content="Hi")])
+    warmup = asyncio.create_task(
+        launcher.warm_up_server(
+            server,
+            app,
+            base_url="http://127.0.0.1:8000",
+            requests=[request],
+            timeout_s=30,
+        )
+    )
+    await started.wait()
+
+    server.should_exit = True
+    await asyncio.wait_for(warmup, timeout=5)
+
+    assert cancelled == [True]
+    assert app.state.server_status is ServerStatus.STARTING
 
 
 @pytest.mark.asyncio

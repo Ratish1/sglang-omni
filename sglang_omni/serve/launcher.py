@@ -32,7 +32,7 @@ import signal
 import socket
 import threading
 import time
-from collections.abc import Callable, Coroutine, Generator
+from collections.abc import Callable, Generator
 from contextlib import contextmanager, suppress
 from types import FrameType
 from typing import TypedDict
@@ -482,7 +482,8 @@ async def warm_up_server(
     """Mark the server up once its warmup requests have crossed every stage.
 
     A fresh process builds kernels on its first request; this keeps that cost
-    off user requests. A failed warmup stops the server and raises.
+    off user requests. A failed warmup stops the server and raises; a shutdown
+    that starts first drops the request in flight and leaves the server down.
     """
     while not server.started:
         await asyncio.sleep(SERVER_START_POLL_S)
@@ -496,34 +497,41 @@ async def warm_up_server(
         async with httpx.AsyncClient(
             base_url=base_url, timeout=timeout_s, trust_env=False
         ) as http_client:
-            posts: list[Coroutine[None, None, httpx.Response]] = []
+            # note (ratish): one request at a time keeps warmup within the
+            # coordinator's admission limit; consecutive admissions still bind
+            # every replica of each process.
             for request in requests:
                 if isinstance(request, ChatCompletionRequest):
-                    posts.append(
-                        http_client.post(
-                            "/v1/chat/completions",
-                            json=request.model_dump(exclude_none=True),
-                        )
+                    post = http_client.post(
+                        "/v1/chat/completions",
+                        json=request.model_dump(exclude_none=True),
                     )
                 else:
-                    posts.append(
-                        http_client.post(
-                            TRANSCRIPTIONS_ENDPOINT,
-                            data={"max_new_tokens": str(request.max_new_tokens)},
-                            files={
-                                "file": ("warmup.wav", request.wav_bytes, "audio/wav")
-                            },
-                        )
+                    post = http_client.post(
+                        TRANSCRIPTIONS_ENDPOINT,
+                        data={"max_new_tokens": str(request.max_new_tokens)},
+                        files={"file": ("warmup.wav", request.wav_bytes, "audio/wav")},
                     )
-            responses = await asyncio.gather(*posts)
-        for response in responses:
-            if response.status_code != 200:
-                raise RuntimeError(
-                    f"Server warmup failed with status {response.status_code}: "
-                    f"{response.text}"
-                )
-            else:
-                pass
+                post_task = asyncio.create_task(post)
+                while not post_task.done() and not server.should_exit:
+                    await asyncio.wait({post_task}, timeout=SERVER_START_POLL_S)
+                if not post_task.done():
+                    # note (ratish): HTTP shutdown waits for in-flight requests, so
+                    # the warmup drops its own; the route aborts it on disconnect.
+                    post_task.cancel()
+                    with suppress(asyncio.CancelledError):
+                        await post_task
+                    return
+                else:
+                    pass
+                response = post_task.result()
+                if response.status_code != 200:
+                    raise RuntimeError(
+                        f"Server warmup failed with status {response.status_code}: "
+                        f"{response.text}"
+                    )
+                else:
+                    pass
     except (httpx.HTTPError, RuntimeError):
         logger.error(
             "Server warmup failed, stopping the server; SGLANG_OMNI_WARMUP_TIMEOUT "
