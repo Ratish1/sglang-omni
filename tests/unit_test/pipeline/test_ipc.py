@@ -423,6 +423,7 @@ async def run_launcher_with_fake_runner(
     config: PipelineConfig,
     serve_mock: AsyncMock | None,
     monkeypatch: pytest.MonkeyPatch,
+    replica_counts: tuple[int, ...] = (1,),
 ) -> tuple[object, FastAPI, SimpleNamespace]:
     app = FastAPI()
     profiler_calls = SimpleNamespace(starts=[], stops=[])
@@ -449,6 +450,11 @@ async def run_launcher_with_fake_runner(
                 process_plan=SimpleNamespace(
                     groups=(),
                     tp_stage_to_processes={},
+                ),
+                logical_process_plan=SimpleNamespace(
+                    processes=tuple(
+                        SimpleNamespace(num_replicas=count) for count in replica_counts
+                    )
                 ),
             )
             runner_ref = self
@@ -548,8 +554,15 @@ def answer_warmup_with(
     )
 
 
+def build_test_warmup_request(pipeline_config: PipelineConfig) -> ChatCompletionRequest:
+    del pipeline_config
+    return ChatCompletionRequest(
+        messages=[ChatMessage(role="user", content="Hi")], max_tokens=8
+    )
+
+
 @pytest.mark.asyncio
-async def test_server_reports_up_after_its_warmup_request_succeeds(
+async def test_server_reports_up_after_its_warmup_requests_succeed(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     posted: list[object] = []
@@ -562,12 +575,46 @@ async def test_server_reports_up_after_its_warmup_request_succeeds(
     )
 
     await launcher.warm_up_server(
-        server, app, base_url="http://127.0.0.1:8000", request=request, timeout_s=5
+        server,
+        app,
+        base_url="http://127.0.0.1:8000",
+        requests=[request, request],
+        timeout_s=5,
     )
 
     assert app.state.server_status is ServerStatus.UP
-    assert posted == [request.model_dump(exclude_none=True)]
+    assert posted == [request.model_dump(exclude_none=True)] * 2
     assert server.should_exit is False
+
+
+@pytest.mark.asyncio
+async def test_launcher_sends_one_warmup_request_per_replica_of_the_most_replicated_process(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        PipelineConfig,
+        "server_warmup_request_factory",
+        f"{__name__}.build_test_warmup_request",
+    )
+    warmups: list[dict[str, object]] = []
+
+    def record_warmup(server, app, **kwargs):
+        del server, app
+        warmups.append(kwargs)
+        return asyncio.sleep(0)
+
+    monkeypatch.setattr(launcher, "warm_up_server", record_warmup)
+    await run_launcher_with_fake_runner(
+        config=make_config(tmp_path),
+        serve_mock=AsyncMock(return_value=None),
+        monkeypatch=monkeypatch,
+        replica_counts=(1, 3, 2),
+    )
+
+    assert (
+        warmups[0]["requests"] == [build_test_warmup_request(make_config(tmp_path))] * 3
+    )
 
 
 @pytest.mark.asyncio
@@ -582,7 +629,11 @@ async def test_failed_warmup_stops_the_server_before_it_reports_up(
 
     with pytest.raises(RuntimeError, match="status 500: warmup answer"):
         await launcher.warm_up_server(
-            server, app, base_url="http://127.0.0.1:8000", request=request, timeout_s=5
+            server,
+            app,
+            base_url="http://127.0.0.1:8000",
+            requests=[request],
+            timeout_s=5,
         )
 
     assert app.state.server_status is ServerStatus.STARTING

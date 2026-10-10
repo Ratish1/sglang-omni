@@ -473,17 +473,17 @@ async def warm_up_server(
     app: FastAPI,
     *,
     base_url: str,
-    request: ChatCompletionRequest | None,
+    requests: list[ChatCompletionRequest],
     timeout_s: float,
 ) -> None:
-    """Mark the server up once one request has crossed every stage.
+    """Mark the server up once its warmup requests have crossed every stage.
 
     A fresh process builds kernels on its first request; this keeps that cost
     off user requests. A failed warmup stops the server and raises.
     """
     while not server.started:
         await asyncio.sleep(SERVER_START_POLL_S)
-    if request is None:
+    if not requests:
         app.state.server_status = ServerStatus.UP
         return
     else:
@@ -493,23 +493,30 @@ async def warm_up_server(
         async with httpx.AsyncClient(
             base_url=base_url, timeout=timeout_s, trust_env=False
         ) as http_client:
-            response = await http_client.post(
-                "/v1/chat/completions", json=request.model_dump(exclude_none=True)
+            responses = await asyncio.gather(
+                *(
+                    http_client.post(
+                        "/v1/chat/completions",
+                        json=request.model_dump(exclude_none=True),
+                    )
+                    for request in requests
+                )
             )
-        if response.status_code != 200:
-            raise RuntimeError(
-                f"Server warmup failed with status {response.status_code}: "
-                f"{response.text}"
-            )
-        else:
-            pass
+        for response in responses:
+            if response.status_code != 200:
+                raise RuntimeError(
+                    f"Server warmup failed with status {response.status_code}: "
+                    f"{response.text}"
+                )
+            else:
+                pass
     except (httpx.HTTPError, RuntimeError):
         server.should_exit = True
         raise
     app.state.server_status = ServerStatus.UP
     logger.info(
-        f"Server warmup finished in {time.perf_counter() - start:.1f} s; "
-        "the server is ready"
+        f"Server warmup of {len(requests)} request(s) finished in "
+        f"{time.perf_counter() - start:.1f} s; the server is ready"
     )
 
 
@@ -564,9 +571,18 @@ async def run_server(
     try:
         warmup_factory = type(pipeline_config).server_warmup_request_factory
         if skip_server_warmup or warmup_factory is None:
-            warmup_request = None
+            warmup_requests = []
         else:
-            warmup_request = import_string(warmup_factory)(pipeline_config)
+            # note (ratish): admission binds each replicated process round robin,
+            # so one request per replica of the most replicated process warms
+            # every replica.
+            num_replicas = max(
+                process.num_replicas
+                for process in mp_runner.prep.logical_process_plan.processes
+            )
+            warmup_requests = [
+                import_string(warmup_factory)(pipeline_config)
+            ] * num_replicas
         cl_kwargs = client_kwargs or {}
         client = Client(coordinator, **cl_kwargs)
         deployment_factory = type(pipeline_config).realtime_deployment_factory
@@ -635,7 +651,7 @@ async def run_server(
                 server,
                 app,
                 base_url=base_url,
-                request=warmup_request,
+                requests=warmup_requests,
                 timeout_s=float(os.environ.get("SGLANG_OMNI_WARMUP_TIMEOUT", "600")),
             )
         )
