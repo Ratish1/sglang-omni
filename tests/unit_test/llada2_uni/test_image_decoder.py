@@ -1,9 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Focused image-decoder tests."""
+"""Focused image-decoder and generation-path tests."""
 
 from __future__ import annotations
 
+import asyncio
+import base64
+import io
 import os
+import re
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -11,8 +15,10 @@ import pytest
 import torch
 import torch.multiprocessing as mp
 from diffusers.models.transformers.transformer_z_image import ZImageTransformer2DModel
+from PIL import Image
 from safetensors.torch import save_file
 
+from sglang_omni.models.llada2_uni.components import image_decoder as decoder_module
 from sglang_omni.models.llada2_uni.components.decoder_model import (
     DecoderConfig,
     ZImageTransformer2DModelWrapper,
@@ -22,7 +28,22 @@ from sglang_omni.models.llada2_uni.components.image_decoder import (
     LLaDA2ImageDecoder,
     create_decoder_model_fn,
 )
+from sglang_omni.models.llada2_uni.components.preprocessor import (
+    BOI_TOKEN,
+    EOI_TOKEN,
+    IMAGE_TOKEN_OFFSET,
+    SOI_TOKEN,
+    LLaDA2Preprocessor,
+)
 from sglang_omni.models.llada2_uni.components.transport import sample_velocity
+from sglang_omni.models.llada2_uni.config import IMAGE_STAGE
+from sglang_omni.models.llada2_uni.merge import extract_image_vq_tokens
+from sglang_omni.models.llada2_uni.payload_types import LLaDA2UniPipelineState
+from sglang_omni.models.llada2_uni.request_builders import (
+    merge_image_tokens_for_thinker,
+)
+from sglang_omni.models.llada2_uni.stages import create_image_decode_executor
+from sglang_omni.proto import OmniRequest, StagePayload
 
 
 def native_worker(
@@ -358,3 +379,116 @@ def test_decode_rejects_invalid_tokens_before_loading(tmp_path, monkeypatch):
     )
     with pytest.raises(ValueError):
         decoder.decode([16384], 1, 1)
+
+
+class FakeTokenizer:
+    mask_token_id = 156895
+    eos_token_id = 2
+
+    def __len__(self):
+        return IMAGE_TOKEN_OFFSET + 16384
+
+    def convert_tokens_to_ids(self, token):
+        return {
+            SOI_TOKEN: 156901,
+            EOI_TOKEN: 156902,
+            BOI_TOKEN: 156904,
+            "<uncondition>": 90,
+        }[token]
+
+    def encode(self, text, add_special_tokens=False):
+        ids = []
+        for part in re.split(
+            r"(<\|reserved_token_\d+\|>|<\|/?image\|>|<boi>|<uncondition>)", text
+        ):
+            if part in {
+                SOI_TOKEN,
+                EOI_TOKEN,
+                BOI_TOKEN,
+                "<uncondition>",
+            }:
+                ids.append(self.convert_tokens_to_ids(part))
+            elif part.startswith("<|reserved_token_"):
+                ids.append(10000 + int(re.search(r"\d+", part)[0]))
+            else:
+                ids.extend(ord(char) + 1000 for char in part)
+        return ids
+
+
+@pytest.fixture
+def preprocessor():
+    processor = LLaDA2Preprocessor.__new__(LLaDA2Preprocessor)
+    processor.tokenizer = FakeTokenizer()
+    processor.soi_id = processor.tokenizer.convert_tokens_to_ids(SOI_TOKEN)
+    processor.boi_id = processor.tokenizer.convert_tokens_to_ids(BOI_TOKEN)
+    processor.eoi_id = processor.tokenizer.convert_tokens_to_ids(EOI_TOKEN)
+    processor.max_seq_len = 8192
+    processor.merge_size = 1
+    processor.factor = 16
+    processor.image_processor = SimpleNamespace(
+        patch_size=16,
+        temporal_patch_size=2,
+        merge_size=1,
+        image_mean=[0.5] * 3,
+        image_std=[0.5] * 3,
+        rescale_factor=1 / 255,
+    )
+    return processor
+
+
+@pytest.mark.parametrize(
+    "source_size,grid",
+    [((1024, 1024), (32, 32)), ((256, 256), (32, 32)), ((1600, 200), (16, 64))],
+)
+def test_edit_preprocess_merge_extract_and_decode(
+    preprocessor, decode_probe, monkeypatch, tmp_path, source_size, grid
+):
+    source = tmp_path / "source.png"
+    Image.new("RGB", source_size, "white").save(source)
+    payload = StagePayload(
+        request_id="e2e",
+        request=OmniRequest(
+            inputs={
+                "messages": [{"role": "user", "content": "make it green"}],
+                "images": [str(source)],
+            },
+            metadata={"output_modalities": ["image"]},
+            params={},
+        ),
+        data={},
+    )
+    state = LLaDA2UniPipelineState.from_dict(asyncio.run(preprocessor(payload)).data)
+    assert state.task_kind == "edit"
+    grid_h, grid_w = grid
+    assert state.stream_state["image_info"] == [{"grid_h": grid_h, "grid_w": grid_w}]
+    encoded = state.encoder_inputs[IMAGE_STAGE]
+    torch.testing.assert_close(
+        encoded["pixel_values"], torch.ones_like(encoded["pixel_values"])
+    )
+
+    source_tokens = list(range(grid_h * grid_w))
+    state.encoder_outs[IMAGE_STAGE] = {"image_token_ids": [source_tokens]}
+    merge_image_tokens_for_thinker(state)
+    prompt_ids = state.prompt["input_ids"].flatten().tolist()
+    assert [tid for tid in prompt_ids if tid >= IMAGE_TOKEN_OFFSET] == [
+        IMAGE_TOKEN_OFFSET + token_id for token_id in source_tokens
+    ]
+
+    state.thinker_out = {
+        "output_ids": [IMAGE_TOKEN_OFFSET + token_id for token_id in source_tokens]
+        + [2]
+    }
+    tokens, h, w, params = extract_image_vq_tokens(state)
+    assert tokens == source_tokens
+    assert (h, w) == grid
+    assert params == {}
+
+    decoder, _ = decode_probe
+    monkeypatch.setattr(decoder_module, "LLaDA2ImageDecoder", lambda **kwargs: decoder)
+    scheduler = create_image_decode_executor("unused", device="cpu")
+    payload.data = state.to_dict()
+    result = scheduler.fn(payload)
+    image = Image.open(io.BytesIO(base64.b64decode(result.data["image"])))
+    assert image.size == (grid_w * 16, grid_h * 16)
+    assert image.getpixel((0, 0)) == (0, 127, 255)
+    assert result.data["events"][0]["type"] == "image_final"
