@@ -119,14 +119,15 @@ def test_spawned_process_threads_start_on_the_planned_cpus(
     monkeypatch.setattr(
         stage_workers, "stage_process_main", affinity_probe.report_thread_cpus
     )
+    monkeypatch.setenv(affinity_probe.SPAWNED_ENV, "1")
     group = stage_workers.StageGroup("probe", [spec])
 
     group.spawn(multiprocessing.get_context("spawn"))
-    thread_cpus = group.startup_error_channels[0].get(timeout=120)
+    import_thread_cpus, thread_cpus = group.startup_error_channels[0].get(timeout=120)
     group.processes[0].join(timeout=30)
 
     assert os.sched_getaffinity(0) == launcher_cpus
-    assert len(thread_cpus) >= 2
+    assert import_thread_cpus == sorted(spec.cpu_affinity)
     assert all(cpus == sorted(spec.cpu_affinity) for cpus in thread_cpus)
 
 
