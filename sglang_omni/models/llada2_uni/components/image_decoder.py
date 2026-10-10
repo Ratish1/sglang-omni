@@ -1,7 +1,4 @@
-"""LLaDA2 image decoder: SigVQ + ZImage Diffusion + VAE.
-
-Converts discrete VQ token IDs produced by the thinker into a PIL image.
-"""
+"""Decode LLaDA2 semantic tokens through SigVQ, diffusion, and a VAE."""
 
 from __future__ import annotations
 
@@ -12,34 +9,41 @@ import os
 import torch
 import torch.nn.functional as F
 from diffusers import AutoencoderKL
+from PIL.Image import Image
 from torchvision.transforms.functional import to_pil_image
 
 from sglang_omni.models.llada2_uni.components.decoder_model import (
+    DecoderConfig,
     ZImageTransformer2DModelWrapper,
 )
 from sglang_omni.models.llada2_uni.components.decoder_runtime import (
     DecoderRuntimeHandle,
 )
 from sglang_omni.models.llada2_uni.components.sigvq import SigVQ
-from sglang_omni.models.llada2_uni.components.transport import sample_velocity
+from sglang_omni.models.llada2_uni.components.transport import (
+    VelocityModel,
+    sample_velocity,
+)
 from sglang_omni.models.weight_loader import resolve_model_path
 
 logger = logging.getLogger(__name__)
 
 
 def create_decoder_model_fn(
-    model,
-    positive_caption_features,
-    negative_caption_features,
-    cfg_scale,
-    patch_size,
-    f_patch_size,
-    dtype,
-):
+    model: ZImageTransformer2DModelWrapper,
+    positive_caption_features: list[torch.Tensor],
+    negative_caption_features: list[torch.Tensor],
+    cfg_scale: float,
+    patch_size: int,
+    f_patch_size: int,
+    dtype: torch.dtype,
+) -> VelocityModel:
     batch_size = len(positive_caption_features)
     combined_caption_features = positive_caption_features + negative_caption_features
 
-    def predict_velocity(latents, timestep, **kwargs):
+    def predict_velocity(
+        latents: torch.Tensor, timestep: torch.Tensor | float
+    ) -> torch.Tensor:
         batch_timesteps = (
             torch.tensor([timestep], device=latents.device, dtype=torch.float32)
             if not isinstance(timestep, torch.Tensor)
@@ -96,21 +100,9 @@ def create_decoder_model_fn(
 
 
 class LLaDA2ImageDecoder:
-    """3-stage image decoder: SigVQ -> Diffusion ODE -> VAE.
+    """Decode semantic tokens using Diffusers or a caller-owned SGLang runtime.
 
-    Args:
-        model_path: Hugging Face model ID or root model directory (parent of
-            decoder/, vae/, image_tokenizer/).
-        device: Torch device string.
-        dtype: Model dtype (default: bfloat16).
-        decode_mode: "normal" for standard 50-step decoder,
-            "decoder-turbo" for distilled 8-step decoder. Used as the default
-            when decode is called without an explicit decode_mode.
-        num_steps: Default number of ODE sampling steps.
-        resolution_multiplier: Default upscale factor (2 = 1024px from 512px tokens).
-        backend: diffusers (default) or explicitly sglang.
-        runtime: Caller-owned SGLang diffusion runtime. Required by the
-            sglang backend and rejected by the diffusers backend.
+    The caller must enter runtime.compute_context() for SGLang operations.
     """
 
     def __init__(
@@ -124,7 +116,7 @@ class LLaDA2ImageDecoder:
         *,
         backend: str = "diffusers",
         runtime: DecoderRuntimeHandle | None = None,
-    ):
+    ) -> None:
         if backend not in {"diffusers", "sglang"}:
             raise ValueError(f"Unsupported image decoder backend: {backend!r}")
         else:
@@ -158,10 +150,10 @@ class LLaDA2ImageDecoder:
         self.diff_model: ZImageTransformer2DModelWrapper | None = None
         self.diff_model_mode: str | None = None
         self.vae: AutoencoderKL | None = None
-        self.diff_config: dict | None = None
+        self.diff_config: DecoderConfig | None = None
 
     @staticmethod
-    def validate_settings(mode, steps, resolution_multiplier):
+    def validate_settings(mode: str, steps: int, resolution_multiplier: int) -> None:
         if mode not in {"normal", "decoder-turbo"}:
             raise ValueError(f"Unsupported image decoder mode: {mode!r}")
         else:
@@ -175,7 +167,7 @@ class LLaDA2ImageDecoder:
         else:
             pass
 
-    def ensure_sigvq(self):
+    def ensure_sigvq(self) -> None:
         if self.sigvq is not None:
             return
         else:
@@ -192,7 +184,7 @@ class LLaDA2ImageDecoder:
         self.sigvq = sigvq.eval()
         logger.info(f"SigVQ loaded from {sigvq_path}")
 
-    def ensure_diff_model(self, decode_mode: str):
+    def ensure_diff_model(self, decode_mode: str) -> None:
         if self.diff_model is not None and self.diff_model_mode == decode_mode:
             return
         else:
@@ -220,25 +212,25 @@ class LLaDA2ImageDecoder:
             decoder_dir = os.path.join(self.model_path, "decoder")
 
         config_path = os.path.join(decoder_dir, "config.json")
-        with open(config_path) as f:
-            cfg = json.load(f)
+        with open(config_path) as config_file:
+            config: DecoderConfig = json.load(config_file)
         # Override axes_lens and cap_feat_dim to match SigVQ output
-        cfg["axes_lens"] = [32768, 1024, 1024]
-        cfg["cap_feat_dim"] = 4096
+        config["axes_lens"] = [32768, 1024, 1024]
+        config["cap_feat_dim"] = 4096
         model = ZImageTransformer2DModelWrapper(
             decoder_dir=decoder_dir,
-            cfg=cfg,
+            cfg=config,
             device=self.device,
             dtype=self.dtype,
             backend=self.backend,
             runtime=self.runtime,
         )
         self.diff_model = model
-        self.diff_config = cfg
+        self.diff_config = config
         self.diff_model_mode = decode_mode
         logger.info(f"Diffusion model loaded from {decoder_dir} ({decode_mode} mode)")
 
-    def ensure_vae(self):
+    def ensure_vae(self) -> None:
         if self.vae is not None:
             return
         else:
@@ -262,22 +254,10 @@ class LLaDA2ImageDecoder:
         num_steps: int | None = None,
         resolution_multiplier: int | None = None,
         seed: int | None = None,
-    ):
-        """Decode VQ token IDs into a PIL Image.
+    ) -> Image:
+        """Decode unoffset VQ IDs on an h-by-w semantic grid into a PIL image.
 
-        Args:
-            token_ids: List of VQ token IDs (without the +157184 offset).
-            h: Semantic grid height (image_pixels // 16).
-            w: Semantic grid width (image_pixels // 16).
-            decode_mode: Override instance default; switches diffusion weights
-                between decoder/ and decoder-turbo/ (single-slot reload).
-            num_steps: Override default ODE step count.
-            resolution_multiplier: Override default upscale factor.
-            seed: If set, draws initial noise with a deterministic generator.
-                If None, each call draws from the global RNG.
-
-        Returns:
-            PIL.Image.Image
+        Switching decode_mode reloads weights; seed=None uses the global RNG.
         """
         mode = decode_mode if decode_mode is not None else self.decode_mode
         steps = num_steps if num_steps is not None else self.num_steps

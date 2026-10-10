@@ -4,7 +4,9 @@
 from __future__ import annotations
 
 import socket
+from collections.abc import Iterator
 from contextlib import contextmanager, nullcontext
+from types import ModuleType, TracebackType
 
 import torch
 import torch.distributed as dist
@@ -18,10 +20,10 @@ class DecoderRuntimeHandle:
         device: torch.device,
         dtype: torch.dtype,
         attention_backend: str,
-        parallel_state,
-        server_args_module,
-        runtime_context,
-        precision,
+        parallel_state: ModuleType,
+        server_args_module: ModuleType,
+        runtime_context: ModuleType,
+        precision: ModuleType,
     ) -> None:
         self.device = device
         self.dtype = dtype
@@ -36,7 +38,7 @@ class DecoderRuntimeHandle:
         self.closed = False
 
     @contextmanager
-    def compute_context(self):
+    def compute_context(self) -> Iterator[None]:
         if self.closed:
             raise RuntimeError("Decoder runtime is closed")
         else:
@@ -68,16 +70,19 @@ class DecoderRuntimeHandle:
             raise RuntimeError("Decoder runtime is closed")
         else:
             pass
-        ps = self.parallel_state
-        if not dist.is_initialized() or not ps.model_parallel_is_initialized():
+        parallel_state = self.parallel_state
+        if (
+            not dist.is_initialized()
+            or not parallel_state.model_parallel_is_initialized()
+        ):
             raise RuntimeError("SGLang decoder runtime is not initialized")
         else:
             pass
         topology = (
-            ps.get_world_size(),
-            ps.get_tp_world_size(),
-            ps.get_sp_world_size(),
-            ps.get_sp_parallel_rank(),
+            parallel_state.get_world_size(),
+            parallel_state.get_tp_world_size(),
+            parallel_state.get_sp_world_size(),
+            parallel_state.get_sp_parallel_rank(),
         )
         if topology != (1, 1, 1, 0):
             raise RuntimeError(
@@ -125,14 +130,19 @@ class DecoderRuntimeHandle:
                 else:
                     pass
 
-    def __enter__(self):
+    def __enter__(self) -> DecoderRuntimeHandle:
         if self.closed:
             raise RuntimeError("Decoder runtime is closed")
         else:
             pass
         return self
 
-    def __exit__(self, exc_type, exc, traceback) -> None:
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> None:
         try:
             self.close()
         except BaseException as cleanup:

@@ -1,13 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Adapters over upstream diffusers and SGLang ZImage backbones.
-
-This is the semantic-only LLaDA2-Uni checkpoint, not LLaDA-Image's
-QueryFormer/text-conditioned transformer. Native spatial partitioning and
-attention collectives are owned by SGLang, not reimplemented here.
-"""
+"""Adapt Diffusers and SGLang ZImage backbones for semantic-only LLaDA2-Uni."""
 
 from __future__ import annotations
 
+from collections.abc import Iterable, Iterator
 from pathlib import Path
 from types import SimpleNamespace
 from typing import TypedDict
@@ -74,8 +70,10 @@ def decoder_config(cfg: DecoderConfig) -> DecoderConfig:
     return defaults
 
 
-def semantic_checkpoint(weights):
-    seen = set()
+def semantic_checkpoint(
+    weights: Iterable[tuple[str, torch.Tensor]],
+) -> Iterator[tuple[str, torch.Tensor]]:
+    seen: set[str] = set()
     for name, value in weights:
         if name.startswith("semantic_embedder."):
             name = "cap_embedder." + name.removeprefix("semantic_embedder.")
@@ -90,27 +88,16 @@ def semantic_checkpoint(weights):
 
 
 class ZImageTransformer2DModelWrapper(nn.Module):
-    """Load a semantic decoder checkpoint and expose its forward convention.
+    """Load semantic checkpoints and return positive velocity for t in [0, 1].
 
-    Args:
-        decoder_dir: Directory containing model.safetensors.
-        cfg: Decoder config, with cap_feat_dim/axes_lens overrides applied
-            by the image decoder. Unknown architectural options fail closed.
-        device, dtype: Weight placement and inference dtype.
-        backend: diffusers (default) or explicitly sglang; no fallback.
-        runtime: Caller-owned single-rank SGLang diffusion runtime.
-
-    Requires diffusers with ZImage support (tested with 0.37.0). Inputs are
-    lists of [C, F, H, W] latents and [L, D] semantic features; t is transport
-    time in [0, 1]. Diffusers embeds t*t_scale and returns positive velocity,
-    so no timestep inversion or output negation is applied.
+    Inputs are lists of [C, F, H, W] latents and [L, D] semantic features.
     """
 
     def __init__(
         self,
-        decoder_dir: str,
+        decoder_dir: str | Path,
         cfg: DecoderConfig,
-        device: torch.device,
+        device: torch.device | str,
         dtype: torch.dtype,
         *,
         backend: str = "diffusers",
@@ -137,7 +124,9 @@ class ZImageTransformer2DModelWrapper(nn.Module):
         model.load_state_dict(state, strict=True, assign=True)
         self.model = model.to(device=device, dtype=dtype).eval().requires_grad_(False)
 
-    def load_sglang_model(self, decoder_dir, device, dtype):
+    def load_sglang_model(
+        self, decoder_dir: str | Path, device: torch.device, dtype: torch.dtype
+    ) -> nn.Module:
         from sglang.multimodal_gen.configs.models.dits.zimage import (
             ZImageArchConfig,
             ZImageDitConfig,
@@ -210,7 +199,14 @@ class ZImageTransformer2DModelWrapper(nn.Module):
         )
         return model.eval().requires_grad_(False)
 
-    def native_forward(self, x, t, cap_feats, patch_size, f_patch_size):
+    def native_forward(
+        self,
+        x: list[torch.Tensor],
+        t: torch.Tensor,
+        cap_feats: list[torch.Tensor],
+        patch_size: int,
+        f_patch_size: int,
+    ) -> list[torch.Tensor]:
         from sglang.multimodal_gen.runtime.managers.forward_context import (
             set_forward_context,
         )
@@ -286,9 +282,9 @@ class ZImageTransformer2DModelWrapper(nn.Module):
 
     def forward(
         self,
-        x,
-        t,
-        cap_feats,
+        x: list[torch.Tensor],
+        t: torch.Tensor | float,
+        cap_feats: list[torch.Tensor],
         return_dict: bool = True,
         patch_size: int = 2,
         f_patch_size: int = 1,
