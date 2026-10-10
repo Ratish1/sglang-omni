@@ -511,6 +511,10 @@ async def warm_up_server(
             else:
                 pass
     except (httpx.HTTPError, RuntimeError):
+        logger.error(
+            "Server warmup failed, stopping the server; SGLANG_OMNI_WARMUP_TIMEOUT "
+            f"bounds each warmup request ({timeout_s:g} s)"
+        )
         server.should_exit = True
         raise
     app.state.server_status = ServerStatus.UP
