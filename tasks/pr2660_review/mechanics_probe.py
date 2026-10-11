@@ -9,6 +9,7 @@ import torch
 
 from sglang_omni.models.qwen3_tts.codec_state_arena import Qwen3TTSCodecStateArena
 from sglang_omni.models.qwen3_tts.incremental_codec import Qwen3TTSIncrementalDecoder
+from sglang_omni.pipeline.replicas import ReplicaTopology
 from sglang_omni.scheduling.message import OutgoingMessage, put_messages
 from tests.unit_test.pipeline.test_stage_streaming import (
     frame_message,
@@ -82,13 +83,35 @@ async def check_mixed_targets() -> None:
     ]
     inbox = receivers["vocoder"].scheduler.inbox
     assert [inbox.get_nowait().data.data.item() for _ in range(2)] == [0, 2]
-    assert len(sender.control_plane.stage_messages) == 1
-    target, _, remote_message = sender.control_plane.stage_messages[0]
+    assert len(sender.control_plane.sent_to_stage) == 1
+    target, _, remote_message = sender.control_plane.sent_to_stage[0]
     assert target == "remote" and remote_message.chunk_id == 0
     assert sender.stream_chunk_counters == {
         ("request", "vocoder"): 2,
         ("request", "remote"): 1,
     }
+
+
+async def check_replicas() -> None:
+    targets = ("vocoder@r0", "vocoder@r1")
+    dispatcher, sender, receivers = make_local_stream_pair(targets=targets)
+    sender.replica_topology = ReplicaTopology.from_dict({"vocoder": list(targets)})
+    sender.replica_bindings = {"first": {"vocoder": 0}, "second": {"vocoder": 1}}
+    sender.active_requests.update(("first", "second"))
+    await sender.route_stream_run(
+        [
+            frame_message("first", 0),
+            frame_message("second", 0),
+            frame_message("first", 1),
+        ]
+    )
+    assert dispatcher.chunk_batches == [
+        ("vocoder@r0", [("first", 0)]),
+        ("vocoder@r1", [("second", 0)]),
+        ("vocoder@r0", [("first", 1)]),
+    ]
+    assert receivers["vocoder@r0"].replica_bindings == {"first": {"vocoder": 0}}
+    assert receivers["vocoder@r1"].replica_bindings == {"second": {"vocoder": 1}}
 
 
 def check_cuda_slot_reuse() -> None:
@@ -144,6 +167,7 @@ def run() -> None:
     check_blocked_consumer()
     asyncio.run(check_drain_boundary())
     asyncio.run(check_mixed_targets())
+    asyncio.run(check_replicas())
     check_cuda_slot_reuse()
     print(
         json.dumps(
@@ -151,6 +175,7 @@ def run() -> None:
                 "blocked_consumer": "pass",
                 "drain_boundary": "pass",
                 "mixed_targets": "pass",
+                "physical_replicas": "pass",
                 "cuda_reuse_and_capture": "pass",
             },
             indent=2,
