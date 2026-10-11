@@ -578,17 +578,7 @@ def run_prefix_solve(
     t, dt = time_span[0], time_span[1] - time_span[0]
     for euler_step in range(euler_steps):
         flow_time[:] = t
-        if modulation_cache is None:
-            block_modulations = None
-            final_modulation = None
-        else:
-            block_modulations = modulation_cache.block_modulations[euler_step]
-            final_modulation = modulation_cache.final_modulations[euler_step]
-        (
-            vector_field,
-            next_context[euler_step, :, 0],
-            next_context[euler_step, :, 1],
-        ) = pool.forward(
+        forward_args = (
             estimator,
             pool.keys[euler_step],
             pool.values[euler_step],
@@ -601,9 +591,21 @@ def run_prefix_solve(
             rope,
             context[euler_step, :, 0],
             context[euler_step, :, 1],
-            block_modulations,
-            final_modulation,
         )
+        if modulation_cache is None:
+            # Do not change the native prefix forward contract when disabled.
+            output = pool.forward(*forward_args)
+        else:
+            output = pool.forward(
+                *forward_args,
+                modulation_cache.block_modulations[euler_step],
+                modulation_cache.final_modulations[euler_step],
+            )
+        (
+            vector_field,
+            next_context[euler_step, :, 0],
+            next_context[euler_step, :, 1],
+        ) = output
         conditional = vector_field[:, :half_frames]
         unconditional = vector_field[:, half_frames:]
         x = x + dt * ((1.0 + cfg_rate) * conditional - cfg_rate * unconditional)
