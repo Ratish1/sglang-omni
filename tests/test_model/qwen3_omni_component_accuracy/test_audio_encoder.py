@@ -105,7 +105,9 @@ def test_audio_encoder_follows_reference(
                 extracted["attention_mask"],
             )
         )
-    joined = torch.cat([features[0] for _, features, _ in clips], dim=-1)
+    joined = torch.cat([features[0] for _, features, _ in clips], dim=-1).repeat(
+        1, max(EDGE_FRAMES) // sum(features.shape[-1] for _, features, _ in clips) + 1
+    )
     edges = [
         (
             f"edge_{frames}_frames",

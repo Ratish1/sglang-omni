@@ -80,9 +80,11 @@ def test_code2wav_follows_reference(
     floor = reference_copy(
         reference_model.code2wav, device=component_device, dtype=torch.bfloat16
     )
+    card = torch.device(component_device)
     scheduler = create_code2wav_scheduler(
         checkpoint_dir,
-        device=component_device,
+        device=card.type,
+        gpu_id=card.index,
         enable_cuda_graph=True,
         total_gpu_memory_fraction=CODE2WAV_MEMORY_FRACTION,
     )
