@@ -429,3 +429,45 @@ def test_flow_causal_batch_mixed_prompt_matches_serial() -> None:
     assert batched[1].shape == serial[1].shape
     for actual, expected in zip(batched, serial, strict=True):
         torch.testing.assert_close(actual, expected)
+
+def test_prefix_solve_without_cache_keeps_original_forward_signature() -> None:
+    """Feature OFF must not pass extra modulation args to an existing forward."""
+    from sglang_omni.models.fun_cosyvoice3.prefix_cache import run_prefix_solve
+
+    calls: list[torch.Tensor] = []
+
+    def original_forward(
+        estimator, keys, values, x, mu, speakers, cond, t,
+        attention, rope, first_context, second_context,
+    ):
+        calls.append(t.detach().clone())
+        return torch.zeros_like(x), first_context, second_context
+
+    pool = SimpleNamespace(
+        forward=original_forward,
+        keys=[[], []],
+        values=[[], []],
+    )
+    attention = SimpleNamespace(
+        speaker_index=torch.tensor([0, 0, 1, 1]),
+        positions=torch.tensor([0, 1, 0, 1]),
+    )
+    noise = torch.arange(8, dtype=torch.float32).reshape(1, 2, 4)
+    context = torch.zeros(2, 2, 2, 1, 4)
+    next_context = torch.empty_like(context)
+
+    actual = run_prefix_solve(
+        object(), pool, noise,
+        torch.tensor([0.0, 0.5, 1.0]),
+        torch.zeros_like(noise),
+        torch.zeros(1, 4),
+        torch.zeros_like(noise),
+        attention, torch.zeros(1, 2, 2),
+        context, next_context,
+        cfg_rate=0.7,
+    )
+
+    assert len(calls) == 2
+    torch.testing.assert_close(actual, noise)
+    torch.testing.assert_close(next_context, context)
+
