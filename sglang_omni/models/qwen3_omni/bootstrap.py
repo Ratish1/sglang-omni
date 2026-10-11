@@ -145,6 +145,7 @@ def create_talker_scheduler(
     from sglang_omni.models.qwen3_omni.request_builders import (
         make_talker_scheduler_adapters,
     )
+    from sglang_omni.models.qwen3_omni.talker_capture import TalkerCapture
     from sglang_omni.models.qwen3_omni.talker_model_runner import QwenTalkerModelRunner
     from sglang_omni.models.qwen3_omni.talker_scheduler import (
         QwenTalkerScheduler,
@@ -275,6 +276,7 @@ def create_talker_scheduler(
         codec_coalesce_frames=codec_coalesce_frames,
         codec_coalesce_first_frames=codec_coalesce_first_frames,
         codec_coalesce_early_frames=codec_coalesce_early_frames,
+        capture=TalkerCapture.from_environment(),
     )
     scheduler.bind_model_runner(model_runner)
     return scheduler

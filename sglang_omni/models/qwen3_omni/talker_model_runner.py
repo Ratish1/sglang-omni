@@ -30,6 +30,7 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
     from sglang_omni.models.qwen3_omni.components.talker import Qwen3OmniTalker
+    from sglang_omni.models.qwen3_omni.talker_capture import TalkerCapture
     from sglang_omni.scheduling.sglang_backend.output_processor import (
         SGLangOutputProcessor,
     )
@@ -58,6 +59,7 @@ class QwenTalkerModelRunner(ModelRunner["SGLangARRequestData"]):
         codec_coalesce_frames: int = 0,
         codec_coalesce_first_frames: int = 0,
         codec_coalesce_early_frames: int = 0,
+        capture: TalkerCapture | None = None,
     ) -> None:
         super().__init__(tp_worker, output_processor)
         self.outbox = outbox
@@ -67,6 +69,7 @@ class QwenTalkerModelRunner(ModelRunner["SGLangARRequestData"]):
         self.codec_coalesce_frames = max(int(codec_coalesce_frames), 0)
         self.codec_coalesce_first_frames = max(int(codec_coalesce_first_frames), 0)
         self.codec_coalesce_early_frames = max(int(codec_coalesce_early_frames), 0)
+        self.capture = capture
 
     def execute(self, scheduler_output: SchedulerOutput) -> ModelRunnerOutput:
         return super().execute(scheduler_output)
@@ -152,6 +155,7 @@ class QwenTalkerModelRunner(ModelRunner["SGLangARRequestData"]):
             schedule_batch=schedule_batch,
             requests=requests,
         )
+        self.capture_step(result, schedule_batch, len(requests))
 
     def post_decode(
         self,
@@ -171,6 +175,23 @@ class QwenTalkerModelRunner(ModelRunner["SGLangARRequestData"]):
         self.emit_code_chunks_and_feedback(
             schedule_batch=schedule_batch,
             requests=requests,
+        )
+        self.capture_step(result, schedule_batch, batch_size)
+
+    def capture_step(
+        self,
+        result: GenerationBatchResult,
+        schedule_batch: ScheduleBatch,
+        batch_size: int,
+    ) -> None:
+        if self.capture is None:
+            return
+        else:
+            pass
+        self.capture.record_step(
+            [req.rid for req in schedule_batch.reqs[:batch_size]],
+            result.logits_output.hidden_states[:batch_size],
+            self.model.output_codes[:batch_size],
         )
 
     def emit_code_chunks_and_feedback(
@@ -298,6 +319,10 @@ class QwenTalkerModelRunner(ModelRunner["SGLangARRequestData"]):
     def on_request_finished(
         self, request_id: str, req_data: "SGLangARRequestData"
     ) -> None:
+        if self.capture is not None:
+            self.capture.finish(request_id, req_data)
+        else:
+            pass
         pending = req_data.pending_codec_rows
         if not pending:
             return
