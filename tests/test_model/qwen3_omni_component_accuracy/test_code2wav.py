@@ -56,18 +56,24 @@ def window_walk(
     return torch.cat(pieces, dim=-1)
 
 
-def best_alignment(longer: torch.Tensor, shorter: torch.Tensor) -> tuple[int, float]:
-    """The offset of shorter inside longer with the smallest relative L2, and that error."""
+def best_alignment(
+    longer: torch.Tensor, shorter: torch.Tensor, *, expected: int, radius: int
+) -> tuple[int, float]:
+    """The offset of shorter inside longer, searched within radius of expected, with the smallest relative L2."""
     longer = longer.flatten().float().cpu()
     shorter = shorter.flatten().float().cpu()
-    errors = [
-        (
+    offsets = range(
+        max(expected - radius, 0),
+        min(expected + radius, longer.numel() - shorter.numel()) + 1,
+    )
+    errors = {
+        offset: (
             (longer[offset : offset + shorter.numel()] - shorter).norm()
             / shorter.norm()
         ).item()
-        for offset in range(longer.numel() - shorter.numel() + 1)
-    ]
-    best = min(range(len(errors)), key=errors.__getitem__)
+        for offset in offsets
+    }
+    best = min(errors, key=errors.__getitem__)
     return best, errors[best]
 
 
@@ -143,15 +149,21 @@ def test_code2wav_follows_reference(
             chunked_truth = truth.chunked_decode(
                 codes, chunk_size=HF_CHUNK_FRAMES, left_context_size=HF_CONTEXT_FRAMES
             )
-        whole_offset, whole_error = best_alignment(walk_truth, whole_truth)
         trim = frames * upsample - whole_truth.shape[-1]
+        whole_offset, whole_error = best_alignment(
+            walk_truth, whole_truth, expected=0, radius=trim
+        )
         chunk_errors = []
         cursor = 0
         for chunk_start in range(0, frames, HF_CHUNK_FRAMES):
             samples = min(HF_CHUNK_FRAMES, frames - chunk_start) * upsample - trim
             piece = chunked_truth[..., cursor : cursor + samples]
             cursor += samples
-            chunk_errors.append(best_alignment(whole_truth, piece)[1])
+            chunk_errors.append(
+                best_alignment(
+                    whole_truth, piece, expected=chunk_start * upsample, radius=trim
+                )[1]
+            )
         semantics.append(
             {
                 "frames": frames,
