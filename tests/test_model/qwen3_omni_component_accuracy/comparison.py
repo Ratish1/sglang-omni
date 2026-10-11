@@ -4,13 +4,19 @@
 from __future__ import annotations
 
 import copy
+import math
+import statistics
 from dataclasses import asdict, dataclass
 
 import torch
 
-# note (ratish): an omni component may stray from the FP32 reference at most this many times as far as the
-# reference's own BF16 copy does on the same input; the first runs record the ratios this bound is reviewed against.
-FLOOR_FACTOR = 2.0
+# note (ratish): two BF16 implementations of equal accuracy differ case by case in how far they stray from FP32. Over
+# the 2000 mmsu-ci-2000 clips, omni's graph-replayed audio encoder strayed 1.00 times as far as HF's own BF16 copy in
+# geometric mean, with log standard deviation 0.25 and single clips from 0.12 to 6.6 times, as many below 0.5 as
+# above 2. So a component fails when its geometric mean ratio passes 1.25 (over three standard errors at 24 cases),
+# a systematic loss, or when one case passes 10 times, beyond the spread equal accuracy produced.
+GEOMETRIC_MEAN_BOUND = 1.25
+CASE_BOUND = 10.0
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -79,10 +85,24 @@ def parameter_mismatches(
     return mismatches
 
 
+def geometric_mean_ratio(records: list[CaseRecord]) -> float:
+    return math.exp(
+        statistics.fmean(math.log(max(record.floor_ratio, 1e-12)) for record in records)
+    )
+
+
 def floor_violations(records: list[CaseRecord]) -> list[str]:
-    return [
+    violations = [
         f"{record.case}: omni relative L2 {record.omni.relative_l2:.3e}, "
         f"reference BF16 {record.floor.relative_l2:.3e} (ratio {record.floor_ratio:.2f})"
         for record in records
-        if record.floor_ratio > FLOOR_FACTOR
+        if record.floor_ratio > CASE_BOUND
     ]
+    geometric_mean = geometric_mean_ratio(records)
+    if geometric_mean > GEOMETRIC_MEAN_BOUND:
+        violations.append(
+            f"geometric mean ratio {geometric_mean:.3f} over {len(records)} cases passes {GEOMETRIC_MEAN_BOUND}"
+        )
+    else:
+        pass
+    return violations

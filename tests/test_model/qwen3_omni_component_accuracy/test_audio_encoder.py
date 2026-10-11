@@ -24,6 +24,7 @@ from tests.test_model.qwen3_omni_component_accuracy.comparison import (
     CaseRecord,
     deviation,
     floor_violations,
+    geometric_mean_ratio,
     parameter_mismatches,
     reference_copy,
 )
@@ -197,7 +198,8 @@ def test_audio_encoder_follows_reference(
         pass
     ratios = sorted(record.floor_ratio for record in records)
     print(
-        f"\n[audio_encoder] {len(records)} cases, floor ratio median {ratios[len(ratios) // 2]:.2f} "
+        f"\n[audio_encoder] {len(records)} cases, floor ratio geometric mean "
+        f"{geometric_mean_ratio(records):.3f} median {ratios[len(ratios) // 2]:.2f} "
         f"max {ratios[-1]:.2f}"
     )
     violations = floor_violations(records)

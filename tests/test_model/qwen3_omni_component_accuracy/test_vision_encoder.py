@@ -27,6 +27,7 @@ from tests.test_model.qwen3_omni_component_accuracy.comparison import (
     CaseRecord,
     deviation,
     floor_violations,
+    geometric_mean_ratio,
     parameter_mismatches,
     reference_copy,
 )
@@ -171,7 +172,7 @@ def test_vision_encoder_follows_reference(
     else:
         pass
     print(
-        "\n[vision_encoder] floor ratio per case: "
+        f"\n[vision_encoder] floor ratio geometric mean {geometric_mean_ratio(records):.3f}, per case: "
         + ", ".join(f"{record.case} {record.floor_ratio:.2f}" for record in records)
         + "\n[vision_encoder] 5.6 interpolation alone in FP32, relative L2: "
         + ", ".join(

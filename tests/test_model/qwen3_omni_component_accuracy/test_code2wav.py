@@ -26,6 +26,7 @@ from tests.test_model.qwen3_omni_component_accuracy.comparison import (
     CaseRecord,
     deviation,
     floor_violations,
+    geometric_mean_ratio,
     parameter_mismatches,
     reference_copy,
 )
@@ -176,7 +177,7 @@ def test_code2wav_follows_reference(
     else:
         pass
     print(
-        "\n[code2wav] floor ratio per case: "
+        f"\n[code2wav] floor ratio geometric mean {geometric_mean_ratio(records):.3f}, per case: "
         + ", ".join(f"{record.case} {record.floor_ratio:.2f}" for record in records)
         + "\n[code2wav] against HF's FP32 whole-sequence decode (relative L2 at best offset): "
         + ", ".join(
