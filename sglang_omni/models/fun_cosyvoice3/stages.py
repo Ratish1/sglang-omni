@@ -2855,23 +2855,14 @@ def create_vocoder_executor(
             )
         if can_build_modulation_cache:
             assert flow.packed_estimator is not None
-            if conditioning.time_span.dtype != conditioning.speaker_embedding.dtype:
-                logger.warning(
-                    "Fun-CosyVoice3 timestep modulation cache stays off: "
-                    f"time_span dtype {conditioning.time_span.dtype} differs from "
-                    f"flow dtype {conditioning.speaker_embedding.dtype}"
-                )
-            else:
-                modulation_cache = TimestepModulationCache.build(
-                    flow.packed_estimator.dit,
-                    conditioning.time_span,
-                    flow_dtype=conditioning.speaker_embedding.dtype,
-                    euler_steps=FLOW_EULER_STEPS,
-                )
-                modulation_cache.validate(
-                    flow.packed_estimator.dit, conditioning.time_span
-                )
-                flow.timestep_modulation_cache = modulation_cache
+            modulation_cache = TimestepModulationCache.build(
+                flow.packed_estimator.dit,
+                conditioning.time_span,
+                flow_dtype=conditioning.speaker_embedding.dtype,
+                euler_steps=FLOW_EULER_STEPS,
+            )
+            modulation_cache.validate(flow.packed_estimator.dit, conditioning.time_span)
+            flow.timestep_modulation_cache = modulation_cache
         else:
             pass
     else:

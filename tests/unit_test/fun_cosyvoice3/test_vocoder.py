@@ -32,6 +32,7 @@ from sglang_omni.platforms.xpu import XPUOmniPlatform
 from sglang_omni.proto import OmniRequest, StagePayload
 from sglang_omni.scheduling.message import IncomingMessage
 from tests.unit_test.fun_cosyvoice3.test_flow_batch import FakeFlow as _PackedFlow
+from tests.unit_test.fun_cosyvoice3.test_timestep_modulation import FakeDiT
 
 
 class FakeF0Predictor(torch.nn.Module):
@@ -110,8 +111,9 @@ class GraphRunnableFakeFlow(RunnableFakeFlow):
 
 
 class RecordingPackedDiT(PackedDiT):
-    def __init__(self) -> None:
+    def __init__(self, dit: torch.nn.Module | None = None) -> None:
         self.is_ragged = True
+        self.dit = dit
 
     def compile(self, dtype: torch.dtype | None) -> bool:
         del dtype
@@ -1161,6 +1163,83 @@ def test_create_vocoder_executor_compile_flag_controls_startup_materialization(
     )
     assert len(compiled) == (1 if enable_dit_torch_compile else 0)
     assert len(packed_warmups) == (1 if enable_dit_torch_compile else 0)
+
+
+@pytest.mark.parametrize(
+    ("enable_cache", "scheduler_name", "expected_cache"),
+    [
+        (True, "cosine", True),
+        (False, "cosine", False),
+        (True, "linear", False),
+    ],
+)
+def test_create_vocoder_executor_activates_bf16_timestep_cache(
+    monkeypatch: pytest.MonkeyPatch,
+    enable_cache: bool,
+    scheduler_name: str,
+    expected_cache: bool,
+) -> None:
+    """The production schedule stays FP32 while Flow timesteps and weights are BF16."""
+    packed_estimator = RecordingPackedDiT(FakeDiT(channels=4, depth=1).bfloat16())
+    raw_flow = RunnableFakeFlow()
+    raw_flow.packed_estimator = packed_estimator
+    raw_flow.decoder.t_scheduler = scheduler_name
+    flow = stages.FunCosyVoice3Flow(
+        raw_flow,
+        packed_estimator=packed_estimator,
+    )
+    conditioning = SimpleNamespace(
+        time_span=torch.linspace(
+            0,
+            1,
+            stages.FLOW_EULER_STEPS + 1,
+            dtype=torch.float32,
+        ),
+        speaker_embedding=torch.zeros(1, 80, dtype=torch.bfloat16),
+    )
+
+    monkeypatch.setattr(
+        stages,
+        "resolve_concrete_device",
+        lambda device, gpu_id: torch.device("cuda"),
+    )
+    monkeypatch.setattr(stages, "resolve_checkpoint", lambda model_path: "/checkpoint")
+    monkeypatch.setattr(stages, "patch_chunk_mask", lambda: None)
+    monkeypatch.setattr(
+        stages,
+        "load_cosyvoice3_flow_hift",
+        lambda checkpoint_dir, device, fp16, **kwargs: (flow, FakeHiFT()),
+    )
+    monkeypatch.setattr(
+        stages,
+        "prepare_flow_conditioning",
+        lambda flow_arg, packed_arg, *, finalize: conditioning,
+    )
+    monkeypatch.setattr(
+        FunCosyVoice3StreamingVocoderScheduler,
+        "warmup_now",
+        lambda scheduler: None,
+    )
+
+    _scheduler = stages.create_vocoder_executor(
+        "model",
+        device="cuda",
+        dtype="bfloat16",
+        flow_prefix_cache_gb=0.0,
+        enable_dit_torch_compile=False,
+        enable_flow_cuda_graph=False,
+        enable_flow_prefix_cuda_graph=False,
+        enable_flow_whole_history_cuda_graph=False,
+        enable_flow_timestep_modulation_cache=enable_cache,
+    )
+
+    if expected_cache:
+        cache = flow.timestep_modulation_cache
+        assert cache is not None
+        assert cache.time_span.dtype == torch.float32
+        assert cache.flow_dtype == torch.bfloat16
+    else:
+        assert flow.timestep_modulation_cache is None
 
 
 FLOW_GRAPH_CAPTURE_SHAPES = ((2, 16),)
