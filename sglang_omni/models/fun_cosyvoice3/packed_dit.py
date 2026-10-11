@@ -592,7 +592,7 @@ def solve_flow_euler_packed(
     t, dt = time_span[0], time_span[1] - time_span[0]
     for step in range(1, len(time_span)):
         flow_time[:] = t
-        vector_field = estimator.forward(
+        forward_args = (
             torch.cat((x, x), dim=1),
             mu_cfg,
             spks_cfg,
@@ -601,17 +601,16 @@ def solve_flow_euler_packed(
             twin_rows,
             attention,
             rope,
-            (
-                None
-                if modulation_cache is None
-                else modulation_cache.block_modulations[step - 1]
-            ),
-            (
-                None
-                if modulation_cache is None
-                else modulation_cache.final_modulations[step - 1]
-            ),
         )
+        if modulation_cache is None:
+            # Preserve the original estimator.forward contract when disabled.
+            vector_field = estimator.forward(*forward_args)
+        else:
+            vector_field = estimator.forward(
+                *forward_args,
+                modulation_cache.block_modulations[step - 1],
+                modulation_cache.final_modulations[step - 1],
+            )
         conditional = vector_field[:, :total]
         unconditional = vector_field[:, total:]
         x = x + dt * ((1.0 + cfg_rate) * conditional - cfg_rate * unconditional)
