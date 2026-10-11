@@ -170,26 +170,22 @@ def test_audio_encoder_follows_reference(
             )
             batched = omni_embeds(encoder, features, mask)
             lengths = served.downsample_lengths(mask.sum(dim=1)).tolist()
-            for (case, item_features, item_mask), rows in zip(
-                group, batched.split(lengths)
+            device_features = features.to(component_device)
+            device_mask = mask.to(component_device)
+            truth_rows = reference_embeds(truth, device_features, device_mask).split(
+                lengths
+            )
+            floor_rows = reference_embeds(floor, device_features, device_mask).split(
+                lengths
+            )
+            for (case, _, _), rows, reference, floor_reference in zip(
+                group, batched.split(lengths), truth_rows, floor_rows
             ):
-                reference = reference_embeds(
-                    truth,
-                    item_features.to(component_device),
-                    item_mask.to(component_device),
-                )
                 records.append(
                     CaseRecord(
                         case=f"{path_name}/batch{start // BATCH_SIZE}/{case}",
                         omni=deviation(rows, reference),
-                        floor=deviation(
-                            reference_embeds(
-                                floor,
-                                item_features.to(component_device),
-                                item_mask.to(component_device),
-                            ),
-                            reference,
-                        ),
+                        floor=deviation(floor_reference, reference),
                     )
                 )
 

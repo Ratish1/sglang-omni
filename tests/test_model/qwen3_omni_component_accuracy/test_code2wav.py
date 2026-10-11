@@ -4,8 +4,10 @@
 Omni builds code2wav as the code2wav stage does (channels-last convs, fused pre-transformer and SnakeBeta, CUDA
 graphs per window) and decodes a stream in windows of 10 new frames with up to 25 frames of left context
 (code2wav_scheduler.py decode_windows and decode_delta). The floor rule covers one whole-sequence forward and that
-window walk run on both sides; the walk's own departure from a whole-sequence decode and from HF's chunked_decode
-(300 frames, 25 of context, the HF generate path) is a semantic difference, reported, not gated.
+window walk run on both sides (graph outputs are borrowed until the next replay, so each window is copied out as the
+scheduler does). The walk's own departure from a whole-sequence decode, beside the departure of HF's chunked_decode
+(300 frames, 25 of context, the HF generate path) from the same decode, is a semantic difference, reported, not
+gated.
 """
 
 from __future__ import annotations
@@ -104,7 +106,7 @@ def test_code2wav_follows_reference(
     codebook = truth.config.codebook_size
 
     def served_forward(codes: torch.Tensor) -> torch.Tensor:
-        return scheduler.forward_codes(codes, graph_eligible=True)[0]
+        return scheduler.forward_codes(codes, graph_eligible=True)[0].clone()
 
     records: list[CaseRecord] = []
     semantics: list[dict[str, object]] = []
@@ -141,7 +143,14 @@ def test_code2wav_follows_reference(
                 codes, chunk_size=HF_CHUNK_FRAMES, left_context_size=HF_CONTEXT_FRAMES
             )
         whole_offset, whole_error = best_alignment(walk_truth, whole_truth)
-        chunked_offset, chunked_error = best_alignment(walk_truth, chunked_truth)
+        trim = frames * upsample - whole_truth.shape[-1]
+        chunk_errors = []
+        cursor = 0
+        for chunk_start in range(0, frames, HF_CHUNK_FRAMES):
+            samples = min(HF_CHUNK_FRAMES, frames - chunk_start) * upsample - trim
+            piece = chunked_truth[..., cursor : cursor + samples]
+            cursor += samples
+            chunk_errors.append(best_alignment(whole_truth, piece)[1])
         semantics.append(
             {
                 "frames": frames,
@@ -150,8 +159,7 @@ def test_code2wav_follows_reference(
                 "chunked_samples": chunked_truth.shape[-1],
                 "walk_vs_whole_offset": whole_offset,
                 "walk_vs_whole_relative_l2": whole_error,
-                "walk_vs_chunked_offset": chunked_offset,
-                "walk_vs_chunked_relative_l2": chunked_error,
+                "chunked_pieces_vs_whole_relative_l2": chunk_errors,
             }
         )
 
@@ -170,10 +178,10 @@ def test_code2wav_follows_reference(
     print(
         "\n[code2wav] floor ratio per case: "
         + ", ".join(f"{record.case} {record.floor_ratio:.2f}" for record in records)
-        + "\n[code2wav] served walk against HF FP32 decodes (relative L2 at best offset): "
+        + "\n[code2wav] against HF's FP32 whole-sequence decode (relative L2 at best offset): "
         + ", ".join(
-            f"{entry['frames']}f whole {entry['walk_vs_whole_relative_l2']:.2e}@{entry['walk_vs_whole_offset']} "
-            f"chunked {entry['walk_vs_chunked_relative_l2']:.2e}@{entry['walk_vs_chunked_offset']}"
+            f"{entry['frames']}f walk {entry['walk_vs_whole_relative_l2']:.2e}@{entry['walk_vs_whole_offset']} "
+            f"hf chunked {max(entry['chunked_pieces_vs_whole_relative_l2']):.2e}"
             for entry in semantics
         )
     )
