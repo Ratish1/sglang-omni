@@ -308,6 +308,47 @@ def test_cosyvoice3_load_weights_maps_custom_and_backbone_keys(
     assert torch.equal(forwarded[0][1], torch.full((3, 3), 3.0))
 
 
+@pytest.mark.parametrize(
+    "device",
+    [
+        "cpu",
+        pytest.param(
+            "cuda",
+            marks=pytest.mark.skipif(
+                not torch.cuda.is_available(), reason="needs a CUDA device"
+            ),
+        ),
+    ],
+)
+def test_cosyvoice3_speech_head_returns_float32_logits(device: str) -> None:
+    """The sampler applies the temperature and the softmax in place in the logits'
+    dtype. From bfloat16 hidden states and weight, the head returns float32 logits
+    equal to the product within float32 accumulation, not rounded to bfloat16."""
+    model = object.__new__(FunCosyVoice3SGLangModel)
+    torch.nn.Module.__init__(model)
+    generator = torch.Generator().manual_seed(0)
+    hidden_states = (torch.randn(4, 64, generator=generator) * 4).to(
+        device=device, dtype=torch.bfloat16
+    )
+    model.speech_embedding = torch.nn.Embedding(8, 64).to(device, torch.bfloat16)
+    model.llm_decoder = torch.nn.Linear(64, 8, bias=False).to(device, torch.bfloat16)
+    model.model = (
+        lambda input_ids, positions, forward_batch, input_embeds, pp_proxy_tensors: (
+            hidden_states
+        )
+    )
+    forward_batch = SimpleNamespace(
+        forward_mode=SimpleNamespace(is_decode=lambda: True, is_extend=lambda: False)
+    )
+    token_ids = torch.zeros(4, dtype=torch.long, device=device)
+
+    output = model(token_ids, token_ids, forward_batch)
+
+    product = hidden_states.double() @ model.llm_decoder.weight.double().T
+    assert output.next_token_logits.dtype == torch.float32
+    assert (output.next_token_logits.double() - product).abs().max() < 1e-3
+
+
 def test_cosyvoice3_runner_builds_prefill_embedding_slice_after_prefix() -> None:
     runner = object.__new__(FunCosyVoice3ModelRunner)
     runner.model = torch.nn.Linear(3, 3, bias=False)

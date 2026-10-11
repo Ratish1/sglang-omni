@@ -92,7 +92,21 @@ class FunCosyVoice3SGLangModel(Qwen2ForCausalLM):
         else:
             pass
 
-        logits = self.llm_decoder(hidden_states)
+        # note(ratish): the sampler applies the temperature and the softmax in place in the
+        # logits' dtype, so the head writes its float32 accumulator, as SGLang's fp32 lm head.
+        speech_head_weight = self.llm_decoder.weight
+        if (
+            hidden_states.is_cuda
+            and hidden_states.dtype == speech_head_weight.dtype
+            and hidden_states.dtype in (torch.float16, torch.bfloat16)
+        ):
+            logits = torch.mm(
+                hidden_states, speech_head_weight.T, out_dtype=torch.float32
+            )
+        else:
+            logits = torch.matmul(
+                hidden_states.to(torch.float32), speech_head_weight.to(torch.float32).T
+            )
         return LogitsProcessorOutput(
             next_token_logits=logits, hidden_states=hidden_states
         )
