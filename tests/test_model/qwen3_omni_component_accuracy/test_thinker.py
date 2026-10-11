@@ -96,7 +96,10 @@ def test_thinker_follows_reference(
     reference_device = os.environ.get("QWEN3_OMNI_ACCURACY_REFERENCE_DEVICE", "cuda:0")
     processor = Qwen3OmniMoeProcessor.from_pretrained(model_path)
     model = Qwen3OmniMoeForConditionalGeneration.from_pretrained(
-        model_path, dtype=torch.bfloat16, device_map={"": reference_device}
+        model_path,
+        dtype=torch.bfloat16,
+        device_map={"": reference_device},
+        enable_audio_output=False,
     )
     thinker = model.thinker.eval()
     records = []
