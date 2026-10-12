@@ -173,6 +173,31 @@ def main() -> None:
         positions[:1],
     )
     assert masked_redraw.tolist() == [9]
+    subset_probabilities = torch.zeros((6, 8), device=device)
+    subset_probabilities[:, 3] = 0.8
+    subset_probabilities[:, 5] = 0.12
+    subset_probabilities[:, 6] = 0.08
+    sampled_ids = torch.full((6,), 3, dtype=torch.int32, device=device)
+    all_rows = torch.arange(6, device=device)
+    selected_rows = torch.tensor([5, 0, 3], device=device)
+    seeds = torch.arange(10, 16, device=device)
+    full_redraw = repetition_aware_redraw(
+        subset_probabilities, sampled_ids, all_rows, seeds, positions
+    )
+    subset_redraw = repetition_aware_redraw(
+        subset_probabilities, sampled_ids, selected_rows, seeds, positions
+    )
+    assert torch.equal(subset_redraw[selected_rows], full_redraw[selected_rows])
+    assert subset_redraw[torch.tensor([1, 2, 4], device=device)].tolist() == [3, 3, 3]
+    permutation = torch.tensor([2, 5, 1, 4, 0, 3], device=device)
+    compact_redraw = repetition_aware_redraw(
+        subset_probabilities[permutation],
+        sampled_ids[permutation],
+        all_rows,
+        seeds[permutation],
+        positions[permutation],
+    )
+    assert torch.equal(compact_redraw, full_redraw[permutation])
     evidence = {
         "candidates": candidate_ids.tolist(),
         "collected_relayed_finalized": expected,
@@ -181,6 +206,7 @@ def main() -> None:
         "collapsed_distribution_kept": True,
         "redrawn_eos_finishes": True,
         "suppressed_eos_stays_suppressed": True,
+        "seeded_subset_and_permutation_match": True,
         "torch": torch.__version__,
         "device": torch.cuda.get_device_name(),
     }
