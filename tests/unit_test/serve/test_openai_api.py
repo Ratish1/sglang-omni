@@ -917,15 +917,12 @@ def test_speech_endpoint_returns_binary_audio() -> None:
     assert response.content == b"RIFF"
     assert response.headers["content-type"] == "audio/wav"
     assert response.headers["x-finish-reason"] == "length"
-<<<<<<< HEAD
     assert response.headers["x-prompt-tokens"] == "5"
     assert response.headers["x-completion-tokens"] == "2"
     assert response.headers["x-sglang-omni-input-tokens"] == "5"
     assert response.headers["x-sglang-omni-output-tokens"] == "2"
     assert response.headers["x-sglang-omni-total-tokens"] == "7"
-=======
     assert response.headers["x-request-id"].startswith("speech-")
->>>>>>> main
     assert speech_client.speech_requests[0].model == "tts"
     assert isinstance(speech_client.speech_requests[0].metadata["tts_params"], dict)
     assert speech_client.speech_requests[0].metadata["tts_params"]["voice"] == "default"
