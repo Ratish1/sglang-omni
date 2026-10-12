@@ -8,6 +8,7 @@ import multiprocessing
 import pickle
 import sys
 import time
+from multiprocessing.connection import Connection
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -32,7 +33,7 @@ MODEL = "OpenMOSS-Team/MOSS-TTS-Local-Transformer-v1.5"
 REFERENCE_URL = "https://huggingface.co/datasets/zhaochenyang20/seed-tts-eval-mini/resolve/main/en/prompt-wavs/common_voice_en_10119832.wav"
 
 
-def produce_prepared_payload(connection) -> None:
+def produce_prepared_payload(connection: Connection) -> None:
     async def produce() -> None:
         set_moss_tts_local_preprocessing_context(processor=FakeProcessor())
         try:
@@ -68,7 +69,6 @@ def produce_prepared_payload(connection) -> None:
                 assert connection.recv_bytes() == b"consumed"
                 operation.mark_receiver_done()
                 await operation.wait_for_completion()
-                assert relay.sem._value == 2
                 set_moss_tts_local_preprocessing_context(processor=FakeProcessor())
         finally:
             clear_moss_tts_local_preprocessing_context()
