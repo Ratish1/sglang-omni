@@ -94,12 +94,7 @@ class FunCosyVoice3SGLangModel(Qwen2ForCausalLM):
         else:
             pass
 
-        if (
-            current_platform.is_cuda()
-            and hidden_states.device.type == "cuda"
-            and hidden_states.dtype in (torch.float16, torch.bfloat16)
-            and hidden_states.dtype == self.llm_decoder.weight.dtype
-        ):
+        if current_platform.is_cuda():
             # note (ratish): the sampler applies the temperature and the softmax in place
             # in the logits' dtype, so the head writes float32 logits.
             logits = torch.mm(
