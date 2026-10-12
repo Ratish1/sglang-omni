@@ -248,12 +248,14 @@ class FunCosyVoice3ModelRunner(ModelRunner):
         sampling_info: SamplingBatchInfo,
         requests: list[SchedulerRequest],
     ) -> torch.Tensor:
-        """Apply the repetition-aware redraw on Torch/MPS.
+        """Apply CosyVoice3's repetition-aware redraw on Torch/MPS.
 
-        A sampled speech token found among the last ten is redrawn once from the
-        full distribution with it masked. SGLang's MPS sampler has already applied
-        the request constraints and left probabilities, so the redraw stays on MPS
-        without the float64 seeded sampler.
+        The upstream CosyVoice sampler draws from top-k/top-p first and, when
+        that candidate appears in the recent ten speech tokens, redraws once
+        from the full distribution with the candidate masked. SGLang's MPS
+        sampler has already applied all request constraints and materialized
+        probabilities by this point, so the second draw can stay on MPS
+        without invoking the float64 seeded sampler.
         """
         request = requests[0]
         request_id = str(request.request_id)
@@ -378,9 +380,7 @@ class FunCosyVoice3ModelRunner(ModelRunner):
         requests: list[SchedulerRequest],
         token_ids: list[int],
     ) -> list[int]:
-        """Redraw each speech token that repeats in its recent window from the full
-        distribution with it masked, so EOS stays reachable after top-k/top-p
-        collapses onto it. Returns the step's host token ids."""
+        """Redraw repeated speech tokens with them masked, so EOS stays reachable."""
         if (
             forward_batch is None
             or not forward_batch.forward_mode.is_decode()
@@ -404,9 +404,8 @@ class FunCosyVoice3ModelRunner(ModelRunner):
             return token_ids
         else:
             pass
-        # note (ratish): both samplers leave the full tempered distribution behind, top-k
-        # and top-p applied to a copy: the pytorch one as probabilities (softmax in
-        # place), the Ascend one as the temperature-scaled logits.
+        # note (ratish): both samplers apply top-k and top-p to a copy,
+        # leaving the tempered probabilities here, or the tempered logits on Ascend.
         if self.tp_worker.model_runner.sampler.use_ascend_backend:
             probs = torch.softmax(
                 result.logits_output.next_token_logits, dim=-1, dtype=torch.float64

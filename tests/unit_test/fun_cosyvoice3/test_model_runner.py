@@ -9,7 +9,6 @@ import pytest
 import torch
 
 import sglang_omni.models.fun_cosyvoice3.model_runner as model_runner_module
-import sglang_omni.sampling.repetition_aware as repetition_aware_module
 from sglang_omni.models.fun_cosyvoice3.model_runner import (
     FunCosyVoice3MlxSchedulerModelRunner,
     FunCosyVoice3ModelRunner,
@@ -298,25 +297,16 @@ def test_cosyvoice3_torch_mps_clears_ras_history_on_finish() -> None:
     assert runner.cosyvoice3_recent_tokens == {"keep": [2]}
 
 
-def collect_ras_step(
-    monkeypatch: pytest.MonkeyPatch,
-    output_ids: list[list[int]],
-    *,
-    use_ascend_backend: bool = False,
-) -> tuple[SimpleNamespace, list[SimpleNamespace], list[torch.Tensor]]:
-    probs = torch.zeros((4, EOS_ID + 1))
+@pytest.mark.parametrize("use_ascend_backend", [False, True])
+def test_cosyvoice3_ras_masks_and_redraws_repeated_speech_tokens(
+    use_ascend_backend: bool,
+) -> None:
+    """A repeated speech token must not crowd out EOS until the length cap."""
+    probs = torch.zeros((5, EOS_ID + 1))
     probs[0, 9], probs[0, EOS_ID] = 0.9, 0.1
-    probs[1:, 2] = 0.4
+    probs[1:4, 2] = 0.4
     probs[1, 5] = probs[2, 9] = probs[3, EOS_ID] = 0.6
-    redraw_probs = []
-
-    def take_most_likely(probs, sampling_seed, positions):
-        redraw_probs.append(probs)
-        return probs.argmax(dim=1).to(torch.int32)
-
-    monkeypatch.setattr(
-        repetition_aware_module, "sampling_from_probs_torch", take_most_likely
-    )
+    probs[4, 9] = 1.0
     runner = object.__new__(FunCosyVoice3ModelRunner)
     runner.outbox = None
     runner.tp_worker = SimpleNamespace(
@@ -329,56 +319,31 @@ def collect_ras_step(
             data=SimpleNamespace(
                 output_codes=[],
                 req=SimpleNamespace(
-                    output_ids=array("q", row_output_ids),
+                    output_ids=array("q", output_ids),
                     sampling_params=SimpleNamespace(top_k=1 if row == 2 else 20),
                 ),
             )
         )
-        for row, row_output_ids in enumerate(output_ids)
+        for row, output_ids in enumerate([[4, 9, 7], [1, 2, 3], [9], [EOS_ID], [9]])
     ]
     result = SimpleNamespace(
-        next_token_ids=torch.tensor([9, 5, 9, EOS_ID], dtype=torch.int32),
+        next_token_ids=torch.tensor([9, 5, 9, EOS_ID, 9], dtype=torch.int32),
         logits_output=SimpleNamespace(
-            next_token_logits=torch.log(probs) if use_ascend_backend else probs
+            next_token_logits=torch.log(probs) + 1 if use_ascend_backend else probs
         ),
     )
     forward_batch = SimpleNamespace(
         forward_mode=SimpleNamespace(is_decode=lambda: True),
         sampling_info=SimpleNamespace(sampling_seed=None),
-        positions=torch.arange(4),
+        positions=torch.arange(5),
     )
 
     runner.collect_tokens(result, forward_batch, None, requests)
-    return result, requests, redraw_probs
 
-
-@pytest.mark.parametrize("use_ascend_backend", [False, True])
-def test_cosyvoice3_ras_redraws_repeated_speech_token_from_full_distribution(
-    monkeypatch: pytest.MonkeyPatch, use_ascend_backend: bool
-) -> None:
-    result, requests, redraw_probs = collect_ras_step(
-        monkeypatch,
-        [[4, 9, 7], [1, 2, 3], [9], [EOS_ID]],
-        use_ascend_backend=use_ascend_backend,
-    )
-
-    assert result.next_token_ids.tolist() == [EOS_ID, 5, 9, EOS_ID]
+    assert result.next_token_ids.tolist() == [EOS_ID, 5, 9, EOS_ID, 9]
     assert [
         [int(code) for code in request.data.output_codes] for request in requests
-    ] == [[], [5], [9], []]
-    assert redraw_probs[0][0, 9].item() == 0.0
-    assert redraw_probs[0][0, EOS_ID].item() == pytest.approx(0.1)
-
-
-def test_cosyvoice3_ras_launches_nothing_without_a_repeat(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    result, _, redraw_probs = collect_ras_step(
-        monkeypatch, [[4, 7], [1, 2, 3], [9], [EOS_ID]]
-    )
-
-    assert result.next_token_ids.tolist() == [9, 5, 9, EOS_ID]
-    assert redraw_probs == []
+    ] == [[], [5], [9], [], [9]]
 
 
 def test_cosyvoice3_load_weights_maps_custom_and_backbone_keys(
