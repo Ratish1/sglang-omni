@@ -92,11 +92,12 @@ class FunCosyVoice3SGLangModel(Qwen2ForCausalLM):
         else:
             pass
 
-        # note(ratish): the sampler applies the temperature and the softmax in place in the
+        # note (ratish): the sampler applies the temperature and the softmax in place in the
         # logits' dtype, so the head writes its float32 accumulator, as SGLang's fp32 lm head.
         speech_head_weight = self.llm_decoder.weight
+        # note (ratish): device.type, since transfer_to_npu sets is_cuda on NPU tensors.
         if (
-            hidden_states.is_cuda
+            hidden_states.device.type == "cuda"
             and hidden_states.dtype == speech_head_weight.dtype
             and hidden_states.dtype in (torch.float16, torch.bfloat16)
         ):

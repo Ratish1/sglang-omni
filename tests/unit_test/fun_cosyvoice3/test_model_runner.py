@@ -444,9 +444,7 @@ def test_cosyvoice3_load_weights_maps_custom_and_backbone_keys(
     ],
 )
 def test_cosyvoice3_speech_head_returns_float32_logits(device: str) -> None:
-    """The sampler applies the temperature and the softmax in place in the logits'
-    dtype. From bfloat16 hidden states and weight, the head returns float32 logits
-    equal to the product within float32 accumulation, not rounded to bfloat16."""
+    """bf16 logits make the sampler's temperature and softmax run in bf16."""
     model = object.__new__(FunCosyVoice3SGLangModel)
     torch.nn.Module.__init__(model)
     generator = torch.Generator().manual_seed(0)
