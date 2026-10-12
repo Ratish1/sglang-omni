@@ -14,7 +14,11 @@ from sglang_omni.models.llada2_uni.components import decoder_runtime as runtime
 @pytest.fixture
 def owned_runtime():
     events: list[str] = []
-    tls = threading.local()
+
+    class PrecisionState(threading.local):
+        state = None
+
+    tls = PrecisionState()
 
     def set_policy(**kwargs):
         tls.state = SimpleNamespace(**kwargs)
@@ -52,10 +56,10 @@ def test_compute_context_is_thread_local_and_restored(owned_runtime):
     tls.state = main_state
 
     def scheduler_work():
-        assert not hasattr(tls, "state")
+        assert tls.state is None
         with handle.compute_context():
             assert tls.state.param_dtype == torch.bfloat16
-        assert not hasattr(tls, "state")
+        assert tls.state is None
         handle.close()
 
     with ThreadPoolExecutor(max_workers=1) as executor:

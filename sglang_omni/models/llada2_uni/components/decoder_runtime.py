@@ -52,18 +52,14 @@ class DecoderRuntimeHandle:
             state = (
                 self.precision._mixed_precision_state
             )  # noqa: leading-underscore  # SGLang API
-            missing = object()
-            previous = getattr(state, "state", missing)
+            previous = state.state
             self.precision.set_mixed_precision_policy(
                 param_dtype=self.dtype, reduce_dtype=torch.float32
             )
             try:
                 yield
             finally:
-                if previous is missing:
-                    del state.state
-                else:
-                    state.state = previous
+                state.state = previous
 
     def validate(self) -> None:
         if self.closed:

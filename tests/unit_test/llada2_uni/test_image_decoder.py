@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from types import SimpleNamespace
 
 import pytest
@@ -18,6 +19,7 @@ from sglang_omni.models.llada2_uni.components.image_decoder import (
     LLaDA2ImageDecoder,
     create_decoder_model_fn,
 )
+from sglang_omni.models.llada2_uni.components.transport import sample_velocity
 
 
 @pytest.fixture
@@ -96,6 +98,94 @@ def test_cfg_batched_model_fn():
     assert actual.dtype == torch.float32
     assert calls[0]["cap_feats"] == positive + negative
     assert len(calls[0]["x"]) == 4
+
+
+def test_turbo_sampler_matches_reference_and_preserves_rng():
+    initial_latents = torch.arange(8, dtype=torch.float32).reshape(1, 2, 2, 2)
+
+    def velocity_model(latents: torch.Tensor, timestep: torch.Tensor) -> torch.Tensor:
+        return latents * 0.125 + timestep.reshape(-1, 1, 1, 1) * 0.25
+
+    actual_generator = torch.Generator().manual_seed(29)
+    actual = sample_velocity(
+        initial_latents,
+        velocity_model,
+        num_steps=3,
+        turbo=True,
+        generator=actual_generator,
+    )
+
+    reference_generator = torch.Generator().manual_seed(29)
+    reference_timesteps = torch.linspace(0, 1, 4, dtype=torch.float64)
+    reference_latents = initial_latents.to(torch.float64)
+    for current_time, next_time in zip(
+        reference_timesteps[:-1], reference_timesteps[1:]
+    ):
+        batch_time = (
+            torch.ones(reference_latents.shape[0], dtype=reference_latents.dtype)
+            * current_time
+        )
+        prediction = velocity_model(reference_latents, batch_time)
+        expanded_time = batch_time[(...,) + (None,) * (reference_latents.ndim - 1)]
+        alpha, sigma = expanded_time, 1 - expanded_time
+        denominator = sigma - -alpha
+        clean = (sigma * prediction - -reference_latents) / denominator
+        noise_estimate = (reference_latents - alpha * prediction) / denominator
+        next_batch_time = torch.ones_like(batch_time) * next_time
+        next_alpha = next_batch_time[(...,) + (None,) * (reference_latents.ndim - 1)]
+        next_sigma = 1 - next_alpha
+        noise = torch.randn(
+            reference_latents.shape,
+            dtype=reference_latents.dtype,
+            generator=reference_generator,
+        )
+        reference_latents = next_alpha * clean + next_sigma * noise
+
+    torch.testing.assert_close(actual, reference_latents)
+    torch.testing.assert_close(
+        torch.randn(4, generator=actual_generator),
+        torch.randn(4, generator=reference_generator),
+    )
+
+
+def test_sampler_step_bounds_and_forward_counts():
+    initial_latents = torch.zeros(1, 1, 1, 1)
+
+    def count_forwards(
+        calls: list[torch.Tensor],
+    ) -> Callable[[torch.Tensor, torch.Tensor], torch.Tensor]:
+        def model(latents: torch.Tensor, timestep: torch.Tensor) -> torch.Tensor:
+            calls.append(timestep.clone())
+            return torch.zeros_like(latents)
+
+        return model
+
+    with pytest.raises(ValueError, match="Normal sampler num_steps must be at least 2"):
+        sample_velocity(
+            initial_latents,
+            count_forwards([]),
+            num_steps=1,
+            turbo=False,
+        )
+
+    normal_calls = []
+    sample_velocity(
+        initial_latents,
+        count_forwards(normal_calls),
+        num_steps=2,
+        turbo=False,
+    )
+    assert len(normal_calls) == 1
+
+    turbo_calls = []
+    sample_velocity(
+        initial_latents,
+        count_forwards(turbo_calls),
+        num_steps=1,
+        turbo=True,
+        generator=torch.Generator().manual_seed(29),
+    )
+    assert len(turbo_calls) == 1
 
 
 @pytest.fixture

@@ -10,7 +10,6 @@ import torch.multiprocessing as mp
 
 
 def native_worker(rank, directory, cfg, dtype):
-    os.environ["CUDA_VISIBLE_DEVICES"] = "0"
     os.environ["LOCAL_RANK"] = "0"
     os.environ["RANK"] = "0"
     os.environ["WORLD_SIZE"] = "1"
@@ -59,7 +58,7 @@ def native_worker(rank, directory, cfg, dtype):
     os.environ.get("LLADA_DECODER_GPU_TEST") != "1",
     reason="opt-in real native GPU test",
 )
-def test_sglang_backend_matches_diffusers(tmp_path, monkeypatch):
+def test_sglang_backend_matches_diffusers(tmp_path):
     from diffusers.models.transformers.transformer_z_image import (
         ZImageTransformer2DModel,
     )
@@ -67,7 +66,6 @@ def test_sglang_backend_matches_diffusers(tmp_path, monkeypatch):
 
     from sglang_omni.models.llada2_uni.components.decoder_model import decoder_config
 
-    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "0")
     dtype = torch.bfloat16
     cfg = decoder_config(
         {

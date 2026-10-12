@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+from typing import Literal
 
 import torch
 import torch.nn.functional as F
@@ -25,8 +26,12 @@ from sglang_omni.models.llada2_uni.components.transport import (
     sample_velocity,
 )
 from sglang_omni.models.weight_loader import resolve_model_path
+from sglang_omni.utils.device import resolve_concrete_device
 
 logger = logging.getLogger(__name__)
+
+DecoderBackend = Literal["diffusers", "sglang"]
+DecoderMode = Literal["normal", "decoder-turbo"]
 
 
 def create_decoder_model_fn(
@@ -110,11 +115,11 @@ class LLaDA2ImageDecoder:
         model_path: str,
         device: str = "cuda",
         dtype: torch.dtype = torch.bfloat16,
-        decode_mode: str = "normal",
+        decode_mode: DecoderMode = "normal",
         num_steps: int = 50,
         resolution_multiplier: int = 2,
         *,
-        backend: str = "diffusers",
+        backend: DecoderBackend = "diffusers",
         runtime: DecoderRuntimeHandle | None = None,
     ) -> None:
         if backend not in {"diffusers", "sglang"}:
@@ -131,7 +136,7 @@ class LLaDA2ImageDecoder:
             pass
         self.validate_settings(decode_mode, num_steps, resolution_multiplier)
         self.backend = backend
-        self.device = torch.device(device)
+        self.device = resolve_concrete_device(device)
         self.dtype = dtype
         self.runtime = runtime
         if runtime is not None:
@@ -142,7 +147,7 @@ class LLaDA2ImageDecoder:
         else:
             pass
         self.model_path = str(resolve_model_path(model_path))
-        self.decode_mode = decode_mode
+        self.decode_mode: DecoderMode = decode_mode
         self.num_steps = num_steps
         self.resolution_multiplier = resolution_multiplier
 
@@ -153,13 +158,18 @@ class LLaDA2ImageDecoder:
         self.diff_config: DecoderConfig | None = None
 
     @staticmethod
-    def validate_settings(mode: str, steps: int, resolution_multiplier: int) -> None:
+    def validate_settings(
+        mode: DecoderMode, steps: int, resolution_multiplier: int
+    ) -> None:
         if mode not in {"normal", "decoder-turbo"}:
             raise ValueError(f"Unsupported image decoder mode: {mode!r}")
         else:
             pass
-        if not isinstance(steps, int) or steps < 1:
-            raise ValueError("Image decoder num_steps must be positive")
+        minimum_steps = 1 if mode == "decoder-turbo" else 2
+        if not isinstance(steps, int) or steps < minimum_steps:
+            raise ValueError(
+                f"Image decoder {mode} num_steps must be at least {minimum_steps}"
+            )
         else:
             pass
         if not isinstance(resolution_multiplier, int) or resolution_multiplier < 1:
@@ -184,7 +194,7 @@ class LLaDA2ImageDecoder:
         self.sigvq = sigvq.eval()
         logger.info(f"SigVQ loaded from {sigvq_path}")
 
-    def ensure_diff_model(self, decode_mode: str) -> None:
+    def ensure_diff_model(self, decode_mode: DecoderMode) -> None:
         if self.diff_model is not None and self.diff_model_mode == decode_mode:
             return
         else:
@@ -250,7 +260,7 @@ class LLaDA2ImageDecoder:
         h: int,
         w: int,
         *,
-        decode_mode: str | None = None,
+        decode_mode: DecoderMode | None = None,
         num_steps: int | None = None,
         resolution_multiplier: int | None = None,
         seed: int | None = None,
@@ -259,7 +269,7 @@ class LLaDA2ImageDecoder:
 
         Switching decode_mode reloads weights; seed=None uses the global RNG.
         """
-        mode = decode_mode if decode_mode is not None else self.decode_mode
+        mode: DecoderMode = decode_mode if decode_mode is not None else self.decode_mode
         steps = num_steps if num_steps is not None else self.num_steps
         output_resolution_multiplier = (
             resolution_multiplier

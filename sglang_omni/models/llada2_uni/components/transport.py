@@ -23,6 +23,14 @@ def sample_velocity(
     generator: torch.Generator | None = None,
 ) -> torch.Tensor:
     """Keep the checkpoint's time grid, accumulation dtype, and noise draws."""
+    minimum_steps = 1 if turbo else 2
+    if type(num_steps) is not int or num_steps < minimum_steps:
+        raise ValueError(
+            f"{'Turbo' if turbo else 'Normal'} sampler num_steps must be at least "
+            f"{minimum_steps}"
+        )
+    else:
+        pass
     if not turbo:
         timesteps = torch.linspace(0, 1, num_steps)
         timesteps = timesteps / (timesteps + 6 - 6 * timesteps)
