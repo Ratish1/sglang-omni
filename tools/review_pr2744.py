@@ -108,6 +108,7 @@ def sample_and_complete() -> dict[str, list[int] | bool]:
         result = GenerationBatchResult(logits_output=logits, next_token_ids=candidates)
         runner = object.__new__(FunCosyVoice3ModelRunner)
         runner.outbox = Queue()
+        runner.vocoder_target = "vocoder"
         runner.token_hop_len = 25
         runner.ar_followup_flush_tokens = 25
         runner.token_id_host_bufs = None
