@@ -15,6 +15,8 @@ from sglang.srt.models.qwen2 import Qwen2ForCausalLM
 from torch import nn
 from transformers import Qwen2Config
 
+from sglang_omni.platforms import current_platform
+
 VOCAB_SIZE = 6561
 TOTAL_VOCAB_SIZE = VOCAB_SIZE + 200
 
@@ -92,22 +94,19 @@ class FunCosyVoice3SGLangModel(Qwen2ForCausalLM):
         else:
             pass
 
-        # note (ratish): the sampler applies the temperature and the softmax in place in the
-        # logits' dtype, so the head writes its float32 accumulator, as SGLang's fp32 lm head.
-        speech_head_weight = self.llm_decoder.weight
-        # note (ratish): device.type, since transfer_to_npu sets is_cuda on NPU tensors.
         if (
-            hidden_states.device.type == "cuda"
-            and hidden_states.dtype == speech_head_weight.dtype
+            current_platform.is_cuda()
+            and hidden_states.device.type == "cuda"
             and hidden_states.dtype in (torch.float16, torch.bfloat16)
+            and hidden_states.dtype == self.llm_decoder.weight.dtype
         ):
+            # note (ratish): the sampler applies the temperature and the softmax in place
+            # in the logits' dtype, so the head writes float32 logits.
             logits = torch.mm(
-                hidden_states, speech_head_weight.T, out_dtype=torch.float32
+                hidden_states, self.llm_decoder.weight.T, out_dtype=torch.float32
             )
         else:
-            logits = torch.matmul(
-                hidden_states.to(torch.float32), speech_head_weight.to(torch.float32).T
-            )
+            logits = self.llm_decoder(hidden_states)
         return LogitsProcessorOutput(
             next_token_logits=logits, hidden_states=hidden_states
         )

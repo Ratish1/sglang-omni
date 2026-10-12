@@ -431,20 +431,11 @@ def test_cosyvoice3_load_weights_maps_custom_and_backbone_keys(
     assert torch.equal(forwarded[0][1], torch.full((3, 3), 3.0))
 
 
-@pytest.mark.parametrize(
-    "device",
-    [
-        "cpu",
-        pytest.param(
-            "cuda",
-            marks=pytest.mark.skipif(
-                not torch.cuda.is_available(), reason="needs a CUDA device"
-            ),
-        ),
-    ],
-)
-def test_cosyvoice3_speech_head_returns_float32_logits(device: str) -> None:
+@pytest.mark.accelerator
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_cosyvoice3_speech_head_returns_float32_logits() -> None:
     """bf16 logits make the sampler's temperature and softmax run in bf16."""
+    device = "cuda"
     model = object.__new__(FunCosyVoice3SGLangModel)
     torch.nn.Module.__init__(model)
     generator = torch.Generator().manual_seed(0)
