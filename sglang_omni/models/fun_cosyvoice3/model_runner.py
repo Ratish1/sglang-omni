@@ -381,13 +381,10 @@ class FunCosyVoice3ModelRunner(ModelRunner):
         """Redraw each speech token that repeats in its recent window from the full
         distribution with it masked, so EOS stays reachable after top-k/top-p
         collapses onto it. Returns the step's host token ids."""
-        # note (Yucheng Hu): the Ascend sampler leaves temperature-scaled logits behind,
-        # not probabilities.
         if (
             forward_batch is None
             or not forward_batch.forward_mode.is_decode()
             or self.uses_mps_ras_fallback(result.next_token_ids)
-            or self.tp_worker.model_runner.sampler.use_ascend_backend
         ):
             return token_ids
         else:
@@ -407,9 +404,15 @@ class FunCosyVoice3ModelRunner(ModelRunner):
             return token_ids
         else:
             pass
-        # note (Yucheng Hu): the pytorch sampler softmaxes next_token_logits in place
-        # and applies top-k/top-p to a sorted copy.
-        probs = result.logits_output.next_token_logits
+        # note (ratish): both samplers leave the full tempered distribution behind, top-k
+        # and top-p applied to a copy: the pytorch one as probabilities (softmax in
+        # place), the Ascend one as the temperature-scaled logits.
+        if self.tp_worker.model_runner.sampler.use_ascend_backend:
+            probs = torch.softmax(
+                result.logits_output.next_token_logits, dim=-1, dtype=torch.float64
+            )
+        else:
+            probs = result.logits_output.next_token_logits
         redrawn_ids = repetition_aware_redraw(
             probs,
             result.next_token_ids.reshape(-1),

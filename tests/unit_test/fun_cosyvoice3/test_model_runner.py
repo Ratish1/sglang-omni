@@ -339,7 +339,9 @@ def collect_ras_step(
     ]
     result = SimpleNamespace(
         next_token_ids=torch.tensor([9, 5, 9, EOS_ID], dtype=torch.int32),
-        logits_output=SimpleNamespace(next_token_logits=probs),
+        logits_output=SimpleNamespace(
+            next_token_logits=torch.log(probs) if use_ascend_backend else probs
+        ),
     )
     forward_batch = SimpleNamespace(
         forward_mode=SimpleNamespace(is_decode=lambda: True),
@@ -351,11 +353,14 @@ def collect_ras_step(
     return result, requests, redraw_probs
 
 
+@pytest.mark.parametrize("use_ascend_backend", [False, True])
 def test_cosyvoice3_ras_redraws_repeated_speech_token_from_full_distribution(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, use_ascend_backend: bool
 ) -> None:
     result, requests, redraw_probs = collect_ras_step(
-        monkeypatch, [[4, 9, 7], [1, 2, 3], [9], [EOS_ID]]
+        monkeypatch,
+        [[4, 9, 7], [1, 2, 3], [9], [EOS_ID]],
+        use_ascend_backend=use_ascend_backend,
     )
 
     assert result.next_token_ids.tolist() == [EOS_ID, 5, 9, EOS_ID]
@@ -371,17 +376,6 @@ def test_cosyvoice3_ras_launches_nothing_without_a_repeat(
 ) -> None:
     result, _, redraw_probs = collect_ras_step(
         monkeypatch, [[4, 7], [1, 2, 3], [9], [EOS_ID]]
-    )
-
-    assert result.next_token_ids.tolist() == [9, 5, 9, EOS_ID]
-    assert redraw_probs == []
-
-
-def test_cosyvoice3_ras_leaves_ascend_draws_unchanged(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    result, _, redraw_probs = collect_ras_step(
-        monkeypatch, [[4, 9, 7], [1, 2, 3], [9], [EOS_ID]], use_ascend_backend=True
     )
 
     assert result.next_token_ids.tolist() == [9, 5, 9, EOS_ID]
