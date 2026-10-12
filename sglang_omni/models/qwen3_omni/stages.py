@@ -1367,7 +1367,7 @@ def create_talker_ar_executor_from_config(
     tp_rank: int = 0,
     tp_size: int = 1,
     nccl_port: int | None = None,
-    max_seq_len: int = 4096,
+    max_seq_len: int | None = None,
     server_args_overrides: Mapping[str, object] | None = None,
     speech_enabled: bool = True,
     feedback_enabled: bool = True,

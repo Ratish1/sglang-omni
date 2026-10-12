@@ -338,8 +338,6 @@ class Qwen3OmniPreprocessor:
         )
         self.model_dir = resolve_local_model_dir(model_path)
         if max_seq_len is None:
-            # note (ratish): the thinker's context as sglang derives it from the checkpoint,
-            # so this prompt check enforces the thinker's own limit.
             thinker_text_config = AutoConfig.from_pretrained(
                 self.model_dir, trust_remote_code=True
             ).thinker_config.text_config

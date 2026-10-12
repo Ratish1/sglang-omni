@@ -22,7 +22,7 @@ from sglang_omni.models.qwen3_omni.payload_types import (
     ThinkerOutput,
 )
 from sglang_omni.pipeline.stage.stream_queue import StreamItem
-from sglang_omni.proto import EXPLICIT_GENERATION_PARAMS_KEY, OmniRequest, StagePayload
+from sglang_omni.proto import OmniRequest, StagePayload
 from sglang_omni.scheduling.message import OutgoingMessage
 from sglang_omni.scheduling.pending_text_queue import (
     PendingTextTensorQueue,
@@ -981,6 +981,8 @@ def build_sglang_talker_request(
     else:
         req.omni_model_inputs = None
 
+    # note (ratish): sglang's request limits cut the frame cap to the context the
+    # replayed prompt leaves, so a long spoken prompt gets shorter audio, not an error.
     data = SGLangARRequestData(
         input_ids=input_ids_tensor,
         max_new_tokens=max_new_tokens,
@@ -988,6 +990,7 @@ def build_sglang_talker_request(
         output_ids=req.output_ids,
         req=req,
         prefill_input_embeds=prefill_embeds_tensor,
+        enforce_request_limits=True,
     )
     data.suppress_tokens = list(
         req._codec_suppress_tokens or []
@@ -1107,16 +1110,7 @@ def make_thinker_scheduler_adapters(
 
     def request_builder(payload: StagePayload) -> SGLangARRequestData:
         state = Qwen3OmniPipelineState.from_dict(payload.data)
-        params = dict(payload.request.params or {})
-        explicit_fields = (
-            payload.request.metadata.get(EXPLICIT_GENERATION_PARAMS_KEY) or ()
-        )
-        # note (ratish): the model card evaluates greedily, so a temperature the caller did not
-        # set (the API layer fills in the OpenAI default) gives way to the thinker's default.
-        if "temperature" not in explicit_fields:
-            params.pop("temperature", None)
-        else:
-            pass
+        params = payload.request.params or {}
         req_data = build_sglang_thinker_request(
             state,
             params=params,

@@ -2622,50 +2622,98 @@ def test_threaded_preprocessing_loads_repeated_remote_images(monkeypatch):
     assert not worker.is_alive()
 
 
-@pytest.mark.parametrize(
-    ("explicit_fields", "params", "expected_temperature"),
-    [
-        (["max_new_tokens"], {"temperature": 1.0}, None),
-        (["temperature"], {"temperature": 0.7}, 0.7),
-        (None, {"temperature": 1.0}, None),
-    ],
-)
-def test_qwen_thinker_temperature_is_greedy_unless_the_caller_sets_it(
-    monkeypatch, explicit_fields, params, expected_temperature
-) -> None:
-    """A temperature the caller did not set gives way to the thinker's greedy default,
-    with or without other explicit fields; the caller's own value passes through."""
-    from sglang_omni.models.qwen3_omni import request_builders
-    from sglang_omni.proto import EXPLICIT_GENERATION_PARAMS_KEY
+def test_speech_talker_clamps_frames_to_the_context_a_long_prompt_leaves() -> None:
+    """A spoken prompt the speech pipeline admits at its front reaches the talker with its
+    frame cap cut to the context left, instead of failing after the thinker answered."""
+    from collections import deque
+    from queue import Queue
 
-    seen: dict[str, object] = {}
+    from sglang.srt.runtime_context import get_context
 
-    def build(state, *, params, **kwargs):
-        seen.update(params)
-        return SimpleNamespace(stage_payload=None)
-
-    monkeypatch.setattr(request_builders, "build_sglang_thinker_request", build)
-    monkeypatch.setattr(
-        request_builders.Qwen3OmniPipelineState, "from_dict", lambda data: None
+    from sglang_omni.models.qwen3_omni.components.talker_input import (
+        build_prefill_input,
     )
-    request_builder, _ = request_builders.make_thinker_scheduler_adapters(
-        tokenizer=None, vocab_size=16
+    from sglang_omni.models.qwen3_omni.request_builders import (
+        build_sglang_talker_request,
     )
-    metadata = (
-        {EXPLICIT_GENERATION_PARAMS_KEY: explicit_fields}
-        if explicit_fields is not None
-        else {}
+    from sglang_omni.scheduling.omni_scheduler import OmniScheduler
+    from tests.unit_test.pipeline.test_scheduler import (
+        init_sync_request_build_state,
+        new_stage_payload,
     )
 
-    request_builder(
-        StagePayload(
-            request_id="greedy-default",
-            request=OmniRequest(inputs=None, params=params, metadata=metadata),
-            data={},
+    checkpoint_context = 65536
+    config = Qwen3OmniSpeechPipelineConfig(model_path="model")
+    contexts = {}
+    for name in ("preprocessing", "talker_ar"):
+        stage = make_stage(config, name)
+        factory = import_string(stage.factory_path)
+        factory_default = inspect.signature(factory).parameters["max_seq_len"].default
+        contexts[name] = (
+            resolve_stage_factory_args(stage, config).get(
+                "max_seq_len", factory_default
+            )
+            or checkpoint_context
         )
+    ids = torch.tensor([1, 2, 3] + [4] * 62444 + [1, 5, 3, 6])
+    preprocessor_mod.validate_prompt_seq_len(ids, max_seq_len=contexts["preprocessing"])
+    embeddings = torch.zeros(ids.numel(), 2)
+    prefill = build_prefill_input(
+        thinker_embed=embeddings,
+        thinker_hidden=embeddings,
+        thinker_input_ids=ids,
+        multimodal_mask=torch.zeros(ids.numel(), dtype=torch.bool),
+        text_projection=torch.nn.Identity(),
+        hidden_projection=torch.nn.Identity(),
+        codec_embed_fn=torch.nn.Embedding(16, 2),
+        tts_bos_embed=torch.zeros(1, 2),
+        tts_eos_embed=torch.zeros(1, 2),
+        tts_pad_embed=torch.zeros(1, 2),
+        im_start_token_id=1,
+        system_token_id=7,
+        user_token_id=2,
+        assistant_token_id=5,
+        speaker_id=8,
+        codec_nothink_id=9,
+        codec_think_bos_id=10,
+        codec_think_eos_id=11,
+        codec_pad_id=12,
+        codec_bos_id=13,
+        tts_pad_token_id=14,
     )
+    talker = build_sglang_talker_request(
+        torch.empty(0),
+        tokenizer=None,
+        codec_vocab_size=3072,
+        max_new_tokens=4096,
+        talker_input_embeds=prefill["input_embeds"],
+        talker_input_ids=prefill["input_ids"],
+        input_embeds_are_projected=True,
+    )
+    scheduler = object.__new__(OmniScheduler)
+    scheduler.outbox = Queue()
+    scheduler.waiting_queue = []
+    scheduler.pending_stream_ingress = {}
+    scheduler.deferred_request_payloads = {}
+    scheduler.dirty_deferred_request_ids = set()
+    scheduler.aborted_request_ids = set()
+    scheduler.aborted_request_id_order = deque()
+    scheduler.max_req_len = contexts["talker_ar"] - 1
+    scheduler.max_req_input_len = scheduler.max_req_len - 1
+    scheduler.max_new_tokens_limit = None
+    scheduler.page_size = 1
+    scheduler.max_total_num_tokens = 2 * checkpoint_context
+    init_sync_request_build_state(scheduler)
+    scheduler.request_builder = lambda payload: talker
 
-    assert seen.get("temperature") == expected_temperature
+    with get_context().override_server_args():
+        scheduler.process_input_requests([new_stage_payload(talker.req.rid)])
+
+    assert scheduler.outbox.empty()
+    assert scheduler.waiting_queue == [talker.req]
+    assert talker.max_new_tokens == (
+        scheduler.max_req_len - len(talker.req.origin_input_ids) - 1
+    )
 
 
 class ProcessorCalled(Exception):
