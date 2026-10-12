@@ -3,8 +3,11 @@
 
 from __future__ import annotations
 
+import base64
+import io
 import logging
 from collections.abc import Mapping
+from contextlib import nullcontext
 from typing import TYPE_CHECKING
 
 from typing_extensions import NotRequired, TypedDict
@@ -15,8 +18,14 @@ else:
     pass
 
 from sglang_omni.models.llada2_uni.config import IMAGE_STAGE, THINKER_STAGE
-from sglang_omni.models.llada2_uni.payload_types import LLaDA2UniEvent
+from sglang_omni.models.llada2_uni.payload_types import (
+    LLaDA2UniEvent,
+    LLaDA2UniPipelineState,
+)
+from sglang_omni.models.weight_loader import resolve_dtype
 from sglang_omni.proto import StagePayload
+from sglang_omni.scheduling.simple_scheduler import SimpleScheduler
+from sglang_omni.utils.device import resolve_concrete_device
 
 logger = logging.getLogger(__name__)
 
@@ -55,7 +64,6 @@ def create_preprocessing_executor(
     max_seq_len: int | None = None,
 ):
     from sglang_omni.models.llada2_uni.components.preprocessor import LLaDA2Preprocessor
-    from sglang_omni.scheduling.simple_scheduler import SimpleScheduler
 
     preprocessor = LLaDA2Preprocessor(
         model_path=model_path,
@@ -76,15 +84,11 @@ def create_image_encoder_executor(
     from sglang_omni.models.llada2_uni.components.image_encoder import (
         LLaDA2ImageEncoder,
     )
-    from sglang_omni.models.llada2_uni.payload_types import LLaDA2UniPipelineState
     from sglang_omni.models.llada2_uni.request_builders import (
         apply_encoder_result,
         build_encoder_request,
         merge_image_tokens_for_thinker,
     )
-    from sglang_omni.models.weight_loader import resolve_dtype
-    from sglang_omni.scheduling.simple_scheduler import SimpleScheduler
-    from sglang_omni.utils.device import resolve_concrete_device
 
     dtype = resolve_dtype(dtype)
     device = str(resolve_concrete_device(device, gpu_id))
@@ -127,7 +131,6 @@ def create_sglang_dllm_thinker_executor_from_config(
         build_sglang_server_args,
         pin_resolved_device_type,
     )
-    from sglang_omni.utils.device import resolve_concrete_device
 
     concrete_device = resolve_concrete_device(device, gpu_id)
     resolved_gpu_id = concrete_device.index or 0
@@ -173,8 +176,6 @@ def create_sglang_dllm_thinker_executor_from_config(
 def create_decode_executor(model_path: str):
     from sglang_omni.models.llada2_uni.components.common import load_llada2_tokenizer
     from sglang_omni.models.llada2_uni.merge import decode_events
-    from sglang_omni.models.llada2_uni.payload_types import LLaDA2UniPipelineState
-    from sglang_omni.scheduling.simple_scheduler import SimpleScheduler
 
     tokenizer = load_llada2_tokenizer(model_path)
 
@@ -252,19 +253,11 @@ def create_image_decode_executor(
     resolution_multiplier: int = 2,
     backend: str = "diffusers",
     attention_backend: str = "torch_sdpa",
-):
-    import base64
-    import io
-    from contextlib import nullcontext
-
+) -> SimpleScheduler[StagePayload, StagePayload]:
     from sglang_omni.models.llada2_uni.components.image_decoder import (
         LLaDA2ImageDecoder,
     )
     from sglang_omni.models.llada2_uni.merge import extract_image_vq_tokens
-    from sglang_omni.models.llada2_uni.payload_types import LLaDA2UniPipelineState
-    from sglang_omni.models.weight_loader import resolve_dtype
-    from sglang_omni.scheduling.simple_scheduler import SimpleScheduler
-    from sglang_omni.utils.device import resolve_concrete_device
 
     concrete_device = resolve_concrete_device(device, gpu_id)
     dtype = resolve_dtype(dtype)
@@ -356,7 +349,7 @@ def create_image_decode_executor(
     else:
         pass
 
-    class ImageDecoderScheduler(SimpleScheduler):
+    class ImageDecoderScheduler(SimpleScheduler[StagePayload, StagePayload]):
         def start(self) -> None:
             try:
                 super().start()

@@ -8,8 +8,10 @@ import base64
 import io
 import os
 import re
+from contextlib import nullcontext
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 import torch
@@ -18,6 +20,7 @@ from diffusers.models.transformers.transformer_z_image import ZImageTransformer2
 from PIL import Image
 from safetensors.torch import save_file
 
+from sglang_omni.models.llada2_uni.components import decoder_runtime
 from sglang_omni.models.llada2_uni.components import image_decoder as decoder_module
 from sglang_omni.models.llada2_uni.components.decoder_model import (
     DecoderConfig,
@@ -44,6 +47,7 @@ from sglang_omni.models.llada2_uni.request_builders import (
 )
 from sglang_omni.models.llada2_uni.stages import create_image_decode_executor
 from sglang_omni.proto import OmniRequest, StagePayload
+from sglang_omni.scheduling.simple_scheduler import SimpleScheduler
 
 
 def native_worker(
@@ -158,6 +162,43 @@ def test_sglang_backend_matches_diffusers(tmp_path: Path) -> None:
     )
     actual = torch.load(tmp_path / "native.pt", weights_only=True)
     torch.testing.assert_close(actual.float(), expected, rtol=2e-2, atol=2e-2)
+
+
+def test_sglang_decoder_factory_wiring(monkeypatch: pytest.MonkeyPatch) -> None:
+    runtime = Mock(spec=decoder_runtime.DecoderRuntimeHandle)
+    runtime.compute_context.return_value = nullcontext()
+    initialize = Mock(return_value=runtime)
+    decoder = Mock(spec=LLaDA2ImageDecoder)
+    decoder.decode.return_value = Image.new("RGB", (8, 8))
+    constructor = Mock(return_value=decoder)
+    monkeypatch.setattr(decoder_runtime, "initialize_decoder_runtime", initialize)
+    monkeypatch.setattr(decoder_module, "LLaDA2ImageDecoder", constructor)
+
+    scheduler = create_image_decode_executor("unused", device="cpu", backend="sglang")
+    state = LLaDA2UniPipelineState(
+        task_kind="t2i",
+        thinker_out={"output_ids": [IMAGE_TOKEN_OFFSET + 3]},
+        request_metadata={"image_generation": {"decode_mode": "decoder-turbo"}},
+    )
+    payload = StagePayload(
+        request_id="decoder-wiring",
+        request=OmniRequest(inputs={}),
+        data=state.to_dict(),
+    )
+    assert scheduler.fn(payload) is payload
+    assert constructor.call_args.kwargs["runtime"] is runtime
+    assert constructor.call_args.kwargs["backend"] == "sglang"
+    initialize.assert_called_once_with(
+        "unused", gpu_id=None, dtype=torch.bfloat16, attention_backend="torch_sdpa"
+    )
+    decoder.decode.assert_called_once_with(
+        [3], 1, 1, decode_mode="decoder-turbo", num_steps=8
+    )
+    assert payload.data["format"] == "png" and payload.data["image"]
+    assert runtime.compute_context.call_count == 2
+    monkeypatch.setattr(SimpleScheduler, "start", lambda self: None)
+    scheduler.start()
+    runtime.close.assert_called_once_with()
 
 
 @pytest.fixture
