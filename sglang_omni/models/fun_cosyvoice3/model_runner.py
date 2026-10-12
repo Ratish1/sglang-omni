@@ -51,7 +51,7 @@ if TYPE_CHECKING:
 else:
     pass
 
-_COSYVOICE3_RAS_WINDOW_SIZE = 10
+COSYVOICE3_RAS_WINDOW_SIZE = 10
 
 
 class FunCosyVoice3ModelRunner(ModelRunner):
@@ -272,7 +272,7 @@ class FunCosyVoice3ModelRunner(ModelRunner):
             probs,
             next_token_ids,
             [request.data.req.output_ids for request in requests],
-            _COSYVOICE3_RAS_WINDOW_SIZE,
+            COSYVOICE3_RAS_WINDOW_SIZE,
             (next_token_ids < VOCAB_SIZE) & (sampling_info.top_ks != 1),
             sampling_info.sampling_seed,
             forward_batch.positions,
@@ -305,14 +305,12 @@ class FunCosyVoice3ModelRunner(ModelRunner):
         sampling_info: SamplingBatchInfo,
         requests: list[SchedulerRequest],
     ) -> torch.Tensor:
-        """Apply CosyVoice3's repetition-aware redraw on Torch/MPS.
+        """Apply the repetition-aware redraw on Torch/MPS.
 
-        The upstream CosyVoice sampler draws from top-k/top-p first and, when
-        that candidate appears in the recent ten speech tokens, redraws once
-        from the full distribution with the candidate masked. SGLang's MPS
-        sampler has already applied all request constraints and materialized
-        probabilities by this point, so the second draw can stay on MPS
-        without invoking the float64 seeded sampler.
+        A sampled speech token found among the last ten is redrawn once from the
+        full distribution with it masked. SGLang's MPS sampler has already applied
+        the request constraints and left probabilities, so the redraw stays on MPS
+        without the float64 seeded sampler.
         """
         request = requests[0]
         request_id = str(request.request_id)
@@ -330,7 +328,7 @@ class FunCosyVoice3ModelRunner(ModelRunner):
         token_id = int(token_ids[0].item())
 
         if not sampling_info.is_all_greedy and token_id < VOCAB_SIZE:
-            if token_id in recent[-_COSYVOICE3_RAS_WINDOW_SIZE:]:
+            if token_id in recent[-COSYVOICE3_RAS_WINDOW_SIZE:]:
                 probs = logits_output.next_token_logits
                 if probs is None or probs.ndim != 2:
                     raise RuntimeError(
@@ -376,7 +374,7 @@ class FunCosyVoice3ModelRunner(ModelRunner):
 
         if 0 <= token_id < VOCAB_SIZE:
             recent.append(token_id)
-            del recent[:-_COSYVOICE3_RAS_WINDOW_SIZE]
+            del recent[:-COSYVOICE3_RAS_WINDOW_SIZE]
         else:
             pass
         return next_token_ids

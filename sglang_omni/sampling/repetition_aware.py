@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 """Repetition-aware sampling: redraw a sampled token that already appears among
-the latest generated tokens, as VALL-E 2 and upstream CosyVoice do."""
+the latest generated tokens."""
 
 from __future__ import annotations
 

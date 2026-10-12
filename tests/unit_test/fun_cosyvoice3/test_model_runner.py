@@ -275,18 +275,19 @@ def test_cosyvoice3_torch_mps_clears_ras_history_on_finish() -> None:
     assert runner.cosyvoice3_recent_tokens == {"keep": [2]}
 
 
-@pytest.mark.parametrize("mode", ["default", "original_logprob", "rl_on_policy"])
-def test_cosyvoice3_ras_redraws_repeated_speech_token_from_full_distribution(
-    monkeypatch: pytest.MonkeyPatch, mode: str
-) -> None:
-    # Rows: a repeated speech token, a new speech token, a greedy request, and
-    # a control token.
+def run_ras_step(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    rl_on_policy_target: str | None,
+    return_original_logprob: bool,
+) -> tuple[torch.Tensor, list[SimpleNamespace], list[torch.Tensor], list[list[int]]]:
     probs = torch.zeros((4, EOS_ID + 1))
     probs[0, 9], probs[0, EOS_ID] = 0.9, 0.1
     probs[1:, 2] = 0.4
     probs[1, 5] = probs[2, 9] = probs[3, EOS_ID] = 0.6
     candidate_ids = torch.tensor([9, 5, 9, EOS_ID], dtype=torch.int32)
     redraw_probs = []
+    synced_ids = []
 
     def sample(logits_output, forward_batch):
         logits_output.next_token_logprobs = torch.log(
@@ -298,17 +299,14 @@ def test_cosyvoice3_ras_redraws_repeated_speech_token_from_full_distribution(
         redraw_probs.append(probs)
         return probs.argmax(dim=1).to(torch.int32)
 
-    synced_ids = []
     monkeypatch.setattr(
         repetition_aware_module, "sampling_from_probs_torch", take_most_likely
     )
     monkeypatch.setattr(
-        model_runner_module,
-        "SGLANG_RETURN_ORIGINAL_LOGPROB",
-        mode == "original_logprob",
+        model_runner_module, "SGLANG_RETURN_ORIGINAL_LOGPROB", return_original_logprob
     )
     sampler = SimpleNamespace(
-        rl_on_policy_target="fsdp" if mode == "rl_on_policy" else None,
+        rl_on_policy_target=rl_on_policy_target,
         use_ascend_backend=False,
         _sync_token_ids_across_tp=lambda ids, info: synced_ids.append(  # noqa: leading-underscore  # upstream spelling, or the public name is already taken
             ids.tolist()
@@ -346,34 +344,50 @@ def test_cosyvoice3_ras_redraws_repeated_speech_token_from_full_distribution(
         token_ids_logprobs=None,
     )
     logits_output = SimpleNamespace(
-        next_token_logits=probs - 1.0 if mode == "rl_on_policy" else probs,
+        next_token_logits=probs if rl_on_policy_target is None else probs - 1.0,
         next_token_logprobs=None,
     )
 
     token_ids = runner.sample_next_token_ids(
         logits_output, forward_batch, None, requests
     )
+    return token_ids, requests, redraw_probs, synced_ids
 
-    if mode == "rl_on_policy":
-        # An RL on-policy sampler leaves raw logits behind, so nothing is redrawn.
-        assert token_ids.tolist() == candidate_ids.tolist()
-        assert redraw_probs == [] and synced_ids == []
-        return
-    else:
-        pass
-    assert token_ids.tolist() == [EOS_ID, 5, 9, EOS_ID]
-    assert synced_ids == [[EOS_ID, 5, 9, EOS_ID]]
-    # The original-logprob mode reports log_softmax before the 0.5 temperature.
+
+@pytest.mark.parametrize("return_original_logprob", [False, True])
+def test_cosyvoice3_ras_redraws_repeated_speech_token_from_full_distribution(
+    monkeypatch: pytest.MonkeyPatch, return_original_logprob: bool
+) -> None:
+    token_ids, requests, redraw_probs, synced_ids = run_ras_step(
+        monkeypatch,
+        rl_on_policy_target=None,
+        return_original_logprob=return_original_logprob,
+    )
+
     expected_logprob = (
         0.5 * math.log(0.1) - math.log(math.sqrt(0.9) + math.sqrt(0.1))
-        if mode == "original_logprob"
+        if return_original_logprob
         else math.log(0.1)
     )
+    assert token_ids.tolist() == [EOS_ID, 5, 9, EOS_ID]
+    assert synced_ids == [[EOS_ID, 5, 9, EOS_ID]]
     assert requests[0].data.output_token_logprobs == [
         [pytest.approx(expected_logprob), EOS_ID]
     ]
     assert redraw_probs[0][0, 9].item() == 0.0
     assert redraw_probs[0][0, EOS_ID].item() == pytest.approx(0.1)
+
+
+def test_cosyvoice3_ras_leaves_rl_on_policy_draws_unchanged(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    token_ids, _, redraw_probs, synced_ids = run_ras_step(
+        monkeypatch, rl_on_policy_target="fsdp", return_original_logprob=False
+    )
+
+    assert token_ids.tolist() == [9, 5, 9, EOS_ID]
+    assert redraw_probs == []
+    assert synced_ids == []
 
 
 def test_cosyvoice3_load_weights_maps_custom_and_backbone_keys(
