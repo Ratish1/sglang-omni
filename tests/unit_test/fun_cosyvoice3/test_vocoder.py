@@ -27,6 +27,8 @@ from sglang_omni.models.fun_cosyvoice3.streaming_vocoder import (
     FunCosyVoice3StreamingVocoderScheduler,
 )
 from sglang_omni.pipeline.stage.stream_queue import StreamItem
+from sglang_omni.platforms.cuda import CUDAOmniPlatform
+from sglang_omni.platforms.xpu import XPUOmniPlatform
 from sglang_omni.proto import OmniRequest, StagePayload
 from sglang_omni.scheduling.message import IncomingMessage
 from tests.unit_test.fun_cosyvoice3.test_flow_batch import FakeFlow as _PackedFlow
@@ -923,6 +925,7 @@ def test_flow_admission_defers_request_after_long_singleton(monkeypatch) -> None
         "model",
         flow_prefix_cache_gb=0.0,
         enable_flow_prefix_cuda_graph=True,
+        enable_flow_whole_history_cuda_graph=True,
         device="cpu",
         flow_batch_admission_frames=2000,
         enable_dit_torch_compile=False,
@@ -938,6 +941,45 @@ def test_flow_admission_defers_request_after_long_singleton(monkeypatch) -> None
     assert scheduler.max_batch_cost == 2000
     assert scheduler.collect_new_request_batch(first) == [first]
     assert scheduler.next_message() == second
+
+
+def test_admission_budget_below_the_first_tier_keeps_finals_eager(monkeypatch) -> None:
+    """A positive admission budget below the first graph tier leaves no whole history
+    graph to capture: startup keeps every final, however long, on the eager solve
+    instead of failing on the empty ladder."""
+    fake_flow = RunnableFakeFlow()
+    fake_flow.packed_estimator.is_ragged = True
+    flow = stages.FunCosyVoice3Flow(
+        fake_flow, packed_estimator=fake_flow.packed_estimator
+    )
+    monkeypatch.setattr(
+        stages, "resolve_concrete_device", lambda device, gpu_id: torch.device("cuda")
+    )
+    monkeypatch.setattr(stages, "resolve_checkpoint", lambda model_path: "/checkpoint")
+    monkeypatch.setattr(stages, "patch_chunk_mask", lambda: None)
+    monkeypatch.setattr(
+        stages,
+        "load_cosyvoice3_flow_hift",
+        lambda checkpoint_dir, device, fp16, **kwargs: (flow, FakeHiFT()),
+    )
+    scheduler = stages.create_vocoder_executor(
+        "model",
+        device="cuda",
+        dtype="float16",
+        flow_prefix_cache_gb=0.0,
+        enable_flow_cuda_graph=False,
+        enable_flow_prefix_cuda_graph=True,
+        enable_flow_whole_history_cuda_graph=True,
+        flow_batch_admission_frames=3,
+        enable_dit_torch_compile=False,
+    )
+
+    mels = scheduler.vocoder.leftover_batch([scheduler.make_warmup_flow_input(2200)])
+
+    assert flow.whole_history_cuda_graph_runner is None
+    assert [mel.shape for mel in mels] == [
+        (1, fake_flow.output_size, 2200 * fake_flow.token_mel_ratio)
+    ]
 
 
 def test_create_vocoder_executor_defaults_batch_for_real_lengths(monkeypatch) -> None:
@@ -960,6 +1002,7 @@ def test_create_vocoder_executor_defaults_batch_for_real_lengths(monkeypatch) ->
         enable_dit_torch_compile=False,
         flow_prefix_cache_gb=0.0,
         enable_flow_prefix_cuda_graph=True,
+        enable_flow_whole_history_cuda_graph=True,
     )
 
     assert scheduler.max_batch_cost == stages.DEFAULT_FLOW_BATCH_ADMISSION_FRAMES
@@ -1002,6 +1045,7 @@ def test_create_vocoder_executor_threads_batch_configuration(monkeypatch) -> Non
         "model",
         flow_prefix_cache_gb=0.0,
         enable_flow_prefix_cuda_graph=True,
+        enable_flow_whole_history_cuda_graph=True,
         device="cpu",
         enable_dit_torch_compile=False,
         dtype="float16",
@@ -1052,6 +1096,7 @@ def test_create_vocoder_executor_threads_trt_flag(monkeypatch) -> None:
         "model",
         flow_prefix_cache_gb=0.0,
         enable_flow_prefix_cuda_graph=True,
+        enable_flow_whole_history_cuda_graph=True,
         device="cpu",
         max_batch_size=4,
         enable_dit_torch_compile=False,
@@ -1092,6 +1137,7 @@ def create_scheduler_recording_native_compile(
         device="cpu",
         flow_prefix_cache_gb=0.0,
         enable_flow_prefix_cuda_graph=True,
+        enable_flow_whole_history_cuda_graph=True,
         **kwargs,
     )
     return compiled, scheduler
@@ -1164,13 +1210,14 @@ def prepare_vocoder_startup(
         "warmup_packed_dit_compile",
         lambda scheduler: startup_events.append("packed_warmup"),
     )
-    if device_type == "cuda":
-        monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    if device_type in ("cuda", "xpu"):
+        platform = CUDAOmniPlatform() if device_type == "cuda" else XPUOmniPlatform()
+        monkeypatch.setattr(stages, "current_platform", platform)
 
         class RecordingFlowCudaGraphRunner:
             def __init__(self, flow, *, device, autocast_dtype) -> None:
                 assert flow is fake_flow
-                assert device.type == "cuda"
+                assert device.type == device_type
                 assert autocast_dtype == torch.bfloat16
                 startup_events.append("runner_create")
 
@@ -1201,6 +1248,7 @@ def test_create_vocoder_executor_compiles_before_flow_graph_capture(
         "model",
         flow_prefix_cache_gb=0.0,
         enable_flow_prefix_cuda_graph=True,
+        enable_flow_whole_history_cuda_graph=True,
         device="cuda",
         enable_dit_torch_compile=enable_dit_torch_compile,
         enable_flow_cuda_graph=True,
@@ -1215,6 +1263,33 @@ def test_create_vocoder_executor_compiles_before_flow_graph_capture(
     else:
         assert "native_compile" not in startup_events
     assert ("packed_warmup" in startup_events) is enable_dit_torch_compile
+
+
+@pytest.mark.parametrize("enable_dit_torch_compile", [False, True])
+def test_create_vocoder_executor_on_xpu_captures_flow_graphs_only_for_an_eager_dit(
+    monkeypatch: pytest.MonkeyPatch,
+    enable_dit_torch_compile: bool,
+) -> None:
+    startup_events: list[str] = []
+    prepare_vocoder_startup(
+        monkeypatch,
+        startup_events,
+        device_type="xpu",
+        allow_native_compile=enable_dit_torch_compile,
+    )
+
+    stages.create_vocoder_executor(
+        "model",
+        flow_prefix_cache_gb=0.0,
+        enable_flow_prefix_cuda_graph=True,
+        enable_flow_whole_history_cuda_graph=True,
+        device="xpu",
+        enable_dit_torch_compile=enable_dit_torch_compile,
+        enable_flow_cuda_graph=True,
+        flow_cuda_graph_capture_shapes=FLOW_GRAPH_CAPTURE_SHAPES,
+    )
+
+    assert ("graph_capture" in startup_events) is not enable_dit_torch_compile
 
 
 def test_create_vocoder_executor_trt_without_compile_skips_the_compile(
@@ -1234,6 +1309,7 @@ def test_create_vocoder_executor_rejects_trt_and_compile() -> None:
             "model",
             flow_prefix_cache_gb=0.0,
             enable_flow_prefix_cuda_graph=True,
+            enable_flow_whole_history_cuda_graph=True,
             enable_dit_torch_compile=True,
             enable_flow_estimator_trt=True,
         )
@@ -1372,6 +1448,7 @@ def test_create_vocoder_executor_rejects_non_positive_admission_budget(
             "model",
             flow_prefix_cache_gb=0.0,
             enable_flow_prefix_cuda_graph=True,
+            enable_flow_whole_history_cuda_graph=True,
             device="cpu",
             flow_batch_admission_frames=0,
             enable_dit_torch_compile=False,
@@ -1394,6 +1471,7 @@ def test_pipeline_config_sets_flow_batch_admission_by_default() -> None:
         "max_batch_wait_ms": 30,
         "enable_flow_cuda_graph": True,
         "enable_flow_prefix_cuda_graph": True,
+        "enable_flow_whole_history_cuda_graph": True,
         "enable_flow_estimator_trt": False,
         "token_hop_len": 25,
         "token_max_hop_len": 100,
