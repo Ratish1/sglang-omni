@@ -36,6 +36,7 @@ REFERENCE_URL = "https://huggingface.co/datasets/zhaochenyang20/seed-tts-eval-mi
 def produce_prepared_payload(connection: Connection) -> None:
     async def produce() -> None:
         set_moss_tts_local_preprocessing_context(processor=FakeProcessor())
+        relay = ShmRelay(engine_id="producer")
         try:
             for index in range(8):
                 request_id = f"wire-{index}"
@@ -55,7 +56,6 @@ def produce_prepared_payload(connection: Connection) -> None:
                         data={},
                     )
                 )
-                relay = ShmRelay(engine_id=request_id)
                 reference, operation = await write_payload(
                     relay,
                     request_id,
