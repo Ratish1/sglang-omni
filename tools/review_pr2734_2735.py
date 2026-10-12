@@ -1,5 +1,7 @@
 import argparse
+import inspect
 import json
+import textwrap
 import time
 from pathlib import Path
 from types import SimpleNamespace
@@ -35,11 +37,29 @@ def inspect_penalty_compilation() -> dict[str, int | float]:
         torch.cuda.synchronize()
         samples[f"fp32_rows_{rows}_seconds"] = time.perf_counter() - started
         samples[f"graphs_after_fp32_rows_{rows}"] = counters["stats"]["unique_graphs"]
+    fixed_source = textwrap.dedent(
+        inspect.getsource(Qwen3OmniTalker.precompile_kernels_after_loading)
+    ).replace("dtype=activations.dtype", "dtype=torch.float32")
+    fixed_namespace = {
+        "torch": torch,
+        "apply_scaling_penalties": apply_scaling_penalties,
+    }
+    exec(compile(fixed_source, "<fp32_warmup_probe>", "exec"), fixed_namespace)
+    torch._dynamo.reset()
+    counters.clear()
+    fixed_namespace["precompile_kernels_after_loading"](model)
+    torch.cuda.synchronize()
+    samples["fixed_graphs_after_startup"] = counters["stats"]["unique_graphs"]
+    for rows in (1, 2):
+        logits = torch.ones(rows, 3072, device="cuda", dtype=torch.float32)
+        apply_scaling_penalties(logits, torch.full_like(logits, 1.05))
+    torch.cuda.synchronize()
+    samples["fixed_graphs_after_live_shapes"] = counters["stats"]["unique_graphs"]
     return {"graphs_after_startup": after_startup, **samples}
 
 
 def inspect_request_boundaries() -> dict[str, object]:
-    from sglang.srt.managers.scheduler import validate_input_length
+    from sglang.srt.managers.utils import validate_input_length
 
     from sglang_omni.client.client import Client
     from sglang_omni.client.types import GenerateRequest, SamplingParams
