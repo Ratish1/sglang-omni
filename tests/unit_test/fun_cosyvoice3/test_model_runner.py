@@ -45,6 +45,7 @@ def test_cosyvoice3_runner_collects_speech_tokens_and_skips_eos() -> None:
 @pytest.mark.accelerator
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_cosyvoice3_runner_reads_cuda_token_ids_through_pinned_staging() -> None:
+    """A pageable read of the step's ids stalls other threads' kernel launches."""
     runner = object.__new__(FunCosyVoice3ModelRunner)
     runner.outbox = None
     runner.token_id_host_bufs = None
@@ -62,8 +63,6 @@ def test_cosyvoice3_runner_reads_cuda_token_ids_through_pinned_staging() -> None
     host_token_ids = runner.resolve_host_token_ids(result)
     assert host_token_ids.is_pinned()
     assert host_token_ids.tolist() == [EOS_ID, 13]
-    assert requests[0].data.output_codes == []
-    assert [code.item() for code in requests[1].data.output_codes] == [13]
 
 
 def test_cosyvoice3_runner_skips_all_control_tokens() -> None:
