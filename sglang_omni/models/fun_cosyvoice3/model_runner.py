@@ -148,10 +148,7 @@ class FunCosyVoice3ModelRunner(ModelRunner):
         schedule_batch: ScheduleBatch | None,
         requests: list[SchedulerRequest],
     ) -> torch.Tensor:
-        if (
-            logits_output.next_token_logits.device.type != "mps"
-            or current_platform.is_float64_supported()
-        ):
+        if not self.uses_mps_ras_fallback(logits_output.next_token_logits):
             return super().sample_next_token_ids(
                 logits_output,
                 forward_batch,
@@ -239,64 +236,11 @@ class FunCosyVoice3ModelRunner(ModelRunner):
             pass
         return next_token_ids
 
-    def process_sampled_token_ids(
-        self,
-        logits_output: LogitsProcessorOutput,
-        forward_batch: ForwardBatch,
-        next_token_ids: torch.Tensor,
-        requests: list[SchedulerRequest],
-    ) -> torch.Tensor:
-        """Redraw a sampled speech token that repeats within the recent window.
-
-        The redraw masks the candidate and samples the full distribution at the
-        request temperature, so EOS stays reachable after top-k/top-p collapses
-        onto the repeated token.
-        """
-        sampling_info = forward_batch.sampling_info
-        sampler = self.tp_worker.model_runner.sampler
-        # note (Yucheng Hu): an RL on-policy rollout must sample the trainer's
-        # distribution, and that sampler and the Ascend one leave raw logits behind.
-        if (
-            sampling_info.is_all_greedy
-            or not forward_batch.forward_mode.is_decode()
-            or sampler.rl_on_policy_target is not None
-            or sampler.use_ascend_backend
-        ):
-            return next_token_ids
-        else:
-            pass
-        # note (Yucheng Hu): the pytorch sampler softmaxes next_token_logits in place
-        # and applies top-k/top-p to a sorted copy.
-        probs = logits_output.next_token_logits
-        next_token_ids, is_repeated = repetition_aware_redraw(
-            probs,
-            next_token_ids,
-            [request.data.req.output_ids for request in requests],
-            COSYVOICE3_RAS_WINDOW_SIZE,
-            (next_token_ids < VOCAB_SIZE) & (sampling_info.top_ks != 1),
-            sampling_info.sampling_seed,
-            forward_batch.positions,
+    def uses_mps_ras_fallback(self, logits: torch.Tensor) -> bool:
+        """Torch MPS without float64 samples one request and redraws it itself."""
+        return (
+            logits.device.type == "mps" and not current_platform.is_float64_supported()
         )
-        if logits_output.next_token_logprobs is not None:
-            emitted_logprobs = torch.log(
-                probs.gather(1, next_token_ids.long().unsqueeze(1)).squeeze(1)
-            )
-            if SGLANG_RETURN_ORIGINAL_LOGPROB:
-                # note (Yucheng Hu): that mode reports logprobs before temperature;
-                # T * log(probs) differs from those logits by a per-row constant.
-                temperatures = sampling_info.temperatures.reshape(-1)
-                scaled_logprobs = torch.log(probs) * temperatures.unsqueeze(1)
-                emitted_logprobs = emitted_logprobs * temperatures - torch.logsumexp(
-                    scaled_logprobs, dim=1
-                )
-            else:
-                pass
-            logits_output.next_token_logprobs = torch.where(
-                is_repeated, emitted_logprobs, logits_output.next_token_logprobs
-            )
-        else:
-            pass
-        return next_token_ids
 
     def apply_ras_fallback(
         self,
@@ -412,7 +356,12 @@ class FunCosyVoice3ModelRunner(ModelRunner):
         # note (Yucheng Hu): a pageable D2H on the default stream stalls other threads'
         # kernel launches while it waits, an event wait does not.
         self.stage_token_ids(result, token_ids)
-        token_ids_cpu = self.resolve_host_token_ids(result).tolist()
+        token_ids_cpu = self.redraw_repeated_tokens(
+            result,
+            forward_batch,
+            requests,
+            self.resolve_host_token_ids(result).tolist(),
+        )
         for idx, sched_req in enumerate(requests):
             token_id = int(token_ids_cpu[idx])
             if token_id >= VOCAB_SIZE:
@@ -422,6 +371,100 @@ class FunCosyVoice3ModelRunner(ModelRunner):
             token = torch.tensor([token_id], dtype=torch.long)
             sched_req.data.output_codes.append(token)
             self.queue_or_emit_code_chunk(sched_req, token)
+
+    def redraw_repeated_tokens(
+        self,
+        result: GenerationBatchResult,
+        forward_batch: ForwardBatch | None,
+        requests: list[SchedulerRequest],
+        token_ids: list[int],
+    ) -> list[int]:
+        """Redraw each speech token that repeats in its recent window from the full
+        distribution with it masked, so EOS stays reachable after top-k/top-p
+        collapses onto it. Returns the step's host token ids."""
+        if forward_batch is None or not forward_batch.forward_mode.is_decode():
+            return token_ids
+        else:
+            pass
+        sampler = self.tp_worker.model_runner.sampler
+        # note (Yucheng Hu): an RL on-policy rollout must sample the trainer's
+        # distribution, and that sampler and the Ascend one leave raw logits behind.
+        if (
+            sampler.rl_on_policy_target is not None
+            or sampler.use_ascend_backend
+            or self.uses_mps_ras_fallback(result.next_token_ids)
+        ):
+            return token_ids
+        else:
+            pass
+        # note (ratish): the window is checked on the host ids the step reads anyway,
+        # so a step without a repeat launches nothing.
+        rows = [
+            row
+            for row, (sched_req, token_id) in enumerate(
+                zip(requests, token_ids, strict=True)
+            )
+            if token_id < VOCAB_SIZE
+            and sched_req.data.req.sampling_params.top_k != 1
+            and token_id in sched_req.data.req.output_ids[-COSYVOICE3_RAS_WINDOW_SIZE:]
+        ]
+        if not rows:
+            return token_ids
+        else:
+            pass
+        sampling_info = forward_batch.sampling_info
+        logits_output = result.logits_output
+        # note (Yucheng Hu): the pytorch sampler softmaxes next_token_logits in place
+        # and applies top-k/top-p to a sorted copy.
+        probs = logits_output.next_token_logits
+        row_index = torch.tensor(rows, device=probs.device)
+        redrawn_ids = repetition_aware_redraw(
+            probs,
+            result.next_token_ids.reshape(-1),
+            row_index,
+            sampling_info.sampling_seed,
+            forward_batch.positions,
+        )
+        # note (Yucheng Hu): the sampler syncs its own draw across TP ranks before
+        # returning, so a replacement must be synced the same way.
+        sampler._sync_token_ids_across_tp(  # noqa: leading-underscore  # upstream spelling, or the public name is already taken
+            redrawn_ids, sampling_info
+        )
+        result.next_token_ids = redrawn_ids.view_as(result.next_token_ids)
+        if logits_output.next_token_logprobs is not None:
+            row_probs = probs[row_index]
+            emitted_logprobs = torch.log(
+                row_probs.gather(1, redrawn_ids[row_index].long().unsqueeze(1)).squeeze(
+                    1
+                )
+            )
+            if SGLANG_RETURN_ORIGINAL_LOGPROB:
+                # note (Yucheng Hu): that mode reports logprobs before temperature;
+                # T * log(probs) differs from those logits by a per-row constant.
+                temperatures = sampling_info.temperatures.reshape(-1)[row_index]
+                emitted_logprobs = emitted_logprobs * temperatures - torch.logsumexp(
+                    torch.log(row_probs) * temperatures.unsqueeze(1), dim=1
+                )
+            else:
+                pass
+            logits_output.next_token_logprobs[row_index] = emitted_logprobs.to(
+                logits_output.next_token_logprobs.dtype
+            )
+            rollout_logprobs = emitted_logprobs.tolist()
+        else:
+            rollout_logprobs = None
+        self.stage_token_ids(result, redrawn_ids)
+        token_ids = self.resolve_host_token_ids(result).tolist()
+        for position, row in enumerate(rows):
+            data = requests[row].data
+            if rollout_logprobs is not None and data.return_logprob:
+                data.output_token_logprobs[-1] = [
+                    rollout_logprobs[position],
+                    token_ids[row],
+                ]
+            else:
+                pass
+        return token_ids
 
     def queue_or_emit_code_chunk(
         self,

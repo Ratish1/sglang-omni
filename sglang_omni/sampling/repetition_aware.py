@@ -4,8 +4,6 @@ the latest generated tokens."""
 
 from __future__ import annotations
 
-from collections.abc import Sequence
-
 import torch
 from sglang.srt.layers.sampler import sampling_from_probs_torch
 
@@ -17,35 +15,29 @@ REDRAW_SEED_SALT = 0x2545F491
 def repetition_aware_redraw(
     probs: torch.Tensor,
     sampled_ids: torch.Tensor,
-    output_ids: Sequence[Sequence[int]],
-    window_size: int,
-    redraw_allowed: torch.Tensor,
+    rows: torch.Tensor,
     sampling_seeds: torch.Tensor | None,
     positions: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Redraw each allowed row whose sampled token is among its last outputs.
+) -> torch.Tensor:
+    """Redraw the given rows from their full distribution with the sampled token masked.
 
-    probs holds the full-vocabulary probabilities after penalties and
-    temperature but before top-k/top-p, so masking the repeated token keeps a
-    stop token reachable after truncation collapsed onto it. Returns the token
-    ids and a mask of the redrawn rows.
+    probs holds the probabilities after penalties and temperature but before
+    top-k/top-p, so masking the repeated token keeps a stop token reachable.
     """
-    recent_rows = [list(row_ids[-window_size:]) for row_ids in output_ids]
-    recent_ids = torch.tensor(
-        [row + [-1] * (window_size - len(row)) for row in recent_rows],
-        dtype=torch.long,
-    ).to(probs.device, non_blocking=True)
-    candidate_ids = sampled_ids.long().unsqueeze(1)
-    is_repeated = (recent_ids == candidate_ids).any(dim=1) & redraw_allowed
     # note (ratish): float64, as SGLang's own seeded draw feeds its compiled
     # multinomial_with_seed, so a seeded redraw reuses that graph, not a new one.
-    redraw_probs = probs.to(torch.float64, copy=True)
-    redraw_probs.scatter_(1, candidate_ids, 0.0)
+    row_probs = probs[rows].to(torch.float64)
+    redraw_probs = row_probs.scatter(1, sampled_ids[rows].long().unsqueeze(1), 0.0)
     # note (Yucheng Hu): multinomial rejects an all-zero row, and a row whose
     # whole mass sat on the candidate has nothing else to draw.
     redraw_probs = torch.where(
-        redraw_probs.sum(dim=1, keepdim=True) > 0, redraw_probs, probs
+        redraw_probs.sum(dim=1, keepdim=True) > 0, redraw_probs, row_probs
     )
-    redraw_seeds = None if sampling_seeds is None else sampling_seeds ^ REDRAW_SEED_SALT
-    redraw_ids = sampling_from_probs_torch(redraw_probs, redraw_seeds, positions)
-    return torch.where(is_repeated, redraw_ids, sampled_ids), is_repeated
+    redraw_seeds = (
+        None if sampling_seeds is None else sampling_seeds[rows] ^ REDRAW_SEED_SALT
+    )
+    token_ids = sampled_ids.clone()
+    token_ids[rows] = sampling_from_probs_torch(
+        redraw_probs, redraw_seeds, positions[rows]
+    ).to(token_ids.dtype)
+    return token_ids
