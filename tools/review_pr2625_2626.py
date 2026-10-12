@@ -4,6 +4,8 @@
 from __future__ import annotations
 
 import json
+import runpy
+import subprocess
 from array import array
 from pathlib import Path
 from types import SimpleNamespace
@@ -198,6 +200,31 @@ def main() -> None:
         positions[permutation],
     )
     assert torch.equal(compact_redraw, full_redraw[permutation])
+    baseline_namespace = {"__name__": "review_baseline_cosyvoice_runner"}
+    baseline_source = subprocess.check_output(
+        ["git", "show", "228ce6fab:sglang_omni/models/fun_cosyvoice3/model_runner.py"],
+        text=True,
+    )
+    exec(
+        compile(baseline_source, "baseline_cosyvoice_runner.py", "exec"),
+        baseline_namespace,
+    )
+    test_namespace = runpy.run_path(
+        "tests/unit_test/fun_cosyvoice3/test_model_runner.py"
+    )
+    ras_case = test_namespace[
+        "test_cosyvoice3_ras_masks_and_redraws_repeated_speech_tokens"
+    ]
+    ras_case.__globals__["FunCosyVoice3ModelRunner"] = baseline_namespace[
+        "FunCosyVoice3ModelRunner"
+    ]
+    try:
+        ras_case(False)
+    except AssertionError:
+        ras_guard_fails_before_ras = True
+    else:
+        ras_guard_fails_before_ras = False
+    assert ras_guard_fails_before_ras
     evidence = {
         "candidates": candidate_ids.tolist(),
         "collected_relayed_finalized": expected,
@@ -207,6 +234,7 @@ def main() -> None:
         "redrawn_eos_finishes": True,
         "suppressed_eos_stays_suppressed": True,
         "seeded_subset_and_permutation_match": True,
+        "existing_ras_contract_test_fails_on_pre_ras_collector": ras_guard_fails_before_ras,
         "torch": torch.__version__,
         "device": torch.cuda.get_device_name(),
     }
