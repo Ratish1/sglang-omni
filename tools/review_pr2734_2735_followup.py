@@ -85,8 +85,14 @@ def admission_cases():
         init_sync_request_build_state(scheduler)
         scheduler.request_builder = lambda payload: data
         with get_context().override_server_args():
-            scheduler.process_input_requests([new_stage_payload(data.req.rid)])
-        assert bool(scheduler.waiting_queue) is accepted
+            if accepted:
+                scheduler.process_input_requests([new_stage_payload(data.req.rid)])
+                assert scheduler.waiting_queue == [data.req]
+                rejection = None
+            else:
+                rejection = scheduler.prepare_request_limits(data)
+                assert rejection is not None
+                assert len(data.req.origin_input_ids) == prompt
         item = dict(
             context=context,
             pool=pool,
@@ -105,8 +111,7 @@ def admission_cases():
             assert data.req.finished_reason.to_json()["type"] == "length"
             item.update(cap=cap, finished_length=data.req.finished_len)
         else:
-            assert not scheduler.outbox.empty()
-            item["error"] = repr(scheduler.outbox.get().data)
+            item["error"] = rejection
         results.append(item)
     return results
 
