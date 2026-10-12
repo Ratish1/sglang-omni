@@ -6,9 +6,10 @@ from __future__ import annotations
 from collections.abc import Iterable, Iterator
 from pathlib import Path
 from types import SimpleNamespace
-from typing import TypedDict
+from typing import Literal, TypedDict
 
 import torch
+from diffusers.models.modeling_outputs import Transformer2DModelOutput
 from safetensors.torch import load_file
 from torch import nn
 
@@ -100,13 +101,29 @@ class ZImageTransformer2DModelWrapper(nn.Module):
         device: torch.device | str,
         dtype: torch.dtype,
         *,
-        backend: str = "diffusers",
+        backend: Literal["diffusers", "sglang"] = "diffusers",
         runtime: DecoderRuntimeHandle | None = None,
     ) -> None:
         super().__init__()
         self.backend = backend
         self.cfg = decoder_config(cfg)
-        self.native_cache = None
+        self.native_cache: (
+            tuple[
+                tuple[
+                    tuple[torch.Size, ...],
+                    tuple[torch.Size, ...],
+                    torch.device,
+                    torch.dtype,
+                    int,
+                    int,
+                ],
+                SimpleNamespace,
+                dict[
+                    str, torch.Tensor | tuple[torch.Tensor, torch.Tensor] | int | None
+                ],
+            ]
+            | None
+        ) = None
         if backend == "sglang":
             self.runtime = runtime
             self.model = self.load_sglang_model(decoder_dir, self.runtime.device, dtype)
@@ -288,7 +305,7 @@ class ZImageTransformer2DModelWrapper(nn.Module):
         return_dict: bool = True,
         patch_size: int = 2,
         f_patch_size: int = 1,
-    ):
+    ) -> tuple[list[torch.Tensor]] | Transformer2DModelOutput:
         t = torch.as_tensor(t, dtype=torch.float32, device=x[0].device)
         t = t.reshape(-1).expand(len(x))
         if self.backend == "sglang":
@@ -297,8 +314,6 @@ class ZImageTransformer2DModelWrapper(nn.Module):
                 return (outputs,)
             else:
                 pass
-            from diffusers.models.modeling_outputs import Transformer2DModelOutput
-
             return Transformer2DModelOutput(sample=outputs)
         else:
             pass
