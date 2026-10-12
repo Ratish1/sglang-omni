@@ -37,7 +37,9 @@ def repetition_aware_redraw(
     ).to(probs.device, non_blocking=True)
     candidate_ids = sampled_ids.long().unsqueeze(1)
     is_repeated = (recent_ids == candidate_ids).any(dim=1) & redraw_allowed
-    redraw_probs = probs.to(torch.float32, copy=True)
+    # note (ratish): float64, as SGLang's own seeded draw feeds its compiled
+    # multinomial_with_seed, so a seeded redraw reuses that graph, not a new one.
+    redraw_probs = probs.to(torch.float64, copy=True)
     redraw_probs.scatter_(1, candidate_ids, 0.0)
     # note (Yucheng Hu): multinomial rejects an all-zero row, and a row whose
     # whole mass sat on the candidate has nothing else to draw.
