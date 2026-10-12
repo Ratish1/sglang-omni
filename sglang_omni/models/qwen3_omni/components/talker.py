@@ -1930,8 +1930,9 @@ class Qwen3OmniTalker(nn.Module):
 
     @torch.no_grad()
     def precompile_kernels_after_loading(self) -> None:
-        """Compile the repetition penalty a request's first sample would compile: one row
-        and several rows are two graphs, as a dimension of 1 specializes."""
+        """Compile the repetition penalty a request's first sample would compile, on the
+        float32 logits it receives: one row and several rows are two graphs, as a
+        dimension of 1 specializes."""
         activations = self.model.codec_embedding.weight
         for rows in (1, 2):
             apply_scaling_penalties(
@@ -1939,7 +1940,7 @@ class Qwen3OmniTalker(nn.Module):
                     rows,
                     self.config.text_config.vocab_size,
                     device=activations.device,
-                    dtype=activations.dtype,
+                    dtype=torch.float32,
                 ),
                 torch.ones(
                     rows,
