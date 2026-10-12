@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import math
 from array import array
 from types import SimpleNamespace
 
@@ -301,22 +300,13 @@ def test_cosyvoice3_torch_mps_clears_ras_history_on_finish() -> None:
 
 
 def collect_ras_step(
-    monkeypatch: pytest.MonkeyPatch,
-    *,
-    output_ids: list[list[int]],
-    rl_on_policy_target: str | None,
-    return_original_logprob: bool,
-) -> tuple[SimpleNamespace, list[SimpleNamespace], list[torch.Tensor], list[list[int]]]:
+    monkeypatch: pytest.MonkeyPatch, output_ids: list[list[int]]
+) -> tuple[SimpleNamespace, list[SimpleNamespace], list[torch.Tensor]]:
     probs = torch.zeros((4, EOS_ID + 1))
     probs[0, 9], probs[0, EOS_ID] = 0.9, 0.1
     probs[1:, 2] = 0.4
     probs[1, 5] = probs[2, 9] = probs[3, EOS_ID] = 0.6
-    candidate_ids = torch.tensor([9, 5, 9, EOS_ID], dtype=torch.int32)
-    candidate_logprobs = torch.log(
-        probs.gather(1, candidate_ids.long().unsqueeze(1)).squeeze(1)
-    )
     redraw_probs = []
-    synced_ids = []
 
     def take_most_likely(probs, sampling_seed, positions):
         redraw_probs.append(probs)
@@ -325,28 +315,12 @@ def collect_ras_step(
     monkeypatch.setattr(
         repetition_aware_module, "sampling_from_probs_torch", take_most_likely
     )
-    monkeypatch.setattr(
-        model_runner_module, "SGLANG_RETURN_ORIGINAL_LOGPROB", return_original_logprob
-    )
-    sampler = SimpleNamespace(
-        rl_on_policy_target=rl_on_policy_target,
-        use_ascend_backend=False,
-        _sync_token_ids_across_tp=lambda ids, info: synced_ids.append(  # noqa: leading-underscore  # upstream spelling, or the public name is already taken
-            ids.tolist()
-        ),
-    )
     runner = object.__new__(FunCosyVoice3ModelRunner)
     runner.outbox = None
-    runner.tp_worker = SimpleNamespace(model_runner=SimpleNamespace(sampler=sampler))
     requests = [
         SimpleNamespace(
             data=SimpleNamespace(
                 output_codes=[],
-                stream_metadata=None,
-                return_logprob=row == 0,
-                output_token_logprobs=(
-                    [[float(candidate_logprobs[0]), 9]] if row == 0 else []
-                ),
                 req=SimpleNamespace(
                     output_ids=array("q", row_output_ids),
                     sampling_params=SimpleNamespace(top_k=1 if row == 2 else 20),
@@ -356,50 +330,30 @@ def collect_ras_step(
         for row, row_output_ids in enumerate(output_ids)
     ]
     result = SimpleNamespace(
-        next_token_ids=candidate_ids.clone(),
-        logits_output=SimpleNamespace(
-            next_token_logits=probs, next_token_logprobs=candidate_logprobs.clone()
-        ),
+        next_token_ids=torch.tensor([9, 5, 9, EOS_ID], dtype=torch.int32),
+        logits_output=SimpleNamespace(next_token_logits=probs),
     )
     forward_batch = SimpleNamespace(
         forward_mode=SimpleNamespace(is_decode=lambda: True),
-        sampling_info=SimpleNamespace(
-            sampling_seed=None, temperatures=torch.full((4, 1), 0.5)
-        ),
+        sampling_info=SimpleNamespace(sampling_seed=None),
         positions=torch.arange(4),
     )
 
     runner.collect_tokens(result, forward_batch, None, requests)
-    return result, requests, redraw_probs, synced_ids
+    return result, requests, redraw_probs
 
 
-@pytest.mark.parametrize("return_original_logprob", [False, True])
 def test_cosyvoice3_ras_redraws_repeated_speech_token_from_full_distribution(
-    monkeypatch: pytest.MonkeyPatch, return_original_logprob: bool
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    result, requests, redraw_probs, synced_ids = collect_ras_step(
-        monkeypatch,
-        output_ids=[[4, 9, 7], [1, 2, 3], [9], [EOS_ID]],
-        rl_on_policy_target=None,
-        return_original_logprob=return_original_logprob,
+    result, requests, redraw_probs = collect_ras_step(
+        monkeypatch, [[4, 9, 7], [1, 2, 3], [9], [EOS_ID]]
     )
 
-    expected_logprob = (
-        0.5 * math.log(0.1) - math.log(math.sqrt(0.9) + math.sqrt(0.1))
-        if return_original_logprob
-        else math.log(0.1)
-    )
     assert result.next_token_ids.tolist() == [EOS_ID, 5, 9, EOS_ID]
     assert [
         [int(code) for code in request.data.output_codes] for request in requests
     ] == [[], [5], [9], []]
-    assert synced_ids == [[EOS_ID, 5, 9, EOS_ID]]
-    assert requests[0].data.output_token_logprobs == [
-        [pytest.approx(expected_logprob), EOS_ID]
-    ]
-    assert result.logits_output.next_token_logprobs[0].item() == pytest.approx(
-        expected_logprob
-    )
     assert redraw_probs[0][0, 9].item() == 0.0
     assert redraw_probs[0][0, EOS_ID].item() == pytest.approx(0.1)
 
@@ -407,31 +361,12 @@ def test_cosyvoice3_ras_redraws_repeated_speech_token_from_full_distribution(
 def test_cosyvoice3_ras_launches_nothing_without_a_repeat(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    result, requests, redraw_probs, synced_ids = collect_ras_step(
-        monkeypatch,
-        output_ids=[[4, 7], [1, 2, 3], [9], [EOS_ID]],
-        rl_on_policy_target=None,
-        return_original_logprob=False,
+    result, _, redraw_probs = collect_ras_step(
+        monkeypatch, [[4, 7], [1, 2, 3], [9], [EOS_ID]]
     )
 
     assert result.next_token_ids.tolist() == [9, 5, 9, EOS_ID]
     assert redraw_probs == []
-    assert synced_ids == []
-
-
-def test_cosyvoice3_ras_leaves_rl_on_policy_draws_unchanged(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    result, _, redraw_probs, synced_ids = collect_ras_step(
-        monkeypatch,
-        output_ids=[[4, 9, 7], [1, 2, 3], [9], [EOS_ID]],
-        rl_on_policy_target="fsdp",
-        return_original_logprob=False,
-    )
-
-    assert result.next_token_ids.tolist() == [9, 5, 9, EOS_ID]
-    assert redraw_probs == []
-    assert synced_ids == []
 
 
 def test_cosyvoice3_load_weights_maps_custom_and_backbone_keys(

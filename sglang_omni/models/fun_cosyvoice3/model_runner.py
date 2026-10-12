@@ -9,7 +9,6 @@ from typing import TYPE_CHECKING
 
 import torch
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
-from sglang.srt.layers.sampler import SGLANG_RETURN_ORIGINAL_LOGPROB
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -382,16 +381,9 @@ class FunCosyVoice3ModelRunner(ModelRunner):
         """Redraw each speech token that repeats in its recent window from the full
         distribution with it masked, so EOS stays reachable after top-k/top-p
         collapses onto it. Returns the step's host token ids."""
-        if forward_batch is None or not forward_batch.forward_mode.is_decode():
-            return token_ids
-        else:
-            pass
-        sampler = self.tp_worker.model_runner.sampler
-        # note (Yucheng Hu): an RL on-policy rollout must sample the trainer's
-        # distribution, and that sampler and the Ascend one leave raw logits behind.
         if (
-            sampler.rl_on_policy_target is not None
-            or sampler.use_ascend_backend
+            forward_batch is None
+            or not forward_batch.forward_mode.is_decode()
             or self.uses_mps_ras_fallback(result.next_token_ids)
         ):
             return token_ids
@@ -412,59 +404,19 @@ class FunCosyVoice3ModelRunner(ModelRunner):
             return token_ids
         else:
             pass
-        sampling_info = forward_batch.sampling_info
-        logits_output = result.logits_output
         # note (Yucheng Hu): the pytorch sampler softmaxes next_token_logits in place
         # and applies top-k/top-p to a sorted copy.
-        probs = logits_output.next_token_logits
-        row_index = torch.tensor(rows, device=probs.device)
+        probs = result.logits_output.next_token_logits
         redrawn_ids = repetition_aware_redraw(
             probs,
             result.next_token_ids.reshape(-1),
-            row_index,
-            sampling_info.sampling_seed,
+            torch.tensor(rows, device=probs.device),
+            forward_batch.sampling_info.sampling_seed,
             forward_batch.positions,
         )
-        # note (Yucheng Hu): the sampler syncs its own draw across TP ranks before
-        # returning, so a replacement must be synced the same way.
-        sampler._sync_token_ids_across_tp(  # noqa: leading-underscore  # upstream spelling, or the public name is already taken
-            redrawn_ids, sampling_info
-        )
         result.next_token_ids = redrawn_ids.view_as(result.next_token_ids)
-        if logits_output.next_token_logprobs is not None:
-            row_probs = probs[row_index]
-            emitted_logprobs = torch.log(
-                row_probs.gather(1, redrawn_ids[row_index].long().unsqueeze(1)).squeeze(
-                    1
-                )
-            )
-            if SGLANG_RETURN_ORIGINAL_LOGPROB:
-                # note (Yucheng Hu): that mode reports logprobs before temperature;
-                # T * log(probs) differs from those logits by a per-row constant.
-                temperatures = sampling_info.temperatures.reshape(-1)[row_index]
-                emitted_logprobs = emitted_logprobs * temperatures - torch.logsumexp(
-                    torch.log(row_probs) * temperatures.unsqueeze(1), dim=1
-                )
-            else:
-                pass
-            logits_output.next_token_logprobs[row_index] = emitted_logprobs.to(
-                logits_output.next_token_logprobs.dtype
-            )
-            rollout_logprobs = emitted_logprobs.tolist()
-        else:
-            rollout_logprobs = None
         self.stage_token_ids(result, redrawn_ids)
-        token_ids = self.resolve_host_token_ids(result).tolist()
-        for position, row in enumerate(rows):
-            data = requests[row].data
-            if rollout_logprobs is not None and data.return_logprob:
-                data.output_token_logprobs[-1] = [
-                    rollout_logprobs[position],
-                    token_ids[row],
-                ]
-            else:
-                pass
-        return token_ids
+        return self.resolve_host_token_ids(result).tolist()
 
     def queue_or_emit_code_chunk(
         self,
