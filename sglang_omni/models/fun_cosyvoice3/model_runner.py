@@ -350,8 +350,8 @@ class FunCosyVoice3ModelRunner(ModelRunner):
         else:
             pass
         # note (guozhihao-224): one batched D2H instead of per-request .item() syncs.
-        # note (Yucheng Hu): a .tolist() here waits inside a default-stream D2H, which
-        # blocks the vocoder thread's launches; the staged copy waits on an event.
+        # note (Yucheng Hu): a pageable D2H on the default stream stalls other threads'
+        # kernel launches while it waits, an event wait does not.
         self.stage_token_ids(result, token_ids)
         token_ids_cpu = self.resolve_host_token_ids(result).tolist()
         for idx, sched_req in enumerate(requests):
