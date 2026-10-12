@@ -136,7 +136,10 @@ class LLaDA2ImageDecoder:
             pass
         self.validate_settings(decode_mode, num_steps, resolution_multiplier)
         self.backend = backend
-        self.device = resolve_concrete_device(device)
+        requested_device = torch.device(device)
+        self.device = resolve_concrete_device(
+            requested_device.type, requested_device.index
+        )
         self.dtype = dtype
         self.runtime = runtime
         if runtime is not None:
@@ -153,7 +156,7 @@ class LLaDA2ImageDecoder:
 
         self.sigvq: SigVQ | None = None
         self.diff_model: ZImageTransformer2DModelWrapper | None = None
-        self.diff_model_mode: str | None = None
+        self.diff_model_mode: DecoderMode | None = None
         self.vae: AutoencoderKL | None = None
         self.diff_config: DecoderConfig | None = None
 

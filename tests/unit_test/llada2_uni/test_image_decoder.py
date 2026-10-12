@@ -3,7 +3,6 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable
 from types import SimpleNamespace
 
 import pytest
@@ -116,7 +115,9 @@ def test_turbo_sampler_matches_reference_and_preserves_rng():
     )
 
     reference_generator = torch.Generator().manual_seed(29)
-    reference_timesteps = torch.linspace(0, 1, 4, dtype=torch.float64)
+    reference_timesteps = torch.linspace(0, 1, 4, dtype=torch.float64).to(
+        initial_latents
+    )
     reference_latents = initial_latents.to(torch.float64)
     for current_time, next_time in zip(
         reference_timesteps[:-1], reference_timesteps[1:]
@@ -130,7 +131,6 @@ def test_turbo_sampler_matches_reference_and_preserves_rng():
         alpha, sigma = expanded_time, 1 - expanded_time
         denominator = sigma - -alpha
         clean = (sigma * prediction - -reference_latents) / denominator
-        noise_estimate = (reference_latents - alpha * prediction) / denominator
         next_batch_time = torch.ones_like(batch_time) * next_time
         next_alpha = next_batch_time[(...,) + (None,) * (reference_latents.ndim - 1)]
         next_sigma = 1 - next_alpha
@@ -148,44 +148,36 @@ def test_turbo_sampler_matches_reference_and_preserves_rng():
     )
 
 
-def test_sampler_step_bounds_and_forward_counts():
+@pytest.mark.parametrize(
+    "turbo,steps,expected_calls", [(False, 2, 1), (False, 50, 49), (True, 1, 1)]
+)
+def test_sampler_forward_counts(turbo, steps, expected_calls):
     initial_latents = torch.zeros(1, 1, 1, 1)
+    calls = []
 
-    def count_forwards(
-        calls: list[torch.Tensor],
-    ) -> Callable[[torch.Tensor, torch.Tensor], torch.Tensor]:
-        def model(latents: torch.Tensor, timestep: torch.Tensor) -> torch.Tensor:
-            calls.append(timestep.clone())
-            return torch.zeros_like(latents)
+    def model(latents: torch.Tensor, timestep: torch.Tensor) -> torch.Tensor:
+        calls.append(timestep.clone())
+        return torch.zeros_like(latents)
 
-        return model
-
-    with pytest.raises(ValueError, match="Normal sampler num_steps must be at least 2"):
-        sample_velocity(
-            initial_latents,
-            count_forwards([]),
-            num_steps=1,
-            turbo=False,
-        )
-
-    normal_calls = []
     sample_velocity(
         initial_latents,
-        count_forwards(normal_calls),
-        num_steps=2,
-        turbo=False,
-    )
-    assert len(normal_calls) == 1
-
-    turbo_calls = []
-    sample_velocity(
-        initial_latents,
-        count_forwards(turbo_calls),
-        num_steps=1,
-        turbo=True,
+        model,
+        num_steps=steps,
+        turbo=turbo,
         generator=torch.Generator().manual_seed(29),
     )
-    assert len(turbo_calls) == 1
+    assert len(calls) == expected_calls
+
+
+def test_normal_step_bound_before_loading(tmp_path):
+    with pytest.raises(ValueError, match="normal num_steps must be at least 2"):
+        LLaDA2ImageDecoder(str(tmp_path), device="cpu", num_steps=1)
+    decoder = LLaDA2ImageDecoder(str(tmp_path), device="cpu")
+    with pytest.raises(ValueError, match="normal num_steps must be at least 2"):
+        decoder.decode([1], 1, 1, num_steps=1)
+    LLaDA2ImageDecoder(
+        str(tmp_path), device="cpu", decode_mode="decoder-turbo", num_steps=1
+    )
 
 
 @pytest.fixture

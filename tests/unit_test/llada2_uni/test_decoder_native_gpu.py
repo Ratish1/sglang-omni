@@ -20,6 +20,9 @@ def native_worker(rank, directory, cfg, dtype):
     from sglang_omni.models.llada2_uni.components.decoder_runtime import (
         initialize_decoder_runtime,
     )
+    from sglang_omni.models.llada2_uni.components.image_decoder import (
+        LLaDA2ImageDecoder,
+    )
 
     path = Path(directory)
     with initialize_decoder_runtime(
@@ -30,6 +33,23 @@ def native_worker(rank, directory, cfg, dtype):
         dist_timeout=120,
     ) as runtime:
         with runtime.compute_context(), torch.inference_mode():
+            for device in ("cuda", "cuda:0"):
+                decoder = LLaDA2ImageDecoder(
+                    directory,
+                    device=device,
+                    dtype=dtype,
+                    backend="sglang",
+                    runtime=runtime,
+                )
+                assert decoder.device == runtime.device
+            with pytest.raises(ValueError, match="device/dtype must match"):
+                LLaDA2ImageDecoder(
+                    directory,
+                    device="cuda:1",
+                    dtype=dtype,
+                    backend="sglang",
+                    runtime=runtime,
+                )
             inputs = torch.load(
                 path / "inputs.pt", weights_only=True, map_location=runtime.device
             )
