@@ -10,6 +10,7 @@ import torch
 from torch import nn
 
 
+@torch.no_grad()
 def inspect_penalty_compilation() -> dict[str, int | float]:
     from sglang.srt.sampling.penaltylib.repetition_penalty import (
         apply_scaling_penalties,
