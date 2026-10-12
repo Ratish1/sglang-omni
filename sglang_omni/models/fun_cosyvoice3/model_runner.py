@@ -381,10 +381,13 @@ class FunCosyVoice3ModelRunner(ModelRunner):
         """Redraw each speech token that repeats in its recent window from the full
         distribution with it masked, so EOS stays reachable after top-k/top-p
         collapses onto it. Returns the step's host token ids."""
+        # note (Yucheng Hu): the Ascend sampler leaves temperature-scaled logits behind,
+        # not probabilities.
         if (
             forward_batch is None
             or not forward_batch.forward_mode.is_decode()
             or self.uses_mps_ras_fallback(result.next_token_ids)
+            or self.tp_worker.model_runner.sampler.use_ascend_backend
         ):
             return token_ids
         else:

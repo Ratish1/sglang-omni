@@ -300,7 +300,10 @@ def test_cosyvoice3_torch_mps_clears_ras_history_on_finish() -> None:
 
 
 def collect_ras_step(
-    monkeypatch: pytest.MonkeyPatch, output_ids: list[list[int]]
+    monkeypatch: pytest.MonkeyPatch,
+    output_ids: list[list[int]],
+    *,
+    use_ascend_backend: bool = False,
 ) -> tuple[SimpleNamespace, list[SimpleNamespace], list[torch.Tensor]]:
     probs = torch.zeros((4, EOS_ID + 1))
     probs[0, 9], probs[0, EOS_ID] = 0.9, 0.1
@@ -317,6 +320,11 @@ def collect_ras_step(
     )
     runner = object.__new__(FunCosyVoice3ModelRunner)
     runner.outbox = None
+    runner.tp_worker = SimpleNamespace(
+        model_runner=SimpleNamespace(
+            sampler=SimpleNamespace(use_ascend_backend=use_ascend_backend)
+        )
+    )
     requests = [
         SimpleNamespace(
             data=SimpleNamespace(
@@ -363,6 +371,17 @@ def test_cosyvoice3_ras_launches_nothing_without_a_repeat(
 ) -> None:
     result, _, redraw_probs = collect_ras_step(
         monkeypatch, [[4, 7], [1, 2, 3], [9], [EOS_ID]]
+    )
+
+    assert result.next_token_ids.tolist() == [9, 5, 9, EOS_ID]
+    assert redraw_probs == []
+
+
+def test_cosyvoice3_ras_leaves_ascend_draws_unchanged(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    result, _, redraw_probs = collect_ras_step(
+        monkeypatch, [[4, 9, 7], [1, 2, 3], [9], [EOS_ID]], use_ascend_backend=True
     )
 
     assert result.next_token_ids.tolist() == [9, 5, 9, EOS_ID]
