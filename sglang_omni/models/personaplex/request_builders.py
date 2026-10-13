@@ -84,7 +84,9 @@ def param_or_default(params: dict, key: str, default, cast):
     return default if value is None else cast(value)
 
 
-def resolve_sampling(params: dict, *, stage_sampling: dict) -> RequestSampling:
+def resolve_sampling(
+    params: dict[str, object], *, stage_sampling: dict[str, object]
+) -> RequestSampling:
     """Resolve selected stage values before stage overrides and top-level values."""
     for source in (params, stage_param_overrides(params, LM_STAGE), stage_sampling):
         temperature = source.get("audio_temperature")
@@ -121,19 +123,18 @@ def resolve_sampling(params: dict, *, stage_sampling: dict) -> RequestSampling:
         seed = lm_params.get("seed")
     else:
         pass
-
-    def text(key: str, default, cast):
-        for source in (stage_sampling, lm_overrides, params):
-            value = source.get(key)
-            if value is not None:
-                return cast(value)
-            else:
-                pass
-        return default
+    text_params = {
+        field_name: value
+        for source in (params, lm_overrides, stage_sampling)
+        for field_name, value in source.items()
+        if value is not None
+    }
 
     return RequestSampling(
-        text_temperature=text("temperature", DEFAULT_TEXT_TEMPERATURE, float),
-        text_top_k=text("top_k", DEFAULT_TEXT_TOP_K, int),
+        text_temperature=float(
+            text_params.get("temperature", DEFAULT_TEXT_TEMPERATURE)
+        ),
+        text_top_k=int(text_params.get("top_k", DEFAULT_TEXT_TOP_K)),
         audio=AudioSampling(
             temperature=param_or_default(
                 lm_params, "audio_temperature", DEFAULT_AUDIO_TEMPERATURE, float
@@ -141,9 +142,9 @@ def resolve_sampling(params: dict, *, stage_sampling: dict) -> RequestSampling:
             top_k=param_or_default(lm_params, "audio_top_k", DEFAULT_AUDIO_TOP_K, int),
         ),
         seed=None if seed is None else int(seed),
-        top_p=text("top_p", 1.0, float),
-        min_p=text("min_p", 0.0, float),
-        repetition_penalty=text("repetition_penalty", 1.0, float),
+        top_p=float(text_params.get("top_p", 1.0)),
+        min_p=float(text_params.get("min_p", 0.0)),
+        repetition_penalty=float(text_params.get("repetition_penalty", 1.0)),
     )
 
 
