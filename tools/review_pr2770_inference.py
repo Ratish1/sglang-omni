@@ -3,7 +3,10 @@
 from types import SimpleNamespace
 
 import torch
-from sglang.srt.layers.sampler import top_k_top_p_min_p_sampling_from_probs_torch
+from sglang.srt.layers.sampler import (
+    multinomial_with_seed,
+    top_k_top_p_min_p_sampling_from_probs_torch,
+)
 from sglang.srt.sampling.penaltylib.repetition_penalty import apply_scaling_penalties
 from sglang.srt.utils import DynamicGradMode
 from torch._dynamo.utils import counters
@@ -17,7 +20,7 @@ class CodecHead(torch.nn.Linear):
         return super().forward(hidden_states), None
 
 
-def check_semantic_seed_buffer(inference_mode: bool) -> None:
+def check_semantic_seed_buffer(inference_mode: bool, warm_normal_seed: bool) -> None:
     DynamicGradMode.set_inference_mode(inference_mode)
     talker = object.__new__(Qwen3TTSTalker)
     torch.nn.Module.__init__(talker)
@@ -29,7 +32,19 @@ def check_semantic_seed_buffer(inference_mode: bool) -> None:
     talker.semantic_sampling_seed_tensor = torch.arange(64, device="cuda")
     runner = SimpleNamespace(model=talker)
     torch.compiler.reset()
+    compiled_before_warmup = counters["stats"]["unique_graphs"]
     talker.precompile_kernels_after_loading()
+    if warm_normal_seed:
+        for rows in (1, 2):
+            seeds = torch.zeros(rows, device="cuda", dtype=torch.long)
+            with DynamicGradMode():
+                multinomial_with_seed(
+                    torch.zeros(rows, 8, device="cuda", dtype=torch.float64),
+                    seeds,
+                    torch.zeros(rows, device="cuda", dtype=torch.long),
+                )
+    else:
+        pass
     compiled_before_requests = counters["stats"]["unique_graphs"]
     with DynamicGradMode():
         for rows in (1, 3, 16):
@@ -64,8 +79,9 @@ def check_semantic_seed_buffer(inference_mode: bool) -> None:
             )
     print(
         f"inference_mode={inference_mode} "
+        f"warm_normal_seed={warm_normal_seed} "
         f"seed_buffer_is_inference={talker.semantic_sampling_seed_tensor.is_inference()} "
-        f"warmup_compiles={compiled_before_requests} "
+        f"warmup_compiles={compiled_before_requests - compiled_before_warmup} "
         f"request_compiles={counters['stats']['unique_graphs'] - compiled_before_requests}",
         flush=True,
     )
@@ -73,5 +89,6 @@ def check_semantic_seed_buffer(inference_mode: bool) -> None:
 
 
 if __name__ == "__main__":
-    check_semantic_seed_buffer(False)
-    check_semantic_seed_buffer(True)
+    check_semantic_seed_buffer(False, False)
+    check_semantic_seed_buffer(True, False)
+    check_semantic_seed_buffer(True, True)
