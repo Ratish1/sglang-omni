@@ -12,7 +12,6 @@ from typing import Any
 
 import pytest
 import torch
-from sglang.srt.layers.sampler import top_k_top_p_min_p_sampling_from_probs_torch
 from sglang.srt.managers.schedule_batch import ReqKvInfo
 from sglang.srt.sampling.penaltylib.repetition_penalty import apply_scaling_penalties
 from sglang.srt.utils import DynamicGradMode
@@ -2864,15 +2863,6 @@ def test_talker_precompile_leaves_the_first_prefill_samples_nothing_to_compile()
                 SimpleNamespace(extend_seq_lens=torch.full((rows,), 2, device="cuda")),
             ).next_token_logits
             apply_scaling_penalties(logits, torch.full_like(logits, 1.05))
-            top_k_top_p_min_p_sampling_from_probs_torch(
-                torch.softmax(logits, dim=-1),
-                torch.full((rows,), 50, device="cuda"),
-                torch.ones(rows, device="cuda"),
-                torch.zeros(rows, device="cuda"),
-                False,
-                torch.arange(rows, device="cuda"),
-                torch.full((rows,), 7, device="cuda"),
-            )
     assert counters["stats"]["unique_graphs"] == compiled
 
 

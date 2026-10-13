@@ -2211,7 +2211,8 @@ class Qwen3TTSTalker(Qwen3TTSPromptBuilderMixin, nn.Module):
         return attn_output
 
     def precompile_kernels_after_loading(self) -> None:
-        # note (ratish): every request is seeded and carries a repetition penalty by default.
+        """Compile the seeded draw and the repetition penalty that every request's
+        default sampling reaches, on the codec head's logits."""
         compile_sampler_functions(
             SamplerCompileForms(
                 device=self.codec_head.weight.device,

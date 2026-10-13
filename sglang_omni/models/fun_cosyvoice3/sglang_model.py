@@ -111,17 +111,13 @@ class FunCosyVoice3SGLangModel(Qwen2ForCausalLM):
         )
 
     def precompile_kernels_after_loading(self) -> None:
-        # note (ratish): every request carries a repetition penalty by default; a seed comes
-        # only from the client.
+        """Compile the repetition penalty every default request applies, on the float32
+        logits forward writes."""
         compile_sampler_functions(
             SamplerCompileForms(
                 device=self.llm_decoder.weight.device,
                 vocab_size=TOTAL_VOCAB_SIZE,
-                penalized_logits_dtype=(
-                    torch.float32
-                    if current_platform.is_cuda()
-                    else self.llm_decoder.weight.dtype
-                ),
+                penalized_logits_dtype=torch.float32,
             )
         )
 

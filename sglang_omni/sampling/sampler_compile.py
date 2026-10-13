@@ -21,7 +21,6 @@ from sglang.srt.utils import DynamicGradMode
 class SamplerCompileForms:
     device: torch.device
     vocab_size: int
-    # note (ratish): None means the model's default requests never reach that function.
     seeded_log_probability_dtype: torch.dtype | None = None
     penalized_logits_dtype: torch.dtype | None = None
 

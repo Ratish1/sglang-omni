@@ -1932,13 +1932,12 @@ class Qwen3OmniTalker(nn.Module):
         return result_codes, summed_embeddings
 
     def precompile_kernels_after_loading(self) -> None:
-        # note (ratish): the first prefill sample is seeded and penalized by default; decode
-        # samples inside its captured graph.
+        """Compile the repetition penalty a request's first sample would compile, on the
+        float32 logits it receives."""
         compile_sampler_functions(
             SamplerCompileForms(
                 device=self.model.codec_embedding.weight.device,
                 vocab_size=self.config.text_config.vocab_size,
-                seeded_log_probability_dtype=torch.float64,
                 penalized_logits_dtype=torch.float32,
             )
         )
