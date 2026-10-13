@@ -8,8 +8,12 @@ import json
 from pathlib import Path
 from urllib.request import Request, urlopen
 
+import torch
+
 from sglang_omni.client.client import Client
 from sglang_omni.client.types import GenerateRequest, SamplingParams
+from sglang_omni.models.personaplex.payload_types import PersonaPlexState
+from sglang_omni.models.personaplex.request_builders import build_lm_request
 from sglang_omni.models.qwen3_tts.request_builders import build_qwen3_tts_state
 from sglang_omni.proto.request import StagePayload
 from sglang_omni.serve.openai_api import (
@@ -192,6 +196,48 @@ def check_bootstrap_boundaries() -> None:
     )
 
 
+def check_personaplex_precedence() -> None:
+    cases: tuple[tuple[float | None, float | None, float | None, float], ...] = (
+        (None, None, None, 0.7),
+        (0.4, None, None, 0.4),
+        (0.4, 0.6, None, 0.6),
+        (0.4, 0.6, 0.3, 0.3),
+        (0.4, 0.6, 0.0, 0.0),
+    )
+    for top_value, stage_override, stage_value, expected_temperature in cases:
+        generation_request = build_chat_generate_request(
+            ChatCompletionRequest(
+                messages=[{"role": "user", "content": "hello"}],
+                temperature=top_value,
+                stage_params={"lm": {"temperature": stage_override}},
+                stage_sampling={"lm": {"temperature": stage_value, "seed": 0}},
+            )
+        )
+        state = PersonaPlexState(
+            text_prompt_ids=[11, 12, 13], user_codes=torch.zeros(2, 8, dtype=torch.long)
+        )
+        data = build_lm_request(
+            StagePayload(
+                request_id="precedence",
+                request=Client.build_omni_request(generation_request),
+                data=state.to_dict(),
+            ),
+            vocab_size=32000,
+        )
+        selected = data.talker_model_inputs["sampling"]
+        assert selected.text_temperature == expected_temperature
+        assert selected.seed == 0
+        if expected_temperature == 0.0:
+            assert data.req.sampling_params.top_k == 1
+        else:
+            assert data.req.sampling_params.temperature == expected_temperature
+    print(
+        json.dumps(
+            {"check": "personaplex_precedence", "cases": len(cases), "passed": True}
+        )
+    )
+
+
 def check_streams(port: int, directory: Path) -> None:
     directory.mkdir(parents=True, exist_ok=True)
     for index, text in enumerate(
@@ -271,6 +317,7 @@ if __name__ == "__main__":
     check_presence()
     check_bootstrap_gate()
     check_bootstrap_boundaries()
+    check_personaplex_precedence()
     if arguments.port is not None:
         check_streams(arguments.port, arguments.output)
     else:
