@@ -423,8 +423,6 @@ class CosyVoice3PreprocessingContext:
         CosyVoice3ReferenceArtifact,
         CosyVoice3StoredReference,
     ]
-    # note (ratish): on CUDA the prompt rows are built on this stream, so their upload
-    # never queues behind the AR's step.
     stream: torch.cuda.Stream | None
 
 
@@ -776,7 +774,7 @@ def prepare_cosyvoice3_request(
     state: FunCosyVoice3State,
     reference_artifact: CosyVoice3ReferenceArtifact | None,
     use_mlx: bool = False,
-    stream: torch.cuda.Stream | None = None,
+    stream: torch.cuda.Stream | None,
 ) -> CosyVoice3PreparedRequest:
     gen_kwargs = state.generation_kwargs
 
