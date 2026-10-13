@@ -145,7 +145,6 @@ def test_custom_voice_config_preserves_model_owned_defaults(
     assert params["voice"] == voice
     assert params["instructions"] == "Calm and clear."
     assert "task_type" not in params and "language" not in params
-    assert params.get("explicit_generation_params", []) == []
     assert generated.prompt == "hello"
     assert prepared.reference_descriptors == []
     assert store.mock_calls == []
@@ -418,7 +417,6 @@ def test_speech_service_normalizes_tts_extension_fields_into_tts_params() -> Non
     assert tts_params["initial_codec_chunk_frames"] == 8
     assert gen_req.extra_params == {"initial_codec_chunk_frames": 8}
     assert gen_req.sampling.max_new_tokens == 128
-    assert tts_params["explicit_generation_params"] == ["max_new_tokens"]
 
 
 def test_file_reference_requires_allowlist() -> None:

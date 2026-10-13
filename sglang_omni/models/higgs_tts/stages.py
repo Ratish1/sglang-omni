@@ -96,6 +96,20 @@ _CONSUMED_REFERENCE_INPUT_KEYS = frozenset(
     {"reference_audio", "references", "reference_codes"}
 )
 
+# note (ratish): /v1/audio/speech has served 0.8, 0.8, 30, the values the Higgs CI WER
+# thresholds are measured at. Every other endpoint has served 1.0 over the full
+# vocabulary, which the full-vocabulary rollout logprobs (selected_token_logprobs) assume.
+SPEECH_SAMPLING_DEFAULTS: dict[str, float | int] = {
+    "temperature": 0.8,
+    "top_p": 0.8,
+    "top_k": 30,
+}
+OTHER_SAMPLING_DEFAULTS: dict[str, float | int] = {
+    "temperature": 1.0,
+    "top_p": 1.0,
+    "top_k": -1,
+}
+
 
 def reference_audio_cache_key(reference_audio: object) -> str | None:
     """Safe source key for preprocessing waveform-cache lookup."""
@@ -283,6 +297,11 @@ def create_preprocessing_executor(
     def _preprocess(payload: StagePayload) -> StagePayload:
         inputs = payload.request.inputs or {}
         params = payload.request.params or {}
+        sampling_defaults = (
+            SPEECH_SAMPLING_DEFAULTS
+            if (payload.request.metadata or {}).get("task") == "tts"
+            else OTHER_SAMPLING_DEFAULTS
+        )
         if isinstance(inputs, str):
             inputs = {"text": inputs}
         else:
@@ -424,9 +443,11 @@ def create_preprocessing_executor(
             num_codebooks=num_codebooks,
             codebook_size=codebook_size,
             max_new_tokens=int(params.get("max_new_tokens", 2048)),
-            temperature=float(params.get("temperature", 1.0)),
-            top_p=params.get("top_p"),
-            top_k=params.get("top_k"),
+            temperature=float(
+                params.get("temperature", sampling_defaults["temperature"])
+            ),
+            top_p=params.get("top_p", sampling_defaults["top_p"]),
+            top_k=params.get("top_k", sampling_defaults["top_k"]),
             seed=params.get("seed"),
             return_logprob=bool(params.get("return_logprob", False)),
             return_omni_rollout=bool(params.get("return_omni_rollout", False)),

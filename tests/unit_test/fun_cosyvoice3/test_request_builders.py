@@ -303,9 +303,8 @@ def test_cosyvoice3_reference_cache_retries_after_encode_failure(
     assert service.stats()["entries"] == 1
 
 
-def test_generation_kwargs_omit_implicit_sampling_defaults_but_keep_explicit_values() -> (
-    None
-):
+def test_generation_kwargs_keep_every_set_value() -> None:
+    """A caller's temperature 0.7, top_p 0.8, top_k 20 were dropped as placeholders."""
     params = {
         "temperature": 0.7,
         "top_p": 0.8,
@@ -314,18 +313,8 @@ def test_generation_kwargs_omit_implicit_sampling_defaults_but_keep_explicit_val
         "do_sample": False,
         "max_new_tokens": 12,
     }
-    assert build_generation_kwargs(params, tts_params={}) == {
-        "do_sample": False,
-        "max_new_tokens": 12,
-    }
-    assert build_generation_kwargs(
-        params, tts_params={"explicit_generation_params": ["temperature", "top_p"]}
-    ) == {
-        "do_sample": False,
-        "temperature": 0.7,
-        "top_p": 0.8,
-        "max_new_tokens": 12,
-    }
+    assert build_generation_kwargs(params) == params
+    assert build_generation_kwargs({"top_k": None}) == {}
 
 
 class FakeTokenizer:
@@ -403,11 +392,6 @@ def test_preprocess_and_build_request_share_prepared_state(
                 else {"repetition_penalty": repetition_penalty}
             ),
         },
-        tts_params=(
-            {}
-            if repetition_penalty is None
-            else {"explicit_generation_params": ["repetition_penalty"]}
-        ),
     )
 
     prepared_payload = preprocess_cosyvoice3_payload(payload)
