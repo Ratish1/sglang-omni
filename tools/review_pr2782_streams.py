@@ -15,6 +15,7 @@ import torch
 import triton
 import triton.language as tl
 from huggingface_hub import hf_hub_download, snapshot_download
+from sglang.srt.mem_cache.radix_cache import RadixKey
 
 from sglang_omni.models.fun_cosyvoice3 import request_builders
 from sglang_omni.models.fun_cosyvoice3.payload_types import FunCosyVoice3State
@@ -22,6 +23,7 @@ from sglang_omni.models.fun_cosyvoice3.request_builders import (
     CosyVoice3PreparedRequest,
     CosyVoice3ReferenceArtifact,
     CosyVoice3SGLangRequestData,
+    build_embedding_cache_key_ids,
     build_sglang_cosyvoice3_request,
     prepare_cosyvoice3_request,
 )
@@ -244,6 +246,7 @@ def check_checkpoint(model_id: str) -> None:
         flow_prompt_speech_feat=torch.zeros(1, 6, 80),
         flow_embedding=torch.zeros(1, 192),
     )
+    prompt_keys: list[tuple[RadixKey, RadixKey]] = []
     for text in ("Hello world.", "The rain falls softly.", "请慢慢地说这句话。"):
         for prompt in (None, "A reference sentence.", "speak warmly"):
             state = FunCosyVoice3State(
@@ -274,7 +277,29 @@ def check_checkpoint(model_id: str) -> None:
                 dtype=torch.bfloat16,
             ).squeeze(0)
             assert torch.equal(prepared.prompt_input_embeds, expected)
-    print(json.dumps({"check": "checkpoint_rows", "cases": 9, "passed": True}))
+            prompt_keys.append(
+                (
+                    RadixKey(prepared.input_ids_list),
+                    RadixKey(build_embedding_cache_key_ids(expected)),
+                )
+            )
+    for new_left, old_left in prompt_keys:
+        for new_right, old_right in prompt_keys:
+            for page_size in (1, 16):
+                assert new_left.match(new_right, page_size) == old_left.match(
+                    old_right, page_size
+                )
+    print(
+        json.dumps(
+            {
+                "check": "checkpoint_rows_and_radix_prefixes",
+                "cases": 9,
+                "ordered_pairs": 81,
+                "page_sizes": [1, 16],
+                "passed": True,
+            }
+        )
+    )
 
 
 if __name__ == "__main__":
