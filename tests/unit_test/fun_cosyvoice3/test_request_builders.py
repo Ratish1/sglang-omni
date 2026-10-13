@@ -29,6 +29,11 @@ from sglang_omni.models.fun_cosyvoice3.request_builders import (
     preprocess_cosyvoice3_payload,
     set_cosyvoice3_preprocessing_context,
 )
+from sglang_omni.models.fun_cosyvoice3.sglang_model import (
+    SOS_ID,
+    TASK_ID,
+    TOTAL_VOCAB_SIZE,
+)
 from sglang_omni.proto import OmniRequest, StagePayload
 from sglang_omni.scheduling.message import IncomingMessage
 from sglang_omni.scheduling.reference_encoder import ReferenceEncodeService
@@ -390,6 +395,7 @@ def test_preprocess_and_build_request_share_prepared_state(
         tokenizer=FakeTokenizer(),
         speech_tokenizer=FakeSpeechTokenizer(),
         speaker_encoder=FakeSpeakerEncoder(),
+        device=torch.device("cpu"),
     )
     payload = make_payload(
         {"text": "hello", "ref_audio": "reference.wav"},
@@ -482,6 +488,7 @@ def test_mlx_preprocessing_uses_token_metadata_without_torch_model(
         tokenizer=FakeTokenizer(),
         speech_tokenizer=FakeSpeechTokenizer(),
         speaker_encoder=FakeSpeakerEncoder(),
+        device=torch.device("cpu"),
         use_mlx=True,
         model_revision="mlx-test",
     )
@@ -615,6 +622,7 @@ def test_preprocessing_overlaps_reference_encoding_but_serializes_finalization(
         tokenizer=FakeTokenizer(),
         speech_tokenizer=FakeSpeechTokenizer(),
         speaker_encoder=FakeSpeakerEncoder(),
+        device=torch.device("cpu"),
     )
 
     request_ids = {"req-reference-a", "req-reference-b"}
@@ -686,6 +694,7 @@ def test_build_request_attaches_stream_metadata_when_stream_true(
         tokenizer=FakeTokenizer(),
         speech_tokenizer=FakeSpeechTokenizer(),
         speaker_encoder=FakeSpeakerEncoder(),
+        device=torch.device("cpu"),
     )
     payload = make_payload(
         {"text": "hello", "ref_audio": "reference.wav"},
@@ -728,6 +737,7 @@ def test_build_request_derives_generation_length_contract_when_unset(
         tokenizer=FakeTokenizer(),
         speech_tokenizer=FakeSpeechTokenizer(),
         speaker_encoder=FakeSpeakerEncoder(),
+        device=torch.device("cpu"),
     )
     payload = make_payload(
         {"text": "hello", "ref_audio": "reference.wav"},
@@ -773,6 +783,7 @@ def test_preprocess_includes_reference_text_before_target_text(
         tokenizer=FakeTokenizer(),
         speech_tokenizer=FakeSpeechTokenizer(),
         speaker_encoder=FakeSpeakerEncoder(),
+        device=torch.device("cpu"),
     )
     payload = make_payload(
         {
@@ -823,6 +834,7 @@ def test_preprocess_excludes_reference_speech_from_instruct_llm_prompt(
         tokenizer=InstructTokenizer(),
         speech_tokenizer=FakeSpeechTokenizer(),
         speaker_encoder=FakeSpeakerEncoder(),
+        device=torch.device("cpu"),
     )
     payload = make_payload(
         {"text": "hello", "ref_audio": "reference.wav"},
@@ -837,6 +849,80 @@ def test_preprocess_excludes_reference_speech_from_instruct_llm_prompt(
     assert prepared.input_ids.numel() == 7
     assert prepared.llm_prompt_speech_token.shape == (1, 0)
     assert prepared.flow_prompt_speech_token.tolist() == [[40]]
+
+
+@pytest.mark.accelerator
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_cuda_preprocessing_builds_prompt_rows_without_a_host_wait(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        request_builders,
+        "load_prompt_audio",
+        lambda source: torch.zeros(1600).numpy(),
+    )
+    monkeypatch.setattr(
+        request_builders,
+        "load_prompt_audio_24k",
+        lambda source: torch.zeros(2400).numpy(),
+    )
+    monkeypatch.setattr(
+        request_builders,
+        "extract_prompt_speech_feat",
+        lambda audio, sample_rate: torch.ones(1, 2, 80),
+    )
+
+    class EmbeddingModel(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.text_embed_tokens = torch.nn.Embedding(8, 4)
+            self.speech_embedding = torch.nn.Embedding(TOTAL_VOCAB_SIZE, 4)
+
+    model = EmbeddingModel().cuda()
+    set_cosyvoice3_preprocessing_context(
+        model=model,
+        tokenizer=FakeTokenizer(),
+        speech_tokenizer=FakeSpeechTokenizer(),
+        speaker_encoder=FakeSpeakerEncoder(),
+        device=torch.device("cuda"),
+    )
+    payload = make_payload(
+        {
+            "text": "hello",
+            "ref_audio": "reference.wav",
+            "ref_text": "reference",
+        },
+        params={"do_sample": False},
+        request_id="req-cuda",
+    )
+
+    sync_debug_mode = torch.cuda.get_sync_debug_mode()
+    torch.cuda.set_sync_debug_mode("error")
+    try:
+        prepared_payload = preprocess_cosyvoice3_payload(payload)
+        request_data = build_sglang_cosyvoice3_request(prepared_payload, model=model)
+    finally:
+        torch.cuda.set_sync_debug_mode(sync_debug_mode)
+
+    assert request_data.req.origin_input_ids == [
+        SOS_ID,
+        TOTAL_VOCAB_SIZE + 3,
+        TOTAL_VOCAB_SIZE + 4,
+        TOTAL_VOCAB_SIZE + 5,
+        TOTAL_VOCAB_SIZE + 1,
+        TOTAL_VOCAB_SIZE + 2,
+        TASK_ID,
+        40,
+        41,
+    ]
+    expected_rows = torch.cat(
+        [
+            model.speech_embedding.weight[[SOS_ID]],
+            model.text_embed_tokens.weight[[3, 4, 5, 1, 2]],
+            model.speech_embedding.weight[[TASK_ID, 40, 41]],
+        ]
+    )
+    assert torch.equal(request_data.prompt_input_embeds, expected_rows)
 
 
 def test_result_adapter_preserves_reference_conditioning_for_vocoder(
