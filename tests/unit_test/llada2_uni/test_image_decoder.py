@@ -13,6 +13,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock
 
+import numpy as np
 import pytest
 import torch
 import torch.multiprocessing as mp
@@ -43,6 +44,7 @@ from sglang_omni.models.llada2_uni.components.preprocessor import (
     IMAGE_TOKEN_OFFSET,
     SOI_TOKEN,
     LLaDA2Preprocessor,
+    preprocess_image_edit,
 )
 from sglang_omni.models.llada2_uni.components.transport import sample_velocity
 from sglang_omni.models.llada2_uni.config import (
@@ -537,7 +539,16 @@ def test_edit_preprocess_merge_extract_and_decode(
     preprocessor, decode_probe, monkeypatch, tmp_path, source_size, grid
 ):
     source = tmp_path / "source.png"
-    Image.new("RGB", source_size, "white").save(source)
+    row_indices, column_indices = np.indices((source_size[1], source_size[0]))
+    source_pixels = np.stack(
+        (
+            row_indices % 256,
+            column_indices % 256,
+            (row_indices + column_indices) % 256,
+        ),
+        axis=-1,
+    ).astype(np.uint8)
+    Image.fromarray(source_pixels).save(source)
     generation_params = {
         "cfg_text_scale": 3.5,
         "cfg_image_scale": 1.5,
@@ -565,6 +576,32 @@ def test_edit_preprocess_merge_extract_and_decode(
     assert state.task_kind == "edit"
     grid_h, grid_w = grid
     assert state.stream_state["image_info"] == [{"grid_h": grid_h, "grid_w": grid_w}]
+    processed_image = preprocess_image_edit(
+        [Image.open(source).convert("RGB")], preprocessor.factor
+    )[0]
+    processed_pixels = (
+        torch.from_numpy(np.asarray(processed_image).copy())
+        .permute(2, 0, 1)
+        .float()
+        .mul(preprocessor.image_processor.rescale_factor)
+    )
+    processed_pixels = (processed_pixels - 0.5) / 0.5
+    expected_patch_rows = []
+    for row_index in range(grid_h):
+        for column_index in range(grid_w):
+            patch = processed_pixels[
+                :,
+                row_index * 16 : (row_index + 1) * 16,
+                column_index * 16 : (column_index + 1) * 16,
+            ]
+            expected_patch_rows.append(
+                patch.unsqueeze(1).expand(-1, 2, -1, -1).flatten()
+            )
+    expected_patch_rows_tensor = torch.stack(expected_patch_rows)
+    torch.testing.assert_close(
+        state.encoder_inputs[IMAGE_STAGE]["pixel_values"],
+        expected_patch_rows_tensor,
+    )
     source_tokens = list(range(grid_h * grid_w))
     state.encoder_outs[IMAGE_STAGE] = {"image_token_ids": [source_tokens]}
     merge_image_tokens_for_thinker(state)
