@@ -178,6 +178,12 @@ def check_lifetime(model: EmbeddingTables, producer: torch.cuda.Stream) -> None:
     shape = prepared.prompt_input_embeds.shape
     source_pointer = prepared.prompt_input_embeds.data_ptr()
     host_snapshot = torch.empty_like(expected, pin_memory=True)
+    with torch.cuda.stream(producer):
+        reserve = [
+            torch.empty(shape, dtype=expected.dtype, device="cuda") for _ in range(256)
+        ]
+    producer.synchronize()
+    del reserve
     allocations: list[torch.Tensor] = []
     release.zero_()
     torch.cuda.synchronize()
@@ -273,6 +279,7 @@ if __name__ == "__main__":
     faulthandler.register(signal.SIGUSR1)
     parser = argparse.ArgumentParser()
     parser.add_argument("--checkpoint")
+    parser.add_argument("--only", choices=("ordering", "lifetime", "checkpoint"))
     arguments = parser.parse_args()
     text_weights = torch.arange(16 * 32, dtype=torch.float32).reshape(16, 32).cuda()
     speech_weights = (
@@ -283,8 +290,14 @@ if __name__ == "__main__":
     tables = EmbeddingTables(text_weights, speech_weights)
     preprocessing_stream = torch.cuda.Stream()
     warm(tables, preprocessing_stream)
-    check_ordering(tables, preprocessing_stream)
-    check_lifetime(tables, preprocessing_stream)
+    if arguments.only in (None, "ordering"):
+        check_ordering(tables, preprocessing_stream)
+    else:
+        pass
+    if arguments.only in (None, "lifetime"):
+        check_lifetime(tables, preprocessing_stream)
+    else:
+        pass
     if arguments.checkpoint is not None:
         check_checkpoint(arguments.checkpoint)
     else:
