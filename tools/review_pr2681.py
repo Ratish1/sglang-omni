@@ -9,6 +9,8 @@ import json
 import logging
 from pathlib import Path
 
+import numpy as np
+import torch
 from PIL import Image
 
 from sglang_omni.config.manager import ConfigManager
@@ -16,6 +18,9 @@ from sglang_omni.config.patch import ConfigPatchSet
 from sglang_omni.config.resolver import ConfigResolver
 from sglang_omni.config.runtime import resolve_stage_typed_kwargs
 from sglang_omni.config.schema import FactoryArgs
+from sglang_omni.models.llada2_uni.components.preprocessor import (
+    edit_image_pixel_values,
+)
 from sglang_omni.models.llada2_uni.config import (
     LLaDA2ImageDecoderFactoryArgs,
     LLaDA2UniOmniPipelineConfig,
@@ -59,6 +64,45 @@ def configuration_boundaries() -> None:
                 }
             )
         )
+
+
+def patch_ordering() -> None:
+    source = np.empty((32, 48, 3), dtype=np.uint8)
+    for y in range(32):
+        for x in range(48):
+            source[y, x] = (x * 5 % 256, y * 7 % 256, (x * 3 + y * 11) % 256)
+    actual = edit_image_pixel_values(
+        [Image.fromarray(source)], 16, 1, 1, [0.5] * 3, [0.5] * 3, 1 / 255
+    )
+    normalized = (torch.from_numpy(source).permute(2, 0, 1).float() / 255 - 0.5) / 0.5
+    expected = torch.stack(
+        [
+            normalized[:, y : y + 16, x : x + 16].flatten()
+            for y in range(0, 32, 16)
+            for x in range(0, 48, 16)
+        ]
+    )
+    torch.testing.assert_close(actual["pixel_values"], expected, atol=3e-7, rtol=0)
+    assert actual["image_grid_thw"].tolist() == [[1, 2, 3]]
+    white = edit_image_pixel_values(
+        [Image.new("RGB", (32, 48), "white")],
+        16,
+        1,
+        1,
+        [0.5] * 3,
+        [0.5] * 3,
+        1 / 255,
+    )["pixel_values"]
+    assert torch.equal(white, white.flip(0).flip(1))
+    assert not torch.equal(expected, expected.flip(0).flip(1))
+    print(
+        json.dumps(
+            {
+                "nonuniform_patch_ordering": "pass",
+                "white_is_permutation_invariant": True,
+            }
+        )
+    )
 
 
 async def model_requests(directory: Path) -> None:
@@ -164,11 +208,13 @@ async def model_requests(directory: Path) -> None:
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("mode", choices=("boundaries", "model"))
+    parser.add_argument("mode", choices=("boundaries", "patches", "model"))
     parser.add_argument("--directory", type=Path, default=Path("/data/pr2681-review"))
     arguments = parser.parse_args()
     logging.basicConfig(level=logging.INFO)
     if arguments.mode == "boundaries":
         configuration_boundaries()
+    elif arguments.mode == "patches":
+        patch_ordering()
     else:
         asyncio.run(model_requests(arguments.directory))
