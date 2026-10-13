@@ -148,6 +148,7 @@ def check_streams(port: int, directory: Path) -> None:
         ):
             body = {
                 "input": text,
+                "task_type": "CustomVoice",
                 "voice": "Ryan",
                 "language": "English",
                 "response_format": "pcm",
