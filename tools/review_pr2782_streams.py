@@ -247,7 +247,16 @@ def check_checkpoint(model_id: str) -> None:
         flow_embedding=torch.zeros(1, 192),
     )
     prompt_keys: list[tuple[RadixKey, RadixKey]] = []
-    for text in ("Hello world.", "The rain falls softly.", "请慢慢地说这句话。"):
+    shared_text = (
+        "The evening rain falls softly over the quiet garden while a patient "
+        "traveler listens to distant music and remembers the stories told "
+        "during the long journey through the mountains. "
+    )
+    for text in (
+        shared_text + "Tomorrow the traveler will return home.",
+        shared_text + "Tomorrow the traveler will continue east.",
+        "请慢慢地说这句话。",
+    ):
         for prompt in (None, "A reference sentence.", "speak warmly"):
             state = FunCosyVoice3State(
                 text=text,
@@ -283,12 +292,19 @@ def check_checkpoint(model_id: str) -> None:
                     RadixKey(build_embedding_cache_key_ids(expected)),
                 )
             )
+    largest_shared_prefix = 0
     for new_left, old_left in prompt_keys:
         for new_right, old_right in prompt_keys:
+            prefix_length = new_left.match(new_right)
+            if prefix_length < min(len(new_left), len(new_right)):
+                largest_shared_prefix = max(largest_shared_prefix, prefix_length)
+            else:
+                pass
             for page_size in (1, 16):
                 assert new_left.match(new_right, page_size) == old_left.match(
                     old_right, page_size
                 )
+    assert largest_shared_prefix >= 16
     print(
         json.dumps(
             {
@@ -296,6 +312,7 @@ def check_checkpoint(model_id: str) -> None:
                 "cases": 9,
                 "ordered_pairs": 81,
                 "page_sizes": [1, 16],
+                "largest_shared_prefix": largest_shared_prefix,
                 "passed": True,
             }
         )
