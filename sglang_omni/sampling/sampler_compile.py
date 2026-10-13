@@ -1,11 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
-"""The torch.compile'd sampler functions, compiled while a model loads.
-
-multinomial_with_seed and apply_scaling_penalties each compile one entry per batch
-size class (one row, two or more), per dtype and per grad mode, on the first call that
-brings it. A model whose default requests reach them compiles those entries from its
-precompile_kernels_after_loading, so no request pays the compile.
-"""
+"""Compiles the sampler's torch.compile'd functions while a model loads, in the forms
+its default requests reach in the default no-grad mode."""
 
 from __future__ import annotations
 
@@ -26,8 +21,8 @@ class SamplerCompileForms:
 
 
 def compile_sampler_functions(forms: SamplerCompileForms) -> None:
-    # note (ratish): the scheduler's event loops sample under DynamicGradMode, and each
-    # entry is guarded on the grad mode it was built in.
+    # note (ratish): the scheduler samples under DynamicGradMode; in its inference mode,
+    # inputs allocated at load (seed buffers, graph outputs) still compile on first use.
     with DynamicGradMode():
         # note (ratish): Dynamo specializes a one-row batch; the entry built at two rows
         # is dynamic and serves every larger batch.
