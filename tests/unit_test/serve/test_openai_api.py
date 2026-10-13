@@ -2031,6 +2031,38 @@ def test_speech_response_returns_when_disconnect_poll_is_false() -> None:
     asyncio.run(drive())
 
 
+@pytest.mark.parametrize("stream", [False, True])
+def test_supported_speech_fields_refuse_an_unknown_field_before_generation(
+    stream: bool,
+) -> None:
+    client_impl = SuccessfulSpeechClient()
+    client = TestClient(
+        create_app(
+            client_impl,
+            model_name="tts",
+            supported_speech_fields=frozenset(
+                {"model", "input", "voice", "response_format", "stream"}
+            ),
+        )
+    )
+
+    response = client.post(
+        "/v1/audio/speech",
+        json={
+            "model": "tts",
+            "input": "hello",
+            "stream": stream,
+            "response_format": "pcm" if stream else "wav",
+            "stage_sampling": {},
+        },
+    )
+
+    assert response.status_code == 400
+    assert response.json()["error"]["param"] == "stage_sampling"
+    assert client_impl.generate_requests == []
+    assert client_impl.speech_requests == []
+
+
 def test_speech_request_passes_only_the_set_sampling_fields() -> None:
     req = CreateSpeechRequest(
         input="hello",
