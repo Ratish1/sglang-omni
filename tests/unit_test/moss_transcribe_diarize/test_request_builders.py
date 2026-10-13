@@ -643,7 +643,7 @@ def test_request_builder_preserves_sampling_overrides() -> None:
 
 
 def test_request_builder_preserves_explicit_default_valued_overrides() -> None:
-    """A caller's temperature 1.0, top_p 1.0, top_k -1 were dropped as placeholders."""
+    """A set temperature 1.0, top_p 1.0 or top_k -1 reaches the model instead of being dropped."""
     request_builder = make_request_builder()
 
     data = request_builder(

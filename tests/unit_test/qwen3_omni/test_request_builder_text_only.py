@@ -115,7 +115,7 @@ def test_out_of_vocabulary_prompt_ids_are_a_bad_request(monkeypatch, token_id):
 
 
 def test_chat_request_without_a_temperature_reaches_the_thinker_greedy(monkeypatch):
-    """A chat request without a temperature sampled the thinker at 1.0."""
+    """A chat request without a temperature samples the thinker greedily, not at 1.0."""
     patch_sampling_validation(monkeypatch)
     gen_req = build_chat_generate_request(
         ChatCompletionRequest(

@@ -304,7 +304,7 @@ def test_cosyvoice3_reference_cache_retries_after_encode_failure(
 
 
 def test_generation_kwargs_keep_every_set_value() -> None:
-    """A caller's temperature 0.7, top_p 0.8, top_k 20 were dropped as placeholders."""
+    """A set temperature 0.7, top_p 0.8 or top_k 20 reaches the model instead of being dropped."""
     params = {
         "temperature": 0.7,
         "top_p": 0.8,

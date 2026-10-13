@@ -906,7 +906,7 @@ def test_qwen3_tts_maps_references_and_keeps_upstream_sampling_defaults() -> Non
 
 
 def test_qwen3_tts_preserves_explicit_default_like_sampling_values() -> None:
-    """A caller's temperature 0.8 and top_k 30 were dropped as placeholders."""
+    """A set temperature 0.8 or top_k 30 reaches the model instead of being dropped."""
     payload = make_payload(
         inputs={
             "text": "target",
@@ -1986,7 +1986,7 @@ def test_qwen3_tts_bootstrap_silence_ineligible_variants(
 def test_qwen3_tts_bootstrap_silence_ineligible_when_sampling_is_set(
     params: dict[str, object],
 ) -> None:
-    """A set temperature 0.8 left the stream eligible as a placeholder."""
+    """Any set sampling field, even at a former placeholder value, disables bootstrap silence."""
     state = build_qwen3_tts_state(bootstrap_eligible_payload(params=params))
 
     assert state.suppress_bootstrap_silence is False

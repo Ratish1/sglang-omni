@@ -106,7 +106,7 @@ def test_request_boundary_rejects_unusable_inputs():
 
 
 def test_a_set_text_value_wins_even_when_it_equals_a_neutral_value():
-    """A caller's temperature 1.0 was dropped as a client placeholder."""
+    """A set temperature 1.0 reaches the sampler instead of being taken for a client placeholder."""
     data = build_lm_request(make_payload(2, {"temperature": 1.0}), vocab_size=32000)
     assert data.req.sampling_params.temperature == 1.0
     assert data.req.sampling_params.top_k == DEFAULT_TEXT_TOP_K
