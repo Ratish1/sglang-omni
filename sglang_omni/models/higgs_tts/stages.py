@@ -96,14 +96,14 @@ _CONSUMED_REFERENCE_INPUT_KEYS = frozenset(
     {"reference_audio", "references", "reference_codes"}
 )
 
-# note (ratish): /v1/audio/speech has served 0.8, 0.8, 30, the values the Higgs CI WER
-# thresholds are measured at. Every other endpoint has served 1.0 over the full
-# vocabulary, which the full-vocabulary rollout logprobs (selected_token_logprobs) assume.
+# note (ratish): measured on SeedTTS EN, top_k 50 without top_p raises WER,
+# and top_k 50 with top_p 0.8 matches these values.
 SPEECH_SAMPLING_DEFAULTS: dict[str, float | int] = {
     "temperature": 0.8,
     "top_p": 0.8,
     "top_k": 30,
 }
+# note (ratish): rollouts sample the full vocabulary, the distribution their logprobs report.
 OTHER_SAMPLING_DEFAULTS: dict[str, float | int] = {
     "temperature": 1.0,
     "top_p": 1.0,
