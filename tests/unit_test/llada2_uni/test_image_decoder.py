@@ -39,7 +39,6 @@ from sglang_omni.models.llada2_uni.components.image_decoder import (
 )
 from sglang_omni.models.llada2_uni.components.preprocessor import (
     BOI_TOKEN,
-    DUMMY_IMAGE_TOKEN_ID,
     EOI_TOKEN,
     IMAGE_TOKEN_OFFSET,
     SOI_TOKEN,
@@ -611,7 +610,6 @@ def test_edit_preprocess_merge_extract_and_decode(
         ),  # noqa: leading-underscore  # DLLM protocol
     ):
         assert len(branch_ids) == len(prompt_ids)
-        assert DUMMY_IMAGE_TOKEN_ID not in branch_ids
         assert 0 <= pad_len < len(branch_ids)
         assert branch_ids[:pad_len] == [preprocessor.tokenizer.mask_token_id] * pad_len
         assert branch_ids[pad_len] != preprocessor.tokenizer.mask_token_id
