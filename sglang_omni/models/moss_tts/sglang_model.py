@@ -815,8 +815,8 @@ class MossTTSDelaySGLangModel(torch.nn.Module):
         return hidden_states[last_index]
 
     def precompile_kernels_after_loading(self) -> None:
-        """Compile the seeded draw every request's eager text step reaches, on float32
-        scores."""
+        # note (ratish): every request is seeded, and its text steps sample eagerly on float32
+        # scores.
         compile_sampler_functions(
             SamplerCompileForms(
                 device=self.device,

@@ -11,7 +11,6 @@ from sglang.srt.utils import DynamicGradMode
 from torch._dynamo.utils import counters
 
 from sglang_omni.sampling.sampler_compile import (
-    SAMPLER_LOG_PROBABILITY_DTYPE,
     SamplerCompileForms,
     compile_sampler_functions,
 )
@@ -30,7 +29,7 @@ def test_compiled_forms_serve_views_and_standalone_tensors_at_every_batch_size()
         SamplerCompileForms(
             device=device,
             vocab_size=VOCAB_SIZE,
-            seeded_log_probability_dtype=SAMPLER_LOG_PROBABILITY_DTYPE,
+            seeded_log_probability_dtype=torch.float64,
             penalized_logits_dtype=torch.bfloat16,
         )
     )
@@ -41,7 +40,7 @@ def test_compiled_forms_serve_views_and_standalone_tensors_at_every_batch_size()
     with DynamicGradMode():
         for rows in (1, 2, 5, 13):
             log_probabilities = torch.randn(
-                rows, VOCAB_SIZE, dtype=SAMPLER_LOG_PROBABILITY_DTYPE, device=device
+                rows, VOCAB_SIZE, dtype=torch.float64, device=device
             )
             positions = torch.arange(rows, device=device)
             multinomial_with_seed(log_probabilities, seed_buffer[:rows], positions)

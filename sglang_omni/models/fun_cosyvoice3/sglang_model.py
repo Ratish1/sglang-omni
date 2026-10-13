@@ -111,8 +111,8 @@ class FunCosyVoice3SGLangModel(Qwen2ForCausalLM):
         )
 
     def precompile_kernels_after_loading(self) -> None:
-        """Compile the repetition penalty every default request applies, on the logits
-        forward writes."""
+        # note (ratish): every request carries a repetition penalty by default; a seed comes
+        # only from the client.
         compile_sampler_functions(
             SamplerCompileForms(
                 device=self.llm_decoder.weight.device,

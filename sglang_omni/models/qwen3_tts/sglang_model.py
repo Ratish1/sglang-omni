@@ -54,7 +54,6 @@ from sglang_omni.models.qwen3_tts.speaker_encoder_cuda_graph import (
 from sglang_omni.platforms import current_platform
 from sglang_omni.platforms.device_graph import ReplayableGraph
 from sglang_omni.sampling.sampler_compile import (
-    SAMPLER_LOG_PROBABILITY_DTYPE,
     SamplerCompileForms,
     compile_sampler_functions,
 )
@@ -2212,13 +2211,12 @@ class Qwen3TTSTalker(Qwen3TTSPromptBuilderMixin, nn.Module):
         return attn_output
 
     def precompile_kernels_after_loading(self) -> None:
-        """Compile the seeded draw and the repetition penalty that every request's
-        default sampling reaches, on the codec head's logits."""
+        # note (ratish): every request is seeded and carries a repetition penalty by default.
         compile_sampler_functions(
             SamplerCompileForms(
                 device=self.codec_head.weight.device,
                 vocab_size=self.config.vocab_size,
-                seeded_log_probability_dtype=SAMPLER_LOG_PROBABILITY_DTYPE,
+                seeded_log_probability_dtype=torch.float64,
                 penalized_logits_dtype=self.codec_head.weight.dtype,
             )
         )

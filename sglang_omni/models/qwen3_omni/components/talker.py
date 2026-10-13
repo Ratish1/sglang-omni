@@ -31,7 +31,6 @@ from sglang_omni.models.qwen3_omni.hf_config import (
 from sglang_omni.platforms import current_platform
 from sglang_omni.quantization import get_weight_preprocessor
 from sglang_omni.sampling.sampler_compile import (
-    SAMPLER_LOG_PROBABILITY_DTYPE,
     SamplerCompileForms,
     compile_sampler_functions,
 )
@@ -1933,13 +1932,13 @@ class Qwen3OmniTalker(nn.Module):
         return result_codes, summed_embeddings
 
     def precompile_kernels_after_loading(self) -> None:
-        """Compile the seeded draw and the repetition penalty a request's first prefill
-        sample reaches, on the float32 logits it receives."""
+        # note (ratish): the first prefill sample is seeded and penalized by default; decode
+        # samples inside its captured graph.
         compile_sampler_functions(
             SamplerCompileForms(
                 device=self.model.codec_embedding.weight.device,
                 vocab_size=self.config.text_config.vocab_size,
-                seeded_log_probability_dtype=SAMPLER_LOG_PROBABILITY_DTYPE,
+                seeded_log_probability_dtype=torch.float64,
                 penalized_logits_dtype=torch.float32,
             )
         )
