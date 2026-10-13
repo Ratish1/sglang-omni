@@ -12,10 +12,12 @@ import numpy as np
 import pytest
 import torch
 from sglang.srt.arg_groups.overrides import resolution_result
+from transformers import PreTrainedTokenizerFast
 
 import sglang_omni.platforms as platforms
 from sglang_omni.cli.serve import patches_from_broadcast_flags
 from sglang_omni.client.client import Client
+from sglang_omni.client.types import GenerateRequest
 from sglang_omni.config.manager import ConfigManager
 from sglang_omni.config.resolver import ConfigResolver
 from sglang_omni.config.runtime import resolve_stage_typed_kwargs
@@ -663,7 +665,7 @@ def test_higgs_preprocessing_prunes_preencoded_reference_inputs(monkeypatch) -> 
 
 
 def preprocessed_sampling(
-    monkeypatch, gen_req
+    monkeypatch: pytest.MonkeyPatch, generation_request: GenerateRequest
 ) -> tuple[float, float | None, int | None]:
     monkeypatch.setattr(stages, "resolve_checkpoint", lambda model_path: model_path)
     monkeypatch.setattr(stages.Tokenizer, "from_file", lambda path: object())
@@ -674,7 +676,7 @@ def preprocessed_sampling(
     )
 
     class FakeAdapter:
-        def __init__(self, tokenizer) -> None:
+        def __init__(self, tokenizer: PreTrainedTokenizerFast) -> None:
             pass
 
         def build_prompt(
@@ -686,7 +688,7 @@ def preprocessed_sampling(
     preprocess = stages.create_preprocessing_executor("ckpt", num_codebooks=2).fn
     payload = StagePayload(
         request_id="sampling",
-        request=Client.build_omni_request(gen_req),
+        request=Client.build_omni_request(generation_request),
         data={},
     )
     state = HiggsTtsState.from_dict(preprocess(payload).data)
@@ -694,25 +696,25 @@ def preprocessed_sampling(
 
 
 def test_higgs_speech_request_without_sampling_gets_the_model_defaults(
-    monkeypatch,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    gen_req = SpeechRequestValidator(default_model="higgs").build_generate_request(
-        CreateSpeechRequest(input="hello")
-    )
+    generation_request = SpeechRequestValidator(
+        default_model="higgs"
+    ).build_generate_request(CreateSpeechRequest(input="hello"))
 
-    assert preprocessed_sampling(monkeypatch, gen_req) == (0.8, 0.8, 30)
+    assert preprocessed_sampling(monkeypatch, generation_request) == (0.8, 0.8, 30)
 
 
 def test_higgs_rollout_request_without_sampling_samples_the_full_vocabulary(
-    monkeypatch,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    gen_req = build_rollout_generate_request(
+    generation_request = build_rollout_generate_request(
         RolloutGenerateRequest(
             prompt="hello", return_omni_rollout=True, output_modalities=["audio"]
         )
     )
 
-    assert preprocessed_sampling(monkeypatch, gen_req) == (1.0, 1.0, -1)
+    assert preprocessed_sampling(monkeypatch, generation_request) == (1.0, 1.0, -1)
 
 
 def test_higgs_preprocessing_prunes_raw_reference_inputs(monkeypatch) -> None:
