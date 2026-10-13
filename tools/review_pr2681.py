@@ -15,6 +15,7 @@ from PIL import Image
 
 from sglang_omni.config.manager import ConfigManager
 from sglang_omni.config.patch import ConfigPatchSet
+from sglang_omni.config.path import ConfigPathError
 from sglang_omni.config.resolver import ConfigResolver
 from sglang_omni.config.runtime import resolve_stage_typed_kwargs
 from sglang_omni.config.schema import FactoryArgs
@@ -31,6 +32,12 @@ from sglang_omni.proto import OmniRequest
 
 
 def configuration_boundaries() -> None:
+    try:
+        ConfigManager.from_file("examples/configs/llada2_uni.yaml")
+    except ConfigPathError as error:
+        print(json.dumps({"example_yaml_error": str(error)}), flush=True)
+    else:
+        print(json.dumps({"example_yaml_error": None}), flush=True)
     configuration = LLaDA2UniOmniPipelineConfig(model_path="unused")
     try:
         preparation = prepare_pipeline_runtime(configuration)
