@@ -10,6 +10,7 @@ import io
 import json
 import logging
 from pathlib import Path
+from typing import Literal
 
 from PIL import Image
 from pydantic import ValidationError
@@ -80,9 +81,15 @@ def check_configuration() -> None:
         )
 
 
-async def check_model(directory: Path) -> None:
+async def check_model(directory: Path, backend: Literal["diffusers", "sglang"]) -> None:
     directory.mkdir(parents=True, exist_ok=True)
     configuration = ConfigManager.from_file("examples/configs/llada2_uni.yaml").config
+    if backend == "sglang":
+        configuration = ConfigManager(configuration).merge_config(
+            {"image_decode.factory.backend": backend}
+        )
+    else:
+        pass
     runner = MultiProcessPipelineRunner(configuration)
     fingerprints: dict[str, str] = {}
 
@@ -136,7 +143,7 @@ async def check_model(directory: Path) -> None:
                 {
                     "check": "model_ready",
                     "placement_override": False,
-                    "decoder_backend": "diffusers",
+                    "decoder_backend": backend,
                     "decode_mode": "normal",
                     "decoder_steps": 50,
                 }
@@ -209,11 +216,14 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", action="store_true")
     parser.add_argument(
+        "--backend", choices=("diffusers", "sglang"), default="diffusers"
+    )
+    parser.add_argument(
         "--output", type=Path, default=Path("/data/pr2681-rereview-0d6b")
     )
     arguments = parser.parse_args()
     check_configuration()
     if arguments.model:
-        asyncio.run(check_model(arguments.output))
+        asyncio.run(check_model(arguments.output, arguments.backend))
     else:
         pass
