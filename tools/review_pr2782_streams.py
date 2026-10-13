@@ -99,9 +99,18 @@ def warm(model: EmbeddingTables, producer: torch.cuda.Stream) -> None:
     torch.cuda.synchronize()
 
 
+def warm_consumer(consumer: torch.cuda.Stream) -> None:
+    with torch.cuda.stream(consumer):
+        scratch = torch.empty(65536, device="cuda")
+        snapshot = scratch + 0.0
+    consumer.synchronize()
+    del scratch, snapshot
+
+
 def check_ordering(model: EmbeddingTables, producer: torch.cuda.Stream) -> None:
     control = torch.cuda.Stream()
     consumer = torch.cuda.Stream()
+    warm_consumer(consumer)
     release = torch.ones(1, dtype=torch.int32, device="cuda")
     hold_stream[(1,)](release, num_warps=1)
     torch.cuda.synchronize()
@@ -157,6 +166,7 @@ def check_ordering(model: EmbeddingTables, producer: torch.cuda.Stream) -> None:
 def check_lifetime(model: EmbeddingTables, producer: torch.cuda.Stream) -> None:
     consumer = torch.cuda.Stream()
     control = torch.cuda.Stream()
+    warm_consumer(consumer)
     release = torch.ones(1, dtype=torch.int32, device="cuda")
     hold_stream[(1,)](release, num_warps=1)
     torch.cuda.synchronize()
