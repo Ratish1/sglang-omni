@@ -182,6 +182,8 @@ def check_lifetime(model: EmbeddingTables, producer: torch.cuda.Stream) -> None:
         reserve = [
             torch.empty(shape, dtype=expected.dtype, device="cuda") for _ in range(256)
         ]
+        for allocation in reserve:
+            allocation.fill_(12345)
     producer.synchronize()
     del reserve
     allocations: list[torch.Tensor] = []
