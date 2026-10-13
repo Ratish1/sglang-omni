@@ -955,7 +955,6 @@ def build_sglang_cosyvoice3_request(
     if prepared.ready_event is not None:
         stream = torch.cuda.current_stream(prepared.prompt_input_embeds.device)
         stream.wait_event(prepared.ready_event)
-        prepared.prompt_input_embeds.record_stream(stream)
     else:
         pass
 
