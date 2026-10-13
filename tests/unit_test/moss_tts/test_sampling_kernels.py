@@ -12,10 +12,12 @@ from sglang.srt.layers.sampler import multinomial_with_seed
 from sglang.srt.utils import DynamicGradMode
 from torch._dynamo.utils import counters
 
+from sglang_omni.models.moss_tts.model_runner import MossTTSModelRunner
 from sglang_omni.models.moss_tts.sampling_kernels import (
     multinomial_with_seed_and_token_ids,
     seeded_gumbel_argmax,
 )
+from sglang_omni.models.moss_tts.sglang_model import MossTTSDelaySGLangModel
 
 pytestmark = pytest.mark.accelerator
 
@@ -545,9 +547,6 @@ def test_tied_two_token_head_agrees_across_sampling_paths() -> None:
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 def test_moss_precompile_leaves_the_eager_samples_nothing_to_compile() -> None:
-    from sglang_omni.models.moss_tts.model_runner import MossTTSModelRunner
-    from sglang_omni.models.moss_tts.sglang_model import MossTTSDelaySGLangModel
-
     device = torch.device("cuda")
     vocab_sizes = [4096, 1025]
     torch.compiler.reset()
