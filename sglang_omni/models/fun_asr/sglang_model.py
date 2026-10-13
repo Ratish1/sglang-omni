@@ -25,6 +25,11 @@ from sglang.srt.models.qwen3 import Qwen3ForCausalLM
 from sglang.srt.utils import add_prefix
 from transformers.activations import ACT2FN
 
+from sglang_omni.sampling.sampler_compile import (
+    SamplerCompileForms,
+    compile_sampler_functions,
+)
+
 from .configuration_fun_asr import FunAsrNanoConfig
 from .tool_funcs.audio_lengths import fun_asr_low_frame_rate_length
 
@@ -580,6 +585,17 @@ class FunAsrNanoForConditionalGeneration(nn.Module):
             positions=positions,
         )
         return hidden_states
+
+    def precompile_kernels_after_loading(self) -> None:
+        """Compile the repetition penalty realtime transcription applies from its second
+        chunk, on the float32 logits the logits processor returns."""
+        compile_sampler_functions(
+            SamplerCompileForms(
+                device=self.language_model.lm_head.weight.device,
+                vocab_size=self.config.text_config.vocab_size,
+                penalized_logits_dtype=torch.float32,
+            )
+        )
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
 
