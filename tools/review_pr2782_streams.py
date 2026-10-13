@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import argparse
+import faulthandler
 import gc
 import json
+import signal
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -182,18 +184,22 @@ def check_lifetime(model: EmbeddingTables, producer: torch.cuda.Stream) -> None:
     with torch.cuda.stream(consumer):
         hold_stream[(1,)](release, num_warps=1)
     try:
+        print("lifetime: lower", flush=True)
         with torch.cuda.stream(consumer):
             request = lower(prepared, model)
             snapshot = request.prompt_input_embeds + 0.0
             host_snapshot.copy_(snapshot, non_blocking=True)
         del request, prepared
+        print("lifetime: collect", flush=True)
         gc.collect()
+        print("lifetime: allocate", flush=True)
         with torch.cuda.stream(producer):
             for _ in range(128):
                 allocation = torch.empty(shape, dtype=expected.dtype, device="cuda")
                 allocation.fill_(12345)
                 allocations.append(allocation)
         producer.synchronize()
+        print("lifetime: producer complete", flush=True)
         reused = any(tensor.data_ptr() == source_pointer for tensor in allocations)
     finally:
         with torch.cuda.stream(control):
@@ -264,6 +270,7 @@ def check_checkpoint(model_id: str) -> None:
 
 
 if __name__ == "__main__":
+    faulthandler.register(signal.SIGUSR1)
     parser = argparse.ArgumentParser()
     parser.add_argument("--checkpoint")
     arguments = parser.parse_args()
