@@ -32,6 +32,24 @@ class SkippedEncoderInputs(TypedDict):
     _result: dict[str, list[list[int]]]
 
 
+class ImageGrid(TypedDict):
+    grid_h: int
+    grid_w: int
+
+
+class LLaDA2UniStreamState(TypedDict, total=False):
+    image_info: list[ImageGrid]
+    max_seq_len: int
+    dllm_steps: int
+    cfg_scale: float
+    cfg_rescale: float
+    cfg_image_scale: float
+    uncond_input_ids: list[int]
+    uncond_left_pad_len: int
+    uncond_img_input_ids: list[int]
+    uncond_img_left_pad_len: int
+
+
 @dataclass
 class LLaDA2UniPipelineState:
     """Typed view of the per-request pipeline state."""
@@ -43,7 +61,7 @@ class LLaDA2UniPipelineState:
     encoder_outs: dict[str, dict[str, list[list[int]]]] = field(default_factory=dict)
     thinker_out: ThinkerOutput | None = None
     engine_outputs: dict[str, ThinkerOutput] = field(default_factory=dict)
-    stream_state: dict[str, object] = field(default_factory=dict)
+    stream_state: LLaDA2UniStreamState = field(default_factory=dict)
     request_metadata: dict[str, object] = field(default_factory=dict)
     task_kind: str = "chat"
 

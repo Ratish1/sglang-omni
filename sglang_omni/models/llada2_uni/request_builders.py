@@ -212,29 +212,26 @@ def build_dllm_thinker_request(
 
     uncond_ids = stream_state.get("uncond_input_ids")
     if uncond_ids is not None:
-        image_generation = state.request_metadata.get("image_generation", {})
-        req._cfg_scale = float(  # noqa: leading-underscore  # DLLM protocol
-            stream_state.get(
-                "cfg_scale",
-                image_generation.get(
-                    "cfg_text_scale", image_generation.get("cfg_scale", 1.0)
-                ),
-            )
-        )
-        req._cfg_rescale = float(
-            stream_state.get("cfg_rescale", image_generation.get("cfg_rescale", 0.7))
-        )  # noqa: leading-underscore  # DLLM protocol
+        req._cfg_scale = stream_state[
+            "cfg_scale"
+        ]  # noqa: leading-underscore  # DLLM protocol
+        req._cfg_rescale = stream_state[
+            "cfg_rescale"
+        ]  # noqa: leading-underscore  # DLLM protocol
         for branch in ("uncond", "uncond_img"):
-            branch_ids = stream_state.get(f"{branch}_input_ids")
-            if branch_ids is None:
-                continue
+            if branch == "uncond":
+                branch_ids = uncond_ids
+                pad_len = stream_state["uncond_left_pad_len"]
             else:
-                pass
+                branch_ids = stream_state.get("uncond_img_input_ids")
+                if branch_ids is None:
+                    continue
+                else:
+                    pad_len = stream_state["uncond_img_left_pad_len"]
             if len(branch_ids) != len(input_ids_array):
                 raise ValueError("CFG branches must have equal physical lengths")
             else:
                 pass
-            pad_len = int(stream_state.get(f"{branch}_left_pad_len", 0))
             if not 0 <= pad_len <= len(branch_ids):
                 raise ValueError(f"Invalid CFG {branch} left-pad length: {pad_len}")
             else:
@@ -254,11 +251,9 @@ def build_dllm_thinker_request(
                     pad_len  # noqa: leading-underscore  # DLLM protocol
                 )
         if stream_state.get("uncond_img_input_ids") is not None:
-            req._cfg_image_scale = float(  # noqa: leading-underscore  # DLLM protocol
-                stream_state.get(
-                    "cfg_image_scale", image_generation.get("cfg_image_scale", 0.0)
-                )
-            )
+            req._cfg_image_scale = stream_state[
+                "cfg_image_scale"
+            ]  # noqa: leading-underscore  # DLLM protocol
         else:
             pass
     else:

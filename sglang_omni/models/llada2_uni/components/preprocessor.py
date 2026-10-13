@@ -7,6 +7,7 @@ import logging
 import math
 from collections.abc import Mapping, Sequence
 from pathlib import Path
+from typing import Literal
 
 import torch
 from PIL import Image, ImageOps
@@ -23,6 +24,7 @@ from sglang_omni.models.llada2_uni.config import (
 from sglang_omni.models.llada2_uni.payload_types import (
     ImageEncoderInputs,
     LLaDA2UniPipelineState,
+    LLaDA2UniStreamState,
     SkippedEncoderInputs,
 )
 from sglang_omni.models.weight_loader import resolve_model_path
@@ -420,7 +422,7 @@ class LLaDA2Preprocessor:
         else:
             pass
 
-        stream_state: dict[str, object] = {}
+        stream_state: LLaDA2UniStreamState = {}
         max_new_tokens = request.params.get(
             "max_new_tokens", DEFAULT_THINKER_MAX_NEW_TOKENS
         )
@@ -646,17 +648,21 @@ class LLaDA2Preprocessor:
 
     def set_cfg_branch(
         self,
-        stream_state: dict[str, object],
+        stream_state: LLaDA2UniStreamState,
         conditional: list[int],
         unconditional: list[int],
         *,
-        branch: str = "uncond",
+        branch: Literal["uncond", "uncond_img"] = "uncond",
     ) -> None:
         ids, pad_len = align_cfg_unconditional_input_ids(
             self.tokenizer, conditional, unconditional
         )
-        stream_state[f"{branch}_input_ids"] = ids
-        stream_state[f"{branch}_left_pad_len"] = pad_len
+        if branch == "uncond":
+            stream_state["uncond_input_ids"] = ids
+            stream_state["uncond_left_pad_len"] = pad_len
+        else:
+            stream_state["uncond_img_input_ids"] = ids
+            stream_state["uncond_img_left_pad_len"] = pad_len
 
     def build_edit_payload(
         self,
@@ -712,7 +718,7 @@ class LLaDA2Preprocessor:
             request_id=payload.request_id,
         )
         ig = request_metadata["image_generation"]
-        stream_state: dict[str, object] = {
+        stream_state: LLaDA2UniStreamState = {
             "image_info": [{"grid_h": grid_h, "grid_w": grid_w}],
         }
         if ig.get("dllm_steps") is not None:

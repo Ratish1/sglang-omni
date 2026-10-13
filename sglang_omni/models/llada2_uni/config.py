@@ -34,6 +34,12 @@ class LLaDA2ImageDecoderFactoryArgs(FactoryArgs):
     attention_backend: str = "torch_sdpa"
 
 
+class LLaDA2ImageDecoderStageConfig(StageConfig):
+    factory: LLaDA2ImageDecoderFactoryArgs = Field(
+        default_factory=LLaDA2ImageDecoderFactoryArgs
+    )
+
+
 class LLaDA2UniPipelineConfig(PipelineConfig):
     """4-stage DLLM pipeline: preprocessing → image_encoder → thinker → decode."""
 
@@ -79,6 +85,11 @@ class LLaDA2UniPipelineConfig(PipelineConfig):
 class LLaDA2UniOmniPipelineConfig(LLaDA2UniPipelineConfig):
     """LLaDA text, image generation and editing with a shared thinker."""
 
+    stage_config_types: ClassVar[dict[str, type[StageConfig]]] = {
+        **LLaDA2UniPipelineConfig.stage_config_types,
+        IMAGE_DECODE_STAGE: LLaDA2ImageDecoderStageConfig,
+    }
+
     stages: list[StageConfig] = [
         StageConfig(
             name=PREPROCESSING_STAGE,
@@ -92,6 +103,7 @@ class LLaDA2UniOmniPipelineConfig(LLaDA2UniPipelineConfig):
             process="pipeline",
             factory_path=f"{_PKG}.stages.create_image_encoder_executor",
             gpu=0,
+            gpu_memory_fraction=0.05,
             next=THINKER_STAGE,
         ),
         EngineStageConfig(
@@ -101,6 +113,7 @@ class LLaDA2UniOmniPipelineConfig(LLaDA2UniPipelineConfig):
             factory=FactoryArgs(max_seq_len=8192, dllm_algorithm="LowConfidenceCFG"),
             engine=EngineArgs(mem_fraction_static=0.75),
             gpu=0,
+            gpu_memory_fraction=0.75,
             next=[DECODE_STAGE, IMAGE_DECODE_STAGE],
         ),
         StageConfig(
@@ -109,12 +122,12 @@ class LLaDA2UniOmniPipelineConfig(LLaDA2UniPipelineConfig):
             factory_path=f"{_PKG}.stages.create_decode_executor",
             terminal=True,
         ),
-        StageConfig(
+        LLaDA2ImageDecoderStageConfig(
             name=IMAGE_DECODE_STAGE,
             process=IMAGE_DECODE_STAGE,
             factory_path=f"{_PKG}.stages.create_image_decode_executor",
-            factory=LLaDA2ImageDecoderFactoryArgs(),
             gpu=0,
+            gpu_memory_fraction=0.20,
             terminal=True,
         ),
     ]

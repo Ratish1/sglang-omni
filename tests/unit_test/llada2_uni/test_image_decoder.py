@@ -18,8 +18,14 @@ import torch
 import torch.multiprocessing as mp
 from diffusers.models.transformers.transformer_z_image import ZImageTransformer2DModel
 from PIL import Image
+from pydantic import ValidationError
 from safetensors.torch import save_file
+from sglang.srt.dllm.config import DllmConfig
 
+from sglang_omni.config import build_process_topology_plan, build_stage_placement_plan
+from sglang_omni.config.manager import ConfigManager
+from sglang_omni.config.patch import ConfigPatchSet
+from sglang_omni.config.resolver import ConfigResolver
 from sglang_omni.models.llada2_uni.components import decoder_runtime
 from sglang_omni.models.llada2_uni.components import image_decoder as decoder_module
 from sglang_omni.models.llada2_uni.components.decoder_model import (
@@ -33,21 +39,68 @@ from sglang_omni.models.llada2_uni.components.image_decoder import (
 )
 from sglang_omni.models.llada2_uni.components.preprocessor import (
     BOI_TOKEN,
+    DUMMY_IMAGE_TOKEN_ID,
     EOI_TOKEN,
     IMAGE_TOKEN_OFFSET,
     SOI_TOKEN,
     LLaDA2Preprocessor,
 )
 from sglang_omni.models.llada2_uni.components.transport import sample_velocity
-from sglang_omni.models.llada2_uni.config import IMAGE_STAGE
+from sglang_omni.models.llada2_uni.config import (
+    IMAGE_DECODE_STAGE,
+    IMAGE_STAGE,
+    THINKER_STAGE,
+    LLaDA2ImageDecoderStageConfig,
+    LLaDA2UniOmniPipelineConfig,
+)
 from sglang_omni.models.llada2_uni.merge import extract_image_vq_tokens
 from sglang_omni.models.llada2_uni.payload_types import LLaDA2UniPipelineState
 from sglang_omni.models.llada2_uni.request_builders import (
+    build_dllm_thinker_request,
     merge_image_tokens_for_thinker,
 )
 from sglang_omni.models.llada2_uni.stages import create_image_decode_executor
 from sglang_omni.proto import OmniRequest, StagePayload
 from sglang_omni.scheduling.simple_scheduler import SimpleScheduler
+
+
+def test_image_pipeline_config_round_trip() -> None:
+    config = LLaDA2UniOmniPipelineConfig(model_path="unused")
+    decoder_stage = next(
+        stage for stage in config.stages if stage.name == IMAGE_DECODE_STAGE
+    )
+    assert isinstance(decoder_stage, LLaDA2ImageDecoderStageConfig)
+    decoder_stage.factory.backend = "sglang"
+    decoder_stage.factory.decode_mode = "decoder-turbo"
+    decoder_stage.factory.num_steps = 12
+    resolved = ConfigResolver(config).resolve(ConfigPatchSet()).config
+    decoder_stage = next(
+        stage for stage in resolved.stages if stage.name == IMAGE_DECODE_STAGE
+    )
+    assert isinstance(decoder_stage, LLaDA2ImageDecoderStageConfig)
+    assert decoder_stage.factory.backend == "sglang"
+    assert decoder_stage.factory.decode_mode == "decoder-turbo"
+    assert decoder_stage.factory.num_steps == 12
+    assert resolved.stage_config_cls(THINKER_STAGE).engine_stage
+    with pytest.raises(ValidationError, match="backend"):
+        ConfigManager(resolved).merge_config(
+            {"image_decode.factory.backend": "invalid"}
+        )
+
+    config_path = (
+        Path(__file__).resolve().parents[3] / "examples/configs/llada2_uni.yaml"
+    )
+    config = ConfigManager.from_file(str(config_path)).config
+    placement = build_stage_placement_plan(config)
+    topology = build_process_topology_plan(config, placement, stages_cfg=config.stages)
+    assert (
+        topology.stage_to_process[IMAGE_STAGE]
+        == topology.stage_to_process[THINKER_STAGE]
+    )
+    assert (
+        topology.stage_to_process[IMAGE_DECODE_STAGE]
+        != topology.stage_to_process[THINKER_STAGE]
+    )
 
 
 def native_worker(
@@ -486,6 +539,14 @@ def test_edit_preprocess_merge_extract_and_decode(
 ):
     source = tmp_path / "source.png"
     Image.new("RGB", source_size, "white").save(source)
+    generation_params = {
+        "cfg_text_scale": 3.5,
+        "cfg_image_scale": 1.5,
+        "cfg_rescale": 0.6,
+        "dllm_steps": 4,
+        "decoder_steps": 2,
+        "seed": 9,
+    }
     payload = StagePayload(
         request_id="e2e",
         request=OmniRequest(
@@ -493,8 +554,11 @@ def test_edit_preprocess_merge_extract_and_decode(
                 "messages": [{"role": "user", "content": "make it green"}],
                 "images": [str(source)],
             },
-            metadata={"output_modalities": ["image"]},
-            params={},
+            metadata={
+                "output_modalities": ["image"],
+                "image_generation": generation_params,
+            },
+            params={"max_new_tokens": 1},
         ),
         data={},
     )
@@ -502,11 +566,6 @@ def test_edit_preprocess_merge_extract_and_decode(
     assert state.task_kind == "edit"
     grid_h, grid_w = grid
     assert state.stream_state["image_info"] == [{"grid_h": grid_h, "grid_w": grid_w}]
-    encoded = state.encoder_inputs[IMAGE_STAGE]
-    torch.testing.assert_close(
-        encoded["pixel_values"], torch.ones_like(encoded["pixel_values"])
-    )
-
     source_tokens = list(range(grid_h * grid_w))
     state.encoder_outs[IMAGE_STAGE] = {"image_token_ids": [source_tokens]}
     merge_image_tokens_for_thinker(state)
@@ -515,6 +574,53 @@ def test_edit_preprocess_merge_extract_and_decode(
         IMAGE_TOKEN_OFFSET + token_id for token_id in source_tokens
     ]
 
+    request = build_dllm_thinker_request(
+        state,
+        params=payload.request.params,
+        tokenizer=preprocessor.tokenizer,
+        vocab_size=len(preprocessor.tokenizer),
+        dllm_config=DllmConfig(
+            algorithm="LowConfidenceCFG",
+            algorithm_config={
+                "threshold": 1.0,
+                "image_token_offset": IMAGE_TOKEN_OFFSET,
+            },
+            block_size=32,
+            mask_id=preprocessor.tokenizer.mask_token_id,
+            max_running_requests=3,
+        ),
+        request_id=payload.request_id,
+    ).req
+    assert list(request.origin_input_ids) == prompt_ids
+    no_text_ids = request._uncond_input_ids  # noqa: leading-underscore  # DLLM protocol
+    no_image_ids = (
+        request._uncond_img_input_ids
+    )  # noqa: leading-underscore  # DLLM protocol
+    assert [tid for tid in no_text_ids if tid >= IMAGE_TOKEN_OFFSET] == [
+        IMAGE_TOKEN_OFFSET + token_id for token_id in source_tokens
+    ]
+    assert not any(tid >= IMAGE_TOKEN_OFFSET for tid in no_image_ids)
+    for branch_ids, pad_len in (
+        (
+            no_text_ids,
+            request._uncond_left_pad_len,
+        ),  # noqa: leading-underscore  # DLLM protocol
+        (
+            no_image_ids,
+            request._uncond_img_left_pad_len,
+        ),  # noqa: leading-underscore  # DLLM protocol
+    ):
+        assert len(branch_ids) == len(prompt_ids)
+        assert DUMMY_IMAGE_TOKEN_ID not in branch_ids
+        assert 0 <= pad_len < len(branch_ids)
+        assert branch_ids[:pad_len] == [preprocessor.tokenizer.mask_token_id] * pad_len
+        assert branch_ids[pad_len] != preprocessor.tokenizer.mask_token_id
+    assert request._cfg_scale == 3.5  # noqa: leading-underscore  # DLLM protocol
+    assert request._cfg_image_scale == 1.5  # noqa: leading-underscore  # DLLM protocol
+    assert request._cfg_rescale == 0.6  # noqa: leading-underscore  # DLLM protocol
+    assert request._dllm_steps == 4  # noqa: leading-underscore  # DLLM protocol
+    assert request.sampling_params.max_new_tokens == grid_h * grid_w
+
     state.thinker_out = {
         "output_ids": [IMAGE_TOKEN_OFFSET + token_id for token_id in source_tokens]
         + [2]
@@ -522,7 +628,7 @@ def test_edit_preprocess_merge_extract_and_decode(
     tokens, h, w, params = extract_image_vq_tokens(state)
     assert tokens == source_tokens
     assert (h, w) == grid
-    assert params == {}
+    assert params == generation_params
 
     decoder, _ = decode_probe
     monkeypatch.setattr(decoder_module, "LLaDA2ImageDecoder", lambda **kwargs: decoder)
