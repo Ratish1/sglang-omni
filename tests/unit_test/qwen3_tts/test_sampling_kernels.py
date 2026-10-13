@@ -19,6 +19,7 @@ from torch._dynamo.utils import counters
 
 from sglang_omni.models.qwen3_tts import sampling_kernels as sampling_kernels_module
 from sglang_omni.models.qwen3_tts import sglang_model as sglang_model_module
+from sglang_omni.models.qwen3_tts.model_runner import Qwen3TTSModelRunner
 from sglang_omni.models.qwen3_tts.sampling_kernels import (
     sample_from_logits_with_seed_top_k_top_p,
     sample_from_sorted_logprobs_with_seed_small_k,
@@ -743,6 +744,9 @@ def test_talker_precompile_leaves_the_first_prefill_samples_nothing_to_compile()
     talker.model = lambda input_ids, positions, forward_batch, input_embeds: (
         input_embeds
     )
+    talker.semantic_sampling_seed_tensor = torch.zeros(
+        64, device="cuda", dtype=torch.long
+    )
     torch.compiler.reset()
 
     talker.precompile_kernels_after_loading()
@@ -754,6 +758,10 @@ def test_talker_precompile_leaves_the_first_prefill_samples_nothing_to_compile()
                 mrope_positions=None,
                 forward_mode=SimpleNamespace(is_extend=lambda: True),
                 extend_seq_lens=torch.full((rows,), 2, device="cuda"),
+                sampling_info=SimpleNamespace(sampling_seed=None),
+            )
+            Qwen3TTSModelRunner.install_semantic_sampling_seeds(
+                SimpleNamespace(model=talker), forward_batch, [None] * rows
             )
             hidden_states = torch.randn(
                 2 * rows, 16, device="cuda", dtype=torch.bfloat16
@@ -770,7 +778,7 @@ def test_talker_precompile_leaves_the_first_prefill_samples_nothing_to_compile()
                 torch.ones(rows, device="cuda"),
                 torch.zeros(rows, device="cuda"),
                 False,
-                torch.arange(rows, device="cuda"),
+                forward_batch.sampling_info.sampling_seed,
                 torch.full((rows,), 7, device="cuda"),
             )
     assert counters["stats"]["unique_graphs"] == compiled_graphs
