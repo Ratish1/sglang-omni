@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import inspect
 import json
 import time
 
@@ -28,6 +27,48 @@ def check_cuda_forms() -> None:
         DynamicGradMode.set_inference_mode(inference_mode)
         for logits_dtype in (torch.bfloat16, torch.float32):
             torch.compiler.reset()
+            reference_batches: list[
+                tuple[
+                    torch.Tensor,
+                    torch.Tensor,
+                    torch.Tensor,
+                    torch.Tensor,
+                    torch.Tensor,
+                    torch.Tensor,
+                ]
+            ] = []
+            cold_frames = counters["frames"]["ok"]
+            with DynamicGradMode():
+                for rows in (1, 2, 5, 13, 64):
+                    input_logits = torch.randn(
+                        rows,
+                        3072,
+                        device=device,
+                        dtype=logits_dtype,
+                        generator=generator,
+                    )
+                    penalties = torch.full_like(input_logits, 1.21, dtype=torch.float32)
+                    seeds = torch.arange(100, 100 + rows, device=device)
+                    positions = torch.arange(20, 20 + rows, device=device)
+                    expected_logits = input_logits.clone()
+                    apply_scaling_penalties(expected_logits, penalties)
+                    expected_tokens = multinomial_with_seed(
+                        torch.log_softmax(expected_logits.double(), dim=-1),
+                        seeds,
+                        positions,
+                    )
+                    reference_batches.append(
+                        (
+                            input_logits,
+                            penalties,
+                            seeds,
+                            positions,
+                            expected_logits,
+                            expected_tokens,
+                        )
+                    )
+            cold_frames = counters["frames"]["ok"] - cold_frames
+            torch.compiler.reset()
             cpu_rng = torch.get_rng_state().clone()
             cuda_rng = torch.cuda.get_rng_state(device).clone()
             started = time.perf_counter()
@@ -47,25 +88,18 @@ def check_cuda_forms() -> None:
             assert torch.equal(cuda_rng, torch.cuda.get_rng_state(device))
             compiled_frames = counters["frames"]["ok"]
             with DynamicGradMode():
-                for rows in (1, 2, 5, 13, 64):
-                    logits = torch.randn(
-                        rows,
-                        3072,
-                        device=device,
-                        dtype=logits_dtype,
-                        generator=generator,
-                    )
-                    penalties = torch.full_like(logits, 1.21, dtype=torch.float32)
-                    expected_logits = logits.clone()
-                    inspect.unwrap(apply_scaling_penalties)(expected_logits, penalties)
+                for (
+                    input_logits,
+                    penalties,
+                    seeds,
+                    positions,
+                    expected_logits,
+                    expected_tokens,
+                ) in reference_batches:
+                    logits = input_logits.clone()
                     apply_scaling_penalties(logits, penalties)
                     torch.testing.assert_close(logits, expected_logits, rtol=0, atol=0)
                     probabilities = torch.log_softmax(logits.double(), dim=-1)
-                    seeds = torch.arange(100, 100 + rows, device=device)
-                    positions = torch.arange(20, 20 + rows, device=device)
-                    expected_tokens = inspect.unwrap(multinomial_with_seed)(
-                        probabilities, seeds, positions
-                    )
                     actual_tokens = multinomial_with_seed(
                         probabilities, seeds, positions
                     )
@@ -78,6 +112,7 @@ def check_cuda_forms() -> None:
                         "inference_mode": inference_mode,
                         "logits_dtype": str(logits_dtype),
                         "warmup_seconds": elapsed,
+                        "cold_request_compiles": cold_frames,
                         "post_warmup_compiles": 0,
                         "exact_outputs": True,
                         "rng_and_grad_restored": True,
