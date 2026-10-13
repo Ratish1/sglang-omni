@@ -451,6 +451,10 @@ def build_qwen3_tts_state(
     seed = tts_params["seed"] if "seed" in tts_params else params.get("seed")
     normalized_seed = normalize_qwen3_tts_seed(seed) if seed is not None else None
 
+    generation_kwargs = build_generation_kwargs(
+        params,
+        tts_engine_params=tts_engine_params,
+    )
     suppress_bootstrap_silence = resolve_bootstrap_silence_suppression(
         task_type=task_type,
         voice=voice,
@@ -459,6 +463,7 @@ def build_qwen3_tts_state(
         stream_codec_output=stream_codec_output,
         params=params,
         tts_params=tts_params,
+        generation_kwargs=generation_kwargs,
     )
 
     return Qwen3TTSState(
@@ -482,10 +487,7 @@ def build_qwen3_tts_state(
         non_streaming_mode=non_streaming_mode,
         stream_codec_output=stream_codec_output,
         suppress_bootstrap_silence=suppress_bootstrap_silence,
-        generation_kwargs=build_generation_kwargs(
-            params,
-            tts_engine_params=tts_engine_params,
-        ),
+        generation_kwargs=generation_kwargs,
         seed=normalized_seed,
     )
 
@@ -670,6 +672,7 @@ def resolve_bootstrap_silence_suppression(
     stream_codec_output: bool,
     params: dict[str, object],
     tts_params: dict[str, object],
+    generation_kwargs: Mapping[str, object],
 ) -> bool:
     for source in (params, tts_params):
         if "suppress_bootstrap_silence" in source:
@@ -700,9 +703,7 @@ def resolve_bootstrap_silence_suppression(
         return False
     else:
         pass
-    if any(
-        params.get(field) is not None for field in _BOOTSTRAP_SILENCE_SAMPLING_FIELDS
-    ):
+    if _BOOTSTRAP_SILENCE_SAMPLING_FIELDS.intersection(generation_kwargs):
         return False
     else:
         pass

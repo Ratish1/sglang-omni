@@ -1981,18 +1981,26 @@ def test_qwen3_tts_bootstrap_silence_ineligible_variants(
         {"temperature": 0.8},
         {"top_p": 0.8},
         {"top_k": 30, "repetition_penalty": 1.1},
+        {"stage_params": {"tts_engine": {"temperature": 0.8}}},
     ],
 )
 def test_qwen3_tts_bootstrap_silence_ineligible_when_sampling_is_set(
     params: dict[str, object],
 ) -> None:
-    """Any set sampling field, even at a former placeholder value, disables bootstrap silence."""
+    """A sampling field set at the top level or under tts_engine, even at a former placeholder value, disables bootstrap silence."""
     state = build_qwen3_tts_state(bootstrap_eligible_payload(params=params))
 
     assert state.suppress_bootstrap_silence is False
 
 
-@pytest.mark.parametrize("params", [{"max_new_tokens": 512}, {"seed": 7}])
+@pytest.mark.parametrize(
+    "params",
+    [
+        {"max_new_tokens": 512},
+        {"seed": 7},
+        {"stage_params": {"tts_engine": {"max_new_tokens": 512}}},
+    ],
+)
 def test_qwen3_tts_bootstrap_silence_ignores_length_and_seed(
     params: dict[str, object],
 ) -> None:
