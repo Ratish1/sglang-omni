@@ -452,6 +452,8 @@ def build_image_request(
 
 def register_images(app: FastAPI) -> None:
     """Register native image-generation and single-image-edit routes."""
+    global ImageGenerationsRequest, ImageResponse, ImageResponseData
+
     from sglang.multimodal_gen.runtime.entrypoints.openai.protocol import (
         ImageGenerationsRequest,
         ImageResponse,
