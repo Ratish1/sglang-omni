@@ -20,11 +20,6 @@ from sglang.kernels.ops.attention.flash_attention_v3 import _is_fa3_supported
 from sglang.srt.utils.custom_op import register_custom_op
 
 from sglang_omni.models.fun_cosyvoice3.causal_conv import FusedConvPositionEmbedding
-from sglang_omni.models.fun_cosyvoice3.timestep_modulation import (
-    TimestepModulationCache,
-    apply_block_modulation,
-    apply_final_modulation,
-)
 
 logger = logging.getLogger(__name__)
 
@@ -435,36 +430,16 @@ class PackedDiT:
         rows: PackedRows,
         attention: PackedRowAttention,
         rope: tuple[torch.Tensor, torch.Tensor],
-        block_modulations: torch.Tensor | None = None,
-        final_modulation: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """x, mu, cond, spks: (1, total, channels); t: (1,); rope: rope(rows).
         Returns (1, total, out_channels)."""
-        if (block_modulations is None) != (final_modulation is None):
-            raise ValueError(
-                "block_modulations and final_modulation must be supplied together"
-            )
-        else:
-            pass
         dit = self.dit
-        if block_modulations is None:
-            assert final_modulation is None
-            timestep_embedding = dit.time_embed(t)
-        else:
-            assert final_modulation is not None
-            timestep_embedding = None
+        t = dit.time_embed(t)
         h = dit.input_embed.proj(torch.cat((x, cond, mu, spks), dim=-1))
         h = self.conv_pos_embed(h, rows) + h
         residual = h
         for block_index, block in enumerate(dit.transformer_blocks):
-            if block_modulations is None:
-                norm, gate_msa, shift_mlp, scale_mlp, gate_mlp = block.attn_norm(
-                    h, emb=timestep_embedding
-                )
-            else:
-                norm, gate_msa, shift_mlp, scale_mlp, gate_mlp = apply_block_modulation(
-                    block.attn_norm, h, block_modulations[block_index]
-                )
+            norm, gate_msa, shift_mlp, scale_mlp, gate_mlp = block.attn_norm(h, emb=t)
             h = h + gate_msa.unsqueeze(1) * self.attend(
                 block.attn,
                 norm,
@@ -479,11 +454,7 @@ class PackedDiT:
             h = dit.long_skip_connection(torch.cat((h, residual), dim=-1))
         else:
             pass
-        if block_modulations is None:
-            h = dit.norm_out(h, timestep_embedding)
-        else:
-            assert final_modulation is not None
-            h = apply_final_modulation(dit.norm_out, h, final_modulation)
+        h = dit.norm_out(h, t)
         return dit.proj_out(h)
 
     def conv_pos_embed(self, h: torch.Tensor, rows: PackedRows) -> torch.Tensor:
@@ -573,7 +544,6 @@ def solve_flow_euler_packed(
     angles: torch.Tensor,
     *,
     cfg_rate: float,
-    modulation_cache: TimestepModulationCache | None = None,
 ) -> torch.Tensor:
     """Euler steps with classifier free guidance, the rows and their twins in one
     DiT call. noise, mu, cond: (1, total, channels), spks: (rows, channels),
@@ -592,7 +562,7 @@ def solve_flow_euler_packed(
     t, dt = time_span[0], time_span[1] - time_span[0]
     for step in range(1, len(time_span)):
         flow_time[:] = t
-        forward_args = (
+        vector_field = estimator.forward(
             torch.cat((x, x), dim=1),
             mu_cfg,
             spks_cfg,
@@ -602,15 +572,6 @@ def solve_flow_euler_packed(
             attention,
             rope,
         )
-        if modulation_cache is None:
-            # Preserve the original estimator.forward contract when disabled.
-            vector_field = estimator.forward(*forward_args)
-        else:
-            vector_field = estimator.forward(
-                *forward_args,
-                modulation_cache.block_modulations[step - 1],
-                modulation_cache.final_modulations[step - 1],
-            )
         conditional = vector_field[:, :total]
         unconditional = vector_field[:, total:]
         x = x + dt * ((1.0 + cfg_rate) * conditional - cfg_rate * unconditional)

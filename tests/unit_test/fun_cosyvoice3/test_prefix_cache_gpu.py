@@ -27,9 +27,6 @@ from sglang_omni.models.fun_cosyvoice3.prefix_cache import (
 )
 from sglang_omni.models.fun_cosyvoice3.prefix_cuda_graph import PrefixCudaGraphRunner
 from sglang_omni.models.fun_cosyvoice3.solve_graph_capture import SolveGraphCapture
-from sglang_omni.models.fun_cosyvoice3.timestep_modulation import (
-    TimestepModulationCache,
-)
 from sglang_omni.models.fun_cosyvoice3.whole_history_cuda_graph import (
     WholeHistoryCudaGraphRunner,
 )
@@ -118,9 +115,6 @@ def test_prefix_hops_are_bit_identical_to_whole_history_hops(
     spks = torch.randn(rows, CHANNELS, device=device, dtype=dtype)
     unit = torch.linspace(0, 1, 11, device=device, dtype=dtype)
     time_span = 1 - torch.cos(unit * 0.5 * torch.pi)
-    modulation_cache = TimestepModulationCache.build(
-        estimator.dit, time_span, flow_dtype=dtype, euler_steps=10
-    )
     caches = [(PrefixCacheRow(), PrefixCacheRow()) for _ in range(rows)]
     previous = 0
     with torch.inference_mode(), torch.autocast("cuda", dtype=dtype):
@@ -157,7 +151,6 @@ def test_prefix_hops_are_bit_identical_to_whole_history_hops(
                 new,
                 caches,
                 cfg_rate=0.7,
-                modulation_cache=modulation_cache,
             )
             for row in range(rows):
                 expected = reference[0, row * total + previous : (row + 1) * total]
@@ -336,12 +329,6 @@ def test_prefix_graph_replays_equal_the_eager_solve(compile_prefix: bool) -> Non
             pool.forward = compile_forward_prefix()
     else:
         pass
-    unit = torch.linspace(0, 1, 11, device=device, dtype=dtype)
-    time_span = 1 - torch.cos(unit * 0.5 * torch.pi)
-    modulation_cache = TimestepModulationCache.build(
-        estimator.dit, time_span.float(), flow_dtype=dtype, euler_steps=10
-    )
-    time_span = modulation_cache.time_span
     backend = current_platform.get_device_graph_backend(device)
     assert backend is not None
     graphs = SolveGraphCapture(backend, device=device, autocast_dtype=dtype)
@@ -358,7 +345,6 @@ def test_prefix_graph_replays_equal_the_eager_solve(compile_prefix: bool) -> Non
         hop_frames=2 * CHUNK,
         min_hop_frames=CHUNK,
         max_frames=1024,
-        modulation_cache=modulation_cache,
     )
     whole_history = WholeHistoryCudaGraphRunner(
         estimator,
@@ -398,6 +384,8 @@ def test_prefix_graph_replays_equal_the_eager_solve(compile_prefix: bool) -> Non
     caches = {
         name: [(PrefixCacheRow(), PrefixCacheRow()) for _ in pools] for name in streams
     }
+    unit = torch.linspace(0, 1, 11, device=device, dtype=dtype)
+    time_span = 1 - torch.cos(unit * 0.5 * torch.pi)
     steps = [
         [("a", 150)],
         [("b", 100), ("a", 250)],
@@ -433,7 +421,7 @@ def test_prefix_graph_replays_equal_the_eager_solve(compile_prefix: bool) -> Non
                     assert grow_rows(pool, list(pair), [total, total])
                 inputs = dict(
                     noise=take("noise"),
-                    time_span=time_span,
+                    time_span=time_span.float(),
                     mu=take("mu"),
                     speaker_embeddings=torch.stack(
                         [streams[name]["speaker_embeddings"] for name in names]
@@ -456,7 +444,6 @@ def test_prefix_graph_replays_equal_the_eager_solve(compile_prefix: bool) -> Non
                         new_frames=new_frames,
                         caches=pairs,
                         cfg_rate=0.7,
-                        modulation_cache=modulation_cache,
                     )
                 else:
                     generated = solve_flow_euler_prefix(
@@ -466,7 +453,6 @@ def test_prefix_graph_replays_equal_the_eager_solve(compile_prefix: bool) -> Non
                         new_frames=new_frames,
                         caches=pairs,
                         cfg_rate=0.7,
-                        modulation_cache=modulation_cache,
                     )
                 outputs.append(generated)
             assert torch.equal(outputs[0], outputs[1]), step
@@ -506,10 +492,6 @@ def test_whole_history_graph_replays_equal_the_eager_solve(
     dtype = torch.bfloat16
     unit = torch.linspace(0, 1, 11, device=device, dtype=dtype)
     time_span = (1 - torch.cos(unit * 0.5 * torch.pi)).float()
-    modulation_cache = TimestepModulationCache.build(
-        estimator.dit, time_span, flow_dtype=dtype, euler_steps=10
-    )
-    time_span = modulation_cache.time_span
 
     def step_inputs(lengths: tuple[int, ...]) -> dict[str, torch.Tensor]:
         generator = torch.Generator(device=device).manual_seed(sum(lengths))
@@ -538,7 +520,6 @@ def test_whole_history_graph_replays_equal_the_eager_solve(
             estimator.row_attention(twin_rows, streaming=False, dtype=dtype),
             estimator.rope_angles(twin_rows.width),
             cfg_rate=0.7,
-            modulation_cache=modulation_cache,
         )
 
     if compile_packed:
@@ -561,7 +542,6 @@ def test_whole_history_graph_replays_equal_the_eager_solve(
         speaker_channels=CHANNELS,
         max_rows=3,
         tier_frames=(128, 256, 2048),
-        modulation_cache=modulation_cache,
     )
     runner.capture()
 

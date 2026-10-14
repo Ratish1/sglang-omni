@@ -30,9 +30,6 @@ from sglang_omni.models.fun_cosyvoice3.packed_dit import (
     solve_flow_euler_packed,
 )
 from sglang_omni.models.fun_cosyvoice3.stages import solve_flow_euler
-from sglang_omni.models.fun_cosyvoice3.timestep_modulation import (
-    TimestepModulationCache,
-)
 
 cosyvoice_dit = pytest.importorskip("cosyvoice.flow.DiT.dit")
 cosyvoice_mask = pytest.importorskip("cosyvoice.utils.mask")
@@ -223,46 +220,6 @@ def test_packed_forward_matches_the_padded_dit_per_row(streaming: bool) -> None:
         torch.testing.assert_close(actual, reference, rtol=1e-9, atol=1e-9)
 
 
-def test_packed_forward_with_cached_modulations_matches_uncached_forward() -> None:
-    dit = tiny_dit()
-    padded = padded_inputs()
-    packed = packed_inputs(padded)
-    estimator = PackedDiT(dit, device=CPU)
-    time_span = torch.tensor([0.37, 1.0], dtype=torch.float64)
-    modulation_cache = TimestepModulationCache.build(
-        dit, time_span, flow_dtype=torch.float64, euler_steps=1
-    )
-
-    with torch.inference_mode():
-        attention = estimator.row_attention(
-            packed["rows"], streaming=True, dtype=packed["x"].dtype
-        )
-        uncached = estimator.forward(
-            packed["x"],
-            packed["mu"],
-            packed["spks"],
-            packed["cond"],
-            time_span[:1],
-            packed["rows"],
-            attention,
-            rope(estimator, packed["rows"]),
-        )
-        cached = estimator.forward(
-            packed["x"],
-            packed["mu"],
-            packed["spks"],
-            packed["cond"],
-            time_span[:1],
-            packed["rows"],
-            attention,
-            rope(estimator, packed["rows"]),
-            modulation_cache.block_modulations[0],
-            modulation_cache.final_modulations[0],
-        )
-
-    torch.testing.assert_close(cached, uncached, rtol=1e-9, atol=1e-9)
-
-
 def test_packed_dit_shares_the_projection_weights_and_keeps_the_dit_forward() -> None:
     dit = tiny_dit()
     padded = padded_inputs()
@@ -315,9 +272,6 @@ def test_packed_solve_matches_the_padded_solve_per_row(streaming: bool) -> None:
     )
     unit_span = torch.linspace(0, 1, 11, dtype=torch.float64)
     time_span = 1 - torch.cos(unit_span * 0.5 * torch.pi)
-    modulation_cache = TimestepModulationCache.build(
-        dit, time_span, flow_dtype=torch.float64, euler_steps=10
-    )
     noise = torch.randn(1, CHANNELS, 19, dtype=torch.float64).expand(4, -1, -1)
 
     estimator = PackedDiT(dit, device=CPU)
@@ -348,27 +302,10 @@ def test_packed_solve_matches_the_padded_solve_per_row(streaming: bool) -> None:
             estimator.rope_angles(twin_rows.width),
             cfg_rate=0.7,
         )
-        cached = solve_flow_euler_packed(
-            estimator,
-            gather_rows(noise.transpose(1, 2), packed["rows"]),
-            time_span,
-            packed["mu"],
-            padded["spks"],
-            packed["cond"],
-            twin_rows,
-            estimator.row_attention(
-                twin_rows, streaming=streaming, dtype=torch.float64
-            ),
-            estimator.rope_angles(twin_rows.width),
-            cfg_rate=0.7,
-            modulation_cache=modulation_cache,
-        )
     out = scatter_rows(out, packed["rows"], 19).transpose(1, 2)
-    cached = scatter_rows(cached, packed["rows"], 19).transpose(1, 2)
 
     for actual, reference in zip(valid(out), valid(expected), strict=True):
         torch.testing.assert_close(actual, reference, rtol=1e-9, atol=1e-9)
-    torch.testing.assert_close(cached, out, rtol=1e-9, atol=1e-9)
 
 
 def test_packed_compile_requires_ragged_half_precision(monkeypatch) -> None:
