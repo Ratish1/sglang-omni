@@ -207,6 +207,17 @@ def native_probe(model_path: str) -> dict[str, int | bool | float]:
         if message.type == "stream"
     )
     assert samples == 15 * codec.downsample_rate
+    streaming_pcm = torch.from_numpy(streamed_audio(messages, "native"))
+    offline_pcm = torch.cat(vocoder.decode_segments([first, second]))
+    assert streaming_pcm.shape == offline_pcm.shape
+    assert torch.isfinite(streaming_pcm).all()
+    partition_error_power = (streaming_pcm - offline_pcm).square().mean()
+    partition_snr = float(
+        10
+        * torch.log10(
+            offline_pcm.square().mean() / partition_error_power.clamp_min(1e-30)
+        )
+    )
     assert not scheduler.session.stream_slots_in_use
     scheduler.shutdown_stream_states()
     assert scheduler.session is None
@@ -221,6 +232,7 @@ def native_probe(model_path: str) -> dict[str, int | bool | float]:
         "pad_segments_valid_frames": 15,
         "pad_segments_samples": samples,
         "output_lifetime": True,
+        "stream_offline_snr_db": partition_snr,
     }
 
 
