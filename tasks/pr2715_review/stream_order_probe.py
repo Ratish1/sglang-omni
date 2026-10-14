@@ -37,11 +37,13 @@ observations = {}
 
 def delayed_build(self, time_span, dtype):
     # Fill the allocator and native kernels before introducing a deterministic queue delay.
+    original_build(self, time_span + 0.23, dtype)
     original_build(self, time_span, dtype)
     torch.cuda.synchronize()
     torch.cuda._sleep(1_000_000_000)
     producer_started.record()
     original_build(self, time_span, dtype)
+    observations["producer_started_before_build_returned"] = producer_started.query()
 
 
 def first_solve(self):
