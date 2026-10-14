@@ -224,15 +224,74 @@ def native_probe(model_path: str) -> dict[str, int | bool | float]:
     }
 
 
+def default_capacity_probe(
+    model_path: str,
+) -> dict[str, int | bool | float | list[int]]:
+    torch.cuda.set_device(1)
+    torch.cuda.set_per_process_memory_fraction(0.18, 1)
+    audio_vocoder = load_moss_audio_vocoder(
+        model_path,
+        device="cuda:1",
+        decoder_dtype=torch.float32,
+        compute_dtype=torch.bfloat16,
+    )
+    codec = audio_vocoder.model
+    count = codec.quantizer.num_quantizers
+    vocabulary = codec.quantizer.quantizers[0].codebook.num_embeddings
+    processor = SimpleNamespace(
+        model_config=SimpleNamespace(
+            n_vq=count,
+            audio_pad_code=vocabulary,
+            sampling_rate=audio_vocoder.sample_rate,
+        )
+    )
+    vocoder = MossTTSVocoder(
+        processor, audio_vocoder, "cuda:1", compute_dtype=torch.bfloat16
+    )
+    scheduler = MossStreamingVocoderScheduler(vocoder)
+    scheduler.warmup_now()
+    session = scheduler.session
+    assert session is not None
+    captured = session.captured_frames()
+    slots = [session.acquire() for _ in range(32)]
+    assert session.acquire() is None
+    raw = torch.randint(
+        0, vocabulary, (count, 16), generator=torch.Generator().manual_seed(2810)
+    )
+    decoded = session.step({slot: raw for slot in slots})
+    assert len(decoded) == 32
+    assert all(
+        audio.numel() == 16 * codec.downsample_rate for audio in decoded.values()
+    )
+    result = {
+        "allocator_fraction": 0.18,
+        "peak_allocated_gib": torch.cuda.max_memory_allocated(1) / 2**30,
+        "peak_reserved_gib": torch.cuda.max_memory_reserved(1) / 2**30,
+        "captured_frame_sizes": captured,
+        "graph_count": len(session.cg_runner.graphs) if session.cg_runner else 0,
+        "all_32_slots_decoded": True,
+    }
+    for slot in slots:
+        session.release(slot)
+    scheduler.shutdown_stream_states()
+    return result
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", required=True)
+    parser.add_argument("--default-capacity", action="store_true")
     arguments = parser.parse_args()
-    results = {
-        "failure_isolation": failure_probe(),
-        "native": native_probe(arguments.model),
-    }
-    Path("/data/pr2801-2805-review/moss-gpu.json").write_text(
+    if arguments.default_capacity:
+        results = {"default_capacity": default_capacity_probe(arguments.model)}
+        filename = "moss-capacity.json"
+    else:
+        results = {
+            "failure_isolation": failure_probe(),
+            "native": native_probe(arguments.model),
+        }
+        filename = "moss-gpu.json"
+    Path(f"/data/pr2801-2805-review/{filename}").write_text(
         json.dumps(results, indent=2) + "\n"
     )
     print(json.dumps(results))
