@@ -51,11 +51,11 @@ while curl -fsS http://127.0.0.1:28980/health >/dev/null 2>&1; do
 done
 sleep 8
 cd "$source_root"
-python3 tasks/pr2798_2799_2804_review/run_pairs.py --model moss --arm head \
+python3 -m tasks.pr2798_2799_2804_review.run_pairs --model moss --arm head \
     --source "$run_root/head2799" --output-root "$run_root/moss-head-swapped" \
     --gpu 0 --concurrencies 64,1,32 --repeats 3 > "$run_root/moss-head-swapped-driver.log" 2>&1 &
 head_process=$!
-python3 tasks/pr2798_2799_2804_review/run_pairs.py --model moss --arm base \
+python3 -m tasks.pr2798_2799_2804_review.run_pairs --model moss --arm base \
     --source "$run_root/base2798" --output-root "$run_root/moss-base-swapped" \
     --gpu 1 --concurrencies 64,1,32 --repeats 3 > "$run_root/moss-base-swapped-driver.log" 2>&1 &
 base_process=$!
