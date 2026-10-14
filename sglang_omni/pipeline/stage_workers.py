@@ -21,7 +21,7 @@ from multiprocessing.synchronize import Event
 from typing import Literal, Sequence
 
 from sglang.srt.utils import kill_itself_when_parent_died
-from torch._dynamo.callback import callback_handler
+from torch._dynamo.callback import CallbackArgs, callback_handler
 
 from sglang_omni.config.runtime import (
     apply_typed_stage_kwargs,
@@ -426,32 +426,61 @@ class StageGroup:
         )
 
     async def wait_ready(self, timeout: float) -> None:
-        """Block until every TP rank signals ready, or until one goes *timeout*
-        seconds without startup progress."""
+        """Block until every TP rank signals ready, or until one dies or goes
+        *timeout* seconds without startup progress."""
         loop = asyncio.get_running_loop()
+        # note (Richard Wang): every rank is checked on each poll, with its own
+        # progress deadline, so one slow but progressing rank never hides a
+        # dead or stalled sibling, including one that was already ready.
+        progress = [
+            self.startup_progress[i] if i < len(self.startup_progress) else None
+            for i in range(len(self.ready_events))
+        ]
+        seen = [counter.value if counter is not None else 0 for counter in progress]
+        last_progress = [time.monotonic()] * len(self.ready_events)
+        reported = [False] * len(self.ready_events)
 
-        for i, event in enumerate(self.ready_events):
-            proc = self._processes[
-                i
-            ]  # noqa: leading-underscore  # upstream spelling, or the public name is already taken
-            spec = self.process_specs[i]
-            process_label = spec.process_name
-            startup_error_channel = self.startup_error_channels[i]
-            progress = (
-                self.startup_progress[i] if i < len(self.startup_progress) else None
-            )
-            seen = progress.value if progress is not None else 0
-            last_progress = time.monotonic()
-
-            while not event.is_set():
-                count = progress.value if progress is not None else 0
-                if count != seen:
-                    seen = count
-                    last_progress = time.monotonic()
+        while True:
+            now = time.monotonic()
+            pending: Event | None = None
+            remaining = timeout
+            for i, event in enumerate(self.ready_events):
+                proc = self._processes[
+                    i
+                ]  # noqa: leading-underscore  # upstream spelling, or the public name is already taken
+                process_label = self.process_specs[i].process_name
+                startup_error_channel = self.startup_error_channels[i]
+                if not proc.is_alive():
+                    details = ""
+                    try:
+                        traceback_text = startup_error_channel.get(timeout=0.2)
+                    except queue.Empty:
+                        pass
+                    else:
+                        details = f"\nStartup failure detail:\n{traceback_text}"
+                    raise RuntimeError(
+                        f"Process {process_label} died during startup "
+                        f"(exit code {proc.exitcode}){details}"
+                    )
                 else:
                     pass
-                remaining = last_progress + timeout - time.monotonic()
-                if remaining <= 0:
+                if event.is_set():
+                    if not reported[i]:
+                        reported[i] = True
+                        logger.info("Process %s ready", process_label)
+                    else:
+                        pass
+                    continue
+                else:
+                    pass
+                count = progress[i].value if progress[i] is not None else 0
+                if count != seen[i]:
+                    seen[i] = count
+                    last_progress[i] = now
+                else:
+                    pass
+                left = last_progress[i] + timeout - now
+                if left <= 0:
                     details = ""
                     try:
                         traceback_text = startup_error_channel.get_nowait()
@@ -467,23 +496,13 @@ class StageGroup:
                     )
                 else:
                     pass
-                if not proc.is_alive():
-                    details = ""
-                    try:
-                        traceback_text = startup_error_channel.get(timeout=0.2)
-                    except queue.Empty:
-                        pass
-                    else:
-                        details = f"\nStartup failure detail:\n{traceback_text}"
-                    raise RuntimeError(
-                        f"Process {process_label} died during startup "
-                        f"(exit code {proc.exitcode}){details}"
-                    )
-                else:
-                    pass
-                await loop.run_in_executor(None, event.wait, min(remaining, 1.0))
-
-            logger.info("Process %s ready", process_label)
+                pending = event if pending is None else pending
+                remaining = min(remaining, left)
+            if pending is None:
+                return
+            else:
+                pass
+            await loop.run_in_executor(None, pending.wait, min(remaining, 1.0))
 
     def any_dead(self) -> bool:
         """Return True if any process in the group exited while runner is active."""
@@ -657,7 +676,7 @@ def run_process(
 
     # note (Richard Wang): each finished torch.compile frame counts as startup
     # progress, since a cold compile and autotune can run for many minutes.
-    def on_compile_end(_args: object) -> None:
+    def on_compile_end(_args: CallbackArgs) -> None:
         report_startup_progress(spec)
 
     callback_handler.register_end_callback(on_compile_end)

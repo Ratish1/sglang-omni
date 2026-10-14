@@ -8,8 +8,7 @@ import os
 import queue
 import subprocess
 import sys
-import threading
-import time
+from collections.abc import Callable
 from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
@@ -113,38 +112,94 @@ def test_spawn_env_cpu_plan_preserves_configured_omp(
     assert "SGLANG_OMNI_OMP_FROM_CPU_PLAN" not in os.environ
 
 
-@pytest.mark.parametrize("progressing", [True, False])
-def test_wait_ready_times_out_on_a_stall_not_on_a_slow_start(progressing: bool) -> None:
-    group = stage_workers.StageGroup("slow", [worker_spec()])
-    ready = threading.Event()
-    progress = multiprocessing.get_context("spawn").Value("q", 0)
-    group._processes = [  # noqa: leading-underscore  # production name
-        SimpleNamespace(is_alive=lambda: True, exitcode=None)
-    ]
-    group.ready_events = [ready]
-    group.startup_error_channels = [queue.Queue()]
-    group.startup_progress = [progress]
+class StartupClock:
+    """A fake monotonic clock that a rank script advances one step per poll."""
 
-    def start() -> None:
-        # Progress for longer than the timeout, then ready, or stall.
-        for _ in range(8):
-            time.sleep(0.1)
-            if progressing:
-                with progress.get_lock():
-                    progress.value += 1
-            else:
-                pass
-        if progressing:
-            ready.set()
+    def __init__(self, steps: Callable[[float], None]) -> None:
+        self.now = 0.0
+        self.steps = steps
+
+    def monotonic(self) -> float:
+        return self.now
+
+    def advance(self, seconds: float | None) -> bool:
+        self.now += seconds or 0.0
+        self.steps(self.now)
+        return False
+
+
+class ScriptedReady:
+    def __init__(self, clock: StartupClock) -> None:
+        self.clock = clock
+        self.ready = False
+
+    def is_set(self) -> bool:
+        return self.ready
+
+    def wait(self, timeout: float | None = None) -> bool:
+        return self.clock.advance(timeout)
+
+
+@pytest.mark.parametrize(
+    ("case", "error", "message"),
+    [
+        ("slow_start", None, None),
+        ("stalled_sibling", TimeoutError, "rank1 made no startup progress"),
+        ("dead_after_ready", RuntimeError, "rank1 died during startup"),
+    ],
+)
+def test_wait_ready_watches_every_rank_on_its_own_progress_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+    case: str,
+    error: type[Exception] | None,
+    message: str | None,
+) -> None:
+    alive = [True, True]
+    counters = [SimpleNamespace(value=0), SimpleNamespace(value=0)]
+
+    def steps(now: float) -> None:
+        # Rank 0 makes progress every second and is ready at 30s, three
+        # timeouts in. Rank 1 depends on the case.
+        if now < 30:
+            counters[0].value += 1
+        else:
+            ready[0].ready = True
+        if case == "slow_start":
+            counters[1].value += 1
+            ready[1].ready = now >= 25
+        elif case == "dead_after_ready":
+            ready[1].ready = True
+            alive[1] = now < 3
         else:
             pass
 
-    threading.Thread(target=start, daemon=True).start()
-    if progressing:
-        asyncio.run(group.wait_ready(0.3))
+    clock = StartupClock(steps)
+    ready = [ScriptedReady(clock), ScriptedReady(clock)]
+    monkeypatch.setattr(
+        stage_workers, "time", SimpleNamespace(monotonic=clock.monotonic)
+    )
+    group = stage_workers.StageGroup(
+        "ranks",
+        [
+            StageWorkerProcessSpec(process_name="rank0", stage_specs=[]),
+            StageWorkerProcessSpec(process_name="rank1", stage_specs=[]),
+        ],
+    )
+    group._processes = [  # noqa: leading-underscore  # production name
+        SimpleNamespace(is_alive=lambda i=i: alive[i], exitcode=None) for i in range(2)
+    ]
+    group.ready_events = ready
+    group.startup_error_channels = [queue.Queue(), queue.Queue()]
+    group.startup_progress = counters
+
+    if error is None:
+        asyncio.run(group.wait_ready(10))
+        assert clock.now >= 30
     else:
-        with pytest.raises(TimeoutError, match="SGLANG_OMNI_STARTUP_TIMEOUT"):
-            asyncio.run(group.wait_ready(0.3))
+        with pytest.raises(error, match=message):
+            asyncio.run(group.wait_ready(10))
+        assert clock.now < 30
+        assert not ready[0].ready
 
 
 @pytest.mark.skipif(
