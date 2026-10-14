@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import argparse
+import base64
+import io
 import json
 import os
 import signal
@@ -12,6 +14,10 @@ import time
 from pathlib import Path
 
 import requests
+import soundfile
+import torch
+
+from benchmarks.dataset.seedtts import load_seedtts_samples
 
 MODEL_IDS = {
     "moss": "OpenMOSS-Team/MOSS-Transcribe-Diarize",
@@ -182,6 +188,64 @@ def run_arm(
                         f"completed {model} {arm} c{concurrency} r{repeat + 1}",
                         flush=True,
                     )
+            if model == "fish":
+                sample = load_seedtts_samples(
+                    "zhaochenyang20/seed-tts-eval-arrow", split="en"
+                )[0]
+                waveform, sample_rate = soundfile.read(
+                    sample.ref_audio, dtype="float32"
+                )
+                waveform = torch.from_numpy(waveform)
+                outcomes = []
+                for seconds in (96, 128, 4):
+                    repeated = waveform.repeat(
+                        1 + int(seconds * sample_rate / waveform.numel())
+                    )[: int(seconds * sample_rate)]
+                    audio_bytes = io.BytesIO()
+                    soundfile.write(
+                        audio_bytes,
+                        repeated.numpy(),
+                        sample_rate,
+                        format="WAV",
+                        subtype="PCM_16",
+                    )
+                    request = {
+                        "model": MODEL_IDS[model],
+                        "voice": "default",
+                        "input": "This request checks reference encoding and recovery.",
+                        "references": [
+                            {
+                                "data": base64.b64encode(
+                                    audio_bytes.getvalue()
+                                ).decode(),
+                                "media_type": "audio/wav",
+                                "text": sample.ref_text,
+                            }
+                        ],
+                        "max_new_tokens": 128,
+                    }
+                    started = time.monotonic()
+                    response = requests.post(
+                        f"http://127.0.0.1:{port}/v1/audio/speech",
+                        json=request,
+                        timeout=180,
+                    )
+                    outcomes.append(
+                        {
+                            "reference_seconds": seconds,
+                            "status": response.status_code,
+                            "wall_seconds": time.monotonic() - started,
+                            "response_bytes": len(response.content),
+                            "error": (
+                                response.text if response.status_code != 200 else None
+                            ),
+                        }
+                    )
+                    (output_root / "long-reference-http.json").write_text(
+                        json.dumps(outcomes, indent=2)
+                    )
+            else:
+                pass
         finally:
             stop_server(server)
 
