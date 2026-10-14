@@ -5,7 +5,7 @@ along the sequence for every per token module, attention within each row."""
 from __future__ import annotations
 
 import logging
-from collections.abc import Sequence
+from collections.abc import Iterator, Sequence
 from dataclasses import dataclass
 from itertools import pairwise
 
@@ -20,11 +20,6 @@ from sglang.kernels.ops.attention.flash_attention_v3 import _is_fa3_supported
 from sglang.srt.utils.custom_op import register_custom_op
 
 from sglang_omni.models.fun_cosyvoice3.causal_conv import FusedConvPositionEmbedding
-from sglang_omni.models.fun_cosyvoice3.timestep_modulation import (
-    TimestepModulationCache,
-    apply_block_modulation,
-    apply_final_modulation,
-)
 
 logger = logging.getLogger(__name__)
 
@@ -317,6 +312,10 @@ class PackedDiT:
     order. Attention is ragged on FA3 half-precision CUDA and padded elsewhere.
     """
 
+    # (euler steps, blocks, 1, 6 * hidden) and (euler steps, 1, 2 * hidden)
+    block_modulations: torch.Tensor
+    final_modulations: torch.Tensor
+
     def __init__(self, dit: torch.nn.Module, *, device: str | torch.device) -> None:
         self.dit = dit
         device = torch.device(device)
@@ -362,6 +361,30 @@ class PackedDiT:
     @property
     def chunk_size(self) -> int:
         return int(self.dit.static_chunk_size)
+
+    def build_modulations(self, time_span: torch.Tensor, dtype: torch.dtype) -> None:
+        """Every block's and the final layer's AdaLN modulation at each Euler step,
+        once: they read only the step's time, and every solve takes the same steps."""
+        dit = self.dit
+        flow_time = torch.zeros(1, device=time_span.device, dtype=dtype)
+        block_modulations: list[torch.Tensor] = []
+        final_modulations: list[torch.Tensor] = []
+        for t, _ in euler_step_times(time_span):
+            flow_time[:] = t
+            time_embedding = dit.time_embed(flow_time)
+            block_modulations.append(
+                torch.stack(
+                    [
+                        block.attn_norm.linear(block.attn_norm.silu(time_embedding))
+                        for block in dit.transformer_blocks
+                    ]
+                )
+            )
+            final_modulations.append(
+                dit.norm_out.linear(dit.norm_out.silu(time_embedding))
+            )
+        self.block_modulations = torch.stack(block_modulations)
+        self.final_modulations = torch.stack(final_modulations)
 
     def row_attention(
         self, rows: PackedRows, *, streaming: bool, dtype: torch.dtype
@@ -431,40 +454,23 @@ class PackedDiT:
         mu: torch.Tensor,
         spks: torch.Tensor,
         cond: torch.Tensor,
-        t: torch.Tensor,
+        block_modulations: torch.Tensor,
+        final_modulation: torch.Tensor,
         rows: PackedRows,
         attention: PackedRowAttention,
         rope: tuple[torch.Tensor, torch.Tensor],
-        block_modulations: torch.Tensor | None = None,
-        final_modulation: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """x, mu, cond, spks: (1, total, channels); t: (1,); rope: rope(rows).
+        """x, mu, cond, spks: (1, total, channels); block_modulations and
+        final_modulation: the Euler step's modulations; rope: rope(rows).
         Returns (1, total, out_channels)."""
-        if (block_modulations is None) != (final_modulation is None):
-            raise ValueError(
-                "block_modulations and final_modulation must be supplied together"
-            )
-        else:
-            pass
         dit = self.dit
-        if block_modulations is None:
-            assert final_modulation is None
-            timestep_embedding = dit.time_embed(t)
-        else:
-            assert final_modulation is not None
-            timestep_embedding = None
         h = dit.input_embed.proj(torch.cat((x, cond, mu, spks), dim=-1))
         h = self.conv_pos_embed(h, rows) + h
         residual = h
         for block_index, block in enumerate(dit.transformer_blocks):
-            if block_modulations is None:
-                norm, gate_msa, shift_mlp, scale_mlp, gate_mlp = block.attn_norm(
-                    h, emb=timestep_embedding
-                )
-            else:
-                norm, gate_msa, shift_mlp, scale_mlp, gate_mlp = apply_block_modulation(
-                    block.attn_norm, h, block_modulations[block_index]
-                )
+            norm, gate_msa, shift_mlp, scale_mlp, gate_mlp = modulate_block(
+                block.attn_norm.norm, h, block_modulations[block_index]
+            )
             h = h + gate_msa.unsqueeze(1) * self.attend(
                 block.attn,
                 norm,
@@ -479,11 +485,7 @@ class PackedDiT:
             h = dit.long_skip_connection(torch.cat((h, residual), dim=-1))
         else:
             pass
-        if block_modulations is None:
-            h = dit.norm_out(h, timestep_embedding)
-        else:
-            assert final_modulation is not None
-            h = apply_final_modulation(dit.norm_out, h, final_modulation)
+        h = modulate_final(dit.norm_out.norm, h, final_modulation)
         return dit.proj_out(h)
 
     def conv_pos_embed(self, h: torch.Tensor, rows: PackedRows) -> torch.Tensor:
@@ -561,6 +563,40 @@ def rotated(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tens
     return torch.where(is_rotary, turned, x)
 
 
+def euler_step_times(
+    time_span: torch.Tensor,
+) -> Iterator[tuple[torch.Tensor, torch.Tensor]]:
+    """Each Euler step's time and size, the time accumulated over the steps
+    rather than read from time_span."""
+    t, dt = time_span[0], time_span[1] - time_span[0]
+    for step in range(1, len(time_span)):
+        yield t, dt
+        t = t + dt
+        if step < len(time_span) - 1:
+            dt = time_span[step + 1] - t
+        else:
+            pass
+
+
+def modulate_block(
+    norm: torch.nn.LayerNorm, x: torch.Tensor, modulation: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """A DiT block's AdaLayerNormZero given its modulation, (1, 6 * hidden)."""
+    shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = modulation.chunk(
+        6, dim=1
+    )
+    x = norm(x) * (1 + scale_msa[:, None]) + shift_msa[:, None]
+    return x, gate_msa, shift_mlp, scale_mlp, gate_mlp
+
+
+def modulate_final(
+    norm: torch.nn.LayerNorm, x: torch.Tensor, modulation: torch.Tensor
+) -> torch.Tensor:
+    """The DiT's AdaLayerNormZero_Final given its modulation, (1, 2 * hidden)."""
+    scale, shift = modulation.chunk(2, dim=1)
+    return norm(x) * (1 + scale)[:, None, :] + shift[:, None, :]
+
+
 def solve_flow_euler_packed(
     estimator: PackedDiT,
     noise: torch.Tensor,
@@ -573,7 +609,6 @@ def solve_flow_euler_packed(
     angles: torch.Tensor,
     *,
     cfg_rate: float,
-    modulation_cache: TimestepModulationCache | None = None,
 ) -> torch.Tensor:
     """Euler steps with classifier free guidance, the rows and their twins in one
     DiT call. noise, mu, cond: (1, total, channels), spks: (rows, channels),
@@ -583,40 +618,24 @@ def solve_flow_euler_packed(
     cond_cfg = torch.cat((cond, torch.zeros_like(cond)), dim=1)
     spks_cfg = torch.cat((spks, torch.zeros_like(spks)), dim=0)
     spks_cfg = spks_cfg[twin_rows.row_ids].unsqueeze(0)
-    flow_time = torch.zeros(1, device=noise.device, dtype=spks.dtype)
     # note(ratish): once per solve and outside the compiled forward,
     # whose graph would otherwise hold RoPE's autocast region and miss the AOT cache.
     angles = angles[:, twin_rows.positions]
     rope = (angles.cos(), angles.sin())
     x = noise
-    t, dt = time_span[0], time_span[1] - time_span[0]
-    for step in range(1, len(time_span)):
-        flow_time[:] = t
-        forward_args = (
+    for step, (_, dt) in enumerate(euler_step_times(time_span)):
+        vector_field = estimator.forward(
             torch.cat((x, x), dim=1),
             mu_cfg,
             spks_cfg,
             cond_cfg,
-            flow_time,
+            estimator.block_modulations[step],
+            estimator.final_modulations[step],
             twin_rows,
             attention,
             rope,
         )
-        if modulation_cache is None:
-            # Preserve the original estimator.forward contract when disabled.
-            vector_field = estimator.forward(*forward_args)
-        else:
-            vector_field = estimator.forward(
-                *forward_args,
-                modulation_cache.block_modulations[step - 1],
-                modulation_cache.final_modulations[step - 1],
-            )
         conditional = vector_field[:, :total]
         unconditional = vector_field[:, total:]
         x = x + dt * ((1.0 + cfg_rate) * conditional - cfg_rate * unconditional)
-        t = t + dt
-        if step < len(time_span) - 1:
-            dt = time_span[step + 1] - t
-        else:
-            pass
     return x.float()

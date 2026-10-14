@@ -19,9 +19,6 @@ from sglang_omni.models.fun_cosyvoice3.prefix_cache import (
     run_prefix_solve,
 )
 from sglang_omni.models.fun_cosyvoice3.solve_graph_capture import SolveGraphCapture
-from sglang_omni.models.fun_cosyvoice3.timestep_modulation import (
-    TimestepModulationCache,
-)
 from sglang_omni.platforms.device_graph import ReplayableGraph
 
 
@@ -56,7 +53,6 @@ class PrefixCudaGraphRunner:
         hop_frames: int,
         min_hop_frames: int,
         max_frames: int,
-        modulation_cache: TimestepModulationCache | None = None,
     ) -> None:
         self.estimator = estimator
         self.pool = pool
@@ -65,7 +61,6 @@ class PrefixCudaGraphRunner:
         self.frame_dtype = frame_dtype
         self.speaker_dtype = speaker_dtype
         self.cfg_rate = cfg_rate
-        self.modulation_cache = modulation_cache
         self.euler_steps = len(pool.keys)
         self.mel_channels = mel_channels
         self.speaker_channels = speaker_channels
@@ -156,7 +151,6 @@ class PrefixCudaGraphRunner:
                         context,
                         next_context,
                         cfg_rate=self.cfg_rate,
-                        modulation_cache=self.modulation_cache,
                     )
 
                 graph, output = self.graphs.capture(solve)
@@ -191,13 +185,6 @@ class PrefixCudaGraphRunner:
     ) -> torch.Tensor | None:
         """The solve replayed from the smallest tier holding the step's new frames;
         None above the largest tier."""
-        if (
-            self.modulation_cache is not None
-            and time_span is not self.modulation_cache.time_span
-        ):
-            return None
-        else:
-            pass
         frame_count = sum(new_frames)
         tier = bisect.bisect_left(self.tier_frames, frame_count)
         if tier == len(self.tier_frames):

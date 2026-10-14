@@ -24,15 +24,13 @@ from sglang_omni.models.fun_cosyvoice3.packed_dit import (
     FA3_PAGE_SIZE,
     PACKED_INDUCTOR_OPTIONS,
     PackedDiT,
+    euler_step_times,
+    modulate_block,
+    modulate_final,
     packed_fa3,
     ragged_fa3,
     rotate_in_place,
     rotated,
-)
-from sglang_omni.models.fun_cosyvoice3.timestep_modulation import (
-    TimestepModulationCache,
-    apply_block_modulation,
-    apply_final_modulation,
 )
 
 BLOCK_FRAMES = 64
@@ -51,13 +49,12 @@ class PrefixForward(Protocol):
         mu: torch.Tensor,
         speaker_embeddings: torch.Tensor,
         mel_conditioning: torch.Tensor,
-        t: torch.Tensor,
+        block_modulations: torch.Tensor,
+        final_modulation: torch.Tensor,
         attention: PrefixRowAttention,
         rope: tuple[torch.Tensor, torch.Tensor],
         first_context: torch.Tensor,
         second_context: torch.Tensor,
-        block_modulations: torch.Tensor | None = None,
-        final_modulation: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]: ...
 
 
@@ -445,32 +442,20 @@ def forward_prefix(
     mu: torch.Tensor,
     speaker_embeddings: torch.Tensor,
     mel_conditioning: torch.Tensor,
-    t: torch.Tensor,
+    block_modulations: torch.Tensor,
+    final_modulation: torch.Tensor,
     attention: PrefixRowAttention,
     rope: tuple[torch.Tensor, torch.Tensor],
     first_context: torch.Tensor,
     second_context: torch.Tensor,
-    block_modulations: torch.Tensor | None = None,
-    final_modulation: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """DiT.forward over the new frames only. keys, values: each layer's
     (pages, 1, head_num, head_dim) pool for this Euler step; x, mu,
     mel_conditioning, speaker_embeddings: (1, total new frames, channels);
+    block_modulations and final_modulation: the Euler step's modulations;
     rope covers the rows' absolute positions. Returns the vector field and
     the two next positional-conv contexts."""
-    if (block_modulations is None) != (final_modulation is None):
-        raise ValueError(
-            "block_modulations and final_modulation must be supplied together"
-        )
-    else:
-        pass
     dit = estimator.dit
-    if block_modulations is None:
-        assert final_modulation is None
-        timestep_embedding = dit.time_embed(t)
-    else:
-        assert final_modulation is not None
-        timestep_embedding = None
     hidden_states = dit.input_embed.proj(
         torch.cat((x, mel_conditioning, mu, speaker_embeddings), dim=-1)
     )
@@ -480,14 +465,9 @@ def forward_prefix(
     hidden_states = embedded + hidden_states
     residual = hidden_states
     for layer, block in enumerate(dit.transformer_blocks):
-        if block_modulations is None:
-            norm, gate_msa, shift_mlp, scale_mlp, gate_mlp = block.attn_norm(
-                hidden_states, emb=timestep_embedding
-            )
-        else:
-            norm, gate_msa, shift_mlp, scale_mlp, gate_mlp = apply_block_modulation(
-                block.attn_norm, hidden_states, block_modulations[layer]
-            )
+        norm, gate_msa, shift_mlp, scale_mlp, gate_mlp = modulate_block(
+            block.attn_norm.norm, hidden_states, block_modulations[layer]
+        )
         attn = block.attn
         query, key, value = F.linear(
             norm, estimator.qkv_weights[layer], estimator.qkv_biases[layer]
@@ -521,13 +501,7 @@ def forward_prefix(
         )
     else:
         pass
-    if block_modulations is None:
-        hidden_states = dit.norm_out(hidden_states, timestep_embedding)
-    else:
-        assert final_modulation is not None
-        hidden_states = apply_final_modulation(
-            dit.norm_out, hidden_states, final_modulation
-        )
+    hidden_states = modulate_final(dit.norm_out.norm, hidden_states, final_modulation)
     return dit.proj_out(hidden_states), first_tail, second_tail
 
 
@@ -557,7 +531,6 @@ def run_prefix_solve(
     next_context: torch.Tensor,
     *,
     cfg_rate: float,
-    modulation_cache: TimestepModulationCache | None = None,
 ) -> torch.Tensor:
     """noise, mu, mel_conditioning: (1, half frames, channels); speaker_embeddings:
     (row slots, channels); context, next_context: (euler_steps, twin row slots, 2,
@@ -572,13 +545,13 @@ def run_prefix_solve(
     )[attention.speaker_index].unsqueeze(0)
     angles = angles[:, attention.positions]
     rope = (angles.cos(), angles.sin())
-    flow_time = torch.zeros(1, device=noise.device, dtype=speaker_embeddings.dtype)
-    euler_steps = len(time_span) - 1
     x = noise
-    t, dt = time_span[0], time_span[1] - time_span[0]
-    for euler_step in range(euler_steps):
-        flow_time[:] = t
-        forward_args = (
+    for euler_step, (_, dt) in enumerate(euler_step_times(time_span)):
+        (
+            vector_field,
+            next_context[euler_step, :, 0],
+            next_context[euler_step, :, 1],
+        ) = pool.forward(
             estimator,
             pool.keys[euler_step],
             pool.values[euler_step],
@@ -586,34 +559,16 @@ def run_prefix_solve(
             mu_cfg,
             speaker_embeddings_cfg,
             mel_conditioning_cfg,
-            flow_time,
+            estimator.block_modulations[euler_step],
+            estimator.final_modulations[euler_step],
             attention,
             rope,
             context[euler_step, :, 0],
             context[euler_step, :, 1],
         )
-        if modulation_cache is None:
-            # Do not change the native prefix forward contract when disabled.
-            output = pool.forward(*forward_args)
-        else:
-            output = pool.forward(
-                *forward_args,
-                modulation_cache.block_modulations[euler_step],
-                modulation_cache.final_modulations[euler_step],
-            )
-        (
-            vector_field,
-            next_context[euler_step, :, 0],
-            next_context[euler_step, :, 1],
-        ) = output
         conditional = vector_field[:, :half_frames]
         unconditional = vector_field[:, half_frames:]
         x = x + dt * ((1.0 + cfg_rate) * conditional - cfg_rate * unconditional)
-        t = t + dt
-        if euler_step < euler_steps - 1:
-            dt = time_span[euler_step + 2] - t
-        else:
-            pass
     return x.float()
 
 
@@ -629,7 +584,6 @@ def solve_flow_euler_prefix(
     caches: list[tuple[PrefixCacheRow, PrefixCacheRow]],
     *,
     cfg_rate: float,
-    modulation_cache: TimestepModulationCache | None = None,
 ) -> torch.Tensor:
     """Euler steps over the new frames of each row with classifier free
     guidance; the conditional rows and their unconditional twins each keep
@@ -699,7 +653,6 @@ def solve_flow_euler_prefix(
         context,
         next_context,
         cfg_rate=cfg_rate,
-        modulation_cache=modulation_cache,
     )
     for index, row in enumerate(twin_caches):
         row.committed_frames = attention.committed_frames[index]
