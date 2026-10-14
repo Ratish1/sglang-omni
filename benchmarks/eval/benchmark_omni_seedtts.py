@@ -169,6 +169,7 @@ from benchmarks.metrics.performance import (
     compute_speed_metrics,
     print_speed_summary,
 )
+from benchmarks.metrics.playback_continuity import compute_max_playback_underrun_s
 from benchmarks.tasks.asr import (
     DEFAULT_ASR_TRANSCRIBE_CONCURRENCY,
     QWEN3_ASR_MODEL_PATH,
@@ -345,6 +346,7 @@ def make_send_fn(
             text=sample.target_text[:TEXT_PREVIEW_LENGTH],
         )
         chunk_times: list[float] = []
+        chunk_seconds: list[float] = []
         text_first_time_holder: list[float] = []
         start_time = time.perf_counter()
         try:
@@ -365,6 +367,7 @@ def make_send_fn(
                 reference_audio_field=reference_audio_field,
                 reference_audio_data=reference_audio_data.get(sample.ref_audio),
                 chunk_times_out=chunk_times if stream else None,
+                chunk_seconds_out=chunk_seconds if stream else None,
                 text_first_time_holder=text_first_time_holder if stream else None,
             )
             result.audio_duration_s = get_wav_duration(wav_bytes)
@@ -400,6 +403,10 @@ def make_send_fn(
                     chunk_times[i + 1] - chunk_times[i]
                     for i in range(len(chunk_times) - 1)
                 ]
+                result.chunk_audio_duration_s = chunk_seconds
+                result.max_playback_underrun_s = compute_max_playback_underrun_s(
+                    chunk_times, chunk_seconds
+                )
             if text_first_time_holder:
                 result.text_ttft_s = text_first_time_holder[0] - start_time
         except (aiohttp.ClientError, asyncio.TimeoutError) as exc:

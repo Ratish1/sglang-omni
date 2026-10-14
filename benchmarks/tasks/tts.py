@@ -838,6 +838,7 @@ class VoiceCloneOmni:
         stream: bool = False,
         system_prompt: str | None = None,
         chunk_times_out: list[float] | None = None,
+        chunk_seconds_out: list[float] | None = None,
         text_first_time_holder: list[float] | None = None,
         reference_audio_field: ReferenceAudioField = "audios",
         reference_audio_data: str | None = None,
@@ -909,6 +910,7 @@ class VoiceCloneOmni:
                 wav_bytes, usage = await self._read_streaming_chat_audio(
                     response,
                     chunk_times_out=chunk_times_out,
+                    chunk_seconds_out=chunk_seconds_out,
                     text_first_time_holder=text_first_time_holder,
                 )
                 latency = time.perf_counter() - t0
@@ -940,6 +942,7 @@ class VoiceCloneOmni:
         self,
         response: aiohttp.ClientResponse,
         chunk_times_out: list[float] | None = None,
+        chunk_seconds_out: list[float] | None = None,
         text_first_time_holder: list[float] | None = None,
     ) -> tuple[bytes, dict]:
         """Read OpenAI chat SSE audio deltas and concatenate them into one WAV."""
@@ -960,6 +963,7 @@ class VoiceCloneOmni:
                     pcm_format,
                     usage,
                     chunk_times_out=chunk_times_out,
+                    chunk_seconds_out=chunk_seconds_out,
                     text_first_time_holder=text_first_time_holder,
                 )
 
@@ -970,6 +974,7 @@ class VoiceCloneOmni:
                 pcm_format,
                 usage,
                 chunk_times_out=chunk_times_out,
+                chunk_seconds_out=chunk_seconds_out,
                 text_first_time_holder=text_first_time_holder,
             )
 
@@ -1332,6 +1337,7 @@ def _collect_chat_streaming_audio(
     pcm_format: tuple[int, int, int] | None,
     usage: dict,
     chunk_times_out: list[float] | None = None,
+    chunk_seconds_out: list[float] | None = None,
     text_first_time_holder: list[float] | None = None,
 ) -> tuple[int, int, int] | None:
     event = parse_sse_event(line)
@@ -1369,6 +1375,8 @@ def _collect_chat_streaming_audio(
                     pcm_chunks.append(wf.readframes(wf.getnframes()))
                     if chunk_times_out is not None:
                         chunk_times_out.append(time.perf_counter())
+                    if chunk_seconds_out is not None:
+                        chunk_seconds_out.append(wf.getnframes() / wf.getframerate())
                     if pcm_format is None:
                         pcm_format = (
                             wf.getframerate(),
