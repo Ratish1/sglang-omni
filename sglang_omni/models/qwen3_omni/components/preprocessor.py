@@ -17,7 +17,7 @@ import numpy.typing as npt
 import torch
 import xxhash
 from tokenizers.normalizers import NFC
-from transformers import BatchFeature, PreTrainedTokenizerBase
+from transformers import BatchEncoding, BatchFeature, PreTrainedTokenizerBase
 from transformers.models.qwen3_omni_moe.processing_qwen3_omni_moe import (
     Qwen3OmniMoeProcessor,
 )
@@ -256,19 +256,21 @@ def validate_prompt_seq_len(
 
 
 def placeholder_counts(
-    processor: object, prompt_text: str, images: list, videos: list, audios: list
+    processor: Qwen3OmniMoeProcessor,
+    prompt_text: str,
+    images: list[object],
+    videos: list[object],
+    audios: list[object] | None,
 ) -> str:
     """Each media placeholder string the prompt holds, next to its media count."""
-    counts = []
-    for kind, items in (("audio", audios), ("image", images), ("video", videos)):
-        token = getattr(processor, f"{kind}_token", None)
-        if isinstance(token, str) and token:
-            counts.append(
-                f"{prompt_text.count(token)} {token} for {len(items or [])} {kind} inputs"
-            )
-        else:
-            pass
-    return ", ".join(counts)
+    return ", ".join(
+        f"{prompt_text.count(token)} {token} for {len(items or [])} {kind} inputs"
+        for kind, token, items in (
+            ("audio", processor.audio_token, audios),
+            ("image", processor.image_token, images),
+            ("video", processor.video_token, videos),
+        )
+    )
 
 
 def is_pretokenized_prompt(inputs: object) -> TypeGuard[list[int]]:
@@ -884,7 +886,7 @@ class Qwen3OmniPreprocessor:
             pass
 
         try:
-            hf_inputs: BatchFeature = self.processor(
+            hf_inputs: BatchFeature | BatchEncoding = self.processor(
                 text=prompt_text,
                 images=images or None,
                 videos=videos or None,
