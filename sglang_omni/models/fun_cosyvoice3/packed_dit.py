@@ -5,7 +5,7 @@ along the sequence for every per token module, attention within each row."""
 from __future__ import annotations
 
 import logging
-from collections.abc import Sequence
+from collections.abc import Iterator, Sequence
 from dataclasses import dataclass
 from itertools import pairwise
 
@@ -532,6 +532,21 @@ def rotated(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tens
     return torch.where(is_rotary, turned, x)
 
 
+def euler_step_times(
+    time_span: torch.Tensor,
+) -> Iterator[tuple[torch.Tensor, torch.Tensor]]:
+    """Each Euler step's time and size, the time accumulated over the steps
+    rather than read from time_span."""
+    t, dt = time_span[0], time_span[1] - time_span[0]
+    for step in range(1, len(time_span)):
+        yield t, dt
+        t = t + dt
+        if step < len(time_span) - 1:
+            dt = time_span[step + 1] - t
+        else:
+            pass
+
+
 def solve_flow_euler_packed(
     estimator: PackedDiT,
     noise: torch.Tensor,
@@ -559,8 +574,7 @@ def solve_flow_euler_packed(
     angles = angles[:, twin_rows.positions]
     rope = (angles.cos(), angles.sin())
     x = noise
-    t, dt = time_span[0], time_span[1] - time_span[0]
-    for step in range(1, len(time_span)):
+    for t, dt in euler_step_times(time_span):
         flow_time[:] = t
         vector_field = estimator.forward(
             torch.cat((x, x), dim=1),
@@ -575,9 +589,4 @@ def solve_flow_euler_packed(
         conditional = vector_field[:, :total]
         unconditional = vector_field[:, total:]
         x = x + dt * ((1.0 + cfg_rate) * conditional - cfg_rate * unconditional)
-        t = t + dt
-        if step < len(time_span) - 1:
-            dt = time_span[step + 1] - t
-        else:
-            pass
     return x.float()

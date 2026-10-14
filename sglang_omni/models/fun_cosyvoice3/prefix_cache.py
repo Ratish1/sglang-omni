@@ -24,6 +24,7 @@ from sglang_omni.models.fun_cosyvoice3.packed_dit import (
     FA3_PAGE_SIZE,
     PACKED_INDUCTOR_OPTIONS,
     PackedDiT,
+    euler_step_times,
     packed_fa3,
     ragged_fa3,
     rotate_in_place,
@@ -541,10 +542,8 @@ def run_prefix_solve(
     angles = angles[:, attention.positions]
     rope = (angles.cos(), angles.sin())
     flow_time = torch.zeros(1, device=noise.device, dtype=speaker_embeddings.dtype)
-    euler_steps = len(time_span) - 1
     x = noise
-    t, dt = time_span[0], time_span[1] - time_span[0]
-    for euler_step in range(euler_steps):
+    for euler_step, (t, dt) in enumerate(euler_step_times(time_span)):
         flow_time[:] = t
         (
             vector_field,
@@ -567,11 +566,6 @@ def run_prefix_solve(
         conditional = vector_field[:, :half_frames]
         unconditional = vector_field[:, half_frames:]
         x = x + dt * ((1.0 + cfg_rate) * conditional - cfg_rate * unconditional)
-        t = t + dt
-        if euler_step < euler_steps - 1:
-            dt = time_span[euler_step + 2] - t
-        else:
-            pass
     return x.float()
 
 

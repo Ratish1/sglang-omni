@@ -55,6 +55,7 @@ from sglang_omni.models.fun_cosyvoice3.packed_dit import (
     DIT_INDUCTOR_OPTIONS,
     FA3_DTYPES,
     PackedDiT,
+    euler_step_times,
     gather_rows,
     pack_rows,
     scatter_rows,
@@ -359,8 +360,7 @@ def solve_flow_euler(
         dtype=dtype,
     )
     prompt_mel_cfg = torch.zeros_like(noisy_mel_cfg)
-    t, dt = time_span[0], time_span[1] - time_span[0]
-    for step in range(1, len(time_span)):
+    for t, dt in euler_step_times(time_span):
         noisy_mel_cfg[:batch_size] = noisy_mel
         noisy_mel_cfg[batch_size:] = noisy_mel
         mel_mask_cfg[:batch_size] = mel_mask
@@ -399,11 +399,6 @@ def solve_flow_euler(
             (1.0 + decoder.inference_cfg_rate) * conditional
             - decoder.inference_cfg_rate * unconditional
         )
-        t = t + dt
-        if step < len(time_span) - 1:
-            dt = time_span[step + 1] - t
-        else:
-            pass
     return noisy_mel.float()
 
 
