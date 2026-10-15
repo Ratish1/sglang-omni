@@ -1316,10 +1316,12 @@ def create_code2wav_scheduler(
         pass
     cuda_graph_runner = None
     if enable_cuda_graph:
+        # note (ratish): with codec state slots a stateless window decodes only a stream the
+        # arena had no slot for, or one that ends before its first window: one row each.
         graph_keys = window_graph_keys(
             stream_chunk_size,
             left_context_size,
-            max(int(max_replay_rows), 1),
+            max(int(max_replay_rows), 1) if codec_arena is None else 1,
             initial_codec_chunk_frames,
         )
         # note (ratish): every length up to a full window is a threshold window or the
