@@ -512,11 +512,16 @@ def register_images(app: FastAPI) -> None:
             image = ImageResponseData(url=f"data:image/png;base64,{result.image}")
         return ImageResponse(id=request_id, data=[image])
 
-    @app.post("/v1/images/generations", response_model=ImageResponse)
     async def generations(
         request: ImageGenerationsRequest, http_request: Request
     ) -> ImageResponse:
         return await generate(request, http_request)
+
+    # The diffusion protocol is an optional dependency imported in this
+    # function. Resolve the local model type before FastAPI builds the route;
+    # postponed annotations cannot resolve function-local names themselves.
+    generations.__annotations__["request"] = ImageGenerationsRequest
+    app.post("/v1/images/generations", response_model=ImageResponse)(generations)
 
     edit_schema = ImageGenerationsRequest.model_json_schema()
     edit_schema["properties"].update(

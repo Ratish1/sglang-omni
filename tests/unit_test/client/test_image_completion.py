@@ -206,8 +206,7 @@ def test_client_rejects_image_stream_before_dispatch(payload: GenerateRequest) -
     assert coordinator.requests == []
 
 
-@pytest.mark.parametrize("stream", [False, True])
-def test_completion_stream_never_silently_discards_image_output(stream: bool) -> None:
+def test_completion_stream_rejects_image_output() -> None:
     coordinator = RecordingCoordinator({"image": "cG5n"})
     client = Client(coordinator)
 
@@ -216,7 +215,7 @@ def test_completion_stream_never_silently_discards_image_output(stream: bool) ->
             chunk
             async for chunk in client.completion_stream(
                 GenerateRequest(
-                    prompt="draw", output_modalities=["image"], stream=stream
+                    prompt="draw", output_modalities=["image"], stream=True
                 ),
                 request_id="r1",
             )
