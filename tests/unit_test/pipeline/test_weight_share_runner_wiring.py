@@ -5,7 +5,8 @@ from __future__ import annotations
 
 import asyncio
 import os
-from typing import ClassVar
+from pathlib import Path
+from typing import ClassVar, Literal
 
 import pytest
 
@@ -421,3 +422,58 @@ async def test_sharing_off_keeps_one_spawn_wave_and_one_broadcast(
     assert events.index("spawn gen@r1") < events.index("ready gen@r0")
     assert first.spawn_env is None
     assert coordinator.shutdown_calls == [None]
+
+
+@pytest.mark.parametrize("exit_mode", ["failure", "cancel"])
+@pytest.mark.asyncio
+async def test_review_pending_startup_waits_finish_before_runner_cleanup(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    exit_mode: Literal["failure", "cancel"],
+) -> None:
+    """A failed or cancelled startup must reap every pending readiness task."""
+    events: list[str] = []
+    started = [asyncio.Event(), asyncio.Event()]
+    failure = RuntimeError("startup probe failed")
+
+    class PendingGroup(FakeGroup):
+        def __init__(self, index: int) -> None:
+            super().__init__(events, f"gen@r{index}")
+            self.index = index
+
+        async def wait_ready(self, timeout: float) -> None:
+            self.ready_timeout = timeout
+            started[self.index].set()
+            try:
+                await asyncio.gather(*(event.wait() for event in started))
+                if exit_mode == "failure" and self.index == 0:
+                    raise failure
+                else:
+                    await asyncio.Event().wait()
+            finally:
+                events.append(f"wait finished {self.group_name}")
+
+    groups = [PendingGroup(0), PendingGroup(1)]
+    patch(monkeypatch, events, groups)
+    runner = MultiProcessPipelineRunner(make_config(tmp_path, weight_share="off"))
+    startup = asyncio.create_task(runner.start(timeout=5.0))
+    await asyncio.wait_for(
+        asyncio.gather(*(event.wait() for event in started)), timeout=5.0
+    )
+    if exit_mode == "cancel":
+        startup.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(startup, timeout=5.0)
+    else:
+        with pytest.raises(RuntimeError, match="startup probe failed") as caught:
+            await asyncio.wait_for(startup, timeout=5.0)
+        assert caught.value is failure
+
+    for group in groups:
+        assert events.index(f"wait finished {group.group_name}") < events.index(
+            f"channels closed {group.group_name}"
+        )
+    assert "coordinator stop" in events
+    assert not runner.started
+    assert not runner.groups
+    assert list(tmp_path.iterdir()) == []
