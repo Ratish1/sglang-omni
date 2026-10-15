@@ -794,6 +794,7 @@ class TalkerSamplingParams(TypedDict, total=False):
     talker_top_p: float
     talker_top_k: int
     talker_repetition_penalty: float
+    initial_codec_chunk_frames: int
 
 
 def talker_sampling_params(

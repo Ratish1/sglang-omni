@@ -222,6 +222,7 @@ class OmniSeedttsBenchmarkConfig:
     talker_top_p: float | None = None
     talker_top_k: int | None = None
     talker_repetition_penalty: float | None = None
+    initial_codec_chunk_frames: int | None = None
     warmup: int | None = None
     warmup_meta: str | None = None
     max_concurrency: int = DEFAULT_TTS_BENCHMARK_CONCURRENCY
@@ -436,12 +437,17 @@ def load_warmup_samples(
 def configured_talker_params(
     config: OmniSeedttsBenchmarkConfig,
 ) -> TalkerSamplingParams:
-    return talker_sampling_params(
+    talker_params = talker_sampling_params(
         talker_temperature=config.talker_temperature,
         talker_top_p=config.talker_top_p,
         talker_top_k=config.talker_top_k,
         talker_repetition_penalty=config.talker_repetition_penalty,
     )
+    if config.initial_codec_chunk_frames is not None:
+        talker_params["initial_codec_chunk_frames"] = config.initial_codec_chunk_frames
+    else:
+        pass
+    return talker_params
 
 
 async def run_separate_warmup(
@@ -630,6 +636,7 @@ def _config_from_args(args: argparse.Namespace) -> OmniSeedttsBenchmarkConfig:
         talker_top_p=args.talker_top_p,
         talker_top_k=args.talker_top_k,
         talker_repetition_penalty=args.talker_repetition_penalty,
+        initial_codec_chunk_frames=args.initial_codec_chunk_frames,
         warmup=args.warmup,
         warmup_meta=args.warmup_meta,
         max_concurrency=args.max_concurrency,
@@ -794,6 +801,12 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         type=int,
         default=None,
         help="Talker top-k sampling cutoff; omit to keep the server default.",
+    )
+    parser.add_argument(
+        "--initial-codec-chunk-frames",
+        type=int,
+        default=None,
+        help="First code2wav window of every streamed request; omit for the server default.",
     )
     parser.add_argument(
         "--talker-repetition-penalty",
