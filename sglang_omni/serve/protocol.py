@@ -53,7 +53,7 @@ class ImageGenerationParams(BaseModel):
     Text-to-image defaults to 1024x1024; edits follow the input image grid.
     """
 
-    model_config = ConfigDict(allow_inf_nan=False)
+    model_config = ConfigDict(allow_inf_nan=False, extra="forbid")
 
     mode: Literal["normal"] = "normal"
     decode_mode: Literal["normal", "decoder-turbo"] = "normal"
@@ -66,6 +66,17 @@ class ImageGenerationParams(BaseModel):
     image_h: int | None = Field(default=None, ge=32, multiple_of=32)
     image_w: int | None = Field(default=None, ge=32, multiple_of=32)
     dllm_steps: int | None = Field(default=None, ge=1)
+
+    @model_validator(mode="after")
+    def validate_decoder_steps(self) -> ImageGenerationParams:
+        if self.decode_mode == "normal" and self.decoder_steps == 1:
+            raise ValueError(
+                "normal decoding requires decoder_steps >= 2; use decoder-turbo "
+                "for a one-step request"
+            )
+        else:
+            pass
+        return self
 
 
 class ChatCompletionRequest(BaseModel):

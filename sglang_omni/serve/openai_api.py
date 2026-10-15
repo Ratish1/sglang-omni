@@ -29,7 +29,7 @@ import uuid
 from contextlib import aclosing, suppress
 from dataclasses import asdict
 from enum import Enum
-from typing import TYPE_CHECKING, AsyncGenerator, AsyncIterator, Literal
+from typing import AsyncGenerator, AsyncIterator, Literal
 
 from fastapi import (
     Depends,
@@ -144,12 +144,6 @@ from sglang_omni.serve.translations import register_translations
 logger = logging.getLogger(__name__)
 HTTP_DISCONNECT_POLL_INTERVAL_S = 0.05
 HTTP_DISCONNECT_CANCEL_TIMEOUT_S = 0.1
-
-if TYPE_CHECKING:
-    from sglang.multimodal_gen.runtime.entrypoints.openai.protocol import (
-        ImageGenerationsRequest,
-    )
-
 
 class ServerStatus(Enum):
     """Readiness the launcher holds at STARTING until its warmup requests complete."""
@@ -364,104 +358,130 @@ def create_app(
     return app
 
 
-def build_image_request(
-    request: "ImageGenerationsRequest", source: str | None = None
-) -> GenerateRequest:
-    """Translate diffusion sampling names without changing the model's defaults."""
-    supplied = request.model_dump(exclude_unset=True, exclude_none=True)
-    controls = ImageGenerationParams.model_fields.keys() - {"image_h", "image_w"}
-    common_fields = {
-        "prompt",
-        "model",
-        "n",
-        "response_format",
-        "output_format",
-        "size",
-        "width",
-        "height",
-        "num_inference_steps",
-        "guidance_scale",
-        "seed",
-        "user",
-    }
-    unsupported = supplied.keys() - common_fields - controls
-    if unsupported:
-        raise ValueError(
-            f"Unsupported image parameters: {', '.join(sorted(unsupported))}"
-        )
-    if request.n != 1:
-        raise ValueError("This image pipeline supports n=1")
-    if request.response_format not in (None, "url", "b64_json"):
-        raise ValueError("response_format must be url or b64_json")
-    if request.output_format not in (None, "png"):
-        raise ValueError("This image pipeline supports PNG output")
-    if isinstance(request.seed, list):
-        raise ValueError("This image pipeline requires a single integer seed")
-
-    options = {key: value for key, value in supplied.items() if key in controls}
-    for native, target in (
-        ("num_inference_steps", "decoder_steps"),
-        ("guidance_scale", "cfg_scale"),
-    ):
-        if native in supplied:
-            if target in options and options[target] != supplied[native]:
-                raise ValueError(f"{native} and {target} disagree")
-            options[target] = supplied[native]
-
-    dimensions = {"size", "width", "height"} & supplied.keys()
-    if source is not None:
-        if not request.prompt.strip():
-            raise ValueError("Image editing requires a non-empty instruction")
-        if dimensions:
-            raise ValueError(
-                "Edit output follows the source grid; omit size, width and height"
-            )
-        if options.get("mode") == "thinking":
-            raise ValueError("Thinking mode does not support editing")
-    else:
-        if (request.width is None) != (request.height is None):
-            raise ValueError("width and height must be provided together")
-        size = supplied.get("size")
-        if size is not None:
-            width, height = (int(value) for value in size.split("x"))
-            if request.width is not None and (width, height) != (
-                request.width,
-                request.height,
-            ):
-                raise ValueError("size and width/height disagree")
-        else:
-            width = request.width if request.width is not None else 1024
-            height = request.height if request.height is not None else 1024
-        options.update(image_w=width, image_h=height)
-
-    params = ImageGenerationParams.model_validate(options)
-    return GenerateRequest(
-        model=request.model,
-        messages=[Message(role="user", content=request.prompt)],
-        output_modalities=["image"],
-        stream=False,
-        sampling=SamplingParams(seed=request.seed),
-        metadata={
-            "image_generation": params.model_dump(
-                exclude_unset=True, exclude_none=True
-            ),
-            **({"images": [source]} if source is not None else {}),
-        },
-    )
-
-
 def register_images(app: FastAPI) -> None:
     """Register native image-generation and single-image-edit routes."""
-    global ImageGenerationsRequest, ImageResponse, ImageResponseData
-
     from sglang.multimodal_gen.runtime.entrypoints.openai.protocol import (
         ImageGenerationsRequest,
         ImageResponse,
         ImageResponseData,
     )
 
-    async def generate(
+    def build_image_request(
         request: ImageGenerationsRequest, source: str | None = None
+    ) -> GenerateRequest:
+        """Translate diffusion sampling names without changing model defaults."""
+        supplied = request.model_dump(exclude_unset=True, exclude_none=True)
+        controls = ImageGenerationParams.model_fields.keys() - {
+            "image_h",
+            "image_w",
+        }
+        common_fields = {
+            "prompt",
+            "model",
+            "n",
+            "response_format",
+            "output_format",
+            "size",
+            "width",
+            "height",
+            "num_inference_steps",
+            "guidance_scale",
+            "seed",
+            "user",
+        }
+        unsupported = supplied.keys() - common_fields - controls
+        if unsupported:
+            raise ValueError(
+                f"Unsupported image parameters: {', '.join(sorted(unsupported))}"
+            )
+        else:
+            pass
+        if request.n != 1:
+            raise ValueError("This image pipeline supports n=1")
+        else:
+            pass
+        if request.response_format not in (None, "url", "b64_json"):
+            raise ValueError("response_format must be url or b64_json")
+        else:
+            pass
+        if request.output_format not in (None, "png"):
+            raise ValueError("This image pipeline supports PNG output")
+        else:
+            pass
+        if isinstance(request.seed, list):
+            raise ValueError("This image pipeline requires a single integer seed")
+        else:
+            pass
+
+        options = {key: value for key, value in supplied.items() if key in controls}
+        for native, target in (
+            ("num_inference_steps", "decoder_steps"),
+            ("guidance_scale", "cfg_scale"),
+        ):
+            if native in supplied:
+                if target in options and options[target] != supplied[native]:
+                    raise ValueError(f"{native} and {target} disagree")
+                else:
+                    pass
+                options[target] = supplied[native]
+            else:
+                pass
+
+        dimensions = {"size", "width", "height"} & supplied.keys()
+        if source is not None:
+            if not request.prompt.strip():
+                raise ValueError("Image editing requires a non-empty instruction")
+            else:
+                pass
+            if dimensions:
+                raise ValueError(
+                    "Edit output follows the source grid; omit size, width and height"
+                )
+            else:
+                pass
+            if options.get("mode") == "thinking":
+                raise ValueError("Thinking mode does not support editing")
+            else:
+                pass
+        else:
+            if (request.width is None) != (request.height is None):
+                raise ValueError("width and height must be provided together")
+            else:
+                pass
+            size = supplied.get("size")
+            if size is not None:
+                width, height = (int(value) for value in size.split("x"))
+                if request.width is not None and (width, height) != (
+                    request.width,
+                    request.height,
+                ):
+                    raise ValueError("size and width/height disagree")
+                else:
+                    pass
+            else:
+                width = request.width if request.width is not None else 1024
+                height = request.height if request.height is not None else 1024
+            options.update(image_w=width, image_h=height)
+
+        params = ImageGenerationParams.model_validate(options)
+        return GenerateRequest(
+            model=request.model,
+            messages=[Message(role="user", content=request.prompt)],
+            output_modalities=["image"],
+            stream=False,
+            sampling=SamplingParams(seed=request.seed),
+            metadata={
+                "image_generation": params.model_dump(
+                    exclude_unset=True, exclude_none=True
+                ),
+                **({"images": [source]} if source is not None else {}),
+            },
+        )
+
+    async def generate(
+        request: ImageGenerationsRequest,
+        http_request: Request,
+        source: str | None = None,
     ) -> ImageResponse:
         try:
             generation = build_image_request(request, source)
@@ -469,16 +489,23 @@ def register_images(app: FastAPI) -> None:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         request_id = str(uuid.uuid4())
         try:
-            result = await app.state.client.completion(
-                generation, request_id=request_id
+            result = await complete_unless_disconnected(
+                http_request,
+                app.state.client,
+                app.state.client.completion(generation, request_id=request_id),
+                request_id=request_id,
             )
         except Exception as exc:
             status_code = generation_error_status_code(exc)
             if status_code == 500:
                 logger.exception(f"Error generating image for request {request_id}")
+            else:
+                pass
             raise HTTPException(status_code=status_code, detail=str(exc)) from exc
         if result.image is None:
             raise HTTPException(status_code=500, detail="Pipeline returned no image")
+        else:
+            pass
         if request.response_format == "b64_json":
             image = ImageResponseData(b64_json=result.image)
         else:
@@ -486,8 +513,10 @@ def register_images(app: FastAPI) -> None:
         return ImageResponse(id=request_id, data=[image])
 
     @app.post("/v1/images/generations", response_model=ImageResponse)
-    async def generations(request: ImageGenerationsRequest) -> ImageResponse:
-        return await generate(request)
+    async def generations(
+        request: ImageGenerationsRequest, http_request: Request
+    ) -> ImageResponse:
+        return await generate(request, http_request)
 
     edit_schema = ImageGenerationsRequest.model_json_schema()
     edit_schema["properties"].update(
@@ -508,8 +537,8 @@ def register_images(app: FastAPI) -> None:
             }
         },
     )
-    async def edits(request: Request) -> ImageResponse:
-        async with request.form() as form:
+    async def edits(http_request: Request) -> ImageResponse:
+        async with http_request.form() as form:
             sources = [
                 value
                 for key, value in form.multi_items()
@@ -519,6 +548,8 @@ def register_images(app: FastAPI) -> None:
                 raise HTTPException(
                     status_code=400, detail="Edit requires exactly one source image"
                 )
+            else:
+                pass
             fields = {
                 key: value
                 for key, value in form.items()
@@ -532,7 +563,9 @@ def register_images(app: FastAPI) -> None:
             if isinstance(source, StarletteUploadFile):
                 encoded = base64.b64encode(await source.read()).decode("ascii")
                 source = f"data:{source.content_type or 'image/png'};base64,{encoded}"
-        return await generate(params, source)
+            else:
+                pass
+        return await generate(params, http_request, source)
 
 
 def register_voices(app: FastAPI) -> None:
@@ -931,16 +964,22 @@ def common_model_info_value(
 
 def validate_image_generation_request(req: ChatCompletionRequest) -> None:
     """Reject unsupported image requests before dispatch or SSE headers."""
-    if req.stream and (
-        req.image_generation is not None or "image" in (req.modalities or [])
-    ):
+    image_requested = req.modalities is not None and "image" in req.modalities
+    if req.image_generation is not None and not image_requested:
+        raise HTTPException(
+            status_code=400,
+            detail="image_generation requires modalities to include image",
+        )
+    else:
+        pass
+    if req.stream and image_requested:
         raise HTTPException(
             status_code=400,
             detail="Image generation does not support streaming; set stream=false",
         )
     else:
         pass
-    if req.image_generation is None:
+    if not image_requested:
         return
     else:
         pass
@@ -1075,6 +1114,10 @@ async def chat_non_stream(
         ) from exc
 
     requested_modalities = req.modalities if req.modalities is not None else ["text"]
+    if "image" in requested_modalities and result.image is None:
+        raise HTTPException(status_code=500, detail="Pipeline returned no image")
+    else:
+        pass
 
     # Build message content
     message: dict[str, str | dict[str, str | None]] = {"role": "assistant"}
@@ -1411,7 +1454,7 @@ def build_chat_generate_request(req: ChatCompletionRequest) -> GenerateRequest:
         metadata["use_audio_in_video"] = req.use_audio_in_video
     else:
         pass
-    if req.image_generation is not None:
+    if req.image_generation is not None and "image" in output_modalities:
         # Omitted CFG values must remain omitted: edit and T2I defaults differ.
         metadata["image_generation"] = req.image_generation.model_dump(
             exclude_none=True,

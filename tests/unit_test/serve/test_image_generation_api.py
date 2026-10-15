@@ -5,6 +5,8 @@ from __future__ import annotations
 
 import subprocess
 import sys
+from collections.abc import AsyncIterator, Iterator
+from typing import NoReturn, TypedDict
 
 import pytest
 from fastapi.testclient import TestClient
@@ -12,17 +14,41 @@ from pydantic import ValidationError
 
 from sglang_omni.admission import QueueFullError
 from sglang_omni.client import Client
-from sglang_omni.client.types import ClientError
+from sglang_omni.client.types import ClientError, GenerateRequest
+from sglang_omni.proto import CompleteMessage, StreamMessage
 from sglang_omni.serve import create_app
 from sglang_omni.serve.openai_api import build_chat_generate_request
 from sglang_omni.serve.protocol import ChatCompletionRequest, ImageGenerationParams
 
 
+class DecodePayload(TypedDict, total=False):
+    text: str
+    finish_reason: str
+    prompt_tokens: int
+    completion_tokens: int
+
+
+class ImageDecodePayload(TypedDict):
+    image: str
+
+
+class PipelineResult(TypedDict, total=False):
+    decode: DecodePayload
+    image_decode: ImageDecodePayload
+    image: str
+
+
+ImagePart = dict[str, str | dict[str, str]]
+MalformedContent = str | None | list[dict[str, str | int | None]]
+
+
 class RecordingCoordinator:
     def __init__(self) -> None:
-        self.requests = []
+        self.requests: list[GenerateRequest] = []
 
-    async def submit(self, request_id, request):
+    async def submit(
+        self, request_id: str, request: GenerateRequest
+    ) -> PipelineResult:
         self.requests.append(request)
         return {
             "decode": {
@@ -34,13 +60,15 @@ class RecordingCoordinator:
             "image_decode": {"image": "cG5n"},
         }
 
-    async def stream(self, request_id, request):
+    async def stream(
+        self, request_id: str, request: GenerateRequest
+    ) -> AsyncIterator[CompleteMessage | StreamMessage]:
         raise AssertionError("Image requests must be rejected before streaming")
         yield
 
 
 @pytest.fixture
-def api():
+def api() -> Iterator[tuple[TestClient, RecordingCoordinator]]:
     coordinator = RecordingCoordinator()
     app = create_app(
         Client(coordinator), model_name="llada2-uni", supports_image_api=True
@@ -56,10 +84,17 @@ def test_non_image_app_does_not_import_diffusion() -> None:
             "-c",
             """
 import importlib.abc
+from importlib.machinery import ModuleSpec
 import sys
+from types import ModuleType
 
 class NoDiffusion(importlib.abc.MetaPathFinder):
-    def find_spec(self, fullname, path=None, target=None):
+    def find_spec(
+        self,
+        fullname: str,
+        path: list[str] | None = None,
+        target: ModuleType | None = None,
+    ) -> ModuleSpec | None:
         if fullname == "sglang.multimodal_gen" or fullname.startswith("sglang.multimodal_gen."):
             raise ModuleNotFoundError("Diffusion is not installed", name=fullname)
         else:
@@ -92,7 +127,9 @@ with TestClient(app) as client:
         ("cfg_rescale", "NaN"),
     ],
 )
-def test_http_rejects_nonfinite_cfg_without_dispatch(api, field, value):
+def test_http_rejects_nonfinite_cfg_without_dispatch(
+    api: tuple[TestClient, RecordingCoordinator], field: str, value: str
+) -> None:
     client, coordinator = api
     response = client.post(
         "/v1/chat/completions",
@@ -121,9 +158,10 @@ def test_http_rejects_nonfinite_cfg_without_dispatch(api, field, value):
         {"mode": "interleaved"},
         {"mode": "thinking"},
         {"decode_mode": "unknown"},
+        {"decode_mode": "normal", "decoder_steps": 1},
     ],
 )
-def test_invalid_image_parameters(params):
+def test_invalid_image_parameters(params: dict[str, int | float | str]) -> None:
     with pytest.raises(ValidationError):
         ImageGenerationParams(**params)
 
@@ -173,10 +211,14 @@ def test_all_image_controls_preserve_explicit_values() -> None:
         "image_w": 1024,
         "dllm_steps": 1,
     }
-    req = ChatCompletionRequest(messages=messages, image_generation=config)
+    req = ChatCompletionRequest(
+        messages=messages, modalities=["image"], image_generation=config
+    )
     assert build_chat_generate_request(req).metadata["image_generation"] == config
     req = ChatCompletionRequest(
-        messages=messages, image_generation={"cfg_text_scale": None}
+        messages=messages,
+        modalities=["image"],
+        image_generation={"cfg_text_scale": None},
     )
     assert build_chat_generate_request(req).metadata["image_generation"] == {}
     assert (
@@ -187,8 +229,10 @@ def test_all_image_controls_preserve_explicit_values() -> None:
     )
 
 
-@pytest.mark.parametrize("modalities", [None, ["text"], ["image"], ["text", "image"]])
-def test_chat_image_response_keeps_pr3_format_and_modality_choices(api, modalities):
+@pytest.mark.parametrize("modalities", [["image"], ["text", "image"]])
+def test_chat_image_response_keeps_pr3_format_and_modality_choices(
+    api: tuple[TestClient, RecordingCoordinator], modalities: list[str] | None
+) -> None:
     client, coordinator = api
     response = client.post(
         "/v1/chat/completions",
@@ -201,10 +245,7 @@ def test_chat_image_response_keeps_pr3_format_and_modality_choices(api, modaliti
     assert response.status_code == 200
     data = response.json()
     message = data["choices"][0]["message"]
-    if modalities and "image" in modalities:
-        assert message["image"] == {"data": "cG5n", "format": "png"}
-    else:
-        assert "image" not in message
+    assert message["image"] == {"data": "cG5n", "format": "png"}
     if modalities == ["image"]:
         assert "content" not in message
     else:
@@ -220,16 +261,77 @@ def test_chat_image_response_keeps_pr3_format_and_modality_choices(api, modaliti
     assert coordinator.requests[0].metadata["image_generation"] == {}
 
 
+@pytest.mark.parametrize("modalities", [None, ["text"]])
+def test_image_generation_requires_image_modality(
+    api: tuple[TestClient, RecordingCoordinator], modalities: list[str] | None
+) -> None:
+    client, coordinator = api
+    body = {
+        "messages": [{"role": "user", "content": "Draw a square"}],
+        "image_generation": {},
+    }
+    if modalities is not None:
+        body["modalities"] = modalities
+    else:
+        pass
+    response = client.post("/v1/chat/completions", json=body)
+    assert response.status_code == 400
+    assert response.json()["detail"] == (
+        "image_generation requires modalities to include image"
+    )
+    assert coordinator.requests == []
+
+
+def test_image_response_does_not_fall_back_to_text(
+    api: tuple[TestClient, RecordingCoordinator], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    client, coordinator = api
+
+    async def submit(request_id: str, request: GenerateRequest) -> PipelineResult:
+        return {"decode": {"text": "text fallback"}}
+
+    monkeypatch.setattr(coordinator, "submit", submit)
+    response = client.post(
+        "/v1/chat/completions",
+        json={
+            "messages": [{"role": "user", "content": "Draw"}],
+            "modalities": ["image"],
+            "image_generation": {},
+        },
+    )
+    assert response.status_code == 500
+    assert response.json()["detail"] == "Pipeline returned no image"
+
+
+def test_edit_validation_without_generation_config_is_a_client_error(
+    api: tuple[TestClient, RecordingCoordinator],
+) -> None:
+    client, coordinator = api
+    response = client.post(
+        "/v1/chat/completions",
+        json={
+            "messages": [{"role": "user", "content": " "}],
+            "images": ["input.png"],
+            "modalities": ["image"],
+        },
+    )
+    assert response.status_code == 400
+    assert response.json()["detail"] == (
+        "Image editing requires a non-empty instruction"
+    )
+    assert coordinator.requests == []
+
+
 @pytest.mark.parametrize(
     "extra",
     [
-        {"image_generation": {}},
         {"modalities": ["image"]},
         {"modalities": ["text", "image"]},
-        {"image_generation": {}, "modalities": ["text"]},
     ],
 )
-def test_image_streaming_is_rejected_before_dispatch(api, extra):
+def test_image_streaming_is_rejected_before_dispatch(
+    api: tuple[TestClient, RecordingCoordinator], extra: dict[str, list[str]]
+) -> None:
     client, coordinator = api
     response = client.post(
         "/v1/chat/completions",
@@ -255,7 +357,11 @@ def test_image_streaming_is_rejected_before_dispatch(api, extra):
     ],
 )
 @pytest.mark.parametrize("instruction", ["", "Make it red"])
-def test_edit_requires_latest_user_instruction(api, image_part, instruction):
+def test_edit_requires_latest_user_instruction(
+    api: tuple[TestClient, RecordingCoordinator],
+    image_part: ImagePart | None,
+    instruction: str,
+) -> None:
     client, coordinator = api
     body = {
         "messages": [
@@ -285,7 +391,9 @@ def test_edit_requires_latest_user_instruction(api, image_part, instruction):
 
 
 @pytest.mark.parametrize("content", ["  ", None, [{"text": None}], [{"text": 123}]])
-def test_empty_or_malformed_edit_text_is_not_a_server_error(api, content):
+def test_empty_or_malformed_edit_text_is_not_a_server_error(
+    api: tuple[TestClient, RecordingCoordinator], content: MalformedContent
+) -> None:
     client, coordinator = api
     response = client.post(
         "/v1/chat/completions",
@@ -293,13 +401,16 @@ def test_empty_or_malformed_edit_text_is_not_a_server_error(api, content):
             "messages": [{"role": "user", "content": content}],
             "images": ["input.png"],
             "image_generation": {},
+            "modalities": ["image"],
         },
     )
     assert response.status_code == 400
     assert coordinator.requests == []
 
 
-def test_image_input_without_generation_config_remains_chat(api):
+def test_image_input_without_generation_config_remains_chat(
+    api: tuple[TestClient, RecordingCoordinator]
+) -> None:
     client, coordinator = api
     response = client.post(
         "/v1/chat/completions",
@@ -310,7 +421,9 @@ def test_image_input_without_generation_config_remains_chat(api):
 
 
 @pytest.mark.parametrize("editing", [False, True])
-def test_native_image_routes_preserve_generation_controls(api, editing):
+def test_native_image_routes_preserve_generation_controls(
+    api: tuple[TestClient, RecordingCoordinator], editing: bool
+) -> None:
     client, coordinator = api
     fields = {
         "prompt": "Make it red",
@@ -346,7 +459,9 @@ def test_native_image_routes_preserve_generation_controls(api, editing):
         assert (options["image_w"], options["image_h"]) == (1024, 768)
 
 
-def test_native_image_rejects_unsupported_controls_and_multiple_sources(api):
+def test_native_image_rejects_unsupported_controls_and_multiple_sources(
+    api: tuple[TestClient, RecordingCoordinator]
+) -> None:
     client, coordinator = api
     for options in ({"n": 2}, {"width": 0, "height": 1024}, {"mask": "mask.png"}):
         response = client.post(
@@ -387,11 +502,16 @@ def test_native_image_rejects_unsupported_controls_and_multiple_sources(api):
     ],
 )
 def test_native_image_pipeline_errors(
-    api, monkeypatch, editing, client_error, message, status
-):
+    api: tuple[TestClient, RecordingCoordinator],
+    monkeypatch: pytest.MonkeyPatch,
+    editing: bool,
+    client_error: bool,
+    message: str,
+    status: int,
+) -> None:
     client, coordinator = api
 
-    async def submit(request_id, request):
+    async def submit(request_id: str, request: GenerateRequest) -> NoReturn:
         if client_error:
             raise ClientError(message)
         else:

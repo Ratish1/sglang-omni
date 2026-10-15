@@ -93,8 +93,8 @@ retention. T2I accepts either `size` or paired `width`/`height`, defaulting to
 1024x1024. Unsupported native sampling controls are rejected rather than ignored.
 The old chat image-generation entrypoint remains available for existing clients.
 
-Only `mode: "normal"` is supported; thinking and interleaved generation are
-not part of this pipeline.
+Only `mode: "normal"` is supported. Thinking and interleaved generation are
+incoming features and are not supported by this pipeline yet.
 
 The server selects a patch-aligned source grid near a 512x512 pixel budget,
 then resizes proportionally and center-crops the image to that grid. Small
@@ -222,4 +222,5 @@ The table below lists all parameters accepted by the `/v1/chat/completions` endp
 ## Known Limitations
 
 - Image generation and editing return one image per non-streaming request.
-- Thinking mode and interleaved generation are not supported.
+- Thinking mode and interleaved generation are incoming features and are not
+  supported by this pipeline yet.

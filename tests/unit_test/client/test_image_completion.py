@@ -4,29 +4,68 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import AsyncIterator
+from typing import TypedDict
 
 import pytest
 
 from sglang_omni.client import Client, ClientError
-from sglang_omni.client.types import GenerateChunk, GenerateRequest
+from sglang_omni.client.types import (
+    CompletionStreamChunk,
+    GenerateChunk,
+    GenerateRequest,
+)
+from sglang_omni.proto import CompleteMessage, StreamMessage
+
+
+class DecodePayload(TypedDict, total=False):
+    text: str
+    token_ids: list[int]
+    logprobs: list[float]
+    output_token_logprobs: list[list[float | int]]
+    omni_rollout: dict[str, int | list[str]]
+    weight_version: str
+    finish_reason: str
+    language: str
+    stage_id: int
+    stage_name: str
+    usage: dict[str, int | float]
+    engine_time_s: float
+    image: str
+
+
+class ImageDecodePayload(TypedDict, total=False):
+    image: str | None
+
+
+class MergedResult(TypedDict, total=False):
+    decode: DecodePayload
+    image_decode: ImageDecodePayload | None
+
+
+CoordinatorResult = GenerateChunk | DecodePayload | MergedResult | None
 
 
 class RecordingCoordinator:
-    def __init__(self, result):
+    def __init__(self, result: CoordinatorResult) -> None:
         self.result = result
-        self.requests = []
+        self.requests: list[GenerateRequest] = []
 
-    async def submit(self, request_id, request):
+    async def submit(
+        self, request_id: str, request: GenerateRequest
+    ) -> CoordinatorResult:
         self.requests.append(request)
         return self.result
 
-    async def stream(self, request_id, request):
+    async def stream(
+        self, request_id: str, request: GenerateRequest
+    ) -> AsyncIterator[CompleteMessage | StreamMessage]:
         raise AssertionError("Image requests must not reach coordinator.stream")
         yield
 
 
 @pytest.mark.parametrize("merged", [False, True])
-def test_image_result_preserves_decode_fields(merged):
+def test_image_result_preserves_decode_fields(merged: bool) -> None:
     decode = {
         "text": "A red square",
         "token_ids": [11, 12],
@@ -74,7 +113,9 @@ def test_image_result_preserves_decode_fields(merged):
 
 
 @pytest.mark.parametrize("image_result", [None, {}, {"image": None}])
-def test_empty_image_terminal_preserves_text(image_result):
+def test_empty_image_terminal_preserves_text(
+    image_result: ImageDecodePayload | None,
+) -> None:
     chunk = Client.default_result_builder(
         "r1", {"decode": {"text": "No image"}, "image_decode": image_result}
     )
@@ -95,7 +136,9 @@ def test_custom_image_chunk_completes() -> None:
 
 @pytest.mark.parametrize("audio_stage", ["code2wav", "talker", "talker_stream"])
 @pytest.mark.parametrize("with_decode_usage", [False, True])
-def test_merged_audio_keeps_usage_fallback(audio_stage, with_decode_usage):
+def test_merged_audio_keeps_usage_fallback(
+    audio_stage: str, with_decode_usage: bool
+) -> None:
     decode = {"text": "hello", "language": "English"}
     if with_decode_usage:
         decode["usage"] = {"prompt_tokens": 3, "completion_tokens": 2}
@@ -119,30 +162,56 @@ def test_merged_audio_keeps_usage_fallback(audio_stage, with_decode_usage):
     assert chunk.usage.total_tokens == (5 if with_decode_usage else 10)
 
 
+def test_client_rejects_image_generation_without_image_modality() -> None:
+    coordinator = RecordingCoordinator(None)
+    client = Client(coordinator)
+    with pytest.raises(ClientError, match="requires output_modalities"):
+        asyncio.run(
+            client.completion(
+                GenerateRequest(
+                    prompt="draw", metadata={"image_generation": {}}, stream=False
+                ),
+                request_id="r1",
+            )
+        )
+    assert coordinator.requests == []
+
+
 @pytest.mark.parametrize(
-    "kwargs",
+    "request",
     [
-        {"metadata": {"image_generation": {}}},
-        {"output_modalities": ["image"]},
-        {"metadata": {"output_modalities": ["image"]}},
+        GenerateRequest(prompt="draw", output_modalities=["image"]),
+        GenerateRequest(
+            prompt="draw",
+            output_modalities=["image"],
+            metadata={"image_generation": {}},
+        ),
     ],
 )
-def test_client_rejects_image_stream_before_dispatch(kwargs):
+def test_client_rejects_image_stream_before_dispatch(request: GenerateRequest) -> None:
     coordinator = RecordingCoordinator(None)
     client = Client(coordinator)
     with pytest.raises(ClientError, match="does not support streaming"):
         asyncio.run(
-            client.completion(GenerateRequest(prompt="draw", **kwargs), request_id="r1")
+            client.completion(
+                request.__class__(
+                    prompt=request.prompt,
+                    output_modalities=request.output_modalities,
+                    metadata=request.metadata,
+                    stream=True,
+                ),
+                request_id="r1",
+            )
         )
     assert coordinator.requests == []
 
 
 @pytest.mark.parametrize("stream", [False, True])
-def test_completion_stream_never_silently_discards_image_output(stream):
+def test_completion_stream_never_silently_discards_image_output(stream: bool) -> None:
     coordinator = RecordingCoordinator({"image": "cG5n"})
     client = Client(coordinator)
 
-    async def consume():
+    async def consume() -> list[CompletionStreamChunk]:
         return [
             chunk
             async for chunk in client.completion_stream(
