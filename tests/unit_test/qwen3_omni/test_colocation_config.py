@@ -217,7 +217,9 @@ def test_factory_kwargs_follow_whether_code2wav_shares_the_talker_process() -> N
     assert sharing_flags(colocated) == (False, False)
 
 
-def test_code2wav_keeps_a_codec_state_slot_per_stream_the_talkers_run() -> None:
+def test_code2wav_keeps_a_codec_state_slot_per_stream_the_talkers_run(
+    monkeypatch,
+) -> None:
     config = Qwen3OmniSpeechPipelineConfig(model_path="dummy")
 
     def slots() -> int:
@@ -225,10 +227,13 @@ def test_code2wav_keeps_a_codec_state_slot_per_stream_the_talkers_run() -> None:
             "codec_state_slots"
         ]
 
+    monkeypatch.setattr(current_platform, "enable_code2wav_incremental", lambda: True)
     assert slots() == 32
     make_stage(config, "talker_ar").engine.max_running_requests = 24
     config.processes["talker_ar"] = ProcessConfig(num_replicas=2)
     assert slots() == 48
+    monkeypatch.setattr(current_platform, "enable_code2wav_incremental", lambda: False)
+    assert slots() == 0
 
 
 @pytest.mark.parametrize(

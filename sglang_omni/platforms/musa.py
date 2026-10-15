@@ -36,6 +36,9 @@ class MUSAOmniPlatform(CUDAOmniPlatform):
     def enable_codec_decode_graph(self) -> bool:
         return False
 
+    def enable_code2wav_incremental(self) -> bool:
+        return False
+
     def apply_model_worker_backend_policy(
         self,
         server_args: ServerArgs,

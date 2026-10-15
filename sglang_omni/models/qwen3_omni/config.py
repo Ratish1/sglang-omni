@@ -475,15 +475,21 @@ class Qwen3OmniSpeechPipelineConfig(Qwen3OmniBasePipelineConfig):
                 talker.engine.overrides() if talker.engine is not None else {}
             )
             talker_process = self.processes.get(talker.process, ProcessConfig())
+            if current_platform.enable_code2wav_incremental():
+                codec_state_slots = (
+                    int(
+                        engine_overrides.get(
+                            "max_running_requests", TALKER_MAX_RUNNING_REQUESTS
+                        )
+                    )
+                    * talker_process.num_replicas
+                )
+            else:
+                codec_state_slots = 0
             return {
                 "enable_cuda_graph": current_platform.enable_code2wav_graph(),
                 "talker_in_process": code2wav_shares_talker_process,
-                "codec_state_slots": int(
-                    engine_overrides.get(
-                        "max_running_requests", TALKER_MAX_RUNNING_REQUESTS
-                    )
-                )
-                * talker_process.num_replicas,
+                "codec_state_slots": codec_state_slots,
             }
         else:
             pass
