@@ -1309,3 +1309,101 @@ def test_channels_last_incremental_code2wav_matches_the_whole_forward(
         actual = decode_in_parts(decoder, codes, (4, 6, 7), torch.device("cuda"))
 
     torch.testing.assert_close(actual, expected, rtol=2e-4, atol=2e-5)
+
+
+def make_incremental_scheduler(
+    model: Qwen3OmniCode2Wav, codec_state_slots: int
+) -> Code2WavScheduler:
+    decoder = Code2WavIncrementalDecoder(model)
+    return Code2WavScheduler(
+        model,
+        device="cpu",
+        stream_chunk_size=3,
+        left_context_size=2,
+        sample_rate=24000,
+        incremental_decoder=decoder,
+        codec_arena=CodecStateArena(
+            decoder,
+            num_slots=codec_state_slots,
+            device=torch.device("cpu"),
+            dtype=torch.float32,
+        ),
+    )
+
+
+def run_streams(scheduler: Code2WavScheduler, codes: torch.Tensor) -> list[np.ndarray]:
+    request_ids = [f"req-{index}" for index in range(int(codes.shape[0]))]
+    for request_id in request_ids:
+        scheduler.stream_payloads[request_id] = make_qwen_payload(request_id=request_id)
+    for frame in range(int(codes.shape[-1])):
+        for request_id, request_codes in zip(request_ids, codes):
+            deliver_code2wav_chunk(
+                scheduler,
+                request_id,
+                StreamItem(
+                    frame,
+                    request_codes[:, frame].clone(),
+                    "talker",
+                    metadata={"stream": False},
+                ),
+            )
+    waveforms = []
+    for request_id in request_ids:
+        scheduler.handle_stream_done(request_id)
+        result = scheduler.outbox.get_nowait()
+        waveforms.append(
+            np.frombuffer(result.data.data["audio_waveform"], dtype=np.float32)
+        )
+    return waveforms
+
+
+def test_scheduler_decodes_from_codec_state_as_the_whole_forward() -> None:
+    model = make_tiny_code2wav("cpu", torch.float32)
+    scheduler = make_incremental_scheduler(model, codec_state_slots=2)
+    codes = torch.randint(0, 16, (2, 2, 11))
+
+    waveforms = run_streams(scheduler, codes)
+
+    with torch.inference_mode():
+        expected = model(codes).reshape(2, -1).numpy()
+    for waveform, wanted in zip(waveforms, expected):
+        np.testing.assert_allclose(waveform, wanted, rtol=2e-5, atol=2e-6)
+    assert scheduler.stateless_fallbacks == 0
+    assert scheduler.codec_arena.active_slots() == 0
+
+
+def test_a_stream_without_a_free_codec_slot_decodes_with_left_context() -> None:
+    model = make_tiny_code2wav("cpu", torch.float32)
+    scheduler = make_incremental_scheduler(model, codec_state_slots=1)
+    codes = torch.randint(0, 16, (2, 2, 7))
+
+    waveforms = run_streams(scheduler, codes)
+
+    with torch.inference_mode():
+        expected = model(codes[:1]).reshape(-1).numpy()
+    np.testing.assert_allclose(waveforms[0], expected, rtol=2e-5, atol=2e-6)
+    assert waveforms[1].shape == expected.shape
+    assert scheduler.stateless_fallbacks == 1
+    assert scheduler.codec_arena.active_slots() == 0
+
+
+def test_abort_returns_the_codec_slot() -> None:
+    model = make_tiny_code2wav("cpu", torch.float32)
+    scheduler = make_incremental_scheduler(model, codec_state_slots=1)
+    scheduler.stream_payloads["req-0"] = make_qwen_payload(request_id="req-0")
+    for frame in range(3):
+        deliver_code2wav_chunk(
+            scheduler,
+            "req-0",
+            StreamItem(
+                frame,
+                torch.randint(0, 16, (2,)),
+                "talker",
+                metadata={"stream": False},
+            ),
+        )
+    assert scheduler.codec_arena.active_slots() == 1
+
+    scheduler.abort("req-0")
+
+    assert scheduler.codec_arena.active_slots() == 0
