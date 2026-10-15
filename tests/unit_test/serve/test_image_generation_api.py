@@ -3,19 +3,28 @@
 
 from __future__ import annotations
 
+import asyncio
+import json
 import subprocess
 import sys
+from contextlib import suppress
+from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
 from pydantic import ValidationError
+from starlette.types import Message as ASGIMessage
 
 from sglang_omni.admission import QueueFullError
 from sglang_omni.client import Client
 from sglang_omni.client.types import ClientError
+from sglang_omni.models.llada2_uni.components.image_decoder import LLaDA2ImageDecoder
+from sglang_omni.pipeline.coordinator import Coordinator
+from sglang_omni.proto.messages import AbortMessage, SubmitMessage
 from sglang_omni.serve import create_app
 from sglang_omni.serve.openai_api import build_chat_generate_request
 from sglang_omni.serve.protocol import ChatCompletionRequest, ImageGenerationParams
+from tests.unit_test.fixtures.pipeline_fakes import RecordingCoordinatorControlPlane
 
 
 class RecordingCoordinator:
@@ -408,3 +417,179 @@ def test_native_image_pipeline_errors(
         response = client.post("/v1/images/generations", json={"prompt": "Draw"})
     assert response.status_code == status
     assert response.json()["detail"] == message
+
+
+class ReviewControlPlane(RecordingCoordinatorControlPlane):
+    def __init__(self) -> None:
+        super().__init__()
+        self.admitted = asyncio.Event()
+        self.aborted = asyncio.Event()
+
+    async def submit_to_stage(
+        self, stage: str, endpoint: str, message: SubmitMessage
+    ) -> None:
+        await super().submit_to_stage(stage, endpoint, message)
+        self.admitted.set()
+
+    async def broadcast_abort(self, message: AbortMessage) -> None:
+        await super().broadcast_abort(message)
+        self.aborted.set()
+
+
+@pytest.mark.parametrize("route", ["generations", "edits", "chat"])
+def test_review_disconnect_releases_real_coordinator(route: str) -> None:
+    """A closed HTTP client must release the generation slot before work completes."""
+
+    async def exercise() -> None:
+        coordinator = Coordinator(
+            "inproc://review-complete",
+            "inproc://review-abort",
+            entry_stage="preprocessing",
+            max_in_flight=1,
+        )
+        coordinator.control_plane.close()
+        control_plane = ReviewControlPlane()
+        coordinator.control_plane = control_plane
+        coordinator.register_stage("preprocessing", "inproc://review-stage")
+        app = create_app(
+            Client(coordinator), model_name="llada2-uni", supports_image_api=True
+        )
+        disconnect = asyncio.Event()
+        receive_count = 0
+        if route == "edits":
+            path = "/v1/images/edits"
+            content_type = b"multipart/form-data; boundary=review"
+            body = (
+                b'--review\r\nContent-Disposition: form-data; name="prompt"\r\n\r\n'
+                b"Make it red\r\n--review\r\nContent-Disposition: form-data; "
+                b'name="url"\r\n\r\ndata:image/png;base64,cG5n\r\n--review--\r\n'
+            )
+        else:
+            path = (
+                "/v1/chat/completions" if route == "chat" else "/v1/images/generations"
+            )
+            content_type = b"application/json"
+            payload = (
+                {"messages": [{"role": "user", "content": "Draw"}]}
+                if route == "chat"
+                else {"prompt": "Draw"}
+            )
+            body = json.dumps(payload).encode()
+
+        async def receive() -> ASGIMessage:
+            nonlocal receive_count
+            receive_count += 1
+            if receive_count == 1:
+                return {"type": "http.request", "body": body, "more_body": False}
+            else:
+                await disconnect.wait()
+                return {"type": "http.disconnect"}
+
+        async def send(message: ASGIMessage) -> None:
+            pass
+
+        scope = {
+            "type": "http",
+            "asgi": {"version": "3.0", "spec_version": "2.3"},
+            "http_version": "1.1",
+            "method": "POST",
+            "scheme": "http",
+            "path": path,
+            "raw_path": path.encode(),
+            "query_string": b"",
+            "root_path": "",
+            "headers": [(b"content-type", content_type)],
+            "client": ("127.0.0.1", 1234),
+            "server": ("127.0.0.1", 8000),
+        }
+        request_task = asyncio.create_task(app(scope, receive, send))
+        try:
+            await asyncio.wait_for(control_plane.admitted.wait(), timeout=10)
+            disconnect.set()
+            if route == "chat":
+                await asyncio.wait_for(control_plane.aborted.wait(), timeout=10)
+                await asyncio.wait_for(request_task, timeout=10)
+            else:
+                # The admitted handler is suspended on its real completion future.
+                await asyncio.sleep(0)
+            retained = len(coordinator.requests)
+            abort_count = len(control_plane.aborts)
+            print(
+                f"REVIEW disconnect route={route} retained={retained} "
+                f"aborts={abort_count} receive_count={receive_count}"
+            )
+            if retained:
+                with pytest.raises(QueueFullError):
+                    await coordinator.submit_request("next-request", {})
+            else:
+                pass
+        finally:
+            request_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await request_task
+            await coordinator.stop()
+        assert retained == 0
+        assert abort_count == 1
+
+    asyncio.run(exercise())
+
+
+def test_review_image_config_returns_generated_image(api) -> None:
+    """Selecting generation without modalities must not discard the PNG."""
+    client, coordinator = api
+    response = client.post(
+        "/v1/chat/completions",
+        json={
+            "messages": [{"role": "user", "content": "Draw"}],
+            "image_generation": {},
+        },
+    )
+    print(f"REVIEW config-only status={response.status_code} body={response.text}")
+    assert response.status_code == 200
+    assert response.json()["choices"][0]["message"]["image"]["data"] == "cG5n"
+
+
+def test_review_missing_requested_image_is_not_success(api, monkeypatch) -> None:
+    """A missing image cannot become a successful image completion with text."""
+    client, coordinator = api
+
+    async def text_only(request_id: str, request) -> dict[str, str]:
+        return {"text": "Text without an image"}
+
+    monkeypatch.setattr(coordinator, "submit", text_only)
+    response = client.post(
+        "/v1/chat/completions",
+        json={
+            "messages": [{"role": "user", "content": "Draw"}],
+            "modalities": ["image"],
+        },
+    )
+    print(f"REVIEW no-image status={response.status_code} body={response.text}")
+    assert response.status_code == 500
+
+
+def test_review_normal_one_step_is_rejected_before_dispatch(
+    api, monkeypatch, tmp_path: Path
+) -> None:
+    """The HTTP boundary must apply the decoder's actual normal-mode step floor."""
+    client, coordinator = api
+    decoder = LLaDA2ImageDecoder(str(tmp_path), device="cpu")
+
+    async def decode(request_id: str, request) -> dict[str, str]:
+        coordinator.requests.append(request)
+        decoder.decode(
+            [1], 1, 1, num_steps=request.metadata["image_generation"]["decoder_steps"]
+        )
+        raise AssertionError("The invalid step count must never load weights")
+
+    monkeypatch.setattr(coordinator, "submit", decode)
+    response = client.post(
+        "/v1/images/generations",
+        json={"prompt": "Draw", "decode_mode": "normal", "num_inference_steps": 1},
+    )
+    print(
+        f"REVIEW normal-one-step dispatched={len(coordinator.requests)} "
+        f"status={response.status_code} body={response.text}"
+    )
+    assert response.status_code == 400
+    assert coordinator.requests == []
