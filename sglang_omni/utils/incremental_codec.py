@@ -23,9 +23,11 @@ class CausalConv(Protocol):
 
 
 class CausalTransConv(Protocol):
-    """A causal transposed conv: the conv and the samples it trims on the right."""
+    """A causal transposed conv: the conv and the samples its whole-sequence forward trims
+    from the start and the end."""
 
     conv: torch.nn.ConvTranspose1d
+    left_pad: int
     right_pad: int
 
 
@@ -210,7 +212,13 @@ def incremental_causal_transconv1d(
     hidden_states: torch.Tensor,
     state: IncrementalCodecState,
     key: str,
+    *,
+    left_trim: int = 0,
 ) -> torch.Tensor:
+    """The transposed conv of new frames: the previous decode's overlap is added in, the
+    samples the next frames still add to are kept as the new overlap, and left_trim samples
+    are dropped from the front, as the whole-sequence forward drops them once at its start.
+    """
     conv = module.conv
     stride = int(conv.stride[0])
     right_pad = int(module.right_pad)
@@ -238,7 +246,7 @@ def incremental_causal_transconv1d(
         pass
 
     emit_length = int(hidden_states.shape[-1]) * stride
-    emitted = output[..., :emit_length]
+    emitted = output[..., left_trim:emit_length]
     tail = output[..., emit_length:]
     if int(tail.shape[-1]) != right_pad:
         raise RuntimeError(
@@ -305,6 +313,8 @@ def channels_last_causal_transconv1d(
     hidden_states: torch.Tensor,
     state: IncrementalCodecState,
     key: str,
+    *,
+    left_trim: int = 0,
 ) -> torch.Tensor:
     """incremental_causal_transconv1d of a (B, L, C) activation with its channels-last
     weight; the overlap keeps its (B, C, overlap) layout."""
@@ -325,7 +335,7 @@ def channels_last_causal_transconv1d(
         pass
 
     emit_length = int(hidden_states.shape[1]) * stride
-    emitted = output[:, :emit_length]
+    emitted = output[:, left_trim:emit_length]
     tail = output[:, emit_length:]
     if int(tail.shape[1]) != right_pad:
         raise RuntimeError(
@@ -364,12 +374,21 @@ def causal_transconv1d(
     state: IncrementalCodecState,
     key: str,
     channels_last_weights: dict[str, torch.Tensor] | None,
+    *,
+    left_trim: int,
 ) -> torch.Tensor:
     if channels_last_weights is None:
-        return incremental_causal_transconv1d(module, hidden_states, state, key)
+        return incremental_causal_transconv1d(
+            module, hidden_states, state, key, left_trim=left_trim
+        )
     else:
         return channels_last_causal_transconv1d(
-            module, channels_last_weights[key], hidden_states, state, key
+            module,
+            channels_last_weights[key],
+            hidden_states,
+            state,
+            key,
+            left_trim=left_trim,
         )
 
 
@@ -444,3 +463,356 @@ def incremental_residual_unit(
         module.conv2, hidden_states, state, f"{key}.conv2", channels_last_weights
     )
     return hidden_states + residual
+
+
+class DecoderAttention(Protocol):
+    head_dim: int
+    num_key_value_groups: int
+    scaling: float
+    sliding_window: int
+    q_proj: torch.nn.Linear
+    k_proj: torch.nn.Linear
+    v_proj: torch.nn.Linear
+    o_proj: torch.nn.Linear
+    q_norm: torch.nn.Module
+    k_norm: torch.nn.Module
+
+
+class DecoderTransformerLayer(Protocol):
+    input_layernorm: torch.nn.Module
+    self_attn: DecoderAttention
+    self_attn_layer_scale: torch.nn.Module
+    post_attention_layernorm: torch.nn.Module
+    mlp: torch.nn.Module
+    mlp_layer_scale: torch.nn.Module
+
+
+class DecoderTransformer(Protocol):
+    layers: torch.nn.ModuleList
+    rotary_emb: torch.nn.Module
+    window_size: int
+
+
+class CodecConvStack(Protocol):
+    """The conv stack after the transformer: upsample stages of a transposed conv and a
+    ConvNeXt block, then decoder.0, decoder blocks (activation, transposed conv, residual
+    units), a final activation and a final conv."""
+
+    upsample: torch.nn.ModuleList
+    decoder: torch.nn.ModuleList
+
+
+def apply_rotary_pos_emb(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    cos = cos.unsqueeze(1)
+    sin = sin.unsqueeze(1)
+
+    def rotate_half(value: torch.Tensor) -> torch.Tensor:
+        first, second = value.chunk(2, dim=-1)
+        return torch.cat((-second, first), dim=-1)
+
+    return (
+        query * cos + rotate_half(query) * sin,
+        key * cos + rotate_half(key) * sin,
+    )
+
+
+def repeat_kv(hidden_states: torch.Tensor, groups: int) -> torch.Tensor:
+    if groups == 1:
+        return hidden_states
+    else:
+        pass
+    batch, heads, length, head_dim = hidden_states.shape
+    hidden_states = hidden_states[:, :, None, :, :].expand(
+        batch, heads, groups, length, head_dim
+    )
+    return hidden_states.reshape(batch, heads * groups, length, head_dim)
+
+
+def incremental_attention(
+    attention: DecoderAttention,
+    hidden_states: torch.Tensor,
+    position_embeddings: tuple[torch.Tensor, torch.Tensor],
+    state: IncrementalCodecState,
+    layer_index: int,
+    key_positions: torch.Tensor,
+    query_positions: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    input_shape = hidden_states.shape[:-1]
+    head_dim = int(attention.head_dim)
+    query = attention.q_norm(attention.q_proj(hidden_states)).view(
+        *input_shape, -1, head_dim
+    )
+    key = attention.k_norm(attention.k_proj(hidden_states)).view(
+        *input_shape, -1, head_dim
+    )
+    value = attention.v_proj(hidden_states).view(*input_shape, -1, head_dim)
+    query = query.transpose(1, 2)
+    key = key.transpose(1, 2)
+    value = value.transpose(1, 2)
+    query, key = apply_rotary_pos_emb(
+        query, key, position_embeddings[0], position_embeddings[1]
+    )
+
+    prior_key = state.transformer_keys.get(layer_index)
+    prior_value = state.transformer_values.get(layer_index)
+    if (prior_key is None) != (prior_value is None):
+        raise RuntimeError(f"incomplete transformer state for layer {layer_index}")
+    else:
+        pass
+    if prior_key is not None:
+        key = torch.cat((prior_key, key), dim=-2)
+        value = torch.cat((prior_value, value), dim=-2)
+    else:
+        pass
+
+    if int(key.shape[-2]) != int(key_positions.shape[-1]):
+        raise RuntimeError(
+            f"incremental transformer state length {int(key.shape[-2])} does not "
+            f"match {int(key_positions.shape[-1])} key positions"
+        )
+    else:
+        pass
+    repeated_key = repeat_kv(key, int(attention.num_key_value_groups))
+    repeated_value = repeat_kv(value, int(attention.num_key_value_groups))
+    scores = torch.matmul(query, repeated_key.transpose(2, 3)) * float(
+        attention.scaling
+    )
+    keys_by_row = key_positions.unsqueeze(1)
+    queries_by_row = query_positions.unsqueeze(2)
+    allowed = keys_by_row <= queries_by_row
+    sliding_window = int(attention.sliding_window)
+    if sliding_window > 0:
+        allowed &= keys_by_row > (queries_by_row - sliding_window)
+    else:
+        pass
+    # Note (Qihao Liu): a right-aligned K/V buffer that a stream has not filled
+    # yet holds zeros whose nominal absolute position is negative. Those slots
+    # would otherwise satisfy both tests above for an early query, so mask them
+    # explicitly. This is what lets a cold and a warm stream share one cohort.
+    allowed &= (key_positions >= 0).unsqueeze(1)
+    scores = scores.masked_fill(
+        ~allowed.unsqueeze(1),
+        torch.finfo(scores.dtype).min,
+    )
+    probabilities = F.softmax(scores, dim=-1, dtype=torch.float32).to(query.dtype)
+    output = torch.matmul(probabilities, repeated_value)
+    output = output.transpose(1, 2).reshape(*input_shape, -1).contiguous()
+    return attention.o_proj(output), key, value
+
+
+def incremental_transformer_layers(
+    transformer: DecoderTransformer,
+    hidden_states: torch.Tensor,
+    state: IncrementalCodecState,
+    valid_frames: torch.Tensor | None,
+) -> torch.Tensor:
+    """The transformer's layers over the new frames, attending to the K/V the state retains;
+    returns the hidden states before the final norm and keeps the newest K/V."""
+    batch_size = int(hidden_states.shape[0])
+    fresh_frames = int(hidden_states.shape[1])
+    device = hidden_states.device
+    frame_positions = state.row_frame_positions(batch_size, device)
+    # Note (Qihao Liu): the retained buffer is right-aligned: slot j of a buffer
+    # of length P holds absolute position frame_position - P + j. Deriving P
+    # from the buffer rather than from transformer_context_length keeps this
+    # correct when an arena hands over a full-width buffer that a cold stream
+    # has not filled.
+    prior_key = state.transformer_keys.get(0)
+    prior_length = 0 if prior_key is None else int(prior_key.shape[-2])
+    key_offsets = torch.arange(
+        -prior_length, fresh_frames, device=device, dtype=torch.long
+    )
+    query_offsets = torch.arange(fresh_frames, device=device, dtype=torch.long)
+    key_positions = frame_positions.unsqueeze(1) + key_offsets.unsqueeze(0)
+    query_positions = frame_positions.unsqueeze(1) + query_offsets.unsqueeze(0)
+    position_embeddings = transformer.rotary_emb(hidden_states, query_positions)
+
+    next_keys: dict[int, torch.Tensor] = {}
+    next_values: dict[int, torch.Tensor] = {}
+    window_size = int(transformer.window_size)
+    retained_context = max(0, window_size - 1)
+    for layer_index, layer in enumerate(transformer.layers):
+        residual = hidden_states
+        normalized = layer.input_layernorm(hidden_states)
+        attended, key, value = incremental_attention(
+            layer.self_attn,
+            normalized,
+            position_embeddings,
+            state,
+            layer_index,
+            key_positions,
+            query_positions,
+        )
+        hidden_states = residual + layer.self_attn_layer_scale(attended)
+        residual = hidden_states
+        hidden_states = layer.post_attention_layernorm(hidden_states)
+        hidden_states = layer.mlp(hidden_states)
+        hidden_states = residual + layer.mlp_layer_scale(hidden_states)
+        if valid_frames is not None:
+            retained_end = prior_length + valid_frames
+            next_keys[layer_index] = frames_ending_at(
+                key, retained_end, retained_context, -2
+            )
+            next_values[layer_index] = frames_ending_at(
+                value, retained_end, retained_context, -2
+            )
+        else:
+            next_keys[layer_index] = (
+                key[..., -retained_context:, :].clone()
+                if retained_context
+                else key[..., :0, :].clone()
+            )
+            next_values[layer_index] = (
+                value[..., -retained_context:, :].clone()
+                if retained_context
+                else value[..., :0, :].clone()
+            )
+
+    state.transformer_keys = next_keys
+    state.transformer_values = next_values
+    return hidden_states
+
+
+def conv_stack_state_layout(
+    codec: CodecConvStack,
+) -> tuple[list[tuple[str, int, int]], list[tuple[str, int, int]]]:
+    """The conv stack's (key, channels, length) conv histories and transposed-conv overlaps,
+    in the order incremental_conv_stack visits them."""
+    conv: list[tuple[str, int, int]] = []
+    transconv: list[tuple[str, int, int]] = []
+
+    def add_conv(module: CausalConv, key: str) -> None:
+        conv.append((key, int(module.conv.in_channels), int(module.padding)))
+
+    def add_transconv(module: CausalTransConv, key: str) -> None:
+        transconv.append((key, int(module.conv.out_channels), int(module.right_pad)))
+
+    for stage_index, blocks in enumerate(codec.upsample):
+        add_transconv(blocks[0], f"upsample.{stage_index}.transconv")
+        add_conv(blocks[1].dwconv, f"upsample.{stage_index}.convnext.dwconv")
+    add_conv(codec.decoder[0], "decoder.0")
+    for block_index, decoder_block in enumerate(codec.decoder[1:-2], start=1):
+        add_transconv(decoder_block.block[1], f"decoder.{block_index}.transconv")
+        for residual_index, residual in enumerate(decoder_block.block[2:]):
+            key = f"decoder.{block_index}.residual.{residual_index}"
+            add_conv(residual.conv1, f"{key}.conv1")
+            add_conv(residual.conv2, f"{key}.conv2")
+    add_conv(codec.decoder[-1], "decoder.final")
+    return conv, transconv
+
+
+def init_incremental_state(
+    spec: IncrementalCodecStateSpec,
+    batch_size: int,
+    *,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> IncrementalCodecState:
+    """Allocate a zeroed state with full-width buffers.
+
+    Note (Qihao Liu): unlike the lazily grown state, the Transformer K/V
+    buffers start at their retained width. A stream that has not filled
+    them yet reads zeros at negative nominal positions, which
+    incremental_attention masks out, so a cold and a warm stream share
+    one execution shape.
+    """
+    state = IncrementalCodecState(
+        frame_positions=torch.zeros(batch_size, device=device, dtype=torch.long),
+        transformer_context_length=spec.retained_context,
+    )
+    for key, channels, length in spec.conv_histories:
+        state.conv_histories[key] = torch.zeros(
+            batch_size, channels, length, device=device, dtype=dtype
+        )
+    for key, channels, length in spec.transconv_overlaps:
+        state.transconv_overlaps[key] = torch.zeros(
+            batch_size, channels, length, device=device, dtype=dtype
+        )
+    for layer_index in range(spec.num_layers):
+        shape = (
+            batch_size,
+            spec.num_key_value_heads,
+            spec.retained_context,
+            spec.head_dim,
+        )
+        state.transformer_keys[layer_index] = torch.zeros(
+            shape, device=device, dtype=dtype
+        )
+        state.transformer_values[layer_index] = torch.zeros(
+            shape, device=device, dtype=dtype
+        )
+    return state
+
+
+def incremental_conv_stack(
+    codec: CodecConvStack,
+    hidden_states: torch.Tensor,
+    state: IncrementalCodecState,
+    channels_last_weights: dict[str, torch.Tensor] | None,
+    *,
+    first_decode: bool,
+) -> torch.Tensor:
+    """Everything after the transformer, from its outputs to the clamped waveform; a stream's
+    first decode drops each transposed conv's left pad, as the whole-sequence forward does.
+    """
+    is_channels_last = channels_last_weights is not None
+    for stage_index, blocks in enumerate(codec.upsample):
+        hidden_states = causal_transconv1d(
+            blocks[0],
+            hidden_states,
+            state,
+            f"upsample.{stage_index}.transconv",
+            channels_last_weights,
+            left_trim=int(blocks[0].left_pad) if first_decode else 0,
+        )
+        hidden_states = incremental_convnext(
+            blocks[1],
+            hidden_states,
+            state,
+            f"upsample.{stage_index}.convnext",
+            is_channels_last,
+        )
+
+    waveform = causal_conv1d(
+        codec.decoder[0],
+        hidden_states,
+        state,
+        "decoder.0",
+        channels_last_weights,
+    )
+    for block_index, decoder_block in enumerate(codec.decoder[1:-2], start=1):
+        waveform = apply_activation(decoder_block.block[0], waveform, is_channels_last)
+        waveform = causal_transconv1d(
+            decoder_block.block[1],
+            waveform,
+            state,
+            f"decoder.{block_index}.transconv",
+            channels_last_weights,
+            left_trim=int(decoder_block.block[1].left_pad) if first_decode else 0,
+        )
+        for residual_index, residual_unit in enumerate(decoder_block.block[2:]):
+            waveform = incremental_residual_unit(
+                residual_unit,
+                waveform,
+                state,
+                f"decoder.{block_index}.residual.{residual_index}",
+                channels_last_weights,
+            )
+    waveform = apply_activation(codec.decoder[-2], waveform, is_channels_last)
+    waveform = causal_conv1d(
+        codec.decoder[-1],
+        waveform,
+        state,
+        "decoder.final",
+        channels_last_weights,
+    )
+    if is_channels_last:
+        waveform = waveform.transpose(1, 2)
+    else:
+        pass
+    return waveform.clamp(min=-1, max=1)
