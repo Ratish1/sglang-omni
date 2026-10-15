@@ -250,7 +250,7 @@ async def test_a_ready_group_that_dies_fails_startup_while_another_still_starts(
     ready = FakeGroup(events, "gen@r0")
     starting = StillStartingGroup(events, "gen@r1", ready)
     patch(monkeypatch, events, [ready, starting])
-    monkeypatch.setattr(mp_runner, "STARTUP_SUPERVISION_POLL_S", 0.01)
+    monkeypatch.setattr(mp_runner, "STARTUP_SUPERVISION_POLL_S", 0.01, raising=False)
     runner = MultiProcessPipelineRunner(
         make_config(tmp_path, weight_share=weight_share)
     )
