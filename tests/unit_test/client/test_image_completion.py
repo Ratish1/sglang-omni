@@ -178,7 +178,7 @@ def test_client_rejects_image_generation_without_image_modality() -> None:
 
 
 @pytest.mark.parametrize(
-    "request",
+    "payload",
     [
         GenerateRequest(prompt="draw", output_modalities=["image"]),
         GenerateRequest(
@@ -188,16 +188,16 @@ def test_client_rejects_image_generation_without_image_modality() -> None:
         ),
     ],
 )
-def test_client_rejects_image_stream_before_dispatch(request: GenerateRequest) -> None:
+def test_client_rejects_image_stream_before_dispatch(payload: GenerateRequest) -> None:
     coordinator = RecordingCoordinator(None)
     client = Client(coordinator)
     with pytest.raises(ClientError, match="does not support streaming"):
         asyncio.run(
             client.completion(
-                request.__class__(
-                    prompt=request.prompt,
-                    output_modalities=request.output_modalities,
-                    metadata=request.metadata,
+                payload.__class__(
+                    prompt=payload.prompt,
+                    output_modalities=payload.output_modalities,
+                    metadata=payload.metadata,
                     stream=True,
                 ),
                 request_id="r1",
