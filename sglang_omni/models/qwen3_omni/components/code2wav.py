@@ -29,6 +29,14 @@ from sglang_omni.utils.channels_last_conv import (
     channels_last_conv_transpose1d,
     channels_last_weight,
 )
+from sglang_omni.utils.incremental_codec import (
+    IncrementalCodecState,
+    IncrementalCodecStateSpec,
+    conv_stack_state_layout,
+    incremental_conv_stack,
+    incremental_transformer_layers,
+    init_incremental_state,
+)
 from sglang_omni.utils.snake_beta import FusedSnakeBeta
 
 
@@ -238,3 +246,101 @@ class Qwen3OmniCode2Wav(Qwen3OmniMoeCode2Wav):
         for block in self.decoder:
             hidden_states = channels_last_block(block, hidden_states)
         return hidden_states.transpose(1, 2).clamp(min=-1, max=1)
+
+
+class Code2WavIncrementalDecoder:
+    """Decodes a stream's new codec frames from the stream's state: a stream's frames decoded
+    in any split give the waveform Qwen3OmniCode2Wav gives on all of them at once."""
+
+    def __init__(self, model: Qwen3OmniCode2Wav) -> None:
+        pre_transformer = model.pre_transformer
+        self.model = model
+        if isinstance(pre_transformer, FusedCode2WavTransformer):
+            self.transformer = pre_transformer.transformer
+        else:
+            self.transformer = pre_transformer
+        self.total_upsample = int(model.total_upsample)
+        # note (ratish): the conv weights are already channels last in place, so the steps
+        # read the module's own weights; the depthwise ConvNeXt conv keeps its (B, C, L) path.
+        if model.is_channels_last:
+            self.channels_last_weights: dict[str, torch.Tensor] | None = {
+                "decoder.0": model.decoder[0].conv.weight,
+                "decoder.final": model.decoder[-1].conv.weight,
+            }
+            for stage_index, blocks in enumerate(model.upsample):
+                self.channels_last_weights[f"upsample.{stage_index}.transconv"] = (
+                    blocks[0].conv.weight
+                )
+            for block_index, block in enumerate(model.decoder[1:-2], start=1):
+                self.channels_last_weights[f"decoder.{block_index}.transconv"] = (
+                    block.block[1].conv.weight
+                )
+                for residual_index, residual in enumerate(block.block[2:]):
+                    key = f"decoder.{block_index}.residual.{residual_index}"
+                    self.channels_last_weights[f"{key}.conv1"] = (
+                        residual.conv1.conv.weight
+                    )
+                    self.channels_last_weights[f"{key}.conv2"] = (
+                        residual.conv2.conv.weight
+                    )
+        else:
+            self.channels_last_weights = None
+        # note (ratish): a stream's first decode drops each transposed conv's left pad once,
+        # carried to the waveform through the strides after it.
+        self.first_decode_shortfall = 0
+        stride_after = 1
+        for block in reversed(model.decoder[1:-2]):
+            transconv = block.block[1]
+            self.first_decode_shortfall += int(transconv.left_pad) * stride_after
+            stride_after *= int(transconv.conv.stride[0])
+        for blocks in reversed(model.upsample):
+            self.first_decode_shortfall += int(blocks[0].left_pad) * stride_after
+            stride_after *= int(blocks[0].conv.stride[0])
+        conv_histories, transconv_overlaps = conv_stack_state_layout(model)
+        attention = self.transformer.layers[0].self_attn
+        self.spec = IncrementalCodecStateSpec(
+            conv_histories=tuple(conv_histories),
+            transconv_overlaps=tuple(transconv_overlaps),
+            num_layers=len(self.transformer.layers),
+            num_key_value_heads=int(attention.k_proj.out_features)
+            // int(attention.head_dim),
+            head_dim=int(attention.head_dim),
+            retained_context=int(self.transformer.window_size) - 1,
+        )
+
+    def state_spec(self) -> IncrementalCodecStateSpec:
+        return self.spec
+
+    def init_state(
+        self, batch_size: int, *, device: torch.device, dtype: torch.dtype
+    ) -> IncrementalCodecState:
+        return init_incremental_state(self.spec, batch_size, device=device, dtype=dtype)
+
+    def decode(
+        self, codes: torch.Tensor, state: IncrementalCodecState, *, first_decode: bool
+    ) -> torch.Tensor:
+        """The (B, 1, samples) waveform of the (B, Q, T) codes after the frames the state
+        holds; every row of a first decode starts its stream."""
+        fresh_frames = int(codes.shape[-1])
+        hidden_states = self.model.code_embedding(codes + self.model.code_offset).mean(
+            1
+        )
+        hidden_states = self.transformer.norm(
+            incremental_transformer_layers(self.transformer, hidden_states, state, None)
+        )
+        if self.channels_last_weights is None:
+            hidden_states = hidden_states.transpose(1, 2)
+        else:
+            pass
+        waveform = incremental_conv_stack(
+            self.model,
+            hidden_states,
+            state,
+            self.channels_last_weights,
+            first_decode=first_decode,
+        )
+        assert waveform.shape[-1] == fresh_frames * self.total_upsample - (
+            self.first_decode_shortfall if first_decode else 0
+        ), "code2wav incremental decode returned the wrong sample count"
+        state.advance(fresh_frames)
+        return waveform

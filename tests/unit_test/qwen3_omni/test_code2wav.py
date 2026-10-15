@@ -16,7 +16,10 @@ from transformers.models.qwen3_omni_moe.configuration_qwen3_omni_moe import (
 
 from sglang_omni.config.schema import StageConfig
 from sglang_omni.models.qwen3_omni.components import code2wav_scheduler
-from sglang_omni.models.qwen3_omni.components.code2wav import Qwen3OmniCode2Wav
+from sglang_omni.models.qwen3_omni.components.code2wav import (
+    Code2WavIncrementalDecoder,
+    Qwen3OmniCode2Wav,
+)
 from sglang_omni.models.qwen3_omni.components.code2wav_cuda_graph import (
     Code2WavRunResult,
     GraphKey,
@@ -28,6 +31,7 @@ from sglang_omni.pipeline.stage.stream_queue import StreamItem
 from sglang_omni.platforms import current_platform
 from sglang_omni.scheduling.message import IncomingMessage
 from sglang_omni.utils import snake_beta
+from sglang_omni.utils.codec_state_arena import CodecStateArena
 from tests.unit_test.fixtures.qwen_fakes import (
     FakeCode2WavModel,
     deliver_code2wav_chunk,
@@ -1217,3 +1221,91 @@ def test_fused_code2wav_transformer_error_to_fp32_is_below_the_hf_error(
         fused_error += float((actual.float() - reference).norm() / reference.norm())
 
     assert fused_error <= 0.95 * hf_error
+
+
+def decode_in_parts(
+    decoder: Code2WavIncrementalDecoder,
+    codes: torch.Tensor,
+    parts: tuple[int, ...],
+    device: torch.device,
+) -> torch.Tensor:
+    state = decoder.init_state(int(codes.shape[0]), device=device, dtype=torch.float32)
+    waveforms = []
+    start = 0
+    for frames in parts:
+        waveforms.append(
+            decoder.decode(
+                codes[..., start : start + frames], state, first_decode=start == 0
+            )
+        )
+        start += frames
+    return torch.cat(waveforms, dim=-1)
+
+
+@pytest.mark.parametrize("parts", [(17,), (4, 6, 7), (1,) * 17, (10, 7)])
+def test_incremental_code2wav_matches_the_whole_forward(parts: tuple[int, ...]) -> None:
+    model = make_tiny_code2wav("cpu", torch.float32)
+    codes = torch.randint(0, 16, (2, 2, sum(parts)))
+    decoder = Code2WavIncrementalDecoder(model)
+
+    with torch.inference_mode():
+        expected = model(codes)
+        actual = decode_in_parts(decoder, codes, parts, torch.device("cpu"))
+
+    torch.testing.assert_close(actual, expected, rtol=2e-5, atol=2e-6)
+
+
+def test_incremental_code2wav_cohort_rows_keep_their_own_streams() -> None:
+    model = make_tiny_code2wav("cpu", torch.float32)
+    decoder = Code2WavIncrementalDecoder(model)
+    arena = CodecStateArena(
+        decoder, num_slots=2, device=torch.device("cpu"), dtype=torch.float32
+    )
+    first_frames = (5, 9)
+    codes = [torch.randint(0, 16, (1, 2, frames + 4)) for frames in first_frames]
+    slots = [arena.acquire(), arena.acquire()]
+
+    with torch.inference_mode():
+        heads = []
+        for slot, stream_codes, frames in zip(slots, codes, first_frames):
+            state = arena.gather([slot])
+            heads.append(
+                decoder.decode(stream_codes[..., :frames], state, first_decode=True)
+            )
+            arena.scatter([slot], state)
+        state = arena.gather(slots)
+        tails = decoder.decode(
+            torch.cat([stream_codes[..., -4:] for stream_codes in codes]),
+            state,
+            first_decode=False,
+        )
+        arena.scatter(slots, state)
+        expected = [model(stream_codes) for stream_codes in codes]
+
+    for row in range(2):
+        torch.testing.assert_close(
+            torch.cat((heads[row], tails[row : row + 1]), dim=-1),
+            expected[row],
+            rtol=2e-5,
+            atol=2e-6,
+        )
+
+
+@pytest.mark.accelerator
+@pytest.mark.skipif(
+    not current_platform.is_cuda(), reason="channels-last convs run on NVIDIA CUDA only"
+)
+def test_channels_last_incremental_code2wav_matches_the_whole_forward(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(torch.backends.cudnn, "allow_tf32", False)
+    model = make_tiny_code2wav("cuda", torch.float32)
+    model.use_channels_last()
+    codes = torch.randint(0, 16, (3, 2, 17), device="cuda")
+    decoder = Code2WavIncrementalDecoder(model)
+
+    with torch.inference_mode():
+        expected = model(codes)
+        actual = decode_in_parts(decoder, codes, (4, 6, 7), torch.device("cuda"))
+
+    torch.testing.assert_close(actual, expected, rtol=2e-4, atol=2e-5)
