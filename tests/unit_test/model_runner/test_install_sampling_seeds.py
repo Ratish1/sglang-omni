@@ -53,21 +53,34 @@ def test_review_unseeded_seeded_unseeded_batches_use_the_expected_draw(
     positions = torch.tensor([17, 23], device="cuda")
     sampling_info = sampling_info_for([11, 22])
 
-    sampling_info.sampling_seed = None
-    unseeded_tokens, _ = draw("flashinfer", logits, sampling_info, positions)
-    assert flashinfer_calls == [torch.float32]
-    assert unseeded_tokens[0] in (7, 9) and unseeded_tokens[1] in (11, 13)
-
-    sampling_info.sampling_seed = torch.tensor([11, 22], device="cuda")
-    seeded_tokens, _ = draw("flashinfer", logits, sampling_info, positions)
     reference_tokens, _ = draw("pytorch", logits, sampling_info, positions)
-    assert seeded_tokens == reference_tokens
-    assert flashinfer_calls == [torch.float32]
-
-    sampling_info.sampling_seed = None
-    unseeded_tokens, _ = draw("flashinfer", logits, sampling_info, positions)
-    assert flashinfer_calls == [torch.float32, torch.float32]
-    assert unseeded_tokens[0] in (7, 9) and unseeded_tokens[1] in (11, 13)
+    with (
+        get_context().override_server_args(sampling_backend="flashinfer"),
+        get_parallel().override(tp_group=SimpleNamespace(device_group=None)),
+    ):
+        sampler = create_sampler()
+        for seeds, expected_calls in ((None, 1), ([11, 22], 1), (None, 2)):
+            sampling_info.sampling_seed = (
+                None if seeds is None else torch.tensor(seeds, device="cuda")
+            )
+            token_ids = (
+                sampler(
+                    LogitsProcessorOutput(next_token_logits=logits.clone()),
+                    sampling_info,
+                    False,
+                    [0, 0],
+                    [[], []],
+                    positions,
+                )
+                .view(-1)
+                .tolist()
+            )
+            assert flashinfer_calls == [torch.float32] * expected_calls
+            assert token_ids[0] in (7, 9) and token_ids[1] in (11, 13)
+            if seeds is not None:
+                assert token_ids == reference_tokens
+            else:
+                pass
 
 
 def req(seed, request_id="req"):
