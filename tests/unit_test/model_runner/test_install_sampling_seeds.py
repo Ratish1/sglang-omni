@@ -22,6 +22,55 @@ VOCAB_SIZE = 3072
 TOP_K = 50
 
 
+@pytest.mark.accelerator
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_review_unseeded_seeded_unseeded_batches_use_the_expected_draw(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import sglang.srt.layers.sampler as sampler_module
+
+    register_flashinfer_seeded_sampler()
+    flashinfer_draw = sampler_module.top_k_top_p_sampling_from_probs
+    flashinfer_calls: list[torch.dtype] = []
+
+    def traced_flashinfer_draw(
+        probabilities: torch.Tensor,
+        top_ks: torch.Tensor,
+        top_ps: torch.Tensor,
+        *,
+        filter_apply_order: str,
+    ) -> torch.Tensor:
+        flashinfer_calls.append(probabilities.dtype)
+        return flashinfer_draw(
+            probabilities, top_ks, top_ps, filter_apply_order=filter_apply_order
+        )
+
+    monkeypatch.setattr(
+        sampler_module, "top_k_top_p_sampling_from_probs", traced_flashinfer_draw
+    )
+    logits = torch.full((2, VOCAB_SIZE), -torch.inf, device="cuda")
+    logits[0, [7, 9]] = torch.tensor([1.0, 0.0], device="cuda")
+    logits[1, [11, 13]] = torch.tensor([0.0, 1.0], device="cuda")
+    positions = torch.tensor([17, 23], device="cuda")
+    sampling_info = sampling_info_for([11, 22])
+
+    sampling_info.sampling_seed = None
+    unseeded_tokens, _ = draw("flashinfer", logits, sampling_info, positions)
+    assert flashinfer_calls == [torch.float32]
+    assert unseeded_tokens[0] in (7, 9) and unseeded_tokens[1] in (11, 13)
+
+    sampling_info.sampling_seed = torch.tensor([11, 22], device="cuda")
+    seeded_tokens, _ = draw("flashinfer", logits, sampling_info, positions)
+    reference_tokens, _ = draw("pytorch", logits, sampling_info, positions)
+    assert seeded_tokens == reference_tokens
+    assert flashinfer_calls == [torch.float32]
+
+    sampling_info.sampling_seed = None
+    unseeded_tokens, _ = draw("flashinfer", logits, sampling_info, positions)
+    assert flashinfer_calls == [torch.float32, torch.float32]
+    assert unseeded_tokens[0] in (7, 9) and unseeded_tokens[1] in (11, 13)
+
+
 def req(seed, request_id="req"):
     sp = SimpleNamespace(sampling_seed=seed)
     return SimpleNamespace(
