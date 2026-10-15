@@ -2214,14 +2214,18 @@ class Qwen3TTSTalker(Qwen3TTSPromptBuilderMixin, nn.Module):
         return attn_output
 
     def precompile_kernels_after_loading(self) -> None:
-        """Compile the seeded draw and the repetition penalty that every request's
-        default sampling reaches, on the codec head's fp32 logits."""
+        """Compile the repetition penalty every request reaches and the seeded draw a
+        request seed reaches, on the codec head's fp32 logits, and load FlashInfer's
+        sampling module when it draws the unseeded requests."""
         compile_sampler_functions(
             SamplerCompileForms(
                 device=self.codec_head.weight.device,
                 vocab_size=self.config.vocab_size,
                 seeded_log_probability_dtype=torch.float64,
                 penalized_logits_dtype=torch.float32,
+                should_load_flashinfer_sampling=(
+                    get_exec().kernel.sampling_backend == "flashinfer"
+                ),
             )
         )
 

@@ -13,6 +13,7 @@ from sglang.srt.layers.sampler import (
     multinomial_with_seed,
     top_k_top_p_min_p_sampling_from_probs_torch,
 )
+from sglang.srt.runtime_context import get_context
 from sglang.srt.sampling.penaltylib.repetition_penalty import apply_scaling_penalties
 from sglang.srt.utils import DynamicGradMode
 from torch._dynamo.utils import counters
@@ -772,9 +773,17 @@ def test_talker_precompile_leaves_the_first_prefill_samples_nothing_to_compile()
     talker.semantic_sampling_seed_tensor = torch.zeros(
         64, device="cuda", dtype=torch.long
     )
+    runner = object.__new__(Qwen3TTSModelRunner)
+    runner.model = talker
+    seeded_request = SimpleNamespace(
+        data=SimpleNamespace(
+            req=SimpleNamespace(sampling_params=SimpleNamespace(sampling_seed=7))
+        )
+    )
     torch.compiler.reset()
 
-    talker.precompile_kernels_after_loading()
+    with get_context().override_server_args(sampling_backend="flashinfer"):
+        talker.precompile_kernels_after_loading()
     compiled_graphs = counters["stats"]["unique_graphs"]
 
     with DynamicGradMode():
@@ -783,11 +792,11 @@ def test_talker_precompile_leaves_the_first_prefill_samples_nothing_to_compile()
                 mrope_positions=None,
                 forward_mode=SimpleNamespace(is_extend=lambda: True),
                 extend_seq_lens=torch.full((rows,), 2, device="cuda"),
-                sampling_info=SimpleNamespace(sampling_seed=None),
+                sampling_info=SimpleNamespace(
+                    sampling_seed=None, need_min_p_sampling=False
+                ),
             )
-            Qwen3TTSModelRunner.install_semantic_sampling_seeds(
-                SimpleNamespace(model=talker), forward_batch, [None] * rows
-            )
+            runner.install_sampling_seeds(forward_batch, [seeded_request] * rows)
             hidden_states = torch.randn(
                 2 * rows, 16, device="cuda", dtype=torch.bfloat16
             )
