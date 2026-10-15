@@ -9,7 +9,7 @@ import math
 import os
 import threading
 from collections import Counter
-from collections.abc import Callable, Generator
+from collections.abc import Callable, Generator, Sequence
 from contextlib import AbstractContextManager
 from copy import deepcopy
 from dataclasses import dataclass
@@ -18,8 +18,10 @@ from typing import Literal, TypeAlias, TypedDict
 
 import torch
 
+from sglang_omni.models.qwen3_omni.components.code2wav import Code2WavIncrementalDecoder
 from sglang_omni.platforms import current_platform
 from sglang_omni.platforms.device_graph import DeviceGraphBackend, ReplayableGraph
+from sglang_omni.utils.codec_state_arena import CodecStateArena
 
 logger = logging.getLogger(__name__)
 _MASK_SWAP_LOCK = threading.Lock()
@@ -74,10 +76,16 @@ class Code2WavGraphStats(TypedDict):
 
 @dataclass(frozen=True, slots=True)
 class GraphKey:
-    """One exact Code2Wav input shape, excluding fixed quantizer count."""
+    """One exact Code2Wav input shape, excluding fixed quantizer count.
+
+    A window graph decodes a stateless window with its left context; a first or next graph
+    decodes only new frames from the streams' codec state slots, on a stream's first decode or
+    a later one.
+    """
 
     batch_size: int
     frames: int
+    decode: Literal["window", "first", "next"] = "window"
 
 
 @dataclass(frozen=True, slots=True)
@@ -103,6 +111,7 @@ class CapturedGraph:
     graph: ReplayableGraph
     static_input: torch.Tensor
     static_output: torch.Tensor
+    static_index: torch.Tensor | None = None
 
 
 CaptureAttemptResult: TypeAlias = (
@@ -180,7 +189,7 @@ class TorchDeviceApi:
         self.module(device).empty_cache()
 
     def new_static_input(
-        self, shape: tuple[int, int, int], *, device: torch.device
+        self, shape: tuple[int, ...], *, device: torch.device
     ) -> torch.Tensor:
         return torch.zeros(shape, dtype=torch.long, device=device)
 
@@ -271,11 +280,23 @@ class Code2WavCudaGraphRunner:
         best_effort_keys: tuple[GraphKey, ...],
         decode_stream: torch.Stream | None,
         device_api: TorchDeviceApi,
+        incremental_decoder: Code2WavIncrementalDecoder | None,
+        codec_arena: CodecStateArena | None,
     ) -> None:
         self.model = model
         self.device = torch.device(device)
         self.decode_stream = decode_stream
         self.device_api = device_api
+        self.incremental_decoder = incremental_decoder
+        self.codec_arena = codec_arena
+        if (incremental_decoder is None or codec_arena is None) and any(
+            key.decode != "window" for key in graph_keys + best_effort_keys
+        ):
+            raise ValueError(
+                "Code2Wav first and next graphs need the incremental decoder and its arena"
+            )
+        else:
+            pass
         if self.device.index is None:
             raise ValueError(
                 f"Code2Wav graphs require a concrete device, got {self.device}"
@@ -301,7 +322,9 @@ class Code2WavCudaGraphRunner:
         )
         self.owner_pid = os.getpid()
         self.graphs: dict[GraphKey, CapturedGraph] = {}
-        self.sizes_by_frames: dict[int, tuple[int, ...]] = {}
+        self.sizes_by_frames: dict[
+            tuple[Literal["window", "first", "next"], int], tuple[int, ...]
+        ] = {}
         self.pool: tuple[int, int] | None = None
         self.capture_stream: torch.Stream | None = None
         self.enabled = False
@@ -328,6 +351,8 @@ class Code2WavCudaGraphRunner:
         decode_stream: torch.Stream | None,
         best_effort_keys: tuple[GraphKey, ...] = (),
         device_api: TorchDeviceApi | None = None,
+        incremental_decoder: Code2WavIncrementalDecoder | None = None,
+        codec_arena: CodecStateArena | None = None,
     ) -> Code2WavCudaGraphRunner:
         """Build the configured serving-reachable serial graphs.
 
@@ -342,6 +367,8 @@ class Code2WavCudaGraphRunner:
             best_effort_keys=best_effort_keys,
             decode_stream=decode_stream,
             device_api=TorchDeviceApi() if device_api is None else device_api,
+            incremental_decoder=incremental_decoder,
+            codec_arena=codec_arena,
         )
         runner._build(total_gpu_memory_fraction, model_footprint_bytes)
         return runner
@@ -424,12 +451,16 @@ class Code2WavCudaGraphRunner:
         self.graphs = {
             key: temporary[key] for key in self.graph_keys if key in temporary
         }
-        sizes_by_frames: dict[int, set[int]] = {}
+        sizes_by_frames: dict[
+            tuple[Literal["window", "first", "next"], int], set[int]
+        ] = {}
         for key in self.graphs:
-            sizes_by_frames.setdefault(key.frames, set()).add(key.batch_size)
+            sizes_by_frames.setdefault((key.decode, key.frames), set()).add(
+                key.batch_size
+            )
         self.sizes_by_frames = {
-            frames: tuple(sorted(sizes, reverse=True))
-            for frames, sizes in sizes_by_frames.items()
+            shape: tuple(sorted(sizes, reverse=True))
+            for shape, sizes in sizes_by_frames.items()
         }
         self.build_stats["published_graph_count"] = len(self.graphs)
         if self.tier1_keys:
@@ -630,12 +661,17 @@ class Code2WavCudaGraphRunner:
 
     @staticmethod
     def key_name(key: GraphKey) -> str:
-        return f"b{key.batch_size}t{key.frames}"
+        if key.decode == "window":
+            return f"b{key.batch_size}t{key.frames}"
+        else:
+            return f"b{key.batch_size}t{key.frames}{key.decode}"
 
-    def available_batch_sizes(self, frames: int) -> tuple[int, ...]:
+    def available_batch_sizes(
+        self, frames: int, decode: Literal["window", "first", "next"] = "window"
+    ) -> tuple[int, ...]:
         """Batch sizes with a published graph for this window length, largest
         first; the scheduler decomposes coalesced batches against this."""
-        return self.sizes_by_frames.get(int(frames), ())
+        return self.sizes_by_frames.get((decode, int(frames)), ())
 
     def capture_graph(
         self,
@@ -647,24 +683,51 @@ class Code2WavCudaGraphRunner:
         static_input = self.device_api.new_static_input(
             (key.batch_size, self.num_quantizers, key.frames), device=self.device
         )
+        if key.decode == "window":
+            static_index = None
+            model = self.model
+        else:
+            # note (ratish): every row of a capture reads and writes the arena's scratch slot,
+            # zeroed before the eager and the replayed decode so both start from one state.
+            static_index = self.device_api.new_static_input(
+                (key.batch_size,), device=self.device
+            )
+            static_index.fill_(self.codec_arena.scratch_slot)
+
+            def model(codes: torch.Tensor) -> torch.Tensor:
+                return self.incremental_decoder.decode_slots(
+                    codes,
+                    self.codec_arena,
+                    static_index,
+                    first_decode=key.decode == "first",
+                )
+
         with xpu_capture_pins():
             self.device_api.warmup(
-                self.model,
+                model,
                 static_input,
                 iterations=self.WARMUP_ITERATIONS,
                 device=self.device,
                 stream=stream,
             )
             graph, static_output = self.device_api.capture(
-                self.model, static_input, pool=pool, stream=stream
+                model, static_input, pool=pool, stream=stream
             )
             with torch.inference_mode():
-                eager_output = self.model(static_input).detach().clone()
+                self.zero_scratch_slot(key)
+                eager_output = model(static_input).detach().clone()
+                self.zero_scratch_slot(key)
                 graph.replay()
         self.verify_equivalence(
             key=key, eager_output=eager_output, graph_output=static_output
         )
-        return CapturedGraph(graph, static_input, static_output)
+        return CapturedGraph(graph, static_input, static_output, static_index)
+
+    def zero_scratch_slot(self, key: GraphKey) -> None:
+        if key.decode == "window":
+            pass
+        else:
+            self.codec_arena.zero_slot(self.codec_arena.scratch_slot)
 
     @staticmethod
     def valid_fraction(value: float | None) -> float | None:
@@ -784,6 +847,57 @@ class Code2WavCudaGraphRunner:
             fallback_reason=None,
         )
 
+    def run_slots(
+        self, codes: torch.Tensor, slots: Sequence[int], *, first_decode: bool
+    ) -> Code2WavRunResult:
+        """Decode new frames from the slots' codec state by an exact graph, or eagerly with a
+        stable reason; the output is borrowed as run's is."""
+        current_pid = os.getpid()
+        if current_pid != self.owner_pid:
+            raise RuntimeError(
+                f"Code2Wav device graph runner/model belongs to PID {self.owner_pid}, but was used in PID {current_pid}; it must be rebuilt in a spawned process before inference"
+            )
+        else:
+            pass
+        if len(slots) != int(codes.shape[0]):
+            raise ValueError("Code2Wav incremental decode needs one slot per code row")
+        else:
+            pass
+        if not self.enabled:
+            return self.eager_slots(
+                codes, slots, first_decode=first_decode, key=None, reason="disabled"
+            )
+        else:
+            pass
+        self.validate_codes(codes)
+        key = GraphKey(
+            batch_size=int(codes.shape[0]),
+            frames=int(codes.shape[2]),
+            decode="first" if first_decode else "next",
+        )
+        captured = self.graphs.get(key)
+        if captured is None:
+            return self.eager_slots(
+                codes, slots, first_decode=first_decode, key=key, reason="key_miss"
+            )
+        else:
+            pass
+        try:
+            captured.static_input.copy_(codes)
+            captured.static_index.copy_(self.codec_arena.stage_index(slots))
+            captured.graph.replay()
+        except Exception as exc:
+            self.replay_failures += 1
+            self.disable_runtime(f"runtime_replay_failed: {type(exc).__name__}: {exc}")
+            raise
+        self.graph_replays += 1
+        return Code2WavRunResult(
+            output=captured.static_output,
+            execution_mode="cuda_graph",
+            key=key,
+            fallback_reason=None,
+        )
+
     def validate_codes(self, codes: torch.Tensor) -> None:
         if not self.device_api.is_accelerator_tensor(codes, self.device):
             raise TypeError(
@@ -820,6 +934,27 @@ class Code2WavCudaGraphRunner:
             output=output, execution_mode="eager", key=key, fallback_reason=reason
         )
 
+    def eager_slots(
+        self,
+        codes: torch.Tensor,
+        slots: Sequence[int],
+        *,
+        first_decode: bool,
+        key: GraphKey | None,
+        reason: str,
+    ) -> Code2WavRunResult:
+        self.fallback_counts[reason] += 1
+        with torch.inference_mode():
+            output = self.incremental_decoder.decode_slots(
+                codes,
+                self.codec_arena,
+                self.codec_arena.stage_index(slots),
+                first_decode=first_decode,
+            )
+        return Code2WavRunResult(
+            output=output, execution_mode="eager", key=key, fallback_reason=reason
+        )
+
     def disable_runtime(self, reason: str) -> None:
         self.graphs.clear()
         self.sizes_by_frames = {}
@@ -850,7 +985,11 @@ class Code2WavCudaGraphRunner:
             },
             "graph_contract": {
                 "keys": [
-                    {"batch_size": key.batch_size, "frames": key.frames}
+                    {
+                        "batch_size": key.batch_size,
+                        "frames": key.frames,
+                        "decode": key.decode,
+                    }
                     for key in self.graph_keys
                 ]
             },

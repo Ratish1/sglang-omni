@@ -21,6 +21,7 @@ from sglang_omni.models.qwen3_omni.components.code2wav import (
     Qwen3OmniCode2Wav,
 )
 from sglang_omni.models.qwen3_omni.components.code2wav_cuda_graph import (
+    Code2WavCudaGraphRunner,
     Code2WavRunResult,
     GraphKey,
 )
@@ -84,9 +85,11 @@ class FakeCudaGraphRunner:
         self.replay_error = replay_error
         self.calls: list[tuple[tuple[int, ...], bool]] = []
 
-    def available_batch_sizes(self, frames: int) -> tuple[int, ...]:
+    def available_batch_sizes(self, frames: int, decode: str) -> tuple[int, ...]:
         return tuple(
-            key.batch_size for key in DEFAULT_GRAPH_KEYS if key.frames == int(frames)
+            key.batch_size
+            for key in DEFAULT_GRAPH_KEYS
+            if key.frames == int(frames) and key.decode == decode
         )
 
     def run(self, codes: torch.Tensor, *, eligible: bool) -> Code2WavRunResult:
@@ -486,6 +489,8 @@ def test_qwen_code2wav_enabled_factory_normalizes_device_and_derives_graph_keys(
         ),
         "model_footprint_bytes": 3 * 4 + 2 * 8,
         "decode_stream": scheduler.decode_stream,
+        "incremental_decoder": None,
+        "codec_arena": None,
     }
     assert scheduler.decode_stream.device == torch.device("cuda:3")
     assert scheduler.decode_stream.priority == -2
@@ -635,7 +640,11 @@ def test_qwen_code2wav_stream_done_tail_replays_the_graph_of_its_shape(
     assert tail_metadata["trigger"] == "stream_done"
     assert tail_metadata["window_frames"] == 10
     assert tail_metadata["execution_mode"] == "cuda_graph"
-    assert tail_metadata["graph_key"] == {"batch_size": 1, "frames": 10}
+    assert tail_metadata["graph_key"] == {
+        "batch_size": 1,
+        "frames": 10,
+        "decode": "window",
+    }
     assert tail_metadata["fallback_reason"] is None
 
 
@@ -753,6 +762,7 @@ def test_qwen_code2wav_eligible_key_miss_has_json_safe_fallback_metadata(
     assert decode_end["metadata"]["graph_key"] == {
         "batch_size": 1,
         "frames": 6,
+        "decode": "window",
     }
     assert decode_end["metadata"]["fallback_reason"] == "key_miss"
 
@@ -821,7 +831,7 @@ def test_qwen_code2wav_consumes_borrowed_output_under_state_lock() -> None:
             self.lock_was_held: list[bool] = []
             self.replays = 0
 
-        def available_batch_sizes(self, frames: int) -> tuple[int, ...]:
+        def available_batch_sizes(self, frames: int, decode: str) -> tuple[int, ...]:
             return (1,)
 
         def run(self, codes: torch.Tensor, *, eligible: bool) -> Code2WavRunResult:
@@ -1312,22 +1322,43 @@ def test_channels_last_incremental_code2wav_matches_the_whole_forward(
 
 
 def make_incremental_scheduler(
-    model: Qwen3OmniCode2Wav, codec_state_slots: int
+    model: Qwen3OmniCode2Wav, codec_state_slots: int, *, cuda_graph: bool = False
 ) -> Code2WavScheduler:
     decoder = Code2WavIncrementalDecoder(model)
+    device = next(model.parameters()).device
+    arena = CodecStateArena(
+        decoder, num_slots=codec_state_slots, device=device, dtype=torch.float32
+    )
+    runner = None
+    if cuda_graph:
+        runner = Code2WavCudaGraphRunner.build(
+            model,
+            device=device,
+            num_quantizers=2,
+            total_gpu_memory_fraction=1.0,
+            graph_keys=code2wav_scheduler.window_graph_keys(3, 2, 2)
+            + code2wav_scheduler.incremental_graph_keys(3, 2),
+            best_effort_keys=tuple(
+                GraphKey(batch_size=1, frames=frames, decode="next")
+                for frames in (1, 2)
+            ),
+            model_footprint_bytes=0,
+            decode_stream=None,
+            incremental_decoder=decoder,
+            codec_arena=arena,
+        )
+    else:
+        pass
     return Code2WavScheduler(
         model,
-        device="cpu",
+        device=str(device),
         stream_chunk_size=3,
         left_context_size=2,
         sample_rate=24000,
+        enable_cuda_graph=cuda_graph,
+        cuda_graph_runner=runner,
         incremental_decoder=decoder,
-        codec_arena=CodecStateArena(
-            decoder,
-            num_slots=codec_state_slots,
-            device=torch.device("cpu"),
-            dtype=torch.float32,
-        ),
+        codec_arena=arena,
     )
 
 
@@ -1369,6 +1400,28 @@ def test_scheduler_decodes_from_codec_state_as_the_whole_forward() -> None:
     for waveform, wanted in zip(waveforms, expected):
         np.testing.assert_allclose(waveform, wanted, rtol=2e-5, atol=2e-6)
     assert scheduler.stateless_fallbacks == 0
+    assert scheduler.codec_arena.active_slots() == 0
+
+
+@pytest.mark.accelerator
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_scheduler_replays_codec_state_graphs_as_the_whole_forward(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(torch.backends.cudnn, "allow_tf32", False)
+    model = make_tiny_code2wav("cuda", torch.float32)
+    scheduler = make_incremental_scheduler(model, codec_state_slots=2, cuda_graph=True)
+    codes = torch.randint(0, 16, (2, 2, 11), device="cuda")
+
+    waveforms = run_streams(scheduler, codes)
+
+    with torch.inference_mode():
+        expected = model(codes).reshape(2, -1).cpu().numpy()
+    for waveform, wanted in zip(waveforms, expected):
+        np.testing.assert_allclose(waveform, wanted, rtol=2e-4, atol=2e-5)
+    runtime = scheduler.cuda_graph_runner.stats()["runtime"]
+    assert runtime["fallback_counts"] == {}
+    assert runtime["graph_replays"] > 0
     assert scheduler.codec_arena.active_slots() == 0
 
 

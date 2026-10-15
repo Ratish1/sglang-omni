@@ -14,7 +14,7 @@ import queue
 import time
 from collections.abc import Mapping
 from dataclasses import dataclass, field
-from typing import TypedDict
+from typing import Literal, TypedDict
 
 import numpy as np
 import torch
@@ -59,10 +59,34 @@ class IngestProfile(TypedDict):
     ready_emitted: bool
 
 
+class GraphKeyMetadata(TypedDict):
+    batch_size: int
+    frames: int
+    decode: Literal["window", "first", "next"]
+
+
 class ExecutionMetadata(TypedDict):
     execution_mode: str
-    graph_key: dict[str, int] | None
+    graph_key: GraphKeyMetadata | None
     fallback_reason: str | None
+
+
+def execution_metadata(result: Code2WavRunResult) -> ExecutionMetadata:
+    if result.key is None:
+        graph_key = None
+    else:
+        graph_key = {
+            "batch_size": int(result.key.batch_size),
+            "frames": int(result.key.frames),
+            "decode": result.key.decode,
+        }
+    return {
+        "execution_mode": str(result.execution_mode),
+        "graph_key": graph_key,
+        "fallback_reason": (
+            None if result.fallback_reason is None else str(result.fallback_reason)
+        ),
+    }
 
 
 def serial_window_frames(
@@ -110,6 +134,24 @@ def window_graph_keys(
         for rows in range(1, max_replay_rows + 1)
         for frames in serial_window_frames(
             stream_chunk_size, left_context_size, initial_chunk_frames
+        )
+    )
+
+
+def incremental_graph_keys(
+    stream_chunk_size: int, max_replay_rows: int, initial_chunk_frames: int = 0
+) -> tuple[GraphKey, ...]:
+    """The new frames of a stream's first window and of its later ones, decoded from codec
+    state slots, at every row count up to max_replay_rows."""
+    first_frames = (
+        min(max(int(initial_chunk_frames), 0), stream_chunk_size) or stream_chunk_size
+    )
+    return tuple(
+        key
+        for rows in range(1, max_replay_rows + 1)
+        for key in (
+            GraphKey(batch_size=rows, frames=first_frames, decode="first"),
+            GraphKey(batch_size=rows, frames=stream_chunk_size, decode="next"),
         )
     )
 
@@ -309,19 +351,23 @@ class Code2WavScheduler(StreamingVocoderBase[Code2WavStreamState, "list[int]"]):
                 torch.get_device_module(self.device).set_device(self.device)
             else:
                 pass
-            state = self.codec_arena.gather(slots)
-            output = self.incremental_decoder.decode(
-                codes, state, first_decode=first_decode
-            )
-            self.codec_arena.scatter(slots, state)
-        return (
-            output,
-            {
-                "execution_mode": "incremental",
-                "graph_key": None,
-                "fallback_reason": None,
-            },
-        )
+            if self.cuda_graph_runner is None:
+                result = Code2WavRunResult(
+                    output=self.incremental_decoder.decode_slots(
+                        codes,
+                        self.codec_arena,
+                        self.codec_arena.stage_index(slots),
+                        first_decode=first_decode,
+                    ),
+                    execution_mode="eager",
+                    key=None,
+                    fallback_reason=None,
+                )
+            else:
+                result = self.cuda_graph_runner.run_slots(
+                    codes, slots, first_decode=first_decode
+                )
+        return (result.output, execution_metadata(result))
 
     def is_streaming_payload(self, payload: StagePayload) -> bool:
         del payload
@@ -936,26 +982,7 @@ class Code2WavScheduler(StreamingVocoderBase[Code2WavStreamState, "list[int]"]):
                 )
             else:
                 result = self.cuda_graph_runner.run(codes, eligible=graph_eligible)
-        graph_key = None
-        if result.key is not None:
-            graph_key = {
-                "batch_size": int(result.key.batch_size),
-                "frames": int(result.key.frames),
-            }
-        else:
-            pass
-        return (
-            result.output,
-            {
-                "execution_mode": str(result.execution_mode),
-                "graph_key": graph_key,
-                "fallback_reason": (
-                    None
-                    if result.fallback_reason is None
-                    else str(result.fallback_reason)
-                ),
-            },
-        )
+        return (result.output, execution_metadata(result))
 
     def next_message(self) -> IncomingMessage | None:
         with self.state_lock:
@@ -1050,14 +1077,20 @@ class Code2WavScheduler(StreamingVocoderBase[Code2WavStreamState, "list[int]"]):
             ),
             key=lambda stream: stream[1].ready_since,
         )
-        if self.cuda_graph_runner is None or from_slot:
+        if not from_slot:
+            decode = "window"
+        elif follows_a_window:
+            decode = "next"
+        else:
+            decode = "first"
+        if self.cuda_graph_runner is None:
             rows = min(len(group), self.max_replay_rows)
         else:
             rows = max(
                 (
                     size
                     for size in self.cuda_graph_runner.available_batch_sizes(
-                        window_frames
+                        window_frames, decode
                     )
                     if size <= len(group)
                 ),
@@ -1300,6 +1333,19 @@ def create_code2wav_scheduler(
             )
             if key not in graph_keys
         )
+        if codec_arena is not None:
+            graph_keys += incremental_graph_keys(
+                stream_chunk_size,
+                max(int(max_replay_rows), 1),
+                initial_codec_chunk_frames,
+            )
+            # note (ratish): a stream with a slot ends on fewer new frames than a window.
+            final_window_keys += tuple(
+                GraphKey(batch_size=1, frames=frames, decode="next")
+                for frames in range(1, stream_chunk_size)
+            )
+        else:
+            pass
         cuda_graph_runner = Code2WavCudaGraphRunner.build(
             model,
             device=concrete_device,
@@ -1313,6 +1359,8 @@ def create_code2wav_scheduler(
                 for tensor in itertools.chain(model.parameters(), model.buffers())
             ),
             decode_stream=decode_stream,
+            incremental_decoder=incremental_decoder,
+            codec_arena=codec_arena,
         )
         logger.info(
             "Code2Wav device graph startup stats=%s",

@@ -29,6 +29,7 @@ from sglang_omni.utils.channels_last_conv import (
     channels_last_conv_transpose1d,
     channels_last_weight,
 )
+from sglang_omni.utils.codec_state_arena import CodecStateArena
 from sglang_omni.utils.incremental_codec import (
     IncrementalCodecState,
     IncrementalCodecStateSpec,
@@ -343,4 +344,19 @@ class Code2WavIncrementalDecoder:
             self.first_decode_shortfall if first_decode else 0
         ), "code2wav incremental decode returned the wrong sample count"
         state.advance(fresh_frames)
+        return waveform
+
+    def decode_slots(
+        self,
+        codes: torch.Tensor,
+        arena: CodecStateArena,
+        index: torch.Tensor,
+        *,
+        first_decode: bool,
+    ) -> torch.Tensor:
+        """Decode the codes of the streams whose state the arena rows in the device index hold,
+        and store their advanced state; a graph captures it with a static index."""
+        state = arena.gather_by_index(index)
+        waveform = self.decode(codes, state, first_decode=first_decode)
+        arena.scatter_by_index(index, state)
         return waveform
