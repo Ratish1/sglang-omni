@@ -734,6 +734,31 @@ class CodecHead(torch.nn.Linear):
         return super().forward(hidden_states), None
 
 
+def test_talker_returns_fp32_logits_from_a_bf16_codec_head() -> None:
+    """A bf16 codec head hands the sampler fp32 logits, so FlashInfer's draw reads
+    probabilities that sum to 1."""
+    talker = object.__new__(Qwen3TTSTalker)
+    torch.nn.Module.__init__(talker)
+    talker.codec_head = CodecHead(16, 8, bias=False).to("cuda", torch.bfloat16)
+    talker.model = lambda input_ids, positions, forward_batch, input_embeds: (
+        input_embeds
+    )
+    forward_batch = SimpleNamespace(
+        mrope_positions=None,
+        forward_mode=SimpleNamespace(is_extend=lambda: False),
+    )
+    hidden_states = torch.randn(3, 16, device="cuda", dtype=torch.bfloat16)
+
+    logits = talker(
+        None, None, forward_batch, input_embeds=hidden_states
+    ).next_token_logits
+
+    assert logits.dtype == torch.float32
+    torch.testing.assert_close(
+        logits, talker.codec_head(hidden_states)[0].float(), rtol=0, atol=0
+    )
+
+
 def test_talker_precompile_leaves_the_first_prefill_samples_nothing_to_compile() -> (
     None
 ):
