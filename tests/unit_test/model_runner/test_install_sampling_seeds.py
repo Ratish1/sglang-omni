@@ -6,6 +6,7 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 import pytest
+import sglang.srt.layers.sampler as sampler_module
 import torch
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.sampler import create_sampler
@@ -27,8 +28,6 @@ TOP_K = 50
 def test_review_unseeded_seeded_unseeded_batches_use_the_expected_draw(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    import sglang.srt.layers.sampler as sampler_module
-
     register_flashinfer_seeded_sampler()
     flashinfer_draw = sampler_module.top_k_top_p_sampling_from_probs
     flashinfer_calls: list[torch.dtype] = []
