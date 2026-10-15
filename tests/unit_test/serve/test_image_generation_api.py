@@ -19,12 +19,16 @@ from sglang_omni.admission import QueueFullError
 from sglang_omni.client import Client
 from sglang_omni.client.types import ClientError
 from sglang_omni.models.llada2_uni.components.image_decoder import LLaDA2ImageDecoder
+from sglang_omni.models.llada2_uni.components.preprocessor import SOI_TOKEN
+from sglang_omni.models.llada2_uni.payload_types import LLaDA2UniPipelineState
 from sglang_omni.pipeline.coordinator import Coordinator
 from sglang_omni.proto.messages import AbortMessage, SubmitMessage
+from sglang_omni.proto.request import OmniRequest, StagePayload
 from sglang_omni.serve import create_app
 from sglang_omni.serve.openai_api import build_chat_generate_request
 from sglang_omni.serve.protocol import ChatCompletionRequest, ImageGenerationParams
 from tests.unit_test.fixtures.pipeline_fakes import RecordingCoordinatorControlPlane
+from tests.unit_test.llada2_uni.test_preprocessor_understanding import make_preprocessor
 
 
 class RecordingCoordinator:
@@ -534,9 +538,22 @@ def test_review_disconnect_releases_real_coordinator(route: str) -> None:
     asyncio.run(exercise())
 
 
-def test_review_image_config_returns_generated_image(api) -> None:
+def test_review_image_config_returns_generated_image(api, monkeypatch) -> None:
     """Selecting generation without modalities must not discard the PNG."""
     client, coordinator = api
+    preprocessor = make_preprocessor()
+    preprocessor.soi_id = preprocessor.tokenizer.convert_tokens_to_ids(SOI_TOKEN)
+    original_submit = coordinator.submit
+
+    async def preprocess(request_id: str, request: OmniRequest):
+        payload = StagePayload(request_id=request_id, request=request, data={})
+        prepared = await preprocessor(payload)
+        state = LLaDA2UniPipelineState.from_dict(prepared.data)
+        print(f"REVIEW config-only real-preprocessor task_kind={state.task_kind}")
+        assert state.task_kind == "t2i"
+        return await original_submit(request_id, request)
+
+    monkeypatch.setattr(coordinator, "submit", preprocess)
     response = client.post(
         "/v1/chat/completions",
         json={
@@ -592,4 +609,23 @@ def test_review_normal_one_step_is_rejected_before_dispatch(
         f"status={response.status_code} body={response.text}"
     )
     assert response.status_code == 400
+    assert coordinator.requests == []
+
+
+def test_review_unsupported_chat_image_control_is_rejected(api) -> None:
+    """A server-only decoder setting must not be silently accepted per request."""
+    client, coordinator = api
+    response = client.post(
+        "/v1/chat/completions",
+        json={
+            "messages": [{"role": "user", "content": "Draw"}],
+            "modalities": ["image"],
+            "image_generation": {"resolution_multiplier": 4},
+        },
+    )
+    print(
+        f"REVIEW unsupported-chat-control status={response.status_code} "
+        f"forwarded={coordinator.requests[0].metadata}"
+    )
+    assert response.status_code == 422
     assert coordinator.requests == []
