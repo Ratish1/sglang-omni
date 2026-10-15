@@ -206,6 +206,99 @@ class FusedCode2WavTransformer(torch.nn.Module):
             last_hidden_state=hidden_states.view(batch_size, length, hidden_size)
         )
 
+    def forward_new_frames(
+        self, inputs_embeds: torch.Tensor, state: IncrementalCodecState
+    ) -> torch.Tensor:
+        """The normed hidden states of a stream's new frames on the fused kernels, attending to
+        the rotated K/V the state retains right-aligned at absolute positions; keeps the newest
+        K/V of every layer in the state."""
+        batch_size, length, hidden_size = inputs_embeds.shape
+        head_dim = self.transformer.layers[0].self_attn.head_dim
+        device = inputs_embeds.device
+        retained = int(state.transformer_keys[0].shape[-2])
+        frame_positions = state.row_frame_positions(batch_size, device)
+        query_positions = frame_positions[:, None] + torch.arange(length, device=device)
+        key_positions = frame_positions[:, None] + torch.arange(
+            -retained, length, device=device
+        )
+        keys_by_query = key_positions[:, None, :]
+        queries = query_positions[:, :, None]
+        # note (ratish): a key slot the stream has not filled sits at a negative position.
+        window_mask = (
+            (keys_by_query <= queries)
+            & (queries - keys_by_query < self.transformer.config.sliding_window)
+            & (keys_by_query >= 0)
+        )[:, None]
+        positions = query_positions.reshape(-1)
+        hidden_states = inputs_embeds.reshape(batch_size * length, hidden_size)
+        for layer_index, layer in enumerate(self.transformer.layers):
+            attention = layer.self_attn
+            residual = hidden_states
+            normed = rmsnorm(
+                hidden_states,
+                layer.input_layernorm.weight,
+                layer.input_layernorm.variance_epsilon,
+            )
+            query, key, value = F.linear(normed, attention.qkv_weight).split(
+                [
+                    attention.q_proj.out_features,
+                    attention.k_proj.out_features,
+                    attention.v_proj.out_features,
+                ],
+                dim=-1,
+            )
+            query = query.view(batch_size * length, -1, head_dim)
+            key = key.view(batch_size * length, -1, head_dim)
+            self.rope(query, key, self.cos_sin_cache, positions, is_neox=True)
+            key = torch.cat(
+                (
+                    state.transformer_keys[layer_index],
+                    key.view(batch_size, length, -1, head_dim).transpose(1, 2),
+                ),
+                dim=2,
+            )
+            value = torch.cat(
+                (
+                    state.transformer_values[layer_index],
+                    value.view(batch_size, length, -1, head_dim).transpose(1, 2),
+                ),
+                dim=2,
+            )
+            state.transformer_keys[layer_index] = key[:, :, -retained:]
+            state.transformer_values[layer_index] = value[:, :, -retained:]
+            attended = F.scaled_dot_product_attention(
+                query.view(batch_size, length, -1, head_dim).transpose(1, 2),
+                key,
+                value,
+                attn_mask=window_mask,
+                scale=attention.scaling,
+                enable_gqa=attention.num_key_value_groups > 1,
+            )
+            attended = attended.transpose(1, 2).reshape(batch_size * length, -1)
+            hidden_states = torch.addcmul(
+                residual,
+                layer.self_attn_layer_scale.scale,
+                F.linear(attended, attention.o_proj.weight),
+            )
+            residual = hidden_states
+            normed = rmsnorm(
+                hidden_states,
+                layer.post_attention_layernorm.weight,
+                layer.post_attention_layernorm.variance_epsilon,
+            )
+            activated = silu_and_mul(F.linear(normed, layer.mlp.gate_up_weight))
+            hidden_states = torch.addcmul(
+                residual,
+                layer.mlp_layer_scale.scale,
+                F.linear(activated, layer.mlp.down_proj.weight),
+            )
+        hidden_states = rmsnorm(
+            hidden_states,
+            self.transformer.norm.weight,
+            self.transformer.norm.variance_epsilon,
+        )
+        return hidden_states.view(batch_size, length, hidden_size)
+
 
 class Qwen3OmniCode2Wav(Qwen3OmniMoeCode2Wav):
     """Code2Wav that carries (B, L, C) activations once its convs are channels last."""
@@ -257,8 +350,10 @@ class Code2WavIncrementalDecoder:
         pre_transformer = model.pre_transformer
         self.model = model
         if isinstance(pre_transformer, FusedCode2WavTransformer):
+            self.fused_transformer: FusedCode2WavTransformer | None = pre_transformer
             self.transformer = pre_transformer.transformer
         else:
+            self.fused_transformer = None
             self.transformer = pre_transformer
         self.total_upsample = int(model.total_upsample)
         # note (ratish): the conv weights are already channels last in place, so the steps
@@ -326,9 +421,16 @@ class Code2WavIncrementalDecoder:
         hidden_states = self.model.code_embedding(codes + self.model.code_offset).mean(
             1
         )
-        hidden_states = self.transformer.norm(
-            incremental_transformer_layers(self.transformer, hidden_states, state, None)
-        )
+        if self.fused_transformer is None:
+            hidden_states = self.transformer.norm(
+                incremental_transformer_layers(
+                    self.transformer, hidden_states, state, None
+                )
+            )
+        else:
+            hidden_states = self.fused_transformer.forward_new_frames(
+                hidden_states, state
+            )
         if self.channels_last_weights is None:
             hidden_states = hidden_states.transpose(1, 2)
         else:

@@ -1238,8 +1238,9 @@ def decode_in_parts(
     codes: torch.Tensor,
     parts: tuple[int, ...],
     device: torch.device,
+    dtype: torch.dtype = torch.float32,
 ) -> torch.Tensor:
-    state = decoder.init_state(int(codes.shape[0]), device=device, dtype=torch.float32)
+    state = decoder.init_state(int(codes.shape[0]), device=device, dtype=dtype)
     waveforms = []
     start = 0
     for frames in parts:
@@ -1319,6 +1320,44 @@ def test_channels_last_incremental_code2wav_matches_the_whole_forward(
         actual = decode_in_parts(decoder, codes, (4, 6, 7), torch.device("cuda"))
 
     torch.testing.assert_close(actual, expected, rtol=2e-4, atol=2e-5)
+
+
+@pytest.mark.accelerator
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or not current_platform.is_cuda(),
+    reason="requires NVIDIA CUDA",
+)
+@pytest.mark.parametrize("parts", [(4, 6, 7), (1,) * 17])
+def test_fused_incremental_code2wav_error_to_fp32_is_the_fused_forward_error(
+    monkeypatch: pytest.MonkeyPatch, parts: tuple[int, ...]
+) -> None:
+    monkeypatch.setattr(torch.backends.cudnn, "allow_tf32", False)
+    whole_error = 0.0
+    incremental_error = 0.0
+    for seed in range(4):
+        model = make_tiny_code2wav("cuda", torch.float32, seed)
+        codes = torch.randint(0, 16, (2, 2, sum(parts)), device="cuda")
+        with torch.inference_mode():
+            reference = model(codes)
+            model.to(torch.bfloat16)
+            model.use_channels_last()
+            model.use_fused_transformer(
+                current_platform.get_joint_rope_inplace_kernel()
+            )
+            whole = model(codes)
+            incremental = decode_in_parts(
+                Code2WavIncrementalDecoder(model),
+                codes,
+                parts,
+                torch.device("cuda"),
+                torch.bfloat16,
+            )
+        whole_error += float((whole.float() - reference).norm() / reference.norm())
+        incremental_error += float(
+            (incremental.float() - reference).norm() / reference.norm()
+        )
+
+    assert incremental_error <= 1.25 * whole_error
 
 
 def make_incremental_scheduler(
