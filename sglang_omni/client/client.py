@@ -10,6 +10,7 @@ from contextlib import aclosing
 from dataclasses import dataclass, replace
 from typing import AsyncIterator, Callable, TypedDict
 
+import msgspec
 import numpy as np
 
 from sglang_omni.client.audio import (
@@ -27,6 +28,7 @@ from sglang_omni.client.types import (
     CompletionAudio,
     CompletionResult,
     CompletionStreamChunk,
+    DiarizationResult,
     GenerateChunk,
     GenerateRequest,
     SpeechResult,
@@ -301,6 +303,7 @@ class Client:
             weight_version=weight_version,
             language=language,
             image=image_base64,
+            diarization=last_chunk.diarization,
         )
 
     # ------------------------------------------------------------------
@@ -792,6 +795,12 @@ class Client:
             else:
                 pass
             chunk.usage = Client.build_usage_info(result)
+            diarization = result.get("diarization")
+            chunk.diarization = (
+                None
+                if diarization is None
+                else msgspec.convert(diarization, type=DiarizationResult)
+            )
             return chunk
         else:
             pass

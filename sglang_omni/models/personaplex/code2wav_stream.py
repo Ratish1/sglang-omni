@@ -53,6 +53,7 @@ class StreamState:
     pending_frames: int = 0
     decodes_done: int = 0
     num_samples: int = 0
+    client_streams: bool = False
 
 
 class PersonaPlexCode2WavScheduler(StreamingSimpleScheduler):
@@ -109,12 +110,14 @@ class PersonaPlexCode2WavScheduler(StreamingSimpleScheduler):
         state.pending_codes.append(codes_FK)
         state.pending_frames += codes_FK.shape[0]
         # Note (wilsonzheng0327): The terminal payload only arrives after the LM finishes,
-        # so the caller length travels with each chunk.
-        num_samples = int((item.metadata or {}).get("num_samples") or 0)
+        # so the caller length and the client's stream flag travel with each chunk.
+        metadata = item.metadata or {}
+        num_samples = int(metadata.get("num_samples") or 0)
         if num_samples:
             state.num_samples = num_samples
         else:
             pass
+        state.client_streams = bool(metadata.get("stream"))
         messages: list[OutgoingMessage] = []
         while state.pending_frames >= self.chunk_target_frames(state):
             messages.append(
@@ -145,7 +148,10 @@ class PersonaPlexCode2WavScheduler(StreamingSimpleScheduler):
         else:
             pass
         state.emitted_samples += waveform.shape[-1]
-        state.audio_parts.append(waveform)
+        if not state.client_streams:
+            state.audio_parts.append(waveform)
+        else:
+            pass
         return OutgoingMessage(
             request_id=request_id,
             type="stream",
@@ -172,20 +178,27 @@ class PersonaPlexCode2WavScheduler(StreamingSimpleScheduler):
         else:
             pass
         messages = self.on_stream_done_before_payload(request_id)
-        waveform = torch.cat(state.audio_parts) if state.audio_parts else torch.zeros(0)
+        request = self.stream_payloads[request_id].request
+        if request.params.get("stream"):
+            # Note (wilsonzheng0327): A streaming client already holds every chunk; only a
+            # non-streaming client reads the reply from the result.
+            result_data = {"modality": "audio", "sample_rate": SAMPLE_RATE}
+        else:
+            waveform = (
+                torch.cat(state.audio_parts) if state.audio_parts else torch.zeros(0)
+            )
+            result_data = audio_waveform_payload(
+                waveform,
+                sample_rate=SAMPLE_RATE,
+                modality="audio",
+                source_hint=SOURCE_HINT,
+            )
         messages.append(
             OutgoingMessage(
                 request_id=request_id,
                 type="result",
                 data=StagePayload(
-                    request_id=request_id,
-                    request=self.stream_payloads[request_id].request,
-                    data=audio_waveform_payload(
-                        waveform,
-                        sample_rate=SAMPLE_RATE,
-                        modality="audio",
-                        source_hint=SOURCE_HINT,
-                    ),
+                    request_id=request_id, request=request, data=result_data
                 ),
             )
         )
