@@ -142,13 +142,9 @@ class IncrementalCodecState:
 
 
 class IncrementalCodecDecoder(Protocol):
-    """What a state arena needs from a decoder: its state layout and a zeroed state."""
+    """What a state arena needs from a decoder: its state layout."""
 
     def state_spec(self) -> IncrementalCodecStateSpec: ...
-
-    def init_state(
-        self, batch_size: int, *, device: torch.device, dtype: torch.dtype
-    ) -> IncrementalCodecState: ...
 
 
 def conv_history(

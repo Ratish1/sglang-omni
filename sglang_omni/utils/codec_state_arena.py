@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import math
 import threading
 from collections.abc import Sequence
 from typing import TypedDict
@@ -27,9 +28,11 @@ class CodecStateArenaStats(TypedDict):
 class CodecStateArena:
     """Bounded, reusable storage for per-stream incremental codec state.
 
-    Every buffer of the decoder's state spec carries a leading slot dimension, so the arena
-    is exactly the state a decode of num_slots rows would use: gather selects a cohort's
-    rows into a contiguous state and scatter writes the advanced state back.
+    A slot's whole state is one row of one buffer, and its frame position one entry of
+    another, so gather selects a cohort's rows with one index op and scatter writes the
+    advanced state back with one, whatever the number of state tensors. The state tensors
+    are views of the row, in the spec's order: conv histories, transposed-conv overlaps,
+    then the keys and the values of every layer.
 
     Note (Qihao Liu): acquire zeroes a slot before handing it out, so a reused slot is
     provably a cold start; release therefore returns a slot without clearing it.
@@ -47,17 +50,36 @@ class CodecStateArena:
             raise ValueError("codec state arena needs at least one slot")
         else:
             pass
-        self.decoder = decoder
         self.device = torch.device(device)
         self.device_module = torch.get_device_module(self.device)
         self.dtype = dtype
         self._num_slots = int(num_slots)  # noqa: leading-underscore
         self.scratch_slot = self._num_slots  # noqa: leading-underscore
-        self.storage = decoder.init_state(
-            self._num_slots + 1,
-            device=self.device,
-            dtype=dtype,  # noqa: leading-underscore
+        self.spec = decoder.state_spec()
+        key_value_shape = (
+            self.spec.num_key_value_heads,
+            self.spec.retained_context,
+            self.spec.head_dim,
         )
+        self.state_shapes: tuple[tuple[int, ...], ...] = (
+            *((channels, length) for _, channels, length in self.spec.conv_histories),
+            *(
+                (channels, length)
+                for _, channels, length in self.spec.transconv_overlaps
+            ),
+            *(key_value_shape for _ in range(2 * self.spec.num_layers)),
+        )
+        self.state_sizes: list[int] = [math.prod(shape) for shape in self.state_shapes]
+        self.state_rows = torch.zeros(
+            self.num_slots + 1,
+            sum(self.state_sizes),
+            device=self.device,
+            dtype=dtype,
+        )
+        self.frame_positions = torch.zeros(
+            self.num_slots + 1, device=self.device, dtype=torch.long
+        )
+        self.storage = self.state_of_rows(self.state_rows, self.frame_positions)
         self.lock = threading.Lock()
         self.staging = threading.local()
         self.release_events: dict[int, torch.Event] = {}
@@ -66,8 +88,9 @@ class CodecStateArena:
         )  # noqa: leading-underscore
         self.retired: set[int] = set()
         self._exhausted_count = 0  # noqa: leading-underscore
-        spec = decoder.state_spec()
-        self._bytes_per_slot = spec.bytes_per_stream(dtype)  # noqa: leading-underscore
+        self._bytes_per_slot = self.spec.bytes_per_stream(
+            dtype
+        )  # noqa: leading-underscore
 
     @property
     def num_slots(self) -> int:
@@ -144,22 +167,68 @@ class CodecStateArena:
             else:
                 pass
 
-    @staticmethod
-    def state_buffers(state: IncrementalCodecState) -> list[torch.Tensor]:
-        return [
-            *state.conv_histories.values(),
-            *state.transconv_overlaps.values(),
-            *state.transformer_keys.values(),
-            *state.transformer_values.values(),
-        ]
-
     def zero_slot(self, slot: int) -> None:
-        # note (ratish): one multi-tensor launch for the slot's buffers: an initial decode resets
-        # a fresh slot per row, and every row of its batch waits for all the resets before launch.
-        torch._foreach_zero_(  # noqa: leading-underscore  # upstream spelling, or the public name is already taken
-            [buffer[slot] for buffer in self.state_buffers(self.storage)]
+        self.state_rows[slot].zero_()
+        self.frame_positions[slot].zero_()
+
+    def state_of_rows(
+        self, rows: torch.Tensor, frame_positions: torch.Tensor
+    ) -> IncrementalCodecState:
+        """The state whose tensors are views of rows, one row per stream."""
+        count = int(rows.shape[0])
+        views = (
+            piece.view(count, *shape)
+            for piece, shape in zip(
+                rows.split(self.state_sizes, dim=1), self.state_shapes
+            )
         )
-        self.storage.frame_positions[slot].zero_()
+        state = IncrementalCodecState(
+            transformer_context_length=self.spec.retained_context,
+            frame_positions=frame_positions,
+        )
+        for key, _, _ in self.spec.conv_histories:
+            state.conv_histories[key] = next(views)
+        for key, _, _ in self.spec.transconv_overlaps:
+            state.transconv_overlaps[key] = next(views)
+        for layer_index in range(self.spec.num_layers):
+            state.transformer_keys[layer_index] = next(views)
+        for layer_index in range(self.spec.num_layers):
+            state.transformer_values[layer_index] = next(views)
+        return state
+
+    def rows_of_state(self, state: IncrementalCodecState, count: int) -> torch.Tensor:
+        """The state's tensors packed into one row per stream, in the order of the views."""
+        pieces = [
+            *(
+                (key, state.conv_histories[key])
+                for key, _, _ in self.spec.conv_histories
+            ),
+            *(
+                (key, state.transconv_overlaps[key])
+                for key, _, _ in self.spec.transconv_overlaps
+            ),
+            *(
+                (f"key.{layer_index}", state.transformer_keys[layer_index])
+                for layer_index in range(self.spec.num_layers)
+            ),
+            *(
+                (f"value.{layer_index}", state.transformer_values[layer_index])
+                for layer_index in range(self.spec.num_layers)
+            ),
+        ]
+        for (name, piece), shape in zip(pieces, self.state_shapes):
+            expected = (count, *shape)
+            if tuple(piece.shape) != expected:
+                raise RuntimeError(
+                    f"codec state arena expected {expected} for {name}, got {tuple(piece.shape)}"
+                )
+            elif piece.dtype != self.dtype:
+                raise RuntimeError(
+                    f"codec state arena expected {self.dtype} for {name}, got {piece.dtype}"
+                )
+            else:
+                pass
+        return torch.cat([piece.reshape(count, -1) for _, piece in pieces], dim=1)
 
     STAGING_RING = 4
 
@@ -213,20 +282,10 @@ class CodecStateArena:
         Capturable: with a static index this is the gather half of a graph
         that reads the arena directly.
         """
-        storage = self.storage
-        state = IncrementalCodecState(
-            transformer_context_length=storage.transformer_context_length,
-            frame_positions=storage.frame_positions.index_select(0, index),
+        return self.state_of_rows(
+            self.state_rows.index_select(0, index),
+            self.frame_positions.index_select(0, index),
         )
-        for key, buffer in storage.conv_histories.items():
-            state.conv_histories[key] = buffer.index_select(0, index)
-        for key, buffer in storage.transconv_overlaps.items():
-            state.transconv_overlaps[key] = buffer.index_select(0, index)
-        for layer_index, buffer in storage.transformer_keys.items():
-            state.transformer_keys[layer_index] = buffer.index_select(0, index)
-        for layer_index, buffer in storage.transformer_values.items():
-            state.transformer_values[layer_index] = buffer.index_select(0, index)
-        return state
 
     def scatter(self, slots: Sequence[int], state: IncrementalCodecState) -> None:
         """Write an advanced cohort state back into its slots."""
@@ -236,49 +295,24 @@ class CodecStateArena:
         self, index: torch.Tensor, state: IncrementalCodecState
     ) -> None:
         """Write a cohort state into the rows named by a device index tensor."""
-        storage = self.storage
-        if state.frame_positions is None:
+        count = int(index.shape[0])
+        frame_positions = state.frame_positions
+        if frame_positions is None:
             raise RuntimeError("codec state arena requires per-row frame positions")
-        else:
-            pass
-        self.copy_rows(storage.frame_positions, index, state.frame_positions)
-        for key, buffer in storage.conv_histories.items():
-            self.copy_rows(buffer, index, state.conv_histories[key], key)
-        for key, buffer in storage.transconv_overlaps.items():
-            self.copy_rows(buffer, index, state.transconv_overlaps[key], key)
-        for layer_index, buffer in storage.transformer_keys.items():
-            self.copy_rows(
-                buffer, index, state.transformer_keys[layer_index], f"key.{layer_index}"
-            )
-        for layer_index, buffer in storage.transformer_values.items():
-            self.copy_rows(
-                buffer,
-                index,
-                state.transformer_values[layer_index],
-                f"value.{layer_index}",
-            )
-
-    @staticmethod
-    def copy_rows(
-        buffer: torch.Tensor,
-        index: torch.Tensor,
-        rows: torch.Tensor,
-        key: str = "frame_positions",
-    ) -> None:
-        expected = (int(index.shape[0]), *buffer.shape[1:])
-        if tuple(rows.shape) != expected:
+        elif tuple(frame_positions.shape) != (count,):
             raise RuntimeError(
-                f"codec state arena expected {expected} for {key}, got {tuple(rows.shape)}"
+                f"codec state arena expected {(count,)} for frame_positions, "
+                f"got {tuple(frame_positions.shape)}"
             )
-        else:
-            pass
-        if rows.dtype != buffer.dtype:
+        elif frame_positions.dtype != torch.long:
             raise RuntimeError(
-                f"codec state arena expected {buffer.dtype} for {key}, got {rows.dtype}"
+                f"codec state arena expected {torch.long} for frame_positions, "
+                f"got {frame_positions.dtype}"
             )
         else:
             pass
-        buffer.index_copy_(0, index, rows.contiguous())
+        self.state_rows.index_copy_(0, index, self.rows_of_state(state, count))
+        self.frame_positions.index_copy_(0, index, frame_positions)
 
     def describe(self) -> CodecStateArenaStats:
         return {
