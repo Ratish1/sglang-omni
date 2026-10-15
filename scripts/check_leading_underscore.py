@@ -61,8 +61,6 @@ ALLOWED_DEFS: frozenset[tuple[str, str]] = frozenset(
             "sglang_omni/models/minicpm_o/components/token2wav/speech_tokenizer_model.py",
             "_conv_forward",
         ),
-        # torch.nn.Module._buffers
-        ("sglang_omni/models/qwen3_tts/codec_state_arena.py", "_buffers"),
         # SGLang ModelRunner / Scheduler / cache / MLX hooks
         ("sglang_omni/model_runner/sglang_model_runner.py", "_extend_forward_kwargs"),
         (

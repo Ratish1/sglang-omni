@@ -1,74 +1,50 @@
-"""Slot-indexed storage for Qwen3-TTS incremental Codec decoder state."""
+# SPDX-License-Identifier: Apache-2.0
+"""Slot-indexed storage for incremental codec decoder state."""
 
 from __future__ import annotations
 
 import threading
 from collections.abc import Sequence
-from typing import TYPE_CHECKING, TypedDict
+from typing import TypedDict
 
 import torch
 
-from sglang_omni.models.qwen3_tts.incremental_codec import (
-    Qwen3TTSIncrementalCodecState,
-    Qwen3TTSIncrementalDecoder,
-)
 from sglang_omni.utils.device import supports_device_streams
-
-if TYPE_CHECKING:
-    from sglang_omni.models.qwen3_tts.incremental_codec_cuda_graph import (
-        IncrementalCodecGraphStats,
-    )
-else:
-    pass
+from sglang_omni.utils.incremental_codec import (
+    IncrementalCodecDecoder,
+    IncrementalCodecState,
+)
 
 
-class DisabledCodecGraphStats(TypedDict):
-    enabled: bool
-
-
-class CodecCudaGraphStats(TypedDict):
-    cold: IncrementalCodecGraphStats | DisabledCodecGraphStats
-    window: IncrementalCodecGraphStats | DisabledCodecGraphStats
-    tail: IncrementalCodecGraphStats | DisabledCodecGraphStats
-    warm: list[IncrementalCodecGraphStats]
-
-
-class CodecStateStats(TypedDict, total=False):
-    """Arena/scheduler snapshot; a disabled decoder reports only enabled."""
-
+class CodecStateArenaStats(TypedDict):
     slots: int
     active_slots: int
     bytes_per_slot: int
     total_bytes: int
     exhausted: int
-    enabled: bool
-    left_context_fallbacks: int
-    cuda_graphs: CodecCudaGraphStats
 
 
-class Qwen3TTSCodecStateArena:
-    """Bounded, reusable storage for per-stream incremental Codec state.
+class CodecStateArena:
+    """Bounded, reusable storage for per-stream incremental codec state.
 
-    Every buffer from ``Qwen3TTSIncrementalDecoder.state_spec`` carries a
-    leading slot dimension, so the arena is exactly the state a decode of
-    ``num_slots`` rows would use: ``gather`` selects a cohort's rows into a
-    contiguous state and ``scatter`` writes the advanced state back.
+    Every buffer of the decoder's state spec carries a leading slot dimension, so the arena
+    is exactly the state a decode of num_slots rows would use: gather selects a cohort's
+    rows into a contiguous state and scatter writes the advanced state back.
 
-    Note (Qihao Liu): ``acquire`` zeroes a slot before handing it out, so a
-    reused slot is provably a cold start; ``release`` therefore returns a slot
-    without clearing it.
+    Note (Qihao Liu): acquire zeroes a slot before handing it out, so a reused slot is
+    provably a cold start; release therefore returns a slot without clearing it.
     """
 
     def __init__(
         self,
-        decoder: Qwen3TTSIncrementalDecoder,
+        decoder: IncrementalCodecDecoder,
         *,
         num_slots: int,
         device: torch.device,
         dtype: torch.dtype,
     ) -> None:
         if num_slots <= 0:
-            raise ValueError("Qwen3-TTS codec state arena needs at least one slot")
+            raise ValueError("codec state arena needs at least one slot")
         else:
             pass
         self.decoder = decoder
@@ -116,7 +92,7 @@ class Qwen3TTSCodecStateArena:
             )  # noqa: leading-underscore
 
     def acquire(self) -> int | None:
-        """Take a zeroed slot, or ``None`` when the arena is full."""
+        """Take a zeroed slot, or None when the arena is full."""
         with self.lock:
             if not self.free:
                 self._exhausted_count += 1  # noqa: leading-underscore
@@ -145,9 +121,7 @@ class Qwen3TTSCodecStateArena:
             else:
                 pass
             if slot in self.free:
-                raise RuntimeError(
-                    f"Qwen3-TTS codec state slot {slot} was released twice"
-                )
+                raise RuntimeError(f"codec state slot {slot} was released twice")
             else:
                 pass
             if released is not None:
@@ -170,7 +144,8 @@ class Qwen3TTSCodecStateArena:
             else:
                 pass
 
-    def _buffers(self, state: Qwen3TTSIncrementalCodecState) -> list[torch.Tensor]:
+    @staticmethod
+    def state_buffers(state: IncrementalCodecState) -> list[torch.Tensor]:
         return [
             *state.conv_histories.values(),
             *state.transconv_overlaps.values(),
@@ -182,7 +157,7 @@ class Qwen3TTSCodecStateArena:
         # note (ratish): one multi-tensor launch for the slot's buffers: an initial decode resets
         # a fresh slot per row, and every row of its batch waits for all the resets before launch.
         torch._foreach_zero_(  # noqa: leading-underscore  # upstream spelling, or the public name is already taken
-            [buffer[slot] for buffer in self._buffers(self.storage)]
+            [buffer[slot] for buffer in self.state_buffers(self.storage)]
         )
         self.storage.frame_positions[slot].zero_()
 
@@ -195,7 +170,7 @@ class Qwen3TTSCodecStateArena:
             pass
         count = len(values)
         if count == 0:
-            raise ValueError("Qwen3-TTS codec state arena needs at least one slot")
+            raise ValueError("codec state arena needs at least one slot")
         else:
             pass
         ring = getattr(self.staging, f"{name}_ring", None)
@@ -228,18 +203,18 @@ class Qwen3TTSCodecStateArena:
         """Stage a cohort's slot ids on the device without a host sync."""
         return self.staged("index", slots)
 
-    def gather(self, slots: Sequence[int]) -> Qwen3TTSIncrementalCodecState:
+    def gather(self, slots: Sequence[int]) -> IncrementalCodecState:
         """Select a cohort's rows into one contiguous state."""
         return self.gather_by_index(self.stage_index(slots))
 
-    def gather_by_index(self, index: torch.Tensor) -> Qwen3TTSIncrementalCodecState:
+    def gather_by_index(self, index: torch.Tensor) -> IncrementalCodecState:
         """Select the rows named by a device index tensor.
 
         Capturable: with a static index this is the gather half of a graph
         that reads the arena directly.
         """
         storage = self.storage
-        state = Qwen3TTSIncrementalCodecState(
+        state = IncrementalCodecState(
             transformer_context_length=storage.transformer_context_length,
             frame_positions=storage.frame_positions.index_select(0, index),
         )
@@ -253,21 +228,17 @@ class Qwen3TTSCodecStateArena:
             state.transformer_values[layer_index] = buffer.index_select(0, index)
         return state
 
-    def scatter(
-        self, slots: Sequence[int], state: Qwen3TTSIncrementalCodecState
-    ) -> None:
+    def scatter(self, slots: Sequence[int], state: IncrementalCodecState) -> None:
         """Write an advanced cohort state back into its slots."""
         self.scatter_by_index(self.stage_index(slots), state)
 
     def scatter_by_index(
-        self, index: torch.Tensor, state: Qwen3TTSIncrementalCodecState
+        self, index: torch.Tensor, state: IncrementalCodecState
     ) -> None:
         """Write a cohort state into the rows named by a device index tensor."""
         storage = self.storage
         if state.frame_positions is None:
-            raise RuntimeError(
-                "Qwen3-TTS codec state arena requires per-row frame positions"
-            )
+            raise RuntimeError("codec state arena requires per-row frame positions")
         else:
             pass
         self.copy_rows(storage.frame_positions, index, state.frame_positions)
@@ -297,19 +268,19 @@ class Qwen3TTSCodecStateArena:
         expected = (int(index.shape[0]), *buffer.shape[1:])
         if tuple(rows.shape) != expected:
             raise RuntimeError(
-                f"Qwen3-TTS codec state arena expected {expected} for {key}, got {tuple(rows.shape)}"
+                f"codec state arena expected {expected} for {key}, got {tuple(rows.shape)}"
             )
         else:
             pass
         if rows.dtype != buffer.dtype:
             raise RuntimeError(
-                f"Qwen3-TTS codec state arena expected {buffer.dtype} for {key}, got {rows.dtype}"
+                f"codec state arena expected {buffer.dtype} for {key}, got {rows.dtype}"
             )
         else:
             pass
         buffer.index_copy_(0, index, rows.contiguous())
 
-    def describe(self) -> CodecStateStats:
+    def describe(self) -> CodecStateArenaStats:
         return {
             "slots": self._num_slots,  # noqa: leading-underscore
             "active_slots": self.active_slots(),
@@ -319,4 +290,4 @@ class Qwen3TTSCodecStateArena:
         }
 
 
-__all__ = ["Qwen3TTSCodecStateArena"]
+__all__ = ["CodecStateArena", "CodecStateArenaStats"]

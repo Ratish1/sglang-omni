@@ -29,10 +29,6 @@ from sglang_omni.models.qwen3_tts import request_builders as qwen3_request_build
 from sglang_omni.models.qwen3_tts import stages as qwen3_stages
 from sglang_omni.models.qwen3_tts import streaming_vocoder as qwen3_streaming_vocoder
 from sglang_omni.models.qwen3_tts.config import Qwen3TTSPipelineConfig
-from sglang_omni.models.qwen3_tts.incremental_codec import (
-    Qwen3TTSIncrementalCodecState,
-    Qwen3TTSIncrementalCodecStateSpec,
-)
 from sglang_omni.models.qwen3_tts.incremental_codec_cuda_graph import (
     split_frames_by_width,
 )
@@ -78,6 +74,10 @@ from sglang_omni.scheduling.speaker_cache import (
 from sglang_omni.scheduling.types import RequestOutput
 from sglang_omni.serve.openai_errors import is_bad_request_error
 from sglang_omni.utils import cuda_staging
+from sglang_omni.utils.incremental_codec import (
+    IncrementalCodecState,
+    IncrementalCodecStateSpec,
+)
 from tests.unit_test.fakes import FakeExecutionBridge
 
 
@@ -2543,8 +2543,8 @@ class FakeIncrementalQwen3TTSDecoder:
         self.decode_inputs: list[torch.Tensor] = []
         self.decode_positions: list[list[int]] = []
 
-    def state_spec(self) -> Qwen3TTSIncrementalCodecStateSpec:
-        return Qwen3TTSIncrementalCodecStateSpec(
+    def state_spec(self) -> IncrementalCodecStateSpec:
+        return IncrementalCodecStateSpec(
             conv_histories=(("fake", 1, 2),),
             transconv_overlaps=(),
             num_layers=1,
@@ -2553,11 +2553,9 @@ class FakeIncrementalQwen3TTSDecoder:
             retained_context=2,
         )
 
-    def init_state(
-        self, batch_size: int, *, device, dtype
-    ) -> Qwen3TTSIncrementalCodecState:
+    def init_state(self, batch_size: int, *, device, dtype) -> IncrementalCodecState:
         spec = self.state_spec()
-        state = Qwen3TTSIncrementalCodecState(
+        state = IncrementalCodecState(
             frame_positions=torch.zeros(batch_size, device=device, dtype=torch.long),
             transformer_context_length=spec.retained_context,
         )
@@ -2573,7 +2571,7 @@ class FakeIncrementalQwen3TTSDecoder:
     def decode(
         self,
         codes: torch.Tensor,
-        state: Qwen3TTSIncrementalCodecState,
+        state: IncrementalCodecState,
     ) -> torch.Tensor:
         self.decode_inputs.append(codes.detach().clone())
         if state.frame_positions is not None:
@@ -2594,7 +2592,7 @@ class FakeIncrementalQwen3TTSDecoder:
         self,
         codes: torch.Tensor,
         valid_frames: torch.Tensor,
-        state: Qwen3TTSIncrementalCodecState,
+        state: IncrementalCodecState,
         emit_frames: int,
     ) -> torch.Tensor:
         self.decode_inputs.append(codes.detach().clone())

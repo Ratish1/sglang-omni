@@ -10,14 +10,8 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from sglang_omni.models.qwen3_tts.codec_state_arena import Qwen3TTSCodecStateArena
 from sglang_omni.models.qwen3_tts.incremental_codec import (
-    Qwen3TTSIncrementalCodecState,
     Qwen3TTSIncrementalDecoder,
-    channels_last_causal_conv1d,
-    channels_last_causal_transconv1d,
-    incremental_causal_conv1d,
-    incremental_causal_transconv1d,
     incremental_transformer,
 )
 from sglang_omni.models.qwen3_tts.incremental_codec_cuda_graph import (
@@ -27,6 +21,14 @@ from sglang_omni.models.qwen3_tts.incremental_codec_cuda_graph import (
 from sglang_omni.platforms import current_platform
 from sglang_omni.utils import channels_last_conv, snake_beta
 from sglang_omni.utils.channels_last_conv import channels_last_weight
+from sglang_omni.utils.codec_state_arena import CodecStateArena
+from sglang_omni.utils.incremental_codec import (
+    IncrementalCodecState,
+    channels_last_causal_conv1d,
+    channels_last_causal_transconv1d,
+    incremental_causal_conv1d,
+    incremental_causal_transconv1d,
+)
 
 
 def random_partitions(total: int, seed: int) -> list[int]:
@@ -288,7 +290,7 @@ def test_incremental_causal_conv_matches_whole(
     module = CausalConv(2, 3, 7, dilation=3)
     inputs = torch.randn(1, 2, sum(partitions))
     expected = module(inputs)
-    state = Qwen3TTSIncrementalCodecState()
+    state = IncrementalCodecState()
     actual = []
     offset = 0
     for length in partitions:
@@ -311,7 +313,7 @@ def test_incremental_causal_transconv_matches_whole(
     module = CausalTransConv(2, 3, 8, 4)
     inputs = torch.randn(1, 2, sum(partitions))
     expected = module(inputs)
-    state = Qwen3TTSIncrementalCodecState()
+    state = IncrementalCodecState()
     actual = []
     offset = 0
     for length in partitions:
@@ -336,7 +338,7 @@ def test_channels_last_causal_conv_matches_whole(
     weight = channels_last_weight(module.conv)
     inputs = torch.randn(1, sum(partitions), 2)
     expected = module(inputs.transpose(1, 2)).transpose(1, 2)
-    state = Qwen3TTSIncrementalCodecState()
+    state = IncrementalCodecState()
     actual = []
     offset = 0
     for length in partitions:
@@ -363,7 +365,7 @@ def test_channels_last_causal_transconv_matches_whole(
     weight = channels_last_weight(module.conv)
     inputs = torch.randn(1, sum(partitions), 2)
     expected = module(inputs.transpose(1, 2)).transpose(1, 2)
-    state = Qwen3TTSIncrementalCodecState()
+    state = IncrementalCodecState()
     actual = []
     offset = 0
     for length in partitions:
@@ -392,7 +394,7 @@ def test_incremental_transformer_matches_whole_across_window(
     transformer = Transformer()
     inputs = torch.randn(1, sum(partitions), 2)
     expected = full_transformer(transformer, inputs)
-    state = Qwen3TTSIncrementalCodecState()
+    state = IncrementalCodecState()
     actual = []
     offset = 0
     for length in partitions:
@@ -416,7 +418,7 @@ def test_incremental_transformer_matches_whole_across_window(
 
 
 def test_incremental_codec_state_clone_owns_tensor_storage() -> None:
-    state = Qwen3TTSIncrementalCodecState(
+    state = IncrementalCodecState(
         frame_position=3,
         transformer_context_length=2,
         transformer_keys={0: torch.ones(1, 1, 2, 2)},
@@ -449,7 +451,7 @@ def test_incremental_decoder_matches_whole_for_arbitrary_partitions(
     codes = torch.randint(0, 16, (1, 2, sum(partitions)))
     expected = decoder(codes)
     incremental = Qwen3TTSIncrementalDecoder(decoder)
-    state = Qwen3TTSIncrementalCodecState()
+    state = IncrementalCodecState()
     actual = []
     offset = 0
     for length in partitions:
@@ -470,7 +472,7 @@ def test_incremental_decoder_reference_prefix_matches_generated_waveform() -> No
     reference_frames = 4
     expected = decoder(codes)[..., reference_frames * decoder.total_upsample :]
     incremental = Qwen3TTSIncrementalDecoder(decoder)
-    state = Qwen3TTSIncrementalCodecState()
+    state = IncrementalCodecState()
 
     initial = incremental.decode(codes[..., :7], state)
     initial = initial[..., reference_frames * decoder.total_upsample :]
@@ -484,7 +486,7 @@ def test_incremental_decoder_reference_prefix_matches_generated_waveform() -> No
 def test_incremental_decoder_rejects_malformed_codes() -> None:
     decoder = Decoder()
     incremental = Qwen3TTSIncrementalDecoder(decoder)
-    state = Qwen3TTSIncrementalCodecState()
+    state = IncrementalCodecState()
 
     with pytest.raises(ValueError, match=r"\[B, Q, T\]"):
         incremental.decode(torch.ones(2, 1, dtype=torch.long), state)
@@ -499,22 +501,20 @@ def test_incremental_decoder_batches_rows_sharing_a_position() -> None:
     incremental = Qwen3TTSIncrementalDecoder(decoder)
     codes = torch.randint(0, 16, (3, 2, 6))
 
-    batched_state = Qwen3TTSIncrementalCodecState(
+    batched_state = IncrementalCodecState(
         frame_positions=torch.zeros(3, dtype=torch.long)
     )
     batched = incremental.decode(codes, batched_state)
 
     for row in range(3):
-        single = incremental.decode(
-            codes[row : row + 1], Qwen3TTSIncrementalCodecState()
-        )
+        single = incremental.decode(codes[row : row + 1], IncrementalCodecState())
         torch.testing.assert_close(batched[row : row + 1], single, rtol=2e-5, atol=2e-6)
     assert batched_state.frame_positions.tolist() == [6, 6, 6]
 
 
 def arena_decode(
     incremental: Qwen3TTSIncrementalDecoder,
-    arena: Qwen3TTSCodecStateArena,
+    arena: CodecStateArena,
     slots: list[int],
     positions: list[int],
     codes: torch.Tensor,
@@ -529,9 +529,9 @@ def arena_decode(
 
 def make_arena(
     decoder: Decoder, slots: int = 4
-) -> tuple[Qwen3TTSIncrementalDecoder, Qwen3TTSCodecStateArena]:
+) -> tuple[Qwen3TTSIncrementalDecoder, CodecStateArena]:
     incremental = Qwen3TTSIncrementalDecoder(decoder)
-    arena = Qwen3TTSCodecStateArena(
+    arena = CodecStateArena(
         incremental,
         num_slots=slots,
         device=torch.device("cpu"),
@@ -547,7 +547,7 @@ def test_state_spec_covers_every_key_the_decode_creates() -> None:
     incremental = Qwen3TTSIncrementalDecoder(decoder)
     spec = incremental.state_spec()
 
-    state = Qwen3TTSIncrementalCodecState()
+    state = IncrementalCodecState()
     incremental.decode(torch.randint(0, 16, (1, 2, 5)), state)
 
     assert {key for key, _, _ in spec.conv_histories} == set(state.conv_histories)
@@ -576,7 +576,7 @@ def test_arena_backed_decode_matches_the_lazy_state() -> None:
     codes = torch.randint(0, 16, (1, 2, 11))
     partitions = [2, 1, 5, 3]
 
-    lazy_state = Qwen3TTSIncrementalCodecState()
+    lazy_state = IncrementalCodecState()
     slot = arena.acquire()
     assert slot is not None
 
@@ -647,7 +647,7 @@ def test_tail_frames_bounds_what_the_kept_samples_and_state_read() -> None:
 
     def run_conv_stack(
         changed_frame: int | None,
-    ) -> tuple[torch.Tensor, Qwen3TTSIncrementalCodecState]:
+    ) -> tuple[torch.Tensor, IncrementalCodecState]:
         inputs = hidden_states.clone()
         if changed_frame is not None:
             inputs[..., changed_frame] += 0.05
@@ -727,7 +727,6 @@ def test_tail_decode_matches_each_row_decoded_whole() -> None:
 def test_incremental_codec_cuda_graph_matches_eager_state(
     mode: str, batch_size: int, batch_bucket: int
 ) -> None:
-    from sglang_omni.models.qwen3_tts.codec_state_arena import Qwen3TTSCodecStateArena
     from sglang_omni.models.qwen3_tts.incremental_codec_cuda_graph import (
         Qwen3TTSIncrementalCodecCudaGraphRunner,
     )
@@ -736,7 +735,7 @@ def test_incremental_codec_cuda_graph_matches_eager_state(
     device = torch.device("cuda", torch.cuda.current_device())
     decoder = Decoder().to(device).eval()
     incremental = Qwen3TTSIncrementalDecoder(decoder)
-    arena = Qwen3TTSCodecStateArena(
+    arena = CodecStateArena(
         incremental, num_slots=batch_bucket + 1, device=device, dtype=torch.float32
     )
     # note (luojiaxuan): rows start at different positions so the replay is
@@ -808,7 +807,6 @@ def test_incremental_codec_cuda_graph_matches_eager_state(
 @pytest.mark.accelerator
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 def test_incremental_codec_cuda_graph_alternates_shared_pool_keys() -> None:
-    from sglang_omni.models.qwen3_tts.codec_state_arena import Qwen3TTSCodecStateArena
     from sglang_omni.models.qwen3_tts.incremental_codec_cuda_graph import (
         Qwen3TTSIncrementalCodecCudaGraphRunner,
     )
@@ -817,7 +815,7 @@ def test_incremental_codec_cuda_graph_alternates_shared_pool_keys() -> None:
     device = torch.device("cuda", torch.cuda.current_device())
     decoder = Decoder().to(device).eval()
     incremental = Qwen3TTSIncrementalDecoder(decoder)
-    arena = Qwen3TTSCodecStateArena(
+    arena = CodecStateArena(
         incremental, num_slots=5, device=device, dtype=torch.float32
     )
     runner = Qwen3TTSIncrementalCodecCudaGraphRunner(
@@ -881,7 +879,7 @@ def test_incremental_codec_cuda_graph_runners_alternate_in_one_pool() -> None:
     device = torch.device("cuda", torch.cuda.current_device())
     decoder = Decoder().to(device).eval()
     incremental = Qwen3TTSIncrementalDecoder(decoder)
-    arena = Qwen3TTSCodecStateArena(
+    arena = CodecStateArena(
         incremental, num_slots=5, device=device, dtype=torch.float32
     )
     graph_pool = IncrementalCodecGraphPool(stream_priority=0)
@@ -1007,8 +1005,8 @@ def test_arena_reports_exhaustion_and_retirement() -> None:
     assert arena.describe()["bytes_per_slot"] == arena.bytes_per_slot
 
 
-def fresh_state(rows: int) -> Qwen3TTSIncrementalCodecState:
-    state = Qwen3TTSIncrementalCodecState()
+def fresh_state(rows: int) -> IncrementalCodecState:
+    state = IncrementalCodecState()
     state.frame_positions = torch.zeros(rows, dtype=torch.long)
     return state
 
@@ -1037,7 +1035,7 @@ def test_incremental_decoder_routes_only_precompiled_shapes_to_the_kernel(
 
     codes = torch.randint(0, 16, (2, 2, 9))
     expected = decoder(codes)
-    state = Qwen3TTSIncrementalCodecState()
+    state = IncrementalCodecState()
     state.frame_positions = torch.zeros(2, dtype=torch.long)
     actual = torch.cat(
         [
@@ -1051,7 +1049,7 @@ def test_incremental_decoder_routes_only_precompiled_shapes_to_the_kernel(
     assert state.frame_position == 9
     assert state.transformer_context_length == decoder.pre_transformer.window_size - 1
 
-    other = Qwen3TTSIncrementalCodecState()
+    other = IncrementalCodecState()
     other.frame_positions = torch.zeros(2, dtype=torch.long)
     incremental.decode(codes[..., :3], other)
     assert calls == [(2, 3)] * 4, "eager decodes never enter the kernel"
@@ -1063,7 +1061,6 @@ def test_incremental_decoder_routes_only_precompiled_shapes_to_the_kernel(
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 def test_arena_bound_graph_replays_match_eager_and_advance_the_arena() -> None:
     """A captured graph gathers, decodes and scatters arena rows exactly like the eager path."""
-    from sglang_omni.models.qwen3_tts.codec_state_arena import Qwen3TTSCodecStateArena
     from sglang_omni.models.qwen3_tts.incremental_codec_cuda_graph import (
         Qwen3TTSIncrementalCodecCudaGraphRunner,
     )
@@ -1072,7 +1069,7 @@ def test_arena_bound_graph_replays_match_eager_and_advance_the_arena() -> None:
     device = torch.device("cuda", torch.cuda.current_device())
     decoder = Decoder().to(device)
     incremental = Qwen3TTSIncrementalDecoder(decoder)
-    arena = Qwen3TTSCodecStateArena(
+    arena = CodecStateArena(
         incremental, num_slots=3, device=device, dtype=torch.float32
     )
     runner = Qwen3TTSIncrementalCodecCudaGraphRunner(
@@ -1095,7 +1092,7 @@ def test_arena_bound_graph_replays_match_eager_and_advance_the_arena() -> None:
     codes = torch.randint(0, 16, (2, 2, 6), device=device)
 
     # note (luojiaxuan): eager reference on private copies of the same zeroed rows
-    reference = Qwen3TTSIncrementalCodecState()
+    reference = IncrementalCodecState()
     reference.frame_positions = torch.zeros(2, dtype=torch.long, device=device)
     expected = torch.cat(
         [incremental.decode(codes[..., i : i + 2], reference) for i in range(0, 6, 2)],
@@ -1152,7 +1149,7 @@ def test_cuda_decoder_runs_channels_last_and_leaves_the_shared_weights(
     with torch.inference_mode():
         expected = decoder(codes)
         incremental = Qwen3TTSIncrementalDecoder(decoder)
-        state = Qwen3TTSIncrementalCodecState()
+        state = IncrementalCodecState()
         actual = torch.cat(
             [
                 incremental.decode(part, state)
@@ -1179,7 +1176,7 @@ def test_decoder_keeps_the_channels_first_path_off_the_cuda_platform(
     with torch.inference_mode():
         expected = decoder(codes)
         incremental = Qwen3TTSIncrementalDecoder(decoder)
-        state = Qwen3TTSIncrementalCodecState()
+        state = IncrementalCodecState()
         actual = torch.cat(
             [
                 incremental.decode(part, state)
@@ -1213,7 +1210,7 @@ def test_windowed_replays_match_one_eager_decode_and_its_arena_state(
     device = torch.device("cuda", torch.cuda.current_device())
     decoder = Decoder().to(device).eval()
     incremental = Qwen3TTSIncrementalDecoder(decoder)
-    arena = Qwen3TTSCodecStateArena(
+    arena = CodecStateArena(
         incremental, num_slots=4, device=device, dtype=torch.float32
     )
     slots = [arena.acquire(), arena.acquire()]
@@ -1308,7 +1305,7 @@ def test_tail_graph_replays_match_eager_tail_decodes_and_reuse_their_buffers(
     device = torch.device("cuda", torch.cuda.current_device())
     decoder = Decoder().to(device).eval()
     incremental = Qwen3TTSIncrementalDecoder(decoder)
-    arena = Qwen3TTSCodecStateArena(
+    arena = CodecStateArena(
         incremental, num_slots=10, device=device, dtype=torch.float32
     )
     tail_frames = incremental.tail_frames(1)
@@ -1366,7 +1363,7 @@ def test_tail_graph_replays_match_eager_tail_decodes_and_reuse_their_buffers(
 def test_tail_graph_runner_keeps_only_widths_that_hold_a_tail() -> None:
     device = torch.device("cuda", torch.cuda.current_device())
     incremental = Qwen3TTSIncrementalDecoder(Decoder().to(device).eval())
-    arena = Qwen3TTSCodecStateArena(
+    arena = CodecStateArena(
         incremental, num_slots=2, device=device, dtype=torch.float32
     )
     emit_frames = 4
@@ -1416,10 +1413,6 @@ def test_real_tts_decoder_and_incremental_pcm_equal() -> None:
     from sglang_omni.models.qwen3_tts.compat import (
         apply_qwen_tts_transformers_compatibility_patches,
     )
-    from sglang_omni.models.qwen3_tts.incremental_codec import (
-        Qwen3TTSIncrementalCodecState,
-        Qwen3TTSIncrementalDecoder,
-    )
 
     apply_qwen_tts_transformers_compatibility_patches()
     from qwen_tts import Qwen3TTSTokenizer
@@ -1444,7 +1437,7 @@ def test_real_tts_decoder_and_incremental_pcm_equal() -> None:
     with torch.inference_mode():
         expected = [decoder(value).clone() for value in codes]
         incremental = Qwen3TTSIncrementalDecoder(decoder)
-        state = Qwen3TTSIncrementalCodecState()
+        state = IncrementalCodecState()
         parts = codes[1].split((2, 6, 8, 8), dim=-1)
         incremental_expected = [
             incremental.decode(part, state).clone() for part in parts
@@ -1454,6 +1447,6 @@ def test_real_tts_decoder_and_incremental_pcm_equal() -> None:
         for value, pcm in zip(codes, expected):
             assert torch.equal(decoder(value), pcm), tuple(value.shape)
         incremental = Qwen3TTSIncrementalDecoder(decoder)
-        state = Qwen3TTSIncrementalCodecState()
+        state = IncrementalCodecState()
         for part, pcm in zip(parts, incremental_expected):
             assert torch.equal(incremental.decode(part, state), pcm)

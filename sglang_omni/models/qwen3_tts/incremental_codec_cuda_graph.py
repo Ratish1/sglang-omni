@@ -14,19 +14,17 @@ from typing import Literal, TypedDict
 
 import torch
 
-from sglang_omni.models.qwen3_tts.codec_state_arena import Qwen3TTSCodecStateArena
-from sglang_omni.models.qwen3_tts.incremental_codec import (
-    Qwen3TTSIncrementalCodecState,
-    Qwen3TTSIncrementalDecoder,
-)
+from sglang_omni.models.qwen3_tts.incremental_codec import Qwen3TTSIncrementalDecoder
 from sglang_omni.platforms import current_platform
 from sglang_omni.platforms.device_graph import (
     DeviceGraphBackend,
     DeviceGraphPool,
     ReplayableGraph,
 )
+from sglang_omni.utils.codec_state_arena import CodecStateArena
 from sglang_omni.utils.device import device_guard, supports_device_streams
 from sglang_omni.utils.gpu_memory import format_bytes_gib
+from sglang_omni.utils.incremental_codec import IncrementalCodecState
 
 logger = logging.getLogger(__name__)
 
@@ -41,6 +39,30 @@ class IncrementalCodecGraphStats(TypedDict):
     memory: dict[str, int | dict[str, int]]
     retained_capture_resource_sets: int
     runtime: dict[str, int | dict[str, int]]
+
+
+class DisabledCodecGraphStats(TypedDict):
+    enabled: bool
+
+
+class CodecCudaGraphStats(TypedDict):
+    cold: IncrementalCodecGraphStats | DisabledCodecGraphStats
+    window: IncrementalCodecGraphStats | DisabledCodecGraphStats
+    tail: IncrementalCodecGraphStats | DisabledCodecGraphStats
+    warm: list[IncrementalCodecGraphStats]
+
+
+class CodecStateStats(TypedDict, total=False):
+    """Arena/scheduler snapshot; a disabled decoder reports only enabled."""
+
+    slots: int
+    active_slots: int
+    bytes_per_slot: int
+    total_bytes: int
+    exhausted: int
+    enabled: bool
+    left_context_fallbacks: int
+    cuda_graphs: CodecCudaGraphStats
 
 
 @dataclass(frozen=True, slots=True)
@@ -69,7 +91,7 @@ class CaptureResourceSet:
     keepalives: list[
         torch.Tensor
         | ReplayableGraph
-        | Qwen3TTSIncrementalCodecState
+        | IncrementalCodecState
         | dict[IncrementalCodecGraphKey, CapturedIncrementalCodecGraph]
     ] = field(default_factory=list)
 
@@ -135,7 +157,7 @@ class Qwen3TTSIncrementalCodecCudaGraphRunner:
         min_free_gb: float = 3.0,
         enabled: bool = True,
         compile_fresh_frames: Sequence[int] = (),
-        arena: Qwen3TTSCodecStateArena,
+        arena: CodecStateArena,
         graph_pool: IncrementalCodecGraphPool,
         emit_frames: int = 0,
     ) -> None:
@@ -411,7 +433,7 @@ class Qwen3TTSIncrementalCodecCudaGraphRunner:
         self,
         codes: torch.Tensor,
         valid_frames: torch.Tensor | None,
-        state: Qwen3TTSIncrementalCodecState,
+        state: IncrementalCodecState,
         *,
         compiled: bool,
     ) -> torch.Tensor:

@@ -16,15 +16,9 @@ from typing import TYPE_CHECKING, Literal, Mapping, TypeVar, overload
 import numpy as np
 import torch
 
-from sglang_omni.models.qwen3_tts.codec_state_arena import (
-    CodecStateStats,
-    Qwen3TTSCodecStateArena,
-)
-from sglang_omni.models.qwen3_tts.incremental_codec import (
-    Qwen3TTSIncrementalCodecState,
-    Qwen3TTSIncrementalDecoder,
-)
+from sglang_omni.models.qwen3_tts.incremental_codec import Qwen3TTSIncrementalDecoder
 from sglang_omni.models.qwen3_tts.incremental_codec_cuda_graph import (
+    CodecStateStats,
     IncrementalCodecGraphPool,
     Qwen3TTSIncrementalCodecCudaGraphRunner,
 )
@@ -47,8 +41,10 @@ from sglang_omni.scheduling.streaming_vocoder import (
     vocoder_decode_stream_priority,
 )
 from sglang_omni.utils.audio_payload import audio_waveform_payload
+from sglang_omni.utils.codec_state_arena import CodecStateArena
 from sglang_omni.utils.cuda_staging import GrowablePinnedBuffer, PinnedTransferSlot
 from sglang_omni.utils.device import supports_device_streams
+from sglang_omni.utils.incremental_codec import IncrementalCodecState
 from sglang_omni.utils.snake_beta import fuse_vocoder_decoder
 
 if TYPE_CHECKING:
@@ -136,7 +132,7 @@ class Qwen3TTSStreamState:
     followup_pending: bool = False
     final_pending: bool = False
     playback_deadline_s: float = 0.0
-    incremental_codec_state: Qwen3TTSIncrementalCodecState | None = None
+    incremental_codec_state: IncrementalCodecState | None = None
     incremental_codec_fallback: bool = False
     codec_slot: int | None = None
     codec_frame_position: int = 0
@@ -197,12 +193,12 @@ class IncrementalDecodeBatch:
     holds reference-prefixed first chunks of different widths, decoded in one replay."""
 
     decoder: Qwen3TTSIncrementalDecoder
-    arena: Qwen3TTSCodecStateArena
+    arena: CodecStateArena
     slots: list[int]
-    cohort_state: Qwen3TTSIncrementalCodecState | None = None
+    cohort_state: IncrementalCodecState | None = None
     tail_runner: Qwen3TTSIncrementalCodecCudaGraphRunner | None = None
 
-    def gathered(self) -> Qwen3TTSIncrementalCodecState:
+    def gathered(self) -> IncrementalCodecState:
         """The cohort's rows on the host-driven path; the graph path skips this."""
         if self.cohort_state is None:
             self.cohort_state = self.arena.gather(self.slots)
@@ -923,12 +919,12 @@ class Qwen3TTSStreamingVocoderScheduler(
 
     def build_codec_arena(
         self, num_slots: int, *, dtype: torch.dtype
-    ) -> Qwen3TTSCodecStateArena | None:
+    ) -> CodecStateArena | None:
         if self.incremental_decoder is None:
             return None
         else:
             pass
-        arena = Qwen3TTSCodecStateArena(
+        arena = CodecStateArena(
             self.incremental_decoder,
             num_slots=num_slots,
             device=self.device,
@@ -1094,30 +1090,31 @@ class Qwen3TTSStreamingVocoderScheduler(
             return {"enabled": False}
         else:
             pass
-        stats = self.codec_arena.describe()
-        stats["enabled"] = True
-        stats["left_context_fallbacks"] = self.codec_fallback_count
-        stats["cuda_graphs"] = {
-            "cold": (
-                self.initial_incremental_decode_graphs.stats()
-                if self.initial_incremental_decode_graphs is not None
-                else {"enabled": False}
-            ),
-            "window": (
-                self.initial_window_decode_graphs.stats()
-                if self.initial_window_decode_graphs is not None
-                else {"enabled": False}
-            ),
-            "tail": (
-                self.initial_tail_decode_graphs.stats()
-                if self.initial_tail_decode_graphs is not None
-                else {"enabled": False}
-            ),
-            "warm": [
-                holder.stats() for holder in self.followup_incremental_graph_holders
-            ],
+        return {
+            **self.codec_arena.describe(),
+            "enabled": True,
+            "left_context_fallbacks": self.codec_fallback_count,
+            "cuda_graphs": {
+                "cold": (
+                    self.initial_incremental_decode_graphs.stats()
+                    if self.initial_incremental_decode_graphs is not None
+                    else {"enabled": False}
+                ),
+                "window": (
+                    self.initial_window_decode_graphs.stats()
+                    if self.initial_window_decode_graphs is not None
+                    else {"enabled": False}
+                ),
+                "tail": (
+                    self.initial_tail_decode_graphs.stats()
+                    if self.initial_tail_decode_graphs is not None
+                    else {"enabled": False}
+                ),
+                "warm": [
+                    holder.stats() for holder in self.followup_incremental_graph_holders
+                ],
+            },
         }
-        return stats
 
     def maybe_log_codec_stats(self) -> None:
         """Log arena usage at most once per interval.
@@ -1451,7 +1448,7 @@ class Qwen3TTSStreamingVocoderScheduler(
 
     def decode_incremental_eager(
         self, state: Qwen3TTSStreamState
-    ) -> tuple[Qwen3TTSDecodePlan, Qwen3TTSIncrementalCodecState, torch.Tensor] | None:
+    ) -> tuple[Qwen3TTSDecodePlan, IncrementalCodecState, torch.Tensor] | None:
         available_generated_frames = state.total_frames - state.ref_frames
         if available_generated_frames <= state.emitted_generated_frames:
             return None
@@ -1465,7 +1462,7 @@ class Qwen3TTSStreamingVocoderScheduler(
                 )
             else:
                 pass
-            candidate_state = Qwen3TTSIncrementalCodecState()
+            candidate_state = IncrementalCodecState()
         else:
             candidate_state = committed_state.clone()
         consumed_frames = candidate_state.frame_position

@@ -8,7 +8,6 @@ import pytest
 import torch
 
 from sglang_omni.models.qwen3_tts import incremental_codec_cuda_graph
-from sglang_omni.models.qwen3_tts.incremental_codec import Qwen3TTSIncrementalCodecState
 from sglang_omni.models.qwen3_tts.incremental_codec_cuda_graph import (
     CaptureResourceSet,
     IncrementalCodecGraphKey,
@@ -21,6 +20,7 @@ from sglang_omni.models.qwen3_tts.streaming_vocoder import (
     IncrementalDecodePlan,
     Qwen3TTSStreamingVocoderScheduler,
 )
+from sglang_omni.utils.incremental_codec import IncrementalCodecState
 from tests.unit_test.fixtures.accelerator import require_device_streams
 
 
@@ -60,9 +60,9 @@ def make_state(
     *,
     offset: int = 0,
     device: torch.device | str = "cpu",
-) -> Qwen3TTSIncrementalCodecState:
+) -> IncrementalCodecState:
     positions = torch.arange(offset, offset + rows, dtype=torch.long, device=device)
-    return Qwen3TTSIncrementalCodecState(
+    return IncrementalCodecState(
         transformer_context_length=2,
         frame_positions=positions,
         transformer_keys={
