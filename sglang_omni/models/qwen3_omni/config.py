@@ -34,8 +34,9 @@ TALKER_START_MIN_CHUNKS = 1
 
 ENABLE_TALKER_START_TOPOLOGY = False
 
-# note (ratish): the talker's default cap on running requests; code2wav keeps one codec
-# state slot per stream the talkers can run at once.
+# note (ratish): the talker factory's default cap on running requests
+# (create_talker_ar_executor_from_config, which this module must not import: it loads in the
+# parent process); code2wav keeps one codec state slot per stream the talkers can run at once.
 TALKER_MAX_RUNNING_REQUESTS = 32
 
 # SGLang reads this when DeepGEMM compile utilities are imported. Qwen AR
