@@ -40,6 +40,7 @@ from sglang_omni.proto.request import StagePayload
 from sglang_omni.scheduling.threaded_simple_scheduler import ThreadedSimpleScheduler
 from sglang_omni.utils.checkpoint import resolve_checkpoint as _resolve_checkpoint
 from sglang_omni.utils.device import resolve_concrete_device
+from sglang_omni.utils.hf import use_text_rope
 from sglang_omni.utils.json import JsonValue
 
 if TYPE_CHECKING:
@@ -160,6 +161,11 @@ def register_qwen3_tts_hf_config() -> None:
             original_init(self, *args, **kwargs)
             talker_config = getattr(self, "talker_config", None)
             if talker_config is not None:
+                # note (ratish): the talker's three MRoPE position rows are always
+                # identical, so it rotates as text RoPE; dropping the MRoPE keys
+                # here, before SGLang reads the text config, keeps SGLang from
+                # building and copying MRoPE positions for it.
+                use_text_rope(talker_config)
                 self.text_config = talker_config
             else:
                 pass

@@ -723,74 +723,37 @@ def test_qwen3_tts_small_base_prefill_covers_maximum_token_budget(
     assert max(defaults["cuda_graph_bs_prefill"]) == defaults["max_prefill_tokens"]
 
 
-def test_qwen3_tts_before_prefill_mirrors_positions_into_mrope() -> None:
-    from sglang_omni.models.qwen3_tts.model_runner import ensure_mrope_positions
+def test_qwen3_tts_talker_config_rotates_as_text_rope() -> None:
+    qwen3_stages.register_qwen3_tts_hf_config()
+    from qwen_tts.core.models import Qwen3TTSConfig
 
-    batch = SimpleNamespace(
-        positions=torch.arange(7, dtype=torch.int64),
-        mrope_positions=None,
+    config = Qwen3TTSConfig(
+        talker_config={
+            "rope_scaling": {
+                "interleaved": True,
+                "mrope_section": [24, 20, 20],
+                "rope_type": "default",
+                "type": "default",
+            },
+            "rope_theta": 1_000_000,
+        }
     )
-    ensure_mrope_positions(
-        batch, prefill_graph_runner=SimpleNamespace(can_run_graph=lambda _: True)
-    )
-
-    assert batch.mrope_positions.shape == (3, 7)
-    assert torch.equal(batch.mrope_positions[0], batch.positions)
-    assert torch.equal(batch.mrope_positions[1], batch.positions)
-    assert torch.equal(batch.mrope_positions[2], batch.positions)
-
-
-def test_qwen3_tts_mrope_mirror_is_scoped_to_the_graphed_path() -> None:
-    """A 2-D positions tensor picks a different CUDA kernel.
-
-    ``MRotaryEmbedding.forward_cuda`` dispatches 1-D positions to
-    ``forward_native`` and 2-D positions to the fused ``forward_triton``, so
-    mirroring an eager prefill would move it to another kernel for no reason.
-    """
-    from sglang_omni.models.qwen3_tts.model_runner import ensure_mrope_positions
-
-    def make_batch():
-        return SimpleNamespace(
-            positions=torch.arange(7, dtype=torch.int64),
-            mrope_positions=None,
+    rope_dicts = [
+        parameters
+        for parameters in (
+            config.text_config.rope_parameters,
+            config.text_config.rope_scaling,
         )
+        if isinstance(parameters, dict)
+    ]
 
-    # note (luojiaxuan): SGLang hands out an EagerRunner rather than None when
-    # prefill graphs are disabled, so the runner's own verdict is what scopes
-    # the mirror.
-    batch = make_batch()
-    ensure_mrope_positions(
-        batch, prefill_graph_runner=SimpleNamespace(can_run_graph=lambda _: False)
-    )
-    assert batch.mrope_positions is None
-
-    batch = make_batch()
-    ensure_mrope_positions(batch, prefill_graph_runner=None)
-    assert batch.mrope_positions is None
-
-    batch = make_batch()
-    ensure_mrope_positions(
-        batch, prefill_graph_runner=SimpleNamespace(can_run_graph=lambda _: True)
-    )
-    assert batch.mrope_positions is not None
-    assert batch.mrope_positions.shape == (3, 7)
-    assert torch.equal(batch.mrope_positions[0], batch.positions)
-
-
-def test_qwen3_tts_mrope_mirror_leaves_real_positions_alone() -> None:
-    """A batch that already carries mrope positions owns them."""
-    from sglang_omni.models.qwen3_tts.model_runner import ensure_mrope_positions
-
-    supplied = torch.arange(21, dtype=torch.int64).reshape(3, 7)
-    batch = SimpleNamespace(
-        positions=torch.zeros(7, dtype=torch.int64),
-        mrope_positions=supplied,
-    )
-    ensure_mrope_positions(
-        batch, prefill_graph_runner=SimpleNamespace(can_run_graph=lambda _: True)
-    )
-
-    assert batch.mrope_positions is supplied
+    assert config.text_config is config.talker_config
+    assert rope_dicts
+    for parameters in rope_dicts:
+        assert not {"interleaved", "mrope_interleaved", "mrope_section"} & set(
+            parameters
+        )
+        assert parameters["rope_type"] == "default"
 
 
 def test_qwen3_tts_factory_forwards_coalescing_params_to_builder(
@@ -7432,23 +7395,16 @@ def test_qwen3_tts_prefill_attaches_runner_composed_embeddings_to_sidecar(
     runner.model = SimpleNamespace(
         prepare_decode_buffers=lambda requests: calls.append("prepare")
     )
-    # note (luojiaxuan): the runner accepts this batch, so the mirror applies.
-    runner.tp_worker = SimpleNamespace(
-        model_runner=SimpleNamespace(
-            prefill_cuda_graph_runner=SimpleNamespace(can_run_graph=lambda _: True)
-        )
-    )
     runner.build_prefill_input_embeds = (
         lambda forward_batch, requests: calls.append("embeds") or input_embeds
     )
     mm_inputs = [object()]
-    positions = torch.arange(3)
     forward_batch = SimpleNamespace(
         input_ids=torch.zeros(3, dtype=torch.long),
         input_embeds=None,
         replace_embeds=None,
         mm_inputs=mm_inputs,
-        positions=positions,
+        positions=torch.arange(3),
         mrope_positions=None,
     )
 
@@ -7460,9 +7416,7 @@ def test_qwen3_tts_prefill_attaches_runner_composed_embeddings_to_sidecar(
     assert forward_batch.input_embeds is None
     assert forward_batch.mm_inputs is mm_inputs
     assert calls == ["prepare", "embeds"]
-    assert forward_batch.mrope_positions.shape == (3, 3)
-    for row in forward_batch.mrope_positions:
-        assert torch.equal(row, positions)
+    assert forward_batch.mrope_positions is None
 
 
 def test_qwen3_tts_prefill_uses_shared_late_bound_forward_transport(
@@ -8536,11 +8490,42 @@ def test_qwen3_tts_talker_forward_accepts_shared_prefill_request_ids(
     )
 
     assert received["input_embeds"] is input_embeds
-    assert Qwen3TTSTalker.is_mrope_enabled is True
     torch.testing.assert_close(
         result.next_token_logits,
         input_embeds[-1:] + 1,
     )
+
+
+def test_qwen3_tts_talker_forward_rotates_on_the_given_positions(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    install_fake_sglang(monkeypatch)
+    from sglang_omni.models.qwen3_tts.sglang_model import Qwen3TTSTalker
+
+    received: dict[str, object] = {}
+
+    def backbone(**kwargs):
+        received.update(kwargs)
+        return kwargs["input_embeds"]
+
+    talker = Qwen3TTSTalker.__new__(Qwen3TTSTalker)
+    talker.model = backbone
+    talker.codec_head = lambda hidden_states: (hidden_states, None)
+    positions = torch.arange(3)
+
+    Qwen3TTSTalker.forward(
+        talker,
+        input_ids=torch.zeros(3, dtype=torch.long),
+        positions=positions,
+        forward_batch=SimpleNamespace(
+            mrope_positions=torch.zeros(3, 3, dtype=torch.long),
+            forward_mode=SimpleNamespace(is_extend=lambda: True),
+            extend_seq_lens=torch.tensor([3]),
+        ),
+        input_embeds=torch.ones(3, 2),
+    )
+
+    assert received["positions"] is positions
 
 
 def make_prep_talker(monkeypatch, device=None, max_batch=2):
