@@ -2296,11 +2296,7 @@ class Qwen3TTSTalker(Qwen3TTSPromptBuilderMixin, nn.Module):
                 pass
             param = params_dict.get(target)
             if param is not None:
-                weight_loader = getattr(param, "weight_loader", None)
-                if weight_loader is None:
-                    param.data.copy_(loaded_weight)
-                else:
-                    weight_loader(param, loaded_weight)
+                param.weight_loader(param, loaded_weight)
             else:
                 pass
         self.post_load_weights()
