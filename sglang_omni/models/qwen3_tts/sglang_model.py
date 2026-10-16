@@ -601,7 +601,6 @@ class Qwen3TTSPromptBuilderMixin:
                 torch.tensor([codec_prefill], device=self.device, dtype=torch.long)
             )
         speaker_ids = self.config.spk_id or {}
-        feedback_buffer = self.model.feedback_buffer
         return Qwen3TTSPromptConstants(
             tts_bos_embed=tts_bos_embed,
             tts_eos_embed=tts_eos_embed,
@@ -633,7 +632,9 @@ class Qwen3TTSPromptBuilderMixin:
             )
             .squeeze(0)
             .squeeze(0)
-            .to(device=feedback_buffer.device, dtype=feedback_buffer.dtype),
+            .to(
+                device=codec_embedding.weight.device, dtype=codec_embedding.weight.dtype
+            ),
         )
 
     def resolve_language_id(
