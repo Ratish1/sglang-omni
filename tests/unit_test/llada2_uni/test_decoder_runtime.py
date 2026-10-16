@@ -160,7 +160,10 @@ def test_review_initialization_failure_releases_partial_groups(monkeypatch, boun
         with runtime.initialize_decoder_runtime("unused", gpu_id=0):
             assert torch.distributed.is_initialized()
     finally:
-        ps.destroy_model_parallel()
-        ps.destroy_distributed_environment()
+        if torch.distributed.is_initialized():
+            ps.destroy_model_parallel()
+            ps.destroy_distributed_environment()
+        else:
+            pass
         server_args.set_global_server_args(None)
         runtime_context.reset_context()
