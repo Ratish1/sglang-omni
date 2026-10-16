@@ -7732,6 +7732,7 @@ def test_qwen3_tts_steady_decode_reports_cuda_graph_ready(
     runner.tp_worker = FakeTPWorker()
     runner.output_processor = FakeOutputProcessor()
     runner.device = torch.device("cpu")
+    runner.row_ids_cache = None
     runner.model = runner.tp_worker.model_runner.model
     runner.bind_execution_bridge(FakeExecutionBridge())
 
