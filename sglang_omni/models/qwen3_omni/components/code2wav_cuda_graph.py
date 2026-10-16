@@ -289,14 +289,6 @@ class Code2WavCudaGraphRunner:
         self.device_api = device_api
         self.incremental_decoder = incremental_decoder
         self.codec_arena = codec_arena
-        if (incremental_decoder is None or codec_arena is None) and any(
-            key.decode != "window" for key in graph_keys + best_effort_keys
-        ):
-            raise ValueError(
-                "Code2Wav first and next graphs need the incremental decoder and its arena"
-            )
-        else:
-            pass
         if self.device.index is None:
             raise ValueError(
                 f"Code2Wav graphs require a concrete device, got {self.device}"
@@ -857,10 +849,6 @@ class Code2WavCudaGraphRunner:
             raise RuntimeError(
                 f"Code2Wav device graph runner/model belongs to PID {self.owner_pid}, but was used in PID {current_pid}; it must be rebuilt in a spawned process before inference"
             )
-        else:
-            pass
-        if len(slots) != int(codes.shape[0]):
-            raise ValueError("Code2Wav incremental decode needs one slot per code row")
         else:
             pass
         if not self.enabled:
