@@ -113,14 +113,24 @@ class PackedRows:
         return sum(self.lengths)
 
 
+def copy_to_device(host_tensor: torch.Tensor, device: torch.device) -> torch.Tensor:
+    """The host tensor on the device. On CUDA it goes through pinned memory without waiting
+    for the stream, and the host allocator keeps the pinned block until the copy completes.
+    """
+    if device.type == "cuda":
+        return host_tensor.pin_memory().to(device, non_blocking=True)
+    else:
+        return host_tensor.to(device)
+
+
 def pack_rows(lengths: Sequence[int], device: torch.device) -> PackedRows:
     lengths = tuple(int(length) for length in lengths)
     starts_host = F.pad(torch.tensor(lengths, dtype=torch.int64).cumsum(0), (1, 0))
-    starts = starts_host.to(device)
+    starts = copy_to_device(starts_host, device)
     total = int(starts_host[-1])
     row_ids = torch.repeat_interleave(
         torch.arange(len(lengths), device=device),
-        torch.tensor(lengths, dtype=torch.int64, device=device),
+        copy_to_device(torch.tensor(lengths, dtype=torch.int64), device),
         output_size=total,
     )
     frames = torch.arange(total, device=device)
@@ -197,7 +207,7 @@ class RowAttention:
         self.heads = heads
         width = rows.width
         device = rows.row_ids.device
-        lengths = torch.tensor(rows.lengths, device=device)
+        lengths = copy_to_device(torch.tensor(rows.lengths), device)
         keys = torch.arange(width, device=device).unsqueeze(0) < lengths.unsqueeze(1)
         if chunk_size is None:
             mask = keys.unsqueeze(1).expand(-1, width, -1)
@@ -236,12 +246,14 @@ class RaggedRowAttention:
         self.head_dim = head_dim
         device = rows.row_ids.device
         segment_rows, segment_ends, offsets = chunk_segments(rows.lengths, chunk_size)
-        self.cache_seqlens = torch.tensor(
-            segment_ends, dtype=torch.int32, device=device
+        self.cache_seqlens = copy_to_device(
+            torch.tensor(segment_ends, dtype=torch.int32), device
         )
-        self.cu_seqlens_q = torch.tensor(offsets, dtype=torch.int32, device=device)
+        self.cu_seqlens_q = copy_to_device(
+            torch.tensor(offsets, dtype=torch.int32), device
+        )
         self.max_seqlen_q = max(end - start for start, end in pairwise(offsets))
-        starts = rows.starts_host[list(segment_rows)].to(device)
+        starts = copy_to_device(rows.starts_host[list(segment_rows)], device)
         # note (ratish): FA3 page ids must land inside the packed keys; pad with page 0.
         page = torch.arange(max(segment_ends), dtype=torch.int32, device=device)
         self.page_table = torch.where(

@@ -33,6 +33,7 @@ from sglang_omni.platforms.xpu import XPUOmniPlatform
 from sglang_omni.proto import OmniRequest, StagePayload
 from sglang_omni.scheduling.message import IncomingMessage
 from tests.unit_test.fun_cosyvoice3.test_flow_batch import FakeFlow as _PackedFlow
+from tests.unit_test.fun_cosyvoice3.test_flow_batch import make_input, make_packed
 
 
 class FakeF0Predictor(torch.nn.Module):
@@ -1504,7 +1505,9 @@ class HiftFlowStub:
 
     @property
     def decoder(self) -> SimpleNamespace:
-        return SimpleNamespace(estimator=torch.nn.Identity())
+        return SimpleNamespace(
+            estimator=torch.nn.Identity(), rand_noise=torch.zeros(1, 80, 1)
+        )
 
 
 def make_causal_hift(voiced_threshold: float) -> torch.nn.Module:
@@ -1540,6 +1543,59 @@ def make_causal_hift(voiced_threshold: float) -> torch.nn.Module:
     stages.keep_hift_constants_on_device(hift, "cuda")
     stages.patch_causal_conv_cache()
     return hift
+
+
+@pytest.mark.accelerator
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_flow_step_inputs_reach_cuda_without_waiting_on_the_stream() -> None:
+    """A blocking copy waits for every launch queued on the vocoder's stream."""
+    host_items = [
+        make_input([1, 2, 3, 4], prompt_token=[5, 6], prompt_value=0.5),
+        make_input([7, 8, 9], prompt_token=[10], prompt_value=1.5),
+    ]
+    reference_flow = _PackedFlow()
+    reference_packed = stages.pack_flow_inputs(reference_flow, host_items)
+    reference = stages.prepare_flow_conditioning(
+        make_packed(reference_flow), reference_packed, finalize=False
+    )
+    flow = _PackedFlow().cuda()
+    vocoder = stages.CosyVoice3Vocoder(make_packed(flow), make_causal_hift(10.0))
+    items = [
+        stages.FlowBatchInput(
+            token=item.token,
+            prompt_token=item.prompt_token,
+            prompt_feat=vocoder.copy_prompt_to_device(item.prompt_feat),
+            embedding=vocoder.copy_prompt_to_device(item.embedding),
+        )
+        for item in host_items
+    ]
+    sync_debug_mode = torch.cuda.get_sync_debug_mode()
+    torch.cuda.set_sync_debug_mode("error")
+    try:
+        with vocoder.stream_context:
+            packed = stages.pack_flow_inputs(flow, items)
+            conditioning = stages.prepare_flow_conditioning(
+                vocoder.flow, packed, finalize=False
+            )
+    finally:
+        torch.cuda.set_sync_debug_mode(sync_debug_mode)
+    torch.cuda.synchronize()
+
+    assert conditioning.mel_lengths == reference.mel_lengths
+    for served, expected in (
+        (packed.token, reference_packed.token),
+        (
+            packed.combined_token_lengths_tensor,
+            reference_packed.combined_token_lengths_tensor,
+        ),
+        (packed.prompt_feat, reference_packed.prompt_feat),
+        (packed.embedding, reference_packed.embedding),
+        (conditioning.token_condition, reference.token_condition),
+        (conditioning.prompt_mel, reference.prompt_mel),
+        (conditioning.noisy_mel, reference.noisy_mel),
+    ):
+        assert served.is_cuda
+        assert torch.equal(served.cpu(), expected)
 
 
 @pytest.mark.accelerator

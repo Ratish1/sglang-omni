@@ -24,6 +24,7 @@ from sglang_omni.models.fun_cosyvoice3.packed_dit import (
     FA3_PAGE_SIZE,
     PACKED_INDUCTOR_OPTIONS,
     PackedDiT,
+    copy_to_device,
     euler_step_times,
     modulate_block,
     modulate_final,
@@ -330,8 +331,8 @@ class PrefixRowAttention:
             segment_ends_tensor,
             offsets_tensor,
             block_table,
-        ) = (
-            torch.cat(host_parts).to(device).split([len(part) for part in host_parts])
+        ) = copy_to_device(torch.cat(host_parts), device).split(
+            [len(part) for part in host_parts]
         )
         self.tail_index = tail_index.view(2 * row_slots, CONV_CONTEXT_FRAMES)
         block_table = block_table.view(len(block_lists), block_width)

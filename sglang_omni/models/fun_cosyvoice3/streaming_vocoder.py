@@ -331,8 +331,8 @@ class FunCosyVoice3StreamingVocoderScheduler(
         )
         if state.prompt_token is None:
             state.prompt_token = token
-            state.prompt_feat = feat
-            state.embedding = speaker_embedding
+            state.prompt_feat = self.vocoder.copy_prompt_to_device(feat)
+            state.embedding = self.vocoder.copy_prompt_to_device(speaker_embedding)
         elif (
             tuple(token.shape) != tuple(state.prompt_token.shape)
             or tuple(feat.shape) != tuple(state.prompt_feat.shape)

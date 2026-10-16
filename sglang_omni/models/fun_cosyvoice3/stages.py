@@ -56,6 +56,7 @@ from sglang_omni.models.fun_cosyvoice3.packed_dit import (
     DIT_INDUCTOR_OPTIONS,
     FA3_DTYPES,
     PackedDiT,
+    copy_to_device,
     euler_step_times,
     gather_rows,
     pack_rows,
@@ -290,20 +291,26 @@ def pack_flow_inputs(
     total_mel_lengths = tuple(
         length * flow.token_mel_ratio for length in combined_lengths
     )
-    combined_token_lengths_tensor = torch.tensor(
-        combined_lengths, dtype=torch.int64, device=device
+    combined_token_lengths_tensor = copy_to_device(
+        torch.tensor(combined_lengths, dtype=torch.int64), device
     )
 
+    # note (ratish): on CUDA the rows are packed on the host and copied once, since
+    # every blocking copy waits for the stream's queued work.
+    packing_device = torch.device("cpu") if device.type == "cuda" else device
     max_tokens = max(combined_lengths)
-    token = torch.zeros(len(inputs), max_tokens, dtype=torch.int32, device=device)
+    token = torch.zeros(
+        len(inputs), max_tokens, dtype=torch.int32, device=packing_device
+    )
     for index, item in enumerate(inputs):
         prompt_length = prompt_lengths[index]
         token[index, :prompt_length] = item.prompt_token[0].to(
-            device=device, dtype=torch.int32
+            device=packing_device, dtype=torch.int32
         )
         token[index, prompt_length : combined_lengths[index]] = item.token[0].to(
-            device=device, dtype=torch.int32
+            device=packing_device, dtype=torch.int32
         )
+    token = copy_to_device(token, device)
     token_mask = (
         torch.arange(max_tokens, device=device).unsqueeze(0)
         < combined_token_lengths_tensor.unsqueeze(1)
@@ -755,8 +762,9 @@ def generate_flow(
     decoder = flow.decoder
     # Note (chenyang): int64 matches torch.arange's default so the comparison
     # below does not mix integer dtypes.
-    mel_lengths = torch.tensor(
-        conditioning.mel_lengths, dtype=torch.int64, device=token_condition.device
+    mel_lengths = copy_to_device(
+        torch.tensor(conditioning.mel_lengths, dtype=torch.int64),
+        token_condition.device,
     )
     mel_mask = (
         (
@@ -1888,13 +1896,27 @@ class CosyVoice3Vocoder(BatchVocoderBase[FunCosyVoice3State, torch.Tensor]):
                 patch_hift_snake(hift)
             else:
                 pass
-            stream = torch.cuda.Stream(device=device)
-            stream.wait_stream(torch.cuda.current_stream(device))
+            # note (ratish): a plain attribute, not a buffer, so moving the Flow leaves it
+            # on the host.
+            self.flow.decoder.rand_noise = self.flow.decoder.rand_noise.to(device)
+            self.stream: torch.cuda.Stream | None = torch.cuda.Stream(device=device)
+            self.stream.wait_stream(torch.cuda.current_stream(device))
             self.stream_context: contextlib.AbstractContextManager[None] = (
-                torch.cuda.stream(stream)
+                torch.cuda.stream(self.stream)
             )
         else:
+            self.stream = None
             self.stream_context = contextlib.nullcontext()
+
+    def copy_prompt_to_device(self, prompt: torch.Tensor) -> torch.Tensor:
+        """A stream's prompt mel or speaker embedding in the Flow's dtype, copied once on
+        the vocoder's stream so its steps do not upload it again."""
+        if self.stream is None:
+            return prompt
+        else:
+            parameter = next(self.flow.parameters())
+            with torch.cuda.stream(self.stream):
+                return copy_to_device(prompt.to(parameter.dtype), parameter.device)
 
     def prepare_item(
         self, payload: StagePayload
