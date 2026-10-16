@@ -530,7 +530,7 @@ class Qwen3TTSPromptBuilderMixin:
         return ["auto", *list(self.config.codec_language_id.keys())]
 
     def get_supported_speakers(self):
-        return (getattr(self.config, "spk_id", None) or {}).keys()
+        return (self.config.spk_id or {}).keys()
 
     @torch.inference_mode()
     def extract_speaker_embedding(self, audio, sr):
@@ -653,7 +653,7 @@ class Qwen3TTSPromptBuilderMixin:
             return None
         else:
             pass
-        spk_is_dialect = getattr(self.config, "spk_is_dialect", None) or {}
+        spk_is_dialect = self.config.spk_is_dialect or {}
         dialect = spk_is_dialect.get(voice.lower())
         if isinstance(dialect, str) and dialect:
             return self.config.codec_language_id.get(dialect)
