@@ -19,7 +19,7 @@ from sglang.srt.layers.moe.topk import StandardTopKOutput
 from sglang.srt.layers.moe.utils import MoeRunnerBackend
 from sglang.srt.layers.quantization.fp8 import Fp8Config
 from sglang.srt.layers.quantization.unquant import UnquantizedFusedMoEMethod
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardMode
 from sglang.srt.model_executor.runner.prefill_cuda_graph_runner import (
     PrefillCudaGraphRunner,
 )
@@ -146,7 +146,9 @@ def test_outer_thinker_forward_accepts_sidecar_request_identity():
     positions = torch.tensor([0, 1], dtype=torch.long)
     input_embeds = torch.ones((2, 3))
     forward_batch = SimpleNamespace(
-        mrope_positions=None, forward_mode=ForwardMode.EXTEND
+        mrope_positions=None,
+        forward_mode=ForwardMode.EXTEND,
+        capture_hidden_mode=CaptureHiddenMode.NULL,
     )
 
     result = wrapper.forward(
@@ -253,9 +255,94 @@ def run_forward(
         forward_batch=SimpleNamespace(
             mrope_positions=None,
             forward_mode=forward_mode,
+            capture_hidden_mode=CaptureHiddenMode.NULL,
             out_cache_loc=torch.tensor(out_cache_loc),
         ),
     )
+
+
+@pytest.mark.parametrize("accepted_layer", [0, 2, 4])
+def test_prompt_capture_returns_the_configured_layer_with_all_extend_rows(
+    accepted_layer: int,
+) -> None:
+    wrapper = make_bare_wrapper()
+    wrapper.root_config = SimpleNamespace(
+        talker_config=SimpleNamespace(accept_hidden_layer=accepted_layer)
+    )
+    wrapper.config = SimpleNamespace(num_hidden_layers=4)
+    selected_states = torch.tensor([[10.0, 11.0], [20.0, 21.0], [30.0, 31.0]])
+    final_states = selected_states + 100
+
+    class CapturingTextModel(torch.nn.Module):
+        layers_to_capture = []
+
+        def forward(self, **kwargs):
+            assert kwargs["forward_batch"].capture_hidden_mode == CaptureHiddenMode.FULL
+            if accepted_layer == 4:
+                assert self.layers_to_capture == []
+                return final_states
+            else:
+                assert self.layers_to_capture == [accepted_layer]
+                return final_states, [selected_states]
+
+    wrapper.model = CapturingTextModel()
+
+    def logits_processor(input_ids, hidden_states, head, batch, aux_hidden_states=None):
+        assert batch.capture_hidden_mode == CaptureHiddenMode.FULL
+        assert hidden_states is final_states
+        return hidden_states if aux_hidden_states is None else aux_hidden_states[0]
+
+    wrapper.logits_processor = logits_processor
+    result = wrapper.forward(
+        input_ids=torch.tensor([1, 2, 3]),
+        positions=torch.arange(3),
+        forward_batch=SimpleNamespace(
+            mrope_positions=None,
+            forward_mode=ForwardMode.EXTEND,
+            capture_hidden_mode=CaptureHiddenMode.FULL,
+        ),
+    )
+    assert torch.equal(result, final_states if accepted_layer == 4 else selected_states)
+    assert wrapper.model.layers_to_capture == []
+
+
+def test_prompt_capture_restores_layer_selection_after_a_failed_forward() -> None:
+    wrapper = make_bare_wrapper(RuntimeError("forward failed"))
+    wrapper.model.layers_to_capture = []
+    wrapper.root_config = SimpleNamespace(
+        talker_config=SimpleNamespace(accept_hidden_layer=2)
+    )
+    wrapper.config = SimpleNamespace(num_hidden_layers=4)
+    with pytest.raises(RuntimeError, match="forward failed"):
+        wrapper.forward(
+            input_ids=torch.tensor([1]),
+            positions=torch.tensor([0]),
+            forward_batch=SimpleNamespace(
+                mrope_positions=None,
+                forward_mode=ForwardMode.EXTEND,
+                capture_hidden_mode=CaptureHiddenMode.FULL,
+            ),
+        )
+    assert wrapper.model.layers_to_capture == []
+
+
+@pytest.mark.parametrize("accepted_layer", [-1, 5])
+def test_prompt_capture_rejects_a_layer_outside_the_text_model(accepted_layer: int):
+    wrapper = make_bare_wrapper()
+    wrapper.root_config = SimpleNamespace(
+        talker_config=SimpleNamespace(accept_hidden_layer=accepted_layer)
+    )
+    wrapper.config = SimpleNamespace(num_hidden_layers=4)
+    with pytest.raises(ValueError, match="accept_hidden_layer"):
+        wrapper.forward(
+            input_ids=torch.tensor([1]),
+            positions=torch.tensor([0]),
+            forward_batch=SimpleNamespace(
+                mrope_positions=None,
+                forward_mode=ForwardMode.EXTEND,
+                capture_hidden_mode=CaptureHiddenMode.FULL,
+            ),
+        )
 
 
 @pytest.mark.parametrize(

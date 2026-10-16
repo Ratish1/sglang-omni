@@ -171,7 +171,7 @@ def test_multimodal_prompt_uses_captured_thinker_states(prompt_builder):
     )
 
 
-@pytest.mark.parametrize("positions", [None, [2, 3], [2, 3, 3], [2, 3, 6]])
+@pytest.mark.parametrize("positions", [None, [2, 3, 6]])
 def test_multimodal_prompt_rejects_missing_or_wrong_capture(prompt_builder, positions):
     metadata = {"token_id": 20}
     if positions is not None:

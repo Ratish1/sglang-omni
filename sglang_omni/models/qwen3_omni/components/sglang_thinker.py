@@ -26,7 +26,11 @@ from sglang.srt.layers.moe.topk import StandardTopKOutput, TopK, TopKOutput
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.unquant import UnquantizedFusedMoEMethod
 from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
+from sglang.srt.model_executor.forward_batch_info import (
+    CaptureHiddenMode,
+    ForwardBatch,
+    PPProxyTensors,
+)
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.qwen3_moe import Qwen3MoeDecoderLayer, Qwen3MoeSparseMoeBlock
 from sglang.srt.models.qwen3_vl_moe import Qwen3MoeLLMModel, load_fused_expert_weights
@@ -177,8 +181,29 @@ class Qwen3OmniThinkerForCausalLM(nn.Module):
             marked_live_rows.is_live_row = forward_batch.out_cache_loc != 0
         else:
             marked_live_rows = None
+        capture_prompt_states = (
+            forward_batch.forward_mode.is_extend()
+            and forward_batch.capture_hidden_mode == CaptureHiddenMode.FULL
+        )
+        if capture_prompt_states:
+            accepted_layer = self.root_config.talker_config.accept_hidden_layer
+            if not 0 <= accepted_layer <= self.config.num_hidden_layers:
+                raise ValueError(
+                    f"Talker accept_hidden_layer {accepted_layer} is outside "
+                    f"[0, {self.config.num_hidden_layers}]"
+                )
+            else:
+                pass
+            previous_capture_layers = self.model.layers_to_capture
+            self.model.layers_to_capture = (
+                [accepted_layer]
+                if accepted_layer < self.config.num_hidden_layers
+                else []
+            )
+        else:
+            pass
         try:
-            hidden_states = self.model(
+            model_output = self.model(
                 input_ids=input_ids,
                 positions=positions,
                 forward_batch=forward_batch,
@@ -187,10 +212,27 @@ class Qwen3OmniThinkerForCausalLM(nn.Module):
                 input_deepstack_embeds=input_deepstack_embeds,
             )
         finally:
+            if capture_prompt_states:
+                self.model.layers_to_capture = previous_capture_layers
+            else:
+                pass
             if marked_live_rows is not None:
                 marked_live_rows.is_live_row = None
             else:
                 pass
+        if capture_prompt_states and accepted_layer < self.config.num_hidden_layers:
+            assert isinstance(model_output, tuple) and len(model_output) == 2
+            hidden_states, auxiliary_hidden_states = model_output
+            assert len(auxiliary_hidden_states) == 1
+            return self.logits_processor(
+                input_ids,
+                hidden_states,
+                self.lm_head,
+                forward_batch,
+                aux_hidden_states=auxiliary_hidden_states,
+            )
+        else:
+            hidden_states = model_output
         return self.logits_processor(
             input_ids,
             hidden_states,

@@ -18,6 +18,7 @@ from sglang_omni.models.qwen3_omni.request_builders import (
     build_sglang_thinker_request,
     build_thinker_request,
     compute_mrope_positions,
+    make_thinker_scheduler_adapters,
 )
 from sglang_omni.serve.openai_api import build_chat_generate_request
 from sglang_omni.serve.openai_errors import is_bad_request_error
@@ -68,6 +69,47 @@ def test_empty_model_inputs_are_not_replaced_by_the_flat_state(monkeypatch):
     assert (
         getattr(sglang_request.req, "_omni_mm_positions", None) is None
     )  # noqa: leading-underscore  # production name
+
+
+@pytest.mark.parametrize(
+    ("speech_enabled", "output_modalities", "prompt_ids", "expected_positions"),
+    [
+        (True, ["audio"], [4, 55, 77, 66, 5], [1, 2, 3]),
+        (True, None, [4, 77, 5], [1]),
+        (True, ["text"], [4, 77, 5], []),
+        (False, ["audio"], [4, 77, 5], []),
+        (True, ["audio"], [4, 5], []),
+    ],
+)
+def test_prompt_capture_admission_is_scoped_to_multimodal_speech(
+    monkeypatch, speech_enabled, output_modalities, prompt_ids, expected_positions
+):
+    patch_sampling_validation(monkeypatch)
+    request_builder, _ = make_thinker_scheduler_adapters(
+        tokenizer=FakeQwenTokenizer(),
+        vocab_size=256,
+        thinker_config=SimpleNamespace(
+            image_token_id=55, video_token_id=66, audio_token_id=77
+        ),
+        speech_enabled=speech_enabled,
+    )
+    payload = make_qwen_payload(
+        make_qwen_state(prompt={"input_ids": torch.tensor(prompt_ids)})
+    )
+    payload.request.metadata = (
+        {} if output_modalities is None else {"output_modalities": output_modalities}
+    )
+    first = request_builder(payload)
+    second = request_builder(payload)
+    if expected_positions:
+        assert first.prompt_hidden_capture.positions.tolist() == expected_positions
+        assert second.prompt_hidden_capture.positions.tolist() == expected_positions
+        assert first.req.extra_key != second.req.extra_key
+        assert first.req.extra_key is not None
+    else:
+        assert first.prompt_hidden_capture is None
+        assert second.prompt_hidden_capture is None
+        assert first.req.extra_key is None
 
 
 @pytest.mark.parametrize("entrypoint", ["generic", "sglang"])

@@ -33,7 +33,6 @@ def create_thinker_scheduler(
     """Create the Qwen thinker scheduler."""
     from sglang.srt.utils.hf_transformers_utils import get_tokenizer
 
-    from sglang_omni.model_runner.thinker_model_runner import ThinkerModelRunner
     from sglang_omni.models.qwen3_omni.request_builders import (
         make_thinker_scheduler_adapters,
         make_thinker_stream_output_builder,
@@ -81,10 +80,10 @@ def create_thinker_scheduler(
 
     output_proc = SGLangOutputProcessor()
 
-    if speech_enabled and prefill_graph_backend != CudaGraphBackend.BREAKABLE:
-        model_runner = ThinkerModelRunner(model_worker, output_proc)
-    else:
-        model_runner = Qwen3OmniThinkerModelRunner(model_worker, output_proc)
+    model_runner = Qwen3OmniThinkerModelRunner(model_worker, output_proc)
+    model_runner.enable_prefill_sidecar = (
+        enable_prefill_input_embeds or not speech_enabled
+    )
 
     tokenizer = get_tokenizer(
         model_config.model_path,
@@ -95,6 +94,7 @@ def create_thinker_scheduler(
         tokenizer=tokenizer,
         vocab_size=model_config.vocab_size,
         thinker_config=thinker_config,
+        speech_enabled=speech_enabled,
     )
     stream_output_builder = make_thinker_stream_output_builder(
         speech_enabled=speech_enabled

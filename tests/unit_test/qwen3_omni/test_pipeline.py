@@ -1273,7 +1273,7 @@ def test_qwen_thinker_cuda_graph_capture_lifecycle(
         qwen_thinker_runner,
         "Qwen3OmniThinkerModelRunner",
         lambda model_worker, output_proc: (
-            qwen_runner_calls.append((model_worker, output_proc)) or object()
+            qwen_runner_calls.append((model_worker, output_proc)) or SimpleNamespace()
         ),
     )
     monkeypatch.setattr(
@@ -1292,12 +1292,9 @@ def test_qwen_thinker_cuda_graph_capture_lifecycle(
     assert infrastructure_saw_return_hidden == [False]
     assert server_args.enable_return_hidden_states is False
     assert server_args.disable_cuda_graph is False
-    assert generic_runner_calls == (
-        [(model_worker, output_proc)] if speech_enabled else []
-    )
-    assert qwen_runner_calls == (
-        [] if speech_enabled else [(model_worker, output_proc)]
-    )
+    assert generic_runner_calls == []
+    assert qwen_runner_calls == [(model_worker, output_proc)]
+    assert scheduler.model_runner.enable_prefill_sidecar is not speech_enabled
     assert scheduler.server_args is server_args
 
 
@@ -1389,7 +1386,7 @@ def test_qwen_thinker_enables_and_attests_breakable_prefill_graphs(
         qwen_thinker_runner,
         "Qwen3OmniThinkerModelRunner",
         lambda model_worker, output_proc: (
-            qwen_runner_calls.append((model_worker, output_proc)) or object()
+            qwen_runner_calls.append((model_worker, output_proc)) or SimpleNamespace()
         ),
     )
     monkeypatch.setattr(omni_scheduler, "OmniScheduler", SimpleNamespace)
@@ -1402,6 +1399,7 @@ def test_qwen_thinker_enables_and_attests_breakable_prefill_graphs(
     assert attest_calls == [(model_worker.model_runner, False)]
     assert output_proc_kwargs == [{}]
     assert qwen_runner_calls == [(model_worker, output_proc)]
+    assert scheduler.model_runner.enable_prefill_sidecar is True
     assert scheduler.server_args is server_args
 
 
