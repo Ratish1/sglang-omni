@@ -7687,8 +7687,6 @@ def test_qwen3_tts_steady_decode_reports_cuda_graph_ready(
         config = SimpleNamespace(codec_eos_token_id=-1)
 
         def __init__(self) -> None:
-            self.feedback_buffer = torch.zeros(1, 4)
-            self.feedback_mask = torch.zeros(1, dtype=torch.bool)
             self.decode_feedback_embedding = torch.nn.Embedding(1, 4)
             self.output_codes = torch.ones(1, 2)
             self.output_embeds = torch.ones(1, 4)
@@ -7774,10 +7772,7 @@ def test_qwen3_tts_decode_feedback_empty_batch_noops() -> None:
     assert forward_batch.input_ids.numel() == 0
 
 
-def test_qwen3_tts_decode_forward_does_not_clear_feedback_mask(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    install_fake_sglang(monkeypatch)
+def layerless_qwen3_tts_text_model(decode_rows: int) -> torch.nn.Module:
     from sglang_omni.models.qwen3_tts.sglang_model import Qwen3TTSTalkerTextModel
 
     class IdentityNorm(torch.nn.Module):
@@ -7793,10 +7788,16 @@ def test_qwen3_tts_decode_forward_does_not_clear_feedback_mask(
     model.start_layer = 0
     model.end_layer = 0
     model.norm = IdentityNorm()
-    model.feedback_buffer = torch.full((1, 4), 5.0)
-    model.feedback_mask = torch.tensor([True])
-    model.decode_feedback_embedding = torch.nn.Embedding(1, 4)
+    model.decode_feedback_embedding = torch.nn.Embedding(decode_rows, 4)
     model.decode_feedback_embedding.weight.requires_grad_(False)
+    return model
+
+
+def test_qwen3_tts_decode_forward_reads_the_decode_feedback_table(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    install_fake_sglang(monkeypatch)
+    model = layerless_qwen3_tts_text_model(decode_rows=1)
     with torch.no_grad():
         model.decode_feedback_embedding.weight[0].fill_(7.0)
 
@@ -7809,7 +7810,24 @@ def test_qwen3_tts_decode_forward_does_not_clear_feedback_mask(
     )
 
     assert torch.equal(output, model.decode_feedback_embedding.weight[:1])
-    assert bool(model.feedback_mask[0]) is True
+
+
+def test_qwen3_tts_extend_without_input_embeds_embeds_codec_ids(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    install_fake_sglang(monkeypatch)
+    model = layerless_qwen3_tts_text_model(decode_rows=1)
+    input_ids = torch.tensor([3, 1, 4, 1, 5])
+
+    output = model.forward(
+        input_ids=input_ids,
+        positions=torch.arange(5),
+        forward_batch=SimpleNamespace(
+            forward_mode=SimpleNamespace(is_decode=lambda: False),
+        ),
+    )
+
+    assert torch.equal(output, model.codec_embedding(input_ids))
 
 
 def test_qwen3_tts_prepare_decode_buffers_collects_private_subtalker_seeds(

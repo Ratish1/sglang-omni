@@ -363,17 +363,6 @@ class Qwen3TTSTalkerTextModel(nn.Module):
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
         max_batch_size = get_schedule().max_running_requests
-        self.feedback_buffer = torch.zeros(
-            max_batch_size,
-            config.hidden_size,
-            device=self.codec_embedding.weight.device,
-            dtype=self.codec_embedding.weight.dtype,
-        )
-        self.feedback_mask = torch.zeros(
-            max_batch_size,
-            dtype=torch.bool,
-            device=self.codec_embedding.weight.device,
-        )
         self.decode_feedback_embedding = nn.Embedding(
             max_batch_size,
             config.hidden_size,
@@ -388,19 +377,6 @@ class Qwen3TTSTalkerTextModel(nn.Module):
     def get_text_embeddings(self) -> nn.Embedding:
         return self.text_embedding
 
-    def build_input_hidden_states(
-        self,
-        input_ids: torch.Tensor,
-    ) -> torch.Tensor:
-        hidden_states = self.codec_embedding(input_ids)
-        bs = hidden_states.shape[0]
-        feedback_mask = self.feedback_mask[:bs]
-        return torch.where(
-            feedback_mask.unsqueeze(-1),
-            self.feedback_buffer[:bs].to(hidden_states.dtype),
-            hidden_states,
-        )
-
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -414,7 +390,7 @@ class Qwen3TTSTalkerTextModel(nn.Module):
             if is_decode:
                 hidden_states = self.decode_feedback_embedding(input_ids)
             else:
-                hidden_states = self.build_input_hidden_states(input_ids)
+                hidden_states = self.codec_embedding(input_ids)
         else:
             hidden_states = input_embeds
 
@@ -1028,8 +1004,6 @@ class Qwen3TTSTalker(Qwen3TTSPromptBuilderMixin, nn.Module):
         predictor_len = config.num_code_groups + 1
         device = self.model.codec_embedding.weight.device
         dtype = self.model.codec_embedding.weight.dtype
-        self.feedback_buffer = self.model.feedback_buffer
-        self.feedback_mask = self.model.feedback_mask
         self.decode_feedback_embedding = self.model.decode_feedback_embedding
         cp_layers = self.code_predictor.model.layers
         cp_attn = cp_layers[0].self_attn
