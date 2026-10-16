@@ -1298,8 +1298,22 @@ def test_qwen_thinker_cuda_graph_capture_lifecycle(
     assert scheduler.server_args is server_args
 
 
+@pytest.mark.parametrize(
+    ("speech_enabled", "prefill_backend", "initial_hidden_mode", "fail_initialization"),
+    [
+        (True, "breakable", None, False),
+        (True, "breakable", "last", False),
+        (True, "breakable", "last", True),
+        (False, "breakable", None, False),
+        (True, "disabled", None, False),
+    ],
+)
 def test_qwen_thinker_enables_and_attests_breakable_prefill_graphs(
     monkeypatch: pytest.MonkeyPatch,
+    speech_enabled: bool,
+    prefill_backend: str,
+    initial_hidden_mode: str | None,
+    fail_initialization: bool,
 ) -> None:
     from sglang.srt.utils import hf_transformers_utils
 
@@ -1314,9 +1328,10 @@ def test_qwen_thinker_enables_and_attests_breakable_prefill_graphs(
 
     server_args = SimpleNamespace(
         disable_cuda_graph=False,
-        enable_return_hidden_states=False,
+        enable_return_hidden_states=initial_hidden_mode is not None,
+        return_hidden_states_mode=initial_hidden_mode,
         cuda_graph_config=SimpleNamespace(
-            prefill=SimpleNamespace(backend=CudaGraphBackend.BREAKABLE)
+            prefill=SimpleNamespace(backend=CudaGraphBackend(prefill_backend))
         ),
     )
     captured: dict[str, object] = {}
@@ -1338,6 +1353,15 @@ def test_qwen_thinker_enables_and_attests_breakable_prefill_graphs(
 
     def fake_create_infrastructure(*args, **kwargs):
         captured.update(kwargs)
+        expects_capture = speech_enabled and prefill_backend == "breakable"
+        assert server_args.enable_return_hidden_states is (
+            expects_capture or initial_hidden_mode is not None
+        )
+        assert server_args.return_hidden_states_mode == (
+            "full" if expects_capture else initial_hidden_mode
+        )
+        if fail_initialization:
+            raise RuntimeError("infrastructure failed")
         return (
             model_worker,
             object(),
@@ -1391,15 +1415,43 @@ def test_qwen_thinker_enables_and_attests_breakable_prefill_graphs(
     )
     monkeypatch.setattr(omni_scheduler, "OmniScheduler", SimpleNamespace)
 
-    scheduler = bootstrap.create_thinker_scheduler(server_args, speech_enabled=True)
+    override_calls = []
 
-    assert captured["enable_prefill_input_embeds"] is True
+    def override_args(server_args, source, **fields):
+        override_calls.append(fields)
+        for name, value in fields.items():
+            setattr(server_args, name, value)
+
+    monkeypatch.setattr(bootstrap, "resolved_view", lambda server_args: server_args)
+    monkeypatch.setattr(bootstrap, "override_server_args", override_args)
+    if fail_initialization:
+        with pytest.raises(RuntimeError, match="infrastructure failed"):
+            bootstrap.create_thinker_scheduler(
+                server_args, speech_enabled=speech_enabled
+            )
+    else:
+        scheduler = bootstrap.create_thinker_scheduler(
+            server_args, speech_enabled=speech_enabled
+        )
+    assert server_args.enable_return_hidden_states is (initial_hidden_mode is not None)
+    assert server_args.return_hidden_states_mode == initial_hidden_mode
+    assert len(override_calls) == (
+        2 if speech_enabled and prefill_backend == "breakable" else 0
+    )
+    if fail_initialization:
+        return
+
+    assert captured["enable_prefill_input_embeds"] is (prefill_backend == "breakable")
     assert "defer_cuda_graph_capture" not in captured
     assert graph_init_workers == []
-    assert attest_calls == [(model_worker.model_runner, False)]
+    assert attest_calls == (
+        [(model_worker.model_runner, False)] if prefill_backend == "breakable" else []
+    )
     assert output_proc_kwargs == [{}]
     assert qwen_runner_calls == [(model_worker, output_proc)]
-    assert scheduler.model_runner.enable_prefill_sidecar is True
+    assert scheduler.model_runner.enable_prefill_sidecar is (
+        prefill_backend == "breakable" or not speech_enabled
+    )
     assert scheduler.server_args is server_args
 
 

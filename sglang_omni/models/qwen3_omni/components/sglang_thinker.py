@@ -95,6 +95,60 @@ class PaddedRowsTopK(nn.Module):
         return self.topk.empty_topk_output(device, layer_id=layer_id)
 
 
+class Qwen3OmniThinkerTextModel(Qwen3MoeLLMModel):
+    def __init__(
+        self,
+        *,
+        config: PretrainedConfig,
+        accept_hidden_layer: int | None,
+        quant_config: QuantizationConfig | None = None,
+        prefix: str = "",
+    ) -> None:
+        if accept_hidden_layer is not None and not (
+            0 <= accept_hidden_layer <= config.num_hidden_layers
+        ):
+            raise ValueError(
+                f"Talker accept_hidden_layer {accept_hidden_layer} is outside "
+                f"[0, {config.num_hidden_layers}]"
+            )
+        else:
+            pass
+        super().__init__(config=config, quant_config=quant_config, prefix=prefix)
+        self.accept_hidden_layer = accept_hidden_layer
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+        input_embeds: torch.Tensor | None = None,
+        pp_proxy_tensors: PPProxyTensors | None = None,
+        input_deepstack_embeds: torch.Tensor | None = None,
+    ) -> torch.Tensor | tuple[torch.Tensor, list[torch.Tensor]] | PPProxyTensors:
+        previous_capture_layers = self.layers_to_capture
+        # Note (wenyao): the final layer uses normalized output; auxiliary states hold layer inputs.
+        if (
+            forward_batch.forward_mode.is_extend()
+            and forward_batch.capture_hidden_mode == CaptureHiddenMode.FULL
+            and self.accept_hidden_layer is not None
+            and self.accept_hidden_layer < self.config.num_hidden_layers
+        ):
+            self.layers_to_capture = [self.accept_hidden_layer]
+        else:
+            self.layers_to_capture = []
+        try:
+            return super().forward(
+                input_ids=input_ids,
+                positions=positions,
+                forward_batch=forward_batch,
+                input_embeds=input_embeds,
+                pp_proxy_tensors=pp_proxy_tensors,
+                input_deepstack_embeds=input_deepstack_embeds,
+            )
+        finally:
+            self.layers_to_capture = previous_capture_layers
+
+
 class Qwen3OmniThinkerForCausalLM(nn.Module):
     """Qwen3-Omni thinker text model without duplicated audio/vision towers."""
 
@@ -110,8 +164,12 @@ class Qwen3OmniThinkerForCausalLM(nn.Module):
         self.config = getattr(self.thinker_config, "text_config", self.thinker_config)
         self.is_mrope_enabled = config_uses_mrope(self.config)
 
-        self.model = Qwen3MoeLLMModel(
+        talker_config = getattr(config, "talker_config", None)
+        self.model = Qwen3OmniThinkerTextModel(
             config=self.config,
+            accept_hidden_layer=(
+                talker_config.accept_hidden_layer if talker_config is not None else None
+            ),
             quant_config=quant_config,
             prefix=add_prefix("model", prefix),
         )
@@ -185,24 +243,6 @@ class Qwen3OmniThinkerForCausalLM(nn.Module):
             forward_batch.forward_mode.is_extend()
             and forward_batch.capture_hidden_mode == CaptureHiddenMode.FULL
         )
-        if capture_prompt_states:
-            accepted_layer = self.root_config.talker_config.accept_hidden_layer
-            if not 0 <= accepted_layer <= self.config.num_hidden_layers:
-                raise ValueError(
-                    f"Talker accept_hidden_layer {accepted_layer} is outside "
-                    f"[0, {self.config.num_hidden_layers}]"
-                )
-            else:
-                pass
-            previous_capture_layers = self.model.layers_to_capture
-            # Note (wenyao): the final layer uses normalized model output; aux holds layer inputs.
-            self.model.layers_to_capture = (
-                [accepted_layer]
-                if accepted_layer < self.config.num_hidden_layers
-                else []
-            )
-        else:
-            pass
         try:
             model_output = self.model(
                 input_ids=input_ids,
@@ -213,25 +253,30 @@ class Qwen3OmniThinkerForCausalLM(nn.Module):
                 input_deepstack_embeds=input_deepstack_embeds,
             )
         finally:
-            if capture_prompt_states:
-                self.model.layers_to_capture = previous_capture_layers
-            else:
-                pass
             if marked_live_rows is not None:
                 marked_live_rows.is_live_row = None
             else:
                 pass
-        if capture_prompt_states and accepted_layer < self.config.num_hidden_layers:
-            if not isinstance(model_output, tuple) or len(model_output) != 2:
+        if isinstance(model_output, tuple):
+            hidden_states, auxiliary_hidden_states = model_output
+        else:
+            hidden_states, auxiliary_hidden_states = model_output, None
+        if (
+            capture_prompt_states
+            and self.model.accept_hidden_layer is not None
+            and self.model.accept_hidden_layer < self.config.num_hidden_layers
+        ):
+            if auxiliary_hidden_states is None:
                 raise RuntimeError(
                     "Prompt capture did not return auxiliary hidden states"
                 )
-            else:
-                pass
-            hidden_states, auxiliary_hidden_states = model_output
-            if len(auxiliary_hidden_states) != 1:
+            elif len(auxiliary_hidden_states) != 1:
                 raise RuntimeError(
                     "Prompt capture requires exactly one auxiliary layer"
+                )
+            elif auxiliary_hidden_states[0].shape != hidden_states.shape:
+                raise RuntimeError(
+                    "Prompt capture hidden states do not align with model rows"
                 )
             else:
                 pass
@@ -243,7 +288,7 @@ class Qwen3OmniThinkerForCausalLM(nn.Module):
                 aux_hidden_states=auxiliary_hidden_states,
             )
         else:
-            hidden_states = model_output
+            pass
         return self.logits_processor(
             input_ids,
             hidden_states,

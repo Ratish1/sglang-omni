@@ -5,6 +5,10 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+from sglang.srt.arg_groups.model_override_base import resolved_view
+
+from sglang_omni.vendor.sglang.server_args import override_server_args
+
 if TYPE_CHECKING:
     from sglang.srt.server_args import ServerArgs
 
@@ -52,15 +56,39 @@ def create_thinker_scheduler(
     prefill_graph_backend = get_prefill_cuda_graph_backend(server_args)
     enable_prefill_input_embeds = prefill_graph_backend == CudaGraphBackend.BREAKABLE
 
-    infrastructure = create_sglang_infrastructure(
-        server_args,
-        gpu_id,
-        tp_rank=tp_rank,
-        nccl_port=nccl_port,
-        model_arch_override="Qwen3OmniThinkerForCausalLM",
-        total_gpu_memory_fraction=total_gpu_memory_fraction,
-        enable_prefill_input_embeds=enable_prefill_input_embeds,
-    )
+    capture_prompt_states = speech_enabled and enable_prefill_input_embeds
+    if capture_prompt_states:
+        resolved_server_args = resolved_view(server_args)
+        saved_return_hidden_states = resolved_server_args.enable_return_hidden_states
+        saved_return_hidden_states_mode = resolved_server_args.return_hidden_states_mode
+        override_server_args(
+            server_args,
+            "sglang_omni.qwen3_omni.capture_prompt_states",
+            enable_return_hidden_states=True,
+            return_hidden_states_mode="full",
+        )
+    else:
+        pass
+    try:
+        infrastructure = create_sglang_infrastructure(
+            server_args,
+            gpu_id,
+            tp_rank=tp_rank,
+            nccl_port=nccl_port,
+            model_arch_override="Qwen3OmniThinkerForCausalLM",
+            total_gpu_memory_fraction=total_gpu_memory_fraction,
+            enable_prefill_input_embeds=enable_prefill_input_embeds,
+        )
+    finally:
+        if capture_prompt_states:
+            override_server_args(
+                server_args,
+                "sglang_omni.qwen3_omni.restore_return_hidden_states",
+                enable_return_hidden_states=saved_return_hidden_states,
+                return_hidden_states_mode=saved_return_hidden_states_mode,
+            )
+        else:
+            pass
 
     (
         model_worker,
