@@ -421,6 +421,7 @@ class Qwen3TTSIncrementalDecoder:
             state,
             self.channels_last_weights,
             first_decode=False,
+            fused_activations=False,
         )
 
     def precompile(self, codes: torch.Tensor, state: IncrementalCodecState) -> None:

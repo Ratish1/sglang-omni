@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import copy
 import json
 import logging
 import threading
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import numpy as np
 import pytest
@@ -31,7 +33,7 @@ from sglang_omni.models.qwen3_omni.components.code2wav_scheduler import (
 from sglang_omni.pipeline.stage.stream_queue import StreamItem
 from sglang_omni.platforms import current_platform
 from sglang_omni.scheduling.message import IncomingMessage
-from sglang_omni.utils import snake_beta
+from sglang_omni.utils import incremental_codec, snake_beta
 from sglang_omni.utils.codec_state_arena import CodecStateArena
 from tests.unit_test.fixtures.qwen_fakes import (
     FakeCode2WavModel,
@@ -1107,6 +1109,36 @@ def decode_in_parts(
         )
         start += frames
     return torch.cat(waveforms, dim=-1)
+
+
+@pytest.mark.accelerator
+@pytest.mark.skipif(
+    not current_platform.is_cuda(), reason="channels-last convs run on NVIDIA CUDA only"
+)
+@pytest.mark.parametrize("parts", [(10, 10, 7), (4, 6)])
+def test_fused_decoder_blocks_decode_as_the_unfused_chain_bit_for_bit(
+    monkeypatch: pytest.MonkeyPatch, parts: tuple[int, ...]
+) -> None:
+    reference = make_tiny_code2wav("cuda", torch.bfloat16)
+    reference.use_channels_last()
+    fused = copy.deepcopy(reference)
+    assert snake_beta.fuse_vocoder_decoder(fused.decoder) > 0
+    kernel = Mock(wraps=snake_beta.fused_bias_snake_beta)
+    monkeypatch.setattr(incremental_codec, "fused_bias_snake_beta", kernel)
+    codes = torch.randint(0, 16, (3, 2, sum(parts)), device="cuda")
+    device = torch.device("cuda")
+
+    with torch.inference_mode():
+        expected = decode_in_parts(
+            Code2WavIncrementalDecoder(reference), codes, parts, device, torch.bfloat16
+        )
+        assert kernel.call_count == 0
+        actual = decode_in_parts(
+            Code2WavIncrementalDecoder(fused), codes, parts, device, torch.bfloat16
+        )
+
+    assert kernel.call_count > 0
+    assert torch.equal(actual, expected)
 
 
 @pytest.mark.parametrize("parts", [(17,), (4, 6, 7), (1,) * 17, (10, 7)])

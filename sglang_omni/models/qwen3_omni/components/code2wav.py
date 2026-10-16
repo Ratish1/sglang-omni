@@ -384,6 +384,17 @@ class Code2WavIncrementalDecoder:
                     )
         else:
             self.channels_last_weights = None
+        # note (ratish): the fused decoder blocks run where FusedSnakeBeta's kernel does, on
+        # bf16 channels-last activations.
+        self.fused_activations = (
+            self.channels_last_weights is not None
+            and model.dtype == torch.bfloat16
+            and all(
+                isinstance(module, FusedSnakeBeta)
+                for module in model.decoder.modules()
+                if isinstance(module, (SnakeBeta, FusedSnakeBeta))
+            )
+        )
         # note (ratish): a stream's first decode drops each transposed conv's left pad once,
         # carried to the waveform through the strides after it.
         self.first_decode_shortfall_samples = 0
@@ -448,6 +459,7 @@ class Code2WavIncrementalDecoder:
             state,
             self.channels_last_weights,
             first_decode=first_decode,
+            fused_activations=self.fused_activations,
         )
         assert waveform.shape[-1] == fresh_frames * self.total_upsample - (
             self.first_decode_shortfall_samples if first_decode else 0

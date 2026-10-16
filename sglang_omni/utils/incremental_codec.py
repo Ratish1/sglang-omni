@@ -13,6 +13,7 @@ from sglang_omni.utils.channels_last_conv import (
     channels_last_conv1d,
     channels_last_conv_transpose1d,
 )
+from sglang_omni.utils.snake_beta import fused_bias_snake_beta
 
 
 class CausalConv(Protocol):
@@ -319,6 +320,27 @@ def channels_last_causal_transconv1d(
 ) -> torch.Tensor:
     """incremental_causal_transconv1d of a (B, L, C) activation with its channels-last
     weight; the overlap keeps its (B, C, overlap) layout."""
+    emitted = channels_last_causal_transconv1d_frames(
+        module, weight, hidden_states, state, key, left_trim=left_trim
+    )
+    if module.conv.bias is not None:
+        emitted = emitted + module.conv.bias
+    else:
+        pass
+    return emitted.contiguous()
+
+
+def channels_last_causal_transconv1d_frames(
+    module: CausalTransConv,
+    weight: torch.Tensor,
+    hidden_states: torch.Tensor,
+    state: IncrementalCodecState,
+    key: str,
+    *,
+    left_trim: int,
+) -> torch.Tensor:
+    """channels_last_causal_transconv1d without the bias: the emitted frames, rows of the
+    conv's longer output."""
     conv = module.conv
     stride = int(conv.stride[0])
     right_pad = int(module.right_pad)
@@ -347,11 +369,7 @@ def channels_last_causal_transconv1d(
     state.transconv_overlaps[key] = tail.transpose(1, 2).clone(
         memory_format=torch.contiguous_format
     )
-    if conv.bias is not None:
-        emitted = emitted + conv.bias
-    else:
-        pass
-    return emitted.contiguous()
+    return emitted
 
 
 def causal_conv1d(
@@ -464,6 +482,158 @@ def incremental_residual_unit(
         module.conv2, hidden_states, state, f"{key}.conv2", channels_last_weights
     )
     return hidden_states + residual
+
+
+def padded_conv_input(
+    module: CausalConv,
+    state: IncrementalCodecState,
+    key: str,
+    frames_like: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """A causal conv's (B, history + L + tail, C) input for frames shaped as frames_like (B,
+    L, C), the stream's history in front and the dilation's zeros after, and the rows its
+    producer writes the frames into."""
+    batch_size, length, channels = frames_like.shape
+    history_size = int(module.padding)
+    tail_frames = (-(history_size + length)) % int(module.conv.dilation[0])
+    padded = frames_like.new_empty(
+        batch_size, history_size + length + tail_frames, channels
+    )
+    padded[:, :history_size].copy_(
+        conv_history(
+            state, key, frames_like, batch_size, channels, history_size
+        ).transpose(1, 2)
+    )
+    padded[:, history_size + length :].zero_()
+    return (padded, padded[:, history_size : history_size + length])
+
+
+def padded_causal_conv1d(
+    module: CausalConv,
+    weight: torch.Tensor,
+    padded: torch.Tensor,
+    state: IncrementalCodecState,
+    key: str,
+    length: int,
+    *,
+    add_bias: bool,
+) -> torch.Tensor:
+    """The causal conv of a filled padded_conv_input, keeping the stream's newest history."""
+    history_size = int(module.padding)
+    output = channels_last_conv1d(
+        padded, module.conv, weight, length, add_bias=add_bias
+    )
+    state.conv_histories[key] = (
+        padded[:, length : length + history_size]
+        .transpose(1, 2)
+        .clone(memory_format=torch.contiguous_format)
+    )
+    return output
+
+
+def fused_decoder_blocks(
+    codec: CodecConvStack,
+    hidden_states: torch.Tensor,
+    state: IncrementalCodecState,
+    channels_last_weights: dict[str, torch.Tensor],
+    *,
+    first_decode: bool,
+) -> torch.Tensor:
+    """The decoder blocks and the final conv of decoder.0's (B, L, C) output, each conv without
+    its bias: one SnakeBeta kernel adds the bias and the residual and writes the next causal
+    conv's padded input, so no bias add, residual add or padding copy runs on its own.
+    """
+    blocks = codec.decoder[1:-2]
+    activated = apply_activation(blocks[0].block[0], hidden_states, True)
+    for block_index, decoder_block in enumerate(blocks, start=1):
+        transconv = decoder_block.block[1]
+        frames = channels_last_causal_transconv1d_frames(
+            transconv,
+            channels_last_weights[f"decoder.{block_index}.transconv"],
+            activated,
+            state,
+            f"decoder.{block_index}.transconv",
+            left_trim=int(transconv.left_pad) if first_decode else 0,
+        )
+        units = decoder_block.block[2:]
+        length = int(frames.shape[1])
+        residual = frames.new_empty(frames.shape)
+        key = f"decoder.{block_index}.residual.0"
+        padded, frame_rows = padded_conv_input(
+            units[0].conv1, state, f"{key}.conv1", frames
+        )
+        fused_bias_snake_beta(
+            frames, transconv.conv.bias, units[0].act1, frame_rows, sum_out=residual
+        )
+        for residual_index, unit in enumerate(units):
+            key = f"decoder.{block_index}.residual.{residual_index}"
+            conv1_output = padded_causal_conv1d(
+                unit.conv1,
+                channels_last_weights[f"{key}.conv1"],
+                padded,
+                state,
+                f"{key}.conv1",
+                length,
+                add_bias=False,
+            )
+            padded, frame_rows = padded_conv_input(
+                unit.conv2, state, f"{key}.conv2", frames
+            )
+            fused_bias_snake_beta(
+                conv1_output, unit.conv1.conv.bias, unit.act2, frame_rows
+            )
+            conv2_output = padded_causal_conv1d(
+                unit.conv2,
+                channels_last_weights[f"{key}.conv2"],
+                padded,
+                state,
+                f"{key}.conv2",
+                length,
+                add_bias=False,
+            )
+            if residual_index + 1 < len(units):
+                next_unit = units[residual_index + 1]
+                next_key = f"decoder.{block_index}.residual.{residual_index + 1}"
+                padded, frame_rows = padded_conv_input(
+                    next_unit.conv1, state, f"{next_key}.conv1", frames
+                )
+                fused_bias_snake_beta(
+                    conv2_output,
+                    unit.conv2.conv.bias,
+                    next_unit.act1,
+                    frame_rows,
+                    residual=residual,
+                    sum_out=residual,
+                )
+            elif block_index < len(blocks):
+                activated = conv2_output.new_empty(conv2_output.shape)
+                fused_bias_snake_beta(
+                    conv2_output,
+                    unit.conv2.conv.bias,
+                    blocks[block_index].block[0],
+                    activated,
+                    residual=residual,
+                )
+            else:
+                padded, frame_rows = padded_conv_input(
+                    codec.decoder[-1], state, "decoder.final", frames
+                )
+                fused_bias_snake_beta(
+                    conv2_output,
+                    unit.conv2.conv.bias,
+                    codec.decoder[-2],
+                    frame_rows,
+                    residual=residual,
+                )
+    return padded_causal_conv1d(
+        codec.decoder[-1],
+        channels_last_weights["decoder.final"],
+        padded,
+        state,
+        "decoder.final",
+        length,
+        add_bias=True,
+    )
 
 
 class DecoderAttention(Protocol):
@@ -757,9 +927,11 @@ def incremental_conv_stack(
     channels_last_weights: dict[str, torch.Tensor] | None,
     *,
     first_decode: bool,
+    fused_activations: bool,
 ) -> torch.Tensor:
     """Everything after the transformer, from its outputs to the clamped waveform; a stream's
     first decode drops each transposed conv's left pad, as the whole-sequence forward does.
+    With fused_activations the decoder blocks run as fused_decoder_blocks.
     """
     is_channels_last = channels_last_weights is not None
     for stage_index, blocks in enumerate(codec.upsample):
@@ -786,32 +958,39 @@ def incremental_conv_stack(
         "decoder.0",
         channels_last_weights,
     )
-    for block_index, decoder_block in enumerate(codec.decoder[1:-2], start=1):
-        waveform = apply_activation(decoder_block.block[0], waveform, is_channels_last)
-        waveform = causal_transconv1d(
-            decoder_block.block[1],
-            waveform,
-            state,
-            f"decoder.{block_index}.transconv",
-            channels_last_weights,
-            left_trim=int(decoder_block.block[1].left_pad) if first_decode else 0,
+    if fused_activations:
+        waveform = fused_decoder_blocks(
+            codec, waveform, state, channels_last_weights, first_decode=first_decode
         )
-        for residual_index, residual_unit in enumerate(decoder_block.block[2:]):
-            waveform = incremental_residual_unit(
-                residual_unit,
+    else:
+        for block_index, decoder_block in enumerate(codec.decoder[1:-2], start=1):
+            waveform = apply_activation(
+                decoder_block.block[0], waveform, is_channels_last
+            )
+            waveform = causal_transconv1d(
+                decoder_block.block[1],
                 waveform,
                 state,
-                f"decoder.{block_index}.residual.{residual_index}",
+                f"decoder.{block_index}.transconv",
                 channels_last_weights,
+                left_trim=int(decoder_block.block[1].left_pad) if first_decode else 0,
             )
-    waveform = apply_activation(codec.decoder[-2], waveform, is_channels_last)
-    waveform = causal_conv1d(
-        codec.decoder[-1],
-        waveform,
-        state,
-        "decoder.final",
-        channels_last_weights,
-    )
+            for residual_index, residual_unit in enumerate(decoder_block.block[2:]):
+                waveform = incremental_residual_unit(
+                    residual_unit,
+                    waveform,
+                    state,
+                    f"decoder.{block_index}.residual.{residual_index}",
+                    channels_last_weights,
+                )
+        waveform = apply_activation(codec.decoder[-2], waveform, is_channels_last)
+        waveform = causal_conv1d(
+            codec.decoder[-1],
+            waveform,
+            state,
+            "decoder.final",
+            channels_last_weights,
+        )
     if is_channels_last:
         waveform = waveform.transpose(1, 2)
     else:
