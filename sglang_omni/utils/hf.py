@@ -5,12 +5,15 @@ from __future__ import annotations
 
 import json
 import os
+from collections.abc import Mapping
 from functools import lru_cache
 from pathlib import Path
 
 import torch.nn as nn
 from huggingface_hub import hf_hub_download
 from transformers import AutoConfig, PretrainedConfig
+
+from sglang_omni.utils.json import JsonValue
 
 try:
     from transformers.initialization import no_init_weights
@@ -63,6 +66,32 @@ def architecture_from_hf_config(hf_config: PretrainedConfig) -> str | None:
     else:
         pass
     return None
+
+
+MROPE_ONLY_KEYS = frozenset({"interleaved", "mrope_interleaved", "mrope_section"})
+
+
+def drop_mrope_keys(
+    rope_parameters: Mapping[str, JsonValue],
+) -> dict[str, JsonValue]:
+    """The rope parameters without the keys only MRoPE reads."""
+    return {
+        key: value
+        for key, value in rope_parameters.items()
+        if key not in MROPE_ONLY_KEYS
+    }
+
+
+def use_text_rope(config: PretrainedConfig) -> None:
+    """Make the runtime build text RoPE for a config whose three MRoPE position
+    rows are always identical, where MRoPE rotates exactly as text RoPE."""
+    for attribute_name in ("rope_parameters", "rope_scaling"):
+        parameters = getattr(config, attribute_name, None)
+        if not isinstance(parameters, dict) or "mrope_section" not in parameters:
+            continue
+        else:
+            pass
+        setattr(config, attribute_name, drop_mrope_keys(parameters))
 
 
 def load_mistral_params_json(
