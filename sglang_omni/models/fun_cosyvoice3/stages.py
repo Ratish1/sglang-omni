@@ -76,6 +76,7 @@ from sglang_omni.models.fun_cosyvoice3.request_builders import (
     cleanup_prepared_cosyvoice3_request,
     preprocess_cosyvoice3_payload,
 )
+from sglang_omni.models.fun_cosyvoice3.snake import snake
 from sglang_omni.models.fun_cosyvoice3.solve_graph_capture import SolveGraphCapture
 from sglang_omni.models.fun_cosyvoice3.streaming import TOKEN_HOP_LEN, TOKEN_MAX_HOP_LEN
 from sglang_omni.models.fun_cosyvoice3.whole_history_cuda_graph import (
@@ -1336,6 +1337,32 @@ def patch_sine_harmonics(hift: "CausalHiFTGenerator", device: torch.device) -> N
     sine_generator.forward = forward
 
 
+def patch_hift_snake(hift: "CausalHiFTGenerator") -> None:
+    """Run each of HiFT's float32 Snake activations as one kernel, bit for bit, where
+    CosyVoice's forward launches seven."""
+    try:
+        from cosyvoice.transformer.activation import Snake
+    except ImportError as exc:
+        raise RuntimeError(COSYVOICE_INSTALL_HINT) from exc
+
+    for module in hift.modules():
+        if isinstance(module, Snake):
+            assert not module.alpha_logscale, "HiFT builds linear scale alphas"
+            alpha = module.alpha.detach().contiguous()
+            inverse_alpha = 1.0 / (alpha + module.no_div_by_zero)
+
+            def forward(
+                x: torch.Tensor,
+                alpha: torch.Tensor = alpha,
+                inverse_alpha: torch.Tensor = inverse_alpha,
+            ) -> torch.Tensor:
+                return snake(x, alpha, inverse_alpha)
+
+            module.forward = forward
+        else:
+            pass
+
+
 def patch_hift_spectra(hift: "CausalHiFTGenerator", device: torch.device) -> None:
     """Give HiFT its STFT and inverse STFT as float32 matmuls over the frames.
     torch.stft and torch.istft build a cuFFT plan for each new shape, whose module
@@ -1857,6 +1884,10 @@ class CosyVoice3Vocoder(BatchVocoderBase[FunCosyVoice3State, torch.Tensor]):
         if device.type == "cuda":
             patch_sine_harmonics(hift, device)
             patch_hift_spectra(hift, device)
+            if HAS_TRITON and self.hift_autocast_dtype is None:
+                patch_hift_snake(hift)
+            else:
+                pass
             stream = torch.cuda.Stream(device=device)
             stream.wait_stream(torch.cuda.current_stream(device))
             self.stream_context: contextlib.AbstractContextManager[None] = (

@@ -1724,6 +1724,26 @@ def test_vocoder_spectra_match_cosyvoice_without_a_host_wait(
         torch.testing.assert_close(output, reference)
 
 
+@pytest.mark.accelerator
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_vocoder_hift_snake_is_bit_identical_to_cosyvoice() -> None:
+    snake_class = pytest.importorskip("cosyvoice.transformer.activation").Snake
+    hift = make_causal_hift(10.0)
+    reference_hift = copy.deepcopy(hift)
+    stages.CosyVoice3Vocoder(HiftFlowStub(), hift)
+    pairs = [
+        (module, reference)
+        for module, reference in zip(hift.modules(), reference_hift.modules())
+        if isinstance(reference, snake_class)
+    ]
+    assert pairs
+    torch.manual_seed(3)
+    with torch.inference_mode():
+        for module, reference in pairs:
+            x = torch.randn(3, reference.in_features, 2049, device="cuda") * 30
+            assert torch.equal(module(x), reference(x))
+
+
 def prefix_pool_scheduler(
     room: list[bool],
 ) -> tuple[FunCosyVoice3StreamingVocoderScheduler, list[tuple[str, int]]]:
