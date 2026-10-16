@@ -224,7 +224,12 @@ class FunCosyVoice3EngineBuilder(TtsEngineBuilder[CosyVoice3SGLangRequestData]):
     def extra_scheduler_kwargs(self) -> SchedulerExtras[CosyVoice3SGLangRequestData]:
         # note (ratish): the vocoder shares this process and card on its own stream, and
         # at equal priority the AR's decode replays wait behind its kernels.
-        return {"should_run_top_priority_stream": current_platform.is_cuda()}
+        is_cuda = current_platform.is_cuda()
+        return {
+            "should_run_top_priority_stream": is_cuda,
+            "enable_async_decode": is_cuda,
+            "async_decode_min_batch_size": 1,
+        }
 
     def make_abort_callback(self) -> Callable[[str], None]:
         return request_builders.cleanup_prepared_cosyvoice3_request

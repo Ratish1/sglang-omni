@@ -111,6 +111,76 @@ class FunCosyVoice3ModelRunner(ModelRunner):
     ) -> None:
         self.collect_tokens(result, forward_batch, schedule_batch, requests)
 
+    def lookahead_eligible(self, batch: ScheduleBatch) -> bool:
+        """A decode step may launch before the one before it resolves: the repetition
+        penalty takes that step's ids on the device, the repeat window lives on the
+        device, and min_new_tokens counts one step late, as SGLang's overlap
+        scheduler does."""
+        return all(
+            req.sampling_params.frequency_penalty == 0.0
+            and req.sampling_params.presence_penalty == 0.0
+            and req.custom_logit_processor is None
+            for req in batch.reqs
+        )
+
+    def before_decode(
+        self,
+        forward_batch: ForwardBatch | None,
+        schedule_batch: ScheduleBatch,
+        requests: list[SchedulerRequest],
+        *,
+        is_lookahead: bool = False,
+    ) -> None:
+        scaling_penalties = forward_batch.sampling_info.acc_scaling_penalties
+        if not is_lookahead or scaling_penalties is None:
+            return
+        else:
+            pass
+        # note (ratish): the scheduler folded in tokens up to the step before the one
+        # still in flight; that step's ids are this step's inputs, and the scatter
+        # repeats harmlessly when the scheduler folds them in later.
+        penalties = torch.tensor(
+            [
+                sched_req.data.req.sampling_params.repetition_penalty
+                for sched_req in requests
+            ],
+            dtype=scaling_penalties.dtype,
+            pin_memory=is_pin_memory_available(self.device),
+        ).to(self.device, non_blocking=True)
+        scaling_penalties.scatter_(
+            1, forward_batch.input_ids.long().unsqueeze(1), penalties.unsqueeze(1)
+        )
+
+    def post_decode_resolve(
+        self,
+        launch_buf: torch.Tensor | None,
+        result: GenerationBatchResult,
+        forward_batch: ForwardBatch | None,
+        schedule_batch: ScheduleBatch,
+        requests: list[SchedulerRequest],
+    ) -> None:
+        super().post_decode_resolve(
+            launch_buf, result, forward_batch, schedule_batch, requests
+        )
+        if launch_buf is None:
+            return
+        else:
+            pass
+        # note (ratish): a lookahead step resolves after the step before it, which can
+        # finish or retract its request.
+        self.emit_speech_tokens(
+            [
+                (sched_req, token_id)
+                for sched_req, token_id in zip(
+                    requests, result.next_token_ids.tolist(), strict=True
+                )
+                if not (
+                    sched_req.data.req.finished()
+                    or self.req_is_retracted(sched_req.data.req)
+                )
+            ]
+        )
+
     def sample_before_post_prefill(
         self,
         forward_batch: ForwardBatch | None,
@@ -371,9 +441,14 @@ class FunCosyVoice3ModelRunner(ModelRunner):
         # note (Yucheng Hu): a pageable D2H on the default stream stalls other threads'
         # kernel launches while it waits, an event wait does not.
         self.stage_token_ids(result, token_ids)
-        token_ids_cpu = self.resolve_host_token_ids(result).tolist()
-        for idx, sched_req in enumerate(requests):
-            token_id = int(token_ids_cpu[idx])
+        self.emit_speech_tokens(
+            list(zip(requests, self.resolve_host_token_ids(result).tolist()))
+        )
+
+    def emit_speech_tokens(
+        self, request_tokens: list[tuple[SchedulerRequest, int]]
+    ) -> None:
+        for sched_req, token_id in request_tokens:
             if token_id >= VOCAB_SIZE:
                 continue
             else:

@@ -110,6 +110,73 @@ def test_cosyvoice3_runner_samples_before_prefill_and_decode_collection() -> Non
     assert decode.next_token_ids is sampled
 
 
+def test_cosyvoice3_lookahead_accepts_repetition_penalty_and_min_new_tokens() -> None:
+    runner = object.__new__(FunCosyVoice3ModelRunner)
+
+    def req(frequency_penalty: float) -> SimpleNamespace:
+        return SimpleNamespace(
+            sampling_params=SimpleNamespace(
+                frequency_penalty=frequency_penalty,
+                presence_penalty=0.0,
+                repetition_penalty=1.21,
+                min_new_tokens=40,
+            ),
+            custom_logit_processor=None,
+        )
+
+    assert runner.lookahead_eligible(SimpleNamespace(reqs=[req(0.0), req(0.0)]))
+    assert not runner.lookahead_eligible(SimpleNamespace(reqs=[req(0.0), req(0.5)]))
+
+
+@pytest.mark.parametrize("is_lookahead", [False, True])
+def test_cosyvoice3_lookahead_step_penalizes_the_unresolved_step_ids(
+    is_lookahead: bool,
+) -> None:
+    runner = object.__new__(FunCosyVoice3ModelRunner)
+    runner.device = torch.device("cpu")
+    scaling_penalties = torch.ones((2, 8))
+    scaling_penalties[0, 1] = 1.21
+    forward_batch = SimpleNamespace(
+        input_ids=torch.tensor([3, 5]),
+        sampling_info=SimpleNamespace(acc_scaling_penalties=scaling_penalties),
+    )
+    requests = [ras_request(row, [], request_id=f"req-{row}") for row in range(2)]
+    for sched_req, penalty in zip(requests, (1.21, 1.5)):
+        sched_req.data.req.sampling_params.repetition_penalty = penalty
+
+    runner.before_decode(forward_batch, None, requests, is_lookahead=is_lookahead)
+
+    expected = torch.ones((2, 8))
+    expected[0, 1] = 1.21
+    if is_lookahead:
+        expected[0, 3], expected[1, 5] = 1.21, 1.5
+    else:
+        pass
+    assert torch.equal(scaling_penalties, expected)
+
+
+def test_cosyvoice3_lookahead_resolve_skips_requests_the_step_before_finished() -> None:
+    runner = object.__new__(FunCosyVoice3ModelRunner)
+    runner.outbox = None
+    requests = [
+        SimpleNamespace(
+            data=CosyVoice3SGLangRequestData(
+                req=SimpleNamespace(
+                    finished=lambda finished=finished: finished, is_retracted=False
+                )
+            )
+        )
+        for finished in (False, True)
+    ]
+    result = SimpleNamespace(next_token_ids=None)
+
+    runner.post_decode_resolve(torch.tensor([13, 14]), result, None, None, requests)
+
+    assert [int(code) for code in requests[0].data.output_codes] == [13]
+    assert requests[1].data.output_codes == []
+    assert result.next_token_ids.tolist() == [13, 14]
+
+
 def test_cosyvoice3_torch_mps_seed_avoids_float64_sampler(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
