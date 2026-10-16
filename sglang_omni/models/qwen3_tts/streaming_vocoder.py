@@ -608,6 +608,8 @@ class Qwen3TTSStreamingVocoderScheduler(
 ):
     """Decode Qwen3-TTS codec frames on a priority device stream."""
 
+    accepts_stream_chunk_batches = True
+
     def __init__(
         self,
         tokenizer: "Qwen3TTSTokenizer",

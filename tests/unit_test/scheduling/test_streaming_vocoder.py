@@ -22,6 +22,7 @@ import torch
 from sglang_omni.pipeline.stage.stream_queue import StreamItem
 from sglang_omni.proto import OmniRequest, StagePayload
 from sglang_omni.scheduling import streaming_vocoder
+from sglang_omni.scheduling.message import IncomingMessage
 from sglang_omni.scheduling.streaming_vocoder import (
     INITIAL_CODEC_CHUNK_FRAMES_PARAM,
     StreamingVocoderBase,
@@ -735,3 +736,21 @@ def test_stream_chunk_accepts_bool_false_stream_flag() -> None:
     scheduler = FakeStreamingVocoder(threshold=10)
     state = scheduler.ingest_stream_item("r", item([1], {"stream": False}))
     assert state is not None
+
+
+def test_delivered_batch_runs_each_chunk_through_a_non_coalescing_vocoder() -> None:
+    scheduler = FakeStreamingVocoder(threshold=1)
+
+    scheduler.handle_message(
+        IncomingMessage(
+            "a",
+            "stream_chunk_batch",
+            [("a", item([1])), ("b", item([2])), ("a", item([3]))],
+        ),
+        None,
+    )
+
+    messages = drain(scheduler)
+    assert [message.request_id for message in messages] == ["a", "b", "a"]
+    for message, values in zip(messages, ([1.0], [2.0], [3.0])):
+        np.testing.assert_array_equal(make_waveform(message.data), values)

@@ -239,7 +239,13 @@ class StreamingVocoderBase(
     def on_stream_chunk_batch(self, items: list[tuple[str, StreamItem]]) -> None:
         """Ingest every chunk then run one coalesced pump under ``state_lock``;
         external abort callbacks for failed requests run after the lock is
-        released, matching the serving loop."""
+        released, matching the serving loop. A vocoder that does not coalesce
+        handles a delivered batch one chunk at a time."""
+        if not self.can_batch_stream_chunks:
+            super().on_stream_chunk_batch(items)
+            return
+        else:
+            pass
         failed: list[str] = []
         with self.state_lock:
             for request_id, item in items:
