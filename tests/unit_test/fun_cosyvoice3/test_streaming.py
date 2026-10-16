@@ -27,7 +27,9 @@ from sglang_omni.models.fun_cosyvoice3.streaming import (
     tokens_needed_for_causal_chunk,
 )
 from sglang_omni.models.fun_cosyvoice3.streaming_vocoder import (
+    CosyVoice3StreamState,
     FunCosyVoice3StreamingVocoderScheduler,
+    NextDecode,
 )
 from sglang_omni.pipeline.stage.stream_queue import StreamItem
 from sglang_omni.proto import OmniRequest, StagePayload
@@ -643,7 +645,8 @@ def test_hops_of_different_token_windows_share_one_causal_flow_batch() -> None:
 
 def test_step_takes_started_streams_before_new_ones_up_to_the_batch_size() -> None:
     flow, scheduler = make_scheduler(max_batch_size=2)
-    scheduler.clock = Clock()
+    clock = Clock()
+    scheduler.clock = clock
     for request_id in ("req-a", "req-b"):
         scheduler.handle_streaming_new_request(request_id, stream_payload(request_id))
         scheduler.ingest_stream_item(request_id, item(list(range(28))))
@@ -653,6 +656,7 @@ def test_step_takes_started_streams_before_new_ones_up_to_the_batch_size() -> No
     for request_id in ("req-c", "req-d"):
         scheduler.handle_streaming_new_request(request_id, stream_payload(request_id))
         scheduler.ingest_stream_item(request_id, item(list(range(28))))
+    clock.now += 1.0
 
     assert serve(scheduler) == 2
     assert stream_ids(drain(scheduler)) == [
@@ -681,6 +685,73 @@ def test_first_hop_runs_when_no_started_stream_is_runnable() -> None:
     assert hop_frames(flow) == {window_frames(flow, 28)}
 
 
+def test_started_hop_waits_for_the_next_stream_to_share_its_step() -> None:
+    flow, scheduler = make_scheduler()
+    scheduler.clock = Clock()
+    for request_id in ("req-a", "req-b"):
+        scheduler.handle_streaming_new_request(request_id, stream_payload(request_id))
+    scheduler.ingest_stream_item("req-a", item(list(range(78))))
+    assert serve(scheduler) == 1
+    assert not scheduler.has_ready_work()
+
+    scheduler.ingest_stream_item("req-b", item(list(range(28))))
+    assert serve(scheduler) == 1
+    assert stream_ids(drain(scheduler)) == ["req-a", "req-b", "req-a"]
+    assert len(estimator_calls(flow)[-1]["lengths"]) == 4
+
+
+def test_held_hop_runs_once_its_slack_is_two_recent_steps() -> None:
+    flow, scheduler = make_scheduler()
+    clock = Clock()
+    scheduler.clock = clock
+    step_seconds = 2**-11
+    run_step = scheduler.run_step
+
+    def timed_run_step(
+        participants: list[tuple[str, CosyVoice3StreamState]], plan: NextDecode
+    ) -> dict[str, torch.Tensor]:
+        clock.now += step_seconds
+        return run_step(participants, plan)
+
+    scheduler.run_step = timed_run_step
+    for request_id in ("req-a", "req-b"):
+        scheduler.handle_streaming_new_request(request_id, stream_payload(request_id))
+    scheduler.ingest_stream_item("req-a", item(list(range(78))))
+    assert serve(scheduler) == 1
+    state = scheduler.stream_states["req-a"]
+    hold_end = (
+        state.first_emit_at
+        + state.speech_offset / scheduler.sample_rate
+        - 2 * step_seconds
+    )
+
+    clock.now = hold_end - 1e-6
+    assert not scheduler.has_ready_work()
+    clock.now = hold_end
+    assert serve(scheduler) == 1
+    assert stream_ids(drain(scheduler)) == ["req-a", "req-a"]
+
+
+def test_finished_stream_runs_its_last_hop_without_waiting() -> None:
+    flow, scheduler = make_scheduler()
+    scheduler.clock = Clock()
+    for request_id in ("req-a", "req-b"):
+        scheduler.handle_streaming_new_request(request_id, stream_payload(request_id))
+    scheduler.ingest_stream_item("req-a", item(list(range(78))))
+    assert serve(scheduler) == 1
+    assert not scheduler.has_ready_work()
+
+    scheduler.handle_stream_done("req-a")
+    assert serve(scheduler) == 2
+    assert [m.type for m in drain(scheduler)] == [
+        "stream",
+        "stream",
+        "stream",
+        "result",
+    ]
+    assert "req-a" not in scheduler.stream_states
+
+
 def test_finals_rank_by_slack_with_the_other_started_streams() -> None:
     flow, scheduler = make_scheduler()
     clock = Clock()
@@ -690,7 +761,9 @@ def test_finals_rank_by_slack_with_the_other_started_streams() -> None:
     scheduler.ingest_stream_item("req-a", item(list(range(28))))
     assert serve(scheduler) == 1
     scheduler.ingest_stream_item("req-c", item(list(range(78))))
-    assert serve(scheduler) == 2
+    assert serve(scheduler) == 1
+    clock.now += 1.0
+    assert serve(scheduler) == 1
     a_samples = scheduler.stream_states["req-a"].speech_offset
     c_samples = scheduler.stream_states["req-c"].speech_offset
     assert 0 < a_samples < c_samples
@@ -750,7 +823,8 @@ def test_finals_share_one_non_streaming_flow_batch() -> None:
 
 def test_a_wide_row_shares_one_step_with_short_rows_at_their_own_lengths() -> None:
     flow, scheduler = make_scheduler()
-    scheduler.clock = Clock()
+    clock = Clock()
+    scheduler.clock = clock
     scheduler.handle_streaming_new_request("req-a", stream_payload("req-a"))
     scheduler.ingest_stream_item("req-a", item([i % 31 for i in range(78)]))
     assert serve(scheduler) == 2
@@ -760,6 +834,7 @@ def test_a_wide_row_shares_one_step_with_short_rows_at_their_own_lengths() -> No
         scheduler.handle_streaming_new_request(request_id, stream_payload(request_id))
         scheduler.ingest_stream_item(request_id, item(list(range(28))))
     estimator_calls(flow).clear()
+    clock.now += 1.0
 
     assert serve(scheduler) == 1
     assert stream_ids(drain(scheduler)) == ["req-a", "req-b", "req-c"]
@@ -768,12 +843,15 @@ def test_a_wide_row_shares_one_step_with_short_rows_at_their_own_lengths() -> No
 
 def test_finals_of_different_widths_share_one_step_at_their_own_lengths() -> None:
     flow, scheduler = make_scheduler()
-    scheduler.clock = Clock()
+    clock = Clock()
+    scheduler.clock = clock
     scheduler.handle_streaming_new_request("req-a", stream_payload("req-a"))
     scheduler.ingest_stream_item("req-a", item(list(range(30))))
     scheduler.handle_streaming_new_request("req-b", stream_payload("req-b"))
     scheduler.ingest_stream_item("req-b", item([i % 31 for i in range(200)]))
-    assert serve(scheduler) == 3
+    assert serve(scheduler) == 1
+    clock.now += 1.0
+    assert serve(scheduler) == 2
     hop_messages = drain(scheduler)
     scheduler.handle_stream_done("req-a")
     scheduler.handle_stream_done("req-b")

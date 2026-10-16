@@ -12,7 +12,9 @@ the next step (or the stream-done flush) is when they become audio.
 from __future__ import annotations
 
 import logging
+import queue
 import time
+from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Literal, Mapping
@@ -41,7 +43,7 @@ from sglang_omni.models.fun_cosyvoice3.streaming import (
     pad_flow_prompt_to_hop,
 )
 from sglang_omni.proto import StagePayload
-from sglang_omni.scheduling.message import OutgoingMessage
+from sglang_omni.scheduling.message import IncomingMessage, OutgoingMessage
 from sglang_omni.scheduling.pipeline_state import build_usage
 from sglang_omni.scheduling.streaming_vocoder import StreamingVocoderBase
 from sglang_omni.utils.audio_payload import audio_waveform_payload
@@ -49,6 +51,7 @@ from sglang_omni.utils.audio_payload import audio_waveform_payload
 logger = logging.getLogger(__name__)
 
 SAMPLE_RATE = 24000
+RECENT_STEP_WINDOW = 16
 
 NextDecode = Literal["causal_window", "leftover", "fallback", "wait"]
 
@@ -124,6 +127,7 @@ class FunCosyVoice3StreamingVocoderScheduler(
             self.disable_hop_growth = bool(disable_hop_growth)
             self.vocoder = vocoder
             self.clock: Callable[[], float] = time.monotonic
+            self.recent_step_seconds: deque[float] = deque(maxlen=RECENT_STEP_WINDOW)
         super().__init__(
             self.vocode_payload,
             batch_compute_fn=self.vocode_payloads,
@@ -136,8 +140,14 @@ class FunCosyVoice3StreamingVocoderScheduler(
         )
 
     def pump_one_step(self) -> list[str] | None:
+        started = self.clock()
         with self.vocoder.stream_context:
-            return super().pump_one_step()
+            failed = super().pump_one_step()
+        if failed is not None:
+            self.recent_step_seconds.append(self.clock() - started)
+        else:
+            pass
+        return failed
 
     async def vocode_payload(self, payload: StagePayload) -> StagePayload:
         results = await self.vocoder.decode_payloads([payload])
@@ -392,14 +402,55 @@ class FunCosyVoice3StreamingVocoderScheduler(
 
     def has_ready_work(self) -> bool:
         with self.state_lock:
-            ready = any(
-                state.next_decode() != "wait" and not self.is_aborted(request_id)
-                for request_id, state in self.stream_state_items()
+            step_at = self.next_step_at()
+        return step_at is not None and step_at <= self.clock()
+
+    def next_message(self) -> IncomingMessage | None:
+        with self.state_lock:
+            step_at = self.next_step_at()
+        # note (ratish): a held hop wakes the loop when its hold ends.
+        timeout = 0.1 if step_at is None else min(max(step_at - self.clock(), 0.0), 0.1)
+        try:
+            return self.get_batch_message(timeout=timeout)
+        except queue.Empty:
+            return None
+
+    def hold_ends_at(self, state: CosyVoice3StreamState) -> float | None:
+        """When a started stream's later hop stops waiting for a fuller step: once its
+        client holds less audio than two recent steps take, the step running then and
+        the hop's own. None for a row that never waits."""
+        if (
+            state.first_emit_at is None
+            or state.done
+            or state.next_decode() != "causal_window"
+        ):
+            return None
+        else:
+            return (
+                state.first_emit_at
+                + state.speech_offset / self.sample_rate
+                - 2 * max(self.recent_step_seconds, default=0.0)
             )
-            if ready:
-                return True
-            else:
-                return False
+
+    def next_step_at(self) -> float | None:
+        """Now, unless every ready row is a held hop and more rows can still join, then
+        the earliest hold's end. None when no row is ready."""
+        now = self.clock()
+        live = [
+            state
+            for request_id, state in self.stream_state_items()
+            if not self.is_aborted(request_id)
+        ]
+        ready = [state for state in live if state.next_decode() != "wait"]
+        hold_ends = [self.hold_ends_at(state) for state in ready]
+        if not ready:
+            return None
+        elif any(end is None or end <= now for end in hold_ends) or len(ready) >= min(
+            len(live), self.max_batch_size
+        ):
+            return now
+        else:
+            return min(hold_ends)
 
     def select_step_participants(
         self,
@@ -407,6 +458,7 @@ class FunCosyVoice3StreamingVocoderScheduler(
         now = self.clock()
         started: list[tuple[float, float, str, CosyVoice3StreamState]] = []
         unstarted: list[tuple[float, str, CosyVoice3StreamState]] = []
+        held: list[tuple[float, float, str, CosyVoice3StreamState]] = []
         for request_id, state in self.stream_state_items():
             if state.next_decode() == "wait" or self.is_aborted(request_id):
                 continue
@@ -418,9 +470,17 @@ class FunCosyVoice3StreamingVocoderScheduler(
                 playback_slack = state.speech_offset / self.sample_rate - (
                     now - state.first_emit_at
                 )
-                started.append((playback_slack, state.ready_since, request_id, state))
+                hold_end = self.hold_ends_at(state)
+                # note (ratish): a held hop has two steps of slack, so it goes last.
+                if hold_end is not None and hold_end > now:
+                    held.append((playback_slack, state.ready_since, request_id, state))
+                else:
+                    started.append(
+                        (playback_slack, state.ready_since, request_id, state)
+                    )
         ranked = [(request_id, state) for _, _, request_id, state in sorted(started)]
         ranked += [(request_id, state) for _, request_id, state in sorted(unstarted)]
+        ranked += [(request_id, state) for _, _, request_id, state in sorted(held)]
         if not ranked:
             return []
         else:
