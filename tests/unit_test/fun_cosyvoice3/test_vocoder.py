@@ -1687,6 +1687,43 @@ def test_vocoder_sine_source_matches_cosyvoice_without_a_host_wait() -> None:
         assert torch.equal(output, reference)
 
 
+@pytest.mark.accelerator
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_vocoder_spectra_match_cosyvoice_without_a_host_wait(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(torch.backends.cuda.matmul, "allow_tf32", False)
+    hift = make_causal_hift(10.0)
+    reference_hift = copy.deepcopy(hift)
+    stages.CosyVoice3Vocoder(HiftFlowStub(), hift)
+    torch.manual_seed(2)
+    waveforms = torch.randn(3, 4800, device="cuda") * 0.3
+    magnitude = torch.rand(3, 9, 1201, device="cuda") * 2
+    phase = (torch.rand(3, 9, 1201, device="cuda") * 2 - 1) * torch.pi
+    with torch.inference_mode():
+        references = (
+            *reference_hift._stft(
+                waveforms
+            ),  # noqa: leading-underscore  # upstream name
+            reference_hift._istft(  # noqa: leading-underscore  # upstream name
+                magnitude, phase
+            ),
+        )
+        sync_debug_mode = torch.cuda.get_sync_debug_mode()
+        torch.cuda.set_sync_debug_mode("error")
+        try:
+            outputs = (
+                *hift._stft(waveforms),  # noqa: leading-underscore  # upstream name
+                hift._istft(
+                    magnitude, phase
+                ),  # noqa: leading-underscore  # upstream name
+            )
+        finally:
+            torch.cuda.set_sync_debug_mode(sync_debug_mode)
+    for output, reference in zip(outputs, references, strict=True):
+        torch.testing.assert_close(output, reference)
+
+
 def prefix_pool_scheduler(
     room: list[bool],
 ) -> tuple[FunCosyVoice3StreamingVocoderScheduler, list[tuple[str, int]]]:

@@ -7,6 +7,7 @@ import contextlib
 import gc
 import importlib
 import logging
+import math
 import os
 from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
@@ -1335,6 +1336,66 @@ def patch_sine_harmonics(hift: "CausalHiFTGenerator", device: torch.device) -> N
     sine_generator.forward = forward
 
 
+def patch_hift_spectra(hift: "CausalHiFTGenerator", device: torch.device) -> None:
+    """Give HiFT its STFT and inverse STFT as float32 matmuls over the frames.
+    torch.stft and torch.istft build a cuFFT plan for each new shape, whose module
+    load waits for all the work queued on the device, and torch.istft reads its
+    window envelope on the host.
+    """
+    n_fft = hift.istft_params["n_fft"]
+    hop_length = hift.istft_params["hop_len"]
+    bins = n_fft // 2 + 1
+    window = hift.stft_window.to(device=device, dtype=torch.float64)
+    angle = (2 * math.pi / n_fft) * torch.outer(
+        torch.arange(bins, device=device, dtype=torch.float64),
+        torch.arange(n_fft, device=device, dtype=torch.float64),
+    )
+    forward_basis = (
+        torch.cat([torch.cos(angle), -torch.sin(angle)]) * window
+    ).T.float()
+    # note (ratish): a one sided inverse counts the bins between DC and Nyquist twice.
+    one_sided = torch.full((bins, 1), 2.0, device=device, dtype=torch.float64)
+    one_sided[0] = 1.0
+    one_sided[-1] = 1.0
+    inverse_basis = (
+        torch.cat([torch.cos(angle) * one_sided, -torch.sin(angle) * one_sided])
+        * window
+        / n_fft
+    ).float()
+    squared_window = hift.stft_window.to(device).pow(2)
+
+    def stft(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        frames = F.pad(x[:, None], (n_fft // 2, n_fft // 2), mode="reflect")[
+            :, 0
+        ].unfold(-1, n_fft, hop_length)
+        spectrum = (frames @ forward_basis).transpose(1, 2)
+        return spectrum[:, :bins], spectrum[:, bins:]
+
+    def istft(magnitude: torch.Tensor, phase: torch.Tensor) -> torch.Tensor:
+        magnitude = torch.clip(magnitude, max=1e2)
+        spectrum = torch.cat(
+            [magnitude * torch.cos(phase), magnitude * torch.sin(phase)], dim=1
+        )
+        frames = spectrum.transpose(1, 2) @ inverse_basis
+        frame_count = frames.shape[1]
+        signal_length = n_fft + hop_length * (frame_count - 1)
+        signal = torch.ops.aten.unfold_backward(
+            frames, [frames.shape[0], signal_length], 1, n_fft, hop_length
+        )
+        envelope = torch.ops.aten.unfold_backward(
+            squared_window.expand(1, frame_count, n_fft),
+            [1, signal_length],
+            1,
+            n_fft,
+            hop_length,
+        )
+        trim = n_fft // 2
+        return signal[:, trim:-trim] / envelope[:, trim:-trim]
+
+    hift._stft = stft  # noqa: leading-underscore  # upstream name
+    hift._istft = istft  # noqa: leading-underscore  # upstream name
+
+
 def load_cosyvoice3_flow_hift_lightweight(
     checkpoint_dir: str,
     *,
@@ -1795,6 +1856,7 @@ class CosyVoice3Vocoder(BatchVocoderBase[FunCosyVoice3State, torch.Tensor]):
         device = next(self.flow.parameters()).device
         if device.type == "cuda":
             patch_sine_harmonics(hift, device)
+            patch_hift_spectra(hift, device)
             stream = torch.cuda.Stream(device=device)
             stream.wait_stream(torch.cuda.current_stream(device))
             self.stream_context: contextlib.AbstractContextManager[None] = (
