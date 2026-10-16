@@ -27,7 +27,12 @@ class PromptHiddenCapture:
         return not bool(self.received.all())
 
     def add_extend(self, *, prefix_length: int, hidden_states: torch.Tensor) -> None:
-        assert prefix_length >= 0 and hidden_states.ndim == 2
+        if prefix_length < 0 or hidden_states.ndim != 2:
+            raise ValueError(
+                "Prompt capture requires a nonnegative prefix and 2D states"
+            )
+        else:
+            pass
         missing = (
             ~self.received
             & (self.positions >= prefix_length)
@@ -43,9 +48,13 @@ class PromptHiddenCapture:
                 dtype=hidden_states.dtype,
                 device="cpu",
             )
+        elif (
+            self.hidden_states.shape[1] != hidden_states.shape[1]
+            or self.hidden_states.dtype != hidden_states.dtype
+        ):
+            raise ValueError("Prompt capture width and dtype must match across chunks")
         else:
-            assert self.hidden_states.shape[1] == hidden_states.shape[1]
-            assert self.hidden_states.dtype == hidden_states.dtype
+            pass
         source_positions = (self.positions[missing] - prefix_length).to(
             device=hidden_states.device
         )

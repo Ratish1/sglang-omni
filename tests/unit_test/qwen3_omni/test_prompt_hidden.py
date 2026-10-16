@@ -49,6 +49,30 @@ def test_prompt_capture_keeps_single_row_rank_and_accepts_empty_chunks() -> None
     )
 
 
+@pytest.mark.parametrize(
+    ("prefix_length", "hidden_states", "message"),
+    [
+        (-1, torch.ones((1, 2)), "nonnegative prefix"),
+        (3, torch.ones(2), "2D states"),
+        (3, torch.ones((1, 1)), "width and dtype"),
+        (3, torch.ones((1, 2), dtype=torch.float64), "width and dtype"),
+    ],
+    ids=["negative-prefix", "rank", "width", "dtype"],
+)
+def test_prompt_capture_rejects_invalid_chunks_without_consuming_rows(
+    prefix_length: int, hidden_states: torch.Tensor, message: str
+) -> None:
+    capture = PromptHiddenCapture(positions=torch.tensor([1, 3]))
+    capture.add_extend(prefix_length=1, hidden_states=torch.ones((1, 2)))
+    with pytest.raises(ValueError, match=message):
+        capture.add_extend(prefix_length=prefix_length, hidden_states=hidden_states)
+    assert capture.needs_capture
+    capture.add_extend(prefix_length=3, hidden_states=torch.full((1, 2), 2.0))
+    torch.testing.assert_close(
+        capture.take_complete().hidden_states, torch.tensor([[1.0, 1.0], [2.0, 2.0]])
+    )
+
+
 def test_prompt_captures_do_not_share_request_storage() -> None:
     positions = torch.tensor([1])
     first = PromptHiddenCapture(positions=positions)

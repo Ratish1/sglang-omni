@@ -150,6 +150,46 @@ def test_prompt_capture_preserves_flat_batch_spans_and_single_hidden_rows(
     )
 
 
+@pytest.mark.parametrize(
+    ("hidden_states", "extend_lengths", "prefix_lengths", "error_message"),
+    [
+        (None, [1], [0], "2D prefill hidden states"),
+        (torch.zeros(HIDDEN), [1], [0], "2D prefill hidden states"),
+        (torch.zeros(2, HIDDEN), [1, 1], [0, 0], "batch lengths"),
+        (torch.zeros(2, HIDDEN), [1], [0], "hidden rows"),
+    ],
+    ids=["missing-states", "wrong-rank", "request-count", "row-count"],
+)
+def test_prompt_capture_rejects_misaligned_prefill_before_storing_states(
+    hidden_states: torch.Tensor | None,
+    extend_lengths: list[int],
+    prefix_lengths: list[int],
+    error_message: str,
+) -> None:
+    runner = make_runner()
+    capture = PromptHiddenCapture(positions=torch.tensor([0]))
+    request = SchedulerRequest(
+        request_id="speech",
+        data=QwenThinkerRequestData(prompt_hidden_capture=capture),
+    )
+    batch = SimpleNamespace(
+        capture_hidden_mode=CaptureHiddenMode.FULL,
+        extend_seq_lens_cpu=extend_lengths,
+        extend_prefix_lens_cpu=prefix_lengths,
+    )
+
+    with pytest.raises(RuntimeError, match=error_message):
+        runner.post_prefill(
+            SimpleNamespace(logits_output=SimpleNamespace(hidden_states=hidden_states)),
+            batch,
+            None,
+            [request],
+        )
+
+    assert capture.hidden_states is None
+    assert capture.needs_capture
+
+
 @pytest.mark.parametrize("enable_sidecar", [False, True])
 def test_replayed_qwen_prompt_uses_its_original_multimodal_embeddings(enable_sidecar):
     runner = make_runner()
@@ -160,7 +200,11 @@ def test_replayed_qwen_prompt_uses_its_original_multimodal_embeddings(enable_sid
     request = make_request(prompt, model_inputs, positions=make_positions(audio=(0, 2)))
     scheduler_request = SchedulerRequest(
         request_id="speech",
-        data=QwenThinkerRequestData(req=request, model_inputs=model_inputs),
+        data=QwenThinkerRequestData(
+            req=request,
+            model_inputs=model_inputs,
+            prompt_hidden_capture=PromptHiddenCapture(positions=torch.tensor([0, 2])),
+        ),
     )
 
     for prefix, length, middle_chunks in [(0, 2, 1), (2, 2, 0), (0, 4, 0)]:
@@ -182,6 +226,32 @@ def test_replayed_qwen_prompt_uses_its_original_multimodal_embeddings(enable_sid
         else:
             pass
     assert scheduler_request.data.model_inputs["audio_embeds"] is audio_embeddings
+
+
+def test_prefill_without_prompt_capture_preserves_request_inputs_and_cursor() -> None:
+    runner = make_runner()
+    runner.enable_prefill_sidecar = False
+    current_inputs = {"audio_embeds": torch.ones(1, HIDDEN)}
+    request = make_request(
+        [AUDIO_ID], current_inputs, positions=make_positions(audio=(0,))
+    )
+    consumed = {"audio": 1}
+    request._omni_consumed = consumed  # noqa: leading-underscore  # production name
+    scheduler_request = SchedulerRequest(
+        request_id="text",
+        data=QwenThinkerRequestData(
+            req=request,
+            model_inputs={"audio_embeds": torch.zeros(1, HIDDEN)},
+        ),
+    )
+    batch, schedule = make_batch([request])
+
+    runner.before_prefill(batch, schedule, [scheduler_request])
+
+    assert request.omni_model_inputs is current_inputs
+    assert (
+        request._omni_consumed is consumed
+    )  # noqa: leading-underscore  # production name
 
 
 def test_qwen_deepstack_prefill_reaches_the_scoped_model_wrapper():

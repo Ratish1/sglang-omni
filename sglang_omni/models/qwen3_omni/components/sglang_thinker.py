@@ -195,6 +195,7 @@ class Qwen3OmniThinkerForCausalLM(nn.Module):
             else:
                 pass
             previous_capture_layers = self.model.layers_to_capture
+            # Note (wenyao): the final layer uses normalized model output; aux holds layer inputs.
             self.model.layers_to_capture = (
                 [accepted_layer]
                 if accepted_layer < self.config.num_hidden_layers
@@ -221,9 +222,19 @@ class Qwen3OmniThinkerForCausalLM(nn.Module):
             else:
                 pass
         if capture_prompt_states and accepted_layer < self.config.num_hidden_layers:
-            assert isinstance(model_output, tuple) and len(model_output) == 2
+            if not isinstance(model_output, tuple) or len(model_output) != 2:
+                raise RuntimeError(
+                    "Prompt capture did not return auxiliary hidden states"
+                )
+            else:
+                pass
             hidden_states, auxiliary_hidden_states = model_output
-            assert len(auxiliary_hidden_states) == 1
+            if len(auxiliary_hidden_states) != 1:
+                raise RuntimeError(
+                    "Prompt capture requires exactly one auxiliary layer"
+                )
+            else:
+                pass
             return self.logits_processor(
                 input_ids,
                 hidden_states,

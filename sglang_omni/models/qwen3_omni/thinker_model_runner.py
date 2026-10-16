@@ -72,11 +72,18 @@ class Qwen3OmniThinkerModelRunner(ThinkerModelRunner):
         else:
             pass
         hidden_states = result.logits_output.hidden_states
-        assert hidden_states is not None and hidden_states.ndim == 2
+        if hidden_states is None or hidden_states.ndim != 2:
+            raise RuntimeError("Prompt capture requires 2D prefill hidden states")
+        else:
+            pass
         extend_lengths = forward_batch.extend_seq_lens_cpu
         prefix_lengths = forward_batch.extend_prefix_lens_cpu
-        assert len(extend_lengths) == len(prefix_lengths) == len(requests)
-        assert hidden_states.shape[0] == sum(extend_lengths)
+        if not len(extend_lengths) == len(prefix_lengths) == len(requests):
+            raise RuntimeError("Prompt capture batch lengths do not match requests")
+        elif hidden_states.shape[0] != sum(extend_lengths):
+            raise RuntimeError("Prompt capture hidden rows do not match extend lengths")
+        else:
+            pass
         batch_start = 0
         for request, prefix_length, extend_length in zip(
             requests, prefix_lengths, extend_lengths
@@ -404,8 +411,10 @@ class Qwen3OmniThinkerModelRunner(ThinkerModelRunner):
         requests: list[SchedulerRequest],
     ) -> None:
         for request_index, request in enumerate(requests):
-            if not isinstance(request, SchedulerRequest) or not isinstance(
-                request.data, QwenThinkerRequestData
+            if (
+                not isinstance(request, SchedulerRequest)
+                or not isinstance(request.data, QwenThinkerRequestData)
+                or request.data.prompt_hidden_capture is None
             ):
                 continue
             else:

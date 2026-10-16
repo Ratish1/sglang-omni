@@ -6,6 +6,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 
@@ -324,6 +325,48 @@ def test_prompt_capture_restores_layer_selection_after_a_failed_forward() -> Non
             ),
         )
     assert wrapper.model.layers_to_capture == []
+
+
+@pytest.mark.parametrize(
+    ("model_output", "error_message"),
+    [
+        (torch.zeros(2, 1), "did not return auxiliary hidden states"),
+        (
+            (torch.zeros(2, 1), [torch.zeros(2, 1), torch.ones(2, 1)]),
+            "exactly one auxiliary layer",
+        ),
+    ],
+    ids=["two-row-tensor", "multiple-layers"],
+)
+def test_prompt_capture_rejects_malformed_model_output_before_logits(
+    monkeypatch: pytest.MonkeyPatch,
+    model_output: torch.Tensor | tuple[torch.Tensor, list[torch.Tensor]],
+    error_message: str,
+) -> None:
+    wrapper = make_bare_wrapper()
+    previous_capture_layers = [1, 3]
+    wrapper.model.layers_to_capture = previous_capture_layers
+    wrapper.root_config = SimpleNamespace(
+        talker_config=SimpleNamespace(accept_hidden_layer=2)
+    )
+    wrapper.config = SimpleNamespace(num_hidden_layers=4)
+    monkeypatch.setattr(wrapper.model, "forward", Mock(return_value=model_output))
+    logits_processor = Mock()
+    wrapper.logits_processor = logits_processor
+
+    with pytest.raises(RuntimeError, match=error_message):
+        wrapper.forward(
+            input_ids=torch.tensor([1, 2]),
+            positions=torch.tensor([0, 1]),
+            forward_batch=SimpleNamespace(
+                mrope_positions=None,
+                forward_mode=ForwardMode.EXTEND,
+                capture_hidden_mode=CaptureHiddenMode.FULL,
+            ),
+        )
+
+    logits_processor.assert_not_called()
+    assert wrapper.model.layers_to_capture is previous_capture_layers
 
 
 @pytest.mark.parametrize("accepted_layer", [-1, 5])
