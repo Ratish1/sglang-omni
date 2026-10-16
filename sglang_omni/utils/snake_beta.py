@@ -59,6 +59,10 @@ except Exception:  # pragma: no cover
 MAX_T = 65535 * 1024
 CHANNELS_LAST_BLOCK_POSITIONS = 32
 CHANNELS_LAST_BLOCK_CHANNELS = 64
+# note (ratish): measured on an H200 at Qwen3-Omni code2wav's decoder shapes (96 to 768
+# channels): 32 channels divide every width, and a tile of 64 positions ran fastest.
+BIAS_BLOCK_POSITIONS = 64
+BIAS_BLOCK_CHANNELS = 32
 TRITON_DEVICE_TYPES = frozenset({"cuda", "xpu"})
 
 logger = logging.getLogger(__name__)
@@ -145,15 +149,7 @@ if HAS_TRITON:
             mask=mask,
         )
 
-    @triton.jit(
-        do_not_specialize=[
-            "x_batch_stride",
-            "y_batch_stride",
-            "C",
-            "length",
-            "positions",
-        ]
-    )
+    @triton.jit(do_not_specialize=["x_batch_stride", "y_batch_stride", "C", "length"])
     def bias_snake_beta_channels_last_kernel(
         x_ptr,
         x_batch_stride,
@@ -166,20 +162,19 @@ if HAS_TRITON:
         beta_ptr,
         C,
         length,
-        positions,
         eps,
         HAS_RESIDUAL: tl.constexpr,
         WRITE_SUM: tl.constexpr,
         BLOCK_POSITIONS: tl.constexpr,
         BLOCK_CHANNELS: tl.constexpr,
     ):
-        # SnakeBeta of x + bias (+ residual) over [B, L, C] rows: x and y rows may sit inside
-        # longer buffers (their own batch strides); residual and the sum are contiguous. The
+        # SnakeBeta of x + bias (+ residual) over [B, L, C]: one program covers BLOCK_POSITIONS
+        # positions by BLOCK_CHANNELS channels of one batch row, so every tensor shares one
+        # offset tile from its own row base; x and y rows may sit inside longer buffers. The
         # sums round to bf16 in the eager order, (x + bias) then + residual.
-        rows = tl.program_id(0).to(tl.int64) * BLOCK_POSITIONS + tl.arange(
-            0, BLOCK_POSITIONS
-        )
+        positions = tl.program_id(0) * BLOCK_POSITIONS + tl.arange(0, BLOCK_POSITIONS)
         c = tl.program_id(1) * BLOCK_CHANNELS + tl.arange(0, BLOCK_CHANNELS)
+        batch = tl.program_id(2).to(tl.int64)
         channel_mask = c < C
         a, r = snake_beta_coefficients(
             tl.load(alpha_ptr + c, mask=channel_mask, other=0).to(tl.float32),
@@ -188,27 +183,28 @@ if HAS_TRITON:
         )
         bias = tl.load(bias_ptr + c, mask=channel_mask, other=0).to(tl.float32)
 
-        mask = (rows < positions)[:, None] & channel_mask[None, :]
-        batch = rows // length
-        frame_offsets = (rows % length) * C
-        contiguous_ptrs = rows[:, None] * C + c[None, :]
-        xv = tl.load(
-            x_ptr + (batch * x_batch_stride + frame_offsets)[:, None] + c[None, :],
-            mask=mask,
-            other=0,
-        ).to(tl.float32)
+        mask = (positions < length)[:, None] & channel_mask[None, :]
+        offsets = positions[:, None] * C + c[None, :]
+        contiguous_base = batch * length * C
+        xv = tl.load(x_ptr + batch * x_batch_stride + offsets, mask=mask, other=0).to(
+            tl.float32
+        )
         total = (xv + bias[None, :]).to(tl.bfloat16).to(tl.float32)
         if HAS_RESIDUAL:
-            residual = tl.load(residual_ptr + contiguous_ptrs, mask=mask, other=0)
+            residual = tl.load(
+                residual_ptr + contiguous_base + offsets, mask=mask, other=0
+            )
             total = (total + residual.to(tl.float32)).to(tl.bfloat16).to(tl.float32)
         else:
             pass
         if WRITE_SUM:
-            tl.store(sum_ptr + contiguous_ptrs, total.to(tl.bfloat16), mask=mask)
+            tl.store(
+                sum_ptr + contiguous_base + offsets, total.to(tl.bfloat16), mask=mask
+            )
         else:
             pass
         tl.store(
-            y_ptr + (batch * y_batch_stride + frame_offsets)[:, None] + c[None, :],
+            y_ptr + batch * y_batch_stride + offsets,
             snake_beta_values(total, a[None, :], r[None, :]),
             mask=mask,
         )
@@ -290,8 +286,9 @@ def fused_bias_snake_beta(
     """
     batch_size, length, channels = conv_output.shape
     grid = (
-        triton.cdiv(batch_size * length, CHANNELS_LAST_BLOCK_POSITIONS),
-        triton.cdiv(channels, CHANNELS_LAST_BLOCK_CHANNELS),
+        triton.cdiv(length, BIAS_BLOCK_POSITIONS),
+        triton.cdiv(channels, BIAS_BLOCK_CHANNELS),
+        batch_size,
     )
     with torch.get_device_module(conv_output.device).device(conv_output.device):
         bias_snake_beta_channels_last_kernel[grid](
@@ -306,12 +303,11 @@ def fused_bias_snake_beta(
             activation.beta,
             channels,
             length,
-            batch_size * length,
             activation.no_div_by_zero,
             HAS_RESIDUAL=residual is not None,
             WRITE_SUM=sum_out is not None,
-            BLOCK_POSITIONS=CHANNELS_LAST_BLOCK_POSITIONS,
-            BLOCK_CHANNELS=CHANNELS_LAST_BLOCK_CHANNELS,
+            BLOCK_POSITIONS=BIAS_BLOCK_POSITIONS,
+            BLOCK_CHANNELS=BIAS_BLOCK_CHANNELS,
             num_warps=4,
             enable_fp_fusion=False,
             **({"enable_reflect_ftz": False} if conv_output.is_cuda else {}),
