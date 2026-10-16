@@ -1308,6 +1308,33 @@ def keep_hift_constants_on_device(hift: "CausalHiFTGenerator", device: str) -> N
     hift.f0_predictor.to(torch.float64)
 
 
+def patch_sine_harmonics(hift: "CausalHiFTGenerator", device: torch.device) -> None:
+    """Give SineGen2 its harmonic multipliers on the device. Its forward builds them
+    on the host on every call, and their pageable upload waits for all the work queued
+    on the stream, the whole Flow solve before HiFT.
+    """
+    sine_generator = hift.m_source.l_sin_gen
+    harmonics = torch.arange(
+        1, sine_generator.harmonic_num + 2, dtype=torch.float32, device=device
+    ).view(1, 1, -1)
+
+    def forward(f0: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        sine_waves = (
+            sine_generator._f02sine(  # noqa: leading-underscore  # upstream name
+                torch.multiply(f0, harmonics)
+            )
+            * sine_generator.sine_amp
+        )
+        uv = sine_generator._f02uv(f0)  # noqa: leading-underscore  # upstream name
+        noise_amp = (
+            uv * sine_generator.noise_std + (1 - uv) * sine_generator.sine_amp / 3
+        )
+        noise = noise_amp * sine_generator.sine_waves[:, : sine_waves.shape[1]]
+        return sine_waves * uv + noise, uv, noise
+
+    sine_generator.forward = forward
+
+
 def load_cosyvoice3_flow_hift_lightweight(
     checkpoint_dir: str,
     *,
@@ -1767,6 +1794,7 @@ class CosyVoice3Vocoder(BatchVocoderBase[FunCosyVoice3State, torch.Tensor]):
         # AR's. It waits once for what the default stream holds at this point.
         device = next(self.flow.parameters()).device
         if device.type == "cuda":
+            patch_sine_harmonics(hift, device)
             stream = torch.cuda.Stream(device=device)
             stream.wait_stream(torch.cuda.current_stream(device))
             self.stream_context: contextlib.AbstractContextManager[None] = (

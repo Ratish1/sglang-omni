@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import copy
 import sys
 from collections.abc import Iterator
 from types import SimpleNamespace
@@ -1663,6 +1664,27 @@ def test_hift_step_final_is_bit_identical_beside_finals_of_other_widths(
     ):
         assert emitted_after == reference_after
         assert torch.equal(delta, reference)
+
+
+@pytest.mark.accelerator
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_vocoder_sine_source_matches_cosyvoice_without_a_host_wait() -> None:
+    hift = make_causal_hift(10.0)
+    reference_sine_generator = copy.deepcopy(hift.m_source.l_sin_gen)
+    stages.CosyVoice3Vocoder(HiftFlowStub(), hift)
+    f0 = torch.cat(
+        [torch.zeros(2, 2400, 1), torch.full((2, 2400, 1), 220.0)], dim=1
+    ).cuda()
+    with torch.inference_mode():
+        references = reference_sine_generator(f0)
+        sync_debug_mode = torch.cuda.get_sync_debug_mode()
+        torch.cuda.set_sync_debug_mode("error")
+        try:
+            outputs = hift.m_source.l_sin_gen(f0)
+        finally:
+            torch.cuda.set_sync_debug_mode(sync_debug_mode)
+    for output, reference in zip(outputs, references, strict=True):
+        assert torch.equal(output, reference)
 
 
 def prefix_pool_scheduler(
