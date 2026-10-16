@@ -215,19 +215,22 @@ class FusedCode2WavTransformer(torch.nn.Module):
         batch_size, length, hidden_size = inputs_embeds.shape
         head_dim = self.transformer.layers[0].self_attn.head_dim
         device = inputs_embeds.device
-        retained = int(state.transformer_keys[0].shape[-2])
+        retained_frames = int(state.transformer_keys[0].shape[-2])
         frame_positions = state.row_frame_positions(batch_size, device)
         query_positions = frame_positions[:, None] + torch.arange(length, device=device)
         key_positions = frame_positions[:, None] + torch.arange(
-            -retained, length, device=device
+            -retained_frames, length, device=device
         )
-        keys_by_query = key_positions[:, None, :]
-        queries = query_positions[:, :, None]
+        key_position_rows = key_positions[:, None, :]
+        query_position_columns = query_positions[:, :, None]
         # note (ratish): a key slot the stream has not filled sits at a negative position.
         window_mask = (
-            (keys_by_query <= queries)
-            & (queries - keys_by_query < self.transformer.config.sliding_window)
-            & (keys_by_query >= 0)
+            (key_position_rows <= query_position_columns)
+            & (
+                query_position_columns - key_position_rows
+                < self.transformer.config.sliding_window
+            )
+            & (key_position_rows >= 0)
         )[:, None]
         positions = query_positions.reshape(-1)
         hidden_states = inputs_embeds.reshape(batch_size * length, hidden_size)
@@ -264,8 +267,8 @@ class FusedCode2WavTransformer(torch.nn.Module):
                 ),
                 dim=2,
             )
-            state.transformer_keys[layer_index] = key[:, :, -retained:]
-            state.transformer_values[layer_index] = value[:, :, -retained:]
+            state.transformer_keys[layer_index] = key[:, :, -retained_frames:]
+            state.transformer_values[layer_index] = value[:, :, -retained_frames:]
             attended = F.scaled_dot_product_attention(
                 query.view(batch_size, length, -1, head_dim).transpose(1, 2),
                 key,
@@ -383,15 +386,19 @@ class Code2WavIncrementalDecoder:
             self.channels_last_weights = None
         # note (ratish): a stream's first decode drops each transposed conv's left pad once,
         # carried to the waveform through the strides after it.
-        self.first_decode_shortfall = 0
-        stride_after = 1
+        self.first_decode_shortfall_samples = 0
+        upsample_after = 1
         for block in reversed(model.decoder[1:-2]):
             transconv = block.block[1]
-            self.first_decode_shortfall += int(transconv.left_pad) * stride_after
-            stride_after *= int(transconv.conv.stride[0])
+            self.first_decode_shortfall_samples += (
+                int(transconv.left_pad) * upsample_after
+            )
+            upsample_after *= int(transconv.conv.stride[0])
         for blocks in reversed(model.upsample):
-            self.first_decode_shortfall += int(blocks[0].left_pad) * stride_after
-            stride_after *= int(blocks[0].conv.stride[0])
+            self.first_decode_shortfall_samples += (
+                int(blocks[0].left_pad) * upsample_after
+            )
+            upsample_after *= int(blocks[0].conv.stride[0])
         conv_histories, transconv_overlaps = conv_stack_state_layout(model)
         attention = self.transformer.layers[0].self_attn
         self.spec = IncrementalCodecStateSpec(
@@ -443,7 +450,7 @@ class Code2WavIncrementalDecoder:
             first_decode=first_decode,
         )
         assert waveform.shape[-1] == fresh_frames * self.total_upsample - (
-            self.first_decode_shortfall if first_decode else 0
+            self.first_decode_shortfall_samples if first_decode else 0
         ), "code2wav incremental decode returned the wrong sample count"
         state.advance(fresh_frames)
         return waveform

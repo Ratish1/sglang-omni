@@ -176,22 +176,25 @@ class CodecStateArena:
         self.state_rows[slot].zero_()
         self.frame_positions[slot].zero_()
 
-    def zero_state(self, count: int) -> IncrementalCodecState:
-        """The cold state of count streams, laid out as gathered rows."""
+    def zero_state(self, stream_count: int) -> IncrementalCodecState:
+        """The cold state of stream_count streams, laid out as gathered rows."""
         return self.state_of_rows(
             torch.zeros(
-                count, self.state_rows.shape[1], device=self.device, dtype=self.dtype
+                stream_count,
+                self.state_rows.shape[1],
+                device=self.device,
+                dtype=self.dtype,
             ),
-            torch.zeros(count, device=self.device, dtype=torch.long),
+            torch.zeros(stream_count, device=self.device, dtype=torch.long),
         )
 
     def state_of_rows(
         self, rows: torch.Tensor, frame_positions: torch.Tensor
     ) -> IncrementalCodecState:
         """The state whose tensors are views of rows, one row per stream."""
-        count = int(rows.shape[0])
+        stream_count = int(rows.shape[0])
         views = (
-            piece.view(count, *shape)
+            piece.view(stream_count, *shape)
             for piece, shape in zip(
                 rows.split(self.state_sizes, dim=1), self.state_shapes
             )
@@ -210,7 +213,9 @@ class CodecStateArena:
             state.transformer_values[layer_index] = next(views)
         return state
 
-    def rows_of_state(self, state: IncrementalCodecState, count: int) -> torch.Tensor:
+    def rows_of_state(
+        self, state: IncrementalCodecState, stream_count: int
+    ) -> torch.Tensor:
         """The state's tensors packed into one row per stream, in the order of the views."""
         pieces = [
             *(state.conv_histories[key] for key, _, _ in self.spec.conv_histories),
@@ -227,7 +232,7 @@ class CodecStateArena:
                 for layer_index in range(self.spec.num_layers)
             ),
         ]
-        return torch.cat([piece.reshape(count, -1) for piece in pieces], dim=1)
+        return torch.cat([piece.reshape(stream_count, -1) for piece in pieces], dim=1)
 
     STAGING_RING = 4
 
@@ -294,13 +299,13 @@ class CodecStateArena:
         self, index: torch.Tensor, state: IncrementalCodecState
     ) -> None:
         """Write a cohort state into the rows named by a device index tensor."""
-        count = int(index.shape[0])
+        stream_count = int(index.shape[0])
         frame_positions = state.frame_positions
         if frame_positions is None:
             raise RuntimeError("codec state arena requires per-row frame positions")
-        elif tuple(frame_positions.shape) != (count,):
+        elif tuple(frame_positions.shape) != (stream_count,):
             raise RuntimeError(
-                f"codec state arena expected {(count,)} for frame_positions, "
+                f"codec state arena expected {(stream_count,)} for frame_positions, "
                 f"got {tuple(frame_positions.shape)}"
             )
         elif frame_positions.dtype != torch.long:
@@ -310,7 +315,7 @@ class CodecStateArena:
             )
         else:
             pass
-        self.state_rows.index_copy_(0, index, self.rows_of_state(state, count))
+        self.state_rows.index_copy_(0, index, self.rows_of_state(state, stream_count))
         self.frame_positions.index_copy_(0, index, frame_positions)
 
     def describe(self) -> CodecStateArenaStats:

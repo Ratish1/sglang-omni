@@ -281,13 +281,13 @@ def channels_last_causal_conv1d(
 
     # note (ratish): the zeros a dilated conv needs after the frames join the history in one
     # copy of the activation, as the whole-sequence forward's single pad does.
-    tail = (-(history_size + length)) % int(conv.dilation[0])
-    if history_size or tail:
+    tail_frames = (-(history_size + length)) % int(conv.dilation[0])
+    if history_size or tail_frames:
         combined = torch.cat(
             (
                 history.transpose(1, 2),
                 hidden_states,
-                hidden_states.new_zeros(batch_size, tail, channels),
+                hidden_states.new_zeros(batch_size, tail_frames, channels),
             ),
             dim=1,
         )
