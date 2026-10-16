@@ -2145,6 +2145,26 @@ def test_qwen3_tts_predictor_codec_embeddings_use_talker_hidden_size(
     assert predictor.small_to_mtp_projection.weight.shape == (1024, 2048)
 
 
+def test_qwen3_tts_codec_tables_embed_each_codebook_from_its_own_table() -> None:
+    codec_tables = Qwen3TTSCodecTables(3, 5, 4)
+    codes = torch.cat(
+        [torch.tensor([[0, 4, 4], [4, 0, 1]]), torch.randint(0, 5, (6, 3))]
+    )
+
+    rows = codec_tables(codes)
+
+    assert torch.equal(
+        rows,
+        torch.stack(
+            [
+                torch.nn.functional.embedding(codes[:, codebook_index], table)
+                for codebook_index, table in enumerate(codec_tables.weight)
+            ],
+            dim=1,
+        ),
+    )
+
+
 def test_qwen3_tts_talker_loads_each_codec_table_into_its_codebook() -> None:
     talker = object.__new__(Qwen3TTSTalker)
     torch.nn.Module.__init__(talker)
