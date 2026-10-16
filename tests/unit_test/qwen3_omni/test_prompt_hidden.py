@@ -8,13 +8,13 @@ from sglang_omni.models.qwen3_omni.prompt_hidden import PromptHiddenCapture
 
 
 def test_prompt_capture_collects_absolute_positions_across_chunks() -> None:
-    capture = PromptHiddenCapture(positions=torch.tensor([1, 4, 7]))
+    capture = PromptHiddenCapture(positions=torch.tensor([3, 7]))
     rows = torch.arange(24, dtype=torch.float32).reshape(8, 3)
-    for start, end in [(0, 3), (3, 6), (6, 8)]:
+    for start, end in [(0, 3), (3, 4), (4, 7), (7, 8)]:
         capture.add_extend(prefix_length=start, hidden_states=rows[start:end])
     result = capture.take_complete()
-    torch.testing.assert_close(result.hidden_states, rows[[1, 4, 7]])
-    assert result.positions.tolist() == [1, 4, 7]
+    torch.testing.assert_close(result.hidden_states, rows[[3, 7]])
+    assert result.positions.tolist() == [3, 7]
     assert not capture.needs_capture
     assert capture.take_complete() is None
 

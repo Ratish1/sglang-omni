@@ -1331,7 +1331,13 @@ def test_qwen_thinker_enables_and_attests_breakable_prefill_graphs(
         enable_return_hidden_states=initial_hidden_mode is not None,
         return_hidden_states_mode=initial_hidden_mode,
         cuda_graph_config=SimpleNamespace(
-            prefill=SimpleNamespace(backend=CudaGraphBackend(prefill_backend))
+            prefill=SimpleNamespace(
+                backend=(
+                    CudaGraphBackend.BREAKABLE
+                    if prefill_backend == "breakable"
+                    else CudaGraphBackend.DISABLED
+                )
+            )
         ),
     )
     captured: dict[str, object] = {}

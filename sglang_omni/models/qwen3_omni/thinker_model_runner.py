@@ -53,8 +53,14 @@ class Qwen3OmniThinkerModelRunner(ThinkerModelRunner):
         if any(
             isinstance(request.data, QwenThinkerRequestData)
             and request.data.prompt_hidden_capture is not None
-            and request.data.prompt_hidden_capture.needs_capture
-            for request in requests
+            and bool(
+                request.data.prompt_hidden_capture.missing_in_extend(
+                    prefix_length=prefix_length, extend_length=extend_length
+                ).any()
+            )
+            for request, prefix_length, extend_length in zip(
+                requests, schedule_batch.prefix_lens, schedule_batch.extend_lens
+            )
         ):
             return CaptureHiddenMode.FULL
         else:
@@ -414,18 +420,14 @@ class Qwen3OmniThinkerModelRunner(ThinkerModelRunner):
             if (
                 not isinstance(request, SchedulerRequest)
                 or not isinstance(request.data, QwenThinkerRequestData)
-                or request.data.prompt_hidden_capture is None
+                or not request.data.model_inputs
             ):
                 continue
             else:
                 pass
             request_data = request.data
             scheduled_request = schedule_batch.reqs[request_index]
-            scheduled_request.omni_model_inputs = request_data.model_inputs or None
-            if not request_data.model_inputs:
-                continue
-            else:
-                pass
+            scheduled_request.omni_model_inputs = request_data.model_inputs
             prefix_length = forward_batch.extend_prefix_lens_cpu[request_index]
             positions = self.req_mm_token_positions(
                 scheduled_request, request_data.model_inputs.get("pad_values", {})

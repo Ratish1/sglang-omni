@@ -26,6 +26,15 @@ class PromptHiddenCapture:
     def needs_capture(self) -> bool:
         return not bool(self.received.all())
 
+    def missing_in_extend(
+        self, *, prefix_length: int, extend_length: int
+    ) -> torch.Tensor:
+        return (
+            ~self.received
+            & (self.positions >= prefix_length)
+            & (self.positions < prefix_length + extend_length)
+        )
+
     def add_extend(self, *, prefix_length: int, hidden_states: torch.Tensor) -> None:
         if prefix_length < 0 or hidden_states.ndim != 2:
             raise ValueError(
@@ -33,10 +42,8 @@ class PromptHiddenCapture:
             )
         else:
             pass
-        missing = (
-            ~self.received
-            & (self.positions >= prefix_length)
-            & (self.positions < prefix_length + hidden_states.shape[0])
+        missing = self.missing_in_extend(
+            prefix_length=prefix_length, extend_length=hidden_states.shape[0]
         )
         if not bool(missing.any()):
             return
