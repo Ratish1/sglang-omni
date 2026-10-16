@@ -52,6 +52,11 @@ from sglang_omni.models.fun_cosyvoice3.flow_estimator_trt import (
     execute_flow_estimator,
     is_flow_estimator_trt,
 )
+from sglang_omni.models.fun_cosyvoice3.hift_kernels import (
+    overlap_add_inverse,
+    short_time_spectrum,
+    snake,
+)
 from sglang_omni.models.fun_cosyvoice3.packed_dit import (
     DIT_INDUCTOR_OPTIONS,
     FA3_DTYPES,
@@ -77,7 +82,6 @@ from sglang_omni.models.fun_cosyvoice3.request_builders import (
     cleanup_prepared_cosyvoice3_request,
     preprocess_cosyvoice3_payload,
 )
-from sglang_omni.models.fun_cosyvoice3.snake import snake
 from sglang_omni.models.fun_cosyvoice3.solve_graph_capture import SolveGraphCapture
 from sglang_omni.models.fun_cosyvoice3.streaming import TOKEN_HOP_LEN, TOKEN_MAX_HOP_LEN
 from sglang_omni.models.fun_cosyvoice3.whole_history_cuda_graph import (
@@ -1372,7 +1376,8 @@ def patch_hift_snake(hift: "CausalHiFTGenerator") -> None:
 
 
 def patch_hift_spectra(hift: "CausalHiFTGenerator", device: torch.device) -> None:
-    """Give HiFT its STFT and inverse STFT as float32 matmuls over the frames.
+    """Give HiFT its STFT and inverse STFT as float32 kernels whose every output sums its
+    own inputs in one order, so a row's spectra do not follow what shares its batch.
     torch.stft and torch.istft build a cuFFT plan for each new shape, whose module
     load waits for all the work queued on the device, and torch.istft reads its
     window envelope on the host.
@@ -1385,9 +1390,7 @@ def patch_hift_spectra(hift: "CausalHiFTGenerator", device: torch.device) -> Non
         torch.arange(bins, device=device, dtype=torch.float64),
         torch.arange(n_fft, device=device, dtype=torch.float64),
     )
-    forward_basis = (
-        torch.cat([torch.cos(angle), -torch.sin(angle)]) * window
-    ).T.float()
+    forward_basis = (torch.cat([torch.cos(angle), -torch.sin(angle)]) * window).float()
     # note (ratish): a one sided inverse counts the bins between DC and Nyquist twice.
     one_sided = torch.full((bins, 1), 2.0, device=device, dtype=torch.float64)
     one_sided[0] = 1.0
@@ -1400,32 +1403,21 @@ def patch_hift_spectra(hift: "CausalHiFTGenerator", device: torch.device) -> Non
     squared_window = hift.stft_window.to(device).pow(2)
 
     def stft(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        frames = F.pad(x[:, None], (n_fft // 2, n_fft // 2), mode="reflect")[
+        padded_signal = F.pad(x[:, None], (n_fft // 2, n_fft // 2), mode="reflect")[
             :, 0
-        ].unfold(-1, n_fft, hop_length)
-        spectrum = (frames @ forward_basis).transpose(1, 2)
+        ].contiguous()
+        spectrum = short_time_spectrum(padded_signal, forward_basis, hop_length)
         return spectrum[:, :bins], spectrum[:, bins:]
 
     def istft(magnitude: torch.Tensor, phase: torch.Tensor) -> torch.Tensor:
         magnitude = torch.clip(magnitude, max=1e2)
-        spectrum = torch.cat(
-            [magnitude * torch.cos(phase), magnitude * torch.sin(phase)], dim=1
-        )
-        frames = spectrum.transpose(1, 2) @ inverse_basis
-        frame_count = frames.shape[1]
-        signal_length = n_fft + hop_length * (frame_count - 1)
-        signal = torch.ops.aten.unfold_backward(
-            frames, [frames.shape[0], signal_length], 1, n_fft, hop_length
-        )
-        envelope = torch.ops.aten.unfold_backward(
-            squared_window.expand(1, frame_count, n_fft),
-            [1, signal_length],
-            1,
-            n_fft,
+        return overlap_add_inverse(
+            (magnitude * torch.cos(phase)).contiguous(),
+            (magnitude * torch.sin(phase)).contiguous(),
+            inverse_basis,
+            squared_window,
             hop_length,
         )
-        trim = n_fft // 2
-        return signal[:, trim:-trim] / envelope[:, trim:-trim]
 
     hift._stft = stft  # noqa: leading-underscore  # upstream name
     hift._istft = istft  # noqa: leading-underscore  # upstream name
@@ -1891,7 +1883,10 @@ class CosyVoice3Vocoder(BatchVocoderBase[FunCosyVoice3State, torch.Tensor]):
         device = next(self.flow.parameters()).device
         if device.type == "cuda":
             patch_sine_harmonics(hift, device)
-            patch_hift_spectra(hift, device)
+            if HAS_TRITON:
+                patch_hift_spectra(hift, device)
+            else:
+                pass
             if HAS_TRITON and self.hift_autocast_dtype is None:
                 patch_hift_snake(hift)
             else:
