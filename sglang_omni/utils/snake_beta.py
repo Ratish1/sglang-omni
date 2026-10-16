@@ -145,6 +145,74 @@ if HAS_TRITON:
             mask=mask,
         )
 
+    @triton.jit(
+        do_not_specialize=[
+            "x_batch_stride",
+            "y_batch_stride",
+            "C",
+            "length",
+            "positions",
+        ]
+    )
+    def bias_snake_beta_channels_last_kernel(
+        x_ptr,
+        x_batch_stride,
+        bias_ptr,
+        residual_ptr,
+        sum_ptr,
+        y_ptr,
+        y_batch_stride,
+        alpha_ptr,
+        beta_ptr,
+        C,
+        length,
+        positions,
+        eps,
+        HAS_RESIDUAL: tl.constexpr,
+        WRITE_SUM: tl.constexpr,
+        BLOCK_POSITIONS: tl.constexpr,
+        BLOCK_CHANNELS: tl.constexpr,
+    ):
+        # SnakeBeta of x + bias (+ residual) over [B, L, C] rows: x and y rows may sit inside
+        # longer buffers (their own batch strides); residual and the sum are contiguous. The
+        # sums round to bf16 in the eager order, (x + bias) then + residual.
+        rows = tl.program_id(0).to(tl.int64) * BLOCK_POSITIONS + tl.arange(
+            0, BLOCK_POSITIONS
+        )
+        c = tl.program_id(1) * BLOCK_CHANNELS + tl.arange(0, BLOCK_CHANNELS)
+        channel_mask = c < C
+        a, r = snake_beta_coefficients(
+            tl.load(alpha_ptr + c, mask=channel_mask, other=0).to(tl.float32),
+            tl.load(beta_ptr + c, mask=channel_mask, other=0).to(tl.float32),
+            eps,
+        )
+        bias = tl.load(bias_ptr + c, mask=channel_mask, other=0).to(tl.float32)
+
+        mask = (rows < positions)[:, None] & channel_mask[None, :]
+        batch = rows // length
+        frame_offsets = (rows % length) * C
+        contiguous_ptrs = rows[:, None] * C + c[None, :]
+        xv = tl.load(
+            x_ptr + (batch * x_batch_stride + frame_offsets)[:, None] + c[None, :],
+            mask=mask,
+            other=0,
+        ).to(tl.float32)
+        total = (xv + bias[None, :]).to(tl.bfloat16).to(tl.float32)
+        if HAS_RESIDUAL:
+            residual = tl.load(residual_ptr + contiguous_ptrs, mask=mask, other=0)
+            total = (total + residual.to(tl.float32)).to(tl.bfloat16).to(tl.float32)
+        else:
+            pass
+        if WRITE_SUM:
+            tl.store(sum_ptr + contiguous_ptrs, total.to(tl.bfloat16), mask=mask)
+        else:
+            pass
+        tl.store(
+            y_ptr + (batch * y_batch_stride + frame_offsets)[:, None] + c[None, :],
+            snake_beta_values(total, a[None, :], r[None, :]),
+            mask=mask,
+        )
+
 else:
     pass
 
@@ -205,6 +273,49 @@ def launch(
                 **({"enable_reflect_ftz": False} if x.is_cuda else {}),
             )
     return out
+
+
+def fused_bias_snake_beta(
+    conv_output: torch.Tensor,
+    bias: torch.Tensor,
+    activation: FusedSnakeBeta,
+    out: torch.Tensor,
+    *,
+    residual: torch.Tensor | None = None,
+    sum_out: torch.Tensor | None = None,
+) -> None:
+    """activation(conv_output + bias, + residual if given) into out, the sum into sum_out if
+    given, bit for bit the eager adds and SnakeBeta. [B, L, C] bf16 on a Triton device; the
+    rows of conv_output and out may sit in longer buffers, residual and sum_out are contiguous.
+    """
+    batch_size, length, channels = conv_output.shape
+    grid = (
+        triton.cdiv(batch_size * length, CHANNELS_LAST_BLOCK_POSITIONS),
+        triton.cdiv(channels, CHANNELS_LAST_BLOCK_CHANNELS),
+    )
+    with torch.get_device_module(conv_output.device).device(conv_output.device):
+        bias_snake_beta_channels_last_kernel[grid](
+            conv_output,
+            conv_output.stride(0),
+            bias,
+            conv_output if residual is None else residual,
+            out if sum_out is None else sum_out,
+            out,
+            out.stride(0),
+            activation.alpha,
+            activation.beta,
+            channels,
+            length,
+            batch_size * length,
+            activation.no_div_by_zero,
+            HAS_RESIDUAL=residual is not None,
+            WRITE_SUM=sum_out is not None,
+            BLOCK_POSITIONS=CHANNELS_LAST_BLOCK_POSITIONS,
+            BLOCK_CHANNELS=CHANNELS_LAST_BLOCK_CHANNELS,
+            num_warps=4,
+            enable_fp_fusion=False,
+            **({"enable_reflect_ftz": False} if conv_output.is_cuda else {}),
+        )
 
 
 def fused_snake_beta(
@@ -338,4 +449,9 @@ def fuse_vocoder_decoder(decoder: torch.nn.Module) -> int:
     return len(replacements)
 
 
-__all__ = ["fused_snake_beta", "fuse_vocoder_decoder", "FusedSnakeBeta"]
+__all__ = [
+    "fused_bias_snake_beta",
+    "fused_snake_beta",
+    "fuse_vocoder_decoder",
+    "FusedSnakeBeta",
+]
