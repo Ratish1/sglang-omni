@@ -772,6 +772,9 @@ class PipelineConfig(BaseModel):
         """
         return frozenset()
 
+    def image_decode_mode(self) -> Literal["normal", "decoder-turbo"]:
+        return "normal"
+
     def stage_named(self, stage_name: str) -> StageConfig:
         """The stage with this name; raises ``KeyError`` when absent."""
         for stage in self.stages:

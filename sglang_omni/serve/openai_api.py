@@ -212,6 +212,7 @@ def create_app(
     *,
     model_name: str | None = None,
     supports_image_api: bool = False,
+    image_decode_mode: Literal["normal", "decoder-turbo"] = "normal",
     requires_uploaded_voice_for_named_voice: bool = False,
     supports_uploaded_voice_references: bool = True,
     custom_voice_config: CustomVoiceConfig | None = None,
@@ -239,6 +240,7 @@ def create_app(
         client: Client instance connected to the pipeline coordinator.
         model_name: Default model name to report in responses and /v1/models.
         supports_image_api: Mount image generation and editing routes for this pipeline.
+        image_decode_mode: Decoder factory mode used to validate omitted request modes.
         requires_uploaded_voice_for_named_voice: Whether non-default TTS voice
             names must resolve to uploaded voices before reaching the model.
         supports_uploaded_voice_references: Whether uploaded voice names can be
@@ -340,7 +342,7 @@ def create_app(
     register_admin(app, resolved_key)
     register_chat_completions(app)
     if supports_image_api:
-        register_images(app)
+        register_images(app, image_decode_mode)
     else:
         pass
     register_voices(app)
@@ -359,7 +361,9 @@ def create_app(
     return app
 
 
-def register_images(app: FastAPI) -> None:
+def register_images(
+    app: FastAPI, decode_mode: Literal["normal", "decoder-turbo"]
+) -> None:
     """Register native image-generation and single-image-edit routes."""
     from sglang.multimodal_gen.runtime.entrypoints.openai.protocol import (
         ImageGenerationsRequest,
@@ -460,7 +464,9 @@ def register_images(app: FastAPI) -> None:
                 height = request.height if request.height is not None else 1024
             options.update(image_w=width, image_h=height)
 
-        params = ImageGenerationParams.model_validate(options)
+        params = ImageGenerationParams.model_validate(
+            {"decode_mode": decode_mode, **options}
+        )
         return GenerateRequest(
             model=request.model,
             messages=[Message(role="user", content=request.prompt)],
@@ -469,7 +475,7 @@ def register_images(app: FastAPI) -> None:
             sampling=SamplingParams(seed=request.seed),
             metadata={
                 "image_generation": params.model_dump(
-                    exclude_unset=True, exclude_none=True
+                    include=set(options), exclude_none=True
                 ),
                 **({"images": [source]} if source is not None else {}),
             },

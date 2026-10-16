@@ -87,6 +87,11 @@ class LLaDA2UniOmniPipelineConfig(LLaDA2UniPipelineConfig):
 
     supports_image_api: ClassVar[bool] = True
 
+    def image_decode_mode(self) -> Literal["normal", "decoder-turbo"]:
+        stage = self.stage_named(IMAGE_DECODE_STAGE)
+        assert isinstance(stage, LLaDA2ImageDecoderStageConfig)
+        return stage.factory.decode_mode
+
     stage_config_types: ClassVar[dict[str, type[StageConfig]]] = {
         **LLaDA2UniPipelineConfig.stage_config_types,
         IMAGE_DECODE_STAGE: LLaDA2ImageDecoderStageConfig,

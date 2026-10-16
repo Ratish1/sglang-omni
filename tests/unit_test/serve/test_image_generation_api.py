@@ -6,7 +6,7 @@ from __future__ import annotations
 import subprocess
 import sys
 from collections.abc import AsyncIterator, Iterator
-from typing import NoReturn, TypedDict
+from typing import Literal, NoReturn, TypedDict
 
 import pytest
 from fastapi.testclient import TestClient
@@ -15,6 +15,11 @@ from pydantic import ValidationError
 from sglang_omni.admission import QueueFullError
 from sglang_omni.client import Client
 from sglang_omni.client.types import ClientError, GenerateRequest
+from sglang_omni.models.llada2_uni.config import (
+    IMAGE_DECODE_STAGE,
+    LLaDA2ImageDecoderStageConfig,
+    LLaDA2UniOmniPipelineConfig,
+)
 from sglang_omni.proto import CompleteMessage, StreamMessage
 from sglang_omni.serve import create_app
 from sglang_omni.serve.protocol import ImageGenerationParams
@@ -188,6 +193,60 @@ def test_native_image_routes_preserve_generation_controls(
         assert "image_w" not in options
     else:
         assert (options["image_w"], options["image_h"]) == (1024, 768)
+
+
+@pytest.mark.parametrize("editing", [False, True])
+@pytest.mark.parametrize(
+    "factory_mode,request_mode,steps,status",
+    [
+        ("normal", None, 1, 400),
+        ("decoder-turbo", None, 1, 200),
+        ("normal", "decoder-turbo", 1, 200),
+        ("decoder-turbo", "normal", 1, 400),
+        ("decoder-turbo", None, None, 200),
+        ("normal", "decoder-turbo", None, 200),
+    ],
+)
+def test_image_steps_follow_factory_mode(
+    editing: bool,
+    factory_mode: Literal["normal", "decoder-turbo"],
+    request_mode: Literal["normal", "decoder-turbo"] | None,
+    steps: int | None,
+    status: int,
+) -> None:
+    config = LLaDA2UniOmniPipelineConfig(model_path="test")
+    stage = config.stage_named(IMAGE_DECODE_STAGE)
+    assert isinstance(stage, LLaDA2ImageDecoderStageConfig)
+    stage.factory.decode_mode = factory_mode
+    coordinator = RecordingCoordinator()
+    app = create_app(
+        Client(coordinator),
+        supports_image_api=config.supports_image_api,
+        image_decode_mode=config.image_decode_mode(),
+    )
+    fields: dict[str, str | int] = {"prompt": "Make it red"}
+    if request_mode is not None:
+        fields["decode_mode"] = request_mode
+    if steps is not None:
+        fields["num_inference_steps"] = steps
+    with TestClient(app) as client:
+        if editing:
+            response = client.post(
+                "/v1/images/edits",
+                data=fields,
+                files={"image": ("source.png", b"png", "image/png")},
+            )
+        else:
+            response = client.post("/v1/images/generations", json=fields)
+    assert response.status_code == status, response.text
+    if status == 400:
+        assert not coordinator.requests
+    else:
+        options = coordinator.requests[0].metadata["image_generation"]
+        assert options.get("decode_mode") == request_mode
+        assert ("decode_mode" in options) == (request_mode is not None)
+        assert options.get("decoder_steps") == steps
+        assert ("decoder_steps" in options) == (steps is not None)
 
 
 def test_native_image_rejects_unsupported_controls_and_multiple_sources(

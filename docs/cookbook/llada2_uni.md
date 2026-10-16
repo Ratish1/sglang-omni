@@ -103,6 +103,8 @@ from `decode_mode`, which selects `normal` or `decoder-turbo` diffusion decoding
 For normal decoding, `num_inference_steps` specifies at least two sampling
 points, giving `num_inference_steps - 1` solver intervals. For decoder-turbo, it specifies at
 least one decoder iteration. The examples use eight turbo iterations.
+When `decode_mode` is omitted, validation uses the decoder factory's configured
+mode, so a turbo factory accepts `num_inference_steps=1` without a mode override.
 Thinking and interleaved generation are incoming features and are not supported
 by this pipeline yet.
 
