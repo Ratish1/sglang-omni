@@ -1401,8 +1401,12 @@ def make_incremental_scheduler(
     )
 
 
-def run_streams(scheduler: Code2WavScheduler, codes: torch.Tensor) -> list[np.ndarray]:
-    request_ids = [f"req-{index}" for index in range(int(codes.shape[0]))]
+def run_streams(
+    scheduler: Code2WavScheduler, codes: torch.Tensor, *, first_request: int = 0
+) -> list[np.ndarray]:
+    request_ids = [
+        f"req-{first_request + index}" for index in range(int(codes.shape[0]))
+    ]
     for request_id in request_ids:
         scheduler.stream_payloads[request_id] = make_qwen_payload(request_id=request_id)
     for frame in range(int(codes.shape[-1])):
@@ -1461,6 +1465,23 @@ def test_scheduler_replays_codec_state_graphs_as_the_whole_forward(
     runtime = scheduler.cuda_graph_runner.stats()["runtime"]
     assert runtime["fallback_counts"] == {}
     assert runtime["graph_replays"] > 0
+    assert scheduler.codec_arena.active_slots() == 0
+
+
+def test_a_reused_codec_slot_decodes_as_the_whole_forward() -> None:
+    model = make_tiny_code2wav("cpu", torch.float32)
+    scheduler = make_incremental_scheduler(model, codec_state_slots=1)
+    first_codes = torch.randint(0, 16, (1, 2, 11))
+    second_codes = torch.randint(0, 16, (1, 2, 8))
+
+    run_streams(scheduler, first_codes)
+    assert scheduler.codec_arena.state_rows[0].any()
+    waveforms = run_streams(scheduler, second_codes, first_request=1)
+
+    with torch.inference_mode():
+        expected = model(second_codes).reshape(-1).numpy()
+    np.testing.assert_allclose(waveforms[0], expected, rtol=2e-5, atol=2e-6)
+    assert scheduler.stateless_fallbacks == 0
     assert scheduler.codec_arena.active_slots() == 0
 
 

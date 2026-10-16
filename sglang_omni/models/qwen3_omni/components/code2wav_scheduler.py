@@ -304,7 +304,8 @@ class Code2WavScheduler(StreamingVocoderBase[Code2WavStreamState, "list[int]"]):
     def claim_codec_slot(self, request_id: str, state: Code2WavStreamState) -> None:
         """Give a stream about to decode its first window a codec state slot, or keep it
         stateless when the arena has none free. Runs on the serving thread, whose stream
-        orders the slot's zeroing before the decode."""
+        orders the decode after the slot's previous owner; the first decode reads no slot
+        state, so the slot is not zeroed."""
         if (
             self.codec_arena is None
             or state.emitted > 0
@@ -314,7 +315,7 @@ class Code2WavScheduler(StreamingVocoderBase[Code2WavStreamState, "list[int]"]):
             return
         else:
             pass
-        state.codec_slot = self.codec_arena.acquire()
+        state.codec_slot = self.codec_arena.acquire(zeroed=False)
         if state.codec_slot is None:
             state.stateless = True
             self.stateless_fallbacks += 1

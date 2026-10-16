@@ -457,8 +457,12 @@ class Code2WavIncrementalDecoder:
         first_decode: bool,
     ) -> torch.Tensor:
         """Decode the codes of the streams whose state the arena rows in the device index hold,
-        and store their advanced state; a graph captures it with a static index."""
-        state = arena.gather_by_index(index)
+        and store their advanced state; a graph captures it with a static index. A first
+        decode starts from the cold state and reads no row."""
+        if first_decode:
+            state = arena.zero_state(int(index.shape[0]))
+        else:
+            state = arena.gather_by_index(index)
         waveform = self.decode(codes, state, first_decode=first_decode)
         arena.scatter_by_index(index, state)
         return waveform

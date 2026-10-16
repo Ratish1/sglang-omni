@@ -35,7 +35,8 @@ class CodecStateArena:
     then the keys and the values of every layer.
 
     Note (Qihao Liu): acquire zeroes a slot before handing it out, so a reused slot is
-    provably a cold start; release therefore returns a slot without clearing it.
+    provably a cold start; release therefore returns a slot without clearing it. A caller
+    whose first decode starts from zero_state reads no slot state and skips the zeroing.
     """
 
     def __init__(
@@ -114,8 +115,9 @@ class CodecStateArena:
                 self._num_slots - len(self.free) - len(self.retired)
             )  # noqa: leading-underscore
 
-    def acquire(self) -> int | None:
-        """Take a zeroed slot, or None when the arena is full."""
+    def acquire(self, *, zeroed: bool = True) -> int | None:
+        """Take a slot, zeroed unless the caller's first decode reads none of its state, or
+        None when the arena is full."""
         with self.lock:
             if not self.free:
                 self._exhausted_count += 1  # noqa: leading-underscore
@@ -128,7 +130,10 @@ class CodecStateArena:
             self.device_module.current_stream(self.device).wait_event(released)
         else:
             pass
-        self.zero_slot(slot)
+        if zeroed:
+            self.zero_slot(slot)
+        else:
+            pass
         return slot
 
     def release(self, slot: int) -> None:
@@ -170,6 +175,15 @@ class CodecStateArena:
     def zero_slot(self, slot: int) -> None:
         self.state_rows[slot].zero_()
         self.frame_positions[slot].zero_()
+
+    def zero_state(self, count: int) -> IncrementalCodecState:
+        """The cold state of count streams, laid out as gathered rows."""
+        return self.state_of_rows(
+            torch.zeros(
+                count, self.state_rows.shape[1], device=self.device, dtype=self.dtype
+            ),
+            torch.zeros(count, device=self.device, dtype=torch.long),
+        )
 
     def state_of_rows(
         self, rows: torch.Tensor, frame_positions: torch.Tensor
