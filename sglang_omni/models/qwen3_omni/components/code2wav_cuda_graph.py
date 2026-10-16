@@ -679,8 +679,8 @@ class Code2WavCudaGraphRunner:
             static_index = None
             model = self.model
         else:
-            # note (ratish): every row of a capture reads and writes the arena's scratch slot,
-            # zeroed before the eager and the replayed decode so both start from one state.
+            # note (ratish): every row of a capture writes the arena's scratch slot; a next
+            # capture also reads it, so it is zeroed before the eager and the replayed decode.
             static_index = self.device_api.new_static_input(
                 (key.batch_size,), device=self.device
             )
@@ -716,10 +716,10 @@ class Code2WavCudaGraphRunner:
         return CapturedGraph(graph, static_input, static_output, static_index)
 
     def zero_scratch_slot(self, key: GraphKey) -> None:
-        if key.decode == "window":
-            pass
-        else:
+        if key.decode == "next":
             self.codec_arena.zero_slot(self.codec_arena.scratch_slot)
+        else:
+            pass
 
     @staticmethod
     def valid_fraction(value: float | None) -> float | None:
