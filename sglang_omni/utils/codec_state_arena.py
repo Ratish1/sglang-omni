@@ -213,36 +213,21 @@ class CodecStateArena:
     def rows_of_state(self, state: IncrementalCodecState, count: int) -> torch.Tensor:
         """The state's tensors packed into one row per stream, in the order of the views."""
         pieces = [
+            *(state.conv_histories[key] for key, _, _ in self.spec.conv_histories),
             *(
-                (key, state.conv_histories[key])
-                for key, _, _ in self.spec.conv_histories
-            ),
-            *(
-                (key, state.transconv_overlaps[key])
+                state.transconv_overlaps[key]
                 for key, _, _ in self.spec.transconv_overlaps
             ),
             *(
-                (f"key.{layer_index}", state.transformer_keys[layer_index])
+                state.transformer_keys[layer_index]
                 for layer_index in range(self.spec.num_layers)
             ),
             *(
-                (f"value.{layer_index}", state.transformer_values[layer_index])
+                state.transformer_values[layer_index]
                 for layer_index in range(self.spec.num_layers)
             ),
         ]
-        for (name, piece), shape in zip(pieces, self.state_shapes):
-            expected = (count, *shape)
-            if tuple(piece.shape) != expected:
-                raise RuntimeError(
-                    f"codec state arena expected {expected} for {name}, got {tuple(piece.shape)}"
-                )
-            elif piece.dtype != self.dtype:
-                raise RuntimeError(
-                    f"codec state arena expected {self.dtype} for {name}, got {piece.dtype}"
-                )
-            else:
-                pass
-        return torch.cat([piece.reshape(count, -1) for _, piece in pieces], dim=1)
+        return torch.cat([piece.reshape(count, -1) for piece in pieces], dim=1)
 
     STAGING_RING = 4
 

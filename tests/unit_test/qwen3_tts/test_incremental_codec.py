@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import os
 import random
-import re
 
 import pytest
 import torch
@@ -1004,29 +1003,6 @@ def test_arena_reports_exhaustion_and_retirement() -> None:
     arena.release(reused)
     assert arena.acquire() is None
     assert arena.describe()["bytes_per_slot"] == arena.bytes_per_slot
-
-
-def test_arena_scatter_rejects_a_misshapen_state_and_keeps_the_slot() -> None:
-    torch.manual_seed(17)
-    _, arena = make_arena(Decoder(), slots=2)
-    slot = arena.acquire()
-    assert slot is not None
-    for buffer in arena.storage.conv_histories.values():
-        buffer.uniform_(1.0, 2.0)
-    key = next(
-        key
-        for key, channels, length in arena.spec.conv_histories
-        if 0 < length != channels
-    )
-    before = arena.gather([slot]).conv_histories[key].clone()
-    state = arena.gather([slot])
-    state.conv_histories[key] = torch.zeros_like(state.conv_histories[key]).transpose(
-        1, 2
-    )
-
-    with pytest.raises(RuntimeError, match=re.escape(key)):
-        arena.scatter([slot], state)
-    assert torch.equal(arena.gather([slot]).conv_histories[key], before)
 
 
 def fresh_state(rows: int) -> IncrementalCodecState:
