@@ -13,6 +13,7 @@ from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
+from sglang.srt.utils import DynamicGradMode
 from sglang.srt.utils.common import is_pin_memory_available
 
 from sglang_omni.model_runner.base import ModelRunner
@@ -23,6 +24,7 @@ from sglang_omni.models.fun_cosyvoice3.request_builders import (
     accept_cosyvoice3_stream_token,
 )
 from sglang_omni.models.fun_cosyvoice3.sglang_model import (
+    TOTAL_VOCAB_SIZE,
     VOCAB_SIZE,
     FunCosyVoice3SGLangModel,
 )
@@ -41,6 +43,31 @@ COSYVOICE3_RAS_WINDOW_SIZE = 10
 # note (Yucheng Hu): the redraw reusing the first draw's seeded noise would be
 # conditioned on the rejected candidate having won that draw.
 COSYVOICE3_RAS_SEED_SALT = 0x2545F491
+
+
+@torch.compile(dynamic=True, disable=not current_platform.is_cuda())
+def mask_repeated_speech_tokens(
+    window: torch.Tensor,
+    candidates: torch.Tensor,
+    top_ks: torch.Tensor,
+    probs: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """The rows whose sampled speech token is in their window, top-k above 1, and every
+    row's float64 probabilities with its sampled token masked."""
+    repeated = (
+        (window == candidates.unsqueeze(1)).any(dim=1)
+        & (candidates < VOCAB_SIZE)
+        & (top_ks != 1)
+    )
+    # note (ratish): float64, as the first seeded draw feeds the compiled
+    # multinomial_with_seed, so the redraw reuses that graph, not a new one.
+    row_probs = probs.to(torch.float64)
+    redraw_probs = row_probs.scatter(1, candidates.unsqueeze(1), 0.0)
+    # note (Yucheng Hu): multinomial rejects an all-zero row, and a row whose
+    # whole mass sat on the candidate has nothing else to draw.
+    return repeated, torch.where(
+        redraw_probs.sum(dim=1, keepdim=True) > 0, redraw_probs, row_probs
+    )
 
 
 class FunCosyVoice3ModelRunner(ModelRunner):
@@ -79,6 +106,28 @@ class FunCosyVoice3ModelRunner(ModelRunner):
             device=self.device,
         )
         self.recent_speech_token_owners: dict[int, str] = {}
+        if current_platform.is_cuda():
+            # note (ratish): Dynamo specializes a one row batch; the entry built at two
+            # rows serves every larger one, compiled here rather than on a request.
+            with DynamicGradMode():
+                for rows in (1, 2):
+                    mask_repeated_speech_tokens(
+                        torch.full(
+                            (rows, COSYVOICE3_RAS_WINDOW_SIZE),
+                            -1,
+                            dtype=torch.long,
+                            device=self.device,
+                        ),
+                        torch.zeros(rows, dtype=torch.long, device=self.device),
+                        torch.ones(rows, dtype=torch.int32, device=self.device),
+                        torch.ones(
+                            (rows, TOTAL_VOCAB_SIZE),
+                            dtype=torch.float32,
+                            device=self.device,
+                        ),
+                    )
+        else:
+            pass
 
     def set_stream_outbox(self, outbox: Queue[OutgoingMessage]) -> None:
         self.outbox = outbox
@@ -507,11 +556,6 @@ class FunCosyVoice3ModelRunner(ModelRunner):
         if sampling_info.is_all_greedy:
             token_ids = candidates
         else:
-            repeated = (
-                (window == candidates.unsqueeze(1)).any(dim=1)
-                & (candidates < VOCAB_SIZE)
-                & (sampling_info.top_ks != 1)
-            )
             # note (ratish): both samplers apply top-k and top-p to a copy,
             # leaving the tempered probabilities here, or the tempered logits on Ascend.
             if self.tp_worker.model_runner.sampler.use_ascend_backend:
@@ -520,14 +564,8 @@ class FunCosyVoice3ModelRunner(ModelRunner):
                 )
             else:
                 probs = logits_output.next_token_logits
-            # note (ratish): float64, as the first seeded draw feeds the compiled
-            # multinomial_with_seed, so the redraw reuses that graph, not a new one.
-            row_probs = probs.to(torch.float64)
-            redraw_probs = row_probs.scatter(1, candidates.unsqueeze(1), 0.0)
-            # note (Yucheng Hu): multinomial rejects an all-zero row, and a row whose
-            # whole mass sat on the candidate has nothing else to draw.
-            redraw_probs = torch.where(
-                redraw_probs.sum(dim=1, keepdim=True) > 0, redraw_probs, row_probs
+            repeated, redraw_probs = mask_repeated_speech_tokens(
+                window, candidates, sampling_info.top_ks, probs
             )
             sampling_seeds = sampling_info.sampling_seed
             redraw_seeds = (
