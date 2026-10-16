@@ -7831,6 +7831,8 @@ def test_qwen3_tts_prepare_decode_buffers_collects_private_subtalker_seeds(
     talker.semantic_sampling_seed_tensor = torch.empty(2, dtype=torch.long)
     talker.sub_sampling_seed_tensor = torch.empty(2, dtype=torch.long)
     talker.sub_do_sample_tensor = torch.empty(2, dtype=torch.bool)
+    talker.decode_prep_rids = None
+    talker.decode_prep_epoch = 0
     requests = [
         SimpleNamespace(
             data=Qwen3TTSSGLangRequestData(
@@ -7892,6 +7894,8 @@ def test_qwen3_tts_prepare_decode_buffers_stages_the_temperature_floor(
     talker.semantic_sampling_seed_tensor = torch.empty(batch_size, dtype=torch.long)
     talker.sub_sampling_seed_tensor = torch.empty(batch_size, dtype=torch.long)
     talker.sub_do_sample_tensor = torch.empty(batch_size, dtype=torch.bool)
+    talker.decode_prep_rids = None
+    talker.decode_prep_epoch = 0
     talker.sub_seed_offsets = torch.arange(1, 16, dtype=torch.long)
 
     def data(temperature: float, dosample: bool) -> Qwen3TTSSGLangRequestData:
@@ -8565,6 +8569,8 @@ def make_prep_talker(monkeypatch, device=None, max_batch=2):
     talker.sub_do_sample_tensor = torch.empty(
         max_batch, dtype=torch.bool, device=device
     )
+    talker.decode_prep_rids = None
+    talker.decode_prep_epoch = 0
     return Qwen3TTSTalker, talker
 
 

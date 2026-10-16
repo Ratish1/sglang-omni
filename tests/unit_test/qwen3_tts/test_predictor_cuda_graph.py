@@ -163,6 +163,8 @@ def build_talker(device: torch.device) -> Qwen3TTSTalker:
         MAX_BS, device=device, dtype=torch.long
     )
     talker.sub_do_sample_tensor = torch.zeros(MAX_BS, device=device, dtype=torch.bool)
+    talker.decode_prep_rids = None
+    talker.decode_prep_epoch = 0
     talker.sub_seed_offsets = torch.arange(
         1, NUM_CODE_GROUPS, device=device, dtype=torch.long
     )

@@ -1139,6 +1139,7 @@ class Qwen3TTSTalker(Qwen3TTSPromptBuilderMixin, nn.Module):
         self.sub_sampled_max_top_k = 0
         self.sub_sampled_has_unbounded_top_k = False
         self.decode_prep_rids: list[tuple[str, int]] | None = None
+        self.decode_prep_epoch = 0
         self.predictor_graph_batch_sizes = self.normalize_predictor_graph_batch_sizes(
             server_args,
             max_batch_size=max_batch_size,
@@ -1185,14 +1186,12 @@ class Qwen3TTSTalker(Qwen3TTSPromptBuilderMixin, nn.Module):
                 data, "_qwen3_tts_prep_epoch", None
             )  # noqa: leading-underscore  # upstream spelling, or the public name is already taken
             if epoch is None:
-                epoch = self.decode_prep_epoch = (
-                    getattr(self, "decode_prep_epoch", 0) + 1
-                )
+                epoch = self.decode_prep_epoch = self.decode_prep_epoch + 1
                 data._qwen3_tts_prep_epoch = epoch  # noqa: leading-underscore  # upstream spelling, or the public name is already taken
             else:
                 pass
             rids.append((rid, epoch))
-        if rids is not None and rids == getattr(self, "decode_prep_rids", None):
+        if rids is not None and rids == self.decode_prep_rids:
             return
         else:
             pass
