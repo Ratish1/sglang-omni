@@ -65,6 +65,24 @@ logger = logging.getLogger(__name__)
 
 if HAS_TRITON:
 
+    @triton.jit
+    def snake_beta_coefficients(alpha_raw, beta_raw, eps):
+        """exp(alpha) and 1 / (exp(beta) + eps), each rounded to bf16 where eager rounds it."""
+        a = libdevice.exp(alpha_raw).to(tl.bfloat16).to(tl.float32)
+        b = libdevice.exp(beta_raw).to(tl.bfloat16).to(tl.float32)
+        t = (b + eps).to(tl.bfloat16).to(tl.float32)
+        r = libdevice.div_rn(1.0, t).to(tl.bfloat16).to(tl.float32)
+        return a, r
+
+    @triton.jit
+    def snake_beta_values(xv, a, r):
+        """x + r * sin(x * a) ** 2, each intermediate rounded to bf16 where eager rounds it."""
+        s = (xv * a).to(tl.bfloat16).to(tl.float32)
+        sn = libdevice.sin(s).to(tl.bfloat16).to(tl.float32)
+        p = (sn * sn).to(tl.bfloat16).to(tl.float32)
+        m = (r * p).to(tl.bfloat16).to(tl.float32)
+        return (xv + m).to(tl.bfloat16)
+
     @triton.jit(do_not_specialize=["C", "T"])
     def snake_beta_kernel(
         x_ptr,
@@ -81,23 +99,17 @@ if HAS_TRITON:
         # chain materializes a bf16 tensor.
         row = tl.program_id(0).to(tl.int64)
         c = row % C
-        a_raw = tl.load(alpha_ptr + c).to(tl.float32)
-        b_raw = tl.load(beta_ptr + c).to(tl.float32)
-        a = libdevice.exp(a_raw).to(tl.bfloat16).to(tl.float32)
-        b = libdevice.exp(b_raw).to(tl.bfloat16).to(tl.float32)
-        t = (b + eps).to(tl.bfloat16).to(tl.float32)
-        r = libdevice.div_rn(1.0, t).to(tl.bfloat16).to(tl.float32)
+        a, r = snake_beta_coefficients(
+            tl.load(alpha_ptr + c).to(tl.float32),
+            tl.load(beta_ptr + c).to(tl.float32),
+            eps,
+        )
 
         offs = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
         mask = offs < T
         ptrs = row * T + offs
         xv = tl.load(x_ptr + ptrs, mask=mask, other=0).to(tl.float32)
-        s = (xv * a).to(tl.bfloat16).to(tl.float32)
-        sn = libdevice.sin(s).to(tl.bfloat16).to(tl.float32)
-        p = (sn * sn).to(tl.bfloat16).to(tl.float32)
-        m = (r * p).to(tl.bfloat16).to(tl.float32)
-        y = (xv + m).to(tl.bfloat16)
-        tl.store(y_ptr + ptrs, y, mask=mask)
+        tl.store(y_ptr + ptrs, snake_beta_values(xv, a, r), mask=mask)
 
     @triton.jit(do_not_specialize=["C", "positions"])
     def snake_beta_channels_last_kernel(
@@ -118,22 +130,20 @@ if HAS_TRITON:
         )
         c = tl.program_id(1) * BLOCK_CHANNELS + tl.arange(0, BLOCK_CHANNELS)
         channel_mask = c < C
-        a_raw = tl.load(alpha_ptr + c, mask=channel_mask, other=0).to(tl.float32)
-        b_raw = tl.load(beta_ptr + c, mask=channel_mask, other=0).to(tl.float32)
-        a = libdevice.exp(a_raw).to(tl.bfloat16).to(tl.float32)
-        b = libdevice.exp(b_raw).to(tl.bfloat16).to(tl.float32)
-        t = (b + eps).to(tl.bfloat16).to(tl.float32)
-        r = libdevice.div_rn(1.0, t).to(tl.bfloat16).to(tl.float32)
+        a, r = snake_beta_coefficients(
+            tl.load(alpha_ptr + c, mask=channel_mask, other=0).to(tl.float32),
+            tl.load(beta_ptr + c, mask=channel_mask, other=0).to(tl.float32),
+            eps,
+        )
 
         mask = (rows < positions)[:, None] & channel_mask[None, :]
         ptrs = rows[:, None] * C + c[None, :]
         xv = tl.load(x_ptr + ptrs, mask=mask, other=0).to(tl.float32)
-        s = (xv * a[None, :]).to(tl.bfloat16).to(tl.float32)
-        sn = libdevice.sin(s).to(tl.bfloat16).to(tl.float32)
-        p = (sn * sn).to(tl.bfloat16).to(tl.float32)
-        m = (r[None, :] * p).to(tl.bfloat16).to(tl.float32)
-        y = (xv + m).to(tl.bfloat16)
-        tl.store(y_ptr + ptrs, y, mask=mask)
+        tl.store(
+            y_ptr + ptrs,
+            snake_beta_values(xv, a[None, :], r[None, :]),
+            mask=mask,
+        )
 
 else:
     pass
