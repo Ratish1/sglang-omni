@@ -1370,13 +1370,18 @@ def make_incremental_scheduler(
     )
     runner = None
     if cuda_graph:
+        window_keys = code2wav_scheduler.window_graph_keys(3, 2, 1)
         runner = Code2WavCudaGraphRunner.build(
             model,
             device=device,
             num_quantizers=2,
             total_gpu_memory_fraction=1.0,
-            graph_keys=code2wav_scheduler.window_graph_keys(3, 2, 2)
-            + code2wav_scheduler.incremental_graph_keys(3, 2),
+            graph_keys=window_keys
+            + tuple(
+                key
+                for key in code2wav_scheduler.incremental_graph_keys(3, 2)
+                if key not in window_keys
+            ),
             best_effort_keys=tuple(
                 GraphKey(batch_size=1, frames=frames, decode="next")
                 for frames in (1, 2)
@@ -1468,6 +1473,19 @@ def test_scheduler_replays_codec_state_graphs_as_the_whole_forward(
     assert scheduler.codec_arena.active_slots() == 0
 
 
+def test_a_stream_of_one_window_decodes_without_codec_state() -> None:
+    model = make_tiny_code2wav("cpu", torch.float32)
+    scheduler = make_incremental_scheduler(model, codec_state_slots=1)
+    codes = torch.randint(0, 16, (1, 2, 3))
+
+    waveforms = run_streams(scheduler, codes)
+
+    with torch.inference_mode():
+        expected = model(codes).reshape(-1).numpy()
+    np.testing.assert_allclose(waveforms[0], expected, rtol=2e-5, atol=2e-6)
+    assert not scheduler.codec_arena.state_rows.any()
+
+
 def test_a_reused_codec_slot_decodes_as_the_whole_forward() -> None:
     model = make_tiny_code2wav("cpu", torch.float32)
     scheduler = make_incremental_scheduler(model, codec_state_slots=1)
@@ -1504,7 +1522,7 @@ def test_abort_returns_the_codec_slot() -> None:
     model = make_tiny_code2wav("cpu", torch.float32)
     scheduler = make_incremental_scheduler(model, codec_state_slots=1)
     scheduler.stream_payloads["req-0"] = make_qwen_payload(request_id="req-0")
-    for frame in range(3):
+    for frame in range(6):
         deliver_code2wav_chunk(
             scheduler,
             "req-0",

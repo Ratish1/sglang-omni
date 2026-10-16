@@ -141,8 +141,9 @@ def window_graph_keys(
 def incremental_graph_keys(
     stream_chunk_size: int, max_replay_rows: int, initial_chunk_frames: int = 0
 ) -> tuple[GraphKey, ...]:
-    """The new frames of a stream's first window and of its later ones, decoded from codec
-    state slots, at every row count up to max_replay_rows."""
+    """The windows of a stream with a codec state slot, at every row count up to
+    max_replay_rows: its first window without state, its second from the cold state over the
+    first window's frames and its new ones, and its later ones over their new frames."""
     first_frames = (
         min(max(int(initial_chunk_frames), 0), stream_chunk_size) or stream_chunk_size
     )
@@ -150,7 +151,12 @@ def incremental_graph_keys(
         key
         for rows in range(1, max_replay_rows + 1)
         for key in (
-            GraphKey(batch_size=rows, frames=first_frames, decode="first"),
+            GraphKey(batch_size=rows, frames=first_frames),
+            GraphKey(
+                batch_size=rows,
+                frames=first_frames + stream_chunk_size,
+                decode="first",
+            ),
             GraphKey(batch_size=rows, frames=stream_chunk_size, decode="next"),
         )
     )
@@ -222,9 +228,12 @@ class Code2WavStreamState:
     checked: int = 0
     pending: PendingWindow | None = None
     codes_ready_event: torch.Event | None = None
-    # note (ratish): a stream decodes from its codec state slot from its first window on, or
-    # with left context when the arena had no slot for it then; it keeps that mode for life.
+    # note (ratish): a stream's first window carries its time to first audio and decodes
+    # without state. From its second window on it decodes from a codec state slot, or with
+    # left context for life when the arena had no slot for it then. The slot's state holds the
+    # stream's first slot_frames frames, so the slot's first decode re-reads every emitted one.
     codec_slot: int | None = None
+    slot_frames: int = 0
     stateless: bool = False
     _critical_ingest_profile: IngestProfile | None = None
 
@@ -302,13 +311,13 @@ class Code2WavScheduler(StreamingVocoderBase[Code2WavStreamState, "list[int]"]):
             self.decode_stream.wait_event(state.codes_ready_event)
 
     def claim_codec_slot(self, request_id: str, state: Code2WavStreamState) -> None:
-        """Give a stream about to decode its first window a codec state slot, or keep it
+        """Give a stream about to decode its second window a codec state slot, or keep it
         stateless when the arena has none free. Runs on the serving thread, whose stream
-        orders the decode after the slot's previous owner; the first decode reads no slot
-        state, so the slot is not zeroed."""
+        orders the decode after the slot's previous owner; the slot's first decode reads no
+        slot state, so the slot is not zeroed."""
         if (
             self.codec_arena is None
-            or state.emitted > 0
+            or state.emitted == 0
             or state.codec_slot is not None
             or state.stateless
         ):
@@ -709,7 +718,7 @@ class Code2WavScheduler(StreamingVocoderBase[Code2WavStreamState, "list[int]"]):
             wav, execution_metadata = self.decode_incremental(
                 torch.stack(rows, dim=0),
                 [state.codec_slot for _, state in participants],
-                first_decode=anchor_state.emitted == 0,
+                first_decode=anchor_state.slot_frames == 0,
             )
         wav = wav[..., -new_frames * self.total_upsample :].reshape(
             len(participants), -1
@@ -726,6 +735,10 @@ class Code2WavScheduler(StreamingVocoderBase[Code2WavStreamState, "list[int]"]):
             zip(participants, profiles)
         ):
             state.emitted += new_frames
+            if state.codec_slot is not None:
+                state.slot_frames = state.emitted
+            else:
+                pass
             state.ready_since = None
             wait_ns = 0
             if host_rows is None:
@@ -1019,12 +1032,12 @@ class Code2WavScheduler(StreamingVocoderBase[Code2WavStreamState, "list[int]"]):
         return len(state.chunks) - state.emitted
 
     def context_frames(self, state: Code2WavStreamState) -> int:
-        """Decoded frames a window re-reads: none from a codec state slot, else the left
-        context."""
+        """Decoded frames a window re-reads: the left context without a codec state slot,
+        else the emitted frames the slot's state does not hold yet."""
         if state.codec_slot is None:
             return min(self.left_context_size, state.emitted)
         else:
-            return 0
+            return state.emitted - state.slot_frames
 
     def window_length(self, state: Code2WavStreamState) -> int:
         return self.context_frames(state) + self.window_new_frames(state)
@@ -1080,10 +1093,10 @@ class Code2WavScheduler(StreamingVocoderBase[Code2WavStreamState, "list[int]"]):
         )
         if not from_slot:
             decode = "window"
-        elif follows_a_window:
-            decode = "next"
-        else:
+        elif anchor[1].slot_frames == 0:
             decode = "first"
+        else:
+            decode = "next"
         if self.cuda_graph_runner is None:
             rows = min(len(group), self.max_replay_rows)
         else:
@@ -1317,8 +1330,9 @@ def create_code2wav_scheduler(
         pass
     cuda_graph_runner = None
     if enable_cuda_graph:
-        # note (ratish): with codec state slots a stateless window decodes only a stream the
-        # arena had no slot for, or one that ends before its first window: one row each.
+        # note (ratish): with codec state slots a stateless window past a stream's first decodes
+        # only a stream the arena had no slot for, or one that ends before its second window:
+        # one row each.
         graph_keys = window_graph_keys(
             stream_chunk_size,
             left_context_size,
@@ -1337,10 +1351,14 @@ def create_code2wav_scheduler(
             if key not in graph_keys
         )
         if codec_arena is not None:
-            graph_keys += incremental_graph_keys(
-                stream_chunk_size,
-                max(int(max_replay_rows), 1),
-                initial_codec_chunk_frames,
+            graph_keys += tuple(
+                key
+                for key in incremental_graph_keys(
+                    stream_chunk_size,
+                    max(int(max_replay_rows), 1),
+                    initial_codec_chunk_frames,
+                )
+                if key not in graph_keys
             )
             # note (ratish): a stream with a slot ends on fewer new frames than a window.
             final_window_keys += tuple(
