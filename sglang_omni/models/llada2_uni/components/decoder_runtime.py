@@ -255,6 +255,7 @@ def initialize_decoder_runtime(
         )
         args_module.set_global_server_args(args)
         runtime.published = True
+        runtime.world_started = True
         ps.init_distributed_environment(
             world_size=1,
             rank=0,
@@ -264,7 +265,7 @@ def initialize_decoder_runtime(
             device_id=None if gpu_id is None else device,
             timeout=dist_timeout,
         )
-        runtime.world_started = True
+        runtime.model_started = True
         ps.initialize_model_parallel(
             data_parallel_size=1,
             classifier_free_guidance_degree=1,
@@ -276,7 +277,6 @@ def initialize_decoder_runtime(
             vae_parallel_size=0,
             backend="gloo" if gpu_id is None else "nccl",
         )
-        runtime.model_started = True
         runtime_context.publish(
             SrtServerArgs(model_path="dummy", tp_size=1),
             role="diffusion_gpu_worker",

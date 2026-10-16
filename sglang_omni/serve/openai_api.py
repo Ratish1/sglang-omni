@@ -213,6 +213,7 @@ def create_app(
     model_name: str | None = None,
     supports_image_api: bool = False,
     image_decode_mode: Literal["normal", "decoder-turbo"] = "normal",
+    image_decode_steps: int = 50,
     requires_uploaded_voice_for_named_voice: bool = False,
     supports_uploaded_voice_references: bool = True,
     custom_voice_config: CustomVoiceConfig | None = None,
@@ -241,6 +242,7 @@ def create_app(
         model_name: Default model name to report in responses and /v1/models.
         supports_image_api: Mount image generation and editing routes for this pipeline.
         image_decode_mode: Decoder factory mode used to validate omitted request modes.
+        image_decode_steps: Decoder factory step count used for omitted request steps.
         requires_uploaded_voice_for_named_voice: Whether non-default TTS voice
             names must resolve to uploaded voices before reaching the model.
         supports_uploaded_voice_references: Whether uploaded voice names can be
@@ -342,7 +344,7 @@ def create_app(
     register_admin(app, resolved_key)
     register_chat_completions(app)
     if supports_image_api:
-        register_images(app, image_decode_mode)
+        register_images(app, image_decode_mode, image_decode_steps)
     else:
         pass
     register_voices(app)
@@ -362,7 +364,9 @@ def create_app(
 
 
 def register_images(
-    app: FastAPI, decode_mode: Literal["normal", "decoder-turbo"]
+    app: FastAPI,
+    decode_mode: Literal["normal", "decoder-turbo"],
+    decoder_steps: int,
 ) -> None:
     """Register native image-generation and single-image-edit routes."""
     from sglang.multimodal_gen.runtime.entrypoints.openai.protocol import (
@@ -465,7 +469,15 @@ def register_images(
             options.update(image_w=width, image_h=height)
 
         params = ImageGenerationParams.model_validate(
-            {"decode_mode": decode_mode, **options}
+            {
+                "decode_mode": decode_mode,
+                "decoder_steps": (
+                    8
+                    if options.get("decode_mode") == "decoder-turbo"
+                    else decoder_steps
+                ),
+                **options,
+            }
         )
         return GenerateRequest(
             model=request.model,

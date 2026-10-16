@@ -197,19 +197,23 @@ def test_native_image_routes_preserve_generation_controls(
 
 @pytest.mark.parametrize("editing", [False, True])
 @pytest.mark.parametrize(
-    "factory_mode,request_mode,steps,status",
+    "factory_mode,factory_steps,request_mode,steps,status",
     [
-        ("normal", None, 1, 400),
-        ("decoder-turbo", None, 1, 200),
-        ("normal", "decoder-turbo", 1, 200),
-        ("decoder-turbo", "normal", 1, 400),
-        ("decoder-turbo", None, None, 200),
-        ("normal", "decoder-turbo", None, 200),
+        ("normal", 50, None, 1, 400),
+        ("decoder-turbo", 8, None, 1, 200),
+        ("normal", 50, "decoder-turbo", 1, 200),
+        ("decoder-turbo", 8, "normal", 1, 400),
+        ("decoder-turbo", 8, None, None, 200),
+        ("normal", 50, "decoder-turbo", None, 200),
+        ("decoder-turbo", 1, "normal", None, 400),
+        ("decoder-turbo", 1, "normal", 2, 200),
+        ("decoder-turbo", 1, None, None, 200),
     ],
 )
 def test_image_steps_follow_factory_mode(
     editing: bool,
     factory_mode: Literal["normal", "decoder-turbo"],
+    factory_steps: int,
     request_mode: Literal["normal", "decoder-turbo"] | None,
     steps: int | None,
     status: int,
@@ -218,11 +222,13 @@ def test_image_steps_follow_factory_mode(
     stage = config.stage_named(IMAGE_DECODE_STAGE)
     assert isinstance(stage, LLaDA2ImageDecoderStageConfig)
     stage.factory.decode_mode = factory_mode
+    stage.factory.num_steps = factory_steps
     coordinator = RecordingCoordinator()
     app = create_app(
         Client(coordinator),
         supports_image_api=config.supports_image_api,
         image_decode_mode=config.image_decode_mode(),
+        image_decode_steps=config.image_decode_steps(),
     )
     fields: dict[str, str | int] = {"prompt": "Make it red"}
     if request_mode is not None:

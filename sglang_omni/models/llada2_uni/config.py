@@ -92,6 +92,11 @@ class LLaDA2UniOmniPipelineConfig(LLaDA2UniPipelineConfig):
         assert isinstance(stage, LLaDA2ImageDecoderStageConfig)
         return stage.factory.decode_mode
 
+    def image_decode_steps(self) -> int:
+        stage = self.stage_named(IMAGE_DECODE_STAGE)
+        assert isinstance(stage, LLaDA2ImageDecoderStageConfig)
+        return stage.factory.num_steps
+
     stage_config_types: ClassVar[dict[str, type[StageConfig]]] = {
         **LLaDA2UniPipelineConfig.stage_config_types,
         IMAGE_DECODE_STAGE: LLaDA2ImageDecoderStageConfig,
