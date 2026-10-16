@@ -279,16 +279,21 @@ def channels_last_causal_conv1d(
         state, key, hidden_states, batch_size, channels, history_size
     )
 
-    if history_size:
-        combined = torch.cat((history.transpose(1, 2), hidden_states), dim=1)
+    # note (ratish): the zeros a dilated conv needs after the frames join the history in one
+    # copy of the activation, as the whole-sequence forward's single pad does.
+    tail = (-(history_size + length)) % int(conv.dilation[0])
+    if history_size or tail:
+        combined = torch.cat(
+            (
+                history.transpose(1, 2),
+                hidden_states,
+                hidden_states.new_zeros(batch_size, tail, channels),
+            ),
+            dim=1,
+        )
     else:
         combined = hidden_states
-    dilation = int(conv.dilation[0])
-    if dilation == 1:
-        padded = combined
-    else:
-        padded = F.pad(combined, (0, 0, 0, (-combined.shape[1]) % dilation))
-    output = channels_last_conv1d(padded, conv, weight, length)
+    output = channels_last_conv1d(combined, conv, weight, length)
     if output.shape[1] != length:
         raise RuntimeError(
             f"incremental causal Conv1d changed temporal length for {key}"
@@ -296,7 +301,7 @@ def channels_last_causal_conv1d(
     else:
         pass
     state.conv_histories[key] = (
-        combined[:, combined.shape[1] - history_size :]
+        combined[:, length : length + history_size]
         .transpose(1, 2)
         .clone(memory_format=torch.contiguous_format)
     )
