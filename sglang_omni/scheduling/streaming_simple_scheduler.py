@@ -129,6 +129,7 @@ class StreamingSimpleScheduler:
             try:
                 self.handle_stream_chunk(request_id, item)
             except Exception as exc:
+                logger.exception(f"{type(self).__name__} failed for {request_id}")
                 self.emit_error(request_id, exc)
                 self.abort(request_id)
 
