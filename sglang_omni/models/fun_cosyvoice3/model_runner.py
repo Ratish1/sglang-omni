@@ -13,6 +13,7 @@ from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
+from sglang.srt.utils.common import is_pin_memory_available
 
 from sglang_omni.model_runner.base import ModelRunner
 from sglang_omni.model_runner.model_worker import ModelWorker
@@ -66,6 +67,18 @@ class FunCosyVoice3ModelRunner(ModelRunner):
         self.outbox: Queue[OutgoingMessage] | None = None
         self.vocoder_target = "vocoder"
         self.cosyvoice3_recent_tokens: dict[str, list[int]] = {}
+        # note (ratish): each request slot's last speech tokens, kept on the device so a
+        # step's repeat check needs no host read of the step before.
+        self.recent_speech_tokens = torch.full(
+            (
+                tp_worker.model_runner.req_to_token_pool.req_to_token.shape[0],
+                COSYVOICE3_RAS_WINDOW_SIZE,
+            ),
+            -1,
+            dtype=torch.long,
+            device=self.device,
+        )
+        self.recent_speech_token_owners: dict[int, str] = {}
 
     def set_stream_outbox(self, outbox: Queue[OutgoingMessage]) -> None:
         self.outbox = outbox
@@ -137,12 +150,24 @@ class FunCosyVoice3ModelRunner(ModelRunner):
         requests: list[SchedulerRequest],
     ) -> torch.Tensor:
         if not self.is_mps_ras_fallback(logits_output.next_token_logits):
-            return super().sample_next_token_ids(
+            next_token_ids = super().sample_next_token_ids(
                 logits_output,
                 forward_batch,
                 schedule_batch,
                 requests,
             )
+            if forward_batch.forward_mode.is_decode():
+                return self.redraw_repeated_tokens(
+                    logits_output, forward_batch, requests, next_token_ids
+                )
+            else:
+                # note (ratish): rows sampled outside a decode step skip the window,
+                # so their next decode step rebuilds it from the host output ids.
+                for sched_req in requests:
+                    self.recent_speech_token_owners.pop(
+                        sched_req.data.req.kv.req_pool_idx, None
+                    )
+                return next_token_ids
         else:
             pass
         if len(requests) != 1:
@@ -346,12 +371,7 @@ class FunCosyVoice3ModelRunner(ModelRunner):
         # note (Yucheng Hu): a pageable D2H on the default stream stalls other threads'
         # kernel launches while it waits, an event wait does not.
         self.stage_token_ids(result, token_ids)
-        token_ids_cpu = self.redraw_repeated_tokens(
-            result,
-            forward_batch,
-            requests,
-            self.resolve_host_token_ids(result).tolist(),
-        )
+        token_ids_cpu = self.resolve_host_token_ids(result).tolist()
         for idx, sched_req in enumerate(requests):
             token_id = int(token_ids_cpu[idx])
             if token_id >= VOCAB_SIZE:
@@ -364,69 +384,90 @@ class FunCosyVoice3ModelRunner(ModelRunner):
 
     def redraw_repeated_tokens(
         self,
-        result: GenerationBatchResult,
-        forward_batch: ForwardBatch | None,
+        logits_output: LogitsProcessorOutput,
+        forward_batch: ForwardBatch,
         requests: list[SchedulerRequest],
-        token_ids: list[int],
-    ) -> list[int]:
-        """Redraw repeated speech tokens with them masked, so EOS stays reachable."""
-        if (
-            forward_batch is None
-            or not forward_batch.forward_mode.is_decode()
-            or self.is_mps_ras_fallback(result.next_token_ids)
-        ):
-            return token_ids
-        else:
-            pass
-        # note (ratish): the window is checked on the host ids the step reads anyway,
-        # so a step without a repeat launches nothing.
-        rows = [
-            row
-            for row, (sched_req, token_id) in enumerate(
-                zip(requests, token_ids, strict=True)
-            )
-            if token_id < VOCAB_SIZE
-            and sched_req.data.req.sampling_params.top_k != 1
-            and token_id in sched_req.data.req.output_ids[-COSYVOICE3_RAS_WINDOW_SIZE:]
+        sampled_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        """Redraw a speech token its row emitted in the last ten with it masked, so EOS
+        stays reachable."""
+        stale = [
+            sched_req
+            for sched_req in requests
+            if self.recent_speech_token_owners.get(sched_req.data.req.kv.req_pool_idx)
+            != sched_req.request_id
         ]
-        if not rows:
-            return token_ids
+        if stale:
+            # note (ratish): a request's first decode step runs after its prefill
+            # step resolved, so its host output ids are complete here.
+            pin_memory = is_pin_memory_available(self.device)
+            stale_slots = torch.tensor(
+                [sched_req.data.req.kv.req_pool_idx for sched_req in stale],
+                pin_memory=pin_memory,
+            )
+            histories = torch.tensor(
+                [
+                    (
+                        [-1] * COSYVOICE3_RAS_WINDOW_SIZE
+                        + list(sched_req.data.req.output_ids)
+                    )[-COSYVOICE3_RAS_WINDOW_SIZE:]
+                    for sched_req in stale
+                ],
+                dtype=torch.long,
+                pin_memory=pin_memory,
+            )
+            self.recent_speech_tokens[
+                stale_slots.to(self.device, non_blocking=True)
+            ] = histories.to(self.device, non_blocking=True)
+            for sched_req in stale:
+                self.recent_speech_token_owners[sched_req.data.req.kv.req_pool_idx] = (
+                    sched_req.request_id
+                )
         else:
             pass
-        # note (ratish): both samplers apply top-k and top-p to a copy,
-        # leaving the tempered probabilities here, or the tempered logits on Ascend.
-        if self.tp_worker.model_runner.sampler.use_ascend_backend:
-            probs = torch.softmax(
-                result.logits_output.next_token_logits, dim=-1, dtype=torch.float64
-            )
+        slots = forward_batch.req_pool_indices
+        window = self.recent_speech_tokens[slots]
+        candidates = sampled_ids.reshape(-1).long()
+        sampling_info = forward_batch.sampling_info
+        if sampling_info.is_all_greedy:
+            token_ids = candidates
         else:
-            probs = result.logits_output.next_token_logits
-        sampled_ids = result.next_token_ids.reshape(-1)
-        row_index = torch.tensor(rows, device=probs.device)
-        sampling_seeds = forward_batch.sampling_info.sampling_seed
-        # note (ratish): float64, as the first seeded draw feeds the compiled
-        # multinomial_with_seed, so a seeded redraw reuses that graph, not a new one.
-        row_probs = probs[row_index].to(torch.float64)
-        redraw_probs = row_probs.scatter(
-            1, sampled_ids[row_index].long().unsqueeze(1), 0.0
+            repeated = (
+                (window == candidates.unsqueeze(1)).any(dim=1)
+                & (candidates < VOCAB_SIZE)
+                & (sampling_info.top_ks != 1)
+            )
+            # note (ratish): both samplers apply top-k and top-p to a copy,
+            # leaving the tempered probabilities here, or the tempered logits on Ascend.
+            if self.tp_worker.model_runner.sampler.use_ascend_backend:
+                probs = torch.softmax(
+                    logits_output.next_token_logits, dim=-1, dtype=torch.float64
+                )
+            else:
+                probs = logits_output.next_token_logits
+            # note (ratish): float64, as the first seeded draw feeds the compiled
+            # multinomial_with_seed, so the redraw reuses that graph, not a new one.
+            row_probs = probs.to(torch.float64)
+            redraw_probs = row_probs.scatter(1, candidates.unsqueeze(1), 0.0)
+            # note (Yucheng Hu): multinomial rejects an all-zero row, and a row whose
+            # whole mass sat on the candidate has nothing else to draw.
+            redraw_probs = torch.where(
+                redraw_probs.sum(dim=1, keepdim=True) > 0, redraw_probs, row_probs
+            )
+            sampling_seeds = sampling_info.sampling_seed
+            redraw_seeds = (
+                None
+                if sampling_seeds is None
+                else sampling_seeds ^ COSYVOICE3_RAS_SEED_SALT
+            )
+            redrawn_ids = sampling_from_probs_torch(
+                redraw_probs, redraw_seeds, forward_batch.positions
+            )
+            token_ids = torch.where(repeated, redrawn_ids.long(), candidates)
+        self.recent_speech_tokens[slots] = torch.cat(
+            (window[:, 1:], token_ids.unsqueeze(1)), dim=1
         )
-        # note (Yucheng Hu): multinomial rejects an all-zero row, and a row whose
-        # whole mass sat on the candidate has nothing else to draw.
-        redraw_probs = torch.where(
-            redraw_probs.sum(dim=1, keepdim=True) > 0, redraw_probs, row_probs
-        )
-        redraw_seeds = (
-            None
-            if sampling_seeds is None
-            else sampling_seeds[row_index] ^ COSYVOICE3_RAS_SEED_SALT
-        )
-        redrawn_ids = sampled_ids.clone()
-        redrawn_ids[row_index] = sampling_from_probs_torch(
-            redraw_probs, redraw_seeds, forward_batch.positions[row_index]
-        ).to(redrawn_ids.dtype)
-        result.next_token_ids = redrawn_ids.view_as(result.next_token_ids)
-        self.stage_token_ids(result, redrawn_ids)
-        return self.resolve_host_token_ids(result).tolist()
+        return token_ids.to(sampled_ids.dtype).view_as(sampled_ids)
 
     def queue_or_emit_code_chunk(
         self,
