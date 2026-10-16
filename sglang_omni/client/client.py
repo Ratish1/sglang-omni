@@ -165,7 +165,6 @@ class Client:
         request: GenerateRequest,
         request_id: str | None = None,
     ) -> AsyncIterator[GenerateChunk]:
-        validate_image_request(request)
         req_id = request_id or str(uuid.uuid4())
         omni_request = self.build_omni_request(request)
         if request.stream:
@@ -319,7 +318,6 @@ class Client:
         Audio data is base64-encoded before yielding so that callers never
         need to touch numpy / raw bytes.
         """
-        validate_image_request(request)
         streamed_text = ""
         stop_trimmer = (
             StreamedStopTrimmer(stop=request.sampling.stop)
@@ -912,28 +910,6 @@ class Client:
             pass
         chunk.text = str(data)
         return chunk
-
-
-def validate_image_request(request: GenerateRequest) -> None:
-    """Enforce the image modality contract before dispatch."""
-    modalities = (
-        request.output_modalities
-        if request.output_modalities is not None
-        else request.metadata.get("output_modalities")
-    )
-    image_requested = "image" in (modalities or [])
-    if request.metadata.get("image_generation") is not None and not image_requested:
-        raise ClientError(
-            "image_generation requires output_modalities to include image"
-        )
-    else:
-        pass
-    if request.stream and image_requested:
-        raise ClientError(
-            "Image generation does not support streaming; set stream=false"
-        )
-    else:
-        pass
 
 
 def extract_inputs(request: GenerateRequest) -> object:

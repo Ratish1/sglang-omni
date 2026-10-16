@@ -17,8 +17,7 @@ from sglang_omni.client import Client
 from sglang_omni.client.types import ClientError, GenerateRequest
 from sglang_omni.proto import CompleteMessage, StreamMessage
 from sglang_omni.serve import create_app
-from sglang_omni.serve.openai_api import build_chat_generate_request
-from sglang_omni.serve.protocol import ChatCompletionRequest, ImageGenerationParams
+from sglang_omni.serve.protocol import ImageGenerationParams
 
 
 class DecodePayload(TypedDict, total=False):
@@ -38,17 +37,11 @@ class PipelineResult(TypedDict, total=False):
     image: str
 
 
-ImagePart = dict[str, str | dict[str, str]]
-MalformedContent = str | None | list[dict[str, str | int | None]]
-
-
 class RecordingCoordinator:
     def __init__(self) -> None:
         self.requests: list[GenerateRequest] = []
 
-    async def submit(
-        self, request_id: str, request: GenerateRequest
-    ) -> PipelineResult:
+    async def submit(self, request_id: str, request: GenerateRequest) -> PipelineResult:
         self.requests.append(request)
         return {
             "decode": {
@@ -71,7 +64,9 @@ class RecordingCoordinator:
 def api() -> Iterator[tuple[TestClient, RecordingCoordinator]]:
     coordinator = RecordingCoordinator()
     app = create_app(
-        Client(coordinator), model_name="llada2-uni", supports_image_api=True
+        Client(coordinator),
+        model_name="served-model",
+        supports_image_api=True,
     )
     with TestClient(app) as client:
         yield client, coordinator
@@ -119,31 +114,6 @@ with TestClient(app) as client:
 
 
 @pytest.mark.parametrize(
-    "field,value",
-    [
-        ("cfg_scale", "NaN"),
-        ("cfg_text_scale", "Infinity"),
-        ("cfg_image_scale", "-Infinity"),
-        ("cfg_rescale", "NaN"),
-    ],
-)
-def test_http_rejects_nonfinite_cfg_without_dispatch(
-    api: tuple[TestClient, RecordingCoordinator], field: str, value: str
-) -> None:
-    client, coordinator = api
-    response = client.post(
-        "/v1/chat/completions",
-        json={
-            "messages": [{"role": "user", "content": "Draw"}],
-            "image_generation": {field: value},
-        },
-    )
-    assert response.status_code == 422
-    assert response.json()["detail"][0]["loc"] == ["body", "image_generation", field]
-    assert coordinator.requests == []
-
-
-@pytest.mark.parametrize(
     "params",
     [
         {"cfg_scale": 0.9},
@@ -166,250 +136,8 @@ def test_invalid_image_parameters(params: dict[str, int | float | str]) -> None:
         ImageGenerationParams(**params)
 
 
-def test_image_config_and_modalities_reach_omni_request() -> None:
-    modalities = ["text", "image"]
-    image_config = {"cfg_scale": 1.0, "cfg_text_scale": 0.0}
-    req = ChatCompletionRequest(
-        model="llada2-uni",
-        messages=[{"role": "user", "content": "Make it red"}],
-        images=["input.png"],
-        image_generation=image_config,
-        modalities=modalities,
-        temperature=1.0,
-        max_completion_tokens=64,
-        stage_sampling={"thinker": {"temperature": 0.5, "max_new_tokens": 32}},
-        stage_params={"thinker": {"return_logprob": True}},
-    )
-    generate = build_chat_generate_request(req)
-    omni = Client.build_omni_request(generate)
-    assert generate.output_modalities == modalities
-    assert omni.metadata["output_modalities"] == modalities
-    assert omni.metadata["image_generation"] == image_config
-    assert omni.metadata["model"] == "llada2-uni"
-    assert omni.inputs["images"] == ["input.png"]
-    assert omni.inputs["messages"] == [{"role": "user", "content": "Make it red"}]
-    assert omni.params["stream"] is False
-    assert omni.params["max_new_tokens"] == 64
-    assert omni.params["stage_sampling"]["thinker"]["temperature"] == 0.5
-    assert omni.params["stage_sampling"]["thinker"]["max_new_tokens"] == 32
-    assert omni.params["stage_params"] == req.stage_params
-    assert omni.params["temperature"] == 1.0
-
-
-def test_all_image_controls_preserve_explicit_values() -> None:
-    messages = [{"role": "user", "content": "Draw a square"}]
-    config = {
-        "mode": "normal",
-        "decode_mode": "decoder-turbo",
-        "decoder_steps": 1,
-        "seed": 0,
-        "cfg_scale": 1.0,
-        "cfg_text_scale": 0.0,
-        "cfg_image_scale": 0.0,
-        "cfg_rescale": 0.0,
-        "image_h": 32,
-        "image_w": 1024,
-        "dllm_steps": 1,
-    }
-    req = ChatCompletionRequest(
-        messages=messages, modalities=["image"], image_generation=config
-    )
-    assert build_chat_generate_request(req).metadata["image_generation"] == config
-    req = ChatCompletionRequest(
-        messages=messages,
-        modalities=["image"],
-        image_generation={"cfg_text_scale": None},
-    )
-    assert build_chat_generate_request(req).metadata["image_generation"] == {}
-    assert (
-        "image_generation"
-        not in build_chat_generate_request(
-            ChatCompletionRequest(messages=messages)
-        ).metadata
-    )
-
-
-@pytest.mark.parametrize("modalities", [["image"], ["text", "image"]])
-def test_chat_image_response_keeps_pr3_format_and_modality_choices(
-    api: tuple[TestClient, RecordingCoordinator], modalities: list[str] | None
-) -> None:
-    client, coordinator = api
-    response = client.post(
-        "/v1/chat/completions",
-        json={
-            "messages": [{"role": "user", "content": "Draw a square"}],
-            "image_generation": {},
-            "modalities": modalities,
-        },
-    )
-    assert response.status_code == 200
-    data = response.json()
-    message = data["choices"][0]["message"]
-    assert message["image"] == {"data": "cG5n", "format": "png"}
-    if modalities == ["image"]:
-        assert "content" not in message
-    else:
-        assert message["content"] == "A red square"
-    assert "audio" not in message
-    assert data["choices"][0]["finish_reason"] == "length"
-    assert data["usage"] == {
-        "prompt_tokens": 3,
-        "completion_tokens": 2,
-        "total_tokens": 5,
-    }
-    assert len(coordinator.requests) == 1
-    assert coordinator.requests[0].metadata["image_generation"] == {}
-
-
-@pytest.mark.parametrize("modalities", [None, ["text"]])
-def test_image_generation_requires_image_modality(
-    api: tuple[TestClient, RecordingCoordinator], modalities: list[str] | None
-) -> None:
-    client, coordinator = api
-    body = {
-        "messages": [{"role": "user", "content": "Draw a square"}],
-        "image_generation": {},
-    }
-    if modalities is not None:
-        body["modalities"] = modalities
-    else:
-        pass
-    response = client.post("/v1/chat/completions", json=body)
-    assert response.status_code == 400
-    assert response.json()["detail"] == (
-        "image_generation requires modalities to include image"
-    )
-    assert coordinator.requests == []
-
-
-def test_image_response_does_not_fall_back_to_text(
-    api: tuple[TestClient, RecordingCoordinator], monkeypatch: pytest.MonkeyPatch
-) -> None:
-    client, coordinator = api
-
-    async def submit(request_id: str, request: GenerateRequest) -> PipelineResult:
-        return {"decode": {"text": "text fallback"}}
-
-    monkeypatch.setattr(coordinator, "submit", submit)
-    response = client.post(
-        "/v1/chat/completions",
-        json={
-            "messages": [{"role": "user", "content": "Draw"}],
-            "modalities": ["image"],
-            "image_generation": {},
-        },
-    )
-    assert response.status_code == 500
-    assert response.json()["detail"] == "Pipeline returned no image"
-
-
-def test_edit_validation_without_generation_config_is_a_client_error(
-    api: tuple[TestClient, RecordingCoordinator],
-) -> None:
-    client, coordinator = api
-    response = client.post(
-        "/v1/chat/completions",
-        json={
-            "messages": [{"role": "user", "content": " "}],
-            "images": ["input.png"],
-            "modalities": ["image"],
-        },
-    )
-    assert response.status_code == 400
-    assert response.json()["detail"] == (
-        "Image editing requires a non-empty instruction"
-    )
-    assert coordinator.requests == []
-
-
-@pytest.mark.parametrize(
-    "extra",
-    [
-        {"modalities": ["image"]},
-        {"modalities": ["text", "image"]},
-    ],
-)
-def test_image_streaming_is_rejected_before_dispatch(
-    api: tuple[TestClient, RecordingCoordinator], extra: dict[str, list[str]]
-) -> None:
-    client, coordinator = api
-    response = client.post(
-        "/v1/chat/completions",
-        json={
-            "messages": [{"role": "user", "content": "Draw"}],
-            "stream": True,
-            **extra,
-        },
-    )
-    assert response.status_code == 400
-    assert "stream=false" in response.json()["detail"]
-    assert response.headers["content-type"] == "application/json"
-    assert coordinator.requests == []
-
-
-@pytest.mark.parametrize(
-    "image_part",
-    [
-        {"type": "image_url", "image_url": {"url": "input.png"}},
-        {"type": "image_url", "image_url": "input.png"},
-        {"type": "image", "image": "input.png"},
-        None,
-    ],
-)
-@pytest.mark.parametrize("instruction", ["", "Make it red"])
-def test_edit_requires_latest_user_instruction(
-    api: tuple[TestClient, RecordingCoordinator],
-    image_part: ImagePart | None,
-    instruction: str,
-) -> None:
-    client, coordinator = api
-    body = {
-        "messages": [
-            {"role": "user", "content": "Earlier instruction must not count"},
-            {"role": "assistant", "content": "Assistant text must not count"},
-            {
-                "role": "user",
-                "content": [
-                    *([image_part] if image_part else []),
-                    {"type": "text", "text": instruction},
-                ],
-            },
-        ],
-        "image_generation": {},
-        "modalities": ["image"],
-    }
-    if image_part is None:
-        body["images"] = ["input.png"]
-    response = client.post("/v1/chat/completions", json=body)
-    assert response.status_code == (200 if instruction else 400)
-    assert len(coordinator.requests) == bool(instruction)
-    if not instruction:
-        assert (
-            response.json()["detail"]
-            == "Image editing requires a non-empty instruction"
-        )
-
-
-@pytest.mark.parametrize("content", ["  ", None, [{"text": None}], [{"text": 123}]])
-def test_empty_or_malformed_edit_text_is_not_a_server_error(
-    api: tuple[TestClient, RecordingCoordinator], content: MalformedContent
-) -> None:
-    client, coordinator = api
-    response = client.post(
-        "/v1/chat/completions",
-        json={
-            "messages": [{"role": "user", "content": content}],
-            "images": ["input.png"],
-            "image_generation": {},
-            "modalities": ["image"],
-        },
-    )
-    assert response.status_code == 400
-    assert coordinator.requests == []
-
-
 def test_image_input_without_generation_config_remains_chat(
-    api: tuple[TestClient, RecordingCoordinator]
+    api: tuple[TestClient, RecordingCoordinator],
 ) -> None:
     client, coordinator = api
     response = client.post(
@@ -447,6 +175,9 @@ def test_native_image_routes_preserve_generation_controls(
     assert response.status_code == 200, response.text
     assert response.json()["data"][0]["b64_json"] == "cG5n"
     request = coordinator.requests[0]
+    assert request.metadata["output_modalities"] == ["image"]
+    assert request.params["stream"] is False
+    assert "choices" not in response.json()
     options = request.metadata["image_generation"]
     assert options["seed"] == 0
     assert options["cfg_scale"] == 4.0
@@ -460,7 +191,7 @@ def test_native_image_routes_preserve_generation_controls(
 
 
 def test_native_image_rejects_unsupported_controls_and_multiple_sources(
-    api: tuple[TestClient, RecordingCoordinator]
+    api: tuple[TestClient, RecordingCoordinator],
 ) -> None:
     client, coordinator = api
     for options in ({"n": 2}, {"width": 0, "height": 1024}, {"mask": "mask.png"}):

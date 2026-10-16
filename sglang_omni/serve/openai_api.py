@@ -2,7 +2,7 @@
 """OpenAI-compatible API server for sglang-omni.
 
 Provides the following endpoints:
-- POST /v1/chat/completions  — Text, audio, and image chat completions
+- POST /v1/chat/completions  — Text (+ audio) chat completions
 - POST /v1/audio/speech      — Text-to-speech synthesis
 - POST /v1/audio/translations — Translate audio speech to English
 - POST /v1/audio/speech/batch — Batch text-to-speech synthesis
@@ -144,6 +144,7 @@ from sglang_omni.serve.translations import register_translations
 logger = logging.getLogger(__name__)
 HTTP_DISCONNECT_POLL_INTERVAL_S = 0.05
 HTTP_DISCONNECT_CANCEL_TIMEOUT_S = 0.1
+
 
 class ServerStatus(Enum):
     """Readiness the launcher holds at STARTING until its warmup requests complete."""
@@ -437,10 +438,6 @@ def register_images(app: FastAPI) -> None:
                 raise ValueError(
                     "Edit output follows the source grid; omit size, width and height"
                 )
-            else:
-                pass
-            if options.get("mode") == "thinking":
-                raise ValueError("Thinking mode does not support editing")
             else:
                 pass
         else:
@@ -967,72 +964,6 @@ def common_model_info_value(
     return None
 
 
-def validate_image_generation_request(req: ChatCompletionRequest) -> None:
-    """Reject unsupported image requests before dispatch or SSE headers."""
-    image_requested = req.modalities is not None and "image" in req.modalities
-    if req.image_generation is not None and not image_requested:
-        raise HTTPException(
-            status_code=400,
-            detail="image_generation requires modalities to include image",
-        )
-    else:
-        pass
-    if req.stream and image_requested:
-        raise HTTPException(
-            status_code=400,
-            detail="Image generation does not support streaming; set stream=false",
-        )
-    else:
-        pass
-    if not image_requested:
-        return
-    else:
-        pass
-
-    has_image = bool(req.images)
-    instruction = ""
-    for message in req.messages:
-        content = message.content
-        text_parts: list[str] = []
-        if isinstance(content, str):
-            text_parts.append(content)
-        elif isinstance(content, list):
-            for item in content:
-                if isinstance(item, str):
-                    text_parts.append(item)
-                elif isinstance(item, dict):
-                    kind = item.get("type", "text")
-                    if kind == "text" and isinstance(item.get("text"), str):
-                        text_parts.append(item["text"])
-                    elif kind == "image_url":
-                        url = item.get("image_url")
-                        if isinstance(url, dict):
-                            url = url.get("url")
-                        else:
-                            pass
-                        has_image = has_image or bool(url)
-                    elif kind == "image":
-                        has_image = has_image or bool(item.get("image"))
-                    else:
-                        pass
-                else:
-                    pass
-        else:
-            pass
-        if message.role == "user":
-            instruction = "".join(text_parts)
-        else:
-            pass
-
-    if has_image and not instruction.strip():
-        raise HTTPException(
-            status_code=400,
-            detail="Image editing requires a non-empty instruction",
-        )
-    else:
-        pass
-
-
 def register_chat_completions(app: FastAPI) -> None:
     @app.post("/v1/chat/completions")
     async def chat_completions(
@@ -1040,8 +971,6 @@ def register_chat_completions(app: FastAPI) -> None:
     ) -> Response:
         client: Client = app.state.client
         default_model: str = app.state.model_name
-
-        validate_image_generation_request(req)
 
         request_id = req.request_id or str(uuid.uuid4())
         response_id = f"chatcmpl-{request_id}"
@@ -1118,11 +1047,7 @@ async def chat_non_stream(
             status_code=generation_error_status_code(exc), detail=str(exc)
         ) from exc
 
-    requested_modalities = req.modalities if req.modalities is not None else ["text"]
-    if "image" in requested_modalities and result.image is None:
-        raise HTTPException(status_code=500, detail="Pipeline returned no image")
-    else:
-        pass
+    requested_modalities = req.modalities or ["text"]
 
     # Build message content
     message: dict[str, str | dict[str, str | None]] = {"role": "assistant"}
@@ -1141,12 +1066,7 @@ async def chat_non_stream(
     else:
         pass
 
-    if "image" in requested_modalities and result.image is not None:
-        message["image"] = {"data": result.image, "format": "png"}
-    else:
-        pass
-
-    if not {"content", "audio", "image"}.intersection(message):
+    if "content" not in message and "audio" not in message:
         message["content"] = result.text
     else:
         pass
@@ -1387,7 +1307,7 @@ def build_chat_generate_request(req: ChatCompletionRequest) -> GenerateRequest:
     messages = [Message(role=m.role, content=m.content) for m in req.messages]
 
     # Determine output modalities
-    output_modalities = req.modalities if req.modalities is not None else ["text"]
+    output_modalities = req.modalities or ["text"]  # e.g. ["text", "audio"]
 
     # Build per-stage sampling overrides
     stage_sampling: dict[str, SamplingParams] | None = None
@@ -1457,14 +1377,6 @@ def build_chat_generate_request(req: ChatCompletionRequest) -> GenerateRequest:
         pass
     if req.use_audio_in_video is not None:
         metadata["use_audio_in_video"] = req.use_audio_in_video
-    else:
-        pass
-    if req.image_generation is not None and "image" in output_modalities:
-        # Omitted CFG values must remain omitted: edit and T2I defaults differ.
-        metadata["image_generation"] = req.image_generation.model_dump(
-            exclude_none=True,
-            exclude_unset=True,
-        )
     else:
         pass
 

@@ -102,7 +102,7 @@ class ChatCompletionRequest(BaseModel):
     stream: bool = False
 
     # Multi-modal output control
-    modalities: list[str] | None = None  # e.g. ["text", "audio"] or ["image"]
+    modalities: list[str] | None = None  # e.g. ["text", "audio"]
 
     # Audio output configuration
     audio: dict[str, object] | None = None  # {"voice": "...", "format": "wav"}
@@ -114,9 +114,6 @@ class ChatCompletionRequest(BaseModel):
     # Image input (sglang-omni extension)
     # Can be a list of image file paths (local paths or URLs)
     images: list[str] | None = None
-
-    # Image generation config (sglang-omni extension)
-    image_generation: ImageGenerationParams | None = None
 
     # Video input (sglang-omni extension)
     # Can be a list of video file paths (local paths or URLs)

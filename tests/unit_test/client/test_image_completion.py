@@ -9,12 +9,8 @@ from typing import TypedDict
 
 import pytest
 
-from sglang_omni.client import Client, ClientError
-from sglang_omni.client.types import (
-    CompletionStreamChunk,
-    GenerateChunk,
-    GenerateRequest,
-)
+from sglang_omni.client import Client
+from sglang_omni.client.types import GenerateChunk, GenerateRequest
 from sglang_omni.proto import CompleteMessage, StreamMessage
 
 
@@ -160,67 +156,3 @@ def test_merged_audio_keeps_usage_fallback(
     assert chunk.modality == "audio"
     assert chunk.image is None
     assert chunk.usage.total_tokens == (5 if with_decode_usage else 10)
-
-
-def test_client_rejects_image_generation_without_image_modality() -> None:
-    coordinator = RecordingCoordinator(None)
-    client = Client(coordinator)
-    with pytest.raises(ClientError, match="requires output_modalities"):
-        asyncio.run(
-            client.completion(
-                GenerateRequest(
-                    prompt="draw", metadata={"image_generation": {}}, stream=False
-                ),
-                request_id="r1",
-            )
-        )
-    assert coordinator.requests == []
-
-
-@pytest.mark.parametrize(
-    "payload",
-    [
-        GenerateRequest(prompt="draw", output_modalities=["image"]),
-        GenerateRequest(
-            prompt="draw",
-            output_modalities=["image"],
-            metadata={"image_generation": {}},
-        ),
-    ],
-)
-def test_client_rejects_image_stream_before_dispatch(payload: GenerateRequest) -> None:
-    coordinator = RecordingCoordinator(None)
-    client = Client(coordinator)
-    with pytest.raises(ClientError, match="does not support streaming"):
-        asyncio.run(
-            client.completion(
-                payload.__class__(
-                    prompt=payload.prompt,
-                    output_modalities=payload.output_modalities,
-                    metadata=payload.metadata,
-                    stream=True,
-                ),
-                request_id="r1",
-            )
-        )
-    assert coordinator.requests == []
-
-
-def test_completion_stream_rejects_image_output() -> None:
-    coordinator = RecordingCoordinator({"image": "cG5n"})
-    client = Client(coordinator)
-
-    async def consume() -> list[CompletionStreamChunk]:
-        return [
-            chunk
-            async for chunk in client.completion_stream(
-                GenerateRequest(
-                    prompt="draw", output_modalities=["image"], stream=True
-                ),
-                request_id="r1",
-            )
-        ]
-
-    with pytest.raises(ClientError, match="does not support streaming"):
-        asyncio.run(consume())
-    assert coordinator.requests == []
