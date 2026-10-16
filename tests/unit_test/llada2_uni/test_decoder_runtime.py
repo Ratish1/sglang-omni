@@ -139,3 +139,59 @@ def test_partial_initialization_releases_groups(
         parallel_state.destroy_distributed_environment()
         server_args.set_global_server_args(None)
         runtime_context.reset_context()
+
+
+@pytest.mark.accelerator
+@pytest.mark.parametrize("boundary", ["world", "model"])
+def test_review_initialization_failure_releases_partial_groups(monkeypatch, boundary):
+    """A failed group constructor must release groups acquired before it failed."""
+    from sglang.multimodal_gen.runtime.distributed import parallel_state as ps
+    from sglang.multimodal_gen.runtime.server_args import server_args
+    from sglang.srt import runtime_context
+
+    original = ps.init_parallel_group_coordinator
+    calls = []
+
+    def fail_world(*args, **kwargs):
+        assert torch.distributed.is_initialized()
+        raise RuntimeError("review world-group failure")
+
+    def fail_second_model_group(*args, **kwargs):
+        calls.append(kwargs["parallel_mode"])
+        if len(calls) == 2:
+            assert ps._DP is not None  # noqa: leading-underscore  # SGLang state
+            raise RuntimeError("review model-group failure")
+        else:
+            return original(*args, **kwargs)
+
+    try:
+        with monkeypatch.context() as patch:
+            if boundary == "world":
+                patch.setattr(ps, "init_world_group", fail_world)
+            else:
+                patch.setattr(
+                    ps, "init_parallel_group_coordinator", fail_second_model_group
+                )
+            with pytest.raises(RuntimeError, match=f"review {boundary}-group failure"):
+                runtime.initialize_decoder_runtime("unused", gpu_id=0)
+        print(
+            f"REVIEW partial-init boundary={boundary} dist={torch.distributed.is_initialized()} dp_retained={ps._DP is not None}"  # noqa: leading-underscore  # SGLang state
+        )
+        assert not torch.distributed.is_initialized()
+        assert ps._DP is None  # noqa: leading-underscore  # SGLang state
+        assert (
+            server_args._global_server_args is None
+        )  # noqa: leading-underscore  # SGLang state
+        assert (
+            runtime_context.get_context()._server_args is None
+        )  # noqa: leading-underscore  # SGLang state
+        with runtime.initialize_decoder_runtime("unused", gpu_id=0):
+            assert torch.distributed.is_initialized()
+    finally:
+        if torch.distributed.is_initialized():
+            ps.destroy_model_parallel()
+            ps.destroy_distributed_environment()
+        else:
+            pass
+        server_args.set_global_server_args(None)
+        runtime_context.reset_context()
