@@ -452,6 +452,15 @@ class Qwen3TTSCodecTables(nn.Module):
             torch.randn(num_codebooks, vocab_size, hidden_size), requires_grad=False
         )
         self.weight.weight_loader = load_codec_table
+        self.register_buffer(
+            "row_offsets", torch.arange(num_codebooks) * vocab_size, persistent=False
+        )
+
+    def forward(self, codes: torch.Tensor) -> torch.Tensor:
+        """Embed (..., codebooks) codes as (..., codebooks, hidden) rows in one lookup."""
+        return torch.nn.functional.embedding(
+            codes + self.row_offsets, self.weight.flatten(0, 1)
+        )
 
     @staticmethod
     def make_params_mapping(
@@ -947,18 +956,16 @@ class Qwen3TTSPromptBuilderMixin:
             self.get_text_embeddings()(torch.cat([ref_id, text_id], dim=-1))
         )
         text_embed = torch.cat([text_embed, prompt_constants.tts_eos_embed], dim=1)
-        codec_embed = []
-        for idx in range(self.config.num_code_groups):
-            if idx == 0:
-                codec_embed.append(self.get_input_embeddings()(ref_code[:, :1]))
-            else:
-                codec_embed.append(
-                    torch.nn.functional.embedding(
-                        ref_code[:, idx : idx + 1],
-                        self.code_predictor.model.codec_embedding.weight[idx - 1],
-                    )
-                )
-        codec_embed = torch.cat(codec_embed, dim=1).sum(1).unsqueeze(0)
+        codec_embed = torch.cat(
+            [
+                self.get_input_embeddings()(ref_code[:, :1]),
+                self.code_predictor.model.codec_embedding(
+                    ref_code[:, 1 : self.config.num_code_groups]
+                ),
+            ],
+            dim=1,
+        )
+        codec_embed = codec_embed.sum(1).unsqueeze(0)
         codec_embed = torch.cat([codec_pad_bos_embed[:, 1:], codec_embed], dim=1)
         text_lens = text_embed.shape[1]
         codec_lens = codec_embed.shape[1]
