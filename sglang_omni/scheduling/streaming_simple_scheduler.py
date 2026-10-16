@@ -44,6 +44,9 @@ class StreamingSimpleScheduler:
     can_batch_stream_chunks: bool = False
     stream_chunk_batch_max: int | None = None
     stream_chunk_batch_distinct_requests: bool = False
+    # note (ratish): a same-process sender delivers a run of chunks as one
+    # stream_chunk_batch message to a scheduler that sets this.
+    accepts_stream_chunk_batches: bool = False
 
     def __init__(
         self,
@@ -177,7 +180,7 @@ class StreamingSimpleScheduler:
                         continue
                     else:
                         pass
-                if self.is_aborted(msg.request_id):
+                if msg.type != "stream_chunk_batch" and self.is_aborted(msg.request_id):
                     continue
                 else:
                     pass
@@ -215,9 +218,19 @@ class StreamingSimpleScheduler:
             pass
         if msg.type == "stream_chunk":
             if self.can_batch_stream_chunks:
-                self.handle_stream_chunk_batch(self.collect_stream_chunk_batch(msg))
+                self.handle_stream_chunk_batch(
+                    [
+                        (chunk.request_id, chunk.data)
+                        for chunk in self.collect_stream_chunk_batch(msg)
+                    ]
+                )
             else:
                 self.handle_stream_chunk(msg.request_id, msg.data)
+            return
+        else:
+            pass
+        if msg.type == "stream_chunk_batch":
+            self.handle_stream_chunk_batch(msg.data)
             return
         else:
             pass
@@ -624,20 +637,20 @@ class StreamingSimpleScheduler:
                 else:
                     pass
 
-    def handle_stream_chunk_batch(self, batch: list[IncomingMessage]) -> None:
+    def handle_stream_chunk_batch(self, chunks: list[tuple[str, object]]) -> None:
         items: list[tuple[str, StreamItem]] = []
-        for msg in batch:
-            if self.is_aborted(msg.request_id):
+        for request_id, chunk in chunks:
+            if self.is_aborted(request_id):
                 continue
             else:
                 pass
             try:
-                item = self.validate_stream_chunk_item(msg.request_id, msg.data)
+                item = self.validate_stream_chunk_item(request_id, chunk)
             except Exception as exc:
-                self.emit_error(msg.request_id, exc)
-                self.abort(msg.request_id)
+                self.emit_error(request_id, exc)
+                self.abort(request_id)
                 continue
-            items.append((msg.request_id, item))
+            items.append((request_id, item))
         items = [
             (request_id, item)
             for request_id, item in items

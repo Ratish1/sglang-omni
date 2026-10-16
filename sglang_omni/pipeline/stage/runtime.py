@@ -66,6 +66,7 @@ from sglang_omni.scheduling.message import (
     OutgoingMessage,
     StageScheduler,
 )
+from sglang_omni.scheduling.streaming_simple_scheduler import StreamingSimpleScheduler
 from sglang_omni.serve.stage_routes import StageHttpServer, StageRoutesError
 
 TorchProfiler = current_platform.get_torch_profiler()
@@ -672,6 +673,12 @@ class Stage:
     async def receive_local_stream_chunks(
         self, from_stage: str, chunks: list[LocalStreamChunk]
     ) -> None:
+        accepts_batches = (
+            isinstance(self.scheduler, StreamingSimpleScheduler)
+            and self.scheduler.accepts_stream_chunk_batches
+        )
+        logical_source = self.logical_source(from_stage)
+        batch: list[tuple[str, StreamItem]] = []
         for chunk in chunks:
             request_id = chunk.request_id
             if request_id in self.aborted:
@@ -691,7 +698,22 @@ class Stage:
                 from_stage=from_stage,
                 chunk_id=chunk.chunk_id,
             )
-            await self.route_stream_item_or_fail(request_id, item)
+            if accepts_batches and self.open_pre_payload_stream_if_allowed(request_id):
+                if logical_source != from_stage:
+                    item = replace(item, from_stage=logical_source)
+                else:
+                    pass
+                batch.append((request_id, item))
+            else:
+                await self.route_stream_item_or_fail(request_id, item)
+        if batch:
+            self.scheduler.inbox.put(
+                IncomingMessage(
+                    request_id=batch[0][0], type="stream_chunk_batch", data=batch
+                )
+            )
+        else:
+            pass
 
     async def receive_local_stream_signal(
         self,
