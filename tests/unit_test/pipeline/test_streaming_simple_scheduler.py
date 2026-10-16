@@ -9,6 +9,7 @@ from sglang_omni.pipeline.stage.stream_queue import StreamItem
 from sglang_omni.proto import OmniRequest, StagePayload
 from sglang_omni.scheduling.message import IncomingMessage, OutgoingMessage
 from sglang_omni.scheduling.streaming_simple_scheduler import StreamingSimpleScheduler
+from tests.unit_test.pipeline.helpers import run_scheduler
 
 
 def make_payload(request_id: str, *, stream: bool = False) -> StagePayload:
@@ -465,3 +466,24 @@ def test_stream_done_returning_none_defers_completion() -> None:
     assert [msg.data for msg in drain_results(scheduler)] == [{"done": "req"}]
     assert "req" not in scheduler.stream_state
     assert "req" not in scheduler.stream_payloads
+
+
+def test_delivered_stream_chunk_batch_is_handled_per_chunk_in_order() -> None:
+    scheduler = StreamingSchedulerUnderTest(max_batch_size=4)
+    scheduler.abort("b")
+    batch = IncomingMessage(
+        "b",
+        "stream_chunk_batch",
+        [
+            ("b", StreamItem(chunk_id=0, data="y", from_stage="src")),
+            ("a", StreamItem(chunk_id=0, data="x", from_stage="src")),
+            ("c", StreamItem(chunk_id=0, data="z", from_stage="src")),
+        ],
+    )
+
+    outputs = run_scheduler(scheduler, [batch], output_count=2)
+
+    assert [(message.request_id, message.data) for message in outputs] == [
+        ("a", {"chunk": "x"}),
+        ("c", {"chunk": "z"}),
+    ]

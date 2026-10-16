@@ -9,7 +9,13 @@ from typing import Literal, Protocol
 
 # A consumer that stops puts a wakeup into its own queue to release a blocked get.
 IncomingMessageType = Literal[
-    "new_request", "stream_chunk", "stream_done", "abort", "admin", "wakeup"
+    "new_request",
+    "stream_chunk",
+    "stream_chunk_batch",
+    "stream_done",
+    "abort",
+    "admin",
+    "wakeup",
 ]
 
 

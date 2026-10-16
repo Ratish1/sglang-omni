@@ -19,6 +19,7 @@ from sglang_omni.pipeline.stage.stream_queue import StreamItem, StreamQueue
 from sglang_omni.proto import DataReadyMessage, OmniRequest, StagePayload
 from sglang_omni.relay.shm import ShmRelay
 from sglang_omni.scheduling.message import OutgoingMessage, put_messages
+from sglang_omni.scheduling.streaming_simple_scheduler import StreamingSimpleScheduler
 from tests.unit_test.fixtures.trace_capture import capture_comm_trace, events_named
 from tests.unit_test.pipeline.helpers import make_stage
 
@@ -1234,6 +1235,49 @@ def test_stream_run_rejects_only_the_request_without_its_payload() -> None:
             for completion in receiver.control_plane.completions
         ] == [("req-b", False)]
         assert receiver.scheduler.aborted == ["req-b"]
+
+    asyncio.run(run())
+
+
+class BatchAcceptingScheduler(StreamingSimpleScheduler):
+    accepts_stream_chunk_batches = True
+
+
+def test_stream_run_reaches_a_batch_accepting_scheduler_as_one_message() -> None:
+    async def run() -> None:
+        _, sender, receivers = make_local_stream_pair(accept_before_payload=False)
+        receiver = receivers["vocoder"]
+        receiver.scheduler = BatchAcceptingScheduler(None)
+        receiver.stream_queue.open("req-a")
+        receiver.stream_queue.open("req-c")
+        receiver.aborted.add("req-c")
+        sender.active_requests.update({"req-a", "req-b", "req-c"})
+        put_messages(
+            sender.scheduler.outbox,
+            [
+                frame_message("req-a", 0),
+                frame_message("req-b", 0),
+                frame_message("req-c", 0),
+                frame_message("req-a", 1),
+            ],
+        )
+
+        sender.end_outbox_drain()
+        await sender.drain_outbox_external()
+
+        inbox = receiver.scheduler.inbox
+        message = inbox.get_nowait()
+        assert inbox.empty()
+        assert message.type == "stream_chunk_batch"
+        assert [(request_id, item.data) for request_id, item in message.data] == [
+            ("req-a", 0),
+            ("req-a", 1),
+        ]
+        assert {item.from_stage for _, item in message.data} == {"tts_engine"}
+        assert [
+            (completion.request_id, completion.success)
+            for completion in receiver.control_plane.completions
+        ] == [("req-b", False)]
 
     asyncio.run(run())
 
