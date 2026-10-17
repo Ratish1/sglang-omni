@@ -17,12 +17,15 @@ import torch
 
 from sglang_omni.client.client import Client
 from sglang_omni.models.fun_cosyvoice3 import stages
+from sglang_omni.models.fun_cosyvoice3.hift_cuda_graph import HiftDecodeCudaGraphRunner
 from sglang_omni.models.fun_cosyvoice3.packed_dit import PackedDiT
 from sglang_omni.models.fun_cosyvoice3.payload_types import FunCosyVoice3State
+from sglang_omni.models.fun_cosyvoice3.solve_graph_capture import SolveGraphCapture
 from sglang_omni.models.fun_cosyvoice3.streaming_vocoder import (
     CosyVoice3StreamState,
     FunCosyVoice3StreamingVocoderScheduler,
 )
+from sglang_omni.platforms import current_platform
 from sglang_omni.platforms.cuda import CUDAOmniPlatform
 from sglang_omni.platforms.xpu import XPUOmniPlatform
 from sglang_omni.proto import OmniRequest, StagePayload
@@ -1477,6 +1480,45 @@ def test_vocoder_spectra_match_cosyvoice_without_a_host_wait(
             torch.cuda.set_sync_debug_mode(sync_debug_mode)
     for output, reference in zip(outputs, references, strict=True):
         torch.testing.assert_close(output, reference)
+
+
+@pytest.mark.accelerator
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_hift_decode_replay_equals_each_rows_own_decode(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(torch.backends.cudnn, "allow_tf32", False)
+    monkeypatch.setattr(torch.backends.cuda.matmul, "allow_tf32", False)
+    hift = make_causal_hift(10.0)
+    vocoder = stages.CosyVoice3Vocoder(HiftFlowStub(), hift)
+    samples_per_frame = vocoder.hift_samples_per_mel_frame
+    device = torch.device("cuda", torch.cuda.current_device())
+    backend = current_platform.get_device_graph_backend(device)
+    assert backend is not None
+    runner = HiftDecodeCudaGraphRunner(
+        hift,
+        graphs=SolveGraphCapture(backend, device=device, autocast_dtype=torch.bfloat16),
+        mel_channels=80,
+        samples_per_frame=samples_per_frame,
+        row_tiers=[1, 4],
+        frame_tiers=[64],
+    )
+    runner.capture()
+    torch.manual_seed(4)
+    mel = torch.randn(3, 80, 64, device="cuda") * 3
+    source = torch.randn(3, 1, 64 * samples_per_frame, device="cuda") * 0.1
+    with torch.inference_mode():
+        replayed = runner.run(mel, source).clone()
+        alone = [
+            hift.decode(x=mel[row : row + 1], s=source[row : row + 1], finalize=True)
+            for row in range(3)
+        ]
+        assert (
+            runner.run(mel[:, :, :48], source[:, :, : 48 * samples_per_frame]) is None
+        )
+        assert runner.run(mel.repeat(2, 1, 1), source.repeat(2, 1, 1)) is None
+    for row, reference in enumerate(alone):
+        assert torch.equal(replayed[row : row + 1], reference)
 
 
 def prefix_pool_scheduler(
