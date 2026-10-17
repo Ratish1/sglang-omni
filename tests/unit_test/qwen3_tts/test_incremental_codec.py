@@ -1465,7 +1465,6 @@ SLOT_DECODES = pytest.mark.skipif(
     or current_platform.get_paged_window_attention() is None,
     reason="slot decodes run on CUDA SM 8.x or 9.x",
 )
-TAIL_ATOL = 1e-2
 
 
 def make_tiny_tts_decoder(seed: int) -> nn.Module:
@@ -1671,17 +1670,11 @@ def test_tail_slot_decode_leaves_each_row_where_its_valid_frames_end() -> None:
     samples = emit_frames * slot_decoder.total_upsample
     follow_samples = 2 * slot_decoder.total_upsample
     assert pool.frame_positions[:3].tolist() == [width + 2 for width in widths]
-    for row, width in enumerate(widths):
-        whole = alone[row][0]
-        torch.testing.assert_close(
-            tail[row],
-            whole[:, -follow_samples - samples : -follow_samples],
-            rtol=0.0,
-            atol=TAIL_ATOL,
+    for row, whole in enumerate(alone):
+        assert torch.equal(
+            tail[row], whole[0, :, -follow_samples - samples : -follow_samples]
         )
-        torch.testing.assert_close(
-            follow[row], whole[:, -follow_samples:], rtol=0.0, atol=TAIL_ATOL
-        )
+        assert torch.equal(follow[row], whole[0, :, -follow_samples:])
 
 
 @pytest.mark.accelerator
