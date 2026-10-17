@@ -87,3 +87,25 @@ def test_prompt_captures_do_not_share_request_storage() -> None:
     torch.testing.assert_close(first_result.hidden_states, torch.ones((1, 2)))
     torch.testing.assert_close(second_result.hidden_states, torch.full((1, 2), 2.0))
     assert first_result.positions.tolist() == [1]
+
+
+def test_handoff_retains_immutable_capture_for_later_cache_insertion() -> None:
+    capture = PromptHiddenCapture(positions=torch.tensor([1]))
+    capture.add_extend(prefix_length=1, hidden_states=torch.tensor([[2.0, 3.0]]))
+    result = capture.take_complete()
+    result.positions.fill_(0)
+    result.hidden_states.fill_(-1)
+    assert capture.positions.tolist() == [1]
+    torch.testing.assert_close(capture.hidden_states, torch.tensor([[2.0, 3.0]]))
+    assert capture.take_complete() is None
+
+
+def test_sparse_restore_copies_only_required_missing_rows() -> None:
+    capture = PromptHiddenCapture(positions=torch.tensor([1, 3]))
+    capture.add_extend(prefix_length=1, hidden_states=torch.tensor([[2.0, 3.0]]))
+    rows = torch.arange(10, dtype=torch.float32).reshape(5, 2)
+    capture.add_rows(positions=torch.arange(5), hidden_states=rows)
+    rows.fill_(-1)
+    torch.testing.assert_close(
+        capture.take_complete().hidden_states, torch.tensor([[2.0, 3.0], [6.0, 7.0]])
+    )

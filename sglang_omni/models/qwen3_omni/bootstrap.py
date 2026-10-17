@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING
 
 from sglang.srt.arg_groups.model_override_base import resolved_view
 
+from sglang_omni.models.qwen3_omni.prompt_hidden_cache import QwenPromptHiddenRadixCache
 from sglang_omni.vendor.sglang.server_args import override_server_args
 
 if TYPE_CHECKING:
@@ -78,6 +79,7 @@ def create_thinker_scheduler(
             model_arch_override="Qwen3OmniThinkerForCausalLM",
             total_gpu_memory_fraction=total_gpu_memory_fraction,
             enable_prefill_input_embeds=enable_prefill_input_embeds,
+            radix_cache_type=QwenPromptHiddenRadixCache if speech_enabled else None,
         )
     finally:
         if capture_prompt_states:

@@ -7,7 +7,6 @@ import logging
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, TypedDict, overload
-from uuid import uuid4
 
 import torch
 import xxhash
@@ -804,12 +803,23 @@ def build_sglang_thinker_request(
             ),
         ).nonzero(as_tuple=True)[0]
         if multimodal_positions.numel():
-            prompt_hidden_capture = PromptHiddenCapture(positions=multimodal_positions)
-            request_namespace = f"qwen3-prompt-hidden:{uuid4().hex}"
-            req.extra_key = (
-                f"{req.extra_key}:{request_namespace}"
-                if req.extra_key is not None
-                else request_namespace
+            unsafe_token_ids = [
+                token_id
+                for modality, token_id in (
+                    ("image", thinker_config.image_token_id),
+                    ("video", thinker_config.video_token_id),
+                    ("audio", thinker_config.audio_token_id),
+                )
+                if modality not in pad_values
+            ]
+            unsafe_positions = torch.isin(
+                original_input_ids, original_input_ids.new_tensor(unsafe_token_ids)
+            ).nonzero(as_tuple=True)[0]
+            prompt_hidden_capture = PromptHiddenCapture(
+                positions=multimodal_positions,
+                cacheable_prefix_length=(
+                    int(unsafe_positions[0]) if unsafe_positions.numel() else None
+                ),
             )
         else:
             pass

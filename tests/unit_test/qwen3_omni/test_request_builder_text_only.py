@@ -104,12 +104,62 @@ def test_prompt_capture_admission_is_scoped_to_multimodal_speech(
     if expected_positions:
         assert first.prompt_hidden_capture.positions.tolist() == expected_positions
         assert second.prompt_hidden_capture.positions.tolist() == expected_positions
-        assert first.req.extra_key != second.req.extra_key
-        assert first.req.extra_key is not None
+        assert (
+            first.prompt_hidden_capture.cacheable_prefix_length == expected_positions[0]
+        )
+        assert (
+            second.prompt_hidden_capture.cacheable_prefix_length
+            == expected_positions[0]
+        )
     else:
         assert first.prompt_hidden_capture is None
         assert second.prompt_hidden_capture is None
-        assert first.req.extra_key is None
+    assert first.req.extra_key is None
+    assert second.req.extra_key is None
+
+
+@pytest.mark.parametrize(
+    ("media_cache_keys", "expected_prefix_length"),
+    [
+        ({"image": "image-a", "audio": "audio-a"}, None),
+        ({"image": "image-a"}, 3),
+        ({"audio": "audio-a"}, 1),
+        ({}, 1),
+    ],
+)
+def test_prompt_cache_reuses_only_stably_keyed_media(
+    monkeypatch, media_cache_keys, expected_prefix_length
+):
+    patch_sampling_validation(monkeypatch)
+    monkeypatch.setattr(
+        "sglang_omni.models.qwen3_omni.request_builders.compute_mrope_positions",
+        lambda *arguments: None,
+    )
+    state = make_qwen_state(
+        prompt={"input_ids": torch.tensor([4, 55, 5, 77, 6])},
+        thinker_inputs={"model_inputs": {}, "media_cache_keys": media_cache_keys},
+    )
+    requests = [
+        build_sglang_thinker_request(
+            state,
+            params={},
+            tokenizer=FakeQwenTokenizer(),
+            vocab_size=256,
+            thinker_config=SimpleNamespace(
+                image_token_id=55, video_token_id=66, audio_token_id=77
+            ),
+            capture_prompt_hidden_states=True,
+        )
+        for _ in range(2)
+    ]
+    assert requests[0].req.origin_input_ids == requests[1].req.origin_input_ids
+    for request in requests:
+        assert request.req.extra_key is None
+        assert (
+            request.prompt_hidden_capture.cacheable_prefix_length
+            == expected_prefix_length
+        )
+        assert request.prompt_hidden_capture.positions.tolist() == [1, 3]
 
 
 def test_nested_non_dict_model_inputs_fail_loudly(monkeypatch):

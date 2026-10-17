@@ -1414,6 +1414,9 @@ def test_qwen_thinker_enables_and_attests_breakable_prefill_graphs(
         return
 
     assert captured["enable_prefill_input_embeds"] is (prefill_backend == "breakable")
+    assert captured["radix_cache_type"] is (
+        bootstrap.QwenPromptHiddenRadixCache if speech_enabled else None
+    )
     assert "defer_cuda_graph_capture" not in captured
     assert graph_init_workers == []
     assert attest_calls == (
