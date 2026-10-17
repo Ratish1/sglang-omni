@@ -427,6 +427,11 @@ def create_vocoder_executor(
         # note (ratish): only a Base checkpoint clones a reference voice, so only its
         # first chunks carry reference codes.
         has_reference_prefixed_first_chunks=model_type == "base",
+        # note (ratish): a stream's codec frames, its reference's included, are talker
+        # positions, so the talker's context bounds the codec's rope positions.
+        codec_max_positions=int(
+            checkpoint_config["talker_config"]["max_position_embeddings"]
+        ),
     )
     # note (ratish): Factory construction completes before the stage process
     # publishes readiness, so CUDA capture cannot overlap request-time GPU work
