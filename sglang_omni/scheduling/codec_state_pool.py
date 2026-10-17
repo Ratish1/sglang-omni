@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Per-stream codec decoder state held by slot."""
+"""Per-stream codec decoder state held by slot: the state's layout, the slot allocator, and the
+pool whose histories, overlaps and K/V rings a decode's kernels read and write in place."""
 
 from __future__ import annotations
 
@@ -185,3 +186,102 @@ class CodecSlotAllocator:
     def stage_index(self, slots: Sequence[int]) -> torch.Tensor:
         """Stage a cohort's slot ids on the device without a host sync."""
         return self.staged("index", slots)
+
+
+@dataclass(frozen=True, kw_only=True)
+class RingAddresses:
+    """A decode's addresses in the per-slot K/V rings: the absolute positions of its new
+    frames and the ring rows their K/V go to, and each row's attention window as ring rows in
+    position order with its length."""
+
+    frame_positions: torch.Tensor
+    write_rows: torch.Tensor
+    window_rows: torch.Tensor
+    window_lengths: torch.Tensor
+
+
+def ring_addresses(
+    slot_index: torch.Tensor,
+    start_positions: torch.Tensor,
+    new_frames: int,
+    ring_frames: int,
+    retained_frames: int,
+) -> RingAddresses:
+    """Position p of a slot's stream lives at ring row slot * ring_frames + p % ring_frames. A
+    row's window holds the retained_frames positions before its first new frame (fewer at the
+    stream's start) and its new frames; ring_frames >= retained_frames + new_frames keeps them
+    on distinct rows."""
+    frame_offsets = torch.arange(new_frames, device=slot_index.device)
+    frame_positions = start_positions[:, None] + frame_offsets
+    slot_rows = slot_index[:, None] * ring_frames
+    window_starts = (start_positions - retained_frames).clamp(min=0)
+    window_positions = window_starts[:, None] + torch.arange(
+        ring_frames, device=slot_index.device
+    )
+    return RingAddresses(
+        frame_positions=frame_positions.reshape(-1),
+        write_rows=(slot_rows + frame_positions % ring_frames).reshape(-1),
+        window_rows=slot_rows + window_positions % ring_frames,
+        window_lengths=start_positions - window_starts + new_frames,
+    )
+
+
+class CodecStatePool(CodecSlotAllocator):
+    """Per-slot codec state kept where the decode's kernels read and write it: a history pool
+    (slots, history samples, channels) per causal conv and an overlap pool (slots, overlap
+    samples, channels) per transposed conv, a K/V ring of ring_frames positions per slot and
+    layer, and each slot's frame position. Past the slots the streams take sit capture_slots
+    scratch slots, one per row a graph capture decodes."""
+
+    def __init__(
+        self,
+        spec: CodecStateSpec,
+        *,
+        num_slots: int,
+        capture_slots: int,
+        ring_frames: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> None:
+        super().__init__(num_slots=num_slots, device=device)
+        assert (
+            ring_frames > spec.retained_context
+        ), "a ring holds the window and new frames"
+        total_slots = num_slots + capture_slots
+        self.ring_frames = ring_frames
+        self.retained_frames = spec.retained_context
+        self.scratch_slots = tuple(range(num_slots, total_slots))
+        self.histories = {
+            key: torch.zeros(total_slots, length, channels, device=device, dtype=dtype)
+            for key, channels, length in spec.conv_histories
+            if length
+        }
+        self.overlaps = {
+            key: torch.zeros(total_slots, length, channels, device=device, dtype=dtype)
+            for key, channels, length in spec.transconv_overlaps
+            if length
+        }
+        ring_width = spec.num_key_value_heads * spec.head_dim
+        self.keys = [
+            torch.zeros(
+                total_slots * ring_frames, ring_width, device=device, dtype=dtype
+            )
+            for _ in range(spec.num_layers)
+        ]
+        self.values = [torch.zeros_like(ring) for ring in self.keys]
+        self.frame_positions = torch.zeros(total_slots, device=device, dtype=torch.long)
+        itemsize = torch.empty((), dtype=dtype).element_size()
+        self.bytes_per_slot = itemsize * (
+            sum(pool[0].numel() for pool in self.histories.values())
+            + sum(pool[0].numel() for pool in self.overlaps.values())
+            + 2 * spec.num_layers * ring_frames * ring_width
+        )
+
+    def zero_slots(self, slots: torch.Tensor) -> None:
+        """Clear the slots' state, for a capture whose eager and replayed decodes must start
+        from one state."""
+        for pool in (*self.histories.values(), *self.overlaps.values()):
+            pool.index_fill_(0, slots, 0)
+        for ring in (*self.keys, *self.values):
+            ring.view(-1, self.ring_frames, ring.shape[1]).index_fill_(0, slots, 0)
+        self.frame_positions.index_fill_(0, slots, 0)
