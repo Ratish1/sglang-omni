@@ -50,6 +50,7 @@ from sglang_omni.models.fun_cosyvoice3.flow_estimator_trt import (
     execute_flow_estimator,
     is_flow_estimator_trt,
 )
+from sglang_omni.models.fun_cosyvoice3.hift_kernels import snake
 from sglang_omni.models.fun_cosyvoice3.packed_dit import (
     DIT_INDUCTOR_OPTIONS,
     FA3_DTYPES,
@@ -1306,6 +1307,32 @@ def keep_hift_constants_on_device(hift: "CausalHiFTGenerator", device: str) -> N
     hift.f0_predictor.to(torch.float64)
 
 
+def patch_hift_snake(hift: "CausalHiFTGenerator") -> None:
+    """Run each of HiFT's float32 Snake activations as one kernel, bit for bit, where
+    CosyVoice's forward launches seven."""
+    try:
+        from cosyvoice.transformer.activation import Snake
+    except ImportError as exc:
+        raise RuntimeError(COSYVOICE_INSTALL_HINT) from exc
+
+    for module in hift.modules():
+        if isinstance(module, Snake):
+            assert not module.alpha_logscale, "HiFT builds linear scale alphas"
+            alpha = module.alpha.detach().contiguous()
+            inverse_alpha = 1.0 / (alpha + module.no_div_by_zero)
+
+            def forward(
+                x: torch.Tensor,
+                alpha: torch.Tensor = alpha,
+                inverse_alpha: torch.Tensor = inverse_alpha,
+            ) -> torch.Tensor:
+                return snake(x, alpha, inverse_alpha)
+
+            module.forward = forward
+        else:
+            pass
+
+
 def load_cosyvoice3_flow_hift_lightweight(
     checkpoint_dir: str,
     *,
@@ -1731,6 +1758,10 @@ class CosyVoice3Vocoder(BatchVocoderBase[FunCosyVoice3State, torch.Tensor]):
             self.stream_context: contextlib.AbstractContextManager[None] = (
                 torch.cuda.stream(stream)
             )
+            if HAS_TRITON and self.hift_autocast_dtype is None:
+                patch_hift_snake(hift)
+            else:
+                pass
         else:
             self.stream_context = contextlib.nullcontext()
 
