@@ -8,7 +8,12 @@ from typing import TYPE_CHECKING
 from sglang.srt.arg_groups.model_override_base import resolved_view
 from sglang.srt.platforms.cuda import CudaDeviceMixin
 
-from sglang_omni.platforms.interface import JointRopeInplaceKernel, OmniPlatform
+from sglang_omni.platforms.interface import (
+    JointRopeInplaceKernel,
+    OmniPlatform,
+    PagedWindowAttention,
+    RopeKVStoreKernel,
+)
 from sglang_omni.quantization import resolve_quant_config
 from sglang_omni.utils.misc import model_config_has_moe, normalize_quantization
 from sglang_omni.vendor.sglang.server_args import override_server_args
@@ -134,6 +139,24 @@ class CUDAOmniPlatform(CudaDeviceMixin, OmniPlatform):
         from sglang.kernels.ops.attention.rope import apply_rope_inplace
 
         return apply_rope_inplace
+
+    def get_rope_kv_store_kernel(self) -> RopeKVStoreKernel:
+        from sglang.kernels.ops.attention.rope import apply_rope_inplace_with_kvcache
+
+        return apply_rope_inplace_with_kvcache
+
+    def get_paged_window_attention(self) -> PagedWindowAttention | None:
+        import torch
+
+        # note (ratish): SGLang's FlashAttention v3 gate for attention without MLA.
+        if torch.cuda.get_device_capability()[0] in (8, 9):
+            from sglang.kernels.ops.attention.flash_attention import (
+                flash_attn_with_kvcache,
+            )
+
+            return flash_attn_with_kvcache
+        else:
+            return None
 
     def apply_model_worker_backend_policy(
         self,
