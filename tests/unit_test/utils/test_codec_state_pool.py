@@ -8,6 +8,7 @@ import torch.nn.functional as F
 
 from sglang_omni.platforms import current_platform
 from sglang_omni.utils.codec_state_pool import (
+    CodecStatePool,
     history_exchange,
     history_exchange_reference,
     launch_history_exchange,
@@ -16,6 +17,45 @@ from sglang_omni.utils.codec_state_pool import (
     overlap_exchange_reference,
     ring_addresses,
 )
+from sglang_omni.utils.incremental_codec import IncrementalCodecStateSpec
+
+
+def test_zeroing_capture_slots_leaves_every_other_slot() -> None:
+    spec = IncrementalCodecStateSpec(
+        conv_histories=(("a", 3, 6), ("b", 2, 0)),
+        transconv_overlaps=(("c", 4, 2),),
+        num_layers=2,
+        num_key_value_heads=2,
+        head_dim=4,
+        retained_context=5,
+    )
+    pool = CodecStatePool(
+        spec,
+        num_slots=3,
+        capture_slots=2,
+        ring_frames=8,
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+    )
+    tensors = [
+        *pool.histories.values(),
+        *pool.overlaps.values(),
+        *pool.keys,
+        *pool.values,
+        pool.frame_positions,
+    ]
+    for tensor in tensors:
+        tensor.fill_(1)
+
+    pool.zero_slots(torch.tensor(pool.scratch_slots))
+
+    assert set(pool.histories) == {"a"}
+    assert pool.scratch_slots == (3, 4)
+    for tensor in [*pool.histories.values(), *pool.overlaps.values()]:
+        assert not tensor[3:].any() and tensor[:3].all()
+    for ring in [*pool.keys, *pool.values]:
+        assert not ring[3 * 8 :].any() and ring[: 3 * 8].all()
+    assert pool.frame_positions.tolist() == [1, 1, 1, 0, 0]
 
 
 @pytest.mark.parametrize("history_samples", [2, 6, 54])
