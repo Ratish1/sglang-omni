@@ -49,7 +49,7 @@ class SolveGraphCapture:
         backend: DeviceGraphBackend,
         *,
         device: torch.device,
-        autocast_dtype: torch.dtype,
+        autocast_dtype: torch.dtype | None,
     ) -> None:
         self.backend = backend
         self.device = device

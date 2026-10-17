@@ -825,6 +825,7 @@ def test_flow_admission_defers_request_after_long_singleton(monkeypatch) -> None
         flow_prefix_cache_gb=0.0,
         enable_flow_prefix_cuda_graph=True,
         enable_flow_whole_history_cuda_graph=True,
+        enable_hift_cuda_graph=False,
         device="cpu",
         flow_batch_admission_frames=2000,
         enable_dit_torch_compile=False,
@@ -869,6 +870,7 @@ def test_admission_budget_below_the_first_tier_keeps_finals_eager(monkeypatch) -
         enable_flow_cuda_graph=False,
         enable_flow_prefix_cuda_graph=True,
         enable_flow_whole_history_cuda_graph=True,
+        enable_hift_cuda_graph=False,
         flow_batch_admission_frames=3,
         enable_dit_torch_compile=False,
     )
@@ -912,6 +914,7 @@ def test_create_vocoder_executor_threads_batch_configuration(monkeypatch) -> Non
         flow_prefix_cache_gb=0.0,
         enable_flow_prefix_cuda_graph=True,
         enable_flow_whole_history_cuda_graph=True,
+        enable_hift_cuda_graph=False,
         device="cpu",
         enable_dit_torch_compile=False,
         dtype="float16",
@@ -963,6 +966,7 @@ def test_create_vocoder_executor_threads_trt_flag(monkeypatch) -> None:
         flow_prefix_cache_gb=0.0,
         enable_flow_prefix_cuda_graph=True,
         enable_flow_whole_history_cuda_graph=True,
+        enable_hift_cuda_graph=False,
         device="cpu",
         max_batch_size=4,
         enable_dit_torch_compile=False,
@@ -1060,6 +1064,7 @@ def test_create_vocoder_executor_compiles_before_flow_graph_capture(
         flow_prefix_cache_gb=0.0,
         enable_flow_prefix_cuda_graph=True,
         enable_flow_whole_history_cuda_graph=True,
+        enable_hift_cuda_graph=False,
         device="cuda",
         enable_dit_torch_compile=enable_dit_torch_compile,
         enable_flow_cuda_graph=True,
@@ -1094,6 +1099,7 @@ def test_create_vocoder_executor_on_xpu_captures_flow_graphs_only_for_an_eager_d
         flow_prefix_cache_gb=0.0,
         enable_flow_prefix_cuda_graph=True,
         enable_flow_whole_history_cuda_graph=True,
+        enable_hift_cuda_graph=False,
         device="xpu",
         enable_dit_torch_compile=enable_dit_torch_compile,
         enable_flow_cuda_graph=True,
@@ -1110,6 +1116,7 @@ def test_create_vocoder_executor_rejects_trt_and_compile() -> None:
             flow_prefix_cache_gb=0.0,
             enable_flow_prefix_cuda_graph=True,
             enable_flow_whole_history_cuda_graph=True,
+            enable_hift_cuda_graph=False,
             enable_dit_torch_compile=True,
             enable_flow_estimator_trt=True,
         )
@@ -1249,6 +1256,7 @@ def test_create_vocoder_executor_rejects_non_positive_admission_budget(
             flow_prefix_cache_gb=0.0,
             enable_flow_prefix_cuda_graph=True,
             enable_flow_whole_history_cuda_graph=True,
+            enable_hift_cuda_graph=False,
             device="cpu",
             flow_batch_admission_frames=0,
             enable_dit_torch_compile=False,
@@ -1515,6 +1523,52 @@ def test_hift_decode_replay_equals_each_rows_own_decode(
         ]
     for row, reference in enumerate(alone):
         assert torch.equal(replayed[row : row + 1], reference)
+
+
+@pytest.mark.accelerator
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_hift_step_through_the_decode_graphs_equals_the_eager_step(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(torch.backends.cudnn, "allow_tf32", False)
+    monkeypatch.setattr(torch.backends.cuda.matmul, "allow_tf32", False)
+    vocoder = stages.CosyVoice3Vocoder(HiftFlowStub(), make_causal_hift(10.0))
+    samples_per_frame = vocoder.hift_samples_per_mel_frame
+    device = torch.device("cuda", torch.cuda.current_device())
+    backend = current_platform.get_device_graph_backend(device)
+    assert backend is not None
+    runner = HiftDecodeCudaGraphRunner(
+        vocoder.hift,
+        graphs=SolveGraphCapture(backend, device=device, autocast_dtype=torch.bfloat16),
+        mel_channels=80,
+        samples_per_frame=samples_per_frame,
+        row_tiers=[1, 4],
+        frame_tiers=[64, 128],
+    )
+    runner.capture()
+    torch.manual_seed(5)
+    rows = [
+        stages.HiftStepRow(
+            history=torch.randn(1, 80, total_frames, device="cuda") * 3,
+            emitted_samples=emitted_frames * samples_per_frame,
+            is_final=is_final,
+        )
+        for total_frames, emitted_frames, is_final in (
+            (50, 0, False),
+            (120, 60, False),
+            (100, 70, True),
+            (24, 0, True),
+        )
+    ]
+    with torch.inference_mode():
+        eager = vocoder.hift_step(rows)
+        vocoder.hift_decode_cuda_graph_runner = runner
+        replayed = vocoder.hift_step(rows)
+    for (delta, emitted_after), (reference, reference_after) in zip(
+        replayed, eager, strict=True
+    ):
+        assert emitted_after == reference_after
+        assert torch.equal(delta, reference)
 
 
 def prefix_pool_scheduler(
