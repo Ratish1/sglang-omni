@@ -231,9 +231,8 @@ class Qwen3TtsEngineBuilder(TtsEngineBuilder[Qwen3TTSSGLangRequestData]):
         return defaults
 
     def customize_server_args(self, server_args: ServerArgs) -> None:
-        resolved = resolved_view(server_args)
-        cuda_graph_config = resolved.cuda_graph_config
-        prefill = cuda_graph_config.prefill
+        cfg = resolved_view(server_args)
+        prefill = cfg.cuda_graph_config.prefill
         if (
             prefill.backend not in (CudaGraphBackend.BREAKABLE, CudaGraphBackend.FULL)
             or not prefill.bs
@@ -242,7 +241,6 @@ class Qwen3TtsEngineBuilder(TtsEngineBuilder[Qwen3TTSSGLangRequestData]):
         else:
             pass
         prefill_fields: dict[str, list[int] | int] = {}
-        declared_prefill = nested_prefill_overrides(self.server_args_overrides)
         # note (luojiaxuan): the derived ladder starts at 4 and a replay falls back
         # to eager when its bucket exceeds twice the real token count, so a prompt
         # cached up to its last token prefills one token eagerly; 1301 of 3203
@@ -251,7 +249,7 @@ class Qwen3TtsEngineBuilder(TtsEngineBuilder[Qwen3TTSSGLangRequestData]):
         if (
             prefill.bs[0] != 1
             and self.server_args_overrides.get("cuda_graph_bs_prefill") is None
-            and "bs" not in declared_prefill
+            and "bs" not in nested_prefill_overrides(self.server_args_overrides)
         ):
             prefill_fields["bs"] = [1, *prefill.bs]
         else:
@@ -264,7 +262,7 @@ class Qwen3TtsEngineBuilder(TtsEngineBuilder[Qwen3TTSSGLangRequestData]):
             prefill.backend == CudaGraphBackend.FULL
             and prefill.full_prefill_max_req is None
         ):
-            prefill_fields["full_prefill_max_req"] = resolved.max_running_requests
+            prefill_fields["full_prefill_max_req"] = cfg.max_running_requests
         else:
             pass
         if prefill_fields:
@@ -272,7 +270,7 @@ class Qwen3TtsEngineBuilder(TtsEngineBuilder[Qwen3TTSSGLangRequestData]):
                 server_args,
                 "qwen3_tts.prefill_cuda_graph_shape",
                 cuda_graph_config=with_phase(
-                    cuda_graph_config, Phase.PREFILL, **prefill_fields
+                    cfg.cuda_graph_config, Phase.PREFILL, **prefill_fields
                 ),
             )
         else:
