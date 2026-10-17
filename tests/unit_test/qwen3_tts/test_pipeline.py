@@ -24,12 +24,14 @@ import torch
 from sglang.srt.arg_groups.cuda_graph_hook import (
     generate_prefill_cuda_graph_batch_sizes,
 )
+from sglang.srt.arg_groups.model_override_base import resolved_view
 from sglang.srt.model_executor.cuda_graph_config import (
     CudaGraphConfig,
     Phase,
     with_phase,
 )
 from sglang.srt.runtime_context import get_context
+from sglang.srt.server_args import ServerArgs
 
 from sglang_omni.config.runtime import resolve_stage_factory_kwargs
 from sglang_omni.model_runner.prefill_inputs import get_omni_prefill_inputs
@@ -38,6 +40,7 @@ from sglang_omni.models.qwen3_tts import request_builders as qwen3_request_build
 from sglang_omni.models.qwen3_tts import stages as qwen3_stages
 from sglang_omni.models.qwen3_tts import streaming_vocoder as qwen3_streaming_vocoder
 from sglang_omni.models.qwen3_tts.config import Qwen3TTSPipelineConfig
+from sglang_omni.models.qwen3_tts.engine_builder import Qwen3TtsEngineBuilder
 from sglang_omni.models.qwen3_tts.incremental_codec import (
     Qwen3TTSIncrementalCodecState,
     Qwen3TTSIncrementalCodecStateSpec,
@@ -83,10 +86,15 @@ from sglang_omni.sampling import seed as sampling_seed
 from sglang_omni.scheduling.engine_factory import GenerationDefaults
 from sglang_omni.scheduling.generation_batch_policy import (
     build_default_prefill_cuda_graph_bs,
+    build_generation_batch_overrides,
+    validate_generation_batch_policy,
 )
 from sglang_omni.scheduling.message import IncomingMessage
 from sglang_omni.scheduling.omni_scheduler import OmniScheduler
 from sglang_omni.scheduling.pending_text_queue import PendingTextTensorQueue
+from sglang_omni.scheduling.sglang_backend.server_args_builder import (
+    build_sglang_server_args,
+)
 from sglang_omni.scheduling.speaker_cache import (
     SpeakerCacheKey,
     get_speaker_artifact_cache,
@@ -96,6 +104,7 @@ from sglang_omni.serve.openai_api import extract_model_info_stage_data
 from sglang_omni.serve.openai_errors import is_bad_request_error
 from sglang_omni.utils import cuda_staging
 from tests.unit_test.fakes import FakeExecutionBridge
+from tests.unit_test.fixtures.mini_checkpoint import write_mini_llama_checkpoint
 
 
 def placeholder_prompt_constants(
@@ -770,6 +779,50 @@ def test_qwen3_tts_keeps_a_declared_empty_or_disabled_prefill_ladder(
         customized_prefill_config(monkeypatch, backend=backend, bs=bs, max_bs=max_bs)
         is None
     )
+
+
+def resolved_qwen3_tts_server_args(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, overrides: dict[str, object]
+) -> ServerArgs:
+    monkeypatch.delenv("SGLANG_OMNI_TORCH_COMPILE_DEFAULT", raising=False)
+    monkeypatch.delenv("TORCHINDUCTOR_CACHE_DIR", raising=False)
+    checkpoint = Path(write_mini_llama_checkpoint(tmp_path))
+    config_path = checkpoint / "config.json"
+    config = json.loads(config_path.read_text())
+    config["tts_model_type"] = "base"
+    config_path.write_text(json.dumps(config))
+    builder = Qwen3TtsEngineBuilder()
+    builder.checkpoint_dir = str(checkpoint)
+    server_args = build_sglang_server_args(
+        str(checkpoint),
+        context_length=8192,
+        device="cuda",
+        **build_generation_batch_overrides(
+            server_args_overrides={"attention_backend": "fa3", **overrides},
+            **builder.generation_defaults(dtype="bfloat16"),
+        ),
+    )
+    builder.customize_server_args(server_args)
+    return server_args
+
+
+@pytest.mark.parametrize("backend", ["breakable", "full"])
+def test_qwen3_tts_one_token_prefill_cap_stays_valid(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, backend: str
+) -> None:
+    """A prefill cap of one token gained a second 1 bucket and failed startup."""
+    server_args = resolved_qwen3_tts_server_args(
+        tmp_path,
+        monkeypatch,
+        {"cuda_graph_backend_prefill": backend, "cuda_graph_max_bs_prefill": 1},
+    )
+
+    validate_generation_batch_policy(
+        model_name="Qwen3-TTS",
+        server_args=server_args,
+        allowed_prefill_backends=("breakable", "full"),
+    )
+    assert resolved_view(server_args).cuda_graph_config.prefill.bs == [1]
 
 
 def qwen3_tts_checkpoint(tmp_path: Path, model_type: str | None) -> str:

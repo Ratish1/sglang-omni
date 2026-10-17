@@ -250,7 +250,7 @@ class Qwen3TtsEngineBuilder(TtsEngineBuilder[Qwen3TTSSGLangRequestData]):
         # cached up to its last token prefills one token eagerly; 1301 of 3203
         # prefills at 10 and 20 RPS on H100 CustomVoice were one token. A ladder
         # derived for its cap gains the 1 bucket; a declared ladder is kept.
-        if prefill.bs in (
+        if prefill.bs[0] != 1 and prefill.bs in (
             generate_prefill_cuda_graph_batch_sizes(prefill.max_bs),
             build_default_prefill_cuda_graph_bs(prefill.max_bs),
         ):
