@@ -7,6 +7,7 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from sglang.srt.runtime_context import get_context
 from sglang.srt.sampling.penaltylib.repetition_penalty import apply_scaling_penalties
 from sglang.srt.utils import DynamicGradMode
 from torch._dynamo.utils import counters
@@ -440,7 +441,8 @@ def test_cosyvoice3_precompile_leaves_the_first_penalized_samples_nothing_to_com
     )
     torch.compiler.reset()
 
-    model.precompile_kernels_after_loading()
+    with get_context().override_server_args(sampling_backend="flashinfer"):
+        model.precompile_kernels_after_loading()
     compiled_graphs = counters["stats"]["unique_graphs"]
 
     with DynamicGradMode():
