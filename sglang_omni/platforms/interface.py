@@ -43,6 +43,42 @@ class JointRopeInplaceKernel(Protocol):
     ) -> None: ...
 
 
+# note (ratish): JointRopeInplaceKernel's rotation, and the rotated k and the raw v [T, Hk, D]
+# stored at rows out_loc [T] (positions' dtype) of 2-D caches [rows, Hk x D] with one row stride.
+class RopeKVStoreKernel(Protocol):
+    def __call__(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        k_cache: torch.Tensor,
+        v_cache: torch.Tensor,
+        cos_sin_cache: torch.Tensor,
+        positions: torch.Tensor,
+        out_loc: torch.Tensor,
+        *,
+        is_neox: bool,
+    ) -> None: ...
+
+
+# note (ratish): attention of q [B, L, Hq, D] over the cache rows [rows, 1, Hk, D] that each
+# batch row's int32 page_table lists in position order, cache_seqlens of them, causal from the
+# bottom right and windowed; returns [B, L, Hq, D].
+class PagedWindowAttention(Protocol):
+    def __call__(
+        self,
+        q: torch.Tensor,
+        k_cache: torch.Tensor,
+        v_cache: torch.Tensor,
+        *,
+        page_table: torch.Tensor,
+        cache_seqlens: torch.Tensor,
+        softmax_scale: float,
+        causal: bool,
+        window_size: tuple[int, int],
+    ) -> torch.Tensor: ...
+
+
 class OmniPlatform(DeviceMixin):
     _omni_platform_qualname: str | None = None
 
@@ -80,6 +116,12 @@ class OmniPlatform(DeviceMixin):
     def get_joint_rope_inplace_kernel(self) -> JointRopeInplaceKernel | None:
         # Note(yzxiao): None means this platform has no implementation. The
         # model decides whether this capability is required or optional.
+        return None
+
+    def get_rope_kv_store_kernel(self) -> RopeKVStoreKernel | None:
+        return None
+
+    def get_paged_window_attention(self) -> PagedWindowAttention | None:
         return None
 
     def apply_model_worker_backend_policy(
