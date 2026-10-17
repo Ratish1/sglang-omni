@@ -196,7 +196,11 @@ def test_graph_disabled_infrastructure_still_initializes_the_eager_runner(
     )
     monkeypatch.setattr(model_worker_mod, "ModelWorker", lambda **kwargs: FakeWorker())
     monkeypatch.setattr(model_worker_mod, "ModelWorkerConfig", lambda **kwargs: kwargs)
-    monkeypatch.setattr(sglang_backend, "create_tree_cache", lambda *args: "tree")
+    monkeypatch.setattr(
+        sglang_backend,
+        "create_tree_cache",
+        lambda *args, radix_cache_type=None: "tree",
+    )
 
     want_cuda_graph, infrastructure = (
         bootstrap.create_sglang_infrastructure_defer_cuda_graph(
