@@ -47,7 +47,8 @@ def conv_stack_state_layout(
     codec: CodecConvStack,
 ) -> tuple[list[tuple[str, int, int]], list[tuple[str, int, int]]]:
     """The conv stack's (key, channels, length) conv histories and transposed-conv overlaps,
-    in the order its decode visits them."""
+    in the order its decode visits them. Qwen3-TTS's speech tokenizer decoder has the same conv
+    stack and lays out its state from this too."""
     conv: list[tuple[str, int, int]] = []
     transconv: list[tuple[str, int, int]] = []
 
