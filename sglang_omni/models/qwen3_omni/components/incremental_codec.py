@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """The code2wav conv stack decoded incrementally from per-stream slots in a codec state pool:
-each causal conv's padded input takes its history from the rows' slots and gives back the
-newest, and each transposed conv adds the slots' overlap and stores the samples the next frames
-still add to, both exchanged in place."""
+every producer writes its frames into the next causal conv's padded input, whose history the
+rows' slots supply and take back, and each transposed conv adds the slots' overlap and stores
+the samples the next frames still add to, both exchanged in place."""
 
 from __future__ import annotations
 
@@ -15,6 +15,7 @@ from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import (
     Qwen3OmniMoeCode2Wav,
 )
 
+from sglang_omni.kernels.bias_snake_beta import fused_bias_snake_beta
 from sglang_omni.kernels.codec_state import history_exchange, overlap_exchange
 from sglang_omni.models.qwen3_omni.components.codec_state_pool import CodecStatePool
 from sglang_omni.utils.channels_last_conv import (
@@ -62,23 +63,34 @@ class SlotDecode:
     is_cold: bool
 
 
-def slot_causal_conv(
-    module: Qwen3OmniMoeCausalConvNet,
-    frames: torch.Tensor,
-    slot_decode: SlotDecode,
-    state_key: str,
-) -> torch.Tensor:
-    """The causal conv's (B, L, C_out) outputs for the rows' new (B, L, C) frames, its padded
-    input's history exchanged with the slots in place."""
-    conv = module.conv
-    histories = slot_decode.pool.histories
-    batch_size, length, channels = frames.shape
+def padded_input(
+    module: Qwen3OmniMoeCausalConvNet, frames_like: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """A causal conv's empty (B, history + L + tail, C) input for (B, L, C) frames shaped as
+    frames_like, and its view of the L frame samples the producer writes."""
+    batch_size, length, channels = frames_like.shape
     history_samples = module.padding
-    tail_samples = (-length) % conv.dilation[0]
-    padded = frames.new_empty(
+    tail_samples = (-length) % module.conv.dilation[0]
+    padded = frames_like.new_empty(
         batch_size, history_samples + length + tail_samples, channels
     )
-    padded[:, history_samples : history_samples + length].copy_(frames)
+    return padded, padded[:, history_samples : history_samples + length]
+
+
+def slot_causal_conv(
+    module: Qwen3OmniMoeCausalConvNet,
+    padded: torch.Tensor,
+    slot_decode: SlotDecode,
+    state_key: str,
+    length: int,
+    *,
+    add_bias: bool,
+) -> torch.Tensor:
+    """The causal conv's (B, length, C_out) outputs for a padded_input whose frames the producer
+    wrote, its history exchanged with the slots in place; without the bias when add_bias is
+    False."""
+    conv = module.conv
+    histories = slot_decode.pool.histories
     if state_key in histories:
         history_exchange(
             padded,
@@ -88,8 +100,8 @@ def slot_causal_conv(
             is_cold=slot_decode.is_cold,
         )
     else:
-        padded[:, history_samples + length :].zero_()
-    return channels_last_conv1d(padded, conv, conv.weight, length)
+        padded[:, module.padding + length :].zero_()
+    return channels_last_conv1d(padded, conv, conv.weight, length, add_bias=add_bias)
 
 
 def slot_causal_transconv(
@@ -100,9 +112,9 @@ def slot_causal_transconv(
     *,
     left_trim: int,
 ) -> torch.Tensor:
-    """The transposed conv's emitted samples after left_trim, the slots' overlap added in
-    front and the samples the next frames add to kept; the bias follows the overlap, so
-    overlapping samples carry it once."""
+    """The transposed conv's emitted samples after left_trim without its bias, the slots'
+    overlap added in front and the samples the next frames add to kept; the consumer adds the
+    bias after the overlap, so overlapping samples carry it once."""
     conv = module.conv
     overlaps = slot_decode.pool.overlaps
     output = channels_last_conv_transpose1d(frames, conv, conv.weight, None)
@@ -117,14 +129,7 @@ def slot_causal_transconv(
         )
     else:
         pass
-    return output[:, left_trim:emitted_samples] + conv.bias
-
-
-def channels_last_activation(
-    module: torch.nn.Module, hidden_states: torch.Tensor
-) -> torch.Tensor:
-    """A (B, C, L) activation module run on (B, L, C) activations."""
-    return module(hidden_states.transpose(1, 2)).transpose(1, 2)
+    return output[:, left_trim:emitted_samples]
 
 
 def slot_conv_stack(
@@ -133,11 +138,13 @@ def slot_conv_stack(
     slot_decode: SlotDecode,
 ) -> torch.Tensor:
     """Everything after the transformer, from its (B, L, C) outputs to the clamped (B, 1,
-    samples) waveform, on channels-last activations. A stream's first decode drops each
-    transposed conv's left pad, as the whole-sequence forward does."""
+    samples) waveform, on bf16 channels-last activations with every SnakeBeta fused. A
+    stream's first decode drops each transposed conv's left pad, as the whole-sequence
+    forward does."""
+    last_stage_index = len(codec.upsample) - 1
     for stage_index, blocks in enumerate(codec.upsample):
         transconv, convnext = blocks[0], blocks[1]
-        hidden_states = slot_causal_transconv(
+        frames = slot_causal_transconv(
             transconv,
             hidden_states,
             slot_decode,
@@ -146,12 +153,13 @@ def slot_conv_stack(
         )
         # note (ratish): the depthwise conv stays on PyTorch's own (B, C, L) kernel, faster
         # than cuDNN's channels-last depthwise and free of its per-shape setup.
-        batch_size, length, channels = hidden_states.shape
+        batch_size, length, channels = frames.shape
         history_samples = convnext.dwconv.padding
-        depthwise_input = hidden_states.new_empty(
+        depthwise_input = frames.new_empty(
             batch_size, channels, history_samples + length
         )
-        depthwise_input[:, :, history_samples:].copy_(hidden_states.transpose(1, 2))
+        residual = depthwise_input[:, :, history_samples:].transpose(1, 2)
+        torch.add(frames, transconv.conv.bias, out=residual)
         history_exchange(
             depthwise_input.transpose(1, 2),
             slot_decode.pool.histories[f"upsample.{stage_index}.convnext.dwconv"],
@@ -160,40 +168,93 @@ def slot_conv_stack(
             is_cold=slot_decode.is_cold,
         )
         normed = convnext.norm(convnext.dwconv.conv(depthwise_input).transpose(1, 2))
-        hidden_states = hidden_states + convnext.gamma * convnext.pwconv2(
+        scaled = convnext.gamma * convnext.pwconv2(
             convnext.act(convnext.pwconv1(normed))
         )
+        if stage_index < last_stage_index:
+            hidden_states = residual + scaled
+        else:
+            padded, padded_frames = padded_input(codec.decoder[0], scaled)
+            torch.add(residual, scaled, out=padded_frames)
     hidden_states = slot_causal_conv(
-        codec.decoder[0], hidden_states, slot_decode, "decoder.0"
+        codec.decoder[0], padded, slot_decode, "decoder.0", length, add_bias=True
     )
-    for block_index, decoder_block in enumerate(codec.decoder[1:-2], start=1):
+    decoder_blocks = codec.decoder[1:-2]
+    activated = (
+        decoder_blocks[0].block[0](hidden_states.transpose(1, 2)).transpose(1, 2)
+    )
+    for block_index, decoder_block in enumerate(decoder_blocks, start=1):
         transconv = decoder_block.block[1]
-        hidden_states = slot_causal_transconv(
+        frames = slot_causal_transconv(
             transconv,
-            channels_last_activation(decoder_block.block[0], hidden_states),
+            activated,
             slot_decode,
             f"decoder.{block_index}.transconv",
             left_trim=transconv.left_pad if slot_decode.is_cold else 0,
         )
-        for residual_index, unit in enumerate(decoder_block.block[2:]):
+        residual_units = decoder_block.block[2:]
+        length = frames.shape[1]
+        residual = frames.new_empty(frames.shape)
+        padded, padded_frames = padded_input(residual_units[0].conv1, frames)
+        fused_bias_snake_beta(
+            frames,
+            transconv.conv.bias,
+            residual_units[0].act1,
+            padded_frames,
+            sum_out=residual,
+        )
+        for residual_index, unit in enumerate(residual_units):
             residual_key = f"decoder.{block_index}.residual.{residual_index}"
-            output = slot_causal_conv(
+            conv1_output = slot_causal_conv(
                 unit.conv1,
-                channels_last_activation(unit.act1, hidden_states),
+                padded,
                 slot_decode,
                 f"{residual_key}.conv1",
+                length,
+                add_bias=False,
             )
-            output = slot_causal_conv(
+            padded, padded_frames = padded_input(unit.conv2, frames)
+            fused_bias_snake_beta(
+                conv1_output, unit.conv1.conv.bias, unit.act2, padded_frames
+            )
+            conv2_output = slot_causal_conv(
                 unit.conv2,
-                channels_last_activation(unit.act2, output),
+                padded,
                 slot_decode,
                 f"{residual_key}.conv2",
+                length,
+                add_bias=False,
             )
-            hidden_states = output + hidden_states
+            if residual_index + 1 < len(residual_units):
+                next_unit = residual_units[residual_index + 1]
+                padded, padded_frames = padded_input(next_unit.conv1, frames)
+                fused_bias_snake_beta(
+                    conv2_output,
+                    unit.conv2.conv.bias,
+                    next_unit.act1,
+                    padded_frames,
+                    residual=residual,
+                    sum_out=residual,
+                )
+            elif block_index < len(decoder_blocks):
+                activated = conv2_output.new_empty(conv2_output.shape)
+                fused_bias_snake_beta(
+                    conv2_output,
+                    unit.conv2.conv.bias,
+                    decoder_blocks[block_index].block[0],
+                    activated,
+                    residual=residual,
+                )
+            else:
+                padded, padded_frames = padded_input(codec.decoder[-1], frames)
+                fused_bias_snake_beta(
+                    conv2_output,
+                    unit.conv2.conv.bias,
+                    codec.decoder[-2],
+                    padded_frames,
+                    residual=residual,
+                )
     waveform = slot_causal_conv(
-        codec.decoder[-1],
-        channels_last_activation(codec.decoder[-2], hidden_states),
-        slot_decode,
-        "decoder.final",
+        codec.decoder[-1], padded, slot_decode, "decoder.final", length, add_bias=True
     )
     return waveform.transpose(1, 2).clamp(min=-1, max=1)
