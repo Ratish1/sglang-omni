@@ -214,6 +214,26 @@ def test_route_session_input_records_authoritative_ar_bypass(
     assert scheduler.outbox.empty()
 
 
+@pytest.mark.accelerator
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@pytest.mark.parametrize("should_run_on_top_priority_stream", [False, True])
+def test_event_loop_runs_on_the_top_priority_stream_only_when_asked(
+    should_run_on_top_priority_stream: bool,
+) -> None:
+    scheduler = object.__new__(OmniScheduler)
+    scheduler.should_run_on_top_priority_stream = should_run_on_top_priority_stream
+    outer_stream = torch.cuda.current_stream()
+
+    with scheduler.event_loop_stream_context():
+        loop_stream = torch.cuda.current_stream()
+
+    if should_run_on_top_priority_stream:
+        assert loop_stream != outer_stream
+        assert loop_stream.priority == torch.cuda.Stream.priority_range()[1]
+    else:
+        assert loop_stream == outer_stream
+
+
 def make_abortable_req(request_id: str, **attributes):
     values = {
         "rid": request_id,
@@ -3419,6 +3439,7 @@ def test_omni_scheduler_start_closes_active_model_paths(
     scheduler = object.__new__(OmniScheduler)
     scheduler.enable_async_decode = False
     scheduler.enable_overlap = False
+    scheduler.should_run_on_top_priority_stream = False
     scheduler.prefill_start_done = {"req-1", "req-2"}
     scheduler.prefill_end_done = set()
     scheduler.request_build_executor = None
