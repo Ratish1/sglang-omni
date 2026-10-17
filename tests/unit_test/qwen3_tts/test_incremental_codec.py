@@ -10,8 +10,12 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+from sglang_omni.models.qwen3_tts.compat import (
+    apply_qwen_tts_transformers_compatibility_patches,
+)
 from sglang_omni.models.qwen3_tts.incremental_codec import (
     Qwen3TTSIncrementalDecoder,
+    Qwen3TTSSlotDecoder,
     incremental_transformer,
 )
 from sglang_omni.models.qwen3_tts.incremental_codec_cuda_graph import (
@@ -22,6 +26,7 @@ from sglang_omni.platforms import current_platform
 from sglang_omni.utils import channels_last_conv, snake_beta
 from sglang_omni.utils.channels_last_conv import channels_last_weight
 from sglang_omni.utils.codec_state_arena import CodecStateArena
+from sglang_omni.utils.codec_state_pool import CodecStatePool
 from sglang_omni.utils.incremental_codec import (
     IncrementalCodecState,
     channels_last_causal_conv1d,
@@ -1453,3 +1458,245 @@ def test_real_tts_decoder_and_incremental_pcm_equal() -> None:
         state = IncrementalCodecState()
         for part, pcm in zip(parts, incremental_expected):
             assert torch.equal(incremental.decode(part, state), pcm)
+
+
+SLOT_DECODES = pytest.mark.skipif(
+    not torch.cuda.is_available()
+    or current_platform.get_paged_window_attention() is None,
+    reason="slot decodes run on CUDA SM 8.x or 9.x",
+)
+TAIL_ATOL = 1e-2
+
+
+def make_tiny_tts_decoder(seed: int) -> nn.Module:
+    """The checkpoint's speech tokenizer decoder class at toy widths, fp32 on CUDA."""
+    apply_qwen_tts_transformers_compatibility_patches()
+    configuration = pytest.importorskip(
+        "qwen_tts.core.tokenizer_12hz.configuration_qwen3_tts_tokenizer_v2"
+    )
+    modeling = pytest.importorskip(
+        "qwen_tts.core.tokenizer_12hz.modeling_qwen3_tts_tokenizer_v2"
+    )
+    config = configuration.Qwen3TTSTokenizerV2DecoderConfig(
+        codebook_size=16,
+        hidden_size=128,
+        latent_dim=64,
+        num_attention_heads=2,
+        num_key_value_heads=2,
+        sliding_window=4,
+        intermediate_size=256,
+        num_hidden_layers=2,
+        num_quantizers=2,
+        upsample_rates=[2, 3],
+        upsampling_ratios=[2],
+        decoder_dim=32,
+        codebook_dim=32,
+        head_dim=64,
+    )
+    config._attn_implementation = "sdpa"  # noqa: leading-underscore  # upstream spelling, or the public name is already taken
+    torch.manual_seed(seed)
+    decoder = modeling.Qwen3TTSTokenizerV2Decoder(config).eval()
+    with torch.no_grad():
+        for name, parameter in decoder.named_parameters():
+            if name.endswith("cluster_usage") or (
+                parameter.dim() == 1 and ("norm" in name or "layer_scale" in name)
+            ):
+                parameter.uniform_(0.5, 1.5)
+            elif name.startswith("pre_transformer.") and parameter.dim() == 2:
+                parameter.normal_(0.0, parameter.shape[1] ** -0.5)
+            else:
+                parameter.normal_(0.0, 0.05)
+    return decoder.to("cuda")
+
+
+def make_slot_decoder(decoder: nn.Module) -> Qwen3TTSSlotDecoder:
+    decoder.to(torch.bfloat16)
+    snake_beta.fuse_vocoder_decoder(decoder)
+    return Qwen3TTSSlotDecoder(Qwen3TTSIncrementalDecoder(decoder), max_positions=64)
+
+
+def make_tts_pool(
+    slot_decoder: Qwen3TTSSlotDecoder, slots: int, largest_part: int
+) -> CodecStatePool:
+    spec = slot_decoder.incremental.state_spec()
+    return CodecStatePool(
+        spec,
+        num_slots=slots,
+        capture_slots=2,
+        ring_frames=spec.retained_context + largest_part,
+        device=torch.device("cuda"),
+        dtype=torch.bfloat16,
+    )
+
+
+def decode_tts_in_parts(
+    slot_decoder: Qwen3TTSSlotDecoder,
+    codes: torch.Tensor,
+    parts: tuple[int, ...],
+    pool: CodecStatePool | None = None,
+    slot_index: torch.Tensor | None = None,
+) -> torch.Tensor:
+    rows = int(codes.shape[0])
+    if pool is None:
+        pool = make_tts_pool(slot_decoder, rows, max(parts))
+        slot_index = torch.arange(rows, device="cuda")
+    else:
+        pass
+    waveforms = []
+    start = 0
+    for frames in parts:
+        waveforms.append(
+            slot_decoder.decode_slots(
+                codes[..., start : start + frames],
+                pool,
+                slot_index,
+                first_decode=start == 0,
+            )
+        )
+        start += frames
+    return torch.cat(waveforms, dim=-1)
+
+
+def relative_error(actual: torch.Tensor, reference: torch.Tensor) -> float:
+    return float((actual.float() - reference).norm() / reference.norm())
+
+
+@pytest.mark.accelerator
+@SLOT_DECODES
+@pytest.mark.parametrize("parts", [(4, 6, 7), (1,) * 17, (10, 7)])
+def test_slot_decodes_error_to_fp32_is_the_bf16_forward_error(
+    monkeypatch: pytest.MonkeyPatch, parts: tuple[int, ...]
+) -> None:
+    monkeypatch.setattr(torch.backends.cudnn, "allow_tf32", False)
+    forward_error = 0.0
+    slot_error = 0.0
+    for seed in range(4):
+        decoder = make_tiny_tts_decoder(seed)
+        codes = torch.randint(0, 16, (2, 2, sum(parts)), device="cuda")
+        with torch.inference_mode():
+            reference = decoder(codes)
+            slot_decoder = make_slot_decoder(decoder)
+            expected = decoder(codes)
+            actual = decode_tts_in_parts(slot_decoder, codes, parts)
+        forward_error += relative_error(expected, reference)
+        slot_error += relative_error(actual, reference)
+
+    assert slot_error <= 1.25 * forward_error
+
+
+@pytest.mark.accelerator
+@SLOT_DECODES
+def test_a_reused_tts_slot_decodes_a_new_stream_as_a_fresh_pool() -> None:
+    slot_decoder = make_slot_decoder(make_tiny_tts_decoder(0))
+    first_codes = torch.randint(0, 16, (1, 2, 13), device="cuda")
+    second_codes = torch.randint(0, 16, (1, 2, 9), device="cuda")
+    pool = make_tts_pool(slot_decoder, 1, 4)
+    slot_index = torch.zeros(1, dtype=torch.long, device="cuda")
+
+    with torch.inference_mode():
+        decode_tts_in_parts(slot_decoder, first_codes, (4, 4, 4, 1), pool, slot_index)
+        reused = decode_tts_in_parts(
+            slot_decoder, second_codes, (3, 4, 2), pool, slot_index
+        )
+        fresh = decode_tts_in_parts(slot_decoder, second_codes, (3, 4, 2))
+
+    assert torch.equal(reused, fresh)
+
+
+@pytest.mark.accelerator
+@SLOT_DECODES
+def test_tts_slot_decode_rows_at_different_positions_keep_their_own_streams() -> None:
+    slot_decoder = make_slot_decoder(make_tiny_tts_decoder(0))
+    first_frames = (5, 9)
+    codes = [
+        torch.randint(0, 16, (1, 2, frames + 4), device="cuda")
+        for frames in first_frames
+    ]
+    pool = make_tts_pool(slot_decoder, 2, 9)
+    slots = [torch.tensor([row], device="cuda") for row in range(2)]
+
+    with torch.inference_mode():
+        for stream_codes, frames, slot in zip(codes, first_frames, slots):
+            slot_decoder.decode_slots(
+                stream_codes[..., :frames], pool, slot, first_decode=True
+            )
+        tails = slot_decoder.decode_slots(
+            torch.cat([stream_codes[..., -4:] for stream_codes in codes]),
+            pool,
+            torch.cat(slots),
+            first_decode=False,
+        )
+        alone = [
+            decode_tts_in_parts(slot_decoder, stream_codes, (frames, 4))
+            for stream_codes, frames in zip(codes, first_frames)
+        ]
+
+    samples = 4 * slot_decoder.total_upsample
+    for row in range(2):
+        assert torch.equal(tails[row], alone[row][0, :, -samples:])
+
+
+@pytest.mark.accelerator
+@SLOT_DECODES
+def test_tail_slot_decode_leaves_each_row_where_its_valid_frames_end() -> None:
+    torch.manual_seed(3)
+    slot_decoder = make_slot_decoder(make_tiny_tts_decoder(0))
+    emit_frames = 1
+    tail_frames = slot_decoder.incremental.tail_frames(emit_frames)
+    widths = (tail_frames + 7, tail_frames + 3, tail_frames)
+    codes = torch.randint(0, 16, (3, 2, max(widths)), device="cuda")
+    follow_codes = torch.randint(0, 16, (3, 2, 2), device="cuda")
+    pool = make_tts_pool(slot_decoder, 3, 2)
+    slot_index = torch.arange(3, device="cuda")
+
+    with torch.inference_mode():
+        tail = slot_decoder.decode_tail_slots(
+            codes, torch.tensor(widths, device="cuda"), pool, slot_index, emit_frames
+        )
+        follow = slot_decoder.decode_slots(
+            follow_codes, pool, slot_index, first_decode=False
+        )
+        alone = [
+            decode_tts_in_parts(
+                slot_decoder,
+                torch.cat(
+                    (codes[row : row + 1, :, :width], follow_codes[row : row + 1]),
+                    dim=-1,
+                ),
+                (width, 2),
+            )
+            for row, width in enumerate(widths)
+        ]
+
+    samples = emit_frames * slot_decoder.total_upsample
+    follow_samples = 2 * slot_decoder.total_upsample
+    assert pool.frame_positions[:3].tolist() == [width + 2 for width in widths]
+    for row, width in enumerate(widths):
+        whole = alone[row][0]
+        torch.testing.assert_close(
+            tail[row],
+            whole[:, -follow_samples - samples : -follow_samples],
+            rtol=0.0,
+            atol=TAIL_ATOL,
+        )
+        torch.testing.assert_close(
+            follow[row], whole[:, -follow_samples:], rtol=0.0, atol=TAIL_ATOL
+        )
+
+
+@pytest.mark.accelerator
+@SLOT_DECODES
+def test_padded_rows_decode_from_the_first_frame_every_time() -> None:
+    """A scratch slot's position grew with every padded replay until the rope kernel read past
+    its table."""
+    slot_decoder = make_slot_decoder(make_tiny_tts_decoder(0))
+    pool = make_tts_pool(slot_decoder, 1, 4)
+    slot_index = torch.tensor([0, *pool.scratch_slots], device="cuda")
+    codes = torch.randint(0, 16, (3, 2, 4), device="cuda")
+
+    with torch.inference_mode():
+        slot_decoder.decode_slots(codes, pool, slot_index, first_decode=True)
+        for _ in range(3):
+            slot_decoder.decode_slots(codes, pool, slot_index, first_decode=False)
+
+    assert pool.frame_positions.tolist() == [16, 0, 0]

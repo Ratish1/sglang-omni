@@ -349,7 +349,8 @@ class CodecStatePool(CodecSlotAllocator):
     (slots, history samples, channels) per causal conv and an overlap pool (slots, overlap
     samples, channels) per transposed conv, a K/V ring of ring_frames positions per slot and
     layer, and each slot's frame position. Past the slots the streams take sit capture_slots
-    scratch slots, one per row a graph capture decodes."""
+    scratch slots, one per row a graph decodes beyond its streams, and past every ring one dump
+    row for K/V a decode does not keep."""
 
     def __init__(
         self,
@@ -380,10 +381,9 @@ class CodecStatePool(CodecSlotAllocator):
             if length
         }
         ring_width = spec.num_key_value_heads * spec.head_dim
+        self.dump_row = total_slots * ring_frames
         self.keys = [
-            torch.zeros(
-                total_slots * ring_frames, ring_width, device=device, dtype=dtype
-            )
+            torch.zeros(self.dump_row + 1, ring_width, device=device, dtype=dtype)
             for _ in range(spec.num_layers)
         ]
         self.values = [torch.zeros_like(ring) for ring in self.keys]
@@ -401,8 +401,24 @@ class CodecStatePool(CodecSlotAllocator):
         for pool in (*self.histories.values(), *self.overlaps.values()):
             pool.index_fill_(0, slots, 0)
         for ring in (*self.keys, *self.values):
-            ring.view(-1, self.ring_frames, ring.shape[1]).index_fill_(0, slots, 0)
+            ring[: self.dump_row].view(-1, self.ring_frames, ring.shape[1]).index_fill_(
+                0, slots, 0
+            )
         self.frame_positions.index_fill_(0, slots, 0)
+
+    def advance(
+        self,
+        slot_index: torch.Tensor,
+        start_positions: torch.Tensor,
+        new_frames: int | torch.Tensor,
+    ) -> None:
+        """Move each row's stream on by new_frames (one count, or one per row). A scratch slot
+        stays at position 0, so a padded row always decodes a stream's first frames and its
+        position never outgrows the rope table."""
+        self.frame_positions.index_put_(
+            (slot_index,),
+            torch.where(slot_index < self.num_slots, start_positions + new_frames, 0),
+        )
 
     def describe(self) -> CodecStateArenaStats:
         return {

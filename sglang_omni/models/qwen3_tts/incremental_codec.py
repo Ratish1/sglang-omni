@@ -4,13 +4,32 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING
 
 import torch
+from sglang.kernels.ops.layernorm import rmsnorm
 
+from sglang_omni.platforms import current_platform
 from sglang_omni.utils.channels_last_conv import (
     channels_last_weight,
     is_channels_last_conv_device,
+)
+from sglang_omni.utils.codec_pool_stack import (
+    SlotDecode,
+    padded_conv,
+    padded_input,
+    pool_conv_stack,
+)
+from sglang_omni.utils.codec_slot_transformer import (
+    merge_layer_weights,
+    rope_cos_sin_table,
+    slot_transformer_layers,
+)
+from sglang_omni.utils.codec_state_pool import (
+    CodecStatePool,
+    RingAddresses,
+    ring_addresses,
 )
 from sglang_omni.utils.incremental_codec import (
     IncrementalCodecState,
@@ -453,3 +472,201 @@ class Qwen3TTSIncrementalDecoder:
         ):
             self.compiled_kernel(codes, state)
         self.compiled_shapes.add(shape)
+
+
+class Qwen3TTSSlotDecoder:
+    """Decodes streams' new codes from their slots in a codec state pool: the quantizer, pre_conv
+    and conv stack with the slots' histories and overlaps exchanged in place, the transformer on
+    the fused kernels with each layer's K/V in the slots' rings. A stream's frames decoded in any
+    split give the waveform the decoder's whole forward gives."""
+
+    def __init__(
+        self, incremental: Qwen3TTSIncrementalDecoder, max_positions: int
+    ) -> None:
+        assert self.supports(
+            incremental
+        ), "slot decodes need the channels-last bf16 decoder, fused SnakeBeta and the kernels"
+        self.incremental = incremental
+        self.decoder = incremental.decoder
+        self.channels_last_weights = incremental.channels_last_weights
+        self.total_upsample = incremental.total_upsample
+        transformer = self.decoder.pre_transformer
+        for layer in transformer.layers:
+            attention = layer.self_attn
+            assert isinstance(attention.q_norm, torch.nn.Identity) and isinstance(
+                attention.k_norm, torch.nn.Identity
+            ), "the decoder's q and k norms are identities"
+            assert attention.q_proj.bias is None, "the decoder's attention has no bias"
+        assert (
+            transformer.rotary_emb.rope_type == "default"
+        ), "the cos/sin table is built once"
+        merge_layer_weights(transformer.layers)
+        self.cos_sin_cache = rope_cos_sin_table(transformer.rotary_emb, max_positions)
+        self.rope_store = current_platform.get_rope_kv_store_kernel()
+        self.paged_attention = current_platform.get_paged_window_attention()
+
+    @staticmethod
+    def supports(incremental: Qwen3TTSIncrementalDecoder) -> bool:
+        """Slot decodes run on bf16 channels-last activations with every SnakeBeta of the conv
+        stack fused, and need the platform's rope K/V store and paged window attention.
+        """
+        decoder = incremental.decoder
+        return (
+            incremental.channels_last_weights is not None
+            and decoder.pre_conv.conv.weight.dtype == torch.bfloat16
+            and not any(
+                type(module).__name__ == "SnakeBeta"
+                for module in decoder.decoder.modules()
+            )
+            and current_platform.get_rope_kv_store_kernel() is not None
+            and current_platform.get_paged_window_attention() is not None
+        )
+
+    def pre_conv_frames(
+        self, quantized: torch.Tensor, slots: SlotDecode
+    ) -> torch.Tensor:
+        """pre_conv of the (B, L, C) quantized frames with the slots' history in front."""
+        padded, frame_rows = padded_input(self.decoder.pre_conv, quantized)
+        frame_rows.copy_(quantized)
+        return padded_conv(
+            self.decoder.pre_conv,
+            self.channels_last_weights["pre_conv"],
+            padded,
+            slots,
+            "pre_conv",
+            int(quantized.shape[1]),
+            add_bias=True,
+        )
+
+    def transformer_frames(
+        self,
+        hidden_states: torch.Tensor,
+        pool: CodecStatePool,
+        addresses: RingAddresses,
+        *,
+        first_decode: bool,
+    ) -> torch.Tensor:
+        """The transformer's (B, L, latent) outputs for the rows' new frames."""
+        transformer = self.decoder.pre_transformer
+        batch_size, length, _ = hidden_states.shape
+        hidden_states = slot_transformer_layers(
+            transformer.layers,
+            transformer.input_proj(hidden_states),
+            pool,
+            addresses,
+            self.cos_sin_cache,
+            first_decode=first_decode,
+            sliding_window=int(transformer.window_size),
+            rope_store=self.rope_store,
+            paged_attention=self.paged_attention,
+        )
+        hidden_states = rmsnorm(
+            hidden_states, transformer.norm.weight, transformer.norm.variance_epsilon
+        )
+        return transformer.output_proj(hidden_states).view(batch_size, length, -1)
+
+    def decode_slots(
+        self,
+        codes: torch.Tensor,
+        pool: CodecStatePool,
+        slot_index: torch.Tensor,
+        *,
+        first_decode: bool,
+    ) -> torch.Tensor:
+        """The (B, 1, samples) waveform of the (B, Q, T) codes after the frames the rows' slots
+        hold, their state advanced in place; a graph captures it with a static index. A first
+        decode starts every row's stream and reads no slot."""
+        new_frames = int(codes.shape[-1])
+        if first_decode:
+            start_positions = torch.zeros_like(slot_index)
+        else:
+            start_positions = pool.frame_positions[slot_index]
+        addresses = ring_addresses(
+            slot_index,
+            start_positions,
+            new_frames,
+            pool.ring_frames,
+            pool.retained_frames,
+        )
+        slots = SlotDecode(pool=pool, slot_index=slot_index, is_cold=first_decode)
+        quantized = self.decoder.quantizer.decode(codes).transpose(1, 2)
+        hidden_states = self.transformer_frames(
+            self.pre_conv_frames(quantized, slots),
+            pool,
+            addresses,
+            first_decode=first_decode,
+        )
+        waveform = pool_conv_stack(
+            self.decoder,
+            hidden_states,
+            slots,
+            self.channels_last_weights,
+            first_decode=first_decode,
+        )
+        assert (
+            waveform.shape[-1] == new_frames * self.total_upsample
+        ), "Qwen3-TTS slot decode returned the wrong sample count"
+        pool.advance(slot_index, start_positions, new_frames)
+        return waveform
+
+    def decode_tail_slots(
+        self,
+        codes: torch.Tensor,
+        valid_frames: torch.Tensor,
+        pool: CodecStatePool,
+        slot_index: torch.Tensor,
+        emit_frames: int,
+    ) -> torch.Tensor:
+        """A stream's first decode of row i's valid_frames[i] frames, padded to one width, with
+        the conv stack on the last tail_frames(emit_frames) outputs only; returns the last
+        emit_frames frames' samples. Each row keeps the K/V and histories that end at its valid
+        frames, and every other frame's K/V goes to the pool's dump row."""
+        width = int(codes.shape[-1])
+        start_positions = torch.zeros_like(slot_index)
+        addresses = ring_addresses(
+            slot_index, start_positions, width, pool.ring_frames, pool.retained_frames
+        )
+        frame_offsets = torch.arange(width, device=codes.device)[None, :]
+        kept = (frame_offsets < valid_frames[:, None]) & (
+            frame_offsets >= valid_frames[:, None] - pool.retained_frames
+        )
+        addresses = replace(
+            addresses,
+            write_rows=torch.where(
+                kept.reshape(-1), addresses.write_rows, pool.dump_row
+            ),
+        )
+        slots = SlotDecode(pool=pool, slot_index=slot_index, is_cold=True)
+        quantized = self.decoder.quantizer.decode(codes).transpose(1, 2)
+        hidden_states = self.pre_conv_frames(quantized, slots)
+        history_samples = int(self.decoder.pre_conv.padding)
+        # note (ratish): the exchange kept the padded width's last frames; a row's history ends
+        # at its valid frames.
+        pool.histories["pre_conv"].index_copy_(
+            0,
+            slot_index,
+            frames_ending_at(quantized, valid_frames, history_samples, 1),
+        )
+        hidden_states = self.transformer_frames(
+            hidden_states, pool, addresses, first_decode=True
+        )
+        window = frames_ending_at(
+            hidden_states,
+            valid_frames,
+            self.incremental.tail_frames(emit_frames),
+            1,
+        )
+        waveform = pool_conv_stack(
+            self.decoder, window, slots, self.channels_last_weights, first_decode=True
+        )
+        pool.advance(slot_index, start_positions, valid_frames)
+        return waveform[..., -int(emit_frames) * self.total_upsample :]
+
+
+@dataclass(frozen=True, kw_only=True)
+class Qwen3TTSSlotDecodes:
+    """A slot decoder and the pool its streams' state lives in, which the stage and its graph
+    runners decode against together."""
+
+    decoder: Qwen3TTSSlotDecoder
+    pool: CodecStatePool

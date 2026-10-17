@@ -401,5 +401,5 @@ class Code2WavIncrementalDecoder:
         assert waveform.shape[-1] == new_frames * self.total_upsample - (
             self.first_decode_shortfall_samples if first_decode else 0
         ), "code2wav incremental decode returned the wrong sample count"
-        pool.frame_positions.index_put_((slot_index,), start_positions + new_frames)
+        pool.advance(slot_index, start_positions, new_frames)
         return waveform
