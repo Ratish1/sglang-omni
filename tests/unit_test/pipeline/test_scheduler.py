@@ -235,6 +235,75 @@ def test_event_loop_runs_on_the_top_priority_stream_only_when_asked(
         assert loop_stream == outer_stream
 
 
+@pytest.mark.accelerator
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@pytest.mark.parametrize("should_run_on_top_priority_stream", [False, True])
+@pytest.mark.parametrize("should_fail_loop", [False, True])
+def test_review_start_replays_and_collects_on_the_requested_stream(
+    should_run_on_top_priority_stream: bool, should_fail_loop: bool
+) -> None:
+    """The serving entry point must place real graph work on its selected stream."""
+    from sglang.srt.managers.scheduler import GenerationBatchResult
+
+    from sglang_omni.model_runner.base import ModelRunner
+
+    outer_stream = torch.cuda.current_stream()
+    capture_stream = torch.cuda.Stream()
+    capture_stream.wait_stream(outer_stream)
+    with torch.cuda.stream(capture_stream):
+        inputs = torch.arange(32, device="cuda", dtype=torch.long)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            outputs = inputs * 7 + 5
+    outer_stream.wait_stream(capture_stream)
+
+    runner = object.__new__(ModelRunner)
+    runner.token_id_host_bufs = None
+    runner.token_id_host_slot = 0
+    scheduler = object.__new__(OmniScheduler)
+    scheduler.enable_async_decode = False
+    scheduler.enable_overlap = False
+    scheduler.should_run_on_top_priority_stream = should_run_on_top_priority_stream
+    scheduler.prefill_start_done = set()
+    scheduler.request_build_executor = None
+    scheduler.request_admission_lock = threading.RLock()
+    scheduler.pending_request_admissions = {}
+    scheduler.shutdown_lock = threading.Lock()
+    shutdowns: list[None] = []
+    scheduler.shutdown_callback = lambda: shutdowns.append(None)
+    observed_streams: list[torch.cuda.Stream] = []
+    collected_tokens: list[torch.Tensor] = []
+
+    def run_loop() -> None:
+        observed_streams.append(torch.cuda.current_stream())
+        graph.replay()
+        result = GenerationBatchResult(next_token_ids=outputs)
+        runner.stage_token_ids(result, outputs)
+        collected_tokens.append(runner.resolve_host_token_ids(result).clone())
+        scheduler.running = False
+        if should_fail_loop:
+            raise RuntimeError("review loop exit")
+        else:
+            pass
+
+    scheduler.event_loop_normal = run_loop
+    if should_fail_loop:
+        with pytest.raises(RuntimeError, match="review loop exit"):
+            scheduler.start()
+    else:
+        scheduler.start()
+
+    torch.testing.assert_close(collected_tokens[0], torch.arange(32) * 7 + 5)
+    if should_run_on_top_priority_stream:
+        assert observed_streams[0] != outer_stream
+        assert observed_streams[0].priority == torch.cuda.Stream.priority_range()[1]
+    else:
+        assert observed_streams[0] == outer_stream
+    assert torch.cuda.current_stream() == outer_stream
+    assert shutdowns == [None]
+    assert scheduler.scheduler_thread_id is None
+
+
 def make_abortable_req(request_id: str, **attributes):
     values = {
         "rid": request_id,
