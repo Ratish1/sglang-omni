@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """The code2wav conv stack decoded incrementally from per-stream slots in a codec state pool:
-each causal conv reads its history from the rows' slots and stores the newest, and each
-transposed conv adds the slots' overlap and stores the samples the next frames still add to."""
+each causal conv's padded input takes its history from the rows' slots and gives back the
+newest, and each transposed conv adds the slots' overlap and stores the samples the next frames
+still add to, both exchanged in place."""
 
 from __future__ import annotations
 
@@ -9,8 +10,8 @@ from dataclasses import dataclass
 from typing import Protocol
 
 import torch
-import torch.nn.functional as F
 
+from sglang_omni.kernels.codec_state import history_exchange, overlap_exchange
 from sglang_omni.scheduling.codec_state_pool import CodecStatePool
 from sglang_omni.utils.channels_last_conv import (
     channels_last_conv1d,
@@ -81,31 +82,29 @@ class SlotDecode:
     is_cold: bool
 
 
-def with_history(
-    frames: torch.Tensor, slots: SlotDecode, key: str, history_samples: int
-) -> torch.Tensor:
-    """The (B, history + L, C) frames with each slot's history in front (zeros when the rows
-    start their streams); the last history samples become the slots' history."""
-    length = int(frames.shape[1])
-    if history_samples == 0:
-        return frames
-    elif slots.is_cold:
-        padded = F.pad(frames, (0, 0, history_samples, 0))
-    else:
-        history = slots.pool.histories[key].index_select(0, slots.slot_index)
-        padded = torch.cat((history, frames), dim=1)
-    slots.pool.histories[key].index_copy_(0, slots.slot_index, padded[:, length:])
-    return padded
-
-
 def slot_causal_conv(
     module: CausalConv, frames: torch.Tensor, slots: SlotDecode, key: str
 ) -> torch.Tensor:
-    """The causal conv's (B, L, C_out) outputs for the rows' new (B, L, C) frames."""
+    """The causal conv's (B, L, C_out) outputs for the rows' new (B, L, C) frames, its padded
+    input's history exchanged with the slots in place."""
     conv = module.conv
-    length = int(frames.shape[1])
-    padded = with_history(frames, slots, key, int(module.padding))
-    padded = F.pad(padded, (0, 0, 0, (-length) % int(conv.dilation[0])))
+    batch_size, length, channels = frames.shape
+    history_samples = int(module.padding)
+    tail_samples = (-length) % int(conv.dilation[0])
+    padded = frames.new_empty(
+        batch_size, history_samples + length + tail_samples, channels
+    )
+    padded[:, history_samples : history_samples + length].copy_(frames)
+    if key in slots.pool.histories:
+        history_exchange(
+            padded,
+            slots.pool.histories[key],
+            slots.slot_index,
+            new_samples=length,
+            is_cold=slots.is_cold,
+        )
+    else:
+        padded[:, history_samples + length :].zero_()
     return channels_last_conv1d(padded, conv, conv.weight, length)
 
 
@@ -124,20 +123,16 @@ def slot_causal_transconv(
     conv = module.conv
     output = channels_last_conv_transpose1d(frames, conv, conv.weight, None)
     emitted_samples = int(frames.shape[1]) * int(conv.stride[0])
-    if key not in slots.pool.overlaps:
-        pass
-    elif slots.is_cold:
-        slots.pool.overlaps[key].index_copy_(
-            0, slots.slot_index, output[:, emitted_samples:]
+    if key in slots.pool.overlaps:
+        overlap_exchange(
+            output,
+            slots.pool.overlaps[key],
+            slots.slot_index,
+            emitted_samples=emitted_samples,
+            is_cold=slots.is_cold,
         )
     else:
-        overlap_samples = int(output.shape[1]) - emitted_samples
-        output[:, :overlap_samples] += slots.pool.overlaps[key].index_select(
-            0, slots.slot_index
-        )
-        slots.pool.overlaps[key].index_copy_(
-            0, slots.slot_index, output[:, emitted_samples:]
-        )
+        pass
     return output[:, left_trim:emitted_samples] + conv.bias
 
 
@@ -167,17 +162,22 @@ def slot_conv_stack(
             f"upsample.{stage_index}.transconv",
             left_trim=int(transconv.left_pad) if first_decode else 0,
         )
-        padded = with_history(
-            hidden_states,
-            slots,
-            f"upsample.{stage_index}.convnext.dwconv",
-            int(convnext.dwconv.padding),
-        )
         # note (ratish): the depthwise conv stays on PyTorch's own (B, C, L) kernel, faster
         # than cuDNN's channels-last depthwise and free of its per-shape setup.
-        normed = convnext.norm(
-            convnext.dwconv.conv(padded.transpose(1, 2).contiguous()).transpose(1, 2)
+        batch_size, length, channels = hidden_states.shape
+        history_samples = int(convnext.dwconv.padding)
+        depthwise_input = hidden_states.new_empty(
+            batch_size, channels, history_samples + length
         )
+        depthwise_input[:, :, history_samples:].copy_(hidden_states.transpose(1, 2))
+        history_exchange(
+            depthwise_input.transpose(1, 2),
+            slots.pool.histories[f"upsample.{stage_index}.convnext.dwconv"],
+            slots.slot_index,
+            new_samples=length,
+            is_cold=slots.is_cold,
+        )
+        normed = convnext.norm(convnext.dwconv.conv(depthwise_input).transpose(1, 2))
         hidden_states = hidden_states + convnext.gamma * convnext.pwconv2(
             convnext.act(convnext.pwconv1(normed))
         )
