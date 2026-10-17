@@ -742,7 +742,7 @@ def test_qwen3_tts_operator_prefill_cap_ladder_starts_at_one(
 def test_qwen3_tts_keeps_a_declared_prefill_ladder(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, backend: str, declaration: str
 ) -> None:
-    """A declared ladder equal to the derived one gained a 1 bucket it did not list."""
+    """A ladder the operator declares is served without an added 1 bucket."""
     overrides: dict[str, object] = (
         {
             "cuda_graph_backend_prefill": backend,
@@ -783,7 +783,7 @@ def test_qwen3_tts_keeps_an_operator_full_prefill_slot_count(
 def test_qwen3_tts_one_token_prefill_cap_stays_valid(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, backend: str
 ) -> None:
-    """A prefill cap of one token gained a second 1 bucket and failed startup."""
+    """A one-token prefill cap resolves to a single 1 bucket and passes validation."""
     server_args = resolved_qwen3_tts_server_args(
         tmp_path,
         monkeypatch,
