@@ -2515,7 +2515,7 @@ class OmniScheduler(Generic[RequestDataT]):
         self.running = True
         model_path_status = "error"
         try:
-            with self.event_loop_stream_context():
+            with contextlib.nullcontext():
                 if self.enable_async_decode:
                     self.event_loop_async_decode()
                 elif self.enable_overlap:
