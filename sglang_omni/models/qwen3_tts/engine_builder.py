@@ -379,7 +379,9 @@ class Qwen3TtsEngineBuilder(TtsEngineBuilder[Qwen3TTSSGLangRequestData]):
             pass
         # note (ratish): on Hopper fa3 sizes split KV against the full graph's
         # context-wide page table, so every replay up to bucket 768 runs a combine
-        # kernel over every request slot; fa4 does not split these shapes.
+        # kernel over every request slot; fa4 does not split these shapes. fa4
+        # prefill reads the query in the model dtype and runs FP8 only on SM100,
+        # so a quantized KV cache keeps the default backend.
         prefill_backend = nested_prefill_overrides(overrides).get(
             "backend", overrides.get("cuda_graph_backend_prefill")
         )
@@ -387,6 +389,7 @@ class Qwen3TtsEngineBuilder(TtsEngineBuilder[Qwen3TTSSGLangRequestData]):
             prefill_backend == CudaGraphBackend.FULL
             and overrides.get("attention_backend") is None
             and overrides.get("prefill_attention_backend") is None
+            and overrides.get("kv_cache_dtype") in (None, "auto")
             and get_platform().is_sm90
         ):
             overrides["prefill_attention_backend"] = "fa4"

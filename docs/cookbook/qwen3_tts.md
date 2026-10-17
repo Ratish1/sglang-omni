@@ -186,9 +186,9 @@ backend. With another attention backend, Base and CustomVoice use `breakable`,
 and an explicit `full` fails at startup.
 
 On Hopper GPUs the full graph runs its prefill attention on `fa4` and holds every
-running request, unless you set `--tts_engine.engine.attention_backend` or
-`--tts_engine.engine.prefill_attention_backend`. Decode keeps its own attention
-backend.
+running request, unless you set `--tts_engine.engine.attention_backend`,
+`--tts_engine.engine.prefill_attention_backend` or an FP8
+`--tts_engine.engine.kv_cache_dtype`. Decode keeps its own attention backend.
 
 The ladder reaches the chunked prefill size, which the server picks from the
 GPU's memory (8192 tokens on an 80 GB GPU), so prefills batched together under

@@ -753,6 +753,31 @@ def test_qwen3_tts_full_prefill_on_hopper_runs_fa4_with_a_slot_per_request(
     )
 
 
+def test_qwen3_tts_fp8_kv_cache_keeps_the_default_prefill_attention(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An FP8 KV cache on Hopper keeps the default prefill attention backend."""
+    with override_platform(is_sm90=True):
+        server_args = resolved_qwen3_tts_server_args(
+            tmp_path,
+            monkeypatch,
+            {
+                "attention_backend": None,
+                "decode_attention_backend": "fa3",
+                "kv_cache_dtype": "fp8_e4m3",
+            },
+        )
+    resolved = resolved_view(server_args)
+
+    validate_generation_batch_policy(
+        model_name="Qwen3-TTS",
+        server_args=server_args,
+        allowed_prefill_backends=("breakable", "full"),
+    )
+    assert attention_backends_of(resolved)[0] != "fa4"
+    assert resolved.cuda_graph_config.prefill.full_prefill_max_req is None
+
+
 @pytest.mark.parametrize("backend", ["breakable", "full"])
 def test_qwen3_tts_operator_prefill_cap_ladder_starts_at_one(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, backend: str
