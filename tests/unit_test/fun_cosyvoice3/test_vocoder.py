@@ -125,6 +125,60 @@ class RecordingPackedDiT(PackedDiT):
         return True
 
 
+@pytest.mark.parametrize(
+    (
+        "device_type",
+        "dtype",
+        "has_estimator",
+        "is_ragged",
+        "is_compiled",
+        "expected_reason",
+    ),
+    [
+        ("cuda", torch.bfloat16, True, True, False, None),
+        ("cuda", torch.float16, True, True, False, None),
+        ("cpu", torch.bfloat16, True, True, True, "device type cpu is not CUDA"),
+        ("mps", torch.bfloat16, True, True, True, "device type mps is not CUDA"),
+        ("cuda", torch.bfloat16, False, False, False, "PackedDiT is unavailable"),
+        ("cuda", torch.bfloat16, True, False, True, "ragged FA3 is unavailable"),
+        ("cuda", None, True, True, True, "dtype None is not FA3-compatible"),
+        (
+            "cuda",
+            torch.float32,
+            True,
+            True,
+            True,
+            "dtype torch.float32 is not FA3-compatible",
+        ),
+        ("cuda", torch.bfloat16, True, True, True, None),
+    ],
+)
+def test_packed_fa3_unavailable_reason(
+    device_type: str,
+    dtype: torch.dtype | None,
+    has_estimator: bool,
+    is_ragged: bool,
+    is_compiled: bool,
+    expected_reason: str | None,
+) -> None:
+    if has_estimator:
+        packed_estimator: PackedDiT | None = RecordingPackedDiT(
+            is_ragged=is_ragged,
+            is_compiled=is_compiled,
+        )
+    else:
+        packed_estimator = None
+    reason = stages.packed_fa3_unavailable_reason(
+        packed_estimator,
+        device=torch.device(device_type),
+        dtype=dtype,
+    )
+    if expected_reason is None:
+        assert reason is None
+    else:
+        assert reason == expected_reason
+
+
 def packed_compile_scheduler(
     packed_estimator: RecordingPackedDiT,
     *,
@@ -1060,7 +1114,7 @@ def prepare_vocoder_startup(
 
         class RecordingFlowCudaGraphRunner:
             def __init__(self, flow, *, device, autocast_dtype) -> None:
-                assert flow is fake_flow
+                assert flow is loaded_flow
                 assert device.type == device_type
                 assert autocast_dtype == torch.bfloat16
                 startup_events.append("runner_create")
@@ -1198,13 +1252,17 @@ def test_create_vocoder_executor_sets_effective_buffered_flow_route(
     else:
         raise AssertionError(f"unhandled test case {case}")
 
-    prepare_vocoder_startup(
+    loaded_flow = prepare_vocoder_startup(
         monkeypatch,
         startup_events,
         device_type=device_type,
         allow_native_compile=enable_dit_torch_compile,
         packed_estimator=packed_estimator,
     )
+    if case == "missing-packed-estimator":
+        loaded_flow.packed_estimator = None
+    else:
+        pass
     monkeypatch.setattr(
         torch,
         "autocast",

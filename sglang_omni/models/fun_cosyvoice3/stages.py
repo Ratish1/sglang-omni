@@ -117,6 +117,26 @@ AUTOCAST_DTYPES: dict[str, torch.dtype | None] = {
     "bfloat16": torch.bfloat16,
 }
 
+
+def packed_fa3_unavailable_reason(
+    estimator: PackedDiT | None,
+    *,
+    device: torch.device,
+    dtype: torch.dtype | None,
+) -> str | None:
+    """Return why the ragged FA3 PackedDiT path is unavailable, if any."""
+    if device.type != "cuda":
+        return f"device type {device.type} is not CUDA"
+    elif estimator is None:
+        return "PackedDiT is unavailable"
+    elif not estimator.is_ragged:
+        return "ragged FA3 is unavailable"
+    elif dtype not in FA3_DTYPES:
+        return f"dtype {dtype} is not FA3-compatible"
+    else:
+        return None
+
+
 COSYVOICE_INSTALL_HINT = (
     "Fun-CosyVoice3 support requires the `cosyvoice` package. "
     "Clone the official repository and set PYTHONPATH, or install it "
@@ -2438,6 +2458,13 @@ def create_vocoder_executor(
     )
 
     device_obj = torch.device(device)
+    packed_estimator = flow.packed_estimator
+    packed_fa3_reason = packed_fa3_unavailable_reason(
+        packed_estimator,
+        device=device_obj,
+        dtype=autocast_dtype,
+    )
+    packed_fa3_available = packed_fa3_reason is None
     if enable_flow_cuda_graph and (
         not supports_device_streams(device_obj)
         or current_platform.get_device_graph_backend(device_obj) is None
@@ -2463,13 +2490,7 @@ def create_vocoder_executor(
     else:
         pass
 
-    if (
-        flow_prefix_cache_gb > 0
-        and device_obj.type == "cuda"
-        and flow.packed_estimator is not None
-        and flow.packed_estimator.is_ragged
-        and autocast_dtype in (torch.float16, torch.bfloat16)
-    ):
+    if flow_prefix_cache_gb > 0 and packed_fa3_available:
         flow.prefix_pool = build_prefix_pool(
             flow, device_obj, autocast_dtype, flow_prefix_cache_gb
         )
@@ -2547,10 +2568,7 @@ def create_vocoder_executor(
     )
     has_whole_history_graphs = (
         enable_flow_whole_history_cuda_graph
-        and device_obj.type == "cuda"
-        and flow.packed_estimator is not None
-        and flow.packed_estimator.is_ragged
-        and autocast_dtype in FA3_DTYPES
+        and packed_fa3_available
         and len(whole_history_tier_frames) > 0
     )
     token_mel_ratio = flow.token_mel_ratio
@@ -2639,21 +2657,12 @@ def create_vocoder_executor(
     if not enable_buffered_packed_flow:
         buffered_flow_route = "native"
         buffered_flow_reason = "explicitly disabled"
-    elif device_obj.type != "cuda":
-        buffered_flow_route = "native"
-        buffered_flow_reason = f"device type {device_obj.type} is not CUDA"
     elif enable_flow_estimator_trt:
         buffered_flow_route = "native"
         buffered_flow_reason = "TensorRT estimator enabled"
-    elif packed_estimator is None:
+    elif packed_fa3_reason is not None:
         buffered_flow_route = "native"
-        buffered_flow_reason = "PackedDiT is unavailable"
-    elif not packed_estimator.is_ragged:
-        buffered_flow_route = "native"
-        buffered_flow_reason = "ragged FA3 is unavailable"
-    elif autocast_dtype not in FA3_DTYPES:
-        buffered_flow_route = "native"
-        buffered_flow_reason = f"dtype {autocast_dtype} is not FA3-compatible"
+        buffered_flow_reason = packed_fa3_reason
     else:
         buffered_flow_route = "packed"
         whole_history_graph_available = flow.whole_history_cuda_graph_runner is not None
