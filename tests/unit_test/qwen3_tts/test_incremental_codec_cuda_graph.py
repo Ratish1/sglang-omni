@@ -490,7 +490,7 @@ def test_incremental_codec_launch_uses_graph_state_and_waveform() -> None:
         def available_batch_sizes(self, fresh_frames):
             return (1,) if fresh_frames == 2 else ()
 
-        def decode_slots(self, codes, slots):
+        def decode_slots(self, codes, slots, *, first_decode):
             self.calls += 1
             assert codes.shape == (1, 2, 2)
             assert list(slots) == [0]
@@ -554,7 +554,7 @@ def test_incremental_codec_launch_falls_back_to_eager_on_graph_miss() -> None:
         def available_batch_sizes(self, fresh_frames):
             return ()
 
-        def decode_slots(self, codes, slots):
+        def decode_slots(self, codes, slots, *, first_decode):
             self.calls += 1
             assert codes.shape == (1, 2, 2)
             assert list(slots) == [0]

@@ -2805,7 +2805,9 @@ class FakeWindowRunner:
             "runtime": {"replays": len(self.calls), "fallback_counts": {}},
         }
 
-    def decode_slots(self, codes: torch.Tensor, slots) -> torch.Tensor | None:
+    def decode_slots(
+        self, codes: torch.Tensor, slots, *, first_decode: bool
+    ) -> torch.Tensor | None:
         self.calls.append((tuple(codes.shape), list(slots)))
         if len(self.calls) == self.miss_on_call:
             return None
@@ -3157,7 +3159,12 @@ class FakeTailRunner:
         return {"enabled": True}
 
     def decode_slots(
-        self, codes: torch.Tensor, slots: list[int], valid_frames: list[int]
+        self,
+        codes: torch.Tensor,
+        slots: list[int],
+        valid_frames: list[int],
+        *,
+        first_decode: bool,
     ) -> torch.Tensor | None:
         self.calls.append((tuple(codes.shape), list(slots), list(valid_frames)))
         if self.miss:
