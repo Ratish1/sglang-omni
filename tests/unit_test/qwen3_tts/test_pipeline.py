@@ -742,7 +742,7 @@ def test_qwen3_tts_full_prefill_on_hopper_runs_fa4_with_a_slot_per_request(
         }
     else:
         pass
-    with override_platform(is_sm90=hopper):
+    with override_platform(is_sm90=hopper, is_hopper_with_cuda_12_3=hopper):
         server_args = resolved_qwen3_tts_server_args(tmp_path, monkeypatch, overrides)
     resolved = resolved_view(server_args)
 
@@ -757,7 +757,7 @@ def test_qwen3_tts_fp8_kv_cache_keeps_the_default_prefill_attention(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """An FP8 KV cache on Hopper keeps the default prefill attention backend."""
-    with override_platform(is_sm90=True):
+    with override_platform(is_sm90=True, is_hopper_with_cuda_12_3=True):
         server_args = resolved_qwen3_tts_server_args(
             tmp_path,
             monkeypatch,
