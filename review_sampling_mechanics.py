@@ -227,9 +227,58 @@ def check_seeds() -> None:
             )
 
 
+def profile_sampling() -> None:
+    register_flashinfer_seeded_sampler()
+    generator = torch.Generator().manual_seed(492)
+    for rows in (1, 16, 32):
+        logits = (torch.randn(rows, TOTAL_VOCAB_SIZE, generator=generator) * 4).cuda()
+        for backend in ("pytorch", "flashinfer"):
+            information = sampling_info(rows, None)
+            output = LogitsProcessorOutput(next_token_logits=logits.clone())
+            positions = torch.arange(rows, device="cuda")
+            with (
+                get_context().override_server_args(sampling_backend=backend),
+                get_parallel().override(tp_group=SimpleNamespace(device_group=None)),
+            ):
+                sampler = create_sampler()
+                for _ in range(5):
+                    output.next_token_logits.copy_(logits)
+                    sampler(
+                        output, information, False, [0] * rows, [[]] * rows, positions
+                    )
+                output.next_token_logits.copy_(logits)
+                torch.cuda.synchronize()
+                with torch.profiler.profile(
+                    activities=[
+                        torch.profiler.ProfilerActivity.CPU,
+                        torch.profiler.ProfilerActivity.CUDA,
+                    ]
+                ) as profile:
+                    sampler(
+                        output, information, False, [0] * rows, [[]] * rows, positions
+                    )
+                trace_path = f"/data/review2897-2898/sampler-{backend}-{rows}.json"
+                profile.export_chrome_trace(trace_path)
+                with open(trace_path) as trace_file:
+                    events = json.load(trace_file)["traceEvents"]
+                kernels = [event for event in events if event.get("cat") == "kernel"]
+                print(
+                    json.dumps(
+                        {
+                            "backend": backend,
+                            "rows": rows,
+                            "cuda_kernels": len(kernels),
+                            "device_kernel_us": sum(event["dur"] for event in kernels),
+                            "kernel_names": [event["name"] for event in kernels],
+                        }
+                    ),
+                    flush=True,
+                )
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("mode", choices=("sampling", "seeds"))
+    parser.add_argument("mode", choices=("sampling", "seeds", "profile"))
     options = parser.parse_args()
     print(
         json.dumps(
@@ -245,5 +294,7 @@ if __name__ == "__main__":
     )
     if options.mode == "sampling":
         check_sampling()
+    elif options.mode == "profile":
+        profile_sampling()
     else:
         check_seeds()
