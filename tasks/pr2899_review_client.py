@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import sys
 from pathlib import Path
 
 import httpx
@@ -11,7 +12,10 @@ OUTPUT_DIRECTORY = Path("/data/review2899")
 
 
 async def synthesize(
-    client: httpx.AsyncClient, index: int, stream: bool
+    client: httpx.AsyncClient,
+    index: int,
+    stream: bool,
+    instructions: str | None = None,
 ) -> dict[str, int | bool]:
     async with client.stream(
         "POST",
@@ -23,6 +27,7 @@ async def synthesize(
             "response_format": "pcm",
             "stream": stream,
             "max_new_tokens": 48,
+            "instructions": instructions,
         },
     ) as response:
         response.raise_for_status()
@@ -41,7 +46,7 @@ async def synthesize(
         }
 
 
-async def main() -> None:
+async def main(is_long_prefill: bool) -> None:
     async with httpx.AsyncClient(timeout=1200.0) as client:
         for attempt in range(120):
             try:
@@ -56,18 +61,27 @@ async def main() -> None:
         else:
             raise RuntimeError("Server did not become ready")
 
-        for label, concurrency, stream in (
+        scenarios = (
             ("single_buffered", 1, False),
             ("single_streamed", 1, True),
             ("c16_new", 16, True),
             ("c16_repeat", 16, True),
             ("c64_new", 64, True),
             ("c64_repeat", 64, True),
-        ):
+        )
+        if is_long_prefill:
+            scenarios = (("long_instruction_prefill", 1, True),)
+            instructions = "Speak with a calm and steady voice. " * 180
+        else:
+            instructions = None
+        for label, concurrency, stream in scenarios:
             before = await client.get(f"{BASE_URL}/model_info")
             before.raise_for_status()
             responses = await asyncio.gather(
-                *(synthesize(client, index, stream) for index in range(concurrency))
+                *(
+                    synthesize(client, index, stream, instructions)
+                    for index in range(concurrency)
+                )
             )
             after = await client.get(f"{BASE_URL}/model_info")
             after.raise_for_status()
@@ -84,4 +98,4 @@ async def main() -> None:
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    asyncio.run(main(is_long_prefill=sys.argv[1:] == ["long"]))
