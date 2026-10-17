@@ -25,11 +25,6 @@ from sglang.srt.arg_groups.cuda_graph_hook import (
     generate_prefill_cuda_graph_batch_sizes,
 )
 from sglang.srt.arg_groups.model_override_base import resolved_view
-from sglang.srt.model_executor.cuda_graph_config import (
-    CudaGraphConfig,
-    Phase,
-    with_phase,
-)
 from sglang.srt.runtime_context import get_context
 from sglang.srt.server_args import ServerArgs
 
@@ -675,112 +670,6 @@ def test_qwen3_tts_breakable_prefill_enabled_by_default() -> None:
     assert overrides["disable_cuda_graph"] is False
 
 
-def customized_prefill_config(
-    monkeypatch: pytest.MonkeyPatch,
-    *,
-    backend: str,
-    bs: list[int],
-    max_bs: int,
-    full_prefill_max_req: int | None = None,
-) -> CudaGraphConfig | None:
-    from sglang_omni.models.qwen3_tts import engine_builder
-
-    resolved = with_phase(
-        CudaGraphConfig(),
-        Phase.PREFILL,
-        backend=backend,
-        bs=bs,
-        max_bs=max_bs,
-        full_prefill_max_req=full_prefill_max_req,
-    )
-    declared: dict[str, CudaGraphConfig] = {}
-    monkeypatch.setattr(
-        engine_builder,
-        "resolved_view",
-        lambda server_args: SimpleNamespace(
-            cuda_graph_config=resolved, max_running_requests=64
-        ),
-    )
-    monkeypatch.setattr(
-        engine_builder,
-        "override_server_args",
-        lambda server_args, source, **fields: declared.update(fields),
-    )
-    engine_builder.Qwen3TtsEngineBuilder().customize_server_args(SimpleNamespace())
-    return declared.get("cuda_graph_config")
-
-
-@pytest.mark.parametrize("backend", ["breakable", "full"])
-@pytest.mark.parametrize(
-    ("ladder", "max_bs"),
-    [
-        (generate_prefill_cuda_graph_batch_sizes(8192), 8192),
-        (build_default_prefill_cuda_graph_bs(3000), 3000),
-    ],
-)
-def test_qwen3_tts_adds_the_one_token_bucket_to_a_derived_prefill_ladder(
-    monkeypatch: pytest.MonkeyPatch, backend: str, ladder: list[int], max_bs: int
-) -> None:
-    config = customized_prefill_config(
-        monkeypatch, backend=backend, bs=ladder, max_bs=max_bs
-    )
-
-    assert config.prefill.bs == [1, *ladder]
-    assert config.prefill.max_bs == max_bs
-    assert config.prefill.full_prefill_max_req == (64 if backend == "full" else None)
-    assert config.decode == CudaGraphConfig().decode
-
-
-@pytest.mark.parametrize(
-    ("bs", "max_bs", "full_prefill_max_req", "expected_bs", "expected_slots"),
-    [
-        ([1, 4, 8], 8, None, [1, 4, 8], 64),
-        (
-            generate_prefill_cuda_graph_batch_sizes(8192),
-            8192,
-            8,
-            [1, *generate_prefill_cuda_graph_batch_sizes(8192)],
-            8,
-        ),
-    ],
-)
-def test_qwen3_tts_full_prefill_slots_cover_every_running_request(
-    monkeypatch: pytest.MonkeyPatch,
-    bs: list[int],
-    max_bs: int,
-    full_prefill_max_req: int | None,
-    expected_bs: list[int],
-    expected_slots: int,
-) -> None:
-    config = customized_prefill_config(
-        monkeypatch,
-        backend="full",
-        bs=bs,
-        max_bs=max_bs,
-        full_prefill_max_req=full_prefill_max_req,
-    )
-
-    assert config.prefill.bs == expected_bs
-    assert config.prefill.full_prefill_max_req == expected_slots
-
-
-@pytest.mark.parametrize(
-    ("backend", "bs", "max_bs"),
-    [
-        ("breakable", [16, 64], 64),
-        ("breakable", [], 8192),
-        ("disabled", generate_prefill_cuda_graph_batch_sizes(8192), 8192),
-    ],
-)
-def test_qwen3_tts_keeps_a_declared_empty_or_disabled_prefill_ladder(
-    monkeypatch: pytest.MonkeyPatch, backend: str, bs: list[int], max_bs: int
-) -> None:
-    assert (
-        customized_prefill_config(monkeypatch, backend=backend, bs=bs, max_bs=max_bs)
-        is None
-    )
-
-
 def resolved_qwen3_tts_server_args(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, overrides: dict[str, object]
 ) -> ServerArgs:
@@ -793,17 +682,101 @@ def resolved_qwen3_tts_server_args(
     config_path.write_text(json.dumps(config))
     builder = Qwen3TtsEngineBuilder()
     builder.checkpoint_dir = str(checkpoint)
+    builder.server_args_overrides = {"attention_backend": "fa3", **overrides}
     server_args = build_sglang_server_args(
         str(checkpoint),
         context_length=8192,
         device="cuda",
         **build_generation_batch_overrides(
-            server_args_overrides={"attention_backend": "fa3", **overrides},
+            server_args_overrides=builder.server_args_overrides,
             **builder.generation_defaults(dtype="bfloat16"),
         ),
     )
     builder.customize_server_args(server_args)
     return server_args
+
+
+@pytest.mark.parametrize("backend", ["breakable", "full"])
+def test_qwen3_tts_prefill_ladder_starts_at_one_and_reaches_the_chunk(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, backend: str
+) -> None:
+    server_args = resolved_qwen3_tts_server_args(
+        tmp_path, monkeypatch, {"cuda_graph_backend_prefill": backend}
+    )
+    resolved = resolved_view(server_args)
+    prefill = resolved.cuda_graph_config.prefill
+
+    validate_generation_batch_policy(
+        model_name="Qwen3-TTS",
+        server_args=server_args,
+        allowed_prefill_backends=("breakable", "full"),
+    )
+    assert prefill.max_bs == resolved.chunked_prefill_size
+    assert prefill.bs == [
+        1,
+        *generate_prefill_cuda_graph_batch_sizes(resolved.chunked_prefill_size),
+    ]
+    assert prefill.full_prefill_max_req == (
+        resolved.max_running_requests if backend == "full" else None
+    )
+
+
+@pytest.mark.parametrize("backend", ["breakable", "full"])
+def test_qwen3_tts_operator_prefill_cap_ladder_starts_at_one(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, backend: str
+) -> None:
+    server_args = resolved_qwen3_tts_server_args(
+        tmp_path,
+        monkeypatch,
+        {"cuda_graph_backend_prefill": backend, "cuda_graph_max_bs_prefill": 3000},
+    )
+
+    assert resolved_view(server_args).cuda_graph_config.prefill.bs == [
+        1,
+        *build_default_prefill_cuda_graph_bs(3000),
+    ]
+
+
+@pytest.mark.parametrize("backend", ["breakable", "full"])
+@pytest.mark.parametrize("declaration", ["flat", "nested"])
+def test_qwen3_tts_keeps_a_declared_prefill_ladder(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, backend: str, declaration: str
+) -> None:
+    """A declared ladder equal to the derived one gained a 1 bucket it did not list."""
+    overrides: dict[str, object] = (
+        {
+            "cuda_graph_backend_prefill": backend,
+            "cuda_graph_bs_prefill": [4, 8],
+            "cuda_graph_max_bs_prefill": 8,
+        }
+        if declaration == "flat"
+        else {
+            "cuda_graph_config": {
+                "prefill": {"backend": backend, "bs": [4, 8], "max_bs": 8}
+            }
+        }
+    )
+    server_args = resolved_qwen3_tts_server_args(tmp_path, monkeypatch, overrides)
+
+    assert resolved_view(server_args).cuda_graph_config.prefill.bs == [4, 8]
+
+
+def test_qwen3_tts_keeps_an_operator_full_prefill_slot_count(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    server_args = resolved_qwen3_tts_server_args(
+        tmp_path,
+        monkeypatch,
+        {
+            "cuda_graph_config": {
+                "prefill": {"backend": "full", "full_prefill_max_req": 8}
+            }
+        },
+    )
+
+    assert (
+        resolved_view(server_args).cuda_graph_config.prefill.full_prefill_max_req == 8
+    )
 
 
 @pytest.mark.parametrize("backend", ["breakable", "full"])

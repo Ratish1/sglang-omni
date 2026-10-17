@@ -11,9 +11,6 @@ from typing import TYPE_CHECKING, Protocol
 import numpy as np
 import numpy.typing as npt
 import torch
-from sglang.srt.arg_groups.cuda_graph_hook import (
-    generate_prefill_cuda_graph_batch_sizes,
-)
 from sglang.srt.arg_groups.model_override_base import resolved_view
 from sglang.srt.model_executor.cuda_graph_config import Phase, with_phase
 from sglang.srt.runtime_context import get_model, get_schedule
@@ -40,7 +37,7 @@ from sglang_omni.scheduling.engine_factory import (
 )
 from sglang_omni.scheduling.generation_batch_policy import (
     CudaGraphBackend,
-    build_default_prefill_cuda_graph_bs,
+    nested_prefill_overrides,
 )
 from sglang_omni.scheduling.sglang_backend.output_processor import SGLangOutputProcessor
 from sglang_omni.scheduling.types import StreamOutputBuilder
@@ -245,14 +242,16 @@ class Qwen3TtsEngineBuilder(TtsEngineBuilder[Qwen3TTSSGLangRequestData]):
         else:
             pass
         prefill_fields: dict[str, list[int] | int] = {}
+        declared_prefill = nested_prefill_overrides(self.server_args_overrides)
         # note (luojiaxuan): the derived ladder starts at 4 and a replay falls back
         # to eager when its bucket exceeds twice the real token count, so a prompt
         # cached up to its last token prefills one token eagerly; 1301 of 3203
         # prefills at 10 and 20 RPS on H100 CustomVoice were one token. A ladder
-        # derived for its cap gains the 1 bucket; a declared ladder is kept.
-        if prefill.bs[0] != 1 and prefill.bs in (
-            generate_prefill_cuda_graph_batch_sizes(prefill.max_bs),
-            build_default_prefill_cuda_graph_bs(prefill.max_bs),
+        # the operator declared is kept as declared.
+        if (
+            prefill.bs[0] != 1
+            and self.server_args_overrides.get("cuda_graph_bs_prefill") is None
+            and "bs" not in declared_prefill
         ):
             prefill_fields["bs"] = [1, *prefill.bs]
         else:

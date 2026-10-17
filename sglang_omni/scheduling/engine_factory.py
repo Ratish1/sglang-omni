@@ -104,6 +104,9 @@ class SGLangGenerationEngineBuilder(ABC, Generic[RequestDataT]):
 
     model_name: str
     context_length: int
+    # The deployment's own overrides, so a builder can tell a value the operator
+    # set from one the shared policy derived.
+    server_args_overrides: Mapping[str, object]
     model_arch_override: str | None = None
     supports_context_length_override: ClassVar[bool] = False
     # Set True only by builders whose model has adopted the breakable prefill
@@ -156,6 +159,7 @@ class SGLangGenerationEngineBuilder(ABC, Generic[RequestDataT]):
             server_args_overrides["disable_cuda_graph"] = True
         else:
             pass
+        self.server_args_overrides = server_args_overrides or {}
 
         requested_context_length = (
             server_args_overrides.get("context_length")
