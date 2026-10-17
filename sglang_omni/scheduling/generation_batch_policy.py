@@ -33,7 +33,7 @@ _PREFILL_PADDING_FACTOR = 2
 # an ordinary EXTEND batch. The triton backend captures decode, target verify,
 # draft extend and dLLM extend, so a full prefill graph over it fails during
 # capture.
-FULL_PREFILL_ATTENTION_BACKENDS = frozenset({"fa3", "flashinfer"})
+FULL_PREFILL_ATTENTION_BACKENDS = frozenset({"fa3", "fa4", "flashinfer"})
 
 
 def get_decode_cuda_graph_max_bs(server_args: ServerArgs) -> int | None:
