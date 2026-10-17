@@ -13,6 +13,7 @@ inheriting from ``SGLangScheduler``.
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import queue as _queue_mod
 import threading
@@ -274,6 +275,7 @@ class OmniSchedulerArguments(TypedDict, Generic[RequestDataT], total=False):
     enable_async_decode: bool
     async_decode_min_batch_size: int
     async_decode_resolve_before_prefill: bool
+    should_run_on_top_priority_stream: bool
     prefill_coalesce_requests: int
     prefill_coalesce_wait_ms: float
     prefill_coalesce_when_idle: bool
@@ -333,6 +335,7 @@ class OmniScheduler(Generic[RequestDataT]):
         enable_async_decode: bool = False,
         async_decode_min_batch_size: int = 1,
         async_decode_resolve_before_prefill: bool = False,
+        should_run_on_top_priority_stream: bool = False,
         prefill_coalesce_requests: int = 0,
         prefill_coalesce_wait_ms: float = 60.0,
         prefill_coalesce_when_idle: bool = False,
@@ -432,6 +435,10 @@ class OmniScheduler(Generic[RequestDataT]):
         # runner allows through the lookahead.
         self.async_decode_min_batch_size = int(async_decode_min_batch_size)
         self.async_decode_resolve_before_prefill = async_decode_resolve_before_prefill
+        # note (ratish): a model whose process shares the card with a busy stream of its
+        # own (a vocoder) runs the loop on the device's top priority stream, so its
+        # replays go first on the SMs. CUDA only, and only when the model asks.
+        self.should_run_on_top_priority_stream = should_run_on_top_priority_stream
         if self.enable_overlap and self.enable_async_decode:
             raise ValueError(
                 "enable_overlap and enable_async_decode are mutually "
@@ -2508,12 +2515,13 @@ class OmniScheduler(Generic[RequestDataT]):
         self.running = True
         model_path_status = "error"
         try:
-            if self.enable_async_decode:
-                self.event_loop_async_decode()
-            elif self.enable_overlap:
-                self.event_loop_overlap()
-            else:
-                self.event_loop_normal()
+            with self.event_loop_stream_context():
+                if self.enable_async_decode:
+                    self.event_loop_async_decode()
+                elif self.enable_overlap:
+                    self.event_loop_overlap()
+                else:
+                    self.event_loop_normal()
             model_path_status = "aborted"
         finally:
             try:
@@ -2530,6 +2538,16 @@ class OmniScheduler(Generic[RequestDataT]):
                 finally:
                     self.discard_pending_request_admissions()
                     self.shutdown_resources()
+
+    def event_loop_stream_context(self) -> contextlib.AbstractContextManager[None]:
+        """The device's top priority stream when the model asks for it, after the work
+        the current stream holds; otherwise the current stream."""
+        if self.should_run_on_top_priority_stream:
+            stream = torch.cuda.Stream(priority=torch.cuda.Stream.priority_range()[1])
+            stream.wait_stream(torch.cuda.current_stream())
+            return torch.cuda.stream(stream)
+        else:
+            return contextlib.nullcontext()
 
     def event_loop(self) -> None:
         self.start()
