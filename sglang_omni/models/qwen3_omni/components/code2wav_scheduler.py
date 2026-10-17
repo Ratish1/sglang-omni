@@ -6,6 +6,7 @@ it decodes, then decodes the ready windows of one length in one replay.
 
 from __future__ import annotations
 
+import contextlib
 import itertools
 import json
 import logging
@@ -13,7 +14,7 @@ import queue
 import time
 from collections.abc import Mapping
 from dataclasses import dataclass, field
-from typing import TypedDict
+from typing import Literal, TypedDict
 
 import numpy as np
 import torch
@@ -21,7 +22,10 @@ from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import (
     Qwen3OmniMoeCode2Wav,
 )
 
-from sglang_omni.models.qwen3_omni.components.code2wav import Qwen3OmniCode2Wav
+from sglang_omni.models.qwen3_omni.components.code2wav import (
+    Qwen3OmniCode2Wav,
+    Qwen3OmniIncrementalCodec,
+)
 from sglang_omni.models.qwen3_omni.components.code2wav_cuda_graph import (
     Code2WavCudaGraphRunner,
     Code2WavRunResult,
@@ -31,6 +35,7 @@ from sglang_omni.platforms import current_platform
 from sglang_omni.profiler.event_recorder import emit as _emit_event
 from sglang_omni.profiler.event_recorder import get_recorder as _get_event_recorder
 from sglang_omni.proto import StagePayload
+from sglang_omni.scheduling.codec_state_pool import CodecStatePool
 from sglang_omni.scheduling.message import IncomingMessage, OutgoingMessage
 from sglang_omni.scheduling.streaming_vocoder import (
     StreamingVocoderBase,
@@ -54,10 +59,34 @@ class IngestProfile(TypedDict):
     ready_emitted: bool
 
 
+class GraphKeyMetadata(TypedDict):
+    batch_size: int
+    frames: int
+    decode: Literal["window", "first", "next"]
+
+
 class ExecutionMetadata(TypedDict):
     execution_mode: str
-    graph_key: dict[str, int] | None
+    graph_key: GraphKeyMetadata | None
     fallback_reason: str | None
+
+
+def execution_metadata(result: Code2WavRunResult) -> ExecutionMetadata:
+    if result.key is None:
+        graph_key = None
+    else:
+        graph_key = {
+            "batch_size": int(result.key.batch_size),
+            "frames": int(result.key.frames),
+            "decode": result.key.decode,
+        }
+    return {
+        "execution_mode": str(result.execution_mode),
+        "graph_key": graph_key,
+        "fallback_reason": (
+            None if result.fallback_reason is None else str(result.fallback_reason)
+        ),
+    }
 
 
 def serial_window_frames(
@@ -105,6 +134,24 @@ def window_graph_keys(
         for rows in range(1, max_replay_rows + 1)
         for frames in serial_window_frames(
             stream_chunk_size, left_context_size, initial_chunk_frames
+        )
+    )
+
+
+def incremental_graph_keys(
+    stream_chunk_size: int, max_replay_rows: int, initial_chunk_frames: int = 0
+) -> tuple[GraphKey, ...]:
+    """The new frames of a stream's first window and of its later ones, decoded from codec
+    state slots, at every row count up to max_replay_rows."""
+    first_frames = (
+        min(max(int(initial_chunk_frames), 0), stream_chunk_size) or stream_chunk_size
+    )
+    return tuple(
+        key
+        for rows in range(1, max_replay_rows + 1)
+        for key in (
+            GraphKey(batch_size=rows, frames=first_frames, decode="first"),
+            GraphKey(batch_size=rows, frames=stream_chunk_size, decode="next"),
         )
     )
 
@@ -180,6 +227,10 @@ class Code2WavStreamState:
     checked: int = 0
     pending: PendingWindow | None = None
     codes_ready_event: torch.Event | None = None
+    # note (ratish): a stream decodes from its codec state slot from its first window on, or
+    # with left context when the pool had no slot for it then; it keeps that mode for life.
+    codec_slot: int | None = None
+    stateless: bool = False
     _critical_ingest_profile: IngestProfile | None = None
 
 
@@ -202,10 +253,15 @@ class Code2WavScheduler(StreamingVocoderBase[Code2WavStreamState, "list[int]"]):
         enable_cuda_graph: bool = False,
         cuda_graph_runner: Code2WavCudaGraphRunner | None = None,
         decode_stream: torch.Stream | None = None,
+        incremental_codec: Qwen3OmniIncrementalCodec | None = None,
+        codec_pool: CodecStatePool | None = None,
     ) -> None:
         self.model = model
         self.device = torch.device(device)
         self.decode_stream = decode_stream
+        self.incremental_codec = incremental_codec
+        self.codec_pool = codec_pool
+        self.stateless_fallbacks = 0
         self.stream_chunk_size = max(int(stream_chunk_size), 1)
         self.left_context_size = max(int(left_context_size), 0)
         self.codec_eos_token_id = codec_eos_token_id
@@ -250,6 +306,75 @@ class Code2WavScheduler(StreamingVocoderBase[Code2WavStreamState, "list[int]"]):
         else:
             self.decode_stream.wait_event(state.codes_ready_event)
 
+    def claim_codec_slot(self, request_id: str, state: Code2WavStreamState) -> None:
+        """Give a stream a codec state slot when its first codes arrive, ahead of its first
+        window, or keep it stateless when the pool has none free. Runs on the serving thread,
+        whose stream orders the decode after the slot's previous owner; the first decode reads
+        no slot state, so the slot is not zeroed."""
+        if (
+            self.codec_pool is None
+            or state.emitted > 0
+            or state.codec_slot is not None
+            or state.stateless
+        ):
+            return
+        else:
+            pass
+        state.codec_slot = self.codec_pool.acquire()
+        if state.codec_slot is None:
+            state.stateless = True
+            self.stateless_fallbacks += 1
+            logger.warning(
+                f"code2wav codec state pool is full ({self.codec_pool.num_slots} slots); "
+                f"{request_id} decodes with left context"
+            )
+        else:
+            pass
+
+    def release_codec_slot(self, state: Code2WavStreamState) -> None:
+        """Return the stream's slot after every decode already queued on the decode stream,
+        whichever thread releases it."""
+        if state.codec_slot is None:
+            return
+        else:
+            pass
+        if self.decode_stream is None:
+            stream_context = contextlib.nullcontext()
+        else:
+            stream_context = torch.get_device_module(self.device).stream(
+                self.decode_stream
+            )
+        with stream_context:
+            self.codec_pool.release(state.codec_slot)
+        state.codec_slot = None
+
+    def decode_incremental(
+        self, codes: torch.Tensor, slots: list[int], *, first_decode: bool
+    ) -> tuple[torch.Tensor, ExecutionMetadata]:
+        """Decode each row's new codes from its slot's state and store the advanced state."""
+        with torch.no_grad():
+            if self.device.type != "cpu":
+                torch.get_device_module(self.device).set_device(self.device)
+            else:
+                pass
+            if self.cuda_graph_runner is None:
+                result = Code2WavRunResult(
+                    output=self.incremental_codec.decode_slots(
+                        codes,
+                        self.codec_pool,
+                        self.codec_pool.stage_index(slots),
+                        first_decode=first_decode,
+                    ),
+                    execution_mode="eager",
+                    key=None,
+                    fallback_reason=None,
+                )
+            else:
+                result = self.cuda_graph_runner.run_slots(
+                    codes, slots, first_decode=first_decode
+                )
+        return (result.output, execution_metadata(result))
+
     def is_streaming_payload(self, payload: StagePayload) -> bool:
         del payload
         return True
@@ -286,6 +411,7 @@ class Code2WavScheduler(StreamingVocoderBase[Code2WavStreamState, "list[int]"]):
     def ingest(
         self, request_id: str, state: Code2WavStreamState, codes: torch.Tensor
     ) -> None:
+        self.claim_codec_slot(request_id, state)
         profile = None
         if _get_event_recorder().is_active():
             profile = self.start_ingest_profile(state)
@@ -469,10 +595,11 @@ class Code2WavScheduler(StreamingVocoderBase[Code2WavStreamState, "list[int]"]):
             pass
         start, end = (state.emitted, len(state.chunks))
         if start >= end:
+            self.release_codec_slot(state)
             return None
         else:
             pass
-        context = min(self.left_context_size, start)
+        context = self.context_frames(state)
         profile_metadata = self.window_profile(
             state, "stream_done", end - start, rows=1
         )
@@ -488,7 +615,15 @@ class Code2WavScheduler(StreamingVocoderBase[Code2WavStreamState, "list[int]"]):
         self.wait_codes_ready(state)
         window = torch.stack(state.chunks[start - context : end], dim=0)
         codes = window.transpose(0, 1).unsqueeze(0)
-        wav, execution_metadata = self.forward_codes(codes, graph_eligible=True)
+        if state.codec_slot is not None and state.emitted > 0:
+            wav, execution_metadata = self.decode_incremental(
+                codes, [state.codec_slot], first_decode=False
+            )
+        else:
+            # note (ratish): a stream that ends before its first window has no state to
+            # continue from, so one stateless window decodes all of it.
+            wav, execution_metadata = self.forward_codes(codes, graph_eligible=True)
+        self.release_codec_slot(state)
         wav = wav[..., -(end - start) * self.total_upsample :]
         audio = wav.reshape(-1).detach().cpu().float().numpy().copy()
         if profile_metadata is not None:
@@ -517,7 +652,7 @@ class Code2WavScheduler(StreamingVocoderBase[Code2WavStreamState, "list[int]"]):
             return None
         else:
             pass
-        context = min(self.left_context_size, state.emitted)
+        context = self.context_frames(state)
         return {
             "trigger": trigger,
             "start_frame": state.emitted,
@@ -568,14 +703,22 @@ class Code2WavScheduler(StreamingVocoderBase[Code2WavStreamState, "list[int]"]):
             else:
                 pass
             start = state.emitted
-            context = min(self.left_context_size, start)
+            context = self.context_frames(state)
             self.wait_codes_ready(state)
             rows.append(
                 torch.stack(state.chunks[start - context : start + new_frames], dim=1)
             )
-        wav, execution_metadata = self.forward_codes(
-            torch.stack(rows, dim=0), graph_eligible=True
-        )
+        anchor_state = participants[0][1]
+        if anchor_state.codec_slot is None:
+            wav, execution_metadata = self.forward_codes(
+                torch.stack(rows, dim=0), graph_eligible=True
+            )
+        else:
+            wav, execution_metadata = self.decode_incremental(
+                torch.stack(rows, dim=0),
+                [state.codec_slot for _, state in participants],
+                first_decode=anchor_state.emitted == 0,
+            )
         wav = wav[..., -new_frames * self.total_upsample :].reshape(
             len(participants), -1
         )
@@ -848,26 +991,7 @@ class Code2WavScheduler(StreamingVocoderBase[Code2WavStreamState, "list[int]"]):
                 )
             else:
                 result = self.cuda_graph_runner.run(codes, eligible=graph_eligible)
-        graph_key = None
-        if result.key is not None:
-            graph_key = {
-                "batch_size": int(result.key.batch_size),
-                "frames": int(result.key.frames),
-            }
-        else:
-            pass
-        return (
-            result.output,
-            {
-                "execution_mode": str(result.execution_mode),
-                "graph_key": graph_key,
-                "fallback_reason": (
-                    None
-                    if result.fallback_reason is None
-                    else str(result.fallback_reason)
-                ),
-            },
-        )
+        return (result.output, execution_metadata(result))
 
     def next_message(self) -> IncomingMessage | None:
         with self.state_lock:
@@ -902,10 +1026,16 @@ class Code2WavScheduler(StreamingVocoderBase[Code2WavStreamState, "list[int]"]):
     def ready(self, state: Code2WavStreamState) -> int:
         return len(state.chunks) - state.emitted
 
+    def context_frames(self, state: Code2WavStreamState) -> int:
+        """Decoded frames a window re-reads: none from a codec state slot, else the left
+        context."""
+        if state.codec_slot is None:
+            return min(self.left_context_size, state.emitted)
+        else:
+            return 0
+
     def window_length(self, state: Code2WavStreamState) -> int:
-        return min(self.left_context_size, state.emitted) + self.window_new_frames(
-            state
-        )
+        return self.context_frames(state) + self.window_new_frames(state)
 
     def ready_streams(self) -> list[tuple[str, Code2WavStreamState]]:
         """Streams with a threshold window ready, each stamped with when it became ready."""
@@ -943,15 +1073,23 @@ class Code2WavScheduler(StreamingVocoderBase[Code2WavStreamState, "list[int]"]):
         )
         window_frames = self.window_length(anchor[1])
         follows_a_window = anchor[1].emitted > 0
+        from_slot = anchor[1].codec_slot is not None
         group = sorted(
             (
                 stream
                 for stream in streams
                 if self.window_length(stream[1]) == window_frames
                 and (stream[1].emitted > 0) == follows_a_window
+                and (stream[1].codec_slot is not None) == from_slot
             ),
             key=lambda stream: stream[1].ready_since,
         )
+        if not from_slot:
+            decode = "window"
+        elif follows_a_window:
+            decode = "next"
+        else:
+            decode = "first"
         if self.cuda_graph_runner is None:
             rows = min(len(group), self.max_replay_rows)
         else:
@@ -959,7 +1097,7 @@ class Code2WavScheduler(StreamingVocoderBase[Code2WavStreamState, "list[int]"]):
                 (
                     size
                     for size in self.cuda_graph_runner.available_batch_sizes(
-                        window_frames
+                        window_frames, decode
                     )
                     if size <= len(group)
                 ),
@@ -1080,6 +1218,7 @@ class Code2WavScheduler(StreamingVocoderBase[Code2WavStreamState, "list[int]"]):
             state.pending = None
         else:
             pass
+        self.release_codec_slot(state)
         if state.chunks and self.device.type == "cuda":
             # note (ratish): windows read the chunks on the decode stream, or on
             # the default stream when the serving thread has none of its own.
@@ -1130,6 +1269,7 @@ def create_code2wav_scheduler(
     total_gpu_memory_fraction: float | None = None,
     fused_snake_activation: bool = True,
     talker_in_process: bool = False,
+    codec_state_slots: int = 0,
 ) -> Code2WavScheduler:
     """Factory: returns Code2WavScheduler."""
     from sglang_omni.utils.device import resolve_concrete_device
@@ -1162,12 +1302,41 @@ def create_code2wav_scheduler(
         )
     else:
         pass
+    incremental_codec = None
+    codec_pool = None
+    pool_bytes = 0
+    if codec_state_slots > 0 and Qwen3OmniIncrementalCodec.supports(model):
+        incremental_codec = Qwen3OmniIncrementalCodec(model)
+        codec_pool = CodecStatePool(
+            incremental_codec.state_spec(),
+            num_slots=codec_state_slots,
+            capture_slots=max(int(max_replay_rows), 1),
+            ring_frames=incremental_codec.state_spec().retained_context
+            + stream_chunk_size,
+            device=concrete_device,
+            dtype=model.dtype,
+        )
+        pool_bytes = codec_pool.bytes_per_slot * (
+            codec_pool.num_slots + len(codec_pool.scratch_slots)
+        )
+        logger.info(
+            f"Code2Wav incremental decode: {codec_pool.num_slots} codec state slots, "
+            f"{codec_pool.bytes_per_slot / 2**20:.2f} MiB each, {pool_bytes / 2**20:.1f} MiB"
+        )
+    elif codec_state_slots > 0:
+        logger.info(
+            "Code2Wav incremental decode off: it needs the fused channels-last code2wav"
+        )
+    else:
+        pass
     cuda_graph_runner = None
     if enable_cuda_graph:
+        # note (ratish): with codec state slots a stateless window decodes only a stream the
+        # pool had no slot for, or one that ends before its first window: one row each.
         graph_keys = window_graph_keys(
             stream_chunk_size,
             left_context_size,
-            max(int(max_replay_rows), 1),
+            max(int(max_replay_rows), 1) if codec_pool is None else 1,
             initial_codec_chunk_frames,
         )
         # note (ratish): every length up to a full window is a threshold window or the
@@ -1181,6 +1350,19 @@ def create_code2wav_scheduler(
             )
             if key not in graph_keys
         )
+        if codec_pool is not None:
+            graph_keys += incremental_graph_keys(
+                stream_chunk_size,
+                max(int(max_replay_rows), 1),
+                initial_codec_chunk_frames,
+            )
+            # note (ratish): a stream with a slot ends on fewer new frames than a window.
+            final_window_keys += tuple(
+                GraphKey(batch_size=1, frames=frames, decode="next")
+                for frames in range(1, stream_chunk_size)
+            )
+        else:
+            pass
         cuda_graph_runner = Code2WavCudaGraphRunner.build(
             model,
             device=concrete_device,
@@ -1188,11 +1370,14 @@ def create_code2wav_scheduler(
             total_gpu_memory_fraction=total_gpu_memory_fraction,
             graph_keys=graph_keys,
             best_effort_keys=final_window_keys,
-            model_footprint_bytes=sum(
+            model_footprint_bytes=pool_bytes
+            + sum(
                 tensor.nbytes
                 for tensor in itertools.chain(model.parameters(), model.buffers())
             ),
             decode_stream=decode_stream,
+            incremental_codec=incremental_codec,
+            codec_pool=codec_pool,
         )
         logger.info(
             "Code2Wav device graph startup stats=%s",
@@ -1213,4 +1398,6 @@ def create_code2wav_scheduler(
         enable_cuda_graph=enable_cuda_graph,
         cuda_graph_runner=cuda_graph_runner,
         decode_stream=decode_stream,
+        incremental_codec=incremental_codec,
+        codec_pool=codec_pool,
     )
