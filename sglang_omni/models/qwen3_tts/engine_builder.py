@@ -11,9 +11,12 @@ from typing import TYPE_CHECKING, Protocol
 import numpy as np
 import numpy.typing as npt
 import torch
-from sglang.srt.arg_groups.model_override_base import resolved_view
+from sglang.srt.arg_groups.model_override_base import (
+    attention_backends_of,
+    resolved_view,
+)
 from sglang.srt.model_executor.cuda_graph_config import Phase, with_phase
-from sglang.srt.runtime_context import get_model, get_schedule
+from sglang.srt.runtime_context import get_model, get_platform, get_schedule
 from sglang.srt.server_args import ServerArgs
 
 from sglang_omni.model_runner.model_worker import ModelWorker
@@ -233,30 +236,49 @@ class Qwen3TtsEngineBuilder(TtsEngineBuilder[Qwen3TTSSGLangRequestData]):
     def customize_server_args(self, server_args: ServerArgs) -> None:
         cfg = resolved_view(server_args)
         prefill = cfg.cuda_graph_config.prefill
+        if (
+            prefill.backend not in (CudaGraphBackend.BREAKABLE, CudaGraphBackend.FULL)
+            or not prefill.bs
+        ):
+            return
+        else:
+            pass
+        prefill_fields: dict[str, list[int] | int] = {}
         # note (luojiaxuan): the derived ladder starts at 4 and a replay falls back
         # to eager when its bucket exceeds twice the real token count, so a prompt
         # cached up to its last token prefills one token eagerly; 1301 of 3203
         # prefills at 10 and 20 RPS on H100 CustomVoice were one token. A ladder
         # the operator declared is kept as declared.
         if (
-            prefill.backend not in (CudaGraphBackend.BREAKABLE, CudaGraphBackend.FULL)
-            or not prefill.bs
+            prefill.bs[0] != 1
+            and self.server_args_overrides.get("cuda_graph_bs_prefill") is None
+            and "bs" not in nested_prefill_overrides(self.server_args_overrides)
         ):
-            return
-        elif (
-            prefill.bs[0] == 1
-            or self.server_args_overrides.get("cuda_graph_bs_prefill") is not None
-            or "bs" in nested_prefill_overrides(self.server_args_overrides)
-        ):
-            return
+            prefill_fields["bs"] = [1, *prefill.bs]
         else:
+            pass
+        # note (ratish): an extend here carries up to every running request, and
+        # one with more requests than slots runs eagerly. Empty slots cost fa4
+        # little, so its full graph holds every running request; fa3 keeps
+        # SGLang's count, since its split KV combine runs over every slot.
+        if (
+            prefill.backend == CudaGraphBackend.FULL
+            and prefill.full_prefill_max_req is None
+            and attention_backends_of(cfg)[0] == "fa4"
+        ):
+            prefill_fields["full_prefill_max_req"] = cfg.max_running_requests
+        else:
+            pass
+        if prefill_fields:
             override_server_args(
                 server_args,
-                "qwen3_tts.one_token_prefill_bucket",
+                "qwen3_tts.prefill_cuda_graph_shape",
                 cuda_graph_config=with_phase(
-                    cfg.cuda_graph_config, Phase.PREFILL, bs=[1, *prefill.bs]
+                    cfg.cuda_graph_config, Phase.PREFILL, **prefill_fields
                 ),
             )
+        else:
+            pass
 
     def before_memory_pool(
         self,
@@ -353,6 +375,21 @@ class Qwen3TtsEngineBuilder(TtsEngineBuilder[Qwen3TTSSGLangRequestData]):
     def adjust_overrides(self, overrides: dict[str, object]) -> None:
         if is_truthy(overrides.get("enable_torch_compile", False)):
             raise ValueError("Qwen3-TTS torch.compile is not supported")
+        else:
+            pass
+        # note (ratish): on Hopper fa3 sizes split KV against the full graph's
+        # context-wide page table, so every replay up to bucket 768 runs a combine
+        # kernel over every request slot; fa4 does not split these shapes.
+        prefill_backend = nested_prefill_overrides(overrides).get(
+            "backend", overrides.get("cuda_graph_backend_prefill")
+        )
+        if (
+            prefill_backend == CudaGraphBackend.FULL
+            and overrides.get("attention_backend") is None
+            and overrides.get("prefill_attention_backend") is None
+            and get_platform().is_sm90
+        ):
+            overrides["prefill_attention_backend"] = "fa4"
         else:
             pass
 

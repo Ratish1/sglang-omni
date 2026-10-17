@@ -181,9 +181,14 @@ backend, VoiceDesign the breakable backend.
 
 `full` captures the whole prefill transformer, attention included, as one
 graph per token count. `breakable` captures the layers in segments and runs
-attention between them. `full` needs the `fa3` or `flashinfer` attention
+attention between them. `full` needs the `fa3`, `fa4` or `flashinfer` attention
 backend. With another attention backend, Base and CustomVoice use `breakable`,
 and an explicit `full` fails at startup.
+
+On Hopper GPUs the full graph runs its prefill attention on `fa4` and holds every
+running request, unless you set `--tts_engine.engine.attention_backend` or
+`--tts_engine.engine.prefill_attention_backend`. Decode keeps its own attention
+backend.
 
 The ladder reaches the chunked prefill size, which the server picks from the
 GPU's memory (8192 tokens on an 80 GB GPU), so prefills batched together under

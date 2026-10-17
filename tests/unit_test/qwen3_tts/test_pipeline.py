@@ -24,8 +24,11 @@ import torch
 from sglang.srt.arg_groups.cuda_graph_hook import (
     generate_prefill_cuda_graph_batch_sizes,
 )
-from sglang.srt.arg_groups.model_override_base import resolved_view
-from sglang.srt.runtime_context import get_context
+from sglang.srt.arg_groups.model_override_base import (
+    attention_backends_of,
+    resolved_view,
+)
+from sglang.srt.runtime_context import get_context, override_platform
 from sglang.srt.server_args import ServerArgs
 
 from sglang_omni.config.runtime import resolve_stage_factory_kwargs
@@ -683,14 +686,13 @@ def resolved_qwen3_tts_server_args(
     builder = Qwen3TtsEngineBuilder()
     builder.checkpoint_dir = str(checkpoint)
     builder.server_args_overrides = {"attention_backend": "fa3", **overrides}
+    stage_overrides = build_generation_batch_overrides(
+        server_args_overrides=builder.server_args_overrides,
+        **builder.generation_defaults(dtype="bfloat16"),
+    )
+    builder.adjust_overrides(stage_overrides)
     server_args = build_sglang_server_args(
-        str(checkpoint),
-        context_length=8192,
-        device="cuda",
-        **build_generation_batch_overrides(
-            server_args_overrides=builder.server_args_overrides,
-            **builder.generation_defaults(dtype="bfloat16"),
-        ),
+        str(checkpoint), context_length=8192, device="cuda", **stage_overrides
     )
     builder.customize_server_args(server_args)
     return server_args
@@ -717,6 +719,38 @@ def test_qwen3_tts_prefill_ladder_starts_at_one_and_reaches_the_chunk(
         *generate_prefill_cuda_graph_batch_sizes(resolved.chunked_prefill_size),
     ]
     assert prefill.full_prefill_max_req is None
+
+
+@pytest.mark.parametrize(
+    ("hopper", "slot_override", "expected_slots"),
+    [(True, None, "running"), (False, None, None), (True, 8, 8)],
+)
+def test_qwen3_tts_full_prefill_on_hopper_runs_fa4_with_a_slot_per_request(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    hopper: bool,
+    slot_override: int | None,
+    expected_slots: int | str | None,
+) -> None:
+    overrides: dict[str, object] = {
+        "attention_backend": None,
+        "decode_attention_backend": "fa3",
+    }
+    if slot_override is not None:
+        overrides["cuda_graph_config"] = {
+            "prefill": {"full_prefill_max_req": slot_override}
+        }
+    else:
+        pass
+    with override_platform(is_sm90=hopper):
+        server_args = resolved_qwen3_tts_server_args(tmp_path, monkeypatch, overrides)
+    resolved = resolved_view(server_args)
+
+    assert resolved.cuda_graph_config.prefill.backend == "full"
+    assert (attention_backends_of(resolved)[0] == "fa4") is hopper
+    assert resolved.cuda_graph_config.prefill.full_prefill_max_req == (
+        resolved.max_running_requests if expected_slots == "running" else expected_slots
+    )
 
 
 @pytest.mark.parametrize("backend", ["breakable", "full"])
