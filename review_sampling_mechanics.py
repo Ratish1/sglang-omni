@@ -109,9 +109,10 @@ def check_sampling() -> None:
         expected, _, _ = draw("pytorch", logits, seeds)
         actual, _, _ = draw("flashinfer", logits, seeds)
         assert torch.equal(actual, expected)
-        _, output, _ = draw("flashinfer", logits, None)
+        _, output, information = draw("flashinfer", logits, None)
         assert torch.equal(
-            output.next_token_logits, torch.softmax(logits / 0.7, dim=-1)
+            output.next_token_logits,
+            torch.softmax(logits.clone().div_(information.temperatures), dim=-1),
         )
         print(f"seeded-token-parity rows={rows}: passed", flush=True)
 
