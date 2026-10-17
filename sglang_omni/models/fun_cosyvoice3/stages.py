@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import bisect
 import contextlib
 import gc
 import importlib
@@ -51,6 +52,7 @@ from sglang_omni.models.fun_cosyvoice3.flow_estimator_trt import (
     execute_flow_estimator,
     is_flow_estimator_trt,
 )
+from sglang_omni.models.fun_cosyvoice3.hift_cuda_graph import HiftDecodeCudaGraphRunner
 from sglang_omni.models.fun_cosyvoice3.hift_kernels import (
     overlap_add_inverse,
     short_time_spectrum,
@@ -80,8 +82,15 @@ from sglang_omni.models.fun_cosyvoice3.request_builders import (
     cleanup_prepared_cosyvoice3_request,
     preprocess_cosyvoice3_payload,
 )
-from sglang_omni.models.fun_cosyvoice3.solve_graph_capture import SolveGraphCapture
-from sglang_omni.models.fun_cosyvoice3.streaming import TOKEN_HOP_LEN, TOKEN_MAX_HOP_LEN
+from sglang_omni.models.fun_cosyvoice3.solve_graph_capture import (
+    SolveGraphCapture,
+    row_tiers,
+)
+from sglang_omni.models.fun_cosyvoice3.streaming import (
+    PRE_LOOKAHEAD_LEN,
+    TOKEN_HOP_LEN,
+    TOKEN_MAX_HOP_LEN,
+)
 from sglang_omni.models.fun_cosyvoice3.whole_history_cuda_graph import (
     WholeHistoryCudaGraphRunner,
 )
@@ -1800,6 +1809,7 @@ class CosyVoice3Vocoder(BatchVocoderBase[FunCosyVoice3State, torch.Tensor]):
         self.hift_hold_frames = (
             hift.f0_predictor.condnet[0].causal_padding + hift.conv_pre_look_right + 1
         )
+        self.hift_decode_cuda_graph_runner: HiftDecodeCudaGraphRunner | None = None
         # note(ratish): the AR shares this process and the default stream; on its
         # own stream the vocoder's kernels and host copies do not queue behind the
         # AR's. It waits once for what the default stream holds at this point.
@@ -2132,6 +2142,19 @@ class CosyVoice3Vocoder(BatchVocoderBase[FunCosyVoice3State, torch.Tensor]):
         ]
         max_history_frames = max(history_frame_counts)
         max_window_frames = max(window_frame_counts)
+        runner = self.hift_decode_cuda_graph_runner
+        # note (ratish): a final from frame 0 needs both its own edges, so it keeps its
+        # width and the eager decode.
+        if runner is None or any(
+            window.row.is_final and window.start_frame == 0 for window in windows
+        ):
+            frame_tier = None
+        else:
+            frame_tier = runner.frame_tier(max_window_frames)
+        if frame_tier is not None:
+            max_window_frames = frame_tier
+        else:
+            pass
         mel_history = windows[0].row.history.new_zeros(
             len(windows), channels, max_history_frames
         )
@@ -2188,7 +2211,14 @@ class CosyVoice3Vocoder(BatchVocoderBase[FunCosyVoice3State, torch.Tensor]):
                     * samples_per_frame : history_frames
                     * samples_per_frame,
                 ]
-        speech = hift.decode(x=window_mel, s=window_source, finalize=True)
+        if frame_tier is None:
+            speech = None
+        else:
+            speech = runner.run(window_mel, window_source)
+        if speech is None:
+            speech = hift.decode(x=window_mel, s=window_source, finalize=True)
+        else:
+            pass
         speech = speech.detach().cpu()
         return [
             (
@@ -2340,6 +2370,7 @@ def create_vocoder_executor(
     enable_flow_cuda_graph: bool = True,
     enable_flow_prefix_cuda_graph: bool,
     enable_flow_whole_history_cuda_graph: bool,
+    enable_hift_cuda_graph: bool,
     flow_cuda_graph_capture_shapes: tuple[tuple[int, int], ...] | None = None,
     enable_flow_estimator_trt: bool = False,
     hift_dtype: str = "float32",
@@ -2512,21 +2543,29 @@ def create_vocoder_executor(
         and autocast_dtype in FA3_DTYPES
         and len(whole_history_tier_frames) > 0
     )
-    if has_prefix_graphs or has_whole_history_graphs:
+    # note (ratish): HiFT's decode captures only with its spectra kernels, which the
+    # vocoder gives a float32 HiFT on CUDA with Triton.
+    has_hift_graphs = (
+        enable_hift_cuda_graph
+        and device_obj.type == "cuda"
+        and HAS_TRITON
+        and vocoder.hift_autocast_dtype is None
+    )
+    if has_prefix_graphs or has_whole_history_graphs or has_hift_graphs:
         graph_backend = current_platform.get_device_graph_backend(device_obj)
-        assert graph_backend is not None and flow.packed_estimator is not None
-        assert autocast_dtype is not None
+        assert graph_backend is not None
         solve_graphs = SolveGraphCapture(
             graph_backend, device=device_obj, autocast_dtype=autocast_dtype
         )
     else:
         pass
+    token_mel_ratio = flow.token_mel_ratio
+    if disable_hop_growth:
+        longest_hop_tokens = token_hop_len
+    else:
+        longest_hop_tokens = token_max_hop_len
     if has_prefix_graphs:
-        token_mel_ratio = flow.token_mel_ratio
-        if disable_hop_growth:
-            longest_hop_tokens = token_hop_len
-        else:
-            longest_hop_tokens = token_max_hop_len
+        assert flow.packed_estimator is not None
         prefix_cuda_graph_runner = PrefixCudaGraphRunner(
             flow.packed_estimator,
             flow.prefix_pool,
@@ -2546,6 +2585,7 @@ def create_vocoder_executor(
     else:
         pass
     if has_whole_history_graphs:
+        assert flow.packed_estimator is not None
         whole_history_cuda_graph_runner = WholeHistoryCudaGraphRunner(
             flow.packed_estimator,
             graphs=solve_graphs,
@@ -2560,6 +2600,33 @@ def create_vocoder_executor(
         )
         whole_history_cuda_graph_runner.capture()
         flow.whole_history_cuda_graph_runner = whole_history_cuda_graph_runner
+    else:
+        pass
+    if has_hift_graphs:
+        # note (ratish): the shortest window is a first hop's; the longest a final's, the
+        # tokens after the last hop (less than a hop, and the lookahead) with the frames
+        # that hop held and the decode's context before them.
+        shortest_window_frames = token_hop_len * token_mel_ratio
+        longest_window_frames = (
+            (longest_hop_tokens + PRE_LOOKAHEAD_LEN - 1) * token_mel_ratio
+            + vocoder.hift_hold_frames
+            + HIFT_DECODE_CONTEXT_FRAMES
+        )
+        window_ladder = generate_prefill_cuda_graph_batch_sizes(
+            flow_batch_admission_frames
+        )
+        first_tier = bisect.bisect_left(window_ladder, shortest_window_frames)
+        last_tier = bisect.bisect_left(window_ladder, longest_window_frames)
+        hift_decode_cuda_graph_runner = HiftDecodeCudaGraphRunner(
+            hift,
+            graphs=solve_graphs,
+            mel_channels=flow.output_size,
+            samples_per_frame=vocoder.hift_samples_per_mel_frame,
+            row_tiers=row_tiers(max_batch_size),
+            frame_tiers=window_ladder[first_tier : last_tier + 1],
+        )
+        hift_decode_cuda_graph_runner.capture()
+        vocoder.hift_decode_cuda_graph_runner = hift_decode_cuda_graph_runner
     else:
         pass
     scheduler.warmup_now()
