@@ -188,8 +188,7 @@ and an explicit `full` fails at startup.
 The ladder reaches the chunked prefill size, which the server picks from the
 GPU's memory (8192 tokens on an 80 GB GPU), so prefills batched together under
 load still replay. It starts at `1` because a prompt that is already cached
-prefills a single token. A full graph has room for every running request
-(`max_running_requests`).
+prefills a single token.
 
 Opt out with `--tts_engine.engine.cuda_graph_backend_prefill disabled`. The
 default adds a few seconds of graph capture at startup. Setting

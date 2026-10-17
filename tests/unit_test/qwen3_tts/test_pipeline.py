@@ -716,9 +716,7 @@ def test_qwen3_tts_prefill_ladder_starts_at_one_and_reaches_the_chunk(
         1,
         *generate_prefill_cuda_graph_batch_sizes(resolved.chunked_prefill_size),
     ]
-    assert prefill.full_prefill_max_req == (
-        resolved.max_running_requests if backend == "full" else None
-    )
+    assert prefill.full_prefill_max_req is None
 
 
 @pytest.mark.parametrize("backend", ["breakable", "full"])
@@ -759,24 +757,6 @@ def test_qwen3_tts_keeps_a_declared_prefill_ladder(
     server_args = resolved_qwen3_tts_server_args(tmp_path, monkeypatch, overrides)
 
     assert resolved_view(server_args).cuda_graph_config.prefill.bs == [4, 8]
-
-
-def test_qwen3_tts_keeps_an_operator_full_prefill_slot_count(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    server_args = resolved_qwen3_tts_server_args(
-        tmp_path,
-        monkeypatch,
-        {
-            "cuda_graph_config": {
-                "prefill": {"backend": "full", "full_prefill_max_req": 8}
-            }
-        },
-    )
-
-    assert (
-        resolved_view(server_args).cuda_graph_config.prefill.full_prefill_max_req == 8
-    )
 
 
 @pytest.mark.parametrize("backend", ["breakable", "full"])
