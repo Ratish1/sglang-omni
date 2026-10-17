@@ -20,6 +20,19 @@ logger = logging.getLogger(__name__)
 CAPTURE_WARMUP_RUNS = 2
 
 
+def row_tiers(max_rows: int) -> list[int]:
+    """SGLang's decode ladder (1, 2, 4, 8, 12, then steps of 8) up to max_rows, which
+    is always a tier."""
+    return sorted(
+        {
+            rows
+            for rows in (1, 2, 4, 8, 12, *range(16, max_rows + 1, 8))
+            if rows <= max_rows
+        }
+        | {max_rows}
+    )
+
+
 class GraphSolve(Protocol):
     def __call__(self) -> torch.Tensor: ...
 
