@@ -22,6 +22,7 @@ import sglang.srt.managers.scheduler as sglang_scheduler_module
 import torch
 from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import ReqKvInfo
+from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.mem_cache.allocator.paged import PagedTokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import (
     CacheRequestHandle,
@@ -31,6 +32,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.runtime_context import get_context
 
 from sglang_omni.admission import QueueFullError
+from sglang_omni.model_runner.base import ModelRunner
 from sglang_omni.proto import OmniRequest, StagePayload
 from sglang_omni.proto.session import (
     SESSION_METADATA_KEY,
@@ -243,10 +245,6 @@ def test_review_start_replays_and_collects_on_the_requested_stream(
     should_run_on_top_priority_stream: bool, should_fail_loop: bool
 ) -> None:
     """The serving entry point must place real graph work on its selected stream."""
-    from sglang.srt.managers.scheduler import GenerationBatchResult
-
-    from sglang_omni.model_runner.base import ModelRunner
-
     outer_stream = torch.cuda.current_stream()
     capture_stream = torch.cuda.Stream()
     capture_stream.wait_stream(outer_stream)
