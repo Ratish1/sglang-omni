@@ -109,6 +109,7 @@ class FusedCode2WavTransformer(torch.nn.Module):
         self,
         transformer: Qwen3OmniMoeCode2WavTransformerModel,
         rope: JointRopeInplaceKernel,
+        max_positions: int,
     ) -> None:
         super().__init__()
         rotary = transformer.rotary_emb
@@ -118,7 +119,7 @@ class FusedCode2WavTransformer(torch.nn.Module):
         self.transformer = transformer
         self.rope = rope
         positions = torch.arange(
-            transformer.config.max_position_embeddings,
+            max_positions,
             device=rotary.inv_freq.device,
             dtype=torch.float32,
         )
@@ -328,9 +329,14 @@ class Qwen3OmniCode2Wav(Qwen3OmniMoeCode2Wav):
                 pass
         self.is_channels_last = True
 
-    def use_fused_transformer(self, rope: JointRopeInplaceKernel) -> None:
-        """Run the pre-transformer on fused kernels, with rope as its rotary kernel."""
-        self.pre_transformer = FusedCode2WavTransformer(self.pre_transformer, rope)
+    def use_fused_transformer(
+        self, rope: JointRopeInplaceKernel, max_positions: int
+    ) -> None:
+        """Run the pre-transformer on fused kernels, with rope as its rotary kernel for
+        frames at positions below max_positions."""
+        self.pre_transformer = FusedCode2WavTransformer(
+            self.pre_transformer, rope, max_positions
+        )
 
     def forward(self, codes: torch.Tensor) -> torch.Tensor:
         if not self.is_channels_last:

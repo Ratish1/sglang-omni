@@ -973,7 +973,7 @@ def test_qwen_code2wav_emits_full_chunk_despite_model_output_deficit() -> None:
 
 
 def make_tiny_code2wav(
-    device: str, dtype: torch.dtype, seed: int = 0
+    device: str, dtype: torch.dtype, seed: int = 0, max_position_embeddings: int = 8000
 ) -> Qwen3OmniCode2Wav:
     config = Qwen3OmniMoeCode2WavConfig(
         codebook_size=16,
@@ -987,6 +987,7 @@ def make_tiny_code2wav(
         upsampling_ratios=[2],
         decoder_dim=32,
         sliding_window=4,
+        max_position_embeddings=max_position_embeddings,
     )
     torch.manual_seed(seed)
     model = Qwen3OmniCode2Wav(config).eval()
@@ -1078,7 +1079,8 @@ def test_fused_code2wav_transformer_error_to_fp32_is_below_the_hf_error(
                 inputs_embeds=hidden_states.to(dtype)
             ).last_hidden_state
             model.use_fused_transformer(
-                current_platform.get_joint_rope_inplace_kernel()
+                current_platform.get_joint_rope_inplace_kernel(),
+                max_positions=model.config.max_position_embeddings,
             )
             actual = model.pre_transformer(
                 inputs_embeds=hidden_states.to(dtype)
@@ -1099,7 +1101,10 @@ SLOT_DECODES = pytest.mark.skipif(
 def make_fused_tiny_code2wav(seed: int = 0) -> Qwen3OmniCode2Wav:
     model = make_tiny_code2wav("cuda", torch.bfloat16, seed)
     model.use_channels_last()
-    model.use_fused_transformer(current_platform.get_joint_rope_inplace_kernel())
+    model.use_fused_transformer(
+        current_platform.get_joint_rope_inplace_kernel(),
+        max_positions=model.config.max_position_embeddings,
+    )
     snake_beta.fuse_vocoder_decoder(model.decoder)
     return model
 
@@ -1162,7 +1167,8 @@ def test_slot_decodes_error_to_fp32_is_the_fused_forward_error(
             model.to(torch.bfloat16)
             model.use_channels_last()
             model.use_fused_transformer(
-                current_platform.get_joint_rope_inplace_kernel()
+                current_platform.get_joint_rope_inplace_kernel(),
+                max_positions=model.config.max_position_embeddings,
             )
             snake_beta.fuse_vocoder_decoder(model.decoder)
             whole = model(codes)
@@ -1174,6 +1180,45 @@ def test_slot_decodes_error_to_fp32_is_the_fused_forward_error(
             (incremental.float() - reference).norm() / reference.norm()
         )
 
+    assert incremental_error <= 1.25 * whole_error
+
+
+@pytest.mark.accelerator
+@SLOT_DECODES
+def test_slot_decodes_rotate_frames_past_the_code2wav_config_positions(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A stream longer than the code2wav config's max_position_embeddings read its later
+    frames' rotary angles from past the end of the table."""
+    monkeypatch.setattr(torch.backends.cudnn, "allow_tf32", False)
+    hf_error = 0.0
+    whole_error = 0.0
+    incremental_error = 0.0
+    for seed in range(4):
+        model = make_tiny_code2wav(
+            "cuda", torch.float32, seed, max_position_embeddings=8
+        )
+        codes = torch.randint(0, 16, (2, 2, 30), device="cuda")
+        with torch.inference_mode():
+            reference = model(codes)
+            model.to(torch.bfloat16)
+            expected = model(codes)
+            model.use_channels_last()
+            model.use_fused_transformer(
+                current_platform.get_joint_rope_inplace_kernel(), max_positions=30
+            )
+            snake_beta.fuse_vocoder_decoder(model.decoder)
+            whole = model(codes)
+            incremental = decode_in_parts(
+                Code2WavIncrementalDecoder(model), codes, (10, 10, 10)
+            )
+        hf_error += float((expected.float() - reference).norm() / reference.norm())
+        whole_error += float((whole.float() - reference).norm() / reference.norm())
+        incremental_error += float(
+            (incremental.float() - reference).norm() / reference.norm()
+        )
+
+    assert whole_error <= hf_error
     assert incremental_error <= 1.25 * whole_error
 
 
