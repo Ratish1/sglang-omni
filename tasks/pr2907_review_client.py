@@ -83,7 +83,7 @@ async def main(label: str) -> None:
                     json={
                         "run_id": f"review2907-{label}",
                         "trace_path_template": str(
-                            OUTPUT_DIRECTORY / f"{label}-{{stage}}-{{rank}}.json"
+                            OUTPUT_DIRECTORY / f"{label}-{{stage}}"
                         ),
                         "event_dir": str(OUTPUT_DIRECTORY / f"{label}-events"),
                     },
