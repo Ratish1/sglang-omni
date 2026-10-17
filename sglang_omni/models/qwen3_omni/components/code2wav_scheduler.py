@@ -1325,7 +1325,8 @@ def create_code2wav_scheduler(
         )
     elif codec_state_slots > 0:
         logger.info(
-            "Code2Wav incremental decode off: it needs the fused channels-last code2wav"
+            "Code2Wav incremental decode off: it needs the fused bf16 channels-last code2wav "
+            "and fused SnakeBeta"
         )
     else:
         pass

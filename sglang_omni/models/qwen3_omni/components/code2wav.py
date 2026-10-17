@@ -404,7 +404,7 @@ class Qwen3OmniIncrementalCodec:
     def __init__(self, model: Qwen3OmniCode2Wav) -> None:
         assert self.supports(
             model
-        ), "slot decodes need the fused channels-last code2wav"
+        ), "slot decodes need the fused bf16 channels-last code2wav and fused SnakeBeta"
         self.model = model
         self.rope_store = current_platform.get_rope_kv_store_kernel()
         self.paged_attention = current_platform.get_paged_window_attention()
@@ -423,10 +423,17 @@ class Qwen3OmniIncrementalCodec:
 
     @staticmethod
     def supports(model: Qwen3OmniCode2Wav) -> bool:
-        """Slot decodes run the fused transformer on channels-last activations."""
+        """Slot decodes run the fused transformer and the fused SnakeBeta decoder blocks on
+        bf16 channels-last activations."""
         return (
             isinstance(model.pre_transformer, FusedCode2WavTransformer)
             and model.is_channels_last
+            and model.dtype == torch.bfloat16
+            and all(
+                isinstance(module, FusedSnakeBeta)
+                for module in model.decoder.modules()
+                if isinstance(module, (SnakeBeta, FusedSnakeBeta))
+            )
         )
 
     def state_spec(self) -> CodecStateSpec:
