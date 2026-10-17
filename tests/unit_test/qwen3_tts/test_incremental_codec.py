@@ -778,7 +778,7 @@ def test_incremental_codec_cuda_graph_matches_eager_state(
     assert stats["enabled"] is True
     assert stats["binding"]["mode"] == mode
     assert stats["build"]["captured_keys"] == [
-        {"fresh_frames": 2, "batch_bucket": batch_bucket}
+        {"fresh_frames": 2, "batch_bucket": batch_bucket, "first_decode": False}
     ]
     for step in range(10):
         codes = (

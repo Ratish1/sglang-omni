@@ -14,7 +14,10 @@ from typing import Literal, TypedDict
 
 import torch
 
-from sglang_omni.models.qwen3_tts.incremental_codec import Qwen3TTSIncrementalDecoder
+from sglang_omni.models.qwen3_tts.incremental_codec import (
+    Qwen3TTSIncrementalDecoder,
+    Qwen3TTSSlotDecodes,
+)
 from sglang_omni.platforms import current_platform
 from sglang_omni.platforms.device_graph import (
     DeviceGraphBackend,
@@ -67,10 +70,11 @@ class CodecStateStats(TypedDict, total=False):
 
 @dataclass(frozen=True, slots=True)
 class IncrementalCodecGraphKey:
-    """One fixed incremental Codec execution shape."""
+    """One fixed incremental Codec execution shape; a pool's first decode reads no slot."""
 
     fresh_frames: int
     batch_bucket: int
+    first_decode: bool = False
 
 
 @dataclass(slots=True)
@@ -78,6 +82,7 @@ class CapturedIncrementalCodecGraph:
     graph: ReplayableGraph
     static_codes: torch.Tensor
     static_index: torch.Tensor
+    scratch_index: torch.Tensor
     waveform: torch.Tensor
     static_valid_frames: torch.Tensor | None = None
 
@@ -157,13 +162,21 @@ class Qwen3TTSIncrementalCodecCudaGraphRunner:
         min_free_gb: float = 3.0,
         enabled: bool = True,
         compile_fresh_frames: Sequence[int] = (),
-        arena: CodecStateArena,
+        arena: CodecStateArena | None = None,
+        slot_decodes: Qwen3TTSSlotDecodes | None = None,
         graph_pool: IncrementalCodecGraphPool,
         emit_frames: int = 0,
     ) -> None:
+        assert (arena is None) != (
+            slot_decodes is None
+        ), "a runner decodes against an arena or a pool"
+        assert not (
+            slot_decodes is not None and compile_fresh_frames
+        ), "slot decodes run uncompiled"
         self.decoder = decoder
         self.compile_fresh_frames = frozenset((int(f) for f in compile_fresh_frames))
         self.arena = arena
+        self.slot_decodes = slot_decodes
         self.graph_pool = graph_pool
         self.device = torch.device(device)
         self.dtype = dtype
@@ -191,6 +204,14 @@ class Qwen3TTSIncrementalCodecCudaGraphRunner:
             )
         else:
             self.tail_frames = 0
+        # note (ratish): on a pool a stream's first decode reads no slot, so it is its own graph;
+        # a window split's first piece is one and the pieces after it are not.
+        if slot_decodes is None:
+            self.decode_kinds: tuple[bool, ...] = (False,)
+        elif self.mode == "window":
+            self.decode_kinds = (True, False)
+        else:
+            self.decode_kinds = (self.mode in ("cold", "tail"),)
         self.batch_sizes = tuple(
             sorted({int(size) for size in batch_sizes if int(size) > 0})
         )
@@ -234,9 +255,10 @@ class Qwen3TTSIncrementalCodecCudaGraphRunner:
             pass
         self.capture_complete = True
         keys = [
-            IncrementalCodecGraphKey(frames, batch_size)
+            IncrementalCodecGraphKey(frames, batch_size, first_decode)
             for frames in self.fresh_frames
             for batch_size in self.batch_sizes
+            for first_decode in self.decode_kinds
         ]
         temporary: dict[IncrementalCodecGraphKey, CapturedIncrementalCodecGraph] = {}
         pool: DeviceGraphPool | None = None
@@ -294,9 +316,14 @@ class Qwen3TTSIncrementalCodecCudaGraphRunner:
         logger.info(
             "Qwen3-TTS incremental Codec graphs captured for %s",
             [
-                (key.fresh_frames, key.batch_bucket)
+                (key.fresh_frames, key.batch_bucket, key.first_decode)
                 for key in sorted(
-                    self.graphs, key=lambda item: (item.fresh_frames, item.batch_bucket)
+                    self.graphs,
+                    key=lambda item: (
+                        item.fresh_frames,
+                        item.batch_bucket,
+                        item.first_decode,
+                    ),
                 )
             ],
         )
@@ -356,7 +383,8 @@ class Qwen3TTSIncrementalCodecCudaGraphRunner:
             self.warmup_capture_shape(key, static_codes, static_valid_frames, resources)
             current_stream = self.device_module.current_stream(self.device)
             compiled = key.fresh_frames in self.compile_fresh_frames
-            static_index = self.scratch_index(key.batch_bucket)
+            scratch_index = self.scratch_index(key.batch_bucket)
+            static_index = scratch_index.clone()
             resources.keepalives.append(static_index)
             if static_valid_frames is not None:
                 resources.keepalives.append(static_valid_frames)
@@ -373,11 +401,13 @@ class Qwen3TTSIncrementalCodecCudaGraphRunner:
                     ) as graph,
                 ):
                     resources.keepalives.append(graph)
-                    state = self.arena.gather_by_index(static_index)
-                    waveform = self.decode_captured(
-                        static_codes, static_valid_frames, state, compiled=compiled
+                    waveform = self.decode_state(
+                        static_codes,
+                        static_valid_frames,
+                        static_index,
+                        first_decode=key.first_decode,
+                        compiled=compiled,
                     )
-                    self.arena.scatter_by_index(static_index, state)
             finally:
                 self.device_module.set_stream(current_stream)
             resources.keepalives.append(waveform)
@@ -387,6 +417,7 @@ class Qwen3TTSIncrementalCodecCudaGraphRunner:
                 graph=graph,
                 static_codes=static_codes,
                 static_index=static_index,
+                scratch_index=scratch_index,
                 waveform=waveform,
                 static_valid_frames=static_valid_frames,
             )
@@ -419,15 +450,56 @@ class Qwen3TTSIncrementalCodecCudaGraphRunner:
             else:
                 pass
             for _ in range(self.WARMUP_ITERATIONS):
-                warmup_state = self.arena.gather_by_index(
-                    self.scratch_index(key.batch_bucket)
-                )
-                resources.keepalives.append(warmup_state)
-                self.decode_captured(
-                    static_codes, static_valid_frames, warmup_state, compiled=compiled
-                )
+                if self.slot_decodes is not None:
+                    self.decode_state(
+                        static_codes,
+                        static_valid_frames,
+                        self.scratch_index(key.batch_bucket),
+                        first_decode=key.first_decode,
+                        compiled=False,
+                    )
+                else:
+                    warmup_state = self.arena.gather_by_index(
+                        self.scratch_index(key.batch_bucket)
+                    )
+                    resources.keepalives.append(warmup_state)
+                    self.decode_captured(
+                        static_codes,
+                        static_valid_frames,
+                        warmup_state,
+                        compiled=compiled,
+                    )
         capture_stream.synchronize()
         del resources.keepalives[1:]
+
+    def decode_state(
+        self,
+        codes: torch.Tensor,
+        valid_frames: torch.Tensor | None,
+        index: torch.Tensor,
+        *,
+        first_decode: bool,
+        compiled: bool,
+    ) -> torch.Tensor:
+        """A captured graph's body: the decode against the pool's slots or the arena's rows that
+        index names, their state advanced in place."""
+        if self.slot_decodes is not None:
+            slot_decoder, pool = self.slot_decodes.decoder, self.slot_decodes.pool
+            if valid_frames is not None:
+                return slot_decoder.decode_tail_slots(
+                    codes, valid_frames, pool, index, self.emit_frames
+                )
+            else:
+                return slot_decoder.decode_slots(
+                    codes, pool, index, first_decode=first_decode
+                )
+        else:
+            state = self.arena.gather_by_index(index)
+            waveform = self.decode_captured(
+                codes, valid_frames, state, compiled=compiled
+            )
+            self.arena.scatter_by_index(index, state)
+            return waveform
 
     def decode_captured(
         self,
@@ -564,24 +636,39 @@ class Qwen3TTSIncrementalCodecCudaGraphRunner:
             return max((key.batch_bucket for key in self.graphs), default=0)
 
     def scratch_index(self, bucket: int) -> torch.Tensor:
-        return torch.full(
-            (int(bucket),),
-            int(self.arena.scratch_slot),
-            dtype=torch.long,
-            device=self.device,
-        )
+        """The slots a capture's rows, and a replay's rows past its cohort, decode against: the
+        arena's one scratch row, or one pool scratch slot per row, since rows sharing a slot
+        would race inside a launch."""
+        if self.slot_decodes is not None:
+            scratch_slots = self.slot_decodes.pool.scratch_slots
+            assert (
+                len(scratch_slots) >= bucket
+            ), "one pool scratch slot per captured row"
+            return torch.tensor(
+                scratch_slots[: int(bucket)], dtype=torch.long, device=self.device
+            )
+        else:
+            return torch.full(
+                (int(bucket),),
+                int(self.arena.scratch_slot),
+                dtype=torch.long,
+                device=self.device,
+            )
 
     def decode_slots(
         self,
         codes: torch.Tensor,
         slots: Sequence[int],
         valid_frames: Sequence[int] | None = None,
+        *,
+        first_decode: bool = False,
     ) -> torch.Tensor | None:
-        """Replay the bucket that fits this cohort directly against the arena.
+        """Replay the bucket that fits this cohort directly against the arena or the pool.
 
         Returns the borrowed waveform rows, or None on a graph miss. Rows past
-        the cohort read and write the arena's scratch row. A tail runner takes each
+        the cohort read and write scratch slots. A tail runner takes each
         row's valid width and replays the smallest captured width that holds the codes.
+        On a pool, first_decode picks a stream's first decode; an arena has one kind.
         """
         if os.getpid() != self.owner_pid:
             raise RuntimeError(
@@ -630,12 +717,13 @@ class Qwen3TTSIncrementalCodecCudaGraphRunner:
             return None
         else:
             pass
+        kind = first_decode if self.slot_decodes is not None else False
         bucket = next(
             (
                 size
                 for size in self.batch_sizes
                 if size >= batch_size
-                and IncrementalCodecGraphKey(width, size) in self.graphs
+                and IncrementalCodecGraphKey(width, size, kind) in self.graphs
             ),
             None,
         )
@@ -645,10 +733,13 @@ class Qwen3TTSIncrementalCodecCudaGraphRunner:
             return None
         else:
             pass
-        entry = self.graphs[IncrementalCodecGraphKey(width, bucket)]
-        entry.static_index[:batch_size].copy_(self.arena.stage_index(slots))
+        entry = self.graphs[IncrementalCodecGraphKey(width, bucket, kind)]
+        slot_allocator = (
+            self.slot_decodes.pool if self.slot_decodes is not None else self.arena
+        )
+        entry.static_index[:batch_size].copy_(slot_allocator.stage_index(slots))
         if batch_size < bucket:
-            entry.static_index[batch_size:].fill_(int(self.arena.scratch_slot))
+            entry.static_index[batch_size:].copy_(entry.scratch_index[batch_size:])
             entry.static_codes[batch_size:].zero_()
         else:
             pass
@@ -659,7 +750,7 @@ class Qwen3TTSIncrementalCodecCudaGraphRunner:
             pass
         if entry.static_valid_frames is not None:
             entry.static_valid_frames[:batch_size].copy_(
-                self.arena.staged("valid_frames", valid_frames)
+                slot_allocator.staged("valid_frames", valid_frames)
             )
             entry.static_valid_frames[batch_size:].fill_(width)
         else:
@@ -719,7 +810,8 @@ class Qwen3TTSIncrementalCodecCudaGraphRunner:
     def stats(self) -> IncrementalCodecGraphStats:
         with self.graphs_lock:
             captured_keys = sorted(
-                self.graphs, key=lambda key: (key.fresh_frames, key.batch_bucket)
+                self.graphs,
+                key=lambda key: (key.fresh_frames, key.batch_bucket, key.first_decode),
             )
             fallback_counts = dict(sorted(self.misses.items()))
         return {
@@ -740,7 +832,11 @@ class Qwen3TTSIncrementalCodecCudaGraphRunner:
             "build": {
                 "capture_complete": self.capture_complete,
                 "captured_keys": [
-                    {"fresh_frames": key.fresh_frames, "batch_bucket": key.batch_bucket}
+                    {
+                        "fresh_frames": key.fresh_frames,
+                        "batch_bucket": key.batch_bucket,
+                        "first_decode": key.first_decode,
+                    }
                     for key in captured_keys
                 ],
             },
