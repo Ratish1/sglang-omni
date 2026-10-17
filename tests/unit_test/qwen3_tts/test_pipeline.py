@@ -86,6 +86,8 @@ from sglang_omni.utils.incremental_codec import (
 )
 from tests.unit_test.fakes import FakeExecutionBridge
 
+TALKER_CONFIG = {"max_position_embeddings": 32768}
+
 
 def placeholder_prompt_constants(
     custom_voice_speaker_embeds: dict[str, torch.Tensor] | None = None,
@@ -464,7 +466,7 @@ def test_qwen3_tts_engine_attaches_the_vocoder_speech_tokenizer_before_the_pool(
     monkeypatch.setattr(
         qwen3_stages,
         "load_qwen3_tts_checkpoint_config",
-        lambda model_path: {"tts_model_type": "base"},
+        lambda model_path: {"tts_model_type": "base", "talker_config": TALKER_CONFIG},
     )
     monkeypatch.setattr(
         qwen3_stages, "Qwen3TTSStreamingVocoderScheduler", FakeScheduler
@@ -2263,7 +2265,7 @@ def test_qwen3_tts_vocoder_batches_decode_requests(
     monkeypatch.setattr(
         stages,
         "load_qwen3_tts_checkpoint_config",
-        lambda model_path: {"tts_model_type": "base"},
+        lambda model_path: {"tts_model_type": "base", "talker_config": TALKER_CONFIG},
     )
     warmed_schedulers: list[Qwen3TTSStreamingVocoderScheduler] = []
     monkeypatch.setattr(
@@ -2340,7 +2342,7 @@ def test_qwen3_tts_vocoder_factory_forwards_incremental_graph_config(
     monkeypatch.setattr(
         qwen3_stages,
         "load_qwen3_tts_checkpoint_config",
-        lambda model_path: {"tts_model_type": "base"},
+        lambda model_path: {"tts_model_type": "base", "talker_config": TALKER_CONFIG},
     )
 
     scheduler = qwen3_stages.create_vocoder_executor(
@@ -2398,6 +2400,7 @@ def vocoder_factory_capture(
         lambda model_path: {
             "tts_model_type": tts_model_type,
             "tts_model_size": tts_model_size,
+            "talker_config": TALKER_CONFIG,
         },
     )
     qwen3_stages.create_vocoder_executor("model", device=device, **factory_kwargs)
@@ -5222,7 +5225,7 @@ def test_qwen3_tts_vocoder_factory_forwards_chunk_ramp(
     monkeypatch.setattr(
         stages,
         "load_qwen3_tts_checkpoint_config",
-        lambda model_path: {"tts_model_type": "base"},
+        lambda model_path: {"tts_model_type": "base", "talker_config": TALKER_CONFIG},
     )
     monkeypatch.setattr(
         Qwen3TTSStreamingVocoderScheduler, "warmup_now", lambda scheduler: None
