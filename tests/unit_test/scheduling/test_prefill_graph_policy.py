@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import logging
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
@@ -11,6 +12,9 @@ import pytest
 from sglang.srt.arg_groups.cuda_graph_hook import (
     generate_prefill_cuda_graph_batch_sizes,
 )
+from sglang.srt.arg_groups.model_override_base import resolved_view
+from sglang.srt.server_args import ServerArgs
+from transformers import Qwen2Config
 from typing_extensions import TypedDict, Unpack
 
 from sglang_omni.scheduling.generation_batch_policy import (
@@ -20,6 +24,104 @@ from sglang_omni.scheduling.generation_batch_policy import (
     validate_generation_batch_policy,
 )
 from sglang_omni.vendor.sglang.server_args import override_server_args
+
+
+@pytest.fixture
+def review_checkpoint(tmp_path: Path) -> str:
+    configuration = Qwen2Config(
+        architectures=["Qwen2ForCausalLM"],
+        hidden_size=128,
+        intermediate_size=256,
+        num_hidden_layers=2,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        vocab_size=128,
+        max_position_embeddings=8192,
+        tts_model_type="base",
+    )
+    configuration.save_pretrained(tmp_path)
+    return str(tmp_path)
+
+
+def review_resolve_qwen_configuration(
+    checkpoint: str, overrides: dict[str, object]
+) -> ServerArgs:
+    from sglang_omni.models.qwen3_tts.engine_builder import Qwen3TtsEngineBuilder
+    from sglang_omni.scheduling.sglang_backend.server_args_builder import (
+        build_sglang_server_args,
+    )
+
+    builder = Qwen3TtsEngineBuilder()
+    builder.checkpoint_dir = checkpoint
+    fields = build_generation_batch_overrides(
+        **builder.generation_defaults(dtype="bfloat16"),
+        server_args_overrides={"attention_backend": "fa3", **overrides},
+    )
+    arguments = build_sglang_server_args(checkpoint, context_length=8192, **fields)
+    builder.customize_server_args(arguments)
+    return arguments
+
+
+@pytest.mark.parametrize("backend", ["breakable", "full"])
+@pytest.mark.parametrize("declaration", ["flat", "nested"])
+def test_review_explicit_generated_looking_ladder_remains_explicit(
+    review_checkpoint: str, backend: str, declaration: str
+) -> None:
+    """An explicit bucket list retains ownership even if it matches a generator."""
+    if declaration == "flat":
+        overrides = {
+            "cuda_graph_backend_prefill": backend,
+            "cuda_graph_bs_prefill": [4, 8],
+            "cuda_graph_max_bs_prefill": 8,
+        }
+    else:
+        overrides = {
+            "cuda_graph_config": {
+                "prefill": {"backend": backend, "bs": [4, 8], "max_bs": 8}
+            }
+        }
+    arguments = review_resolve_qwen_configuration(review_checkpoint, overrides)
+    assert resolved_view(arguments).cuda_graph_config.prefill.bs == [4, 8]
+
+
+@pytest.mark.parametrize("backend", ["breakable", "full"])
+def test_review_one_token_prefill_cap_is_valid(
+    review_checkpoint: str, backend: str
+) -> None:
+    """A cap for the cached one-token extend must remain a valid startup policy."""
+    arguments = review_resolve_qwen_configuration(
+        review_checkpoint,
+        {"cuda_graph_backend_prefill": backend, "cuda_graph_max_bs_prefill": 1},
+    )
+    validate_generation_batch_policy(
+        model_name="Qwen3-TTS",
+        server_args=arguments,
+        allowed_prefill_backends=("breakable", "full"),
+    )
+    assert resolved_view(arguments).cuda_graph_config.prefill.bs == [1]
+
+
+@pytest.mark.parametrize("backend", ["breakable", "full"])
+def test_review_default_config_covers_card_chunk_and_running_requests(
+    review_checkpoint: str, backend: str
+) -> None:
+    """Resolved capture limits cover the scheduler without an explicit ladder."""
+    arguments = review_resolve_qwen_configuration(
+        review_checkpoint, {"cuda_graph_backend_prefill": backend}
+    )
+    resolved = resolved_view(arguments)
+    prefill = resolved.cuda_graph_config.prefill
+    validate_generation_batch_policy(
+        model_name="Qwen3-TTS",
+        server_args=arguments,
+        allowed_prefill_backends=("breakable", "full"),
+    )
+    assert prefill.bs[0] == 1
+    assert prefill.bs[-1] == prefill.max_bs == resolved.chunked_prefill_size
+    if backend == "full":
+        assert prefill.full_prefill_max_req == resolved.max_running_requests
+    else:
+        assert prefill.full_prefill_max_req is None
 
 
 class AttentionBackendOverrides(TypedDict, total=False):
