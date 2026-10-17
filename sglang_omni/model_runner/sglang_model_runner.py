@@ -24,6 +24,9 @@ from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.model_executor.model_runner_components.layer_setup import (
     AttentionAndMoeLayers,
 )
+from sglang.srt.model_executor.runner.decode_cuda_graph_runner import (
+    DecodeCudaGraphRunner,
+)
 from sglang.srt.model_executor.runner.prefill_cuda_graph_runner import (
     PrefillCudaGraphRunner,
 )
@@ -362,6 +365,7 @@ class SGLModelRunner(ModelRunner):
         self.weight_ipc_leader_monitor = None
         self.extra_prefill_graph_attention_layers: list[RadixAttention] = []
         self.prefill_graph_runner_class: type[PrefillCudaGraphRunner] | None = None
+        self.decode_graph_runner_class: type[DecodeCudaGraphRunner] | None = None
         self.register_omni_model()
         register_flashinfer_seeded_sampler()
 
@@ -621,6 +625,16 @@ class SGLModelRunner(ModelRunner):
                     *[None] * len(extra_layers),
                 ],
             )
+
+    def _decode_cuda_graph_runner_cls(  # noqa: leading-underscore  # upstream spelling, or the public name is already taken
+        self,
+    ) -> type[DecodeCudaGraphRunner]:
+        if self.decode_graph_runner_class is not None:
+            return self.decode_graph_runner_class
+        else:
+            return (
+                super()._decode_cuda_graph_runner_cls()
+            )  # noqa: leading-underscore  # upstream spelling, or the public name is already taken
 
     def prefill_cuda_graph_runner_cls(self) -> type[PrefillCudaGraphRunner] | None:
         is_breakable = (

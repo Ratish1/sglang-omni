@@ -10,6 +10,7 @@ from typing import Any
 import pytest
 import torch
 from sglang.srt.managers.schedule_batch import ReqKvInfo
+from sglang.srt.runtime_context import get_context
 from sglang.srt.sampling.penaltylib.repetition_penalty import apply_scaling_penalties
 from sglang.srt.utils import DynamicGradMode
 from torch import nn
@@ -19,6 +20,8 @@ import sglang_omni.models.qwen3_omni.components.talker as talker_module
 from sglang_omni.model_runner.prefill_inputs import get_omni_prefill_inputs
 from sglang_omni.model_runner.thinker_model_runner import ThinkerModelRunner
 from sglang_omni.models.qwen3_omni.components.talker import (
+    FLASHINFER_DRAW,
+    SEEDED_DRAW,
     Qwen3OmniTalker,
     bind_default_weight_loaders,
 )
@@ -26,6 +29,7 @@ from sglang_omni.models.qwen3_omni.components.talker_input import build_assistan
 from sglang_omni.models.qwen3_omni.components.talker_prefill import TalkerPrefillBuilder
 from sglang_omni.models.qwen3_omni.config import TALKER_START_MIN_CHUNKS
 from sglang_omni.models.qwen3_omni.request_builders import build_sglang_talker_request
+from sglang_omni.models.qwen3_omni.talker_decode_graph import TalkerDrawGraphVariants
 from sglang_omni.models.qwen3_omni.talker_model_runner import QwenTalkerModelRunner
 from sglang_omni.models.qwen3_omni.talker_scheduler import (
     MIN_PARTIAL_START_CHUNKS,
@@ -1689,7 +1693,6 @@ def test_rollback_decode_prep_after_skip_is_noop_for_prefill_batches() -> None:
 def test_prepare_for_decode_rollback_type_contract_with_upstream(monkeypatch) -> None:
     schedule_batch_mod = pytest.importorskip("sglang.srt.managers.schedule_batch")
     ScheduleBatch = schedule_batch_mod.ScheduleBatch
-    from sglang.srt.runtime_context import get_context
 
     batch = ScheduleBatch.__new__(ScheduleBatch)
     reqs = [
@@ -2306,6 +2309,61 @@ def test_talker_prepare_decode_buffers_unseeded_seed_is_rank_shared() -> None:
     )
 
 
+@pytest.mark.parametrize(
+    "seeds, variant",
+    [((None, None), FLASHINFER_DRAW), ((None, 5), SEEDED_DRAW), ((3, 5), SEEDED_DRAW)],
+)
+def test_talker_decode_replays_the_seeded_draw_only_for_a_batch_with_a_request_seed(
+    seeds: tuple[int | None, ...], variant: str
+) -> None:
+    fake = talker_seed_self()
+    requests = [talker_seed_req(seed, f"r{row}") for row, seed in enumerate(seeds)]
+
+    Qwen3OmniTalker.prepare_decode_buffers(fake, requests)
+
+    assert TalkerDrawGraphVariants(fake).select(SimpleNamespace()) == variant
+
+
+@pytest.mark.accelerator
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_flashinfer_draw_replayed_in_a_graph_draws_afresh_within_the_top_k() -> None:
+    rows, vocab, top_k = 4, 64, 8
+    device = torch.device("cuda")
+    fake = SimpleNamespace(
+        sampling_temperatures=torch.ones(rows, 1, device=device),
+        sampling_top_ks=torch.full((rows,), top_k, dtype=torch.int32, device=device),
+        sampling_top_ps=torch.ones(rows, device=device),
+        sampled_token_ids=torch.zeros(rows, dtype=torch.long, device=device),
+        flashinfer_seed=torch.full((1,), 1234, dtype=torch.int64, device=device),
+        flashinfer_offset=torch.zeros(1, dtype=torch.int64, device=device),
+    )
+    logits = torch.randn(
+        rows, vocab, device=device, generator=torch.Generator(device).manual_seed(0)
+    )
+    tokens = torch.zeros(rows, dtype=torch.long, device=device)
+
+    def draw() -> None:
+        tokens.copy_(Qwen3OmniTalker.draw_with_flashinfer(fake, logits.clone()))
+
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        draw()
+    torch.cuda.current_stream().wait_stream(stream)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        draw()
+    replayed = []
+    for _ in range(32):
+        graph.replay()
+        replayed.append(tokens.clone())
+    replayed = torch.stack(replayed)
+
+    top_k_ids = logits.topk(top_k, dim=-1).indices
+    assert all(len(set(replayed[:, row].tolist())) > 1 for row in range(rows))
+    assert bool((replayed[..., None] == top_k_ids).any(-1).all())
+
+
 def talker_prep_req(
     rid: str,
     *,
@@ -2688,7 +2746,8 @@ def test_talker_precompile_leaves_the_first_prefill_samples_nothing_to_compile()
         ),
     )
     torch.compiler.reset()
-    Qwen3OmniTalker.precompile_kernels_after_loading(fake)
+    with get_context().override_server_args(sampling_backend="flashinfer"):
+        Qwen3OmniTalker.precompile_kernels_after_loading(fake)
     compiled = counters["stats"]["unique_graphs"]
 
     with DynamicGradMode():

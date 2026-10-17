@@ -18,7 +18,7 @@ import sglang_omni.models.qwen3_omni.stages as qwen_stages
 from sglang_omni.platforms import current_platform
 
 
-def thinker_sampling_backend() -> str:
+def cuda_sampling_backend() -> str:
     return "flashinfer" if current_platform.is_cuda() else "pytorch"
 
 
@@ -175,7 +175,7 @@ def patch_thinker_startup(monkeypatch) -> list[dict[str, object]]:
     def fake_server_args_builder(model_path, context_length, **overrides):
         assert model_path == "dummy"
         assert context_length is None
-        assert overrides["sampling_backend"] == thinker_sampling_backend()
+        assert overrides["sampling_backend"] == cuda_sampling_backend()
         return SimpleNamespace(
             mem_fraction_static=overrides["mem_fraction_static"],
             sampling_backend=overrides["sampling_backend"],
@@ -470,7 +470,7 @@ def test_qwen_colocated_thinker_startup_threads_effective_budget(
     assert scheduler_calls == [
         {
             "mem_fraction_static": 0.70,
-            "sampling_backend": thinker_sampling_backend(),
+            "sampling_backend": cuda_sampling_backend(),
             "gpu_id": 0,
             "total_gpu_memory_fraction": 0.70,
         }
@@ -496,7 +496,7 @@ def test_qwen_colocated_thinker_explicit_mem_fraction_skips_default_reserve(
     assert scheduler_calls == [
         {
             "mem_fraction_static": 0.75,
-            "sampling_backend": thinker_sampling_backend(),
+            "sampling_backend": cuda_sampling_backend(),
             "gpu_id": 0,
             "total_gpu_memory_fraction": 0.75,
         }
@@ -647,7 +647,7 @@ def test_qwen_talker_ar_threads_explicit_generation_batch_policy(monkeypatch) ->
             "disable_cuda_graph": not current_platform.enable_talker_graph(),
             "enable_torch_compile": False,
             "max_running_requests": 32,
-            "sampling_backend": "pytorch",
+            "sampling_backend": cuda_sampling_backend(),
             "torch_compile_max_bs": 32,
             "tp_size": 1,
             "cuda_graph_backend_prefill": prefill_backend,
@@ -658,7 +658,7 @@ def test_qwen_talker_ar_threads_explicit_generation_batch_policy(monkeypatch) ->
     assert scheduler_calls == [
         {
             "gpu_id": 0,
-            "sampling_backend": "pytorch",
+            "sampling_backend": cuda_sampling_backend(),
             "max_running_requests": 32,
             "cuda_graph_max_bs": 32,
             "cuda_graph_bs": [1, 2, 4, 8, 12, 16, 24, 32],

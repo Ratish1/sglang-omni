@@ -11,12 +11,16 @@ import torch
 from sglang.kernels.fused_op import get_fused_op_backend
 from sglang.kernels.spec import KernelBackend
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
-from sglang.srt.model_executor.runner_utils.capture_mode import get_is_capture_mode
+from sglang.srt.model_executor.runner_utils.capture_mode import (
+    get_capture_attention_variant,
+    get_is_capture_mode,
+)
 from sglang.srt.model_loader.weight_utils import default_weight_loader
-from sglang.srt.runtime_context import get_context, get_schedule
+from sglang.srt.runtime_context import get_context, get_exec, get_schedule
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import add_prefix
+from sglang.srt.utils.async_probe import sanitize_nan_logits
 from torch import nn
 
 from sglang_omni.models.qwen3_omni.components.thinker_model import (
@@ -62,7 +66,17 @@ from sglang_omni.vendor.sglang.layers import (
 from sglang_omni.vendor.sglang.models import FusedSetKVBufferArg, apply_qk_norm
 from sglang_omni.vendor.sglang.utils import make_layers
 
+if current_platform.is_cuda():
+    from flashinfer.sampling import top_k_top_p_sampling_from_probs
+else:
+    pass
+
 logger = logging.getLogger(__name__)
+
+# The talker's decode graph variants: a batch with a request seed keeps the seeded
+# PyTorch draw, any other batch draws with FlashInfer.
+SEEDED_DRAW = "seeded_draw"
+FLASHINFER_DRAW = "flashinfer_draw"
 
 
 def bind_default_weight_loaders(module: nn.Module) -> None:
@@ -974,6 +988,12 @@ class Qwen3OmniTalker(nn.Module):
             dtype=torch.int64,
             device=device,
         )
+        # note (ratish): FlashInfer's draw reads its seed and offset from device tensors,
+        # so a captured decode graph draws afresh on every replay; the graph advances the
+        # offset, and the bootstrap writes the ranks' shared seed.
+        self.flashinfer_seed = torch.zeros(1, dtype=torch.int64, device=device)
+        self.flashinfer_offset = torch.zeros(1, dtype=torch.int64, device=device)
+        self.decode_has_request_seed = False
         # Note (akazaakane): int64-typed; rows 0-3 hold floats bit-cast via
         # .view(torch.float64) so one copy covers both float and int params.
         # Note (akazaakane): device="cpu" is required — model init runs under
@@ -1160,6 +1180,10 @@ class Qwen3OmniTalker(nn.Module):
             else:
                 pass
 
+        self.decode_has_request_seed = any(
+            sched_req.data.req.sampling_params.sampling_seed is not None
+            for sched_req in requests
+        )
         if self.sampling_staging_event is not None:
             # Note (akazaakane): guards the prior async copy still reading
             # this buffer before we overwrite it.
@@ -1408,6 +1432,8 @@ class Qwen3OmniTalker(nn.Module):
         )
         if self.sampler is None:
             return torch.argmax(logits, dim=-1)
+        elif self.draws_with_flashinfer():
+            return self.draw_with_flashinfer(logits)
         else:
             pass
         sampling_info = self.build_static_sampling_info(batch_size)
@@ -1424,6 +1450,34 @@ class Qwen3OmniTalker(nn.Module):
         else:
             pass
         return sampled
+
+    def draws_with_flashinfer(self) -> bool:
+        """Whether this decode draws with FlashInfer: on the flashinfer backend, while
+        capturing its graph variant, else for a batch without a request seed."""
+        if get_exec().kernel.sampling_backend != "flashinfer":
+            return False
+        elif get_is_capture_mode():
+            return get_capture_attention_variant() == FLASHINFER_DRAW
+        else:
+            return not self.decode_has_request_seed
+
+    def draw_with_flashinfer(self, logits: torch.Tensor) -> torch.Tensor:
+        """The rows' tokens by FlashInfer's joint top-k, top-p draw from the logits as
+        sglang's sampler prepares them, the random offset advanced by as much as
+        FlashInfer advances it for a call."""
+        batch_size = logits.shape[0]
+        sanitize_nan_logits(logits, "sampler: next_token_logits")
+        logits.div_(self.sampling_temperatures[:batch_size])
+        sampled = top_k_top_p_sampling_from_probs(
+            torch.softmax(logits, dim=-1),
+            self.sampling_top_ks[:batch_size],
+            self.sampling_top_ps[:batch_size],
+            filter_apply_order="joint",
+            seed=self.flashinfer_seed,
+            offset=self.flashinfer_offset,
+        )
+        self.flashinfer_offset.add_(batch_size * 32)
+        return sampled.to(self.sampled_token_ids.dtype)
 
     def build_static_sampling_info(self, batch_size: int) -> SamplingBatchInfo:
         return SamplingBatchInfo(
@@ -1933,12 +1987,16 @@ class Qwen3OmniTalker(nn.Module):
 
     def precompile_kernels_after_loading(self) -> None:
         """Compile the repetition penalty a request's first sample would compile, on the
-        float32 logits it receives."""
+        float32 logits it receives, and load FlashInfer's sampling module when it draws
+        the unseeded requests."""
         compile_sampler_functions(
             SamplerCompileForms(
                 device=self.model.codec_embedding.weight.device,
                 vocab_size=self.config.text_config.vocab_size,
                 penalized_logits_dtype=torch.float32,
+                should_load_flashinfer_sampling=(
+                    get_exec().kernel.sampling_backend == "flashinfer"
+                ),
             )
         )
 

@@ -145,6 +145,9 @@ def create_talker_scheduler(
     from sglang_omni.models.qwen3_omni.request_builders import (
         make_talker_scheduler_adapters,
     )
+    from sglang_omni.models.qwen3_omni.talker_decode_graph import (
+        TalkerDecodeCudaGraphRunner,
+    )
     from sglang_omni.models.qwen3_omni.talker_model_runner import QwenTalkerModelRunner
     from sglang_omni.models.qwen3_omni.talker_scheduler import (
         QwenTalkerScheduler,
@@ -195,7 +198,16 @@ def create_talker_scheduler(
     else:
         pass
     model_worker.model_runner.model.sampler = model_worker.model_runner.sampler
+    # note (ratish): every rank shares the worker's random seed, so the ranks' FlashInfer
+    # draws give the same tokens.
+    model_worker.model_runner.model.flashinfer_seed.fill_(model_worker.random_seed)
     if want_cuda_graph:
+        if server_args.sampling_backend == "flashinfer":
+            model_worker.model_runner.decode_graph_runner_class = (
+                TalkerDecodeCudaGraphRunner
+            )
+        else:
+            pass
         # note (ratish): capture after binding the sampler so decode graphs record it.
         init_sglang_cuda_graphs(model_worker)
         if prefill_graph_backend == CudaGraphBackend.BREAKABLE:
