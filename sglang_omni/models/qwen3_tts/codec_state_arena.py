@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import threading
 from collections.abc import Sequence
 from typing import TYPE_CHECKING, TypedDict
 
@@ -12,8 +11,7 @@ from sglang_omni.models.qwen3_tts.incremental_codec import (
     Qwen3TTSIncrementalCodecState,
     Qwen3TTSIncrementalDecoder,
 )
-from sglang_omni.utils.cuda_staging import PinnedTransferSlot
-from sglang_omni.utils.device import supports_device_streams
+from sglang_omni.scheduling.codec_state_pool import CodecSlotAllocator
 
 if TYPE_CHECKING:
     from sglang_omni.models.qwen3_tts.incremental_codec_cuda_graph import (
@@ -47,7 +45,7 @@ class CodecStateStats(TypedDict, total=False):
     cuda_graphs: CodecCudaGraphStats
 
 
-class Qwen3TTSCodecStateArena:
+class Qwen3TTSCodecStateArena(CodecSlotAllocator):
     """Bounded, reusable storage for per-stream incremental Codec state.
 
     Every buffer from ``Qwen3TTSIncrementalDecoder.state_spec`` carries a
@@ -68,35 +66,17 @@ class Qwen3TTSCodecStateArena:
         device: torch.device,
         dtype: torch.dtype,
     ) -> None:
-        if num_slots <= 0:
-            raise ValueError("Qwen3-TTS codec state arena needs at least one slot")
-        else:
-            pass
+        super().__init__(num_slots=num_slots, device=device)
         self.decoder = decoder
-        self.device = torch.device(device)
-        self.device_module = torch.get_device_module(self.device)
         self.dtype = dtype
-        self._num_slots = int(num_slots)  # noqa: leading-underscore
         self.scratch_slot = self._num_slots  # noqa: leading-underscore
         self.storage = decoder.init_state(
             self._num_slots + 1,
             device=self.device,
             dtype=dtype,  # noqa: leading-underscore
         )
-        self.lock = threading.Lock()
-        self.staging = threading.local()
-        self.release_events: dict[int, torch.Event] = {}
-        self.free: list[int] = list(
-            reversed(range(self._num_slots))
-        )  # noqa: leading-underscore
-        self.retired: set[int] = set()
-        self._exhausted_count = 0  # noqa: leading-underscore
         spec = decoder.state_spec()
         self._bytes_per_slot = spec.bytes_per_stream(dtype)  # noqa: leading-underscore
-
-    @property
-    def num_slots(self) -> int:
-        return self._num_slots  # noqa: leading-underscore
 
     @property
     def bytes_per_slot(self) -> int:
@@ -106,70 +86,14 @@ class Qwen3TTSCodecStateArena:
     def total_bytes(self) -> int:
         return self._bytes_per_slot * self._num_slots  # noqa: leading-underscore
 
-    @property
-    def exhausted_count(self) -> int:
-        return self._exhausted_count  # noqa: leading-underscore
-
-    def active_slots(self) -> int:
-        with self.lock:
-            return (
-                self._num_slots - len(self.free) - len(self.retired)
-            )  # noqa: leading-underscore
-
     def acquire(self) -> int | None:
-        """Take a zeroed slot, or ``None`` when the arena is full."""
-        with self.lock:
-            if not self.free:
-                self._exhausted_count += 1  # noqa: leading-underscore
-                return None
-            else:
-                pass
-            slot = self.free.pop()
-            released = self.release_events.pop(slot, None)
-        if released is not None:
-            self.device_module.current_stream(self.device).wait_event(released)
+        """Take a zeroed slot, or None when the arena is full."""
+        slot = super().acquire()
+        if slot is not None:
+            self.zero_slot(slot)
         else:
             pass
-        self.zero_slot(slot)
         return slot
-
-    def release(self, slot: int) -> None:
-        released = None
-        if supports_device_streams(self.device):
-            released = self.device_module.Event()
-            released.record(self.device_module.current_stream(self.device))
-        else:
-            pass
-        with self.lock:
-            if slot in self.retired:
-                return
-            else:
-                pass
-            if slot in self.free:
-                raise RuntimeError(
-                    f"Qwen3-TTS codec state slot {slot} was released twice"
-                )
-            else:
-                pass
-            if released is not None:
-                self.release_events[slot] = released
-            else:
-                pass
-            self.free.append(slot)
-
-    def retire(self, slot: int) -> None:
-        """Withdraw a slot for the life of the process.
-
-        Note (Qihao Liu): used when a decode that touched the slot could not be
-        proven complete, so its memory must never be handed to later work.
-        """
-        with self.lock:
-            self.retired.add(slot)
-            self.release_events.pop(slot, None)
-            if slot in self.free:
-                self.free.remove(slot)
-            else:
-                pass
 
     def _buffers(self, state: Qwen3TTSIncrementalCodecState) -> list[torch.Tensor]:
         return [
@@ -186,58 +110,6 @@ class Qwen3TTSCodecStateArena:
             [buffer[slot] for buffer in self._buffers(self.storage)]
         )
         self.storage.frame_positions[slot].zero_()
-
-    STAGING_RING = 4
-
-    def staged(self, name: str, values: Sequence[int]) -> torch.Tensor:
-        if not supports_device_streams(self.device):
-            return torch.as_tensor(list(values), dtype=torch.long)
-        else:
-            pass
-        count = len(values)
-        if count == 0:
-            raise ValueError("Qwen3-TTS codec state arena needs at least one slot")
-        else:
-            pass
-        ring = getattr(self.staging, f"{name}_ring", None)
-        if ring is None:
-            ring = [
-                (
-                    PinnedTransferSlot(
-                        self.device,
-                        torch.long,
-                        initial_capacity=self._num_slots
-                        + 1,  # noqa: leading-underscore
-                    ),
-                    torch.empty(
-                        self._num_slots + 1,
-                        dtype=torch.long,
-                        device=self.device,  # noqa: leading-underscore
-                    ),
-                )
-                for _ in range(self.STAGING_RING)
-            ]
-            setattr(self.staging, f"{name}_ring", ring)
-            setattr(self.staging, f"{name}_turn", 0)
-        else:
-            pass
-        turn = (getattr(self.staging, f"{name}_turn") + 1) % self.STAGING_RING
-        setattr(self.staging, f"{name}_turn", turn)
-        transfer, device = ring[turn]
-        # note (Zhuofeng-Li): a wrapped host slot may still be supplying its copy.
-        if transfer.recorded:
-            transfer.synchronize()
-        else:
-            pass
-        host = transfer.view(count)
-        host.copy_(torch.as_tensor(list(values), dtype=torch.long))
-        device[:count].copy_(host, non_blocking=True)
-        transfer.record(self.device_module.current_stream(self.device))
-        return device[:count]
-
-    def stage_index(self, slots: Sequence[int]) -> torch.Tensor:
-        """Stage a cohort's slot ids on the device without a host sync."""
-        return self.staged("index", slots)
 
     def gather(self, slots: Sequence[int]) -> Qwen3TTSIncrementalCodecState:
         """Select a cohort's rows into one contiguous state."""
