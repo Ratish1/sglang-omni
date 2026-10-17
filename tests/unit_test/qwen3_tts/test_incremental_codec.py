@@ -1686,6 +1686,25 @@ def test_tail_slot_decode_leaves_each_row_where_its_valid_frames_end() -> None:
 
 @pytest.mark.accelerator
 @SLOT_DECODES
+def test_a_first_decode_wider_than_the_ring_keeps_its_last_frames() -> None:
+    """A first decode wider than the ring wrote two of its frames' K/V to one ring row in one
+    launch."""
+    slot_decoder = make_slot_decoder(make_tiny_tts_decoder(0))
+    codes = torch.randint(0, 16, (2, 2, 20), device="cuda")
+    narrow = make_tts_pool(slot_decoder, 2, 4)
+    slot_index = torch.arange(2, device="cuda")
+
+    with torch.inference_mode():
+        actual = decode_tts_in_parts(
+            slot_decoder, codes, (12, 4, 4), narrow, slot_index
+        )
+        expected = decode_tts_in_parts(slot_decoder, codes, (12, 4, 4))
+
+    assert torch.equal(actual, expected)
+
+
+@pytest.mark.accelerator
+@SLOT_DECODES
 def test_padded_rows_decode_from_the_first_frame_every_time() -> None:
     """A scratch slot's position grew with every padded replay until the rope kernel read past
     its table."""

@@ -565,6 +565,37 @@ class Qwen3TTSSlotDecoder:
         )
         return transformer.output_proj(hidden_states).view(batch_size, length, -1)
 
+    @staticmethod
+    def first_decode_addresses(
+        slot_index: torch.Tensor,
+        valid_frames: torch.Tensor | int,
+        width: int,
+        pool: CodecStatePool,
+    ) -> RingAddresses:
+        """A first decode's ring addresses for width frames from position 0: only the last
+        retained frames before valid_frames (one count, or a (rows, 1) column) are read again,
+        so only theirs go to the ring and every other frame's K/V goes to the dump row. A width
+        past the ring would otherwise write two frames to one row in one launch."""
+        addresses = ring_addresses(
+            slot_index,
+            torch.zeros_like(slot_index),
+            width,
+            pool.ring_frames,
+            pool.retained_frames,
+        )
+        frame_offsets = torch.arange(width, device=slot_index.device)[None, :]
+        kept = (frame_offsets < valid_frames) & (
+            frame_offsets >= valid_frames - pool.retained_frames
+        )
+        return replace(
+            addresses,
+            write_rows=torch.where(
+                kept.expand(int(slot_index.shape[0]), width).reshape(-1),
+                addresses.write_rows,
+                pool.dump_row,
+            ),
+        )
+
     def decode_slots(
         self,
         codes: torch.Tensor,
@@ -579,15 +610,21 @@ class Qwen3TTSSlotDecoder:
         new_frames = int(codes.shape[-1])
         if first_decode:
             start_positions = torch.zeros_like(slot_index)
+            addresses = self.first_decode_addresses(
+                slot_index, new_frames, new_frames, pool
+            )
         else:
+            assert (
+                new_frames + pool.retained_frames <= pool.ring_frames
+            ), "a later decode's window and new frames fit the ring"
             start_positions = pool.frame_positions[slot_index]
-        addresses = ring_addresses(
-            slot_index,
-            start_positions,
-            new_frames,
-            pool.ring_frames,
-            pool.retained_frames,
-        )
+            addresses = ring_addresses(
+                slot_index,
+                start_positions,
+                new_frames,
+                pool.ring_frames,
+                pool.retained_frames,
+            )
         slots = SlotDecode(pool=pool, slot_index=slot_index, is_cold=first_decode)
         quantized = self.decoder.quantizer.decode(codes).transpose(1, 2)
         hidden_states = self.transformer_frames(
@@ -623,18 +660,8 @@ class Qwen3TTSSlotDecoder:
         frames, and every other frame's K/V goes to the pool's dump row."""
         width = int(codes.shape[-1])
         start_positions = torch.zeros_like(slot_index)
-        addresses = ring_addresses(
-            slot_index, start_positions, width, pool.ring_frames, pool.retained_frames
-        )
-        frame_offsets = torch.arange(width, device=codes.device)[None, :]
-        kept = (frame_offsets < valid_frames[:, None]) & (
-            frame_offsets >= valid_frames[:, None] - pool.retained_frames
-        )
-        addresses = replace(
-            addresses,
-            write_rows=torch.where(
-                kept.reshape(-1), addresses.write_rows, pool.dump_row
-            ),
+        addresses = self.first_decode_addresses(
+            slot_index, valid_frames[:, None], width, pool
         )
         slots = SlotDecode(pool=pool, slot_index=slot_index, is_cold=True)
         quantized = self.decoder.quantizer.decode(codes).transpose(1, 2)
