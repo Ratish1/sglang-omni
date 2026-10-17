@@ -35,6 +35,11 @@ from sglang_omni.utils.channels_last_conv import (
     channels_last_weight,
 )
 from sglang_omni.utils.codec_pool_stack import SlotDecode, pool_conv_stack
+from sglang_omni.utils.codec_slot_transformer import (
+    merge_layer_weights,
+    rope_cos_sin_table,
+    slot_transformer_layers,
+)
 from sglang_omni.utils.codec_state_pool import (
     CodecStatePool,
     RingAddresses,
@@ -118,33 +123,12 @@ class FusedCode2WavTransformer(torch.nn.Module):
         assert rotary.rope_type == "default", "the cos/sin table is built once"
         self.transformer = transformer
         self.rope = rope
-        positions = torch.arange(
-            max_positions,
-            device=rotary.inv_freq.device,
-            dtype=torch.float32,
-        )
-        angles = torch.outer(positions, rotary.inv_freq.float())
         self.register_buffer(
             "cos_sin_cache",
-            torch.cat((angles.cos(), angles.sin()), dim=-1) * rotary.attention_scaling,
+            rope_cos_sin_table(rotary, max_positions),
             persistent=False,
         )
-        # note (ratish): q, k, v and gate, up become views of one matrix each, so the
-        # fused GEMMs read the loaded weights without a second copy.
-        for layer in transformer.layers:
-            attention, mlp = layer.self_attn, layer.mlp
-            projections = (attention.q_proj, attention.k_proj, attention.v_proj)
-            attention.qkv_weight = torch.cat([p.weight.data for p in projections])
-            start = 0
-            for projection in projections:
-                rows = projection.weight.shape[0]
-                projection.weight.data = attention.qkv_weight[start : start + rows]
-                start += rows
-            mlp.gate_up_weight = torch.cat(
-                (mlp.gate_proj.weight.data, mlp.up_proj.weight.data)
-            )
-            mlp.gate_proj.weight.data = mlp.gate_up_weight[: mlp.intermediate_size]
-            mlp.up_proj.weight.data = mlp.gate_up_weight[mlp.intermediate_size :]
+        merge_layer_weights(transformer.layers)
 
     def forward(self, inputs_embeds: torch.Tensor) -> BaseModelOutputWithPast:
         batch_size, length, hidden_size = inputs_embeds.shape
@@ -227,84 +211,17 @@ class FusedCode2WavTransformer(torch.nn.Module):
         stores every layer's new K/V in the rows' rings; a first decode attends to its own
         frames, a later one to its window in the ring."""
         batch_size, length, hidden_size = inputs_embeds.shape
-        head_dim = self.transformer.layers[0].self_attn.head_dim
-        sliding_window = self.transformer.config.sliding_window
-        if length <= sliding_window:
-            window_mask = None
-        else:
-            query = torch.arange(length, device=inputs_embeds.device)[:, None]
-            key = torch.arange(length, device=inputs_embeds.device)[None, :]
-            window_mask = (key <= query) & (query - key < sliding_window)
-        hidden_states = inputs_embeds.reshape(batch_size * length, hidden_size)
-        for layer_index, layer in enumerate(self.transformer.layers):
-            attention = layer.self_attn
-            residual = hidden_states
-            normed = rmsnorm(
-                hidden_states,
-                layer.input_layernorm.weight,
-                layer.input_layernorm.variance_epsilon,
-            )
-            query, key, value = F.linear(normed, attention.qkv_weight).split(
-                [
-                    attention.q_proj.out_features,
-                    attention.k_proj.out_features,
-                    attention.v_proj.out_features,
-                ],
-                dim=-1,
-            )
-            query = query.view(batch_size * length, -1, head_dim)
-            key = key.view(batch_size * length, -1, head_dim)
-            value = value.view(batch_size * length, -1, head_dim)
-            rope_store(
-                query,
-                key,
-                value,
-                pool.keys[layer_index],
-                pool.values[layer_index],
-                self.cos_sin_cache,
-                addresses.frame_positions,
-                addresses.write_rows,
-                is_neox=True,
-            )
-            if first_decode:
-                attended = F.scaled_dot_product_attention(
-                    query.view(batch_size, length, -1, head_dim).transpose(1, 2),
-                    key.view(batch_size, length, -1, head_dim).transpose(1, 2),
-                    value.view(batch_size, length, -1, head_dim).transpose(1, 2),
-                    attn_mask=window_mask,
-                    is_causal=window_mask is None,
-                    scale=attention.scaling,
-                    enable_gqa=attention.num_key_value_groups > 1,
-                ).transpose(1, 2)
-            else:
-                attended = paged_attention(
-                    query.view(batch_size, length, -1, head_dim),
-                    pool.keys[layer_index].view(-1, 1, key.shape[1], head_dim),
-                    pool.values[layer_index].view(-1, 1, key.shape[1], head_dim),
-                    page_table=addresses.window_rows,
-                    cache_seqlens=addresses.window_lengths,
-                    softmax_scale=attention.scaling,
-                    causal=True,
-                    window_size=(pool.retained_frames, 0),
-                )
-            attended = attended.reshape(batch_size * length, -1)
-            hidden_states = torch.addcmul(
-                residual,
-                layer.self_attn_layer_scale.scale,
-                F.linear(attended, attention.o_proj.weight),
-            )
-            residual = hidden_states
-            normed = rmsnorm(
-                hidden_states,
-                layer.post_attention_layernorm.weight,
-                layer.post_attention_layernorm.variance_epsilon,
-            )
-            activated = silu_and_mul(F.linear(normed, layer.mlp.gate_up_weight))
-            hidden_states = torch.addcmul(
-                residual,
-                layer.mlp_layer_scale.scale,
-                F.linear(activated, layer.mlp.down_proj.weight),
-            )
+        hidden_states = slot_transformer_layers(
+            self.transformer.layers,
+            inputs_embeds,
+            pool,
+            addresses,
+            self.cos_sin_cache,
+            first_decode=first_decode,
+            sliding_window=self.transformer.config.sliding_window,
+            rope_store=rope_store,
+            paged_attention=paged_attention,
+        )
         hidden_states = rmsnorm(
             hidden_states,
             self.transformer.norm.weight,
