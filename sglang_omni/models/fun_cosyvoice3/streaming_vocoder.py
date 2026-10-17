@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import logging
 import time
+from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Literal, Mapping
@@ -49,6 +50,8 @@ from sglang_omni.utils.audio_payload import audio_waveform_payload
 logger = logging.getLogger(__name__)
 
 SAMPLE_RATE = 24000
+# note (ratish): the window of SGLang's RecentPrefillBatchSizeTracker.
+RECENT_STEP_WINDOW = 16
 
 NextDecode = Literal["causal_window", "leftover", "fallback", "wait"]
 
@@ -124,6 +127,7 @@ class FunCosyVoice3StreamingVocoderScheduler(
             self.disable_hop_growth = bool(disable_hop_growth)
             self.vocoder = vocoder
             self.clock: Callable[[], float] = time.monotonic
+            self.recent_step_seconds: deque[float] = deque(maxlen=RECENT_STEP_WINDOW)
         super().__init__(
             self.vocode_payload,
             batch_compute_fn=self.vocode_payloads,
@@ -136,8 +140,18 @@ class FunCosyVoice3StreamingVocoderScheduler(
         )
 
     def pump_one_step(self) -> list[str] | None:
+        started = self.clock()
         with self.vocoder.stream_context:
-            return super().pump_one_step()
+            failed = super().pump_one_step()
+        if failed is not None:
+            self.recent_step_seconds.append(self.clock() - started)
+        else:
+            pass
+        return failed
+
+    def expected_step_seconds(self) -> float:
+        """The longest of the vocoder's recent step walls, 0 before its first step."""
+        return max(self.recent_step_seconds, default=0.0)
 
     async def vocode_payload(self, payload: StagePayload) -> StagePayload:
         results = await self.vocoder.decode_payloads([payload])
@@ -419,8 +433,26 @@ class FunCosyVoice3StreamingVocoderScheduler(
                     now - state.first_emit_at
                 )
                 started.append((playback_slack, state.ready_since, request_id, state))
-        ranked = [(request_id, state) for _, _, request_id, state in sorted(started)]
+        step_seconds = self.expected_step_seconds()
+        is_first_hop_ready = any(
+            state.next_decode() == "causal_window" for _, _, state in unstarted
+        )
+        ranked: list[tuple[str, CosyVoice3StreamState]] = []
+        finals_not_due: list[tuple[str, CosyVoice3StreamState]] = []
+        for playback_slack, _, request_id, state in sorted(started):
+            # note (ratish): a final step takes no first hop along, whose listener is
+            # waiting now; a final whose stream holds more audio than a step takes lets
+            # the ready first hops go first.
+            if (
+                is_first_hop_ready
+                and state.next_decode() == "leftover"
+                and playback_slack > step_seconds
+            ):
+                finals_not_due.append((request_id, state))
+            else:
+                ranked.append((request_id, state))
         ranked += [(request_id, state) for _, request_id, state in sorted(unstarted)]
+        ranked += finals_not_due
         if not ranked:
             return []
         else:

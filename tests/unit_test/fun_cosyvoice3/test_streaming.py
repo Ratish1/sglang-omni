@@ -27,7 +27,9 @@ from sglang_omni.models.fun_cosyvoice3.streaming import (
     tokens_needed_for_causal_chunk,
 )
 from sglang_omni.models.fun_cosyvoice3.streaming_vocoder import (
+    CosyVoice3StreamState,
     FunCosyVoice3StreamingVocoderScheduler,
+    NextDecode,
 )
 from sglang_omni.pipeline.stage.stream_queue import StreamItem
 from sglang_omni.proto import OmniRequest, StagePayload
@@ -668,6 +670,42 @@ def test_finals_rank_by_slack_with_the_other_started_streams() -> None:
     assert stream_ids(drain(scheduler)) == ["req-a", "req-c"]
     assert estimator_calls(flow)[-1]["streaming"] is False
     assert "req-c" not in scheduler.stream_states
+
+
+def test_ready_first_hop_runs_before_a_final_that_is_not_due() -> None:
+    flow, scheduler = make_scheduler()
+    clock = Clock()
+    scheduler.clock = clock
+    step_seconds = 2**-11
+    run_step = scheduler.run_step
+
+    def timed_run_step(
+        participants: list[tuple[str, CosyVoice3StreamState]], plan: NextDecode
+    ) -> dict[str, torch.Tensor]:
+        clock.now += step_seconds
+        return run_step(participants, plan)
+
+    scheduler.run_step = timed_run_step
+    for request_id in ("req-a", "req-b"):
+        scheduler.handle_streaming_new_request(request_id, stream_payload(request_id))
+    scheduler.ingest_stream_item("req-a", item(list(range(28))))
+    assert serve(scheduler) == 1
+    scheduler.handle_stream_done("req-a")
+    scheduler.ingest_stream_item("req-b", item(list(range(28))))
+    state = scheduler.stream_states["req-a"]
+    half_a_step_of_audio_left_at = (
+        state.first_emit_at
+        + state.speech_offset / scheduler.sample_rate
+        - step_seconds / 2
+    )
+
+    assert [request_id for request_id, _ in scheduler.select_step_participants()] == [
+        "req-b"
+    ]
+    clock.now = half_a_step_of_audio_left_at
+    assert [request_id for request_id, _ in scheduler.select_step_participants()] == [
+        "req-a"
+    ]
 
 
 def test_stream_done_defers_the_final_to_a_step() -> None:
