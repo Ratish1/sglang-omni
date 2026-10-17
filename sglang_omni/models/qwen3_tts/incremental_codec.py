@@ -10,6 +10,9 @@ from typing import TYPE_CHECKING
 import torch
 import torch.nn.functional as F
 
+from sglang_omni.models.qwen3_omni.components.incremental_codec import (
+    conv_stack_state_layout,
+)
 from sglang_omni.scheduling.codec_state_pool import CodecStateSpec
 from sglang_omni.utils.channels_last_conv import (
     channels_last_conv1d,
@@ -727,31 +730,11 @@ class Qwen3TTSIncrementalDecoder:
 
     def build_state_spec(self) -> CodecStateSpec:
         decoder = self.decoder
-        conv: list[tuple[str, int, int]] = []
-        transconv: list[tuple[str, int, int]] = []
-
-        def add_conv(module: "Qwen3TTSTokenizerV2CausalConvNet", key: str) -> None:
-            conv.append((key, int(module.conv.in_channels), int(module.padding)))
-
-        def add_transconv(
-            module: "Qwen3TTSTokenizerV2CausalTransConvNet", key: str
-        ) -> None:
-            transconv.append(
-                (key, int(module.conv.out_channels), int(module.right_pad))
-            )
-
-        add_conv(decoder.pre_conv, "pre_conv")
-        for stage_index, blocks in enumerate(decoder.upsample):
-            add_transconv(blocks[0], f"upsample.{stage_index}.transconv")
-            add_conv(blocks[1].dwconv, f"upsample.{stage_index}.convnext.dwconv")
-        add_conv(decoder.decoder[0], "decoder.0")
-        for block_index, decoder_block in enumerate(decoder.decoder[1:-2], start=1):
-            add_transconv(decoder_block.block[1], f"decoder.{block_index}.transconv")
-            for residual_index, residual in enumerate(decoder_block.block[2:]):
-                key = f"decoder.{block_index}.residual.{residual_index}"
-                add_conv(residual.conv1, f"{key}.conv1")
-                add_conv(residual.conv2, f"{key}.conv2")
-        add_conv(decoder.decoder[-1], "decoder.final")
+        pre_conv = decoder.pre_conv
+        conv, transconv = conv_stack_state_layout(decoder)
+        conv.insert(
+            0, ("pre_conv", int(pre_conv.conv.in_channels), int(pre_conv.padding))
+        )
 
         transformer = decoder.pre_transformer
         attention = transformer.layers[0].self_attn
