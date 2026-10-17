@@ -54,7 +54,7 @@ def test_zeroing_capture_slots_leaves_every_other_slot() -> None:
     for tensor in [*pool.histories.values(), *pool.overlaps.values()]:
         assert not tensor[3:].any() and tensor[:3].all()
     for ring in [*pool.keys, *pool.values]:
-        assert not ring[3 * 8 :].any() and ring[: 3 * 8].all()
+        assert not ring[3 * 8 : pool.dump_row].any() and ring[: 3 * 8].all()
     assert pool.frame_positions.tolist() == [1, 1, 1, 0, 0]
 
 
