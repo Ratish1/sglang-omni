@@ -259,7 +259,7 @@ def test_build_uses_two_warmups_one_private_pool_and_atomic_publication() -> Non
     stats = runner.stats()
     assert stats["enabled"] is True
     assert stats["graph_contract"]["keys"] == [
-        {"batch_size": key.batch_size, "frames": key.frames}
+        {"batch_size": key.batch_size, "frames": key.frames, "decode": "window"}
         for key in DEFAULT_GRAPH_KEYS
     ]
     assert stats["build"]["published_graph_count"] == 4
