@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING
 import torch
 import torch.nn.functional as F
 
+from sglang_omni.scheduling.codec_state_pool import CodecStateSpec
 from sglang_omni.utils.channels_last_conv import (
     channels_last_conv1d,
     channels_last_conv_transpose1d,
@@ -29,39 +30,6 @@ if TYPE_CHECKING:
     )
 else:
     pass
-
-
-@dataclass(frozen=True)
-class Qwen3TTSIncrementalCodecStateSpec:
-    """Static description of one stream's incremental state.
-
-    ``conv_histories`` and ``transconv_overlaps`` are ``(key, channels,
-    length)`` triples in the order ``Qwen3TTSIncrementalDecoder.decode``
-    visits them. Zero-length entries are kept so every consumer sees the same
-    key set regardless of kernel size.
-    """
-
-    conv_histories: tuple[tuple[str, int, int], ...]
-    transconv_overlaps: tuple[tuple[str, int, int], ...]
-    num_layers: int
-    num_key_value_heads: int
-    head_dim: int
-    retained_context: int
-
-    def bytes_per_stream(self, dtype: torch.dtype) -> int:
-        itemsize = torch.empty((), dtype=dtype).element_size()
-        elements = sum(channels * length for _, channels, length in self.conv_histories)
-        elements += sum(
-            channels * length for _, channels, length in self.transconv_overlaps
-        )
-        elements += (
-            2
-            * self.num_layers
-            * self.num_key_value_heads
-            * self.retained_context
-            * self.head_dim
-        )
-        return int(elements * itemsize)
 
 
 @dataclass
@@ -718,7 +686,7 @@ class Qwen3TTSIncrementalDecoder:
                     )
         else:
             self.channels_last_weights = None
-        self._state_spec: Qwen3TTSIncrementalCodecStateSpec | None = (
+        self._state_spec: CodecStateSpec | None = (
             None  # noqa: leading-underscore  # upstream spelling, or the public name is already taken
         )
         self.compiled_kernel: (
@@ -737,7 +705,7 @@ class Qwen3TTSIncrementalDecoder:
         else:
             pass
 
-    def state_spec(self) -> Qwen3TTSIncrementalCodecStateSpec:
+    def state_spec(self) -> CodecStateSpec:
         """Describe one stream's state without running a decode.
 
         Note (Qihao Liu): the lazy buffers in ``decode`` only materialize once
@@ -757,7 +725,7 @@ class Qwen3TTSIncrementalDecoder:
             self._state_spec
         )  # noqa: leading-underscore  # upstream spelling, or the public name is already taken
 
-    def build_state_spec(self) -> Qwen3TTSIncrementalCodecStateSpec:
+    def build_state_spec(self) -> CodecStateSpec:
         decoder = self.decoder
         conv: list[tuple[str, int, int]] = []
         transconv: list[tuple[str, int, int]] = []
@@ -796,7 +764,7 @@ class Qwen3TTSIncrementalDecoder:
             )
         else:
             pass
-        return Qwen3TTSIncrementalCodecStateSpec(
+        return CodecStateSpec(
             conv_histories=tuple(conv),
             transconv_overlaps=tuple(transconv),
             num_layers=len(transformer.layers),
