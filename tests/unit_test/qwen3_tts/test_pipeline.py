@@ -759,6 +759,26 @@ def test_qwen3_tts_keeps_a_declared_prefill_ladder(
     assert resolved_view(server_args).cuda_graph_config.prefill.bs == [4, 8]
 
 
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"cuda_graph_backend_prefill": "disabled"},
+        {"cuda_graph_config": {"prefill": {"backend": "full", "max_bs": 2}}},
+    ],
+)
+def test_qwen3_tts_disabled_or_empty_prefill_ladder_stays_valid(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, overrides: dict[str, object]
+) -> None:
+    server_args = resolved_qwen3_tts_server_args(tmp_path, monkeypatch, overrides)
+
+    validate_generation_batch_policy(
+        model_name="Qwen3-TTS",
+        server_args=server_args,
+        allowed_prefill_backends=("breakable", "full"),
+    )
+    assert 1 not in (resolved_view(server_args).cuda_graph_config.prefill.bs or [])
+
+
 @pytest.mark.parametrize("backend", ["breakable", "full"])
 def test_qwen3_tts_one_token_prefill_cap_stays_valid(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, backend: str
