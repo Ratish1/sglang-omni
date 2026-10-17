@@ -192,6 +192,7 @@ def make_entry(bucket: int, graph=None) -> SimpleNamespace:
         graph=graph or FakeGraph(),
         static_codes=torch.full((bucket, 2, 8), -1, dtype=torch.long),
         static_index=torch.full((bucket,), -1, dtype=torch.long),
+        scratch_index=torch.full((bucket,), FakeArena.scratch_slot, dtype=torch.long),
         waveform=torch.arange(bucket * 32, dtype=torch.float32).view(bucket, 1, 32),
         static_valid_frames=None,
     )
