@@ -667,18 +667,30 @@ def test_qwen3_tts_breakable_prefill_enabled_by_default() -> None:
 
 
 def customized_prefill_config(
-    monkeypatch: pytest.MonkeyPatch, *, backend: str, bs: list[int], max_bs: int
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    backend: str,
+    bs: list[int],
+    max_bs: int,
+    full_prefill_max_req: int | None = None,
 ) -> CudaGraphConfig | None:
     from sglang_omni.models.qwen3_tts import engine_builder
 
     resolved = with_phase(
-        CudaGraphConfig(), Phase.PREFILL, backend=backend, bs=bs, max_bs=max_bs
+        CudaGraphConfig(),
+        Phase.PREFILL,
+        backend=backend,
+        bs=bs,
+        max_bs=max_bs,
+        full_prefill_max_req=full_prefill_max_req,
     )
     declared: dict[str, CudaGraphConfig] = {}
     monkeypatch.setattr(
         engine_builder,
         "resolved_view",
-        lambda server_args: SimpleNamespace(cuda_graph_config=resolved),
+        lambda server_args: SimpleNamespace(
+            cuda_graph_config=resolved, max_running_requests=64
+        ),
     )
     monkeypatch.setattr(
         engine_builder,
@@ -706,14 +718,47 @@ def test_qwen3_tts_adds_the_one_token_bucket_to_a_derived_prefill_ladder(
 
     assert config.prefill.bs == [1, *ladder]
     assert config.prefill.max_bs == max_bs
+    assert config.prefill.full_prefill_max_req == (64 if backend == "full" else None)
     assert config.decode == CudaGraphConfig().decode
+
+
+@pytest.mark.parametrize(
+    ("bs", "max_bs", "full_prefill_max_req", "expected_bs", "expected_slots"),
+    [
+        ([1, 4, 8], 8, None, [1, 4, 8], 64),
+        (
+            generate_prefill_cuda_graph_batch_sizes(8192),
+            8192,
+            8,
+            [1, *generate_prefill_cuda_graph_batch_sizes(8192)],
+            8,
+        ),
+    ],
+)
+def test_qwen3_tts_full_prefill_slots_cover_every_running_request(
+    monkeypatch: pytest.MonkeyPatch,
+    bs: list[int],
+    max_bs: int,
+    full_prefill_max_req: int | None,
+    expected_bs: list[int],
+    expected_slots: int,
+) -> None:
+    config = customized_prefill_config(
+        monkeypatch,
+        backend="full",
+        bs=bs,
+        max_bs=max_bs,
+        full_prefill_max_req=full_prefill_max_req,
+    )
+
+    assert config.prefill.bs == expected_bs
+    assert config.prefill.full_prefill_max_req == expected_slots
 
 
 @pytest.mark.parametrize(
     ("backend", "bs", "max_bs"),
     [
         ("breakable", [16, 64], 64),
-        ("full", [1, 4, 8], 8),
         ("breakable", [], 8192),
         ("disabled", generate_prefill_cuda_graph_batch_sizes(8192), 8192),
     ],

@@ -234,31 +234,50 @@ class Qwen3TtsEngineBuilder(TtsEngineBuilder[Qwen3TTSSGLangRequestData]):
         return defaults
 
     def customize_server_args(self, server_args: ServerArgs) -> None:
-        # note (luojiaxuan): the derived ladder starts at 4 and a replay falls back
-        # to eager when its bucket exceeds twice the real token count, so a prompt
-        # cached up to its last token prefills one token eagerly; 1301 of 3203
-        # prefills at 10 and 20 RPS on H100 CustomVoice were one token. A ladder
-        # derived for its cap gains the 1 bucket; a declared ladder is kept.
-        cuda_graph_config = resolved_view(server_args).cuda_graph_config
+        resolved = resolved_view(server_args)
+        cuda_graph_config = resolved.cuda_graph_config
         prefill = cuda_graph_config.prefill
         if (
             prefill.backend not in (CudaGraphBackend.BREAKABLE, CudaGraphBackend.FULL)
             or not prefill.bs
         ):
             return
-        elif prefill.bs not in (
+        else:
+            pass
+        prefill_fields: dict[str, list[int] | int] = {}
+        # note (luojiaxuan): the derived ladder starts at 4 and a replay falls back
+        # to eager when its bucket exceeds twice the real token count, so a prompt
+        # cached up to its last token prefills one token eagerly; 1301 of 3203
+        # prefills at 10 and 20 RPS on H100 CustomVoice were one token. A ladder
+        # derived for its cap gains the 1 bucket; a declared ladder is kept.
+        if prefill.bs in (
             generate_prefill_cuda_graph_batch_sizes(prefill.max_bs),
             build_default_prefill_cuda_graph_bs(prefill.max_bs),
         ):
-            return
+            prefill_fields["bs"] = [1, *prefill.bs]
         else:
+            pass
+        # note (ratish): SGLang sizes the full graph's request slots for 512-token
+        # prompts (chunked prefill size // 512); an extend here carries up to every
+        # running request, mostly a few dozen or one cached token each, and a batch
+        # with more requests than slots runs eagerly.
+        if (
+            prefill.backend == CudaGraphBackend.FULL
+            and prefill.full_prefill_max_req is None
+        ):
+            prefill_fields["full_prefill_max_req"] = resolved.max_running_requests
+        else:
+            pass
+        if prefill_fields:
             override_server_args(
                 server_args,
-                "qwen3_tts.one_token_prefill_bucket",
+                "qwen3_tts.prefill_cuda_graph_shape",
                 cuda_graph_config=with_phase(
-                    cuda_graph_config, Phase.PREFILL, bs=[1, *prefill.bs]
+                    cuda_graph_config, Phase.PREFILL, **prefill_fields
                 ),
             )
+        else:
+            pass
 
     def before_memory_pool(
         self,
