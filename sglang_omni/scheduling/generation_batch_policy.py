@@ -255,9 +255,9 @@ def build_generation_batch_overrides(
 
     prefill_bs = overrides.get("cuda_graph_bs_prefill")
     prefill_max_bs = overrides.get("cuda_graph_max_bs_prefill")
-    if (
-        prefill_bs is None
-        and overrides.get("cuda_graph_backend_prefill") == CudaGraphBackend.BREAKABLE
+    if prefill_bs is None and overrides.get("cuda_graph_backend_prefill") in (
+        CudaGraphBackend.BREAKABLE,
+        CudaGraphBackend.FULL,
     ):
         # note (ratish): SGLang's prefill generator omits an off-grid cap, and
         # an unset chunk is only known inside ServerArgs.

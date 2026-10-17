@@ -30,7 +30,6 @@ from sglang_omni.models.qwen3_tts import request_builders as qwen3_request_build
 from sglang_omni.models.qwen3_tts import stages as qwen3_stages
 from sglang_omni.models.qwen3_tts import streaming_vocoder as qwen3_streaming_vocoder
 from sglang_omni.models.qwen3_tts.config import Qwen3TTSPipelineConfig
-from sglang_omni.models.qwen3_tts.engine_builder import Qwen3TtsEngineBuilder
 from sglang_omni.models.qwen3_tts.incremental_codec import (
     Qwen3TTSIncrementalCodecState,
     Qwen3TTSIncrementalCodecStateSpec,
@@ -73,6 +72,7 @@ from sglang_omni.profiler.event_recorder import (
 )
 from sglang_omni.proto import OmniRequest, StagePayload
 from sglang_omni.sampling import seed as sampling_seed
+from sglang_omni.scheduling.engine_factory import GenerationDefaults
 from sglang_omni.scheduling.message import IncomingMessage
 from sglang_omni.scheduling.omni_scheduler import OmniScheduler
 from sglang_omni.scheduling.pending_text_queue import PendingTextTensorQueue
@@ -629,17 +629,15 @@ def test_qwen3_tts_deterministic_inference_configures_pipeline() -> None:
 
 def test_qwen3_tts_breakable_prefill_enabled_by_default() -> None:
     from sglang_omni.models.qwen3_tts import CAPABILITIES
-    from sglang_omni.models.qwen3_tts.engine_builder import (
-        QWEN3_TTS_PREFILL_CUDA_GRAPH_BS,
-        Qwen3TtsEngineBuilder,
-    )
+    from sglang_omni.models.qwen3_tts.engine_builder import Qwen3TtsEngineBuilder
     from sglang_omni.scheduling.generation_batch_policy import (
         CudaGraphBackend,
-        build_default_prefill_cuda_graph_bs,
+        build_generation_batch_overrides,
     )
 
     builder = Qwen3TtsEngineBuilder()
     defaults = builder.generation_defaults(dtype="bfloat16")
+    overrides = build_generation_batch_overrides(**defaults)
 
     assert CAPABILITIES.supports_breakable_prefill_cuda_graph is True
     assert (
@@ -651,17 +649,10 @@ def test_qwen3_tts_breakable_prefill_enabled_by_default() -> None:
         type(builder).supports_full_prefill_cuda_graph
         is CAPABILITIES.supports_full_prefill_cuda_graph
     )
-    assert defaults["cuda_graph_backend_prefill"] is CudaGraphBackend.BREAKABLE
-    assert defaults["cuda_graph_bs_prefill"] == list(QWEN3_TTS_PREFILL_CUDA_GRAPH_BS)
-    # A 1-token prefill is the only shape the shared ladder sends back to eager,
-    # so the 1 bucket is what this default adds; 2 and 3 replay inside bucket 4.
-    ladder = defaults["cuda_graph_bs_prefill"]
-    assert ladder[0] == 1
-    assert ladder[1:] == build_default_prefill_cuda_graph_bs(512)
-    assert all(
-        next(b for b in ladder if b >= tokens) <= 2 * tokens for tokens in (1, 2, 3, 4)
-    )
-    assert defaults["disable_cuda_graph"] is False
+    assert overrides["cuda_graph_backend_prefill"] is CudaGraphBackend.BREAKABLE
+    assert "cuda_graph_bs_prefill" not in overrides
+    assert "cuda_graph_max_bs_prefill" not in overrides
+    assert overrides["disable_cuda_graph"] is False
 
 
 def qwen3_tts_checkpoint(tmp_path: Path, model_type: str | None) -> str:
@@ -680,47 +671,20 @@ def test_qwen3_tts_full_prefill_is_scoped_to_base_and_custom_voice(
     from sglang_omni.models.qwen3_tts.engine_builder import Qwen3TtsEngineBuilder
     from sglang_omni.scheduling.generation_batch_policy import CudaGraphBackend
 
-    def backend(model_type: str | None) -> str:
+    def defaults(model_type: str | None) -> GenerationDefaults:
         builder = Qwen3TtsEngineBuilder()
         builder.checkpoint_dir = qwen3_tts_checkpoint(tmp_path, model_type)
-        return builder.generation_defaults(dtype="bfloat16")[
-            "cuda_graph_backend_prefill"
-        ]
+        return builder.generation_defaults(dtype="bfloat16")
 
-    assert backend("custom_voice") is CudaGraphBackend.FULL
-    assert backend("base") is CudaGraphBackend.FULL
-    for model_type in ("voice_design", None):
-        assert backend(model_type) is CudaGraphBackend.BREAKABLE, model_type
-
-
-def test_qwen3_tts_base_prefill_covers_reference_prompts(tmp_path: Path) -> None:
-    from sglang_omni.models.qwen3_tts.engine_builder import Qwen3TtsEngineBuilder
-
-    builder = Qwen3TtsEngineBuilder()
-    builder.checkpoint_dir = qwen3_tts_checkpoint(tmp_path, "base")
-    defaults = builder.generation_defaults(dtype="bfloat16")
-    assert max(defaults["cuda_graph_bs_prefill"]) == 1024
-    assert defaults["max_running_requests"] == 64
-    assert defaults["max_prefill_tokens"] == 8192
-    builder.checkpoint_dir = qwen3_tts_checkpoint(tmp_path, "custom_voice")
-    assert (
-        max(builder.generation_defaults(dtype="bfloat16")["cuda_graph_bs_prefill"])
-        == 512
-    )
-
-
-def test_qwen3_tts_small_base_prefill_covers_maximum_token_budget(
-    tmp_path: Path,
-) -> None:
-    builder = Qwen3TtsEngineBuilder()
-    checkpoint = Path(qwen3_tts_checkpoint(tmp_path, "base"))
-    config_path = checkpoint / "config.json"
-    config = json.loads(config_path.read_text())
-    config["tts_model_size"] = "0b6"
-    config_path.write_text(json.dumps(config))
-    builder.checkpoint_dir = str(checkpoint)
-    defaults = builder.generation_defaults(dtype="bfloat16")
-    assert max(defaults["cuda_graph_bs_prefill"]) == defaults["max_prefill_tokens"]
+    for model_type, backend in (
+        ("custom_voice", CudaGraphBackend.FULL),
+        ("base", CudaGraphBackend.FULL),
+        ("voice_design", CudaGraphBackend.BREAKABLE),
+        (None, CudaGraphBackend.BREAKABLE),
+    ):
+        resolved = defaults(model_type)
+        assert resolved["cuda_graph_backend_prefill"] is backend, model_type
+        assert "cuda_graph_bs_prefill" not in resolved, model_type
 
 
 def test_qwen3_tts_before_prefill_mirrors_positions_into_mrope() -> None:

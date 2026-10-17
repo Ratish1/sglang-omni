@@ -34,10 +34,7 @@ from sglang_omni.scheduling.engine_factory import (
     SchedulerExtras,
     TtsEngineBuilder,
 )
-from sglang_omni.scheduling.generation_batch_policy import (
-    CudaGraphBackend,
-    build_default_prefill_cuda_graph_bs,
-)
+from sglang_omni.scheduling.generation_batch_policy import CudaGraphBackend
 from sglang_omni.scheduling.sglang_backend.output_processor import SGLangOutputProcessor
 from sglang_omni.scheduling.types import StreamOutputBuilder
 
@@ -69,18 +66,6 @@ def is_truthy(value: object) -> bool:
         pass
     return False
 
-
-# note (luojiaxuan): the generic ladder starts at 4, and a replay falls back to
-# eager when its bucket exceeds twice the real token count, so a 1-token prefill
-# lands in bucket 4 and misses. Measured over 3203 prefills at 10 and 20 RPS on
-# H100 CustomVoice, 1301 of them (40.6%) are exactly one token, and they are the
-# only shapes that fall back: 2 and 3 already replay inside bucket 4. Adding the
-# single 1 bucket takes the fallback rate to zero, so the default is the shared
-# ladder plus that bucket rather than a hand-picked list.
-QWEN3_TTS_PREFILL_CUDA_GRAPH_BS = (1,) + tuple(build_default_prefill_cuda_graph_bs(512))
-QWEN3_TTS_BASE_PREFILL_CUDA_GRAPH_BS = (1,) + tuple(
-    build_default_prefill_cuda_graph_bs(1024)
-)
 
 # note (luojiaxuan): on 1.7B and 0.6B Base the share of generated leading silence these probes cover
 # saturates at a -50 dBFS ceiling, and no speech frame falls in the set up to -40 dBFS.
@@ -217,15 +202,15 @@ class Qwen3TtsEngineBuilder(TtsEngineBuilder[Qwen3TTSSGLangRequestData]):
                 "flashinfer" if current_platform.is_cuda() else "pytorch"
             ),
             "trust_remote_code": True,
-            # note (luojiaxuan): under load prefills coalesce into one extend
-            # batch, so the ladder must reach well past a single prompt.
+            # note (ratish): no ladder is declared, so SGLang captures its own
+            # ladder up to the chunked prefill size it resolves for the card;
+            # under load prefills coalesce into extends of that size.
             "cuda_graph_backend_prefill": CudaGraphBackend.BREAKABLE,
-            "cuda_graph_bs_prefill": list(QWEN3_TTS_PREFILL_CUDA_GRAPH_BS),
         }
         if self.checkpoint_dir:
-            checkpoint_config = load_qwen3_tts_checkpoint_config(self.checkpoint_dir)
-            configured_model_type = checkpoint_config.get("tts_model_type")
-            model_size = checkpoint_config.get("tts_model_size")
+            configured_model_type = load_qwen3_tts_checkpoint_config(
+                self.checkpoint_dir
+            ).get("tts_model_type")
             model_type = (
                 normalize_qwen3_tts_model_type(configured_model_type)
                 if isinstance(configured_model_type, str) and configured_model_type
@@ -233,23 +218,9 @@ class Qwen3TtsEngineBuilder(TtsEngineBuilder[Qwen3TTSSGLangRequestData]):
             )
         else:
             model_type = None
-            model_size = None
         if model_type in {"base", "custom_voice"}:
             # note (Zhuofeng-Li): full prefill avoids host launches between layers.
             defaults["cuda_graph_backend_prefill"] = CudaGraphBackend.FULL
-        else:
-            pass
-        if model_type == "base":
-            defaults["cuda_graph_bs_prefill"] = (
-                [
-                    1,
-                    *build_default_prefill_cuda_graph_bs(
-                        defaults["max_prefill_tokens"]
-                    ),
-                ]
-                if model_size == "0b6"
-                else list(QWEN3_TTS_BASE_PREFILL_CUDA_GRAPH_BS)
-            )
         else:
             pass
         return defaults
