@@ -21,6 +21,7 @@ from typing import Literal
 import numpy as np
 import pytest
 import torch
+from sglang.kernels.ops.attention.flash_attention import flash_attn_with_kvcache
 from sglang.srt.arg_groups.cuda_graph_hook import (
     generate_prefill_cuda_graph_batch_sizes,
 )
@@ -28,6 +29,8 @@ from sglang.srt.arg_groups.model_override_base import (
     attention_backends_of,
     resolved_view,
 )
+from sglang.srt.layers.attention.flashattention_backend import FlashAttentionBackend
+from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.runtime_context import get_context, override_platform
 from sglang.srt.server_args import ServerArgs
 
@@ -830,6 +833,67 @@ def test_qwen3_tts_one_token_prefill_cap_stays_valid(
         allowed_prefill_backends=("breakable", "full"),
     )
     assert resolved_view(server_args).cuda_graph_config.prefill.bs == [1]
+
+
+@pytest.mark.accelerator
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("attention_backend", ["fa3", None])
+def test_review_automatic_prefill_backend_accepts_existing_fp8_kv_cache(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    attention_backend: str | None,
+) -> None:
+    """Automatic backend selection must preserve a serving FP8-cache deployment."""
+    arguments = resolved_qwen3_tts_server_args(
+        tmp_path,
+        monkeypatch,
+        {"attention_backend": attention_backend, "kv_cache_dtype": "fp8_e4m3"},
+    )
+    resolved = resolved_view(arguments)
+    prefill_backend = attention_backends_of(resolved)[0]
+    validate_generation_batch_policy(
+        model_name="Qwen3-TTS",
+        server_args=arguments,
+        allowed_prefill_backends=("breakable", "full"),
+    )
+    backend = object.__new__(FlashAttentionBackend)
+    backend.fa_impl_ver = 4 if prefill_backend == "fa4" else 3
+    backend.kv_cache_dtype_str = "fp8_e4m3"
+    backend.kv_cache_dtype = torch.float8_e4m3fn
+    backend.kv_cache_is_mxfp8 = False
+    layer = RadixAttention(
+        num_heads=16, head_dim=128, scaling=128**-0.5, num_kv_heads=8, layer_id=0
+    )
+    query = torch.full((4, 16, 128), 0.125, device="cuda", dtype=torch.bfloat16)
+    prepared_query, _, _, key_descale, value_descale = backend.prepare_paged_mha_query(
+        query,
+        None,
+        None,
+        layer,
+        logical_batch_size=1,
+        kv_head_num=8,
+        is_prefill=True,
+    )
+    key_cache = torch.full(
+        (32, 1, 8, 128), 0.25, device="cuda", dtype=torch.bfloat16
+    ).to(torch.float8_e4m3fn)
+    value_cache = torch.full_like(key_cache, 0.5)
+    output = flash_attn_with_kvcache(
+        q=prepared_query,
+        k_cache=key_cache,
+        v_cache=value_cache,
+        page_table=torch.arange(8, device="cuda", dtype=torch.int32).unsqueeze(0),
+        cache_seqlens=torch.tensor([8], device="cuda", dtype=torch.int32),
+        cu_seqlens_q=torch.tensor([0, 4], device="cuda", dtype=torch.int32),
+        max_seqlen_q=4,
+        k_descale=key_descale,
+        v_descale=value_descale,
+        softmax_scale=layer.scaling,
+        causal=True,
+        num_splits=0,
+        ver=backend.fa_impl_ver,
+    )
+    torch.testing.assert_close(output.float(), torch.full_like(query.float(), 0.5))
 
 
 def qwen3_tts_checkpoint(tmp_path: Path, model_type: str | None) -> str:
