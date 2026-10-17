@@ -21,7 +21,7 @@ import torch
 from sglang_omni.models.qwen3_omni.components.code2wav import Code2WavIncrementalDecoder
 from sglang_omni.platforms import current_platform
 from sglang_omni.platforms.device_graph import DeviceGraphBackend, ReplayableGraph
-from sglang_omni.utils.codec_state_arena import CodecStateArena
+from sglang_omni.utils.codec_state_pool import CodecStatePool
 
 logger = logging.getLogger(__name__)
 _MASK_SWAP_LOCK = threading.Lock()
@@ -281,14 +281,14 @@ class Code2WavCudaGraphRunner:
         decode_stream: torch.Stream | None,
         device_api: TorchDeviceApi,
         incremental_decoder: Code2WavIncrementalDecoder | None,
-        codec_arena: CodecStateArena | None,
+        codec_pool: CodecStatePool | None,
     ) -> None:
         self.model = model
         self.device = torch.device(device)
         self.decode_stream = decode_stream
         self.device_api = device_api
         self.incremental_decoder = incremental_decoder
-        self.codec_arena = codec_arena
+        self.codec_pool = codec_pool
         if self.device.index is None:
             raise ValueError(
                 f"Code2Wav graphs require a concrete device, got {self.device}"
@@ -344,7 +344,7 @@ class Code2WavCudaGraphRunner:
         best_effort_keys: tuple[GraphKey, ...] = (),
         device_api: TorchDeviceApi | None = None,
         incremental_decoder: Code2WavIncrementalDecoder | None = None,
-        codec_arena: CodecStateArena | None = None,
+        codec_pool: CodecStatePool | None = None,
     ) -> Code2WavCudaGraphRunner:
         """Build the configured serving-reachable serial graphs.
 
@@ -360,7 +360,7 @@ class Code2WavCudaGraphRunner:
             decode_stream=decode_stream,
             device_api=TorchDeviceApi() if device_api is None else device_api,
             incremental_decoder=incremental_decoder,
-            codec_arena=codec_arena,
+            codec_pool=codec_pool,
         )
         runner._build(total_gpu_memory_fraction, model_footprint_bytes)
         return runner
@@ -679,17 +679,20 @@ class Code2WavCudaGraphRunner:
             static_index = None
             model = self.model
         else:
-            # note (ratish): every row of a capture writes the arena's scratch slot; a next
-            # capture also reads it, so it is zeroed before the eager and the replayed decode.
+            # note (ratish): each row of a capture writes its own scratch slot, since the
+            # kernels update the pool in place; a next capture also reads them, so they are
+            # zeroed before the eager and the replayed decode.
             static_index = self.device_api.new_static_input(
                 (key.batch_size,), device=self.device
             )
-            static_index.fill_(self.codec_arena.scratch_slot)
+            static_index.copy_(
+                torch.tensor(self.codec_pool.scratch_slots[: key.batch_size])
+            )
 
             def model(codes: torch.Tensor) -> torch.Tensor:
                 return self.incremental_decoder.decode_slots(
                     codes,
-                    self.codec_arena,
+                    self.codec_pool,
                     static_index,
                     first_decode=key.decode == "first",
                 )
@@ -706,18 +709,20 @@ class Code2WavCudaGraphRunner:
                 model, static_input, pool=pool, stream=stream
             )
             with torch.inference_mode():
-                self.zero_scratch_slot(key)
+                self.zero_scratch_slots(key, static_index)
                 eager_output = model(static_input).detach().clone()
-                self.zero_scratch_slot(key)
+                self.zero_scratch_slots(key, static_index)
                 graph.replay()
         self.verify_equivalence(
             key=key, eager_output=eager_output, graph_output=static_output
         )
         return CapturedGraph(graph, static_input, static_output, static_index)
 
-    def zero_scratch_slot(self, key: GraphKey) -> None:
+    def zero_scratch_slots(
+        self, key: GraphKey, static_index: torch.Tensor | None
+    ) -> None:
         if key.decode == "next":
-            self.codec_arena.zero_slot(self.codec_arena.scratch_slot)
+            self.codec_pool.zero_slots(static_index)
         else:
             pass
 
@@ -872,7 +877,7 @@ class Code2WavCudaGraphRunner:
             pass
         try:
             captured.static_input.copy_(codes)
-            captured.static_index.copy_(self.codec_arena.stage_index(slots))
+            captured.static_index.copy_(self.codec_pool.stage_index(slots))
             captured.graph.replay()
         except Exception as exc:
             self.replay_failures += 1
@@ -935,8 +940,8 @@ class Code2WavCudaGraphRunner:
         with torch.inference_mode():
             output = self.incremental_decoder.decode_slots(
                 codes,
-                self.codec_arena,
-                self.codec_arena.stage_index(slots),
+                self.codec_pool,
+                self.codec_pool.stage_index(slots),
                 first_decode=first_decode,
             )
         return Code2WavRunResult(
