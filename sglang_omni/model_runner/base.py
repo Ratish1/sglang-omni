@@ -8,6 +8,7 @@ pass, sampling, logit post-processing, and output extraction.
 from __future__ import annotations
 
 from collections import Counter
+from collections.abc import Mapping
 from contextlib import AbstractContextManager
 from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Generic, Protocol, TypeAlias
@@ -33,7 +34,6 @@ from sglang_omni.scheduling.types import (
 )
 
 if TYPE_CHECKING:
-    from sglang.srt.hardware_backend.mlx.tp_worker import MlxTpModelWorker
     from sglang.srt.layers.logits_processor import LogitsProcessorOutput
     from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
     from sglang.srt.managers.scheduler import GenerationBatchResult
@@ -154,7 +154,7 @@ class ModelRunner(Generic[RequestDataInput]):
 
     def __init__(
         self,
-        tp_worker: ModelWorker | MlxTpModelWorker,
+        tp_worker: ModelWorker,
         output_processor: SGLangOutputProcessor,
     ) -> None:
         self.tp_worker = tp_worker
@@ -901,6 +901,10 @@ class ModelRunner(Generic[RequestDataInput]):
         outputs: dict[str, RequestOutput],
     ) -> None:
         """Called after output tokens are materialized into RequestOutput."""
+
+    def model_info(self) -> Mapping[str, object]:
+        """Model-specific entries the model_info admin action adds to the worker's."""
+        return {}
 
     def on_request_finished(self, request_id: str, req_data: RequestDataInput) -> None:
         """Drain per-request state on any non-abort finish.
