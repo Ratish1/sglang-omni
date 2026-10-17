@@ -17,6 +17,7 @@ from sglang_omni.models.qwen3_omni.config import (
 from sglang_omni.pipeline.mp_runner import apply_cpu_thread_plan, build_stage_groups
 from sglang_omni.pipeline.runtime_config import prepare_pipeline_runtime
 from sglang_omni.pipeline.stage_workers import patched_spawn_env
+from sglang_omni.platforms import current_platform
 from sglang_omni.utils import cpu
 from tests.unit_test.fixtures.pipeline_fakes import FakeMpContext
 from tests.unit_test.pipeline.helpers import build_compiled_process_topology
