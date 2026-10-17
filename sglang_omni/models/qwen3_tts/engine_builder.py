@@ -11,7 +11,11 @@ from typing import TYPE_CHECKING, Protocol
 import numpy as np
 import numpy.typing as npt
 import torch
+from sglang.srt.arg_groups.cuda_graph_hook import (
+    generate_prefill_cuda_graph_batch_sizes,
+)
 from sglang.srt.arg_groups.model_override_base import resolved_view
+from sglang.srt.model_executor.cuda_graph_config import Phase, with_phase
 from sglang.srt.runtime_context import get_model, get_schedule
 from sglang.srt.server_args import ServerArgs
 
@@ -34,9 +38,13 @@ from sglang_omni.scheduling.engine_factory import (
     SchedulerExtras,
     TtsEngineBuilder,
 )
-from sglang_omni.scheduling.generation_batch_policy import CudaGraphBackend
+from sglang_omni.scheduling.generation_batch_policy import (
+    CudaGraphBackend,
+    build_default_prefill_cuda_graph_bs,
+)
 from sglang_omni.scheduling.sglang_backend.output_processor import SGLangOutputProcessor
 from sglang_omni.scheduling.types import StreamOutputBuilder
+from sglang_omni.vendor.sglang.server_args import override_server_args
 
 if TYPE_CHECKING:
     from qwen_tts import Qwen3TTSModel
@@ -224,6 +232,33 @@ class Qwen3TtsEngineBuilder(TtsEngineBuilder[Qwen3TTSSGLangRequestData]):
         else:
             pass
         return defaults
+
+    def customize_server_args(self, server_args: ServerArgs) -> None:
+        # note (luojiaxuan): the derived ladder starts at 4 and a replay falls back
+        # to eager when its bucket exceeds twice the real token count, so a prompt
+        # cached up to its last token prefills one token eagerly; 1301 of 3203
+        # prefills at 10 and 20 RPS on H100 CustomVoice were one token. A ladder
+        # derived for its cap gains the 1 bucket; a declared ladder is kept.
+        cuda_graph_config = resolved_view(server_args).cuda_graph_config
+        prefill = cuda_graph_config.prefill
+        if (
+            prefill.backend not in (CudaGraphBackend.BREAKABLE, CudaGraphBackend.FULL)
+            or not prefill.bs
+        ):
+            return
+        elif prefill.bs not in (
+            generate_prefill_cuda_graph_batch_sizes(prefill.max_bs),
+            build_default_prefill_cuda_graph_bs(prefill.max_bs),
+        ):
+            return
+        else:
+            override_server_args(
+                server_args,
+                "qwen3_tts.one_token_prefill_bucket",
+                cuda_graph_config=with_phase(
+                    cuda_graph_config, Phase.PREFILL, bs=[1, *prefill.bs]
+                ),
+            )
 
     def before_memory_pool(
         self,

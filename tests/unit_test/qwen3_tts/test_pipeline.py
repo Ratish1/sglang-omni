@@ -21,6 +21,14 @@ from typing import Literal
 import numpy as np
 import pytest
 import torch
+from sglang.srt.arg_groups.cuda_graph_hook import (
+    generate_prefill_cuda_graph_batch_sizes,
+)
+from sglang.srt.model_executor.cuda_graph_config import (
+    CudaGraphConfig,
+    Phase,
+    with_phase,
+)
 from sglang.srt.runtime_context import get_context
 
 from sglang_omni.config.runtime import resolve_stage_factory_kwargs
@@ -73,6 +81,9 @@ from sglang_omni.profiler.event_recorder import (
 from sglang_omni.proto import OmniRequest, StagePayload
 from sglang_omni.sampling import seed as sampling_seed
 from sglang_omni.scheduling.engine_factory import GenerationDefaults
+from sglang_omni.scheduling.generation_batch_policy import (
+    build_default_prefill_cuda_graph_bs,
+)
 from sglang_omni.scheduling.message import IncomingMessage
 from sglang_omni.scheduling.omni_scheduler import OmniScheduler
 from sglang_omni.scheduling.pending_text_queue import PendingTextTensorQueue
@@ -653,6 +664,67 @@ def test_qwen3_tts_breakable_prefill_enabled_by_default() -> None:
     assert "cuda_graph_bs_prefill" not in overrides
     assert "cuda_graph_max_bs_prefill" not in overrides
     assert overrides["disable_cuda_graph"] is False
+
+
+def customized_prefill_config(
+    monkeypatch: pytest.MonkeyPatch, *, backend: str, bs: list[int], max_bs: int
+) -> CudaGraphConfig | None:
+    from sglang_omni.models.qwen3_tts import engine_builder
+
+    resolved = with_phase(
+        CudaGraphConfig(), Phase.PREFILL, backend=backend, bs=bs, max_bs=max_bs
+    )
+    declared: dict[str, CudaGraphConfig] = {}
+    monkeypatch.setattr(
+        engine_builder,
+        "resolved_view",
+        lambda server_args: SimpleNamespace(cuda_graph_config=resolved),
+    )
+    monkeypatch.setattr(
+        engine_builder,
+        "override_server_args",
+        lambda server_args, source, **fields: declared.update(fields),
+    )
+    engine_builder.Qwen3TtsEngineBuilder().customize_server_args(SimpleNamespace())
+    return declared.get("cuda_graph_config")
+
+
+@pytest.mark.parametrize("backend", ["breakable", "full"])
+@pytest.mark.parametrize(
+    ("ladder", "max_bs"),
+    [
+        (generate_prefill_cuda_graph_batch_sizes(8192), 8192),
+        (build_default_prefill_cuda_graph_bs(3000), 3000),
+    ],
+)
+def test_qwen3_tts_adds_the_one_token_bucket_to_a_derived_prefill_ladder(
+    monkeypatch: pytest.MonkeyPatch, backend: str, ladder: list[int], max_bs: int
+) -> None:
+    config = customized_prefill_config(
+        monkeypatch, backend=backend, bs=ladder, max_bs=max_bs
+    )
+
+    assert config.prefill.bs == [1, *ladder]
+    assert config.prefill.max_bs == max_bs
+    assert config.decode == CudaGraphConfig().decode
+
+
+@pytest.mark.parametrize(
+    ("backend", "bs", "max_bs"),
+    [
+        ("breakable", [16, 64], 64),
+        ("full", [1, 4, 8], 8),
+        ("breakable", [], 8192),
+        ("disabled", generate_prefill_cuda_graph_batch_sizes(8192), 8192),
+    ],
+)
+def test_qwen3_tts_keeps_a_declared_empty_or_disabled_prefill_ladder(
+    monkeypatch: pytest.MonkeyPatch, backend: str, bs: list[int], max_bs: int
+) -> None:
+    assert (
+        customized_prefill_config(monkeypatch, backend=backend, bs=bs, max_bs=max_bs)
+        is None
+    )
 
 
 def qwen3_tts_checkpoint(tmp_path: Path, model_type: str | None) -> str:
