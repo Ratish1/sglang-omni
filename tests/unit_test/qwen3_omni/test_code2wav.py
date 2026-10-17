@@ -1151,11 +1151,19 @@ def decode_in_parts(
 
 @pytest.mark.accelerator
 @SLOT_DECODES
+@pytest.mark.parametrize("platform_kernels", [True, False])
 @pytest.mark.parametrize("parts", [(4, 6, 7), (1,) * 17, (10, 7)])
 def test_slot_decodes_error_to_fp32_is_the_fused_forward_error(
-    monkeypatch: pytest.MonkeyPatch, parts: tuple[int, ...]
+    monkeypatch: pytest.MonkeyPatch, parts: tuple[int, ...], platform_kernels: bool
 ) -> None:
     monkeypatch.setattr(torch.backends.cudnn, "allow_tf32", False)
+    if platform_kernels:
+        pass
+    else:
+        monkeypatch.setattr(current_platform, "get_rope_kv_store_kernel", lambda: None)
+        monkeypatch.setattr(
+            current_platform, "get_paged_window_attention", lambda: None
+        )
     whole_error = 0.0
     incremental_error = 0.0
     for seed in range(4):
