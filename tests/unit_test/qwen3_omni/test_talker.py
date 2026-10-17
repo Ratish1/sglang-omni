@@ -2324,6 +2324,36 @@ def test_talker_decode_replays_the_seeded_draw_only_for_a_batch_with_a_request_s
     assert TalkerDrawGraphVariants(fake).select(SimpleNamespace()) == variant
 
 
+@pytest.mark.parametrize(
+    "backend, capturing, variant, has_request_seed, expected",
+    [
+        ("pytorch", False, None, False, False),
+        ("flashinfer", True, FLASHINFER_DRAW, True, True),
+        ("flashinfer", True, SEEDED_DRAW, False, False),
+        ("flashinfer", False, None, False, True),
+        ("flashinfer", False, None, True, False),
+    ],
+)
+def test_talker_draws_with_flashinfer_for_its_graph_variant_or_an_unseeded_batch(
+    monkeypatch: pytest.MonkeyPatch,
+    backend: str,
+    capturing: bool,
+    variant: str | None,
+    has_request_seed: bool,
+    expected: bool,
+) -> None:
+    monkeypatch.setattr(
+        talker_module,
+        "get_exec",
+        lambda: SimpleNamespace(kernel=SimpleNamespace(sampling_backend=backend)),
+    )
+    monkeypatch.setattr(talker_module, "get_is_capture_mode", lambda: capturing)
+    monkeypatch.setattr(talker_module, "get_capture_attention_variant", lambda: variant)
+    fake = SimpleNamespace(decode_has_request_seed=has_request_seed)
+
+    assert Qwen3OmniTalker.draws_with_flashinfer(fake) is expected
+
+
 @pytest.mark.accelerator
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_flashinfer_draw_replayed_in_a_graph_draws_afresh_within_the_top_k() -> None:
@@ -2629,6 +2659,7 @@ def test_talker_samples_from_fp32_logits() -> None:
 
     fake.sampler = sampler
     fake.build_static_sampling_info = lambda batch_size: None
+    fake.draws_with_flashinfer = lambda: False
 
     tokens = Qwen3OmniTalker.sample_decode_tokens(
         fake, logits, SimpleNamespace(positions=None)

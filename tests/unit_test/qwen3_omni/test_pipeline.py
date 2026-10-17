@@ -1449,6 +1449,9 @@ def test_qwen_talker_enables_and_attests_breakable_prefill_graphs(
         talker_model_runner,
         talker_scheduler,
     )
+    from sglang_omni.models.qwen3_omni.talker_decode_graph import (
+        TalkerDecodeCudaGraphRunner,
+    )
     from sglang_omni.scheduling import bootstrap as scheduling_bootstrap
     from sglang_omni.scheduling import sglang_backend
     from sglang_omni.scheduling.generation_batch_policy import CudaGraphBackend
@@ -1459,6 +1462,7 @@ def test_qwen_talker_enables_and_attests_breakable_prefill_graphs(
         cuda_graph_config=SimpleNamespace(
             prefill=SimpleNamespace(backend=prefill_backend)
         ),
+        sampling_backend="flashinfer",
     )
     captured = {}
     attest_calls = []
@@ -1492,9 +1496,13 @@ def test_qwen_talker_enables_and_attests_breakable_prefill_graphs(
         ),
     )
     model_runner = SimpleNamespace(
-        model=SimpleNamespace(), sampler=object(), model_config=model_config
+        model=SimpleNamespace(flashinfer_seed=torch.zeros(1, dtype=torch.int64)),
+        sampler=object(),
+        model_config=model_config,
     )
-    model_worker = SimpleNamespace(model_runner=model_runner, model_config=model_config)
+    model_worker = SimpleNamespace(
+        model_runner=model_runner, model_config=model_config, random_seed=1234
+    )
 
     def fake_create_infrastructure(*args, **kwargs):
         captured.update(kwargs)
@@ -1549,6 +1557,8 @@ def test_qwen_talker_enables_and_attests_breakable_prefill_graphs(
     assert captured["defer_cuda_graph_capture"] is True
     assert graph_init_samplers == [model_runner.sampler]
     assert attest_calls == ([(model_runner, True, 1)] if is_breakable else [])
+    assert int(model_runner.model.flashinfer_seed) == 1234
+    assert model_runner.decode_graph_runner_class is TalkerDecodeCudaGraphRunner
 
 
 def test_qwen_cli_thinker_tp_override_applies_tp_size_and_gpus() -> None:
