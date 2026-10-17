@@ -104,8 +104,7 @@ class SGLangGenerationEngineBuilder(ABC, Generic[RequestDataT]):
 
     model_name: str
     context_length: int
-    # The deployment's own overrides, so a builder can tell a value the operator
-    # set from one the shared policy derived.
+    # The operator's overrides, to tell a set value from one the policy derived.
     server_args_overrides: Mapping[str, object]
     model_arch_override: str | None = None
     supports_context_length_override: ClassVar[bool] = False
