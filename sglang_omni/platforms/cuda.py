@@ -67,6 +67,9 @@ class CUDAOmniPlatform(CudaDeviceMixin, OmniPlatform):
     def enable_codec_decode_graph(self) -> bool:
         return True
 
+    def enable_code2wav_incremental(self) -> bool:
+        return True
+
     def get_stage_process_env(
         self,
         spec: StageLaunchConfig,

@@ -166,6 +166,11 @@ class OmniPlatform(DeviceMixin):
         """Check if current platform captures codec decode graphs (Higgs TTS, Mimi)"""
         return False
 
+    def enable_code2wav_incremental(self) -> bool:
+        """Whether Qwen3-Omni code2wav decodes each stream's new frames from its codec state
+        rather than windows with left context."""
+        return False
+
     def enable_talker_graph(self) -> bool:
         return True
 

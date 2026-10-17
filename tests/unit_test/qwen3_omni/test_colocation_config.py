@@ -17,6 +17,7 @@ from sglang_omni.models.qwen3_omni.config import (
 from sglang_omni.pipeline.mp_runner import apply_cpu_thread_plan, build_stage_groups
 from sglang_omni.pipeline.runtime_config import prepare_pipeline_runtime
 from sglang_omni.pipeline.stage_workers import patched_spawn_env
+from sglang_omni.platforms import current_platform
 from sglang_omni.utils import cpu
 from tests.unit_test.fixtures.pipeline_fakes import FakeMpContext
 from tests.unit_test.pipeline.helpers import build_compiled_process_topology
@@ -168,6 +169,25 @@ def test_factory_kwargs_follow_whether_code2wav_shares_the_talker_process() -> N
     assert sharing_flags(colocated) == (True, True)
     make_stage(colocated, "code2wav").process = "code2wav"
     assert sharing_flags(colocated) == (False, False)
+
+
+def test_code2wav_keeps_a_codec_state_slot_per_stream_the_talkers_run(
+    monkeypatch,
+) -> None:
+    config = Qwen3OmniSpeechPipelineConfig(model_path="dummy")
+
+    def slots() -> int:
+        return resolve_stage_factory_args(make_stage(config, "code2wav"), config)[
+            "codec_state_slots"
+        ]
+
+    monkeypatch.setattr(current_platform, "enable_code2wav_incremental", lambda: True)
+    assert slots() == 32
+    make_stage(config, "talker_ar").engine.max_running_requests = 24
+    config.processes["talker_ar"] = ProcessConfig(num_replicas=2)
+    assert slots() == 48
+    monkeypatch.setattr(current_platform, "enable_code2wav_incremental", lambda: False)
+    assert slots() == 0
 
 
 def test_colocated_config_passes_with_explicit_budgets_without_ar_mem_fraction() -> (
