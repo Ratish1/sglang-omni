@@ -763,7 +763,7 @@ def test_qwen3_tts_keeps_a_declared_prefill_ladder(
     "overrides",
     [
         {"cuda_graph_backend_prefill": "disabled"},
-        {"cuda_graph_config": {"prefill": {"backend": "full", "max_bs": 2}}},
+        {"cuda_graph_bs_prefill": []},
     ],
 )
 def test_qwen3_tts_disabled_or_empty_prefill_ladder_stays_valid(
