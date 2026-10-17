@@ -200,10 +200,13 @@ class TalkerPrefillBuilder:
         multimodal_mask = self.build_multimodal_mask(thinker_input_ids)
         thinker_embed = torch.cat([prompt_embed, assistant_embed], dim=0)
         prompt_hidden = torch.zeros_like(prompt_embed)
-        required_positions = multimodal_mask[: prompt_ids.numel()].nonzero(
-            as_tuple=True
-        )[0]
-        if required_positions.numel():
+        required_positions = [
+            position
+            for position, token_id in enumerate(prompt_ids.tolist())
+            if token_id
+            in (self.audio_token_id, self.image_token_id, self.video_token_id)
+        ]
+        if required_positions:
             prompt_chunk = thinker_chunks[0]
             captured_positions = (prompt_chunk.metadata or {}).get(
                 "prompt_hidden_positions"
@@ -211,7 +214,7 @@ class TalkerPrefillBuilder:
             if (
                 not isinstance(captured_positions, list)
                 or any(type(position) is not int for position in captured_positions)
-                or captured_positions != required_positions.cpu().tolist()
+                or captured_positions != required_positions
             ):
                 raise ValueError(
                     "Missing or misaligned multimodal prompt hidden positions"
@@ -222,7 +225,7 @@ class TalkerPrefillBuilder:
             if (
                 not isinstance(captured_states, torch.Tensor)
                 or captured_states.shape
-                != (required_positions.numel(), prompt_embed.shape[1])
+                != (len(required_positions), prompt_embed.shape[1])
                 or not torch.is_floating_point(captured_states)
             ):
                 raise ValueError("Invalid multimodal prompt hidden state dimensions")
