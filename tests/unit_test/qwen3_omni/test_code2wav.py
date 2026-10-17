@@ -16,7 +16,10 @@ from transformers.models.qwen3_omni_moe.configuration_qwen3_omni_moe import (
 
 from sglang_omni.config.schema import StageConfig
 from sglang_omni.models.qwen3_omni.components import code2wav_scheduler
-from sglang_omni.models.qwen3_omni.components.code2wav import Qwen3OmniCode2Wav
+from sglang_omni.models.qwen3_omni.components.code2wav import (
+    Qwen3OmniCode2Wav,
+    Qwen3OmniIncrementalCodec,
+)
 from sglang_omni.models.qwen3_omni.components.code2wav_cuda_graph import (
     Code2WavRunResult,
     GraphKey,
@@ -26,6 +29,7 @@ from sglang_omni.models.qwen3_omni.components.code2wav_scheduler import (
 )
 from sglang_omni.pipeline.stage.stream_queue import StreamItem
 from sglang_omni.platforms import current_platform
+from sglang_omni.scheduling.codec_state_pool import CodecStatePool
 from sglang_omni.scheduling.message import IncomingMessage
 from sglang_omni.utils import snake_beta
 from tests.unit_test.fixtures.qwen_fakes import (
@@ -959,7 +963,7 @@ def test_qwen_code2wav_emits_full_chunk_despite_model_output_deficit() -> None:
 
 
 def make_tiny_code2wav(
-    device: str, dtype: torch.dtype, seed: int = 0
+    device: str, dtype: torch.dtype, seed: int = 0, max_position_embeddings: int = 8000
 ) -> Qwen3OmniCode2Wav:
     config = Qwen3OmniMoeCode2WavConfig(
         codebook_size=16,
@@ -973,6 +977,7 @@ def make_tiny_code2wav(
         upsampling_ratios=[2],
         decoder_dim=32,
         sliding_window=4,
+        max_position_embeddings=max_position_embeddings,
     )
     torch.manual_seed(seed)
     model = Qwen3OmniCode2Wav(config).eval()
@@ -1064,7 +1069,8 @@ def test_fused_code2wav_transformer_error_to_fp32_is_below_the_hf_error(
                 inputs_embeds=hidden_states.to(dtype)
             ).last_hidden_state
             model.use_fused_transformer(
-                current_platform.get_joint_rope_inplace_kernel()
+                current_platform.get_joint_rope_inplace_kernel(),
+                max_positions=model.config.max_position_embeddings,
             )
             actual = model.pre_transformer(
                 inputs_embeds=hidden_states.to(dtype)
@@ -1073,3 +1079,193 @@ def test_fused_code2wav_transformer_error_to_fp32_is_below_the_hf_error(
         fused_error += float((actual.float() - reference).norm() / reference.norm())
 
     assert fused_error <= 0.95 * hf_error
+
+
+SLOT_DECODES = pytest.mark.skipif(
+    not torch.cuda.is_available() or not current_platform.is_cuda(),
+    reason="slot decodes run on the fused channels-last code2wav, NVIDIA CUDA only",
+)
+
+
+def make_fused_tiny_code2wav(seed: int = 0) -> Qwen3OmniCode2Wav:
+    model = make_tiny_code2wav("cuda", torch.bfloat16, seed)
+    model.use_channels_last()
+    model.use_fused_transformer(
+        current_platform.get_joint_rope_inplace_kernel(),
+        max_positions=model.config.max_position_embeddings,
+    )
+    snake_beta.fuse_vocoder_decoder(model.decoder)
+    return model
+
+
+def make_pool(
+    incremental_codec: Qwen3OmniIncrementalCodec, slots: int, largest_part: int
+) -> CodecStatePool:
+    return CodecStatePool(
+        incremental_codec.state_spec(),
+        num_slots=slots,
+        capture_slots=0,
+        ring_frames=incremental_codec.state_spec().retained_context + largest_part,
+        device=torch.device("cuda"),
+        dtype=torch.bfloat16,
+    )
+
+
+def decode_in_parts(
+    incremental_codec: Qwen3OmniIncrementalCodec,
+    codes: torch.Tensor,
+    parts: tuple[int, ...],
+    pool: CodecStatePool | None = None,
+    slot_index: torch.Tensor | None = None,
+) -> torch.Tensor:
+    rows = int(codes.shape[0])
+    if pool is None:
+        pool = make_pool(incremental_codec, rows, max(parts))
+        slot_index = torch.arange(rows, device="cuda")
+    else:
+        pass
+    waveforms = []
+    start = 0
+    for frames in parts:
+        waveforms.append(
+            incremental_codec.decode_slots(
+                codes[..., start : start + frames],
+                pool,
+                slot_index,
+                first_decode=start == 0,
+            )
+        )
+        start += frames
+    return torch.cat(waveforms, dim=-1)
+
+
+@pytest.mark.accelerator
+@SLOT_DECODES
+@pytest.mark.parametrize("parts", [(4, 6, 7), (1,) * 17, (10, 7)])
+def test_slot_decodes_error_to_fp32_is_the_fused_forward_error(
+    monkeypatch: pytest.MonkeyPatch, parts: tuple[int, ...]
+) -> None:
+    monkeypatch.setattr(torch.backends.cudnn, "allow_tf32", False)
+    whole_error = 0.0
+    incremental_error = 0.0
+    for seed in range(4):
+        model = make_tiny_code2wav("cuda", torch.float32, seed)
+        codes = torch.randint(0, 16, (2, 2, sum(parts)), device="cuda")
+        with torch.inference_mode():
+            reference = model(codes)
+            model.to(torch.bfloat16)
+            model.use_channels_last()
+            model.use_fused_transformer(
+                current_platform.get_joint_rope_inplace_kernel(),
+                max_positions=model.config.max_position_embeddings,
+            )
+            snake_beta.fuse_vocoder_decoder(model.decoder)
+            whole = model(codes)
+            incremental = decode_in_parts(
+                Qwen3OmniIncrementalCodec(model), codes, parts
+            )
+        whole_error += float((whole.float() - reference).norm() / reference.norm())
+        incremental_error += float(
+            (incremental.float() - reference).norm() / reference.norm()
+        )
+
+    assert incremental_error <= 1.25 * whole_error
+
+
+@pytest.mark.accelerator
+@SLOT_DECODES
+def test_slot_decodes_rotate_frames_past_the_code2wav_config_positions(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A stream longer than the code2wav config's max_position_embeddings read its later
+    frames' rotary angles from past the end of the table."""
+    monkeypatch.setattr(torch.backends.cudnn, "allow_tf32", False)
+    hf_error = 0.0
+    whole_error = 0.0
+    incremental_error = 0.0
+    for seed in range(4):
+        model = make_tiny_code2wav(
+            "cuda", torch.float32, seed, max_position_embeddings=8
+        )
+        codes = torch.randint(0, 16, (2, 2, 30), device="cuda")
+        with torch.inference_mode():
+            reference = model(codes)
+            model.to(torch.bfloat16)
+            expected = model(codes)
+            model.use_channels_last()
+            model.use_fused_transformer(
+                current_platform.get_joint_rope_inplace_kernel(), max_positions=30
+            )
+            snake_beta.fuse_vocoder_decoder(model.decoder)
+            whole = model(codes)
+            incremental = decode_in_parts(
+                Qwen3OmniIncrementalCodec(model), codes, (10, 10, 10)
+            )
+        hf_error += float((expected.float() - reference).norm() / reference.norm())
+        whole_error += float((whole.float() - reference).norm() / reference.norm())
+        incremental_error += float(
+            (incremental.float() - reference).norm() / reference.norm()
+        )
+
+    assert whole_error <= hf_error
+    assert incremental_error <= 1.25 * whole_error
+
+
+@pytest.mark.accelerator
+@SLOT_DECODES
+def test_a_reused_slot_decodes_a_new_stream_as_a_fresh_pool() -> None:
+    model = make_fused_tiny_code2wav()
+    incremental_codec = Qwen3OmniIncrementalCodec(model)
+    first_codes = torch.randint(0, 16, (1, 2, 13), device="cuda")
+    second_codes = torch.randint(0, 16, (1, 2, 9), device="cuda")
+    pool = make_pool(incremental_codec, 1, 4)
+    slot_index = torch.zeros(1, dtype=torch.long, device="cuda")
+
+    with torch.inference_mode():
+        decode_in_parts(incremental_codec, first_codes, (4, 4, 4, 1), pool, slot_index)
+        reused = decode_in_parts(
+            incremental_codec, second_codes, (3, 4, 2), pool, slot_index
+        )
+        fresh = decode_in_parts(incremental_codec, second_codes, (3, 4, 2))
+
+    assert torch.equal(reused, fresh)
+
+
+@pytest.mark.accelerator
+@SLOT_DECODES
+def test_slot_decode_rows_at_different_positions_keep_their_own_streams() -> None:
+    model = make_fused_tiny_code2wav()
+    incremental_codec = Qwen3OmniIncrementalCodec(model)
+    first_frames = (5, 9)
+    codes = [
+        torch.randint(0, 16, (1, 2, frames + 4), device="cuda")
+        for frames in first_frames
+    ]
+    pool = make_pool(incremental_codec, 2, 9)
+    slots = [torch.tensor([row], device="cuda") for row in range(2)]
+
+    with torch.inference_mode():
+        heads = [
+            incremental_codec.decode_slots(
+                stream_codes[..., :frames], pool, slot, first_decode=True
+            )
+            for stream_codes, frames, slot in zip(codes, first_frames, slots)
+        ]
+        tails = incremental_codec.decode_slots(
+            torch.cat([stream_codes[..., -4:] for stream_codes in codes]),
+            pool,
+            torch.cat(slots),
+            first_decode=False,
+        )
+        alone = [
+            decode_in_parts(incremental_codec, stream_codes, (frames, 4))
+            for stream_codes, frames in zip(codes, first_frames)
+        ]
+
+    for row in range(2):
+        torch.testing.assert_close(
+            torch.cat((heads[row], tails[row : row + 1]), dim=-1),
+            alone[row],
+            rtol=2e-2,
+            atol=2e-3,
+        )
