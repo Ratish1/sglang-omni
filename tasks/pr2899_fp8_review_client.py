@@ -67,7 +67,7 @@ async def main() -> None:
             ("buffered", 1, False, "Please read this sentence with a steady voice."),
             ("cached", 1, True, "Please read this sentence with a steady voice."),
             ("burst", 16, True, "Please read this new sentence with a clear voice."),
-            ("long", 1, True, "This sentence exercises a longer prefill. " * 200),
+            ("long", 1, True, "I am here. We go now. " * 170),
         ):
             before = await client.get(f"{BASE_URL}/model_info")
             before.raise_for_status()
