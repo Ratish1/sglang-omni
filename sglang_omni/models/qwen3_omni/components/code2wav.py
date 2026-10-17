@@ -34,7 +34,12 @@ from sglang_omni.models.qwen3_omni.components.incremental_codec import (
     conv_stack_state_layout,
     slot_conv_stack,
 )
-from sglang_omni.platforms.interface import JointRopeInplaceKernel
+from sglang_omni.platforms import current_platform
+from sglang_omni.platforms.interface import (
+    JointRopeInplaceKernel,
+    PagedWindowAttention,
+    RopeKVStoreKernel,
+)
 from sglang_omni.utils.channels_last_conv import (
     channels_last_conv1d,
     channels_last_conv_transpose1d,
@@ -216,10 +221,13 @@ class FusedCode2WavTransformer(torch.nn.Module):
         addresses: RingAddresses,
         *,
         first_decode: bool,
+        rope_store: RopeKVStoreKernel | None,
+        paged_attention: PagedWindowAttention | None,
     ) -> torch.Tensor:
         """The normed hidden states of the rows' new frames. Every layer stores its new K/V in
-        the rows' rings; a first decode attends to its own frames, a later one to its window in
-        the ring."""
+        the rows' rings, in the rope kernel when the platform has rope_store; a first decode
+        attends to its own frames, a later one to its window in the ring, through the ring's
+        page table when the platform has paged_attention."""
         batch_size, length, hidden_size = inputs_embeds.shape
         head_dim = self.transformer.layers[0].self_attn.head_dim
         sliding_window = self.transformer.config.sliding_window
@@ -229,6 +237,10 @@ class FusedCode2WavTransformer(torch.nn.Module):
         elif first_decode:
             distances = frame_offsets[:, None] - frame_offsets[None, :]
             window_mask = (distances >= 0) & (distances < sliding_window)
+        elif paged_attention is not None:
+            window_mask = None
+            page_table = addresses.window_rows.to(torch.int32)
+            cache_seqlens = addresses.window_lengths.to(torch.int32)
         else:
             # note (ratish): a row's window lists its ring rows in position order, its new
             # frames last; a frame sees itself and the sliding_window - 1 positions before it.
@@ -256,33 +268,62 @@ class FusedCode2WavTransformer(torch.nn.Module):
             )
             query = query.view(batch_size * length, -1, head_dim)
             key = key.view(batch_size * length, -1, head_dim)
-            self.rope(
-                query, key, self.cos_sin_cache, addresses.frame_positions, is_neox=True
-            )
-            pool.keys[layer_index].index_copy_(
-                0, addresses.write_rows, key.reshape(batch_size * length, -1)
-            )
-            pool.values[layer_index].index_copy_(0, addresses.write_rows, value)
-            if first_decode:
-                keys = key.view(batch_size, length, -1, head_dim)
-                values = value.view(batch_size, length, -1, head_dim)
+            if rope_store is None:
+                self.rope(
+                    query,
+                    key,
+                    self.cos_sin_cache,
+                    addresses.frame_positions,
+                    is_neox=True,
+                )
+                pool.keys[layer_index].index_copy_(
+                    0, addresses.write_rows, key.reshape(batch_size * length, -1)
+                )
+                pool.values[layer_index].index_copy_(0, addresses.write_rows, value)
             else:
-                keys = pool.keys[layer_index][addresses.window_rows].view(
-                    batch_size, pool.ring_frames, -1, head_dim
+                rope_store(
+                    query,
+                    key,
+                    value.view(batch_size * length, -1, head_dim),
+                    pool.keys[layer_index],
+                    pool.values[layer_index],
+                    self.cos_sin_cache,
+                    addresses.frame_positions,
+                    addresses.write_rows,
+                    is_neox=True,
                 )
-                values = pool.values[layer_index][addresses.window_rows].view(
-                    batch_size, pool.ring_frames, -1, head_dim
+            if first_decode or paged_attention is None:
+                if first_decode:
+                    keys = key.view(batch_size, length, -1, head_dim)
+                    values = value.view(batch_size, length, -1, head_dim)
+                else:
+                    keys = pool.keys[layer_index][addresses.window_rows].view(
+                        batch_size, pool.ring_frames, -1, head_dim
+                    )
+                    values = pool.values[layer_index][addresses.window_rows].view(
+                        batch_size, pool.ring_frames, -1, head_dim
+                    )
+                attended = F.scaled_dot_product_attention(
+                    query.view(batch_size, length, -1, head_dim).transpose(1, 2),
+                    keys.transpose(1, 2),
+                    values.transpose(1, 2),
+                    attn_mask=window_mask,
+                    is_causal=window_mask is None,
+                    scale=attention.scaling,
+                    enable_gqa=attention.num_key_value_groups > 1,
+                ).transpose(1, 2)
+            else:
+                attended = paged_attention(
+                    query.view(batch_size, length, -1, head_dim),
+                    pool.keys[layer_index].view(-1, 1, key.shape[1], head_dim),
+                    pool.values[layer_index].view(-1, 1, key.shape[1], head_dim),
+                    page_table=page_table,
+                    cache_seqlens=cache_seqlens,
+                    softmax_scale=attention.scaling,
+                    causal=True,
+                    window_size=(pool.retained_frames, 0),
                 )
-            attended = F.scaled_dot_product_attention(
-                query.view(batch_size, length, -1, head_dim).transpose(1, 2),
-                keys.transpose(1, 2),
-                values.transpose(1, 2),
-                attn_mask=window_mask,
-                is_causal=window_mask is None,
-                scale=attention.scaling,
-                enable_gqa=attention.num_key_value_groups > 1,
-            )
-            attended = attended.transpose(1, 2).reshape(batch_size * length, -1)
+            attended = attended.reshape(batch_size * length, -1)
             hidden_states = torch.addcmul(
                 residual,
                 layer.self_attn_layer_scale.scale,
@@ -365,6 +406,8 @@ class Qwen3OmniIncrementalCodec:
             model
         ), "slot decodes need the fused channels-last code2wav"
         self.model = model
+        self.rope_store = current_platform.get_rope_kv_store_kernel()
+        self.paged_attention = current_platform.get_paged_window_attention()
         transformer = model.pre_transformer.transformer
         conv_histories, transconv_overlaps = conv_stack_state_layout(model)
         self.spec = CodecStateSpec(
@@ -414,7 +457,12 @@ class Qwen3OmniIncrementalCodec:
             1
         )
         hidden_states = self.model.pre_transformer.forward_slot_frames(
-            hidden_states, pool, addresses, first_decode=first_decode
+            hidden_states,
+            pool,
+            addresses,
+            first_decode=first_decode,
+            rope_store=self.rope_store,
+            paged_attention=self.paged_attention,
         )
         waveform = slot_conv_stack(
             self.model,
