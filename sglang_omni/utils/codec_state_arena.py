@@ -26,62 +26,19 @@ class CodecStateArenaStats(TypedDict):
     exhausted: int
 
 
-class CodecStateArena:
-    """Bounded, reusable storage for per-stream incremental codec state.
+class CodecSlotAllocator:
+    """Bounded, reusable slots for per-stream codec state: a slot is handed out after every
+    decode its previous owner queued, and a cohort's slot ids reach the device without a host
+    sync."""
 
-    A slot's whole state is one row of one buffer, and its frame position one entry of
-    another, so gather selects a cohort's rows with one index op and scatter writes the
-    advanced state back with one, whatever the number of state tensors. The state tensors
-    are views of the row, in the spec's order: conv histories, transposed-conv overlaps,
-    then the keys and the values of every layer.
-
-    Note (Qihao Liu): acquire zeroes a slot before handing it out, so a reused slot is
-    provably a cold start; release therefore returns a slot without clearing it. A caller
-    whose first decode starts from zero_state reads no slot state and skips the zeroing.
-    """
-
-    def __init__(
-        self,
-        decoder: IncrementalCodecDecoder,
-        *,
-        num_slots: int,
-        device: torch.device,
-        dtype: torch.dtype,
-    ) -> None:
+    def __init__(self, *, num_slots: int, device: torch.device) -> None:
         if num_slots <= 0:
             raise ValueError("codec state arena needs at least one slot")
         else:
             pass
         self.device = torch.device(device)
         self.device_module = torch.get_device_module(self.device)
-        self.dtype = dtype
         self._num_slots = int(num_slots)  # noqa: leading-underscore
-        self.scratch_slot = self._num_slots  # noqa: leading-underscore
-        self.spec = decoder.state_spec()
-        key_value_shape = (
-            self.spec.num_key_value_heads,
-            self.spec.retained_context,
-            self.spec.head_dim,
-        )
-        self.state_shapes: tuple[tuple[int, ...], ...] = (
-            *((channels, length) for _, channels, length in self.spec.conv_histories),
-            *(
-                (channels, length)
-                for _, channels, length in self.spec.transconv_overlaps
-            ),
-            *(key_value_shape for _ in range(2 * self.spec.num_layers)),
-        )
-        self.state_sizes: list[int] = [math.prod(shape) for shape in self.state_shapes]
-        self.state_rows = torch.zeros(
-            self.num_slots + 1,
-            sum(self.state_sizes),
-            device=self.device,
-            dtype=dtype,
-        )
-        self.frame_positions = torch.zeros(
-            self.num_slots + 1, device=self.device, dtype=torch.long
-        )
-        self.storage = self.state_of_rows(self.state_rows, self.frame_positions)
         self.lock = threading.Lock()
         self.staging = threading.local()
         self.release_events: dict[int, torch.Event] = {}
@@ -90,21 +47,10 @@ class CodecStateArena:
         )  # noqa: leading-underscore
         self.retired: set[int] = set()
         self._exhausted_count = 0  # noqa: leading-underscore
-        self._bytes_per_slot = self.spec.bytes_per_stream(
-            dtype
-        )  # noqa: leading-underscore
 
     @property
     def num_slots(self) -> int:
         return self._num_slots  # noqa: leading-underscore
-
-    @property
-    def bytes_per_slot(self) -> int:
-        return self._bytes_per_slot  # noqa: leading-underscore
-
-    @property
-    def total_bytes(self) -> int:
-        return self._bytes_per_slot * self._num_slots  # noqa: leading-underscore
 
     @property
     def exhausted_count(self) -> int:
@@ -116,9 +62,9 @@ class CodecStateArena:
                 self._num_slots - len(self.free) - len(self.retired)
             )  # noqa: leading-underscore
 
-    def acquire(self, *, zeroed: bool = True) -> int | None:
-        """Take a slot, zeroed unless the caller's first decode reads none of its state, or
-        None when the arena is full."""
+    def acquire(self) -> int | None:
+        """Take a slot once the current stream is ordered after its previous owner's decodes,
+        or None when every slot is taken."""
         with self.lock:
             if not self.free:
                 self._exhausted_count += 1  # noqa: leading-underscore
@@ -129,10 +75,6 @@ class CodecStateArena:
             released = self.release_events.pop(slot, None)
         if released is not None:
             self.device_module.current_stream(self.device).wait_event(released)
-        else:
-            pass
-        if zeroed:
-            self.zero_slot(slot)
         else:
             pass
         return slot
@@ -172,6 +114,131 @@ class CodecStateArena:
                 self.free.remove(slot)
             else:
                 pass
+
+    STAGING_RING = 4
+
+    def staged(self, name: str, values: Sequence[int]) -> torch.Tensor:
+        if not supports_device_streams(self.device):
+            return torch.as_tensor(list(values), dtype=torch.long)
+        else:
+            pass
+        count = len(values)
+        if count == 0:
+            raise ValueError("codec state arena needs at least one slot")
+        else:
+            pass
+        ring = getattr(self.staging, f"{name}_ring", None)
+        if ring is None:
+            ring = [
+                (
+                    PinnedTransferSlot(
+                        self.device,
+                        torch.long,
+                        initial_capacity=self._num_slots
+                        + 1,  # noqa: leading-underscore
+                    ),
+                    torch.empty(
+                        self._num_slots + 1,
+                        dtype=torch.long,
+                        device=self.device,  # noqa: leading-underscore
+                    ),
+                )
+                for _ in range(self.STAGING_RING)
+            ]
+            setattr(self.staging, f"{name}_ring", ring)
+            setattr(self.staging, f"{name}_turn", 0)
+        else:
+            pass
+        turn = (getattr(self.staging, f"{name}_turn") + 1) % self.STAGING_RING
+        setattr(self.staging, f"{name}_turn", turn)
+        transfer, device = ring[turn]
+        # note (Zhuofeng-Li): a wrapped host slot may still be supplying its copy.
+        if transfer.recorded:
+            transfer.synchronize()
+        else:
+            pass
+        host = transfer.view(count)
+        host.copy_(torch.as_tensor(list(values), dtype=torch.long))
+        device[:count].copy_(host, non_blocking=True)
+        transfer.record(self.device_module.current_stream(self.device))
+        return device[:count]
+
+    def stage_index(self, slots: Sequence[int]) -> torch.Tensor:
+        """Stage a cohort's slot ids on the device without a host sync."""
+        return self.staged("index", slots)
+
+
+class CodecStateArena(CodecSlotAllocator):
+    """Bounded, reusable storage for per-stream incremental codec state.
+
+    A slot's whole state is one row of one buffer, and its frame position one entry of
+    another, so gather selects a cohort's rows with one index op and scatter writes the
+    advanced state back with one, whatever the number of state tensors. The state tensors
+    are views of the row, in the spec's order: conv histories, transposed-conv overlaps,
+    then the keys and the values of every layer.
+
+    Note (Qihao Liu): acquire zeroes a slot before handing it out, so a reused slot is
+    provably a cold start; release therefore returns a slot without clearing it. A caller
+    whose first decode starts from zero_state reads no slot state and skips the zeroing.
+    """
+
+    def __init__(
+        self,
+        decoder: IncrementalCodecDecoder,
+        *,
+        num_slots: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> None:
+        super().__init__(num_slots=num_slots, device=device)
+        self.dtype = dtype
+        self.scratch_slot = self._num_slots  # noqa: leading-underscore
+        self.spec = decoder.state_spec()
+        key_value_shape = (
+            self.spec.num_key_value_heads,
+            self.spec.retained_context,
+            self.spec.head_dim,
+        )
+        self.state_shapes: tuple[tuple[int, ...], ...] = (
+            *((channels, length) for _, channels, length in self.spec.conv_histories),
+            *(
+                (channels, length)
+                for _, channels, length in self.spec.transconv_overlaps
+            ),
+            *(key_value_shape for _ in range(2 * self.spec.num_layers)),
+        )
+        self.state_sizes: list[int] = [math.prod(shape) for shape in self.state_shapes]
+        self.state_rows = torch.zeros(
+            self.num_slots + 1,
+            sum(self.state_sizes),
+            device=self.device,
+            dtype=dtype,
+        )
+        self.frame_positions = torch.zeros(
+            self.num_slots + 1, device=self.device, dtype=torch.long
+        )
+        self.storage = self.state_of_rows(self.state_rows, self.frame_positions)
+        self._bytes_per_slot = self.spec.bytes_per_stream(
+            dtype
+        )  # noqa: leading-underscore
+
+    @property
+    def bytes_per_slot(self) -> int:
+        return self._bytes_per_slot  # noqa: leading-underscore
+
+    @property
+    def total_bytes(self) -> int:
+        return self._bytes_per_slot * self._num_slots  # noqa: leading-underscore
+
+    def acquire(self, *, zeroed: bool = True) -> int | None:
+        """Take a slot, zeroed unless the caller's first decode reads none of its state, or
+        None when the arena is full."""
+        slot = super().acquire()
+        if slot is not None and zeroed:
+            self.zero_slot(slot)
+        else:
+            pass
+        return slot
 
     def zero_slot(self, slot: int) -> None:
         self.state_rows[slot].zero_()
@@ -234,58 +301,6 @@ class CodecStateArena:
             ),
         ]
         return torch.cat([piece.reshape(stream_count, -1) for piece in pieces], dim=1)
-
-    STAGING_RING = 4
-
-    def staged(self, name: str, values: Sequence[int]) -> torch.Tensor:
-        if not supports_device_streams(self.device):
-            return torch.as_tensor(list(values), dtype=torch.long)
-        else:
-            pass
-        count = len(values)
-        if count == 0:
-            raise ValueError("codec state arena needs at least one slot")
-        else:
-            pass
-        ring = getattr(self.staging, f"{name}_ring", None)
-        if ring is None:
-            ring = [
-                (
-                    PinnedTransferSlot(
-                        self.device,
-                        torch.long,
-                        initial_capacity=self._num_slots
-                        + 1,  # noqa: leading-underscore
-                    ),
-                    torch.empty(
-                        self._num_slots + 1,
-                        dtype=torch.long,
-                        device=self.device,  # noqa: leading-underscore
-                    ),
-                )
-                for _ in range(self.STAGING_RING)
-            ]
-            setattr(self.staging, f"{name}_ring", ring)
-            setattr(self.staging, f"{name}_turn", 0)
-        else:
-            pass
-        turn = (getattr(self.staging, f"{name}_turn") + 1) % self.STAGING_RING
-        setattr(self.staging, f"{name}_turn", turn)
-        transfer, device = ring[turn]
-        # note (Zhuofeng-Li): a wrapped host slot may still be supplying its copy.
-        if transfer.recorded:
-            transfer.synchronize()
-        else:
-            pass
-        host = transfer.view(count)
-        host.copy_(torch.as_tensor(list(values), dtype=torch.long))
-        device[:count].copy_(host, non_blocking=True)
-        transfer.record(self.device_module.current_stream(self.device))
-        return device[:count]
-
-    def stage_index(self, slots: Sequence[int]) -> torch.Tensor:
-        """Stage a cohort's slot ids on the device without a host sync."""
-        return self.staged("index", slots)
 
     def gather(self, slots: Sequence[int]) -> IncrementalCodecState:
         """Select a cohort's rows into one contiguous state."""
