@@ -7,6 +7,7 @@ import contextlib
 import gc
 import importlib
 import logging
+import math
 import os
 from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass
@@ -50,7 +51,11 @@ from sglang_omni.models.fun_cosyvoice3.flow_estimator_trt import (
     execute_flow_estimator,
     is_flow_estimator_trt,
 )
-from sglang_omni.models.fun_cosyvoice3.hift_kernels import snake
+from sglang_omni.models.fun_cosyvoice3.hift_kernels import (
+    overlap_add_inverse,
+    short_time_spectrum,
+    snake,
+)
 from sglang_omni.models.fun_cosyvoice3.packed_dit import (
     DIT_INDUCTOR_OPTIONS,
     FA3_DTYPES,
@@ -1333,6 +1338,54 @@ def patch_hift_snake(hift: "CausalHiFTGenerator") -> None:
             pass
 
 
+def patch_hift_spectra(hift: "CausalHiFTGenerator", device: torch.device) -> None:
+    """Give HiFT its STFT and inverse STFT as float32 kernels whose every output sums its
+    own inputs in one order, so a row's spectra do not follow what shares its batch.
+    torch.stft and torch.istft build a cuFFT plan for each new shape, whose module
+    load waits for all the work queued on the device, and torch.istft reads its
+    window envelope on the host.
+    """
+    n_fft = hift.istft_params["n_fft"]
+    hop_length = hift.istft_params["hop_len"]
+    bins = n_fft // 2 + 1
+    window = hift.stft_window.to(device=device, dtype=torch.float64)
+    angle = (2 * math.pi / n_fft) * torch.outer(
+        torch.arange(bins, device=device, dtype=torch.float64),
+        torch.arange(n_fft, device=device, dtype=torch.float64),
+    )
+    forward_basis = (torch.cat([torch.cos(angle), -torch.sin(angle)]) * window).float()
+    # note (ratish): a one sided inverse counts the bins between DC and Nyquist twice.
+    one_sided = torch.full((bins, 1), 2.0, device=device, dtype=torch.float64)
+    one_sided[0] = 1.0
+    one_sided[-1] = 1.0
+    inverse_basis = (
+        torch.cat([torch.cos(angle) * one_sided, -torch.sin(angle) * one_sided])
+        * window
+        / n_fft
+    ).float()
+    squared_window = hift.stft_window.to(device).pow(2)
+
+    def stft(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        padded_signal = F.pad(x[:, None], (n_fft // 2, n_fft // 2), mode="reflect")[
+            :, 0
+        ].contiguous()
+        spectrum = short_time_spectrum(padded_signal, forward_basis, hop_length)
+        return spectrum[:, :bins], spectrum[:, bins:]
+
+    def istft(magnitude: torch.Tensor, phase: torch.Tensor) -> torch.Tensor:
+        magnitude = torch.clip(magnitude, max=1e2)
+        return overlap_add_inverse(
+            (magnitude * torch.cos(phase)).contiguous(),
+            (magnitude * torch.sin(phase)).contiguous(),
+            inverse_basis,
+            squared_window,
+            hop_length,
+        )
+
+    hift._stft = stft  # noqa: leading-underscore  # upstream name
+    hift._istft = istft  # noqa: leading-underscore  # upstream name
+
+
 def load_cosyvoice3_flow_hift_lightweight(
     checkpoint_dir: str,
     *,
@@ -1759,6 +1812,7 @@ class CosyVoice3Vocoder(BatchVocoderBase[FunCosyVoice3State, torch.Tensor]):
             )
             if HAS_TRITON and self.hift_autocast_dtype is None:
                 patch_hift_snake(hift)
+                patch_hift_spectra(hift, device)
             else:
                 pass
         else:
