@@ -31,10 +31,7 @@ from sglang_omni.models.qwen3_tts import stages as qwen3_stages
 from sglang_omni.models.qwen3_tts import streaming_vocoder as qwen3_streaming_vocoder
 from sglang_omni.models.qwen3_tts.config import Qwen3TTSPipelineConfig
 from sglang_omni.models.qwen3_tts.engine_builder import Qwen3TtsEngineBuilder
-from sglang_omni.models.qwen3_tts.incremental_codec import (
-    Qwen3TTSIncrementalCodecState,
-    Qwen3TTSIncrementalCodecStateSpec,
-)
+from sglang_omni.models.qwen3_tts.incremental_codec import Qwen3TTSIncrementalCodecState
 from sglang_omni.models.qwen3_tts.incremental_codec_cuda_graph import (
     Qwen3TTSIncrementalCodecCudaGraphRunner,
     split_frames_by_width,
@@ -73,6 +70,7 @@ from sglang_omni.profiler.event_recorder import (
 )
 from sglang_omni.proto import OmniRequest, StagePayload
 from sglang_omni.sampling import seed as sampling_seed
+from sglang_omni.scheduling.codec_state_pool import CodecStateSpec
 from sglang_omni.scheduling.message import IncomingMessage
 from sglang_omni.scheduling.omni_scheduler import OmniScheduler
 from sglang_omni.scheduling.pending_text_queue import PendingTextTensorQueue
@@ -2520,8 +2518,8 @@ class FakeIncrementalQwen3TTSDecoder:
         self.decode_inputs: list[torch.Tensor] = []
         self.decode_positions: list[list[int]] = []
 
-    def state_spec(self) -> Qwen3TTSIncrementalCodecStateSpec:
-        return Qwen3TTSIncrementalCodecStateSpec(
+    def state_spec(self) -> CodecStateSpec:
+        return CodecStateSpec(
             conv_histories=(("fake", 1, 2),),
             transconv_overlaps=(),
             num_layers=1,
