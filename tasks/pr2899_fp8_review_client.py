@@ -36,13 +36,16 @@ async def main() -> None:
         else:
             raise RuntimeError("FP8-cache server did not become ready")
 
-        async def synthesize(index: int, *, stream: bool, text: str) -> dict[str, int]:
+        async def synthesize(
+            index: int, *, stream: bool, text: str, instructions: str | None
+        ) -> dict[str, int]:
             async with client.stream(
                 "POST",
                 f"{BASE_URL}/v1/audio/speech",
                 json={
                     "model": MODEL,
                     "input": text,
+                    "instructions": instructions,
                     "references": [
                         {
                             "audio_path": reference,
@@ -63,17 +66,31 @@ async def main() -> None:
                 assert byte_count > 0 and byte_count % 2 == 0
                 return {"index": index, "bytes": byte_count, "chunks": chunk_count}
 
-        for scenario, concurrency, stream, text in (
-            ("buffered", 1, False, "Please read this sentence with a steady voice."),
-            ("cached", 1, True, "Please read this sentence with a steady voice."),
-            ("burst", 16, True, "Please read this new sentence with a clear voice."),
-            ("long", 1, True, "I am here. We go now. " * 170),
+        for scenario, concurrency, stream, text, instructions in (
+            (
+                "buffered",
+                1,
+                False,
+                "Please read this sentence with a steady voice.",
+                None,
+            ),
+            ("cached", 1, True, "Please read this sentence with a steady voice.", None),
+            (
+                "burst",
+                16,
+                True,
+                "Please read this new sentence with a clear voice.",
+                None,
+            ),
+            ("long", 1, True, "Please read this final sentence.", "Be calm. " * 400),
         ):
             before = await client.get(f"{BASE_URL}/model_info")
             before.raise_for_status()
             responses = await asyncio.gather(
                 *(
-                    synthesize(index, stream=stream, text=text)
+                    synthesize(
+                        index, stream=stream, text=text, instructions=instructions
+                    )
                     for index in range(concurrency)
                 )
             )
