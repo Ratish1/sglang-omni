@@ -29,7 +29,6 @@ from sglang_omni.models.qwen3_omni.components.streaming_detokenizer import (
     StreamingDetokenizeScheduler,
     create_streaming_detokenize_scheduler,
 )
-from sglang_omni.models.qwen3_omni.config import TALKER_MAX_RUNNING_REQUESTS
 from sglang_omni.models.qwen3_omni.payload_types import Qwen3OmniPipelineState
 from sglang_omni.models.qwen3_omni.request_builders import (
     EncoderRequestData,
@@ -1404,7 +1403,7 @@ def create_talker_ar_executor_from_config(
     else:
         prefill_graph_backend = CudaGraphBackend.DISABLED
     overrides = build_generation_batch_overrides(
-        max_running_requests=TALKER_MAX_RUNNING_REQUESTS,
+        max_running_requests=32,
         server_args_overrides=server_args_overrides,
         disable_cuda_graph=False,
         # note (zhaochenyang20): the native rotary path under torch compile rejects fused_set_kv_buffer_arg.
