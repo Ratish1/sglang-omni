@@ -1299,6 +1299,140 @@ def test_create_vocoder_executor_sets_effective_buffered_flow_route(
     )
 
 
+@pytest.mark.parametrize("is_ragged", [False, True])
+def test_create_vocoder_executor_fa3_eligibility_controls_prefix_pool(
+    monkeypatch: pytest.MonkeyPatch,
+    is_ragged: bool,
+) -> None:
+    startup_events: list[str] = []
+    packed_estimator = RecordingPackedDiT(is_ragged=is_ragged)
+    loaded_flow = prepare_vocoder_startup(
+        monkeypatch,
+        startup_events,
+        device_type="cuda",
+        allow_native_compile=False,
+        packed_estimator=packed_estimator,
+    )
+    prefix_pool = object()
+    pool_calls: list[tuple[object, torch.device, torch.dtype, float]] = []
+
+    def record_prefix_pool(
+        flow: object,
+        device: torch.device,
+        dtype: torch.dtype,
+        budget_gb: float,
+    ) -> object:
+        pool_calls.append((flow, device, dtype, budget_gb))
+        return prefix_pool
+
+    monkeypatch.setattr(stages, "build_prefix_pool", record_prefix_pool)
+    monkeypatch.setattr(
+        torch,
+        "autocast",
+        lambda *args, **kwargs: contextlib.nullcontext(),
+    )
+
+    scheduler = stages.create_vocoder_executor(
+        "model",
+        device="cuda",
+        dtype="bfloat16",
+        flow_prefix_cache_gb=1.0,
+        enable_flow_cuda_graph=False,
+        enable_flow_prefix_cuda_graph=False,
+        enable_flow_whole_history_cuda_graph=False,
+        enable_dit_torch_compile=False,
+        enable_buffered_packed_flow=False,
+    )
+
+    if is_ragged:
+        assert len(pool_calls) == 1
+        assert pool_calls[0][0] is loaded_flow
+        assert pool_calls[0][1] == torch.device("cuda")
+        assert pool_calls[0][2] == torch.bfloat16
+        assert pool_calls[0][3] == 1.0
+        assert scheduler.vocoder.flow.prefix_pool is prefix_pool
+    else:
+        assert pool_calls == []
+        assert scheduler.vocoder.flow.prefix_pool is None
+
+
+@pytest.mark.parametrize("is_ragged", [False, True])
+def test_create_vocoder_executor_fa3_eligibility_controls_whole_history_graph(
+    monkeypatch: pytest.MonkeyPatch,
+    is_ragged: bool,
+) -> None:
+    startup_events: list[str] = []
+    packed_estimator = RecordingPackedDiT(is_ragged=is_ragged)
+    loaded_flow = prepare_vocoder_startup(
+        monkeypatch,
+        startup_events,
+        device_type="cuda",
+        allow_native_compile=False,
+        packed_estimator=packed_estimator,
+    )
+    graph_events: list[str] = []
+
+    class RecordingSolveGraphCapture:
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            del args, kwargs
+            graph_events.append("solve_graph_create")
+
+    class RecordingWholeHistoryCudaGraphRunner:
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            del args, kwargs
+            graph_events.append("whole_history_create")
+
+        def capture(self) -> None:
+            graph_events.append("whole_history_capture")
+
+    monkeypatch.setattr(
+        stages,
+        "current_platform",
+        SimpleNamespace(
+            get_device_graph_backend=lambda device: "fake-graph-backend",
+        ),
+    )
+    monkeypatch.setattr(stages, "SolveGraphCapture", RecordingSolveGraphCapture)
+    monkeypatch.setattr(
+        stages,
+        "WholeHistoryCudaGraphRunner",
+        RecordingWholeHistoryCudaGraphRunner,
+    )
+    monkeypatch.setattr(
+        stages,
+        "generate_prefill_cuda_graph_batch_sizes",
+        lambda admission_frames: (admission_frames,),
+    )
+    monkeypatch.setattr(
+        torch,
+        "autocast",
+        lambda *args, **kwargs: contextlib.nullcontext(),
+    )
+
+    scheduler = stages.create_vocoder_executor(
+        "model",
+        device="cuda",
+        dtype="bfloat16",
+        flow_prefix_cache_gb=0.0,
+        enable_flow_cuda_graph=False,
+        enable_flow_prefix_cuda_graph=False,
+        enable_flow_whole_history_cuda_graph=True,
+        enable_dit_torch_compile=False,
+    )
+
+    if is_ragged:
+        assert graph_events == [
+            "solve_graph_create",
+            "whole_history_create",
+            "whole_history_capture",
+        ]
+        assert scheduler.vocoder.flow is loaded_flow
+        assert scheduler.vocoder.flow.whole_history_cuda_graph_runner is not None
+    else:
+        assert graph_events == []
+        assert scheduler.vocoder.flow.whole_history_cuda_graph_runner is None
+
+
 def test_create_vocoder_executor_rejects_trt_and_compile() -> None:
     with pytest.raises(ValueError, match="enable only one"):
         stages.create_vocoder_executor(

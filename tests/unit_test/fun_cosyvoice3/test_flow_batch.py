@@ -366,6 +366,65 @@ def test_buffered_packed_flow_inference_uses_packed_eager_without_native_retry(
         packed_flow.inference(inputs)
 
 
+def test_buffered_packed_flow_inference_replays_whole_history_graph(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    flow = FakeFlow(max_frames=128)
+    packed_flow = FunCosyVoice3Flow(flow, packed_estimator=flow.packed_estimator)
+    packed_flow.enable_buffered_packed_flow = True
+
+    class GraphHit:
+        def __init__(self) -> None:
+            self.lengths: list[tuple[int, ...]] = []
+            self.noises: list[torch.Tensor] = []
+
+        def run(self, **kwargs: object) -> torch.Tensor:
+            lengths = kwargs["lengths"]
+            noise = kwargs["noise"]
+            assert isinstance(lengths, tuple)
+            assert isinstance(noise, torch.Tensor)
+            self.lengths.append(lengths)
+            self.noises.append(noise.detach().clone())
+            return noise.clone()
+
+    graph_runner = GraphHit()
+    packed_flow.whole_history_cuda_graph_runner = graph_runner
+    monkeypatch.setattr(
+        stages,
+        "solve_flow_euler_packed",
+        lambda *args, **kwargs: pytest.fail("Packed Graph hit ran eager Flow"),
+    )
+    monkeypatch.setattr(
+        stages,
+        "solve_flow_euler",
+        lambda *args, **kwargs: pytest.fail("Packed Graph hit ran native Flow"),
+    )
+
+    inputs = [
+        make_input([1], prompt_token=[2]),
+        make_input([3, 4], prompt_token=[5, 6]),
+    ]
+    generated = packed_flow.inference(inputs)
+
+    assert graph_runner.lengths == [(4, 8)]
+    assert len(graph_runner.noises) == 1
+    packed_noise = graph_runner.noises[0]
+    expected: list[torch.Tensor] = []
+    offset = 0
+    for total_frames, prompt_frames in zip((4, 8), (2, 4), strict=True):
+        expected.append(
+            packed_noise[
+                :, offset + prompt_frames : offset + total_frames, :
+            ].transpose(1, 2)
+        )
+        offset += total_frames
+
+    assert [tuple(mel.shape) for mel in generated] == [(1, 4, 2), (1, 4, 4)]
+    for actual, expected_mel in zip(generated, expected, strict=True):
+        torch.testing.assert_close(actual, expected_mel)
+    assert flow.packed_estimator.calls == []
+
+
 def test_flow_batch_cfg_uses_two_times_request_batch() -> None:
     flow = FakeFlow()
 
