@@ -1509,6 +1509,44 @@ def test_vocoder_spectra_match_cosyvoice_without_a_host_wait(
 
 @pytest.mark.accelerator
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_vocoder_reads_hift_samples_without_a_host_wait() -> None:
+    vocoder = stages.CosyVoice3Vocoder(HiftFlowStub(), make_causal_hift(10.0))
+    torch.manual_seed(4)
+    speech = torch.randn(3, 4800, device="cuda")
+    sync_debug_mode = torch.cuda.get_sync_debug_mode()
+    torch.cuda.set_sync_debug_mode("error")
+    try:
+        samples = vocoder.read_hift_samples(speech)
+    finally:
+        torch.cuda.set_sync_debug_mode(sync_debug_mode)
+    assert torch.equal(samples, speech.cpu())
+
+
+@pytest.mark.accelerator
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_hift_step_samples_outlive_the_next_step() -> None:
+    vocoder = stages.CosyVoice3Vocoder(HiftFlowStub(), make_causal_hift(10.0))
+    torch.manual_seed(5)
+    steps = [
+        [
+            stages.HiftStepRow(
+                history=torch.randn(1, 80, 120, device="cuda") * 3,
+                emitted_samples=0,
+                is_final=False,
+            )
+        ]
+        for _ in range(2)
+    ]
+    with torch.inference_mode():
+        first = vocoder.hift_step(steps[0])
+        kept = [delta.clone() for delta, _ in first]
+        vocoder.hift_step(steps[1])
+    for (delta, _), reference in zip(first, kept, strict=True):
+        assert torch.equal(delta, reference)
+
+
+@pytest.mark.accelerator
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_hift_decode_replay_equals_each_rows_own_decode(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

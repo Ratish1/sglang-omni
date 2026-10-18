@@ -1807,6 +1807,7 @@ class CosyVoice3Vocoder(BatchVocoderBase[FunCosyVoice3State, torch.Tensor]):
             hift.f0_predictor.condnet[0].causal_padding + hift.conv_pre_look_right + 1
         )
         self.hift_decode_cuda_graph_runner: HiftDecodeCudaGraphRunner | None = None
+        self.hift_samples_host: torch.Tensor | None = None
         # note(ratish): the AR shares this process and card on its own top priority
         # stream; on a stream of its own the vocoder's kernels and host copies do not
         # queue behind the AR's. It waits once for what the default stream holds at
@@ -1818,6 +1819,7 @@ class CosyVoice3Vocoder(BatchVocoderBase[FunCosyVoice3State, torch.Tensor]):
             self.stream_context: contextlib.AbstractContextManager[None] = (
                 torch.cuda.stream(stream)
             )
+            self.hift_samples_event: torch.cuda.Event | None = torch.cuda.Event()
             # note (ratish): a ROCm device is a cuda device too, and the kernels' inline
             # PTX cannot compile there.
             self.has_hift_kernels = (
@@ -1830,6 +1832,7 @@ class CosyVoice3Vocoder(BatchVocoderBase[FunCosyVoice3State, torch.Tensor]):
                 pass
         else:
             self.stream_context = contextlib.nullcontext()
+            self.hift_samples_event = None
             self.has_hift_kernels = False
 
     def prepare_item(
@@ -2219,7 +2222,8 @@ class CosyVoice3Vocoder(BatchVocoderBase[FunCosyVoice3State, torch.Tensor]):
             speech = hift.decode(x=window_mel, s=window_source, finalize=True)
         else:
             speech = runner.run(window_mel, window_source)
-        speech = speech.detach().cpu()
+        speech = self.read_hift_samples(speech)
+        # note (ratish): clones, as the pinned samples are the next step's buffer.
         return [
             (
                 speech[
@@ -2227,13 +2231,34 @@ class CosyVoice3Vocoder(BatchVocoderBase[FunCosyVoice3State, torch.Tensor]):
                     (window.emitted_frame - origin)
                     * samples_per_frame : (window.end_frame - origin)
                     * samples_per_frame,
-                ].contiguous(),
+                ].clone(),
                 window.end_frame * samples_per_frame,
             )
             for index, (window, origin) in enumerate(
                 zip(windows, origin_frames, strict=True)
             )
         ]
+
+    def read_hift_samples(self, speech: torch.Tensor) -> torch.Tensor:
+        """A step's samples on the host. On CUDA through a pinned buffer and an event: a
+        pageable copy holds its CUDA call until the device reaches it, and another
+        thread's event creation waits behind it meanwhile."""
+        if self.hift_samples_event is None:
+            return speech.detach().cpu()
+        else:
+            pass
+        count = speech.numel()
+        host = self.hift_samples_host
+        if host is None or host.numel() < count or host.dtype != speech.dtype:
+            host = torch.empty(count, dtype=speech.dtype, pin_memory=True)
+            self.hift_samples_host = host
+        else:
+            pass
+        samples = host[:count].view(speech.shape)
+        samples.copy_(speech.detach(), non_blocking=True)
+        self.hift_samples_event.record()
+        self.hift_samples_event.synchronize()
+        return samples
 
     def make_flow_input(
         self,
