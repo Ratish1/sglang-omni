@@ -1087,12 +1087,16 @@ def prepare_vocoder_startup(
     monkeypatch.setattr(stages, "compile_dit_backbone", record_native_compile)
 
     def record_shared_compile_prepare(
-        flow: GraphRunnableFakeFlow | stages.FunCosyVoice3Flow,
+        estimator: torch.nn.Module,
     ) -> None:
-        assert flow is loaded_flow
+        assert estimator is loaded_flow.decoder.estimator
         startup_events.append("shared_compile_prepare")
 
-    monkeypatch.setattr(stages, "prepare_dit_compile", record_shared_compile_prepare)
+    monkeypatch.setattr(
+        stages,
+        "prepare_dit_compilation",
+        record_shared_compile_prepare,
+    )
 
     def warmup_packed_dit_compile(
         scheduler: FunCosyVoice3StreamingVocoderScheduler,

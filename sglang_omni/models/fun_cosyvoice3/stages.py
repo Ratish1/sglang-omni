@@ -1480,21 +1480,7 @@ def load_cosyvoice3_flow_hift_lightweight(
     )
 
 
-def prepare_dit_compile(flow: FunCosyVoice3Flow) -> None:
-    estimator = flow.decoder.estimator
-    if not isinstance(estimator, torch.nn.Module):
-        raise RuntimeError(
-            "Fun-CosyVoice3 DiT torch.compile requires a PyTorch estimator, "
-            f"got {type(estimator).__name__}"
-        )
-    else:
-        pass
-
-    try:
-        from cosyvoice.flow.DiT import modules as cosyvoice_dit_modules
-    except ImportError as exc:
-        raise RuntimeError(COSYVOICE_INSTALL_HINT) from exc
-
+def prepare_dit_compilation(estimator: torch.nn.Module) -> None:
     inductor_config.fx_graph_cache = True
     dynamo.config.cache_size_limit = 1024
     dynamo.config.accumulated_cache_size_limit = 1024
@@ -1513,7 +1499,6 @@ def prepare_dit_compile(flow: FunCosyVoice3Flow) -> None:
         return torch.stack((freqs, freqs), dim=-1).flatten(-2), 1.0
 
     rotary.forward = rotary_frequencies
-    cosyvoice_dit_modules.apply_rotary_pos_emb = apply_rotary_pos_emb.__wrapped__
 
 
 def compile_dit_backbone(
@@ -1538,7 +1523,12 @@ def compile_dit_backbone(
         pass
 
     original_forward = estimator.forward
-    prepare_dit_compile(flow)
+    prepare_dit_compilation(estimator)
+    try:
+        from cosyvoice.flow.DiT import modules as cosyvoice_dit_modules
+    except ImportError as exc:
+        raise RuntimeError(COSYVOICE_INSTALL_HINT) from exc
+    cosyvoice_dit_modules.apply_rotary_pos_emb = apply_rotary_pos_emb.__wrapped__
     try:
         # note(ratish): not dynamic=True, which makes the LayerNorm eps a symbol;
         # Inductor cannot keep it and restarts the compile.
@@ -2514,7 +2504,14 @@ def create_vocoder_executor(
     patch_chunk_mask()
 
     if enable_dit_torch_compile and use_packed_buffered:
-        prepare_dit_compile(flow)
+        dit_estimator = flow.decoder.estimator
+        if not isinstance(dit_estimator, torch.nn.Module):
+            raise RuntimeError(
+                "Fun-CosyVoice3 DiT torch.compile requires a PyTorch estimator, "
+                f"got {type(dit_estimator).__name__}"
+            )
+        else:
+            prepare_dit_compilation(dit_estimator)
     elif enable_dit_torch_compile:
         compile_dit_backbone(flow, autocast_dtype=autocast_dtype)
     else:

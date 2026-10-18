@@ -9,7 +9,7 @@ from x_transformers.x_transformers import RotaryEmbedding
 import sglang_omni.models.fun_cosyvoice3.stages as stages
 from sglang_omni.models.fun_cosyvoice3.packed_dit import DIT_INDUCTOR_OPTIONS
 
-pytest.importorskip("cosyvoice.flow.DiT.modules")
+cosyvoice_dit_modules = pytest.importorskip("cosyvoice.flow.DiT.modules")
 
 
 class FakeDiTEstimator(torch.nn.Module):
@@ -34,6 +34,38 @@ class NonModuleEstimator:
     pass
 
 
+def test_prepare_dit_compilation_only_patches_shared_estimator(
+    monkeypatch,
+) -> None:
+    estimator = FakeDiTEstimator()
+    original_forward = estimator.forward
+    original_native_rotary = cosyvoice_dit_modules.apply_rotary_pos_emb
+    expected = {
+        frame_count: estimator.rotary_embed.forward_from_seq_len(frame_count)
+        for frame_count in (17, 37, 128)
+    }
+
+    def fail_compile(fn, options=None):
+        raise AssertionError("shared preparation must not call torch.compile")
+
+    monkeypatch.setattr(torch, "compile", fail_compile)
+    monkeypatch.setattr(
+        cosyvoice_dit_modules,
+        "apply_rotary_pos_emb",
+        original_native_rotary,
+    )
+
+    stages.prepare_dit_compilation(estimator)
+
+    assert estimator.forward == original_forward
+    assert cosyvoice_dit_modules.apply_rotary_pos_emb is original_native_rotary
+    for frame_count, (expected_freqs, expected_scale) in expected.items():
+        freqs, scale = estimator.rotary_embed.forward_from_seq_len(frame_count)
+        assert freqs.dtype == expected_freqs.dtype
+        assert torch.equal(freqs, expected_freqs)
+        assert scale == expected_scale
+
+
 def test_compile_dit_backbone_compiles_the_estimator_forward(monkeypatch) -> None:
     estimator = FakeDiTEstimator()
     flow = FakeFlow(estimator)
@@ -55,6 +87,12 @@ def test_compile_dit_backbone_compiles_the_estimator_forward(monkeypatch) -> Non
         return wrapped
 
     monkeypatch.setattr(torch, "compile", fake_compile)
+    original_native_rotary = cosyvoice_dit_modules.apply_rotary_pos_emb
+    monkeypatch.setattr(
+        cosyvoice_dit_modules,
+        "apply_rotary_pos_emb",
+        original_native_rotary,
+    )
 
     stages.compile_dit_backbone(flow, warmup_mel_frames=16)
 
@@ -62,6 +100,10 @@ def test_compile_dit_backbone_compiles_the_estimator_forward(monkeypatch) -> Non
     assert compile_calls[0]["fn"] == original_forward
     # Bound-method compile keeps parameter names stable (no _orig_mod prefix).
     assert set(dict(estimator.named_parameters())) == param_names
+    assert (
+        cosyvoice_dit_modules.apply_rotary_pos_emb
+        is stages.apply_rotary_pos_emb.__wrapped__
+    )
     # Warmup runs the CFG [2, 80, T] signature for buffered and causal hops.
     assert forward_shapes == (
         [((2, 80, 16), (2, 1, 16), (2, 80, 16), False)] * 3
