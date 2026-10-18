@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterator
 from types import ModuleType
 from unittest.mock import Mock
 
@@ -36,8 +37,13 @@ class NonModuleEstimator:
 
 
 @pytest.fixture
-def native_dit_modules() -> ModuleType:
-    return pytest.importorskip("cosyvoice.flow.DiT.modules")
+def native_dit_modules() -> Iterator[ModuleType]:
+    native_dit_module = pytest.importorskip("cosyvoice.flow.DiT.modules")
+    original_apply_rotary_pos_emb = native_dit_module.apply_rotary_pos_emb
+    try:
+        yield native_dit_module
+    finally:
+        native_dit_module.apply_rotary_pos_emb = original_apply_rotary_pos_emb
 
 
 @pytest.fixture(autouse=True)
