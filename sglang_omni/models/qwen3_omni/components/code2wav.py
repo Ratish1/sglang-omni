@@ -25,7 +25,6 @@ from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import (
 
 from sglang_omni.models.qwen3_omni.components.incremental_codec import (
     SlotDecode,
-    conv_stack_state_layout,
     slot_conv_stack,
 )
 from sglang_omni.platforms.interface import JointRopeInplaceKernel
@@ -33,6 +32,7 @@ from sglang_omni.scheduling.codec_state_pool import (
     CodecStatePool,
     CodecStateSpec,
     RingAddresses,
+    conv_stack_state_layout,
     ring_addresses,
 )
 from sglang_omni.utils.channels_last_conv import (
@@ -425,7 +425,6 @@ class Qwen3OmniIncrementalCodec:
             self.model,
             hidden_states,
             SlotDecode(pool=pool, slot_index=slot_index, is_cold=first_decode),
-            first_decode=first_decode,
         )
         pool.frame_positions.index_put_((slot_index,), start_positions + new_frames)
         return waveform

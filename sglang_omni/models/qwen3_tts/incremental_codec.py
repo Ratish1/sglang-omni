@@ -10,10 +10,10 @@ from typing import TYPE_CHECKING
 import torch
 import torch.nn.functional as F
 
-from sglang_omni.models.qwen3_omni.components.incremental_codec import (
+from sglang_omni.scheduling.codec_state_pool import (
+    CodecStateSpec,
     conv_stack_state_layout,
 )
-from sglang_omni.scheduling.codec_state_pool import CodecStateSpec
 from sglang_omni.utils.channels_last_conv import (
     channels_last_conv1d,
     channels_last_conv_transpose1d,

@@ -7,21 +7,24 @@ from __future__ import annotations
 import threading
 from collections.abc import Sequence
 from dataclasses import dataclass
+from typing import Literal, Protocol
 
 import torch
 
 from sglang_omni.utils.cuda_staging import PinnedTransferSlot
 from sglang_omni.utils.device import supports_device_streams
 
+# A thread has at most two cohorts between launch and resolve, each staging its slot index
+# twice, so a ring of four rewrites no host buffer whose copy is still queued.
+STAGING_RING_DEPTH = 4
+
+StagingName = Literal["index", "valid_frames"]
+
 
 @dataclass(frozen=True)
 class CodecStateSpec:
-    """Static description of one stream's incremental codec state.
-
-    conv_histories and transconv_overlaps are (key, channels, length) triples in the order the
-    decoder visits them. Zero-length entries are kept so every consumer sees the same key set
-    regardless of kernel size.
-    """
+    """One stream's incremental codec state: (key, channels, length) conv histories and
+    transposed-conv overlaps in decode order, zero lengths kept, and its K/V shape."""
 
     conv_histories: tuple[tuple[str, int, int], ...]
     transconv_overlaps: tuple[tuple[str, int, int], ...]
@@ -31,7 +34,6 @@ class CodecStateSpec:
     retained_context: int
 
     def bytes_per_stream(self, dtype: torch.dtype) -> int:
-        itemsize = torch.empty((), dtype=dtype).element_size()
         elements = sum(channels * length for _, channels, length in self.conv_histories)
         elements += sum(
             channels * length for _, channels, length in self.transconv_overlaps
@@ -43,149 +45,65 @@ class CodecStateSpec:
             * self.retained_context
             * self.head_dim
         )
-        return int(elements * itemsize)
+        return elements * dtype.itemsize
 
 
-class CodecSlotAllocator:
-    """Bounded, reusable slots for per-stream codec state: a slot is handed out after every
-    decode its previous owner queued, and a cohort's slot ids reach the device without a host
-    sync."""
+class CausalConv(Protocol):
+    """A stride-1 causal conv: the conv and the history length it pads on the left."""
 
-    def __init__(self, *, num_slots: int, device: torch.device) -> None:
-        if num_slots <= 0:
-            raise ValueError("codec state needs at least one slot")
-        else:
-            pass
-        self.device = torch.device(device)
-        self.device_module = torch.get_device_module(self.device)
-        self._num_slots = int(num_slots)  # noqa: leading-underscore
-        self.lock = threading.Lock()
-        self.staging = threading.local()
-        self.release_events: dict[int, torch.Event] = {}
-        self.free: list[int] = list(
-            reversed(range(self._num_slots))
-        )  # noqa: leading-underscore
-        self.retired: set[int] = set()
-        self._exhausted_count = 0  # noqa: leading-underscore
+    conv: torch.nn.Conv1d
+    padding: int
 
-    @property
-    def num_slots(self) -> int:
-        return self._num_slots  # noqa: leading-underscore
 
-    @property
-    def exhausted_count(self) -> int:
-        return self._exhausted_count  # noqa: leading-underscore
+class CausalTransConv(Protocol):
+    """A causal transposed conv: the conv and the samples its whole-sequence forward trims
+    from the start and the end."""
 
-    def active_slots(self) -> int:
-        with self.lock:
-            return (
-                self._num_slots - len(self.free) - len(self.retired)
-            )  # noqa: leading-underscore
+    conv: torch.nn.ConvTranspose1d
+    left_pad: int
+    right_pad: int
 
-    def acquire(self) -> int | None:
-        """Take a slot once the current stream is ordered after its previous owner's decodes,
-        or None when every slot is taken."""
-        with self.lock:
-            if not self.free:
-                self._exhausted_count += 1  # noqa: leading-underscore
-                return None
-            else:
-                pass
-            slot = self.free.pop()
-            released = self.release_events.pop(slot, None)
-        if released is not None:
-            self.device_module.current_stream(self.device).wait_event(released)
-        else:
-            pass
-        return slot
 
-    def release(self, slot: int) -> None:
-        released = None
-        if supports_device_streams(self.device):
-            released = self.device_module.Event()
-            released.record(self.device_module.current_stream(self.device))
-        else:
-            pass
-        with self.lock:
-            if slot in self.retired:
-                return
-            else:
-                pass
-            if slot in self.free:
-                raise RuntimeError(f"codec state slot {slot} was released twice")
-            else:
-                pass
-            if released is not None:
-                self.release_events[slot] = released
-            else:
-                pass
-            self.free.append(slot)
+class CodecConvStack(Protocol):
+    """The conv stack after the transformer: upsample stages of a transposed conv and a
+    ConvNeXt block, then decoder.0, decoder blocks (activation, transposed conv, residual
+    units), a final activation and a final conv."""
 
-    def retire(self, slot: int) -> None:
-        """Withdraw a slot for the life of the process.
+    upsample: torch.nn.ModuleList
+    decoder: torch.nn.ModuleList
 
-        Note (Qihao Liu): used when a decode that touched the slot could not be
-        proven complete, so its memory must never be handed to later work.
-        """
-        with self.lock:
-            self.retired.add(slot)
-            self.release_events.pop(slot, None)
-            if slot in self.free:
-                self.free.remove(slot)
-            else:
-                pass
 
-    STAGING_RING = 4
+def conv_stack_state_layout(
+    codec: CodecConvStack,
+) -> tuple[list[tuple[str, int, int]], list[tuple[str, int, int]]]:
+    """The conv stack's (key, channels, length) conv histories and transposed-conv overlaps,
+    in the order its decode visits them; Qwen3-Omni's code2wav and Qwen3-TTS's speech
+    tokenizer decoder share this stack."""
+    conv_histories: list[tuple[str, int, int]] = []
+    transconv_overlaps: list[tuple[str, int, int]] = []
 
-    def staged(self, name: str, values: Sequence[int]) -> torch.Tensor:
-        if not supports_device_streams(self.device):
-            return torch.as_tensor(list(values), dtype=torch.long)
-        else:
-            pass
-        count = len(values)
-        if count == 0:
-            raise ValueError("codec state needs at least one slot")
-        else:
-            pass
-        ring = getattr(self.staging, f"{name}_ring", None)
-        if ring is None:
-            ring = [
-                (
-                    PinnedTransferSlot(
-                        self.device,
-                        torch.long,
-                        initial_capacity=self._num_slots
-                        + 1,  # noqa: leading-underscore
-                    ),
-                    torch.empty(
-                        self._num_slots + 1,
-                        dtype=torch.long,
-                        device=self.device,  # noqa: leading-underscore
-                    ),
-                )
-                for _ in range(self.STAGING_RING)
-            ]
-            setattr(self.staging, f"{name}_ring", ring)
-            setattr(self.staging, f"{name}_turn", 0)
-        else:
-            pass
-        turn = (getattr(self.staging, f"{name}_turn") + 1) % self.STAGING_RING
-        setattr(self.staging, f"{name}_turn", turn)
-        transfer, device = ring[turn]
-        # note (Zhuofeng-Li): a wrapped host slot may still be supplying its copy.
-        if transfer.recorded:
-            transfer.synchronize()
-        else:
-            pass
-        host = transfer.view(count)
-        host.copy_(torch.as_tensor(list(values), dtype=torch.long))
-        device[:count].copy_(host, non_blocking=True)
-        transfer.record(self.device_module.current_stream(self.device))
-        return device[:count]
+    def add_conv(module: CausalConv, state_key: str) -> None:
+        conv_histories.append(
+            (state_key, int(module.conv.in_channels), int(module.padding))
+        )
 
-    def stage_index(self, slots: Sequence[int]) -> torch.Tensor:
-        """Stage a cohort's slot ids on the device without a host sync."""
-        return self.staged("index", slots)
+    def add_transconv(module: CausalTransConv, state_key: str) -> None:
+        transconv_overlaps.append(
+            (state_key, int(module.conv.out_channels), int(module.right_pad))
+        )
+
+    for stage_index, blocks in enumerate(codec.upsample):
+        add_transconv(blocks[0], f"upsample.{stage_index}.transconv")
+        add_conv(blocks[1].dwconv, f"upsample.{stage_index}.convnext.dwconv")
+    add_conv(codec.decoder[0], "decoder.0")
+    for block_index, decoder_block in enumerate(codec.decoder[1:-2], start=1):
+        add_transconv(decoder_block.block[1], f"decoder.{block_index}.transconv")
+        for residual_index, residual in enumerate(decoder_block.block[2:]):
+            residual_key = f"decoder.{block_index}.residual.{residual_index}"
+            add_conv(residual.conv1, f"{residual_key}.conv1")
+            add_conv(residual.conv2, f"{residual_key}.conv2")
+    add_conv(codec.decoder[-1], "decoder.final")
+    return conv_histories, transconv_overlaps
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -207,10 +125,9 @@ def ring_addresses(
     ring_frames: int,
     retained_frames: int,
 ) -> RingAddresses:
-    """Position p of a slot's stream lives at ring row slot * ring_frames + p % ring_frames. A
-    row's window holds the retained_frames positions before its first new frame (fewer at the
-    stream's start) and its new frames; ring_frames >= retained_frames + new_frames keeps them
-    on distinct rows."""
+    """Position p of a slot's stream lives at ring row slot * ring_frames + p % ring_frames; a
+    row's window is the retained_frames positions before its first new frame and its new
+    frames, on distinct rows while ring_frames >= retained_frames + new_frames."""
     frame_offsets = torch.arange(new_frames, device=slot_index.device)
     frame_positions = start_positions[:, None] + frame_offsets
     slot_rows = slot_index[:, None] * ring_frames
@@ -226,12 +143,145 @@ def ring_addresses(
     )
 
 
+@dataclass(kw_only=True)
+class StagingRing:
+    """Pinned host buffers and the device buffers they copy into, taken in turn."""
+
+    entries: list[tuple[PinnedTransferSlot, torch.Tensor]]
+    turn: int = 0
+
+
+class ThreadStaging(threading.local):
+    """A thread's staging rings by name: a ring's device buffers are reused on its thread's
+    stream only, which orders every read of them before the next copy."""
+
+    def __init__(self) -> None:
+        self.rings: dict[StagingName, StagingRing] = {}
+
+
+class CodecSlotAllocator:
+    """Bounded, reusable slots for per-stream codec state: a slot is handed out after every
+    decode its previous owner queued, and slot ids reach the device without a host sync.
+    """
+
+    def __init__(self, *, num_slots: int, device: torch.device) -> None:
+        if num_slots <= 0:
+            raise ValueError("codec state needs at least one slot")
+        else:
+            pass
+        self.device = torch.device(device)
+        self.device_module = torch.get_device_module(self.device)
+        self.num_slots = num_slots
+        self.exhausted_count = 0
+        self.lock = threading.Lock()
+        self.staging = ThreadStaging()
+        self.release_events: dict[int, torch.Event] = {}
+        self.free: list[int] = list(reversed(range(num_slots)))
+        self.retired: set[int] = set()
+
+    def active_slots(self) -> int:
+        with self.lock:
+            return self.num_slots - len(self.free) - len(self.retired)
+
+    def acquire(self) -> int | None:
+        """Take a slot once the current stream is ordered after its previous owner's decodes,
+        or None when every slot is taken."""
+        with self.lock:
+            if not self.free:
+                self.exhausted_count += 1
+                return None
+            else:
+                pass
+            slot = self.free.pop()
+            release_event = self.release_events.pop(slot, None)
+        if release_event is not None:
+            self.device_module.current_stream(self.device).wait_event(release_event)
+        else:
+            pass
+        return slot
+
+    def release(self, slot: int) -> None:
+        release_event = None
+        if supports_device_streams(self.device):
+            release_event = self.device_module.Event()
+            release_event.record(self.device_module.current_stream(self.device))
+        else:
+            pass
+        with self.lock:
+            if slot in self.retired:
+                return
+            else:
+                pass
+            assert slot not in self.free, f"codec state slot {slot} was released twice"
+            if release_event is not None:
+                self.release_events[slot] = release_event
+            else:
+                pass
+            self.free.append(slot)
+
+    def retire(self, slot: int) -> None:
+        """Withdraw a slot for the life of the process.
+
+        Note (Qihao Liu): used when a decode that touched the slot could not be
+        proven complete, so its memory must never be handed to later work.
+        """
+        with self.lock:
+            self.retired.add(slot)
+            self.release_events.pop(slot, None)
+            if slot in self.free:
+                self.free.remove(slot)
+            else:
+                pass
+
+    def staged(self, name: StagingName, values: Sequence[int]) -> torch.Tensor:
+        """The values on the device, copied from the thread's next pinned buffer for name."""
+        value_count = len(values)
+        if value_count == 0:
+            raise ValueError("staging needs at least one value")
+        elif not supports_device_streams(self.device):
+            return torch.as_tensor(list(values), dtype=torch.long)
+        else:
+            pass
+        ring = self.staging.rings.get(name)
+        if ring is None:
+            ring = StagingRing(
+                entries=[
+                    (
+                        PinnedTransferSlot(
+                            self.device, torch.long, initial_capacity=self.num_slots + 1
+                        ),
+                        torch.empty(
+                            self.num_slots + 1, dtype=torch.long, device=self.device
+                        ),
+                    )
+                    for _ in range(STAGING_RING_DEPTH)
+                ]
+            )
+            self.staging.rings[name] = ring
+        else:
+            pass
+        ring.turn = (ring.turn + 1) % STAGING_RING_DEPTH
+        transfer, device_buffer = ring.entries[ring.turn]
+        # note (Zhuofeng-Li): a wrapped host slot may still be supplying its copy.
+        if transfer.recorded:
+            transfer.synchronize()
+        else:
+            pass
+        host = transfer.view(value_count)
+        host.copy_(torch.as_tensor(list(values), dtype=torch.long))
+        device_buffer[:value_count].copy_(host, non_blocking=True)
+        transfer.record(self.device_module.current_stream(self.device))
+        return device_buffer[:value_count]
+
+    def stage_index(self, slots: Sequence[int]) -> torch.Tensor:
+        """Stage a cohort's slot ids on the device without a host sync."""
+        return self.staged("index", slots)
+
+
 class CodecStatePool(CodecSlotAllocator):
-    """Per-slot codec state kept where the decode's kernels read and write it: a history pool
-    (slots, history samples, channels) per causal conv and an overlap pool (slots, overlap
-    samples, channels) per transposed conv, a K/V ring of ring_frames positions per slot and
-    layer, and each slot's frame position. Past the slots the streams take sit capture_slots
-    scratch slots, one per row a graph capture decodes."""
+    """Per-slot codec state where the decode's kernels read and write it: a history pool per
+    causal conv, an overlap pool per transposed conv, per-layer K/V rings and frame positions,
+    then capture_slots scratch slots past the streams' slots, one per captured row."""
 
     def __init__(
         self,
@@ -252,26 +302,31 @@ class CodecStatePool(CodecSlotAllocator):
         self.retained_frames = spec.retained_context
         self.scratch_slots = tuple(range(num_slots, total_slots))
         self.histories = {
-            key: torch.zeros(total_slots, length, channels, device=device, dtype=dtype)
-            for key, channels, length in spec.conv_histories
+            state_key: torch.zeros(
+                total_slots, length, channels, device=self.device, dtype=dtype
+            )
+            for state_key, channels, length in spec.conv_histories
             if length
         }
         self.overlaps = {
-            key: torch.zeros(total_slots, length, channels, device=device, dtype=dtype)
-            for key, channels, length in spec.transconv_overlaps
+            state_key: torch.zeros(
+                total_slots, length, channels, device=self.device, dtype=dtype
+            )
+            for state_key, channels, length in spec.transconv_overlaps
             if length
         }
         ring_width = spec.num_key_value_heads * spec.head_dim
         self.keys = [
             torch.zeros(
-                total_slots * ring_frames, ring_width, device=device, dtype=dtype
+                total_slots * ring_frames, ring_width, device=self.device, dtype=dtype
             )
             for _ in range(spec.num_layers)
         ]
         self.values = [torch.zeros_like(ring) for ring in self.keys]
-        self.frame_positions = torch.zeros(total_slots, device=device, dtype=torch.long)
-        itemsize = torch.empty((), dtype=dtype).element_size()
-        self.bytes_per_slot = itemsize * (
+        self.frame_positions = torch.zeros(
+            total_slots, device=self.device, dtype=torch.long
+        )
+        self.bytes_per_slot = dtype.itemsize * (
             sum(pool[0].numel() for pool in self.histories.values())
             + sum(pool[0].numel() for pool in self.overlaps.values())
             + 2 * spec.num_layers * ring_frames * ring_width

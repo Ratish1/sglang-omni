@@ -69,11 +69,11 @@ class Qwen3TTSCodecStateArena(CodecSlotAllocator):
         super().__init__(num_slots=num_slots, device=device)
         self.decoder = decoder
         self.dtype = dtype
-        self.scratch_slot = self._num_slots  # noqa: leading-underscore
+        self.scratch_slot = self.num_slots
         self.storage = decoder.init_state(
-            self._num_slots + 1,
+            self.num_slots + 1,
             device=self.device,
-            dtype=dtype,  # noqa: leading-underscore
+            dtype=dtype,
         )
         spec = decoder.state_spec()
         self._bytes_per_slot = spec.bytes_per_stream(dtype)  # noqa: leading-underscore
@@ -84,7 +84,7 @@ class Qwen3TTSCodecStateArena(CodecSlotAllocator):
 
     @property
     def total_bytes(self) -> int:
-        return self._bytes_per_slot * self._num_slots  # noqa: leading-underscore
+        return self._bytes_per_slot * self.num_slots  # noqa: leading-underscore
 
     def acquire(self) -> int | None:
         """Take a zeroed slot, or None when the arena is full."""
@@ -194,11 +194,11 @@ class Qwen3TTSCodecStateArena(CodecSlotAllocator):
 
     def describe(self) -> CodecStateStats:
         return {
-            "slots": self._num_slots,  # noqa: leading-underscore
+            "slots": self.num_slots,
             "active_slots": self.active_slots(),
             "bytes_per_slot": self._bytes_per_slot,  # noqa: leading-underscore
             "total_bytes": self.total_bytes,
-            "exhausted": self._exhausted_count,  # noqa: leading-underscore
+            "exhausted": self.exhausted_count,
         }
 
 
