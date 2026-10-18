@@ -119,8 +119,7 @@ if HAS_TRITON:
                 mask=mask,
                 other=0.0,
             )
-            frame_inverse = tl.sum(real * cosine + imaginary * sine, axis=1)
-            signal += tl.where(is_frame, frame_inverse, 0.0)
+            signal += tl.sum(real * cosine + imaginary * sine, axis=1)
             envelope += tl.load(
                 squared_window_ptr + tap_indices, mask=is_frame, other=0.0
             )
