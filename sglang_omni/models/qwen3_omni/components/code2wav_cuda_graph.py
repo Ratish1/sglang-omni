@@ -805,13 +805,7 @@ class Code2WavCudaGraphRunner:
         launches on the caller's current stream, which the serving thread holds
         at decode_stream.
         """
-        current_pid = os.getpid()
-        if current_pid != self.owner_pid:
-            raise RuntimeError(
-                f"Code2Wav device graph runner/model belongs to PID {self.owner_pid}, but was used in PID {current_pid}; it must be rebuilt in a spawned process before inference"
-            )
-        else:
-            pass
+        self.check_owner_process()
         if not self.enabled:
             return self.eager(codes, key=None, reason="disabled")
         else:
@@ -827,35 +821,14 @@ class Code2WavCudaGraphRunner:
             return self.eager(codes, key=key, reason="key_miss")
         else:
             pass
-        try:
-            captured.static_input.copy_(codes)
-            captured.graph.replay()
-        except Exception as exc:
-            self.replay_failures += 1
-            reason = f"runtime_replay_failed: {type(exc).__name__}: {exc}"
-            captured = None
-            self.disable_runtime(reason)
-            raise
-        self.graph_replays += 1
-        return Code2WavRunResult(
-            output=captured.static_output,
-            execution_mode="cuda_graph",
-            key=key,
-            fallback_reason=None,
-        )
+        return self.replay(captured, key, codes, slots=None)
 
     def run_slots(
         self, codes: torch.Tensor, slots: list[int], *, first_decode: bool
     ) -> Code2WavRunResult:
         """Decode new frames from the slots' codec state by an exact graph, or eagerly with a
         stable reason; the output is borrowed as run's is."""
-        current_pid = os.getpid()
-        if current_pid != self.owner_pid:
-            raise RuntimeError(
-                f"Code2Wav device graph runner/model belongs to PID {self.owner_pid}, but was used in PID {current_pid}; it must be rebuilt in a spawned process before inference"
-            )
-        else:
-            pass
+        self.check_owner_process()
         if not self.enabled:
             return self.eager_slots(
                 codes, slots, first_decode=first_decode, key=None, reason="disabled"
@@ -875,9 +848,33 @@ class Code2WavCudaGraphRunner:
             )
         else:
             pass
+        return self.replay(captured, key, codes, slots=slots)
+
+    def check_owner_process(self) -> None:
+        current_pid = os.getpid()
+        if current_pid != self.owner_pid:
+            raise RuntimeError(
+                f"Code2Wav device graph runner/model belongs to PID {self.owner_pid}, but was used in PID {current_pid}; it must be rebuilt in a spawned process before inference"
+            )
+        else:
+            pass
+
+    def replay(
+        self,
+        captured: CapturedGraph,
+        key: GraphKey,
+        codes: torch.Tensor,
+        *,
+        slots: list[int] | None,
+    ) -> Code2WavRunResult:
+        """Fill the graph's static codes, and its slot index for a slot decode, then replay it;
+        a failure disables every graph and re-raises."""
         try:
             captured.static_input.copy_(codes)
-            captured.static_index.copy_(self.codec_pool.stage_index(slots))
+            if slots is not None:
+                captured.static_index.copy_(self.codec_pool.stage_index(slots))
+            else:
+                pass
             captured.graph.replay()
         except Exception as exc:
             self.replay_failures += 1
