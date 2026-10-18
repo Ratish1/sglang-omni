@@ -1394,10 +1394,9 @@ def create_talker_ar_executor_from_config(
     # after #384, which routed talker MoE through `self.experts` (FusedMoE)
     # — the `fused_experts (full graph)` backend picked in #344. Caller can
     # override via the talker stage's engine.disable_cuda_graph setting.
-    # note (ratish): sglang's FlashInfer draw reads its RNG state on the host, which a
-    # captured decode graph would freeze; the talker draws inside its decode graph with
-    # FlashInfer's seed and offset on the device, the offset advanced by the graph, and a
-    # batch with a request seed keeps the PyTorch draw in a graph of its own.
+    # note (ratish): the talker's decode graphs draw with FlashInfer's seed and offset on the
+    # device (sglang's draw reads them on the host, which a graph freezes); a batch with a
+    # request seed decodes eagerly with the seeded PyTorch draw.
     if current_platform.is_cuda() and current_platform.enable_talker_graph():
         prefill_graph_backend = CudaGraphBackend.BREAKABLE
     else:

@@ -11,10 +11,7 @@ import torch
 from sglang.kernels.fused_op import get_fused_op_backend
 from sglang.kernels.spec import KernelBackend
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
-from sglang.srt.model_executor.runner_utils.capture_mode import (
-    get_capture_attention_variant,
-    get_is_capture_mode,
-)
+from sglang.srt.model_executor.runner_utils.capture_mode import get_is_capture_mode
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.runtime_context import get_context, get_exec, get_schedule
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
@@ -72,11 +69,6 @@ else:
     pass
 
 logger = logging.getLogger(__name__)
-
-# The talker's decode graph variants: a batch with a request seed keeps the seeded
-# PyTorch draw, any other batch draws with FlashInfer.
-SEEDED_DRAW = "seeded_draw"
-FLASHINFER_DRAW = "flashinfer_draw"
 
 
 def bind_default_weight_loaders(module: nn.Module) -> None:
@@ -1453,11 +1445,11 @@ class Qwen3OmniTalker(nn.Module):
 
     def draws_with_flashinfer(self) -> bool:
         """Whether this decode draws with FlashInfer: on the flashinfer backend, while
-        capturing its graph variant, else for a batch without a request seed."""
+        capturing the decode graphs, else for a batch without a request seed."""
         if get_exec().kernel.sampling_backend != "flashinfer":
             return False
         elif get_is_capture_mode():
-            return get_capture_attention_variant() == FLASHINFER_DRAW
+            return True
         else:
             return not self.decode_has_request_seed
 

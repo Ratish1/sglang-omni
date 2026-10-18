@@ -10,6 +10,9 @@ from typing import Any
 import pytest
 import torch
 from sglang.srt.managers.schedule_batch import ReqKvInfo
+from sglang.srt.model_executor.runner.decode_cuda_graph_runner import (
+    DecodeCudaGraphRunner,
+)
 from sglang.srt.runtime_context import get_context
 from sglang.srt.sampling.penaltylib.repetition_penalty import apply_scaling_penalties
 from sglang.srt.utils import DynamicGradMode
@@ -20,8 +23,6 @@ import sglang_omni.models.qwen3_omni.components.talker as talker_module
 from sglang_omni.model_runner.prefill_inputs import get_omni_prefill_inputs
 from sglang_omni.model_runner.thinker_model_runner import ThinkerModelRunner
 from sglang_omni.models.qwen3_omni.components.talker import (
-    FLASHINFER_DRAW,
-    SEEDED_DRAW,
     Qwen3OmniTalker,
     bind_default_weight_loaders,
 )
@@ -29,7 +30,9 @@ from sglang_omni.models.qwen3_omni.components.talker_input import build_assistan
 from sglang_omni.models.qwen3_omni.components.talker_prefill import TalkerPrefillBuilder
 from sglang_omni.models.qwen3_omni.config import TALKER_START_MIN_CHUNKS
 from sglang_omni.models.qwen3_omni.request_builders import build_sglang_talker_request
-from sglang_omni.models.qwen3_omni.talker_decode_graph import TalkerDrawGraphVariants
+from sglang_omni.models.qwen3_omni.talker_decode_graph import (
+    TalkerDecodeCudaGraphRunner,
+)
 from sglang_omni.models.qwen3_omni.talker_model_runner import QwenTalkerModelRunner
 from sglang_omni.models.qwen3_omni.talker_scheduler import (
     MIN_PARTIAL_START_CHUNKS,
@@ -2310,35 +2313,41 @@ def test_talker_prepare_decode_buffers_unseeded_seed_is_rank_shared() -> None:
 
 
 @pytest.mark.parametrize(
-    "seeds, variant",
-    [((None, None), FLASHINFER_DRAW), ((None, 5), SEEDED_DRAW), ((3, 5), SEEDED_DRAW)],
+    "seeds, replays_graph",
+    [((None, None), True), ((None, 5), False), ((3, 5), False)],
 )
-def test_talker_decode_replays_the_seeded_draw_only_for_a_batch_with_a_request_seed(
-    seeds: tuple[int | None, ...], variant: str
+def test_talker_decode_graph_refuses_a_batch_with_a_request_seed(
+    monkeypatch: pytest.MonkeyPatch,
+    seeds: tuple[int | None, ...],
+    replays_graph: bool,
 ) -> None:
+    monkeypatch.setattr(
+        DecodeCudaGraphRunner, "can_run_graph", lambda self, forward_batch: True
+    )
     fake = talker_seed_self()
     requests = [talker_seed_req(seed, f"r{row}") for row, seed in enumerate(seeds)]
+    runner = TalkerDecodeCudaGraphRunner.__new__(TalkerDecodeCudaGraphRunner)
+    runner.model_runner = SimpleNamespace(model=fake)
 
     Qwen3OmniTalker.prepare_decode_buffers(fake, requests)
 
-    assert TalkerDrawGraphVariants(fake).select(SimpleNamespace()) == variant
+    assert runner.can_run_graph(SimpleNamespace()) is replays_graph
 
 
 @pytest.mark.parametrize(
-    "backend, capturing, variant, has_request_seed, expected",
+    "backend, capturing, has_request_seed, expected",
     [
-        ("pytorch", False, None, False, False),
-        ("flashinfer", True, FLASHINFER_DRAW, True, True),
-        ("flashinfer", True, SEEDED_DRAW, False, False),
-        ("flashinfer", False, None, False, True),
-        ("flashinfer", False, None, True, False),
+        ("pytorch", False, False, False),
+        ("pytorch", True, False, False),
+        ("flashinfer", True, True, True),
+        ("flashinfer", False, False, True),
+        ("flashinfer", False, True, False),
     ],
 )
-def test_talker_draws_with_flashinfer_for_its_graph_variant_or_an_unseeded_batch(
+def test_talker_draws_with_flashinfer_in_its_graphs_or_for_an_unseeded_batch(
     monkeypatch: pytest.MonkeyPatch,
     backend: str,
     capturing: bool,
-    variant: str | None,
     has_request_seed: bool,
     expected: bool,
 ) -> None:
@@ -2348,7 +2357,6 @@ def test_talker_draws_with_flashinfer_for_its_graph_variant_or_an_unseeded_batch
         lambda: SimpleNamespace(kernel=SimpleNamespace(sampling_backend=backend)),
     )
     monkeypatch.setattr(talker_module, "get_is_capture_mode", lambda: capturing)
-    monkeypatch.setattr(talker_module, "get_capture_attention_variant", lambda: variant)
     fake = SimpleNamespace(decode_has_request_seed=has_request_seed)
 
     assert Qwen3OmniTalker.draws_with_flashinfer(fake) is expected
