@@ -152,7 +152,9 @@ def test_chunk_progress_and_private_slots_are_released(
         assert cache.total_size() == 16
         release_kv_cache(request, cache)
         match = cache.match_prefix(
-            MatchPrefixParams(key=RadixKey(list(range(20)) + list(range(30, 51))))
+            MatchPrefixParams(
+                key=RadixKey(request.origin_input_ids + request.output_ids)
+            )
         )
         assert len(match.device_indices) == 16
         assert allocator.available_size() + cache.evictable_size() == total
