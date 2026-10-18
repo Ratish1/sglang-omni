@@ -10,7 +10,9 @@ import torch
 
 from sglang_omni.models.fun_cosyvoice3.causal_conv import HAS_TRITON
 
+# note (ratish): the block SGLang's exact elementwise kernels launch.
 SAMPLES_PER_PROGRAM = 1024
+# note (ratish): fixed, since the frames' layout sets each bin's summation order.
 FRAMES_PER_PROGRAM = 128
 OUTPUT_SAMPLES_PER_PROGRAM = 256
 
