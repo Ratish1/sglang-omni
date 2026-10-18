@@ -46,7 +46,10 @@ async def main() -> None:
         ) -> None:
             payload = {
                 "model": "Qwen/Qwen3-TTS-12Hz-1.7B-Base",
-                "input": "We will read this sentence clearly. Then we will read it once more.",
+                "input": (
+                    "We will read this sentence clearly. Then we will read it once more. "
+                    * (12 if retract else 1)
+                ),
                 "references": [
                     {
                         "audio_path": reference,
@@ -70,7 +73,7 @@ async def main() -> None:
                 response.raise_for_status()
                 async for chunk in response.aiter_bytes():
                     audio.extend(chunk)
-                    if retract and pause_result is None:
+                    if retract and pause_result is None and len(audio) >= 184320:
                         pause = await client.post(
                             f"{base_url}/pause_generation",
                             json={"stages": ["tts_engine"], "mode": "retract"},
