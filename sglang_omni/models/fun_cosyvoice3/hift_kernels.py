@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """HiFT's Snake activation, short time Fourier transform and its inverse as Triton kernels.
-Snake rounds each step as CosyVoice's eager ops do; every spectral output element sums its
-own inputs in one fixed order, so a row's result does not follow what shares its batch."""
+Snake equals CosyVoice's eager Snake bit for bit. The transforms match torch.stft and
+torch.istft to float32 rounding, each output summing its own inputs in one fixed order, so a
+row's result does not follow what shares its batch."""
 
 from __future__ import annotations
 
