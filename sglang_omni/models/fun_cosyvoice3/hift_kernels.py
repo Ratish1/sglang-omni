@@ -16,7 +16,7 @@ OUTPUT_SAMPLES_PER_PROGRAM = 256
 if HAS_TRITON:
     import triton
     import triton.language as tl
-    from sglang.kernels.ops.diffusion.common.numerics import mul_rn_f32
+    from sglang.kernels.ops.diffusion.common.numerics import div_rn_f32, mul_rn_f32
     from triton.language.extra import libdevice
 
     # note (ratish): sample counts change every step, one binary serves them all.
@@ -115,7 +115,12 @@ if HAS_TRITON:
             value = tl.sum(real * cosine + imag * sine, axis=1)
             signal += tl.where(is_frame, value, 0.0)
             envelope += tl.load(squared_window_ptr + tap, mask=is_frame, other=0.0)
-        tl.store(out_ptr + row * samples + output, signal / envelope, mask=is_output)
+        # note (ratish): Triton's float32 division is approximate, torch.istft's correctly rounded.
+        tl.store(
+            out_ptr + row * samples + output,
+            div_rn_f32(signal, envelope),
+            mask=is_output,
+        )
 
 else:
     pass
