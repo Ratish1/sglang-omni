@@ -159,16 +159,12 @@ def register_qwen3_tts_hf_config() -> None:
 
         def _patched_init(self, *args, **kwargs):
             original_init(self, *args, **kwargs)
-            talker_config = getattr(self, "talker_config", None)
-            if talker_config is not None:
-                # note (ratish): the talker's three MRoPE position rows are always
-                # identical, so it rotates as text RoPE; dropping the MRoPE keys
-                # here, before SGLang reads the text config, keeps SGLang from
-                # building and copying MRoPE positions for it.
-                use_text_rope(talker_config)
-                self.text_config = talker_config
-            else:
-                pass
+            # note (ratish): the talker's three MRoPE position rows are always
+            # identical, so it rotates as text RoPE; dropping the MRoPE keys here,
+            # before SGLang reads the text config, keeps SGLang from building and
+            # copying MRoPE positions for it.
+            use_text_rope(self.talker_config)
+            self.text_config = self.talker_config
 
         Qwen3TTSConfig.__init__ = _patched_init
         Qwen3TTSConfig._sglang_omni_patched = True  # noqa: leading-underscore  # upstream spelling, or the public name is already taken
