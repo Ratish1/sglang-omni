@@ -79,10 +79,9 @@ class HiftDecodeCudaGraphRunner:
 
     @torch.inference_mode()
     def run(self, mel: torch.Tensor, source: torch.Tensor) -> torch.Tensor:
-        """The decode of mel (rows, channels, frames) and source (rows, 1, samples),
-        frames a frame tier and rows at most the largest row tier, replayed from the
-        smallest row tier holding the rows. The samples are graph memory: the caller
-        consumes them on this stream before the next replay of any graph in the pool."""
+        """Replays the decode of mel (rows, channels, frames), frames a frame tier, and its
+        source at the smallest row tier holding the rows. The samples are graph memory,
+        consumed on this stream before the next replay of any graph in the pool."""
         rows, _, frames = mel.shape
         tier = bisect.bisect_left(self.row_tiers, rows)
         assert tier < len(self.row_tiers), f"{rows} rows past the largest row tier"

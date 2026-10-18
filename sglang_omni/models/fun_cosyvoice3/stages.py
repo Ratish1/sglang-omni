@@ -1348,12 +1348,9 @@ def patch_hift_snake(hift: "CausalHiFTGenerator") -> None:
 
 
 def patch_hift_spectra(hift: "CausalHiFTGenerator", device: torch.device) -> None:
-    """Give HiFT its STFT and inverse STFT as float32 kernels whose every output sums its
-    own inputs in one order, so a row's spectra do not follow what shares its batch.
-    torch.stft and torch.istft build a cuFFT plan for each new shape, whose module
-    load waits for all the work queued on the device, and torch.istft reads its
-    window envelope on the host.
-    """
+    """Give HiFT its STFT and inverse STFT as the float32 kernels: no cuFFT plan per new
+    shape, whose module load waits for the device, and no host read of the inverse's
+    window envelope, which a CUDA graph cannot capture."""
     n_fft = hift.istft_params["n_fft"]
     hop_length = hift.istft_params["hop_len"]
     bins = n_fft // 2 + 1

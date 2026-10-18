@@ -1,8 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
-"""HiFT's Snake activation, short time Fourier transform and its inverse as Triton kernels.
-Snake equals CosyVoice's eager Snake bit for bit. The transforms match torch.stft and
-torch.istft to float32 rounding, each output summing its own inputs in one fixed order, so a
-row's result does not follow what shares its batch."""
+"""HiFT's Snake, short time Fourier transform and its inverse as Triton kernels. Snake equals
+CosyVoice's Snake bit for bit; the transforms match torch.stft and torch.istft to float32
+rounding with one fixed sum order per output, so a row's result does not follow its batch."""
 
 from __future__ import annotations
 
@@ -178,11 +177,9 @@ def overlap_add_inverse(
     squared_window: torch.Tensor,
     hop_length: int,
 ) -> torch.Tensor:
-    """real, imaginary: (rows, bins, frames) float32; basis: (2 * bins, n_fft), the one
-    sided inverse's windowed cosines then negative sines over n_fft. Each frame's inverse,
-    overlap added, divided by the squared window's overlap and trimmed by n_fft / 2 on
-    each side, as torch.istft with center=True. Returns (rows, hop_length * (frames - 1)).
-    """
+    """torch.istft with center=True over real, imaginary: (rows, bins, frames) float32;
+    basis: (2 * bins, n_fft), the one sided inverse's windowed cosines then negative
+    sines over n_fft. Returns (rows, hop_length * (frames - 1))."""
     rows, bins, frames = real.shape
     components, n_fft = basis.shape
     assert real.is_contiguous() and imaginary.is_contiguous() and components == 2 * bins

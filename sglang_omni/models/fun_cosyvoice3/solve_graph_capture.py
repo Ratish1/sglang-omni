@@ -39,10 +39,9 @@ class GraphSolve(Protocol):
 
 
 class SolveGraphCapture:
-    """Captures the prefix hop and whole history solve graphs and HiFT's decode graphs
-    into one pool. They share it because a stream step replays one graph at a time,
-    under the scheduler's state lock, and consumes its output on the same stream (a
-    clone, or HiFT's copy to the host) before the next replay."""
+    """Captures the Flow's solve graphs and HiFT's decode graphs into one pool. They share
+    it because a stream step replays one graph at a time, under the scheduler's state
+    lock, and consumes its output on this stream (a clone or a host copy) first."""
 
     def __init__(
         self,
