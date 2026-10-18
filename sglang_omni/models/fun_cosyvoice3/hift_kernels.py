@@ -30,11 +30,12 @@ if HAS_TRITON:
         channels,
         BLOCK_SAMPLES: tl.constexpr,
     ):
-        row = tl.program_id(1).to(tl.int64)
+        channel = tl.program_id(1)
+        row = tl.program_id(2).to(tl.int64) * channels + channel
         offsets = tl.program_id(0) * BLOCK_SAMPLES + tl.arange(0, BLOCK_SAMPLES)
         is_sample = offsets < samples
-        alpha = tl.load(alpha_ptr + row % channels)
-        inverse_alpha = tl.load(inverse_alpha_ptr + row % channels)
+        alpha = tl.load(alpha_ptr + channel)
+        inverse_alpha = tl.load(inverse_alpha_ptr + channel)
         x = tl.load(x_ptr + row * samples + offsets, mask=is_sample)
         sine = libdevice.sin(mul_rn_f32(x, alpha))
         # note (ratish): each product rounds alone, as in the eager ops; an FMA would not.
@@ -134,7 +135,7 @@ def snake(
     batch, channels, samples = x.shape
     assert x.is_contiguous() and x.dtype == torch.float32
     out = torch.empty_like(x)
-    grid = (triton.cdiv(samples, SAMPLES_PER_PROGRAM), batch * channels)
+    grid = (triton.cdiv(samples, SAMPLES_PER_PROGRAM), channels, batch)
     snake_kernel[grid](
         x,
         alpha,
