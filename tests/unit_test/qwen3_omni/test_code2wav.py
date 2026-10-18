@@ -1358,14 +1358,17 @@ def run_streams(
 @pytest.mark.accelerator
 @SLOT_DECODES
 @pytest.mark.parametrize("cuda_graph", [False, True])
-def test_scheduler_decodes_streams_from_their_slots(cuda_graph: bool) -> None:
+def test_scheduler_decodes_streams_from_their_slots(
+    cuda_graph: bool, caplog: pytest.LogCaptureFixture
+) -> None:
     model = make_fused_tiny_code2wav()
     scheduler = make_incremental_scheduler(
         model, codec_state_slots=2, cuda_graph=cuda_graph
     )
     codes = torch.randint(0, 16, (2, 2, 11), device="cuda")
 
-    waveforms = run_streams(scheduler, codes)
+    with caplog.at_level(logging.WARNING):
+        waveforms = run_streams(scheduler, codes)
 
     with torch.inference_mode():
         expected = decode_in_parts(
@@ -1373,7 +1376,7 @@ def test_scheduler_decodes_streams_from_their_slots(cuda_graph: bool) -> None:
         )
     for waveform, wanted in zip(waveforms, expected.reshape(2, -1).float().cpu()):
         np.testing.assert_allclose(waveform, wanted.numpy(), rtol=2e-2, atol=2e-3)
-    assert scheduler.stateless_fallbacks == 0
+    assert "codec state pool is full" not in caplog.text
     assert scheduler.codec_pool.available_size() == scheduler.codec_pool.num_slots
     if cuda_graph:
         runtime = scheduler.cuda_graph_runner.stats()["runtime"]
@@ -1385,12 +1388,15 @@ def test_scheduler_decodes_streams_from_their_slots(cuda_graph: bool) -> None:
 
 @pytest.mark.accelerator
 @SLOT_DECODES
-def test_a_stream_without_a_free_slot_decodes_with_left_context() -> None:
+def test_a_stream_without_a_free_slot_decodes_with_left_context(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
     model = make_fused_tiny_code2wav()
     scheduler = make_incremental_scheduler(model, codec_state_slots=1)
     codes = torch.randint(0, 16, (2, 2, 7), device="cuda")
 
-    waveforms = run_streams(scheduler, codes)
+    with caplog.at_level(logging.WARNING):
+        waveforms = run_streams(scheduler, codes)
 
     with torch.inference_mode():
         expected = decode_in_parts(
@@ -1399,7 +1405,7 @@ def test_a_stream_without_a_free_slot_decodes_with_left_context() -> None:
     wanted = expected.reshape(-1).float().cpu().numpy()
     np.testing.assert_allclose(waveforms[0], wanted, rtol=2e-2, atol=2e-3)
     assert waveforms[1].shape == wanted.shape
-    assert scheduler.stateless_fallbacks == 1
+    assert caplog.text.count("req-1 decodes with left context") == 1
     assert scheduler.codec_pool.available_size() == scheduler.codec_pool.num_slots
 
 

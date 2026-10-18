@@ -226,10 +226,8 @@ class Code2WavStreamState:
     checked: int = 0
     pending: PendingWindow | None = None
     codes_ready_event: torch.Event | None = None
-    # note (ratish): a stream decodes from its codec state slot from its first window on, or
-    # with left context when the pool had no slot for it then; it keeps that mode for life.
     codec_slot: int | None = None
-    stateless: bool = False
+    is_stateless: bool = False
     _critical_ingest_profile: IngestProfile | None = None
 
 
@@ -260,7 +258,6 @@ class Code2WavScheduler(StreamingVocoderBase[Code2WavStreamState, "list[int]"]):
         self.decode_stream = decode_stream
         self.incremental_codec = incremental_codec
         self.codec_pool = codec_pool
-        self.stateless_fallbacks = 0
         self.stream_chunk_size = max(int(stream_chunk_size), 1)
         self.left_context_size = max(int(left_context_size), 0)
         self.codec_eos_token_id = codec_eos_token_id
@@ -306,23 +303,20 @@ class Code2WavScheduler(StreamingVocoderBase[Code2WavStreamState, "list[int]"]):
             self.decode_stream.wait_event(state.codes_ready_event)
 
     def claim_codec_slot(self, request_id: str, state: Code2WavStreamState) -> None:
-        """Give a stream a codec state slot when its first codes arrive, ahead of its first
-        window, or keep it stateless when the pool has none free. Runs on the serving thread,
-        whose stream orders the decode after the slot's previous owner; the first decode reads
-        no slot state, so the slot is not zeroed."""
+        """Give a stream a codec state slot with its first codes, or leave it stateless for
+        life when none is free; a first decode reads no slot state, so none is zeroed.
+        """
         if (
             self.codec_pool is None
-            or state.emitted > 0
             or state.codec_slot is not None
-            or state.stateless
+            or state.is_stateless
         ):
             return
         else:
             pass
         state.codec_slot = self.codec_pool.acquire()
         if state.codec_slot is None:
-            state.stateless = True
-            self.stateless_fallbacks += 1
+            state.is_stateless = True
             logger.warning(
                 f"code2wav codec state pool is full ({self.codec_pool.num_slots} slots); "
                 f"{request_id} decodes with left context"
@@ -613,8 +607,7 @@ class Code2WavScheduler(StreamingVocoderBase[Code2WavStreamState, "list[int]"]):
                 codes, [state.codec_slot], first_decode=False
             )
         else:
-            # note (ratish): a stream that ends before its first window has no state to
-            # continue from, so one stateless window decodes all of it.
+            # note (ratish): a stream that ends before its first window holds no slot state.
             wav, execution_metadata = self.forward_codes(codes, graph_eligible=True)
         self.release_codec_slot(state)
         wav = wav[..., -(end - start) * self.total_upsample :]
@@ -1323,8 +1316,7 @@ def create_code2wav_scheduler(
         pass
     cuda_graph_runner = None
     if enable_cuda_graph:
-        # note (ratish): with codec state slots a stateless window decodes only a stream the
-        # pool had no slot for, or one that ends before its first window: one row each.
+        # note (ratish): with slots, stateless windows serve only slotless or short streams.
         graph_keys = window_graph_keys(
             stream_chunk_size,
             left_context_size,
