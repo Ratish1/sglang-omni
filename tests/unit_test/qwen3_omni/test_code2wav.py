@@ -1187,8 +1187,6 @@ def test_slot_decodes_error_to_fp32_is_the_fused_forward_error(
 def test_slot_decodes_rotate_frames_past_the_code2wav_config_positions(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A stream longer than the code2wav config's max_position_embeddings read its later
-    frames' rotary angles from past the end of the table."""
     monkeypatch.setattr(torch.backends.cudnn, "allow_tf32", False)
     hf_error = 0.0
     whole_error = 0.0
@@ -1427,8 +1425,6 @@ def test_a_stream_takes_its_slot_with_its_first_codes_and_abort_returns_it() -> 
 @pytest.mark.accelerator
 @SLOT_DECODES
 def test_a_stream_ending_before_its_first_window_decodes_without_slot_state() -> None:
-    """A stream shorter than its first window decoded as a later window of its slot, reading
-    the position and state the slot's previous stream left."""
     model = make_fused_tiny_code2wav()
     scheduler = make_incremental_scheduler(model, codec_state_slots=1)
     run_streams(scheduler, torch.randint(0, 16, (1, 2, 7), device="cuda"))
