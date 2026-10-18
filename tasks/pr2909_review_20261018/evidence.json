@@ -1,0 +1,590 @@
+{
+  "checkpoint": {
+    "model": "Qwen/Qwen3-Omni-30B-A3B-Instruct",
+    "rows": [
+      {
+        "frames": 11,
+        "first_part": 10,
+        "parts": 2,
+        "snr_db": 34.30024243770223,
+        "whole_snr_db": 34.16988272937975,
+        "old_window_snr_db": 34.13038870950513,
+        "samples": 20565
+      },
+      {
+        "frames": 11,
+        "first_part": 1,
+        "parts": 3,
+        "snr_db": 34.31044735561824,
+        "whole_snr_db": 34.16988272937975,
+        "old_window_snr_db": 34.13038870950513,
+        "samples": 20565
+      },
+      {
+        "frames": 71,
+        "first_part": 10,
+        "parts": 8,
+        "snr_db": 32.88480358437408,
+        "whole_snr_db": 33.130314130926685,
+        "old_window_snr_db": 21.90140333658882,
+        "samples": 135765
+      },
+      {
+        "frames": 71,
+        "first_part": 1,
+        "parts": 15,
+        "snr_db": 32.85422224729327,
+        "whole_snr_db": 33.130314130926685,
+        "old_window_snr_db": 21.90140333658882,
+        "samples": 135765
+      },
+      {
+        "frames": 72,
+        "first_part": 10,
+        "parts": 8,
+        "snr_db": 34.608936969690554,
+        "whole_snr_db": 34.67822747562,
+        "old_window_snr_db": 25.27344362682412,
+        "samples": 137685
+      },
+      {
+        "frames": 72,
+        "first_part": 1,
+        "parts": 15,
+        "snr_db": 34.63702022066948,
+        "whole_snr_db": 34.67822747562,
+        "old_window_snr_db": 25.27344362682412,
+        "samples": 137685
+      },
+      {
+        "frames": 81,
+        "first_part": 10,
+        "parts": 9,
+        "snr_db": 33.951209000827454,
+        "whole_snr_db": 34.11301050247834,
+        "old_window_snr_db": 19.742032012144605,
+        "samples": 154965
+      },
+      {
+        "frames": 81,
+        "first_part": 1,
+        "parts": 17,
+        "snr_db": 33.96914687095322,
+        "whole_snr_db": 34.11301050247834,
+        "old_window_snr_db": 19.742032012144605,
+        "samples": 154965
+      },
+      {
+        "frames": 82,
+        "first_part": 10,
+        "parts": 9,
+        "snr_db": 33.83555254350822,
+        "whole_snr_db": 34.42199027048603,
+        "old_window_snr_db": 20.844171781353303,
+        "samples": 156885
+      },
+      {
+        "frames": 82,
+        "first_part": 1,
+        "parts": 18,
+        "snr_db": 33.787703507996014,
+        "whole_snr_db": 34.42199027048603,
+        "old_window_snr_db": 20.844171781353303,
+        "samples": 156885
+      },
+      {
+        "frames": 171,
+        "first_part": 10,
+        "parts": 18,
+        "snr_db": 34.872444605199085,
+        "whole_snr_db": 34.57592825546986,
+        "old_window_snr_db": 18.64133070856986,
+        "samples": 327765
+      },
+      {
+        "frames": 171,
+        "first_part": 1,
+        "parts": 35,
+        "snr_db": 34.32441251116991,
+        "whole_snr_db": 34.57592825546986,
+        "old_window_snr_db": 18.64133070856986,
+        "samples": 327765
+      },
+      {
+        "frames": 290,
+        "first_part": 10,
+        "parts": 29,
+        "snr_db": 34.70872013478853,
+        "whole_snr_db": 34.76743662986634,
+        "old_window_snr_db": 18.353125338437685,
+        "samples": 556245
+      },
+      {
+        "frames": 290,
+        "first_part": 1,
+        "parts": 58,
+        "snr_db": 34.99568622758501,
+        "whole_snr_db": 34.76743662986634,
+        "old_window_snr_db": 18.353125338437685,
+        "samples": 556245
+      }
+    ],
+    "bytes_per_slot": 2935104,
+    "graph_stats": {
+      "enabled": true,
+      "disable_reason": null,
+      "binding": {
+        "device": "cuda:0",
+        "num_quantizers": 16,
+        "input_dtype": "torch.long",
+        "owner_pid": 9369
+      },
+      "graph_contract": {
+        "keys": [
+          {
+            "batch_size": 1,
+            "frames": 10,
+            "decode": "window"
+          },
+          {
+            "batch_size": 1,
+            "frames": 10,
+            "decode": "first"
+          },
+          {
+            "batch_size": 1,
+            "frames": 10,
+            "decode": "next"
+          },
+          {
+            "batch_size": 2,
+            "frames": 10,
+            "decode": "first"
+          },
+          {
+            "batch_size": 2,
+            "frames": 10,
+            "decode": "next"
+          },
+          {
+            "batch_size": 3,
+            "frames": 10,
+            "decode": "first"
+          },
+          {
+            "batch_size": 3,
+            "frames": 10,
+            "decode": "next"
+          },
+          {
+            "batch_size": 4,
+            "frames": 10,
+            "decode": "first"
+          },
+          {
+            "batch_size": 4,
+            "frames": 10,
+            "decode": "next"
+          },
+          {
+            "batch_size": 5,
+            "frames": 10,
+            "decode": "first"
+          },
+          {
+            "batch_size": 5,
+            "frames": 10,
+            "decode": "next"
+          },
+          {
+            "batch_size": 6,
+            "frames": 10,
+            "decode": "first"
+          },
+          {
+            "batch_size": 6,
+            "frames": 10,
+            "decode": "next"
+          },
+          {
+            "batch_size": 7,
+            "frames": 10,
+            "decode": "first"
+          },
+          {
+            "batch_size": 7,
+            "frames": 10,
+            "decode": "next"
+          },
+          {
+            "batch_size": 8,
+            "frames": 10,
+            "decode": "first"
+          },
+          {
+            "batch_size": 8,
+            "frames": 10,
+            "decode": "next"
+          },
+          {
+            "batch_size": 1,
+            "frames": 1,
+            "decode": "next"
+          },
+          {
+            "batch_size": 1,
+            "frames": 2,
+            "decode": "next"
+          },
+          {
+            "batch_size": 1,
+            "frames": 3,
+            "decode": "next"
+          },
+          {
+            "batch_size": 1,
+            "frames": 4,
+            "decode": "next"
+          },
+          {
+            "batch_size": 1,
+            "frames": 5,
+            "decode": "next"
+          },
+          {
+            "batch_size": 1,
+            "frames": 6,
+            "decode": "next"
+          },
+          {
+            "batch_size": 1,
+            "frames": 7,
+            "decode": "next"
+          },
+          {
+            "batch_size": 1,
+            "frames": 8,
+            "decode": "next"
+          },
+          {
+            "batch_size": 1,
+            "frames": 9,
+            "decode": "next"
+          }
+        ]
+      },
+      "build": {
+        "attempted_graph_count": 26,
+        "published_graph_count": 26
+      },
+      "memory": {
+        "total_gpu_memory_fraction": 0.02,
+        "tier1": {
+          "attempted_key_count": 23,
+          "published_key_count": 23,
+          "attempts": 1,
+          "skipped_keys": [],
+          "disable_reason": null,
+          "per_key_footprint_bytes": {
+            "b8t10first": 33864704,
+            "b8t10next": 318976,
+            "b7t10first": 271872,
+            "b7t10next": 279552,
+            "b6t10first": 232960,
+            "b6t10next": 239616,
+            "b5t10first": 195072,
+            "b5t10next": 200192,
+            "b4t10first": 156160,
+            "b4t10next": 160256,
+            "b3t10first": 117760,
+            "b3t10next": 120832,
+            "b2t10first": 78848,
+            "b2t10next": 80896,
+            "b1t9next": 37888,
+            "b1t8next": 33280,
+            "b1t7next": 29696,
+            "b1t6next": 25600,
+            "b1t5next": 22016,
+            "b1t4next": 17408,
+            "b1t3next": 13824,
+            "b1t2next": 9728,
+            "b1t1next": 6144
+          }
+        },
+        "before": {
+          "allocated_bytes": 1480755200,
+          "reserved_bytes": 4892655616,
+          "max_reserved_bytes": 4892655616,
+          "free_bytes": 144480206848,
+          "total_bytes": 150111977472
+        },
+        "stage_budget_bytes": 3002239549,
+        "loaded_model_footprint_bytes": 549437314,
+        "graph_budget_bytes": 2452802235,
+        "after": {
+          "allocated_bytes": 1517390336,
+          "reserved_bytes": 2097152000,
+          "max_reserved_bytes": 5234491392,
+          "free_bytes": 147175047168,
+          "total_bytes": 150111977472
+        },
+        "graph_footprint_bytes": 36635136
+      },
+      "runtime": {
+        "graph_replays": 19,
+        "replay_failures": 0,
+        "fallback_counts": {}
+      }
+    },
+    "reuse_bit_identical": true,
+    "batched_scheduler_rows": 8,
+    "timings": [
+      {
+        "rows": 1,
+        "mode": "stateless_35_frames",
+        "median_ms": 1.9278079867362976
+      },
+      {
+        "rows": 1,
+        "mode": "incremental_10_frames",
+        "median_ms": 1.5831519961357117
+      },
+      {
+        "rows": 8,
+        "mode": "stateless_35_frames",
+        "median_ms": 10.464303970336914
+      },
+      {
+        "rows": 8,
+        "mode": "incremental_10_frames",
+        "median_ms": 4.0843682289123535
+      }
+    ]
+  },
+  "serving": [
+    {
+      "stream": true,
+      "frame_cap": 1,
+      "audio_samples": 1365,
+      "audio_chunks": 1
+    },
+    {
+      "stream": true,
+      "frame_cap": 9,
+      "audio_samples": 16725,
+      "audio_chunks": 1
+    },
+    {
+      "stream": true,
+      "frame_cap": 10,
+      "audio_samples": 18645,
+      "audio_chunks": 1
+    },
+    {
+      "stream": true,
+      "frame_cap": 11,
+      "audio_samples": 20565,
+      "audio_chunks": 2
+    },
+    {
+      "stream": true,
+      "frame_cap": 20,
+      "audio_samples": 37845,
+      "audio_chunks": 2
+    },
+    {
+      "stream": true,
+      "frame_cap": 21,
+      "audio_samples": 39765,
+      "audio_chunks": 3
+    },
+    {
+      "stream": false,
+      "frame_cap": 1,
+      "audio_samples": 1365,
+      "audio_chunks": 1
+    },
+    {
+      "stream": false,
+      "frame_cap": 9,
+      "audio_samples": 16725,
+      "audio_chunks": 1
+    },
+    {
+      "stream": false,
+      "frame_cap": 10,
+      "audio_samples": 18645,
+      "audio_chunks": 1
+    },
+    {
+      "stream": false,
+      "frame_cap": 11,
+      "audio_samples": 20565,
+      "audio_chunks": 1
+    },
+    {
+      "stream": false,
+      "frame_cap": 20,
+      "audio_samples": 37845,
+      "audio_chunks": 1
+    },
+    {
+      "stream": false,
+      "frame_cap": 21,
+      "audio_samples": 39765,
+      "audio_chunks": 1
+    },
+    {
+      "stream": false,
+      "frame_cap": 90,
+      "audio_samples": 70485,
+      "audio_chunks": 1
+    },
+    {
+      "stream": true,
+      "frame_cap": 91,
+      "audio_samples": 64725,
+      "audio_chunks": 4
+    },
+    {
+      "stream": false,
+      "frame_cap": 92,
+      "audio_samples": 99285,
+      "audio_chunks": 1
+    },
+    {
+      "stream": true,
+      "frame_cap": 90,
+      "audio_samples": 68565,
+      "audio_chunks": 4
+    },
+    {
+      "stream": false,
+      "frame_cap": 91,
+      "audio_samples": 87765,
+      "audio_chunks": 1
+    },
+    {
+      "stream": true,
+      "frame_cap": 92,
+      "audio_samples": 72405,
+      "audio_chunks": 4
+    },
+    {
+      "stream": false,
+      "frame_cap": 90,
+      "audio_samples": 68565,
+      "audio_chunks": 1
+    },
+    {
+      "stream": true,
+      "frame_cap": 91,
+      "audio_samples": 72405,
+      "audio_chunks": 4
+    },
+    {
+      "stream": false,
+      "frame_cap": 92,
+      "audio_samples": 80085,
+      "audio_chunks": 1
+    },
+    {
+      "stream": true,
+      "frame_cap": 90,
+      "audio_samples": 64725,
+      "audio_chunks": 4
+    },
+    {
+      "stream": false,
+      "frame_cap": 91,
+      "audio_samples": 74325,
+      "audio_chunks": 1
+    },
+    {
+      "stream": true,
+      "frame_cap": 92,
+      "audio_samples": 66645,
+      "audio_chunks": 4
+    },
+    {
+      "stream": false,
+      "frame_cap": 90,
+      "audio_samples": 82005,
+      "audio_chunks": 1
+    },
+    {
+      "stream": true,
+      "frame_cap": 91,
+      "audio_samples": 62805,
+      "audio_chunks": 4
+    },
+    {
+      "stream": false,
+      "frame_cap": 92,
+      "audio_samples": 80085,
+      "audio_chunks": 1
+    },
+    {
+      "stream": true,
+      "frame_cap": 90,
+      "audio_samples": 74325,
+      "audio_chunks": 4
+    }
+  ],
+  "capacity-8": {
+    "max_replay_rows": 8,
+    "stream_slots": 1,
+    "capture_slots": 8,
+    "unreachable_stateful_graphs": 14,
+    "published_graphs": 60,
+    "pool_bytes": 26415936,
+    "graph_footprint_bytes": 572522496,
+    "factory_seconds": 12.760359999956563,
+    "served_audio_bytes": 151380,
+    "served_audio_sha256": "faf13c896125086a8e0ae2e4cb6d0a9472facafc420cf6f2b8af07fec0abeff6",
+    "runtime": {
+      "graph_replays": 2,
+      "replay_failures": 0,
+      "fallback_counts": {}
+    }
+  },
+  "capacity-1": {
+    "max_replay_rows": 1,
+    "stream_slots": 1,
+    "capture_slots": 1,
+    "unreachable_stateful_graphs": 0,
+    "published_graphs": 46,
+    "pool_bytes": 5870208,
+    "graph_footprint_bytes": 180355072,
+    "factory_seconds": 10.751611882122234,
+    "served_audio_bytes": 151380,
+    "served_audio_sha256": "faf13c896125086a8e0ae2e4cb6d0a9472facafc420cf6f2b8af07fec0abeff6",
+    "runtime": {
+      "graph_replays": 2,
+      "replay_failures": 0,
+      "fallback_counts": {}
+    }
+  },
+  "pytest_exit": 0,
+  "cohort-test_exit": 0,
+  "mutation-existing_exit": 0,
+  "mutation-new_exit": 1,
+  "lifecycle_exit": 0,
+  "checkpoint_exit": 0,
+  "serving-wav_exit": 0,
+  "capacity-8_exit": 0,
+  "capacity-1_exit": 0,
+  "server_exit": 0,
+  "pytest_summary": "724 passed, 28 skipped, 29 warnings in 184.94s (0:03:04)",
+  "cleanup": {
+    "gpu_memory_mib": 0,
+    "serving_or_spawn_or_probe_processes_remaining": 0,
+    "server_tracebacks": 0,
+    "pool_exhaustion": 0,
+    "graph_replay_failures": 0,
+    "no_audio_errors": 0,
+    "pipeline_stopped": true,
+    "assignment_retained": true,
+    "container_retained": true
+  }
+}
