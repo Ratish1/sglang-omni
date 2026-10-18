@@ -1818,20 +1818,19 @@ class CosyVoice3Vocoder(BatchVocoderBase[FunCosyVoice3State, torch.Tensor]):
             self.stream_context: contextlib.AbstractContextManager[None] = (
                 torch.cuda.stream(stream)
             )
+            # note (ratish): a ROCm device is a cuda device too, and the kernels' inline
+            # PTX cannot compile there.
+            self.has_hift_kernels = (
+                current_platform.is_cuda() and self.hift_autocast_dtype is None
+            )
+            if self.has_hift_kernels:
+                patch_hift_snake(hift)
+                patch_hift_spectra(hift, device)
+            else:
+                pass
         else:
             self.stream_context = contextlib.nullcontext()
-        # note (ratish): the kernels round with NVIDIA PTX, which ROCm cannot compile.
-        self.has_hift_kernels = (
-            device.type == "cuda"
-            and current_platform.is_cuda()
-            and HAS_TRITON
-            and self.hift_autocast_dtype is None
-        )
-        if self.has_hift_kernels:
-            patch_hift_snake(hift)
-            patch_hift_spectra(hift, device)
-        else:
-            pass
+            self.has_hift_kernels = False
 
     def prepare_item(
         self, payload: StagePayload
