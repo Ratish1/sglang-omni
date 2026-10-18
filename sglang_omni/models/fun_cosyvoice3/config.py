@@ -157,6 +157,7 @@ class FunCosyVoice3PipelineConfig(PipelineConfig):
                 dtype="bfloat16",
                 onnx_intra_op_threads=16,
                 token_hop_len=25,
+                enable_async_decode=True,
             ),
             gpu=0,
             next="vocoder",
