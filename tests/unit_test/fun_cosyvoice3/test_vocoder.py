@@ -1438,6 +1438,10 @@ def test_hift_step_final_is_bit_identical_beside_finals_of_other_widths(
 def test_vocoder_hift_snake_is_bit_identical_to_cosyvoice() -> None:
     snake_class = pytest.importorskip("cosyvoice.transformer.activation").Snake
     hift = make_causal_hift(10.0)
+    snakes = [module for module in hift.modules() if isinstance(module, snake_class)]
+    with torch.no_grad():
+        for snake in snakes:
+            snake.alpha.copy_(torch.linspace(0.125, 4.0, snake.in_features))
     reference_hift = copy.deepcopy(hift)
     stages.CosyVoice3Vocoder(HiftFlowStub(), hift)
     pairs = [
