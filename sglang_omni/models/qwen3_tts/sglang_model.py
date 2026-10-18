@@ -965,27 +965,22 @@ class Qwen3TTSTalker(Qwen3TTSPromptBuilderMixin, nn.Module):
 
     def __init__(
         self,
-        config: "Qwen3TTSConfig | Qwen3TTSTalkerConfig",
+        config: "Qwen3TTSConfig",
         quant_config: object = None,
         prefix: str = "",
     ) -> None:
         del quant_config
         super().__init__()
-        if hasattr(config, "talker_config"):
-            root_config = config
-            config = config.talker_config
-        else:
-            root_config = None
+        root_config = config
+        config = root_config.talker_config
         self.root_config = root_config
         self.config = config
         self.vocab_size = config.vocab_size
-        self.tts_model_type = getattr(root_config, "tts_model_type", "base")
-        self.tokenizer_type = getattr(root_config, "tokenizer_type", "")
-        self.tts_model_size = getattr(root_config, "tts_model_size", "")
-        self.speaker_encoder_sample_rate = getattr(
-            getattr(root_config, "speaker_encoder_config", None),
-            "sample_rate",
-            24000,
+        self.tts_model_type = root_config.tts_model_type
+        self.tokenizer_type = root_config.tokenizer_type
+        self.tts_model_size = root_config.tts_model_size
+        self.speaker_encoder_sample_rate = (
+            root_config.speaker_encoder_config.sample_rate
         )
 
         self.text_projection = ResizeMLP(
