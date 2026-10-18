@@ -69,17 +69,21 @@ def test_compile_dit_backbone_compiles_the_estimator_forward(monkeypatch) -> Non
     )
 
 
+@pytest.mark.parametrize("frame_count", [17, 37, 128])
 def test_compile_dit_backbone_keeps_the_rope_frequencies_bit_for_bit(
     monkeypatch,
+    frame_count: int,
 ) -> None:
     estimator = FakeDiTEstimator()
-    expected_freqs, expected_scale = estimator.rotary_embed.forward_from_seq_len(37)
+    expected_freqs, expected_scale = estimator.rotary_embed.forward_from_seq_len(
+        frame_count
+    )
     monkeypatch.setattr(torch, "compile", lambda fn, options=None: fn)
 
     stages.compile_dit_backbone(
         FakeFlow(estimator), warmup_mel_frames=16, warmup_steps=1
     )
-    freqs, scale = estimator.rotary_embed.forward_from_seq_len(37)
+    freqs, scale = estimator.rotary_embed.forward_from_seq_len(frame_count)
 
     assert freqs.dtype == torch.float32
     assert torch.equal(freqs, expected_freqs)

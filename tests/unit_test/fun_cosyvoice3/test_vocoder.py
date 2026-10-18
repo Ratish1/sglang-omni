@@ -1086,6 +1086,14 @@ def prepare_vocoder_startup(
 
     monkeypatch.setattr(stages, "compile_dit_backbone", record_native_compile)
 
+    def record_shared_compile_prepare(
+        flow: GraphRunnableFakeFlow | stages.FunCosyVoice3Flow,
+    ) -> None:
+        assert flow is loaded_flow
+        startup_events.append("shared_compile_prepare")
+
+    monkeypatch.setattr(stages, "prepare_dit_compile", record_shared_compile_prepare)
+
     def warmup_packed_dit_compile(
         scheduler: FunCosyVoice3StreamingVocoderScheduler,
     ) -> None:
@@ -1159,6 +1167,85 @@ def test_create_vocoder_executor_compiles_before_flow_graph_capture(
     else:
         assert "native_compile" not in startup_events
     assert ("packed_warmup" in startup_events) is enable_dit_torch_compile
+
+
+def test_create_vocoder_executor_skips_unused_native_startup_on_packed_route(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    startup_events: list[str] = []
+    packed_estimator = RecordingPackedDiT(is_ragged=True)
+    loaded_flow = prepare_vocoder_startup(
+        monkeypatch,
+        startup_events,
+        device_type="cuda",
+        allow_native_compile=False,
+        packed_estimator=packed_estimator,
+    )
+    monkeypatch.setattr(torch, "autocast", null_autocast)
+
+    scheduler = stages.create_vocoder_executor(
+        "model",
+        device="cuda",
+        dtype="bfloat16",
+        flow_prefix_cache_gb=0.0,
+        enable_dit_torch_compile=True,
+        enable_flow_cuda_graph=True,
+        flow_cuda_graph_capture_shapes=FLOW_GRAPH_CAPTURE_SHAPES,
+        enable_flow_prefix_cuda_graph=False,
+        enable_flow_whole_history_cuda_graph=False,
+        enable_hift_cuda_graph=False,
+    )
+
+    assert scheduler.vocoder.flow is loaded_flow
+    assert scheduler.vocoder.flow.enable_buffered_packed_flow is True
+    assert scheduler.vocoder.flow.cuda_graph_runner is None
+    assert "native_compile" not in startup_events
+    assert "runner_create" not in startup_events
+    assert "graph_capture" not in startup_events
+    assert "shared_compile_prepare" in startup_events
+    assert "packed_warmup" in startup_events
+    assert startup_events.index("shared_compile_prepare") < startup_events.index(
+        "packed_warmup"
+    )
+
+
+def test_create_vocoder_executor_keeps_native_startup_on_buffered_opt_out(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    startup_events: list[str] = []
+    packed_estimator = RecordingPackedDiT(is_ragged=True)
+    loaded_flow = prepare_vocoder_startup(
+        monkeypatch,
+        startup_events,
+        device_type="cuda",
+        allow_native_compile=True,
+        packed_estimator=packed_estimator,
+    )
+    monkeypatch.setattr(torch, "autocast", null_autocast)
+
+    scheduler = stages.create_vocoder_executor(
+        "model",
+        device="cuda",
+        dtype="bfloat16",
+        flow_prefix_cache_gb=0.0,
+        enable_buffered_packed_flow=False,
+        enable_dit_torch_compile=True,
+        enable_flow_cuda_graph=True,
+        flow_cuda_graph_capture_shapes=FLOW_GRAPH_CAPTURE_SHAPES,
+        enable_flow_prefix_cuda_graph=False,
+        enable_flow_whole_history_cuda_graph=False,
+        enable_hift_cuda_graph=False,
+    )
+
+    assert scheduler.vocoder.flow is loaded_flow
+    assert scheduler.vocoder.flow.enable_buffered_packed_flow is False
+    assert "native_compile" in startup_events
+    assert "runner_create" in startup_events
+    assert "graph_capture" in startup_events
+    assert "packed_warmup" in startup_events
+    assert startup_events.index("native_compile") < startup_events.index(
+        "graph_capture"
+    )
 
 
 @pytest.mark.parametrize("enable_dit_torch_compile", [False, True])

@@ -1480,6 +1480,42 @@ def load_cosyvoice3_flow_hift_lightweight(
     )
 
 
+def prepare_dit_compile(flow: FunCosyVoice3Flow) -> None:
+    estimator = flow.decoder.estimator
+    if not isinstance(estimator, torch.nn.Module):
+        raise RuntimeError(
+            "Fun-CosyVoice3 DiT torch.compile requires a PyTorch estimator, "
+            f"got {type(estimator).__name__}"
+        )
+    else:
+        pass
+
+    try:
+        from cosyvoice.flow.DiT import modules as cosyvoice_dit_modules
+    except ImportError as exc:
+        raise RuntimeError(COSYVOICE_INSTALL_HINT) from exc
+
+    inductor_config.fx_graph_cache = True
+    dynamo.config.cache_size_limit = 1024
+    dynamo.config.accumulated_cache_size_limit = 1024
+    # note(ratish): Inductor picks CUDA's libdevice on its first kernel build;
+    # cache entries record the file, so a warm boot's first lookups would miss.
+    with inductor_config.patch({"eager_numerics.use_pytorch_libdevice": True}):
+        _set_triton_libdevice_path()
+    # note(ratish): the AOT cache refuses the autocast-disabled regions around RoPE;
+    # these match without them: an outer product and elementwise ops.
+    rotary = estimator.rotary_embed
+    assert rotary.scale is None, "the DiT's RoPE has no xpos scale"
+
+    def rotary_frequencies(positions: torch.Tensor) -> tuple[torch.Tensor, float]:
+        freqs = positions.to(rotary.inv_freq.dtype)[None, :, None] * rotary.inv_freq
+        freqs = freqs / rotary.interpolation_factor
+        return torch.stack((freqs, freqs), dim=-1).flatten(-2), 1.0
+
+    rotary.forward = rotary_frequencies
+    cosyvoice_dit_modules.apply_rotary_pos_emb = apply_rotary_pos_emb.__wrapped__
+
+
 def compile_dit_backbone(
     flow: FunCosyVoice3Flow,
     *,
@@ -1501,31 +1537,8 @@ def compile_dit_backbone(
     else:
         pass
 
-    try:
-        from cosyvoice.flow.DiT import modules as cosyvoice_dit_modules
-    except ImportError as exc:
-        raise RuntimeError(COSYVOICE_INSTALL_HINT) from exc
-
     original_forward = estimator.forward
-    inductor_config.fx_graph_cache = True
-    dynamo.config.cache_size_limit = 1024
-    dynamo.config.accumulated_cache_size_limit = 1024
-    # note(ratish): Inductor picks CUDA's libdevice on its first kernel build;
-    # cache entries record the file, so a warm boot's first lookups would miss.
-    with inductor_config.patch({"eager_numerics.use_pytorch_libdevice": True}):
-        _set_triton_libdevice_path()
-    # note(ratish): the AOT cache refuses the autocast-disabled regions around RoPE;
-    # these match without them: an outer product and elementwise ops.
-    rotary = estimator.rotary_embed
-    assert rotary.scale is None, "the DiT's RoPE has no xpos scale"
-
-    def rotary_frequencies(positions: torch.Tensor) -> tuple[torch.Tensor, float]:
-        freqs = positions.to(rotary.inv_freq.dtype)[None, :, None] * rotary.inv_freq
-        freqs = freqs / rotary.interpolation_factor
-        return torch.stack((freqs, freqs), dim=-1).flatten(-2), 1.0
-
-    rotary.forward = rotary_frequencies
-    cosyvoice_dit_modules.apply_rotary_pos_emb = apply_rotary_pos_emb.__wrapped__
+    prepare_dit_compile(flow)
     try:
         # note(ratish): not dynamic=True, which makes the LayerNorm eps a symbol;
         # Inductor cannot keep it and restarts the compile.
@@ -2465,13 +2478,28 @@ def create_vocoder_executor(
         dtype=autocast_dtype,
     )
     packed_fa3_available = packed_fa3_reason is None
-    if enable_flow_cuda_graph and (
+    if not enable_buffered_packed_flow:
+        use_packed_buffered = False
+        buffered_flow_reason = "explicitly disabled"
+    elif enable_flow_estimator_trt:
+        use_packed_buffered = False
+        buffered_flow_reason = "TensorRT estimator enabled"
+    elif packed_fa3_reason is not None:
+        use_packed_buffered = False
+        buffered_flow_reason = packed_fa3_reason
+    else:
+        use_packed_buffered = True
+        buffered_flow_reason = ""
+    flow.enable_buffered_packed_flow = use_packed_buffered
+
+    native_flow_cuda_graph_enabled = enable_flow_cuda_graph and not use_packed_buffered
+    if native_flow_cuda_graph_enabled and (
         not supports_device_streams(device_obj)
         or current_platform.get_device_graph_backend(device_obj) is None
     ):
-        enable_flow_cuda_graph = False
+        native_flow_cuda_graph_enabled = False
     elif (
-        enable_flow_cuda_graph
+        native_flow_cuda_graph_enabled
         and enable_dit_torch_compile
         and current_platform.get_graph_capture_sdpa_backends()
     ):
@@ -2479,13 +2507,15 @@ def create_vocoder_executor(
             f"Fun-CosyVoice3 Flow graphs stay off on {device_obj}: the compiled DiT "
             "keeps an SDPA kernel this platform cannot record"
         )
-        enable_flow_cuda_graph = False
+        native_flow_cuda_graph_enabled = False
     else:
         pass
 
     patch_chunk_mask()
 
-    if enable_dit_torch_compile:
+    if enable_dit_torch_compile and use_packed_buffered:
+        prepare_dit_compile(flow)
+    elif enable_dit_torch_compile:
         compile_dit_backbone(flow, autocast_dtype=autocast_dtype)
     else:
         pass
@@ -2497,7 +2527,7 @@ def create_vocoder_executor(
     else:
         pass
 
-    if enable_flow_cuda_graph:
+    if native_flow_cuda_graph_enabled:
         capture_shapes = verify_flow_cuda_graph_capture_shapes(
             flow_cuda_graph_capture_shapes,
         )
@@ -2654,25 +2684,17 @@ def create_vocoder_executor(
         vocoder.hift_decode_cuda_graph_runner = hift_decode_cuda_graph_runner
     else:
         pass
-    if not enable_buffered_packed_flow:
-        buffered_flow_route = "native"
-        buffered_flow_reason = "explicitly disabled"
-    elif enable_flow_estimator_trt:
-        buffered_flow_route = "native"
-        buffered_flow_reason = "TensorRT estimator enabled"
-    elif packed_fa3_reason is not None:
-        buffered_flow_route = "native"
-        buffered_flow_reason = packed_fa3_reason
-    else:
-        buffered_flow_route = "packed"
+    if use_packed_buffered:
+        assert packed_estimator is not None
         whole_history_graph_available = flow.whole_history_cuda_graph_runner is not None
         buffered_flow_reason = (
             f"FA3 available, compile={packed_estimator.is_compiled}, "
             f"whole_history_graph={whole_history_graph_available}"
         )
-    flow.enable_buffered_packed_flow = buffered_flow_route == "packed"
+    else:
+        pass
     logger.info(
-        f"Fun-CosyVoice3 buffered Flow: {buffered_flow_route} "
+        f"Fun-CosyVoice3 buffered Flow: {'packed' if use_packed_buffered else 'native'} "
         f"({buffered_flow_reason})"
     )
     scheduler.warmup_now()
