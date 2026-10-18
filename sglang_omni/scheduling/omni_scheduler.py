@@ -2071,7 +2071,7 @@ class OmniScheduler(Generic[RequestDataT]):
 
     def stash_chunked_request(self, req: Req) -> None:
         # note (ratish): a prompt-only-radix request with output keeps its tail out of the tree, so
-        # SGLang's stash would not advance a retracted re-prefill; advance it as SGLang's chunk cache does.
+        # SGLang's stash would not advance a retracted re-prefill.
         if req.skip_radix_cache_insert and getattr(
             req, "_omni_prompt_only_radix", False
         ):  # noqa: leading-underscore  # upstream spelling, or the public name is already taken
