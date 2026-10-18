@@ -180,8 +180,10 @@ class FunCosyVoice3ModelRunner(ModelRunner):
         *,
         is_lookahead: bool = False,
     ) -> None:
-        scaling_penalties = forward_batch.sampling_info.acc_scaling_penalties
-        if not is_lookahead or scaling_penalties is None:
+        scaling_penalties = (
+            forward_batch.sampling_info.acc_scaling_penalties if is_lookahead else None
+        )
+        if scaling_penalties is None:
             return
         else:
             pass
