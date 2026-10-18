@@ -1442,3 +1442,50 @@ def test_a_stream_ending_before_its_first_window_decodes_without_slot_state() ->
         expected = model(short_codes).reshape(-1).float().cpu().numpy()
     np.testing.assert_allclose(waveforms[0], expected, rtol=2e-2, atol=2e-3)
     assert scheduler.codec_pool.available_size() == scheduler.codec_pool.num_slots
+
+
+@pytest.mark.accelerator
+@SLOT_DECODES
+@pytest.mark.parametrize("cuda_graph", [False, True])
+def test_streams_decoded_in_one_replay_keep_their_own_slots(cuda_graph: bool) -> None:
+    model = make_fused_tiny_code2wav()
+    scheduler = make_incremental_scheduler(
+        model, codec_state_slots=2, cuda_graph=cuda_graph
+    )
+    codes = torch.randint(0, 16, (2, 2, 11), device="cuda")
+    request_ids = ["req-0", "req-1"]
+    for request_id in request_ids:
+        scheduler.stream_payloads[request_id] = make_qwen_payload(request_id=request_id)
+
+    for start in (0, 3, 6):
+        for request_id, request_codes in zip(request_ids, codes):
+            scheduler.handle_stream_chunk(
+                request_id,
+                StreamItem(
+                    start,
+                    request_codes[:, start : start + 3].T,
+                    "talker",
+                    metadata={"stream": False},
+                ),
+            )
+        assert len(scheduler.ready_window_group()) == 2
+        scheduler.run_ready_step()
+    waveforms = []
+    for request_id, request_codes in zip(request_ids, codes):
+        scheduler.handle_stream_chunk(
+            request_id,
+            StreamItem(9, request_codes[:, 9:].T, "talker", metadata={"stream": False}),
+        )
+        scheduler.handle_stream_done(request_id)
+        result = scheduler.outbox.get_nowait()
+        waveforms.append(
+            np.frombuffer(result.data.data["audio_waveform"], dtype=np.float32)
+        )
+
+    with torch.inference_mode():
+        expected = decode_in_parts(
+            Qwen3OmniIncrementalCodec(model), codes, (3, 3, 3, 2)
+        )
+    for waveform, wanted in zip(waveforms, expected.reshape(2, -1).float().cpu()):
+        np.testing.assert_allclose(waveform, wanted.numpy(), rtol=2e-2, atol=2e-3)
+    assert scheduler.codec_pool.available_size() == scheduler.codec_pool.num_slots
