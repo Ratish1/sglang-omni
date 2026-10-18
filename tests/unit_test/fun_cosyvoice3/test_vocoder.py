@@ -1386,6 +1386,11 @@ def test_create_vocoder_executor_sets_effective_buffered_flow_route(
         and expected_reason in record.message
         for record in caplog.records
     )
+    if enable_dit_torch_compile:
+        pass
+    else:
+        assert "native_compile" not in startup_events
+        assert "shared_compile_prepare" not in startup_events
 
 
 @pytest.mark.parametrize("is_ragged", [False, True])
