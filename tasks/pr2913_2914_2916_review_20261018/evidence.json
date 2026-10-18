@@ -1,0 +1,266 @@
+{
+  "node": "node-radixark-16-0001",
+  "container": "sglang-omni-review2913-2914-2916",
+  "unit_suites": {
+    "pr2913-unit": {
+      "exit_code": 0,
+      "summary": "43 passed, 16 warnings in 39.19s"
+    },
+    "pr2913-pipeline": {
+      "exit_code": 0,
+      "summary": "8 passed, 324 deselected, 16 warnings in 17.17s"
+    },
+    "pr2916-gpu": {
+      "exit_code": 0,
+      "summary": "103 passed, 1 skipped, 17 warnings in 52.12s"
+    },
+    "pr2916-pipeline": {
+      "exit_code": 0,
+      "summary": "5 passed, 328 deselected, 16 warnings in 13.72s"
+    },
+    "pr2914-asr": {
+      "exit_code": 0,
+      "summary": "10 passed, 16 warnings in 11.04s"
+    },
+    "pr2914-pipeline": {
+      "exit_code": 0,
+      "summary": "4 passed, 326 deselected, 18 warnings in 13.40s"
+    }
+  },
+  "probes": {
+    "pr2914-rope": {
+      "exit_code": 0,
+      "results": {
+        "rope_checks": [
+          {
+            "index_dtype": "torch.int32",
+            "graph_replays": 3,
+            "query_max_error": 0.007790088653564453,
+            "key_max_error": 0.007750511169433594
+          },
+          {
+            "index_dtype": "torch.int64",
+            "graph_replays": 3,
+            "query_max_error": 0.007809877395629883,
+            "key_max_error": 0.007811546325683594
+          }
+        ]
+      }
+    },
+    "pr2914-native": {
+      "exit_code": 0,
+      "results": {
+        "before_mrope_native": "ok",
+        "after_text_cuda": "ok",
+        "after_text_native": "fused_set_kv_buffer_arg is not supported for native implementation",
+        "after_text_native_without_fused_store": "ok"
+      }
+    },
+    "pr2916-checkpoint": {
+      "exit_code": 0,
+      "results": {
+        "checkpoint_tables": 15,
+        "vocabulary": 2048,
+        "width": 2048,
+        "prompt_comparisons": [
+          {
+            "frames": 3,
+            "text_tokens": 29,
+            "non_streaming": false,
+            "bit_identical": true
+          },
+          {
+            "frames": 37,
+            "text_tokens": 3,
+            "non_streaming": false,
+            "bit_identical": true
+          },
+          {
+            "frames": 37,
+            "text_tokens": 29,
+            "non_streaming": true,
+            "bit_identical": true
+          }
+        ],
+        "storage_rebind": "passed"
+      }
+    }
+  },
+  "serving": {
+    "pr2914-full": {
+      "exit_code": 0,
+      "source_head": "598a30d02b0783409758adc7ca9ebd93697375f0",
+      "model": "Qwen/Qwen3-TTS-12Hz-1.7B-Base",
+      "requests": [
+        {
+          "request": 0,
+          "pcm_bytes": 122882,
+          "sha256": "2d22595e1d2d10054c2c6a064ce666d1ec5aaa5ba12dccfebe55abcb9729d763"
+        },
+        {
+          "request": 1,
+          "pcm_bytes": 122880,
+          "sha256": "2e9083c08b3f414e2d97638f71cfb5c5e87e3521d3380d931c4cc4042a238d5e"
+        },
+        {
+          "request": 2,
+          "pcm_bytes": 122882,
+          "sha256": "3e6e5e6568c0815c6c05d407f030b7ff76999abc4f31140f912d11f8c8d3e6ee"
+        },
+        {
+          "request": 3,
+          "pcm_bytes": 122880,
+          "sha256": "992e25e0b5c2248fd77204c670b5b2155ac34b3e447f79db881f1c21ed13a536"
+        }
+      ],
+      "stage_success": true,
+      "prefill_cuda_graph": {
+        "backend": "full",
+        "runner": "PrefillCudaGraphRunner",
+        "backend_runner": "FullCudaGraphBackend",
+        "capture_num_tokens": [
+          1,
+          4,
+          8,
+          12,
+          16,
+          20,
+          24,
+          28,
+          32,
+          48,
+          64,
+          80,
+          96,
+          112,
+          128,
+          144,
+          160,
+          176,
+          192,
+          208,
+          224,
+          240,
+          256,
+          288,
+          320,
+          352,
+          384,
+          416,
+          448,
+          480,
+          512
+        ],
+        "input_embeds_slot": true,
+        "replay_count": 4,
+        "standard_eager_count": 0,
+        "custom_eager_count": 0,
+        "replay_buckets": {
+          "4": 2,
+          "8": 1,
+          "24": 1
+        }
+      },
+      "predictor_cuda_graph": {
+        "enabled": true,
+        "startup_graph_count": 5,
+        "lazy_graph_count": 0,
+        "replays": 143,
+        "eager_runs": 0,
+        "capacity_fallbacks": 0,
+        "capture_failures": 0
+      }
+    },
+    "pr2914-breakable": {
+      "exit_code": 0,
+      "source_head": "3d058c9f137238366e8824704cbf3c00eeba8e30",
+      "model": "Qwen/Qwen3-TTS-12Hz-1.7B-Base",
+      "requests": [
+        {
+          "request": 0,
+          "pcm_bytes": 122882,
+          "sha256": "496701a63567a17ad4555fbf3c2c5c011a940550d78a0e1d30df8244cf897df5"
+        },
+        {
+          "request": 1,
+          "pcm_bytes": 122880,
+          "sha256": "ace49ecffc20f628c8a8c1f5ec214d904e14de2b6babb0181d40f015b01670c2"
+        },
+        {
+          "request": 2,
+          "pcm_bytes": 122882,
+          "sha256": "61c66b37fdb9038d1c7a678325d3f0493fa3f7d0379a3be9ea215b46c8b16e2a"
+        },
+        {
+          "request": 3,
+          "pcm_bytes": 122880,
+          "sha256": "a6e2514ed4cc43cb58a975353d08544c180f0e864f7a0281ee56b6c18e5a6ab2"
+        }
+      ],
+      "stage_success": true,
+      "prefill_cuda_graph": {
+        "backend": "breakable",
+        "runner": "PrefillCudaGraphRunner",
+        "backend_runner": "BreakableCudaGraphBackend",
+        "capture_num_tokens": [
+          1,
+          4,
+          8,
+          12,
+          16,
+          20,
+          24,
+          28,
+          32,
+          48,
+          64,
+          80,
+          96,
+          112,
+          128,
+          144,
+          160,
+          176,
+          192,
+          208,
+          224,
+          240,
+          256,
+          288,
+          320,
+          352,
+          384,
+          416,
+          448,
+          480,
+          512
+        ],
+        "input_embeds_slot": true,
+        "replay_count": 4,
+        "standard_eager_count": 0,
+        "custom_eager_count": 0,
+        "replay_buckets": {
+          "4": 2,
+          "8": 1,
+          "24": 1
+        }
+      },
+      "predictor_cuda_graph": {
+        "enabled": true,
+        "startup_graph_count": 5,
+        "lazy_graph_count": 0,
+        "replays": 138,
+        "eager_runs": 0,
+        "capacity_fallbacks": 0,
+        "capture_failures": 0
+      }
+    }
+  },
+  "cleanup": {
+    "owned_serving_processes_remaining": 0,
+    "gpu_memory_mib": 0,
+    "container_retained": true,
+    "gpu_lease_retained": true,
+    "final_production_head": "0e608409ce7284ba0ca01838ee371faeb6991533"
+  }
+}

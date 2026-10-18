@@ -1,0 +1,29 @@
+{
+  "local_sglang_head": "baa9befa381511cd4d56f83980951e5a45fffc6d",
+  "files": {
+    "python/sglang/srt/layers/rotary_embedding/base.py": "55f45802ee9db2548595b55d0578b5e1c37c08ab5529d64583579ebfd87564af",
+    "python/sglang/srt/layers/rotary_embedding/mrope.py": "2c25ff1a73070bd731c721940b467eafdf4538d8a60d2ab9eaacb36d5157bea0",
+    "python/sglang/srt/layers/rotary_embedding/factory.py": "66ab12d4ceb0f9cbf18bb2ecb42f560e93ab4e9a9312530b0f9b1fbe98d2aa4f",
+    "python/sglang/kernels/ops/attention/rope.py": "079a4d99dadbad673159bdb7ec9231467a4ff6c4aa63a40850022e61995a70f9",
+    "python/sglang/kernels/jit/csrc/elementwise/rope.cuh": "46780a3c1b3339a5f925f463f9589b39b95cc1f6689c3b7e3384eccc0b35ac73",
+    "python/sglang/srt/models/utils.py": "97b2e65b34010250771a063d8cfdcc8471f8fa01e6dde7670c381d26601bf951",
+    "python/sglang/srt/model_executor/cuda_graph_buffer_registry.py": "b33966823abf1f720dee2629495e9bd257b8aa598589d981b9771f3f0bb2fc8d",
+    "python/sglang/srt/model_executor/runner/prefill_cuda_graph_runner.py": "79dfe054614988172acb88a616824ecb437ea0848337840d170e1a57f3979bab"
+  },
+  "runtime_versions": {
+    "torch": "2.13.0+cu130",
+    "transformers": "5.12.1",
+    "sglang": "0.5.21",
+    "qwen_tts": "0.1.1"
+  },
+  "runtime_files": {
+    "srt/layers/rotary_embedding/base.py": "2a1a6d0e2d2cfe04946eee771c6257a2a7b84710049890d856acb5ae92596d6d",
+    "srt/layers/rotary_embedding/mrope.py": "d394e7a3e63880fcbf4ab91656cecf0d69283d3f0a47462bf942be7c71ec8f3d",
+    "srt/layers/rotary_embedding/factory.py": "66ab12d4ceb0f9cbf18bb2ecb42f560e93ab4e9a9312530b0f9b1fbe98d2aa4f",
+    "kernels/ops/attention/rope.py": "079a4d99dadbad673159bdb7ec9231467a4ff6c4aa63a40850022e61995a70f9",
+    "kernels/jit/csrc/elementwise/rope.cuh": "46780a3c1b3339a5f925f463f9589b39b95cc1f6689c3b7e3384eccc0b35ac73",
+    "srt/models/utils.py": "a161b4d26f5d8722b33976937514f3f646b85be22bd2504ce8ac2aabfb2575fd",
+    "srt/model_executor/cuda_graph_buffer_registry.py": "839a1a077a6c7ec50148d4a6481e37880baa8947432db7ac09574b7e601f0d78",
+    "srt/model_executor/runner/prefill_cuda_graph_runner.py": "3f9c35d036ed8c4469c262f6cc00084987deafc9787721d5d3475e93dcafcd6f"
+  }
+}

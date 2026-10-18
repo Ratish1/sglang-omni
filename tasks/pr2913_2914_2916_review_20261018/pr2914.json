@@ -1,0 +1,82 @@
+{
+  "baseRefName": "main",
+  "baseRefOid": "76de3ff8f2ee98cb96c989e7d89527dc3d7d263f",
+  "body": "## Motivation\n\nThe talker's config declares MRoPE (`interleaved`, `mrope_section` `[24, 20, 20]`), but a TTS request has no spatial axes: the reference builds the three position rows identical, so MRoPE rotates exactly as text RoPE. Declaring it still costs every forward: SGLang builds and copies `(3, T)` positions for every batch, the fused rope and K/V store kernel does not take MRoPE, so each layer stores K/V in a separate kernel, and a replayed prefill graph needed `ensure_mrope_positions` to mirror positions into the slot the captured graph reads.\n\n## Modifications\n\n- `sglang_omni/utils/hf.py`: `use_text_rope` drops the keys only MRoPE reads (`interleaved`, `mrope_interleaved`, `mrope_section`) from a config's rope parameters, and `drop_mrope_keys` does it for a parameter dict. Qwen3-ASR's thinker, which already did this for the same reason, uses the shared helpers.\n- `register_qwen3_tts_hf_config` applies `use_text_rope` to the talker config before SGLang reads it, so the talker builds text RoPE and the fused store.\n- The talker drops `is_mrope_enabled` and its preference for `forward_batch.mrope_positions`, and the runner drops `ensure_mrope_positions`. With no MRoPE declared, SGLang builds no MRoPE positions, so the breakable and full prefill graphs and the decode graphs capture and replay the plain positions slot, which SGLang refreshes on every replay.\n\nTests: a real `Qwen3TTSConfig` resolves the talker to text RoPE; a default `Qwen3TTSConfig`, which transformers builds when it serializes a config, still builds with no rope parameters; a prefill leaves no MRoPE positions on the batch; the helper drops exactly the MRoPE keys from a real `Qwen3Config`.\n\n## Accuracy Test\n\nH100, Base 1.7B, SeedTTS EN full corpus (1,088 requests), streaming, warmup 1, main and this PR at the same time on two cards, both card orders. The text RoPE cache is fp32, so audio is not byte identical to main.\n\n| concurrency | order | WER main / this PR | speaker similarity main / this PR |\n| --- | --- | --- | --- |\n| 16 | a | 0.96 / 1.02 % | 71.38 / 71.06 |\n| 16 | b | 1.02 / 1.01 % | 71.50 / 71.26 |\n| 64 | a | 1.02 / 1.12 % | |\n| 64 | b | 1.03 / 1.05 % | |\n\nSpeaker similarity moves by -0.32 and -0.24 here and by -0.16 and +0.19 in an earlier pair of runs, inside the 0.25-point difference two runs of main show.\n\n## Benchmark & Profiling\n\nSame setup, no seed, Base on the full prefill graph.\n\n| concurrency | order | RTF main / this PR | req/s main / this PR | latency mean main / this PR (s) | latency p99 main / this PR (s) | first audio p50 main / this PR (ms) |\n| --- | --- | --- | --- | --- | --- | --- |\n| 16 | a | 0.1070 / 0.1057 | 36.01 / 36.43 | 0.442 / 0.437 | 0.729 / 0.718 | 30.7 / 30.6 |\n| 16 | b | 0.1072 / 0.1061 | 35.97 / 36.41 | 0.442 / 0.437 | 0.716 / 0.719 | 30.8 / 30.4 |\n| 64 | a | 0.2387 / 0.2401 | 63.85 / 63.31 | 0.983 / 0.990 | 1.629 / 1.643 | 45.9 / 46.2 |\n| 64 | b | 0.2379 / 0.2360 | 45.90 / 46.66 | 1.000 / 0.988 | 1.691 / 1.670 | 45.9 / 46.0 |\n\nIn the c64 b row one request in each arm ran to the 2,048-frame cap, which lowers req/s in both.\n\nOn the breakable prefill graph, which VoiceDesign uses, each extend runs 28 fewer eager kernel launches (179.3 to 150.4 per extend).\n",
+  "comments": [
+    {
+      "id": "IC_kwDOQ1KxM88AAAABdLCoFg",
+      "author": {
+        "login": "Ratish1"
+      },
+      "authorAssociation": "COLLABORATOR",
+      "body": "/tag-and-rerun-ci qwen3-tts ",
+      "createdAt": "2026-10-18T17:07:58Z",
+      "includesCreatedEdit": false,
+      "isMinimized": false,
+      "minimizedReason": "",
+      "reactionGroups": [
+        {
+          "content": "THUMBS_UP",
+          "users": {
+            "totalCount": 1
+          }
+        }
+      ],
+      "url": "https://github.com/sgl-project/sglang-omni/pull/2914#issuecomment-6252701718",
+      "viewerDidAuthor": true
+    }
+  ],
+  "files": [
+    {
+      "path": "sglang_omni/models/qwen3_asr/sglang_model.py",
+      "additions": 5,
+      "deletions": 25
+    },
+    {
+      "path": "sglang_omni/models/qwen3_asr/torch_mps_runner.py",
+      "additions": 2,
+      "deletions": 7
+    },
+    {
+      "path": "sglang_omni/models/qwen3_tts/model_runner.py",
+      "additions": 0,
+      "deletions": 39
+    },
+    {
+      "path": "sglang_omni/models/qwen3_tts/sglang_model.py",
+      "additions": 0,
+      "deletions": 10
+    },
+    {
+      "path": "sglang_omni/models/qwen3_tts/stages.py",
+      "additions": 6,
+      "deletions": 5
+    },
+    {
+      "path": "sglang_omni/utils/hf.py",
+      "additions": 25,
+      "deletions": 0
+    },
+    {
+      "path": "tests/unit_test/qwen3_asr/test_sglang_model.py",
+      "additions": 0,
+      "deletions": 21
+    },
+    {
+      "path": "tests/unit_test/qwen3_tts/test_pipeline.py",
+      "additions": 25,
+      "deletions": 75
+    },
+    {
+      "path": "tests/unit_test/utils/test_hf.py",
+      "additions": 19,
+      "deletions": 0
+    }
+  ],
+  "headRefName": "perf/qwen3-tts-talker-plain-rope",
+  "headRefOid": "9f1840ee4322921b3f10016634ce32a449b7b7e6",
+  "number": 2914,
+  "reviews": [],
+  "title": "[Qwen3-TTS] Rotate the talker with text RoPE so it runs the fused RoPE and KV store kernels",
+  "updatedAt": "2026-10-18T17:08:18Z"
+}

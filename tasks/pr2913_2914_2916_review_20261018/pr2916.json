@@ -1,0 +1,57 @@
+{
+  "baseRefName": "main",
+  "baseRefOid": "369776998166e4114b4c6868f1b1069fd9a06282",
+  "body": "## Motivation\n\nThe code predictor keeps its 15 residual codebook embedding tables as 15 separate `nn.Embedding` modules. A Base request with reference audio builds its ICL prompt on a preprocessing thread by embedding the reference codes one codebook at a time: 16 lookups, then a cat and a sum, 37 kernel launches per prompt build. In a burst of new requests, preprocessing builds every prompt on eight threads that share the interpreter lock with the engine and vocoder threads, so each launch's host time delays the first prefills and the first audio chunks.\n\n## Modifications\n\n- `Qwen3TTSCodecTables` (`sglang_omni/models/qwen3_tts/sglang_model.py`) holds the 15 tables as one `(codebooks, vocab, hidden)` parameter. Its weight loader copies each checkpoint table `code_predictor.model.codec_embedding.{i}.weight` into slice `i`, and the talker and the prompt frontend resolve those names through one mapping, so checkpoints load unchanged.\n- Decode reads codebook `i`'s table as `weight[i]`, a contiguous view taken at each use. The decode CUDA graphs and the codec gather kernel read the same rows as before, and a view taken at use follows every rebinding of the parameter (the frontend's move to its device, the IPC weight share on followers).\n- The ICL prompt embeds the 15 residual codebooks with one lookup over the flattened weight plus per-codebook row offsets, and sums the same `(frames, 16, hidden)` tensor as before.\n- The prompt frontend (`sglang_omni/models/qwen3_tts/prompt_frontend.py`) builds the same module, lists the indexed checkpoint names and reports a missing table.\n- CustomVoice and VoiceDesign prompts carry no reference codes and are untouched; their decode reads the same predictor rows through the view.\n\nTests: each checkpoint table loads into its codebook's slice on the talker and the frontend, a missing table is reported, the one-lookup embedding equals the per-table lookups at the vocabulary edges, and the ICL prompt equals the per-table prompt.\n\n## Accuracy Test\n\nH100, SeedTTS EN, streaming, main and this PR at the same time on two cards. Seed 1234 at concurrency 1, audio byte identical to main: Base full corpus (1,088 of 1,088), Base with the prompt frontend in its own process, CustomVoice and VoiceDesign (200 of 200 each).\n\nFull corpus, no seed, both card orders:\n\n| concurrency | order | WER main / this PR | speaker similarity main / this PR |\n| --- | --- | --- | --- |\n| 16 | a | 1.06 / 1.06 % | 71.37 / 71.51 |\n| 16 | b | 1.02 / 1.07 % | 71.45 / 71.39 |\n| 64 | a | 0.97 / 1.06 % | |\n| 64 | b | 1.06 / 1.00 % | |\n\nWER excludes one main sample per run that sampled past 50 % at c16 a (a 2,048-frame runaway) and at c64 b; this PR had none.\n\n## Benchmark & Profiling\n\nH100, Base 1.7B, SeedTTS EN, streaming, no seed, main and this PR at the same time on two cards, both card orders.\n\nStart bursts (a benchmark's opening burst of 64 or 16 new requests, eight bursts per arm):\n\n| concurrency | first audio, median per burst, mean main / this PR (ms) | bursts lower | stall-free start p90, mean main / this PR (ms) | bursts lower | total stall main / this PR (s) |\n| --- | --- | --- | --- | --- | --- |\n| 64 | 327.5 / 303.9 | 8 of 8 | 464.0 / 383.7 | 8 of 8 | 20.56 / 20.22 |\n| 16 | 101.2 / 98.1 | 6 of 8 | 128.4 / 122.2 | 5 of 8 | 0.02 / 0.06 |\n\nThe burst's prompt builds also finish earlier: at concurrency 64 the time to the burst's p90 preprocessing completion is lower in 8 of 8 bursts.\n\nFull corpus, warmup 1:\n\n| concurrency | order | RTF main / this PR | req/s main / this PR | latency mean main / this PR (s) | latency p99 main / this PR (s) | first audio p50 main / this PR (ms) | first audio p95 main / this PR (ms) |\n| --- | --- | --- | --- | --- | --- | --- | --- |\n| 16 | a | 0.1089 / 0.1087 | 34.31 / 35.59 | 0.464 / 0.447 | 0.835 / 0.858 | 30.6 / 30.6 | 46.8 / 43.4 |\n| 16 | b | 0.1081 / 0.1072 | 35.57 / 36.00 | 0.447 / 0.442 | 0.732 / 0.720 | 31.3 / 31.0 | 46.3 / 43.4 |\n| 64 | a | 0.2425 / 0.2398 | 62.91 / 63.45 | 0.999 / 0.988 | 1.626 / 1.639 | 46.2 / 45.4 | 292.6 / 263.8 |\n| 64 | b | 0.2451 / 0.2371 | 62.19 / 64.21 | 1.010 / 0.975 | 1.681 / 1.580 | 45.6 / 45.3 | 181.5 / 178.3 |\n\nStartup and card memory are unchanged.\n\nNsight, Base at concurrency 64, per ICL prompt build (median): kernel launches 37 to 25, interpreter lock held 0.70 to 0.46 ms and waited 3.36 to 2.06 ms. The whole preprocessing payload drops from 48 to 36 launches.\n",
+  "comments": [
+    {
+      "id": "IC_kwDOQ1KxM88AAAABdLCQxw",
+      "author": {
+        "login": "Ratish1"
+      },
+      "authorAssociation": "COLLABORATOR",
+      "body": "/tag-and-rerun-ci qwen3-tts",
+      "createdAt": "2026-10-18T17:07:22Z",
+      "includesCreatedEdit": false,
+      "isMinimized": false,
+      "minimizedReason": "",
+      "reactionGroups": [
+        {
+          "content": "THUMBS_UP",
+          "users": {
+            "totalCount": 1
+          }
+        }
+      ],
+      "url": "https://github.com/sgl-project/sglang-omni/pull/2916#issuecomment-6252695751",
+      "viewerDidAuthor": true
+    }
+  ],
+  "files": [
+    {
+      "path": "sglang_omni/models/qwen3_tts/prompt_frontend.py",
+      "additions": 24,
+      "deletions": 14
+    },
+    {
+      "path": "sglang_omni/models/qwen3_tts/sglang_model.py",
+      "additions": 73,
+      "deletions": 24
+    },
+    {
+      "path": "tests/unit_test/qwen3_tts/test_pipeline.py",
+      "additions": 70,
+      "deletions": 15
+    },
+    {
+      "path": "tests/unit_test/qwen3_tts/test_predictor_cuda_graph.py",
+      "additions": 12,
+      "deletions": 15
+    }
+  ],
+  "headRefName": "perf/qwen3-tts-stacked-codec-tables",
+  "headRefOid": "0e608409ce7284ba0ca01838ee371faeb6991533",
+  "number": 2916,
+  "reviews": [],
+  "title": "[Qwen3-TTS] Embed a voice-clone prompt's residual codebooks in one lookup over stacked codec tables",
+  "updatedAt": "2026-10-18T17:07:41Z"
+}

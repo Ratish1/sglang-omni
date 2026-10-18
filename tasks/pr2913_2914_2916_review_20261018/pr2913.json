@@ -1,0 +1,77 @@
+{
+  "baseRefName": "main",
+  "baseRefOid": "76de3ff8f2ee98cb96c989e7d89527dc3d7d263f",
+  "body": "## Motivation\n\nThe talker's input is never a bare codec embedding: the prompt embeddings at prefill, and at every later step the sum of the previous frame's 16 codebook embeddings plus the next text embedding (or the pad embedding once the text ends), as in the reference model.\nSince the decode input moved to `decode_feedback_embedding`, a table the decode CUDA graph reads by row id, nothing has written `feedback_mask`, so `build_input_hidden_states` applies `torch.where` with an all-false mask and `feedback_buffer` survives only as a device, dtype and row-width anchor for the prompt builders and the graph batch validator's capacity probe.\nTwo branches still fall back to a codec embedding alone: an extend without input embeds, and a decode row with no queued feedback. Neither has a path: the runner builds input embeds for every prefill, chunk and retraction replay and raises when it cannot, prefill graph capture and replay pass them, the prefill queues the first frame's feedback, every frame that is not EOS queues the next, and an EOS ends the request. Were either reached, it would feed the talker an input the model never takes and produce wrong audio silently.\nThis changes no output and no speed: it removes the dead state and makes those two states fail visibly.\n\n## Modifications\n\n- The graph batch validator probes the talker's decode capacity at `decode_feedback_embedding.weight`, the table the decode graph reads.\n- The prompt builders (`set_qwen3_tts_preprocessing_context`, `prepare_qwen3_tts_request`, `load_prepared_qwen3_tts_request`, `build_prompt_constants`) read device and dtype from the codec embedding table; the prompt frontend's stand-in `feedback_buffer` is removed.\n- `Qwen3TTSTalkerTextModel` takes a decode's input from the decode feedback table and an extend's from its input embeds only; `feedback_buffer`, `feedback_mask`, `build_input_hidden_states` and the talker's two aliases are removed.\n- `Qwen3TTSModelRunner.write_feedback_buffers` raises for a decode row with no queued feedback instead of staging that row's codec embedding. Like the function's existing checks, it fires before the forward and any table write, and the scheduler's batch failure path fails that batch's requests and keeps serving.\n- The text model reads `forward_batch.forward_mode` directly, a required field of the forward batch.\n\nTests: the capacity probe reads the decode feedback table on the real module layout; decode reads the decode feedback table; an extend reads its input embeds; the feedback write batches text and pad rows and rejects a row without queued feedback.\n\n## Accuracy Test\n\nH100, seed 1234, concurrency 1, streaming, audio byte identical to main on every path the talker input serves: SeedTTS EN full corpus (1,088 of 1,088); Base with the prompt frontend in its own process (200 of 200); CustomVoice (200 of 200); VoiceDesign (200 of 200). No request reached the new error.\n\nWith 32-token chunks on 1.7B Base and #2911's chunk fix applied, a buffered request, a cached streaming request and a request retracted mid-decode then resumed all complete without error: the prompts prefill in up to nine chunks, the retracted request's re-prefill replays its 58-token generated tail across two chunks, and decode resumes to its frame cap.\n\n## Benchmark & Profiling\n\nNo speed change: the removed `torch.where` and both fallbacks ran on paths no request reaches, and the decode feedback write keeps its batched path.\n",
+  "comments": [
+    {
+      "id": "IC_kwDOQ1KxM88AAAABdLCGLQ",
+      "author": {
+        "login": "Ratish1"
+      },
+      "authorAssociation": "COLLABORATOR",
+      "body": "/tag-and-rerun-ci qwen3-tts",
+      "createdAt": "2026-10-18T17:07:06Z",
+      "includesCreatedEdit": false,
+      "isMinimized": false,
+      "minimizedReason": "",
+      "reactionGroups": [
+        {
+          "content": "THUMBS_UP",
+          "users": {
+            "totalCount": 1
+          }
+        }
+      ],
+      "url": "https://github.com/sgl-project/sglang-omni/pull/2913#issuecomment-6252693037",
+      "viewerDidAuthor": true
+    }
+  ],
+  "files": [
+    {
+      "path": "sglang_omni/models/qwen3_tts/model_runner.py",
+      "additions": 7,
+      "deletions": 20
+    },
+    {
+      "path": "sglang_omni/models/qwen3_tts/prompt_frontend.py",
+      "additions": 0,
+      "deletions": 7
+    },
+    {
+      "path": "sglang_omni/models/qwen3_tts/request_builders.py",
+      "additions": 12,
+      "deletions": 11
+    },
+    {
+      "path": "sglang_omni/models/qwen3_tts/sglang_model.py",
+      "additions": 5,
+      "deletions": 35
+    },
+    {
+      "path": "sglang_omni/utils/cuda_graph_batch_validator.py",
+      "additions": 6,
+      "deletions": 1
+    },
+    {
+      "path": "tests/unit_test/model_runner/test_cuda_graph_batch_validator.py",
+      "additions": 22,
+      "deletions": 10
+    },
+    {
+      "path": "tests/unit_test/qwen3_tts/test_pipeline.py",
+      "additions": 44,
+      "deletions": 23
+    },
+    {
+      "path": "tests/unit_test/qwen3_tts/test_retract_prefill.py",
+      "additions": 27,
+      "deletions": 12
+    }
+  ],
+  "headRefName": "refactor/qwen3-tts-talker-input-embedding",
+  "headRefOid": "4fa680cb1f273673635d7bd2042597af8551b757",
+  "number": 2913,
+  "reviews": [],
+  "title": "[Qwen3-TTS] Raise on a missing talker input embedding instead of falling back to a codec embedding",
+  "updatedAt": "2026-10-18T17:07:23Z"
+}
