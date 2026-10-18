@@ -1002,7 +1002,7 @@ class Qwen3TTSTalker(Qwen3TTSPromptBuilderMixin, nn.Module):
             prefix=add_prefix("code_predictor", prefix),
         )
 
-        if root_config is not None and self.tts_model_type == "base":
+        if self.tts_model_type == "base":
             apply_qwen_tts_transformers_compatibility_patches()
             from qwen_tts.core.models.modeling_qwen3_tts import Qwen3TTSSpeakerEncoder
 
