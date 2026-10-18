@@ -112,7 +112,7 @@ if HAS_TRITON:
             envelope += tl.load(
                 squared_window_ptr + tap_indices, mask=is_frame, other=0.0
             )
-        # note (ratish): Triton's float32 division is approximate, torch.istft's correctly rounded.
+        # note (ratish): torch.istft divides correctly rounded; Triton's / is approximate.
         tl.store(
             out_ptr + row * samples + sample_indices,
             div_rn_f32(signal, envelope),
