@@ -164,6 +164,7 @@ class Qwen3TTSSGLangRequestData(SGLangARRequestData):
     subtalker_top_k: int = 50
     subtalker_sampling_seed: int = field(default_factory=new_qwen3_tts_sampling_seed)
     engine_start_s: float = 0.0
+    decode_prep_epoch: int | None = None
 
 
 @dataclass

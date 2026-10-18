@@ -1178,15 +1178,12 @@ class Qwen3TTSTalker(Qwen3TTSPromptBuilderMixin, nn.Module):
             else:
                 pass
             data = sched_req.data
-            epoch = getattr(
-                data, "_qwen3_tts_prep_epoch", None
-            )  # noqa: leading-underscore  # upstream spelling, or the public name is already taken
-            if epoch is None:
-                epoch = self.decode_prep_epoch = self.decode_prep_epoch + 1
-                data._qwen3_tts_prep_epoch = epoch  # noqa: leading-underscore  # upstream spelling, or the public name is already taken
+            if data.decode_prep_epoch is None:
+                self.decode_prep_epoch += 1
+                data.decode_prep_epoch = self.decode_prep_epoch
             else:
                 pass
-            rids.append((rid, epoch))
+            rids.append((rid, data.decode_prep_epoch))
         if rids is not None and rids == self.decode_prep_rids:
             return
         else:
