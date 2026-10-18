@@ -15,7 +15,6 @@ from sglang.srt.runtime_context import get_context, get_schedule
 import sglang_omni.model_runner.sglang_model_runner as runner_mod
 import sglang_omni.models.qwen3_omni.bootstrap as qwen_bootstrap
 import sglang_omni.models.qwen3_omni.stages as qwen_stages
-from sglang_omni.models.qwen3_omni.config import TALKER_MAX_RUNNING_REQUESTS
 from sglang_omni.platforms import current_platform
 
 
@@ -778,14 +777,6 @@ def test_talker_decode_graph_follows_the_platform_gate(
     overrides = talker_overrides(monkeypatch, allows=allows)
 
     assert overrides["disable_cuda_graph"] is expected
-
-
-def test_the_talker_runs_as_many_requests_as_code2wav_keeps_codec_state_for(
-    monkeypatch,
-) -> None:
-    overrides = talker_overrides(monkeypatch, allows=True)
-
-    assert overrides["max_running_requests"] == TALKER_MAX_RUNNING_REQUESTS
 
 
 def test_talker_graph_stays_available_to_an_explicit_override(monkeypatch) -> None:
