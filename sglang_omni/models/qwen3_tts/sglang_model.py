@@ -25,6 +25,7 @@ import torch
 from sglang.kernels.fused_op import get_fused_op_backend
 from sglang.kernels.spec import KernelBackend
 from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
+from sglang.srt.layers.linear import RowParallelLinear
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.quantization.unquant import (
     UnquantizedLinearMethod,
@@ -2103,13 +2104,13 @@ class Qwen3TTSTalker(Qwen3TTSPromptBuilderMixin, nn.Module):
 
     @staticmethod
     def predictor_o_proj_add_residual(
-        o_proj: nn.Module,
+        o_proj: RowParallelLinear,
         attn_input: torch.Tensor,
         residual: torch.Tensor,
     ) -> torch.Tensor:
         """Run the Predictor attention output projection and residual add."""
 
-        weight = getattr(o_proj, "weight", None)
+        weight = o_proj.weight
         # note(ratish): the fusion stands in for sglang's linear only where that
         # linear is torch's GEMM: batch invariant mode overrides aten::addmm but
         # not the out variant, and the cutedsl backend replaces F.linear on sm100.
@@ -2118,12 +2119,9 @@ class Qwen3TTSTalker(Qwen3TTSPromptBuilderMixin, nn.Module):
             and not is_batch_invariant_mode_enabled()
             and not get_bf16_gemm_backend().is_cutedsl()
             and not torch.is_grad_enabled()
-            and isinstance(
-                getattr(o_proj, "quant_method", None), UnquantizedLinearMethod
-            )
-            and getattr(o_proj, "tp_size", None) == 1
-            and getattr(o_proj, "bias", None) is None
-            and isinstance(weight, torch.Tensor)
+            and isinstance(o_proj.quant_method, UnquantizedLinearMethod)
+            and o_proj.tp_size == 1
+            and o_proj.bias is None
             and weight.is_cuda
             and weight.dtype == torch.bfloat16
             and weight.ndim == 2
