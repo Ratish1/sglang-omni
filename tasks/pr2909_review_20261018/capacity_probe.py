@@ -25,7 +25,8 @@ def main() -> None:
     start = time.perf_counter()
     scheduler = create_code2wav_scheduler(
         "Qwen/Qwen3-Omni-30B-A3B-Instruct",
-        device="cuda:0",
+        device="cuda",
+        gpu_id=0,
         dtype="bfloat16",
         codec_state_slots=1,
         max_replay_rows=arguments.rows,
