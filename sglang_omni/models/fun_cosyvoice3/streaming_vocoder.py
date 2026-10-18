@@ -124,6 +124,7 @@ class FunCosyVoice3StreamingVocoderScheduler(
             self.disable_hop_growth = bool(disable_hop_growth)
             self.vocoder = vocoder
             self.clock: Callable[[], float] = time.monotonic
+            self.last_step_seconds = 0.0
         super().__init__(
             self.vocode_payload,
             batch_compute_fn=self.vocode_payloads,
@@ -136,8 +137,14 @@ class FunCosyVoice3StreamingVocoderScheduler(
         )
 
     def pump_one_step(self) -> list[str] | None:
+        started = self.clock()
         with self.vocoder.stream_context:
-            return super().pump_one_step()
+            failed = super().pump_one_step()
+        if failed is not None:
+            self.last_step_seconds = self.clock() - started
+        else:
+            pass
+        return failed
 
     async def vocode_payload(self, payload: StagePayload) -> StagePayload:
         results = await self.vocoder.decode_payloads([payload])
