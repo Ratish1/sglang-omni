@@ -158,7 +158,11 @@ def register_qwen3_tts_hf_config() -> None:
 
         def _patched_init(self, *args, **kwargs):
             original_init(self, *args, **kwargs)
-            self.text_config = self.talker_config
+            talker_config = getattr(self, "talker_config", None)
+            if talker_config is not None:
+                self.text_config = talker_config
+            else:
+                pass
 
         Qwen3TTSConfig.__init__ = _patched_init
         Qwen3TTSConfig._sglang_omni_patched = True  # noqa: leading-underscore  # upstream spelling, or the public name is already taken
