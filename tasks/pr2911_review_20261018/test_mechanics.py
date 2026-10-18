@@ -25,6 +25,10 @@ def test_middle_chunk_runs_through_real_finalize() -> None:
     """An unfinished prompt cannot consume a generated step or emit codec audio."""
     token_ids = torch.tensor([7, 9], device="cuda")
     result, forward_batch, requests = step(token_ids)
+    for request in requests:
+        request.data.req = Req(
+            request.request_id, "", [1, 2, 3], SamplingParams(max_new_tokens=40)
+        )
     requests[0].data.req.inflight_middle_chunks = 1
 
     def predict(
