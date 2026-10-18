@@ -1,0 +1,120 @@
+{
+  "recorded_utc": "2026-10-18T18:15:34.291742+00:00",
+  "pr_head": "be255e7ea058af8c83a0ca0a36adefa919388121",
+  "machine": "node-radixark-16-0001",
+  "container": "sglang-omni-review2915",
+  "gpu": "H200 [0]",
+  "unit_tests": {
+    "passed": 58,
+    "warnings": 16,
+    "seconds": 51.79,
+    "exit_code": 0,
+    "local_pytest_run": false
+  },
+  "sampling_probe": {
+    "contracts": {
+      "greedy": true,
+      "temperature_only": true,
+      "seeded_joint": true,
+      "mixed_seeded_batch": true,
+      "filter_support": {
+        "pytorch_min_p_0.0": [
+          0,
+          1
+        ],
+        "pytorch_min_p_0.01": [
+          0,
+          1
+        ],
+        "flashinfer_min_p_0.0": [
+          0,
+          1
+        ],
+        "flashinfer_min_p_0.01": [
+          0
+        ]
+      },
+      "mixed_min_p_neighbor_support": {
+        "pytorch": [
+          0,
+          1
+        ],
+        "flashinfer": [
+          0
+        ]
+      },
+      "mixed_greedy_tie_support": {
+        "pytorch": [
+          7
+        ],
+        "flashinfer": [
+          7,
+          300,
+          2048
+        ]
+      }
+    },
+    "sampling_cost": [
+      {
+        "rows": 1,
+        "backend": "pytorch",
+        "microseconds": 266.2950325012207
+      },
+      {
+        "rows": 1,
+        "backend": "flashinfer",
+        "microseconds": 247.94719696044922
+      },
+      {
+        "rows": 16,
+        "backend": "pytorch",
+        "microseconds": 683.7296295166016
+      },
+      {
+        "rows": 16,
+        "backend": "flashinfer",
+        "microseconds": 403.55457305908203
+      },
+      {
+        "rows": 64,
+        "backend": "pytorch",
+        "microseconds": 1417.1110534667969
+      },
+      {
+        "rows": 64,
+        "backend": "flashinfer",
+        "microseconds": 522.8639984130859
+      }
+    ]
+  },
+  "regression_assertions": {
+    "pytorch_exit_code": 0,
+    "flashinfer_exit_code": 1,
+    "failed_contract": "joint min-p support remains [0, 1]"
+  },
+  "serving": {
+    "source": "same PR head; explicit PyTorch backend override for control",
+    "model": "Qwen/Qwen3-Omni-30B-A3B-Instruct",
+    "head_requests": 11,
+    "control_requests": 11,
+    "both_clients_exit_code": 0,
+    "both_readiness_warmups_completed": true,
+    "greedy_text_equal": true,
+    "seeded_text_equal": true,
+    "seeded_audio_byte_identical": true
+  },
+  "limits": [
+    "No independent full-corpus WER/SIM evaluation",
+    "No end-to-end performance A/B benchmark",
+    "No TP>1 or multi-GPU layout execution",
+    "No alternative accelerator execution"
+  ],
+  "cleanup": {
+    "owned_servers_stopped": true,
+    "live_owned_stage_processes_remaining": false,
+    "gpu_released": false,
+    "container_deleted": false
+  },
+  "author_source_modified": false,
+  "github_review_staged_or_posted": false
+}

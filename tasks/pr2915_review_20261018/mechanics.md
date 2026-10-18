@@ -61,7 +61,7 @@ The official [FlashInfer joint-sampling documentation](https://docs.flashinfer.a
 
 ## Sources read
 
-Complete model-local production files: stages.py, components/sglang_thinker.py, thinker_model_runner.py, shared model_runner/thinker_model_runner.py and model_runner/base.py. Complete changed test files: test_sglang_thinker.py and test_sglang_ar_budget.py. Complete shared seed/backend test file: test_install_sampling_seeds.py. Complete shared sampler_compile.py and SGLang layers/sampler.py.
+Complete model-local production files: stages.py, components/sglang_thinker.py, thinker_model_runner.py, shared model_runner/thinker_model_runner.py, model_runner/base.py and model_runner/sglang_execution.py. Complete changed test files: test_sglang_thinker.py and test_sglang_ar_budget.py. Complete shared seed/backend test file: test_install_sampling_seeds.py. Complete shared sampler_compile.py and SGLang layers/sampler.py.
 
 Boundary/caller reads: request builder and its SamplingParams normalization/verification, API sampling forwarding, client serialization, config topology/warmup/defaults, thinker bootstrap, SGLModelRunner registration/construction, ModelWorker initialization/reseed, generation override merging, SGLang ModelRunner.sample, LogitsProcessor FP32 publication, SamplingBatchInfo construction/merge, deterministic backend policy and load-hook invocation. These are targeted sections of large unchanged infrastructure files; this review does not claim to have read all of SGLang or every unrelated kernel.
 

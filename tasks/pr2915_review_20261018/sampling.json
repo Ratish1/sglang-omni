@@ -22,7 +22,11 @@
       ]
     },
     "mixed_min_p_neighbor_support": {
-      "zero_min_p_row": [
+      "pytorch": [
+        0,
+        1
+      ],
+      "flashinfer": [
         0
       ]
     },
@@ -41,32 +45,32 @@
     {
       "rows": 1,
       "backend": "pytorch",
-      "microseconds": 281.6774368286133
+      "microseconds": 266.2950325012207
     },
     {
       "rows": 1,
       "backend": "flashinfer",
-      "microseconds": 242.94208526611328
+      "microseconds": 247.94719696044922
     },
     {
       "rows": 16,
       "backend": "pytorch",
-      "microseconds": 681.7362976074219
+      "microseconds": 683.7296295166016
     },
     {
       "rows": 16,
       "backend": "flashinfer",
-      "microseconds": 398.2284927368164
+      "microseconds": 403.55457305908203
     },
     {
       "rows": 64,
       "backend": "pytorch",
-      "microseconds": 1418.5871887207031
+      "microseconds": 1417.1110534667969
     },
     {
       "rows": 64,
       "backend": "flashinfer",
-      "microseconds": 537.407341003418
+      "microseconds": 522.8639984130859
     }
   ]
 }

@@ -29,7 +29,7 @@ The ratio of the second token to the largest token is 0.75, so a min-p threshold
 
 This also affects a neighboring row whose own min-p is zero: `SamplingBatchInfo.need_min_p_sampling` is batch-wide. The H200 two-row check confirms its support changes to `{0}` when only the other row requests min-p. These are valid, documented request fields, not malformed input or an unsupported platform.
 
-Smallest bounded fix: extend the existing shared FlashInfer sampler fallback to use the PyTorch filtering/draw for min-p batches as well as seeded batches. Keep the accelerated joint path for unseeded batches without min-p. Alternatively make the GPU min-p path preserve the joint support, with a derived-property test. The former needs no new abstraction and avoids changing this optimization's common path. Seeded min-p remains rejected by the existing contract.
+Bounded fix: preserve this thinker's previous min-p composition by using the existing PyTorch filtering/draw for its min-p batches. Keep the accelerated joint path for unseeded batches without min-p. Alternatively make its GPU min-p path preserve the joint support, with a derived-property test. If extending the shared wrapper, check other adopters' prior semantics instead of silently changing those models' filtering order. Seeded min-p remains rejected by the existing contract.
 
 The regression case belongs beside the existing shared seed/backend sampling tests. Assert the allowed support for the four-token distribution, including a zero-min-p neighboring row. It must pass with the old PyTorch selection and fail with this PR's current selection. It exercises real GPU filtering, needs no probabilistic frequency assertion, and catches an actual supported-path difference. The checked-in review probe records both outcomes; it does not modify author code.
 
@@ -51,6 +51,8 @@ The regression case belongs beside the existing shared seed/backend sampling tes
 The ordinary CUDA optimization and load hook implement the stated goal. The main gap is the supported min-p combination described in F1. An unchanged temperature-only draw does not prove parity for top-k/top-p/min-p combinations. The author's full-corpus measurements remain author-reported; this review performs targeted mechanical and serving checks rather than treating a small smoke test as another quality benchmark.
 
 Validation details and exact limits are in [verification.md](verification.md). Nothing has been staged or posted to GitHub, and no author source branch has been changed.
+
+Completed validation: 58 existing tests passed on H200; both full 30B serving arms passed 11 requests, including streamed speech and readiness warmup; seeded speech was byte-identical. The deterministic min-p contract assertion passes on the PyTorch control and fails on FlashInfer. Recommend the bounded F1 fix before merging; the optimization itself is worth keeping. F2 is optional reporting cleanup.
 
 ## 4. Coherence and system fit
 

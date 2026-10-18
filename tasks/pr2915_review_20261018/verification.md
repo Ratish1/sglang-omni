@@ -35,7 +35,7 @@ python3 tasks/pr2915_review_20261018/probe_sampling.py --assert-min-p-backend py
 python3 tasks/pr2915_review_20261018/probe_sampling.py --assert-min-p-backend flashinfer
 ```
 
-The expected contract is the previous thinker's support `{0, 1}`, both for the min-p request and for its zero-min-p neighbor. The PyTorch command is the old-path control; the FlashInfer command deliberately exposes the current regression. These are review diagnostics, not changes to the author's CI suite.
+The expected contract is the previous thinker's support `{0, 1}`, both for the min-p request and for its zero-min-p neighbor. The PyTorch command is the old-path control; the FlashInfer command deliberately exposes the current regression. **Observed exit codes: PyTorch 0, FlashInfer 1**, with the latter failing the support assertion. The current probe records both backends' mixed-row support as well. These are review diagnostics, not changes to the author's CI suite.
 
 ## Component performance
 
@@ -47,7 +47,7 @@ Warm 100-iteration CUDA-event measurements of the real sampler, including logits
 | 16 | 681.7 | 398.2 |
 | 64 | 1418.6 | 537.4 |
 
-The first run measured 253.5/237.7, 681.9/392.5 and 1415.6/538.8 respectively. The multi-row reduction is clear in this component check; small single-row or end-to-end percentages should not be treated as statistically established from this probe. Later runs used only for contract assertions are not extra performance evidence.
+The first run measured 253.5/237.7, 681.9/392.5 and 1415.6/538.8 respectively. The second run's values above are retained in sampling_measured.json. The multi-row reduction is clear in this component check; small single-row or end-to-end percentages should not be treated as statistically established from this probe. Later runs saved in sampling.json were used only for contract assertions and are not extra performance evidence.
 
 The installed wheel sorts the full vocabulary on the PyTorch path. The local SGLang checkout additionally supports an unseeded max_top_k shortcut; this review does not claim the table compares against that newer optimization.
 
@@ -73,7 +73,9 @@ This isolates the changed backend and disables the new FlashInfer load-hook acti
 
 `probe_serving.py` sends 11 requests per arm: greedy text, seeded filtered text, temperature-only text, four concurrent unseeded filtered text requests, filtered min-p text, seeded filtered speech, unseeded filtered speech and streamed unseeded filtered speech. Speech bytes are checked and hashed, not transcribed. The streamed case requires text and audio chunks followed by DONE without an error event. Normal readiness warmup includes image and audio inputs before the public checks.
 
-Detailed arm outcomes and cleanup are recorded in evidence.json after the runs. The unit and component checks establish the sampling mechanics; a successful model request alone does not prove quality equivalence or disprove F1.
+**Both arms passed all 11 requests**, in addition to normal readiness warmup. Greedy and seeded text matched. Seeded speech matched byte for byte: 94,934 encoded bytes, SHA256 b01a55d6e57019c53df7a6d1f247f8023f65d3974a1fc2dc44525e4356582f45. Both streamed replies produced text and audio and terminated with DONE. Unseeded audio differed, as expected from changing the random draw; no WER or SIM conclusion is drawn from those bytes.
+
+Detailed arm outcomes and cleanup are recorded in evidence.json, head_serving.json and control_serving.json. The unit and component checks establish the sampling mechanics; a successful model request alone does not prove quality equivalence or disprove F1. Both servers stopped normally and no live stage-worker or model-server processes remained. The GPU allocation and task container were retained.
 
 ## Boundaries
 
