@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import math
+import statistics
 from pathlib import Path
 
 import numpy as np
@@ -96,10 +97,10 @@ def main() -> None:
                 for key, value in read_safetensors_keys(shard_path, names).items()
             }
         )
-    reference = Qwen3OmniMoeCode2Wav(configuration.code2wav_config).eval()
+    reference = Qwen3OmniMoeCode2Wav._from_config(configuration.code2wav_config).eval()
     reference.load_state_dict(weights, strict=True)
     reference.to(device="cuda", dtype=torch.float32)
-    model = Qwen3OmniCode2Wav(configuration.code2wav_config).eval()
+    model = Qwen3OmniCode2Wav._from_config(configuration.code2wav_config).eval()
     model.load_state_dict(weights, strict=True)
     model.to(device="cuda", dtype=torch.bfloat16)
     model.use_channels_last()
@@ -121,6 +122,17 @@ def main() -> None:
             wanted = reference(codes)
             whole = model(codes)
             uniform = [10] * (frames // 10) + ([frames % 10] if frames % 10 else [])
+            old_windows = []
+            position = 0
+            for count in uniform:
+                context = min(25, position)
+                old_windows.append(
+                    model(codes[..., position - context : position + count])[
+                        ..., -count * model.total_upsample :
+                    ]
+                )
+                position += count
+            old_window_snr = signal_to_noise(torch.cat(old_windows, dim=-1), wanted)
             irregular = []
             left = frames
             while left:
@@ -138,6 +150,7 @@ def main() -> None:
                     "parts": len(parts),
                     "snr_db": snr,
                     "whole_snr_db": whole_snr,
+                    "old_window_snr_db": old_window_snr,
                     "samples": actual.numel(),
                 }
                 rows.append(row)
@@ -225,6 +238,50 @@ def main() -> None:
         "trained eight-row scheduler graph batching, wrap and final tail: passed",
         flush=True,
     )
+    timings = []
+    for row_count in (1, 8):
+        static_codes = torch.randint(
+            model.config.codebook_size,
+            (row_count, model.config.num_quantizers, 35),
+            device="cuda",
+        )
+        warmup_stream = torch.cuda.Stream()
+        warmup_stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(warmup_stream), torch.inference_mode():
+            for _ in range(3):
+                model(static_codes)
+        torch.cuda.current_stream().wait_stream(warmup_stream)
+        old_graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(old_graph), torch.inference_mode():
+            old_output = model(static_codes)
+        assert old_output.numel() > 0
+        runner.run_slots(
+            static_codes[..., :10], list(range(row_count)), first_decode=True
+        )
+        for name, graph in (
+            ("stateless_35_frames", old_graph),
+            (
+                "incremental_10_frames",
+                runner.graphs[GraphKey(row_count, 10, "next")].graph,
+            ),
+        ):
+            samples = []
+            for _ in range(25):
+                start_event, end_event = torch.cuda.Event(
+                    enable_timing=True
+                ), torch.cuda.Event(enable_timing=True)
+                start_event.record()
+                graph.replay()
+                end_event.record()
+                end_event.synchronize()
+                samples.append(start_event.elapsed_time(end_event))
+            timing = {
+                "rows": row_count,
+                "mode": name,
+                "median_ms": statistics.median(samples[5:]),
+            }
+            timings.append(timing)
+            print(json.dumps(timing), flush=True)
     OUTPUT.write_text(
         json.dumps(
             {
@@ -234,6 +291,7 @@ def main() -> None:
                 "graph_stats": runner.stats(),
                 "reuse_bit_identical": True,
                 "batched_scheduler_rows": 8,
+                "timings": timings,
             },
             indent=2,
         )
