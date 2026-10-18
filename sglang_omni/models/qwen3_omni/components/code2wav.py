@@ -195,8 +195,7 @@ class FusedCode2WavTransformer(torch.nn.Module):
             distances = frame_offsets[:, None] - frame_offsets[None, :]
             window_mask = (distances >= 0) & (distances < sliding_window)
         else:
-            # note (ratish): a row's window lists its ring rows in position order, its new
-            # frames last; a frame sees itself and the sliding_window - 1 positions before it.
+            # note (ratish): window rows run in position order, a row's new frames last.
             query_offsets = (addresses.window_lengths - length)[:, None] + frame_offsets
             distances = query_offsets[:, :, None] - torch.arange(
                 pool.ring_frames, device=inputs_embeds.device

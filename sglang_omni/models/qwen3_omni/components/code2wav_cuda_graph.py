@@ -76,12 +76,8 @@ class Code2WavGraphStats(TypedDict):
 
 @dataclass(frozen=True, slots=True)
 class GraphKey:
-    """One exact Code2Wav input shape, excluding fixed quantizer count.
-
-    A window graph decodes a stateless window with its left context; a first or next graph
-    decodes only new frames from the streams' codec state slots, on a stream's first decode or
-    a later one.
-    """
+    """One exact Code2Wav input shape, excluding fixed quantizer count: a stateless window with
+    its left context, or a stream's first or later new frames decoded from its slot."""
 
     batch_size: int
     frames: int
@@ -679,9 +675,8 @@ class Code2WavCudaGraphRunner:
             static_index = None
             model = self.model
         else:
-            # note (ratish): each row of a capture writes its own scratch slot, since the
-            # kernels update the pool in place; a next capture also reads them, so they are
-            # zeroed before the eager and the replayed decode.
+            # note (ratish): rows write state in place, so each has its own scratch slot; a
+            # next capture also reads them, so both its decodes start from zeroed slots.
             static_index = self.device_api.new_static_input(
                 (key.batch_size,), device=self.device
             )
