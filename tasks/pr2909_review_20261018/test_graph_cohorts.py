@@ -24,20 +24,19 @@ def test_two_slots_keep_their_streams_across_batched_next_graphs() -> None:
     for request_id in request_ids:
         scheduler.stream_payloads[request_id] = make_qwen_payload(request_id=request_id)
     for position in (0, 3, 6):
-        scheduler.on_stream_chunk_batch(
-            [
-                (
-                    request_id,
-                    StreamItem(
-                        position,
-                        row_codes[:, position : position + 3].T,
-                        "talker",
-                        metadata={"stream": False},
-                    ),
-                )
-                for request_id, row_codes in zip(request_ids, codes)
-            ]
-        )
+        for request_id, stream_item in [
+            (
+                request_id,
+                StreamItem(
+                    position,
+                    row_codes[:, position : position + 3].T,
+                    "talker",
+                    metadata={"stream": False},
+                ),
+            )
+            for request_id, row_codes in zip(request_ids, codes)
+        ]:
+            scheduler.handle_stream_chunk(request_id, stream_item)
         assert len(scheduler.ready_window_group()) == 2
         scheduler.run_ready_step()
     for request_id, row_codes in zip(request_ids, codes):

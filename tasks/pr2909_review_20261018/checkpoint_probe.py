@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import math
 import statistics
+from copy import deepcopy
 from pathlib import Path
 
 import numpy as np
@@ -97,7 +98,9 @@ def main() -> None:
                 for key, value in read_safetensors_keys(shard_path, names).items()
             }
         )
-    reference = Qwen3OmniMoeCode2Wav._from_config(configuration.code2wav_config).eval()
+    reference = Qwen3OmniMoeCode2Wav._from_config(
+        deepcopy(configuration.code2wav_config)
+    ).eval()
     reference.load_state_dict(weights, strict=True)
     reference.to(device="cuda", dtype=torch.float32)
     model = Qwen3OmniCode2Wav._from_config(configuration.code2wav_config).eval()
@@ -202,20 +205,19 @@ def main() -> None:
     for request_id in request_ids:
         scheduler.stream_payloads[request_id] = make_qwen_payload(request_id=request_id)
     for position in range(0, 90, 10):
-        scheduler.on_stream_chunk_batch(
-            [
-                (
-                    request_id,
-                    StreamItem(
-                        position,
-                        row_codes[:, position : position + 10].T,
-                        "talker",
-                        metadata={"stream": False},
-                    ),
-                )
-                for request_id, row_codes in zip(request_ids, codes)
-            ]
-        )
+        for request_id, stream_item in [
+            (
+                request_id,
+                StreamItem(
+                    position,
+                    row_codes[:, position : position + 10].T,
+                    "talker",
+                    metadata={"stream": False},
+                ),
+            )
+            for request_id, row_codes in zip(request_ids, codes)
+        ]:
+            scheduler.handle_stream_chunk(request_id, stream_item)
         assert len(scheduler.ready_window_group()) == 8
         scheduler.run_ready_step()
     for request_id, row_codes in zip(request_ids, codes):

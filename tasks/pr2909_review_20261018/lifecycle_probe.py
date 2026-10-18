@@ -28,20 +28,19 @@ def main() -> None:
     for request_id in ("abort-0", "abort-1"):
         scheduler.stream_payloads[request_id] = make_qwen_payload(request_id=request_id)
     for position in (0, 3):
-        scheduler.on_stream_chunk_batch(
-            [
-                (
-                    f"abort-{row}",
-                    StreamItem(
-                        position,
-                        row_codes[:, position : position + 3].T,
-                        "talker",
-                        metadata={"stream": False},
-                    ),
-                )
-                for row, row_codes in enumerate(codes)
-            ]
-        )
+        for request_id, stream_item in [
+            (
+                f"abort-{row}",
+                StreamItem(
+                    position,
+                    row_codes[:, position : position + 3].T,
+                    "talker",
+                    metadata={"stream": False},
+                ),
+            )
+            for row, row_codes in enumerate(codes)
+        ]:
+            scheduler.handle_stream_chunk(request_id, stream_item)
         if position == 3:
             torch.cuda._sleep(500_000_000)
         else:
@@ -59,15 +58,14 @@ def main() -> None:
     print("in-flight cohort abort and immediate codec-slot reuse: passed", flush=True)
     for request_id in ("failure-0", "failure-1"):
         scheduler.stream_payloads[request_id] = make_qwen_payload(request_id=request_id)
-    scheduler.on_stream_chunk_batch(
-        [
-            (
-                f"failure-{row}",
-                StreamItem(0, row_codes[:, :3].T, "talker", metadata={"stream": False}),
-            )
-            for row, row_codes in enumerate(codes)
-        ]
-    )
+    for request_id, stream_item in [
+        (
+            f"failure-{row}",
+            StreamItem(0, row_codes[:, :3].T, "talker", metadata={"stream": False}),
+        )
+        for row, row_codes in enumerate(codes)
+    ]:
+        scheduler.handle_stream_chunk(request_id, stream_item)
     original_replay = scheduler.cuda_graph_runner.replay
 
     def fail_after_state_write(
