@@ -88,6 +88,7 @@ def main() -> None:
     assert torch.equal(tables(codes), expected)
     # note (ratish): IPC rebinds Parameter.data before capture; future lookups
     # must read that allocation rather than a slice saved during construction.
+    original_weight = tables.weight.detach()
     tables.weight.data = tables.weight.detach().clone() + 0.25
     expected = torch.stack(
         [
@@ -97,6 +98,7 @@ def main() -> None:
         dim=1,
     )
     assert torch.equal(tables(codes), expected)
+    tables.weight.data = original_weight
     old_tables = nn.ModuleList()
     for table in tables.weight:
         embedding = nn.Embedding(vocabulary, width, device="meta", dtype=table.dtype)
