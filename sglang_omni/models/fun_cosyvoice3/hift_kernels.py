@@ -87,40 +87,29 @@ if HAS_TRITON:
         N_FFT: tl.constexpr,
         HOP_LENGTH: tl.constexpr,
         BINS: tl.constexpr,
-        BLOCK_BINS: tl.constexpr,
         BLOCK_SAMPLES: tl.constexpr,
     ):
         row = tl.program_id(1).to(tl.int64)
         sample_indices = tl.program_id(0) * BLOCK_SAMPLES + tl.arange(0, BLOCK_SAMPLES)
         is_sample = sample_indices < samples
         padded_positions = sample_indices + N_FFT // 2
-        bin_indices = tl.arange(0, BLOCK_BINS)
-        is_bin = bin_indices < BINS
         signal = tl.zeros((BLOCK_SAMPLES,), dtype=tl.float32)
         envelope = tl.zeros((BLOCK_SAMPLES,), dtype=tl.float32)
         for overlap in tl.static_range(N_FFT // HOP_LENGTH):
             frame_indices = padded_positions // HOP_LENGTH - overlap
             tap_indices = padded_positions - frame_indices * HOP_LENGTH
             is_frame = is_sample & (frame_indices >= 0) & (frame_indices < frames)
-            mask = is_frame[:, None] & is_bin[None, :]
-            spectrum_offsets = (
-                row * BINS + bin_indices[None, :]
-            ) * frames + frame_indices[:, None]
-            real = tl.load(real_ptr + spectrum_offsets, mask=mask, other=0.0)
-            imaginary = tl.load(imaginary_ptr + spectrum_offsets, mask=mask, other=0.0)
-            cosine = tl.load(
-                basis_ptr + bin_indices[None, :] * N_FFT + tap_indices[:, None],
-                mask=mask,
-                other=0.0,
-            )
-            sine = tl.load(
-                basis_ptr
-                + (BINS + bin_indices[None, :]) * N_FFT
-                + tap_indices[:, None],
-                mask=mask,
-                other=0.0,
-            )
-            signal += tl.sum(real * cosine + imaginary * sine, axis=1)
+            # note (ratish): one bin at a time, so each output sums in the same order
+            # whatever the tile.
+            for bin_index in tl.static_range(BINS):
+                spectrum_offsets = (row * BINS + bin_index) * frames + frame_indices
+                real = tl.load(real_ptr + spectrum_offsets, mask=is_frame, other=0.0)
+                imaginary = tl.load(
+                    imaginary_ptr + spectrum_offsets, mask=is_frame, other=0.0
+                )
+                cosine = tl.load(basis_ptr + bin_index * N_FFT + tap_indices)
+                sine = tl.load(basis_ptr + (BINS + bin_index) * N_FFT + tap_indices)
+                signal += real * cosine + imaginary * sine
             envelope += tl.load(
                 squared_window_ptr + tap_indices, mask=is_frame, other=0.0
             )
@@ -212,7 +201,6 @@ def overlap_add_inverse(
         N_FFT=n_fft,
         HOP_LENGTH=hop_length,
         BINS=bins,
-        BLOCK_BINS=triton.next_power_of_2(bins),
         BLOCK_SAMPLES=OUTPUT_SAMPLES_PER_PROGRAM,
     )
     return out
