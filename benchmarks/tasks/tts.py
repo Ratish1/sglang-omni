@@ -881,6 +881,8 @@ class VoiceCloneOmni:
             "audio": {"format": "wav"},
             "max_tokens": max_tokens,
             "temperature": temperature,
+            "top_p": 0.8,
+            "top_k": 20,
             "stream": stream,
         }
         if seed is not None:
