@@ -27,10 +27,7 @@ from sglang.kernels.spec import KernelBackend
 from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
 from sglang.srt.layers.linear import RowParallelLinear
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
-from sglang.srt.layers.quantization.unquant import (
-    UnquantizedLinearMethod,
-    get_bf16_gemm_backend,
-)
+from sglang.srt.layers.quantization.unquant import get_bf16_gemm_backend
 from sglang.srt.layers.sampler import multinomial_with_seed
 from sglang.srt.runtime_context import get_context, get_exec, get_parallel, get_schedule
 from sglang.srt.server_args import ServerArgs
@@ -2116,7 +2113,6 @@ class Qwen3TTSTalker(Qwen3TTSPromptBuilderMixin, nn.Module):
             and not is_batch_invariant_mode_enabled()
             and not get_bf16_gemm_backend().is_cutedsl()
             and not torch.is_grad_enabled()
-            and isinstance(o_proj.quant_method, UnquantizedLinearMethod)
             and o_proj.tp_size == 1
             and o_proj.bias is None
             and weight.is_cuda

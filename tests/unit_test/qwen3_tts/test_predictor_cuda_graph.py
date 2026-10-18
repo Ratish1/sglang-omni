@@ -72,7 +72,6 @@ class TupleLinear(nn.Module):
     def __init__(self, in_features: int, out_features: int) -> None:
         super().__init__()
         self.proj = nn.Linear(in_features, out_features, bias=False)
-        self.quant_method = sglang_model_module.UnquantizedLinearMethod()
         self.tp_size = 1
 
     @property
