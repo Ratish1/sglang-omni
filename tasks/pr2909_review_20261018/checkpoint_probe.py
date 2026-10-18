@@ -228,13 +228,25 @@ def main() -> None:
         scheduler.handle_stream_done(request_id)
     messages = [scheduler.outbox.get_nowait() for _ in request_ids]
     with torch.inference_mode():
-        expected = parts_forward(
-            codec, codes, [10] * 9 + [3], make_pool(codec, 8), list(range(8))
+        oracle_pool = make_pool(codec, 8)
+        prefix = parts_forward(
+            codec, codes[..., :90], [10] * 9, oracle_pool, list(range(8))
         )
-    for message, waveform in zip(messages, expected.float().cpu().reshape(8, -1)):
+        expected = []
+        for row in range(8):
+            tail = codec.decode_slots(
+                codes[row : row + 1, :, 90:],
+                oracle_pool,
+                oracle_pool.stage_index([row]),
+                first_decode=False,
+            )
+            expected.append(torch.cat((prefix[row : row + 1], tail), dim=-1))
+    for message, waveform in zip(messages, expected):
         assert message.type == "result", message
         actual = np.frombuffer(message.data.data["audio_waveform"], dtype=np.float32)
-        np.testing.assert_allclose(actual, waveform.numpy(), atol=0.003, rtol=0.03)
+        np.testing.assert_array_equal(
+            actual, waveform.float().cpu().numpy().reshape(-1)
+        )
     assert pool.available_size() == 32
     print(
         "trained eight-row scheduler graph batching, wrap and final tail: passed",
