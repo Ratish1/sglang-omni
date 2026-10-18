@@ -419,35 +419,49 @@ class FunCosyVoice3StreamingVocoderScheduler(
         self,
     ) -> list[tuple[str, CosyVoice3StreamState]]:
         now = self.clock()
-        started: list[tuple[float, float, str, CosyVoice3StreamState]] = []
-        unstarted: list[tuple[float, str, CosyVoice3StreamState]] = []
+        # note (ratish): a row runs within the step running when it falls due and its
+        # own, so none waits past two recent steps once one has been timed.
+        bound = 2 * self.expected_step_seconds()
+        ranked: list[tuple[float, float, str, CosyVoice3StreamState, bool]] = []
         for request_id, state in self.stream_state_items():
             if state.next_decode() == "wait" or self.is_aborted(request_id):
                 continue
-            elif state.first_emit_at is None:
-                assert state.ready_since is not None
-                unstarted.append((state.ready_since, request_id, state))
             else:
                 assert state.ready_since is not None
-                playback_slack = state.speech_offset / self.sample_rate - (
-                    now - state.first_emit_at
-                )
-                started.append((playback_slack, state.ready_since, request_id, state))
-        ranked = [(request_id, state) for _, _, request_id, state in sorted(started)]
-        ranked += [(request_id, state) for _, request_id, state in sorted(unstarted)]
+            # note (ratish): a stream without audio is due now, its listener waiting, as
+            # SGLang runs a new prefill before the running decode; a started one when
+            # the audio it emitted runs out.
+            if state.first_emit_at is None:
+                due = now
+            else:
+                due = state.first_emit_at + state.speech_offset / self.sample_rate
+            is_waited_out = bound > 0 and now - state.ready_since >= bound
+            is_due_soon = due <= now + bound or is_waited_out
+            if is_waited_out:
+                due = min(due, state.ready_since + bound)
+            else:
+                pass
+            ranked.append((due, state.ready_since, request_id, state, is_due_soon))
         if not ranked:
             return []
         else:
-            head_decode = ranked[0][1].next_decode()
-            if head_decode == "fallback":
-                return ranked[:1]
-            else:
-                peers = [
-                    (request_id, state)
-                    for request_id, state in ranked
-                    if state.next_decode() == head_decode
-                ]
-                return peers[: self.max_batch_size]
+            ranked.sort()
+        _, _, head_id, head, _ = ranked[0]
+        head_decode = head.next_decode()
+        if head_decode == "fallback":
+            return [(head_id, head)]
+        else:
+            pass
+        # note (ratish): a step carrying a first audio leaves out the streams whose audio
+        # lasts past the bound, so the listener waits on a lighter step.
+        is_first_audio_step = head.first_emit_at is None
+        peers = [
+            (request_id, state)
+            for _, _, request_id, state, is_due_soon in ranked
+            if state.next_decode() == head_decode
+            and (not is_first_audio_step or is_due_soon)
+        ]
+        return peers[: self.max_batch_size]
 
     def build_step_plan(
         self, participants: list[tuple[str, CosyVoice3StreamState]]
