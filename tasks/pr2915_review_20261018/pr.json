@@ -1,0 +1,72 @@
+{
+  "baseRefName": "main",
+  "baseRefOid": "369776998166e4114b4c6868f1b1069fd9a06282",
+  "body": "## Summary\n\nQwen3-Omni's thinker samples on SGLang's PyTorch backend, which applies top-k and top-p by sorting all 152064 logits of every row; FlashInfer's joint draw does the same filtering without a sort (78 against 219 us a decode step at 1 row, 211 against 1378 us at 64 rows, H200).\n\nThis PR runs the thinker on the FlashInfer backend on CUDA, as Qwen3-TTS and Fun-CosyVoice3 do, and loads FlashInfer's sampling module while the model loads. A batch with a request seed keeps the PyTorch seeded draw, so seeded requests return the same tokens as before. A request without top-k or top-p takes SGLang's plain draw on either backend and is unchanged.\n\n## Changes\n\n`sglang_omni/models/qwen3_omni/stages.py`: the thinker's sampling backend is flashinfer on CUDA, pytorch elsewhere.\n\n`sglang_omni/models/qwen3_omni/components/sglang_thinker.py`: the load hook loads FlashInfer's sampling module when it draws the requests.\n\n## Results\n\nQwen3-Omni colocated bf16 on H200, SeedTTS EN streamed with voice clone, full corpus (1088 requests), the thinker at top_p 0.8 and top_k 20, main against this PR at the same time on two cards, then swapped; the mean of the two rounds.\n\n| metric | main | this PR | change |\n|---|---|---|---|\n| c16 QPS | 11.637 | 11.884 | +2.1 % |\n| c16 RTF | 0.3757 | 0.3691 | -1.7 % |\n| c16 latency median / p95 / p99 (s) | 1.356 / 2.024 / 2.321 | 1.335 / 1.986 / 2.255 | -1.5 / -1.9 / -2.9 % |\n| c16 first audio mean (ms) | 560.6 | 555.5 | -0.9 % |\n| c64 QPS | 15.502 | 15.710 | +1.3 % |\n| c64 RTF | 1.1618 | 1.1462 | -1.4 % |\n| c64 latency median / p95 (s) | 4.090 / 5.268 | 4.054 / 5.184 | -0.9 / -1.6 % |\n| c1 RTF | 0.1227 | 0.1220 | -0.6 % |\n| c16 WER below 50 % | 1.62 % | 1.63 % | +0.01 pt |\n| c16 SIM | 6.51 | 6.37 | -0.14 |\n\nc16 SIM moves by up to 0.57 between rounds of one arm under unseeded sampling; over four rounds the means are 6.43 (main) and 6.46 (this PR).\n\nWith the benchmark's default request (temperature only), both backends take the same draw, and seeded c1 audio is byte identical to main's on every clip.\n\n## Tests\n\nThe load hook loads FlashInfer's sampling module only on the flashinfer backend; the thinker's server args select flashinfer on CUDA and pytorch elsewhere.\n",
+  "comments": [
+    {
+      "id": "IC_kwDOQ1KxM88AAAABdLfBPA",
+      "author": {
+        "login": "Ratish1"
+      },
+      "authorAssociation": "COLLABORATOR",
+      "body": "/tag-and-rerun-ci qwen3-omni",
+      "createdAt": "2026-10-18T17:52:47Z",
+      "includesCreatedEdit": false,
+      "isMinimized": false,
+      "minimizedReason": "",
+      "reactionGroups": [
+        {
+          "content": "THUMBS_UP",
+          "users": {
+            "totalCount": 1
+          }
+        }
+      ],
+      "url": "https://github.com/sgl-project/sglang-omni/pull/2915#issuecomment-6253166908",
+      "viewerDidAuthor": true
+    }
+  ],
+  "files": [
+    {
+      "path": "sglang_omni/models/qwen3_omni/components/sglang_thinker.py",
+      "additions": 17,
+      "deletions": 3
+    },
+    {
+      "path": "sglang_omni/models/qwen3_omni/stages.py",
+      "additions": 1,
+      "deletions": 1
+    },
+    {
+      "path": "tests/unit_test/qwen3_omni/test_sglang_ar_budget.py",
+      "additions": 7,
+      "deletions": 3
+    },
+    {
+      "path": "tests/unit_test/qwen3_omni/test_sglang_thinker.py",
+      "additions": 28,
+      "deletions": 2
+    }
+  ],
+  "headRefName": "perf/qwen3-omni-thinker-flashinfer",
+  "headRefOid": "be255e7ea058af8c83a0ca0a36adefa919388121",
+  "number": 2915,
+  "reviews": [
+    {
+      "id": "PRR_kwDOQ1KxM88AAAABS6Xi1Q",
+      "author": {
+        "login": "zhaochenyang20"
+      },
+      "authorAssociation": "COLLABORATOR",
+      "body": "",
+      "submittedAt": "2026-10-18T17:48:53Z",
+      "includesCreatedEdit": false,
+      "reactionGroups": [],
+      "state": "APPROVED",
+      "commit": {
+        "oid": "be255e7ea058af8c83a0ca0a36adefa919388121"
+      }
+    }
+  ],
+  "title": "[Perf][Qwen3-Omni] Draw unseeded thinker requests with FlashInfer"
+}

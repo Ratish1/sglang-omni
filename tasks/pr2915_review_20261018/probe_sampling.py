@@ -1,5 +1,6 @@
 """Exercise the real thinker sampler's seed routing, filter support and cost."""
 
+import argparse
 import json
 from pathlib import Path
 from types import SimpleNamespace
@@ -130,18 +131,19 @@ def check_contracts() -> dict[str, bool | dict[str, list[int]]]:
             )
     checks["filter_support"] = supports
 
-    mixed_min_p = sampling_inputs(2, 2, 0.5, capture_support=True)
-    mixed_min_p.min_ps[1] = 0.01
-    mixed_min_p.need_min_p_sampling = True
-    _, mixed_min_p_output = sample(
-        "flashinfer", four_token_logits.repeat(2, 1), mixed_min_p
-    )
-    mixed_mask = mixed_min_p_output.sampling_mask_output
-    checks["mixed_min_p_neighbor_support"] = {
-        "zero_min_p_row": sorted(
+    mixed_min_p_support: dict[str, list[int]] = {}
+    for backend in ("pytorch", "flashinfer"):
+        mixed_min_p = sampling_inputs(2, 2, 0.5, capture_support=True)
+        mixed_min_p.min_ps[1] = 0.01
+        mixed_min_p.need_min_p_sampling = True
+        _, mixed_min_p_output = sample(
+            backend, four_token_logits.repeat(2, 1), mixed_min_p
+        )
+        mixed_mask = mixed_min_p_output.sampling_mask_output
+        mixed_min_p_support[backend] = sorted(
             mixed_mask.token_ids[0, : int(mixed_mask.lengths[0])].tolist()
         )
-    }
+    checks["mixed_min_p_neighbor_support"] = mixed_min_p_support
 
     tied_logits = torch.full((2, VOCABULARY_SIZE), -20.0, device="cuda")
     tied_logits[:, [7, 300, 2048]] = 10.0
@@ -198,8 +200,17 @@ def measure_sampling() -> list[dict[str, int | str | float]]:
     return measurements
 
 
+parser = argparse.ArgumentParser()
+parser.add_argument("--assert-min-p-backend", choices=("pytorch", "flashinfer"))
+arguments = parser.parse_args()
 register_flashinfer_seeded_sampler()
 with torch.no_grad():
     evidence = {"contracts": check_contracts(), "sampling_cost": measure_sampling()}
 Path("/data/review2915/sampling.json").write_text(json.dumps(evidence, indent=2) + "\n")
 print(json.dumps(evidence, indent=2))
+if arguments.assert_min_p_backend is not None:
+    backend = arguments.assert_min_p_backend
+    assert evidence["contracts"]["filter_support"][f"{backend}_min_p_0.01"] == [0, 1]
+    assert evidence["contracts"]["mixed_min_p_neighbor_support"][backend] == [0, 1]
+else:
+    pass

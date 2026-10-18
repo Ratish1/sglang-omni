@@ -1,0 +1,53 @@
+{
+  "local_sglang_head": "baa9befa381511cd4d56f83980951e5a45fffc6d",
+  "files": {
+    "/Users/ratish/sglang-omni/.worktrees/thinker-flashinfer-only/sglang_omni/models/qwen3_omni/stages.py": {
+      "sha256": "b3b67d980313dc290d5a0513f78ba7d44831f71d588a9c9aeae8872d3d607ef7",
+      "lines": 1488
+    },
+    "/Users/ratish/sglang-omni/.worktrees/thinker-flashinfer-only/sglang_omni/models/qwen3_omni/components/sglang_thinker.py": {
+      "sha256": "09fa6e987ac4af96084f8dd2b8a52684ad60ad6578f2626c3102b83290e43de7",
+      "lines": 442
+    },
+    "/Users/ratish/sglang-omni/.worktrees/thinker-flashinfer-only/sglang_omni/models/qwen3_omni/thinker_model_runner.py": {
+      "sha256": "0569c9d74100629410904062dfde5595a35ae4c37d0748fe8236313d9abb5c0c",
+      "lines": 421
+    },
+    "/Users/ratish/sglang-omni/.worktrees/thinker-flashinfer-only/sglang_omni/model_runner/thinker_model_runner.py": {
+      "sha256": "74322dbafe756c12d6a0f04b40dd7ec333062b7f509874584bf233a64602a172",
+      "lines": 599
+    },
+    "/Users/ratish/sglang-omni/.worktrees/thinker-flashinfer-only/sglang_omni/model_runner/base.py": {
+      "sha256": "6d6f07a5ecece104047203bd5a3b435c5bb24b973d4f92cb47079343316fdb1d",
+      "lines": 1230
+    },
+    "/Users/ratish/sglang-omni/.worktrees/thinker-flashinfer-only/sglang_omni/sampling/sampler_compile.py": {
+      "sha256": "268a7c2253e70371b85ca27f1454028c19a390a1268a6aa9904f7c644d29be23",
+      "lines": 76
+    },
+    "/Users/ratish/sglang/python/sglang/srt/layers/sampler.py": {
+      "sha256": "98a36e61762f5b1b1ae06666c5a42f126e8bca1cec7d5b5fa63b32f9ebe75c1d",
+      "lines": 1063
+    },
+    "/Users/ratish/sglang/python/sglang/srt/sampling/sampling_batch_info.py": {
+      "sha256": "5ddd691c5a3bd5e7f78fb4700012e00da75baecfa5c2dde2adf3766ca3fdfb90",
+      "lines": 721
+    },
+    "/Users/ratish/sglang/python/sglang/srt/model_executor/model_runner.py": {
+      "sha256": "0192531598c05e5fc5316a634ba291b81b6bc1572694fb6b303abc26690a3899",
+      "lines": 2553
+    },
+    "/Users/ratish/sglang/python/sglang/kernels/aot/python/sgl_kernel/sampling.py": {
+      "sha256": "80f01a3812ff7be617c169ab82828a09fa4f22969c42cdcaedf3a01c628bfdf8",
+      "lines": 115
+    },
+    "/Users/ratish/sglang/python/sglang/kernels/ops/sampling/__init__.py": {
+      "sha256": "7b28087423d586f267b90e6a6651621be2c80ea8be7b8e5a9ff2b434a6302bd2",
+      "lines": 127
+    },
+    "/Users/ratish/sglang/python/sglang/kernels/ops/sampling/murmur_hash.py": {
+      "sha256": "e932e4a7c5ae39eadc6400cc74ef4e646eaedc8370061e52b97a2544bbb5919b",
+      "lines": 128
+    }
+  }
+}

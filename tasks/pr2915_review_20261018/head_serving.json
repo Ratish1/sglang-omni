@@ -1,0 +1,71 @@
+[
+  {
+    "case": "concurrent_filtered_text_0",
+    "status": 200,
+    "text": "The blue train arrives at noon.",
+    "finish_reason": "stop"
+  },
+  {
+    "case": "concurrent_filtered_text_1",
+    "status": 200,
+    "text": "The blue train arrives at noon.",
+    "finish_reason": "stop"
+  },
+  {
+    "case": "concurrent_filtered_text_2",
+    "status": 200,
+    "text": "The blue train arrives at noon.",
+    "finish_reason": "stop"
+  },
+  {
+    "case": "concurrent_filtered_text_3",
+    "status": 200,
+    "text": "The blue train arrives at noon.",
+    "finish_reason": "stop"
+  },
+  {
+    "case": "filtered_min_p_text",
+    "status": 200,
+    "text": "The blue train arrives at noon.",
+    "finish_reason": "stop"
+  },
+  {
+    "case": "greedy_text",
+    "status": 200,
+    "text": "The blue train arrives at noon.",
+    "finish_reason": "stop"
+  },
+  {
+    "case": "seeded_filtered_speech",
+    "status": 200,
+    "text": "The blue train arrives at noon.",
+    "finish_reason": "stop",
+    "audio_bytes": 94934,
+    "audio_sha256": "b01a55d6e57019c53df7a6d1f247f8023f65d3974a1fc2dc44525e4356582f45"
+  },
+  {
+    "case": "seeded_filtered_text",
+    "status": 200,
+    "text": "The blue train arrives at noon.",
+    "finish_reason": "stop"
+  },
+  {
+    "case": "streamed_filtered_speech",
+    "audio_chunks": 3,
+    "text_chunks": 7
+  },
+  {
+    "case": "temperature_only_text",
+    "status": 200,
+    "text": "The blue train arrives at noon.",
+    "finish_reason": "stop"
+  },
+  {
+    "case": "unseeded_filtered_speech",
+    "status": 200,
+    "text": "The blue train arrives at noon.",
+    "finish_reason": "stop",
+    "audio_bytes": 87254,
+    "audio_sha256": "de9287ce2c90375b264654466fe2dbe9e414133fd4eb8be9f9368d1b15352a24"
+  }
+]
