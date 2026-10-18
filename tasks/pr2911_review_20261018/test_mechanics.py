@@ -104,6 +104,7 @@ def test_chunk_progress_and_private_slots_are_released(
         )
         total = allocator.available_size()
         request = Req("chunk", "", list(range(20)), SamplingParams(max_new_tokens=40))
+        OmniScheduler.normalize_req_token_arrays(request)
         request_pool.alloc([request])
         request.init_next_round_input(cache)
         prompt_slots = allocator.alloc(16)
