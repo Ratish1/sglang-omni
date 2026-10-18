@@ -13,7 +13,7 @@ import queue
 import time
 from collections.abc import Mapping
 from dataclasses import dataclass, field
-from typing import Literal, TypedDict
+from typing import TypedDict
 
 import numpy as np
 import torch
@@ -29,6 +29,7 @@ from sglang_omni.models.qwen3_omni.components.code2wav_cuda_graph import (
     Code2WavCudaGraphRunner,
     Code2WavRunResult,
     GraphKey,
+    GraphKeyStats,
 )
 from sglang_omni.models.qwen3_omni.components.codec_state_pool import CodecStatePool
 from sglang_omni.platforms import current_platform
@@ -58,30 +59,16 @@ class IngestProfile(TypedDict):
     ready_emitted: bool
 
 
-class GraphKeyMetadata(TypedDict):
-    batch_size: int
-    frames: int
-    decode: Literal["window", "first", "next"]
-
-
 class ExecutionMetadata(TypedDict):
     execution_mode: str
-    graph_key: GraphKeyMetadata | None
+    graph_key: GraphKeyStats | None
     fallback_reason: str | None
 
 
 def execution_metadata(result: Code2WavRunResult) -> ExecutionMetadata:
-    if result.key is None:
-        graph_key = None
-    else:
-        graph_key = {
-            "batch_size": int(result.key.batch_size),
-            "frames": int(result.key.frames),
-            "decode": result.key.decode,
-        }
     return {
         "execution_mode": str(result.execution_mode),
-        "graph_key": graph_key,
+        "graph_key": None if result.key is None else result.key.stats(),
         "fallback_reason": (
             None if result.fallback_reason is None else str(result.fallback_reason)
         ),

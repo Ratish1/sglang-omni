@@ -26,12 +26,20 @@ from sglang_omni.platforms.device_graph import DeviceGraphBackend, ReplayableGra
 logger = logging.getLogger(__name__)
 _MASK_SWAP_LOCK = threading.Lock()
 
+GraphDecode: TypeAlias = Literal["window", "first", "next"]
+
+
+class GraphKeyStats(TypedDict):
+    batch_size: int
+    frames: int
+    decode: GraphDecode
+
 
 class Tier1Stats(TypedDict):
     attempted_key_count: int
     published_key_count: int
     attempts: int
-    skipped_keys: list[dict[str, int]]
+    skipped_keys: list[GraphKeyStats]
     disable_reason: str | None
     per_key_footprint_bytes: dict[str, int]
 
@@ -68,7 +76,7 @@ class Code2WavGraphStats(TypedDict):
     enabled: bool
     disable_reason: str | None
     binding: BindingStats
-    graph_contract: dict[str, list[dict[str, int]]]
+    graph_contract: dict[str, list[GraphKeyStats]]
     build: dict[str, int]
     memory: MemoryStats
     runtime: RuntimeStats
@@ -81,7 +89,14 @@ class GraphKey:
 
     batch_size: int
     frames: int
-    decode: Literal["window", "first", "next"] = "window"
+    decode: GraphDecode = "window"
+
+    def stats(self) -> GraphKeyStats:
+        return {
+            "batch_size": self.batch_size,
+            "frames": self.frames,
+            "decode": self.decode,
+        }
 
 
 @dataclass(frozen=True, slots=True)
@@ -310,9 +325,7 @@ class Code2WavCudaGraphRunner:
         )
         self.owner_pid = os.getpid()
         self.graphs: dict[GraphKey, CapturedGraph] = {}
-        self.sizes_by_frames: dict[
-            tuple[Literal["window", "first", "next"], int], tuple[int, ...]
-        ] = {}
+        self.sizes_by_frames: dict[tuple[GraphDecode, int], tuple[int, ...]] = {}
         self.pool: tuple[int, int] | None = None
         self.capture_stream: torch.Stream | None = None
         self.enabled = False
@@ -439,9 +452,7 @@ class Code2WavCudaGraphRunner:
         self.graphs = {
             key: temporary[key] for key in self.graph_keys if key in temporary
         }
-        sizes_by_frames: dict[
-            tuple[Literal["window", "first", "next"], int], set[int]
-        ] = {}
+        sizes_by_frames: dict[tuple[GraphDecode, int], set[int]] = {}
         for key in self.graphs:
             sizes_by_frames.setdefault((key.decode, key.frames), set()).add(
                 key.batch_size
@@ -456,9 +467,7 @@ class Code2WavCudaGraphRunner:
                 (1 for key in self.tier1_keys if key in self.graphs)
             )
             tier1_info["skipped_keys"] = [
-                {"batch_size": key.batch_size, "frames": key.frames}
-                for key in self.tier1_keys
-                if key not in self.graphs
+                key.stats() for key in self.tier1_keys if key not in self.graphs
             ]
             if tier1_info["skipped_keys"]:
                 logger.warning(
@@ -655,7 +664,7 @@ class Code2WavCudaGraphRunner:
             return f"b{key.batch_size}t{key.frames}{key.decode}"
 
     def available_batch_sizes(
-        self, frames: int, decode: Literal["window", "first", "next"] = "window"
+        self, frames: int, decode: GraphDecode = "window"
     ) -> tuple[int, ...]:
         """Batch sizes with a published graph for this window length, largest
         first; the scheduler decomposes coalesced batches against this."""
@@ -968,16 +977,7 @@ class Code2WavCudaGraphRunner:
                 "input_dtype": "torch.long",
                 "owner_pid": self.owner_pid,
             },
-            "graph_contract": {
-                "keys": [
-                    {
-                        "batch_size": key.batch_size,
-                        "frames": key.frames,
-                        "decode": key.decode,
-                    }
-                    for key in self.graph_keys
-                ]
-            },
+            "graph_contract": {"keys": [key.stats() for key in self.graph_keys]},
             "build": deepcopy(self.build_stats),
             "memory": deepcopy(self.memory_stats),
             "runtime": {
