@@ -159,10 +159,9 @@ def register_qwen3_tts_hf_config() -> None:
 
         def _patched_init(self, *args, **kwargs):
             original_init(self, *args, **kwargs)
-            # note (ratish): the talker's three MRoPE position rows are always
-            # identical, so it rotates as text RoPE; dropping the MRoPE keys here,
-            # before SGLang reads the text config, keeps SGLang from building and
-            # copying MRoPE positions for it.
+            # note (ratish): the talker's three MRoPE position rows are identical, so it
+            # rotates as text RoPE; dropping the MRoPE keys before SGLang reads the text
+            # config keeps SGLang from building and copying MRoPE positions for it.
             use_text_rope(self.talker_config)
             self.text_config = self.talker_config
 
