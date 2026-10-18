@@ -83,15 +83,11 @@ def drop_mrope_keys(
 
 
 def use_text_rope(config: PretrainedConfig) -> None:
-    """Make the runtime build text RoPE for a config whose three MRoPE position
-    rows are always identical, where MRoPE rotates exactly as text RoPE."""
-    for attribute_name in ("rope_parameters", "rope_scaling"):
-        parameters = getattr(config, attribute_name, None)
-        if not isinstance(parameters, dict) or "mrope_section" not in parameters:
-            continue
-        else:
-            pass
-        setattr(config, attribute_name, drop_mrope_keys(parameters))
+    """Drop the MRoPE-only rope keys so the runtime builds text RoPE."""
+    if config.rope_parameters is None:
+        pass
+    else:
+        config.rope_parameters = drop_mrope_keys(config.rope_parameters)
 
 
 def load_mistral_params_json(

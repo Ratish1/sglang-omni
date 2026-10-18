@@ -904,22 +904,19 @@ def test_qwen3_tts_talker_config_rotates_as_text_rope() -> None:
             "rope_theta": 1_000_000,
         }
     )
-    rope_dicts = [
-        parameters
-        for parameters in (
-            config.text_config.rope_parameters,
-            config.text_config.rope_scaling,
-        )
-        if isinstance(parameters, dict)
-    ]
 
     assert config.text_config is config.talker_config
-    assert rope_dicts
-    for parameters in rope_dicts:
-        assert not {"interleaved", "mrope_interleaved", "mrope_section"} & set(
-            parameters
-        )
-        assert parameters["rope_type"] == "default"
+    assert config.text_config.rope_scaling == {
+        "rope_type": "default",
+        "type": "default",
+    }
+
+
+def test_qwen3_tts_default_config_builds_without_rope_parameters() -> None:
+    qwen3_stages.register_qwen3_tts_hf_config()
+    from qwen_tts.core.models import Qwen3TTSConfig
+
+    assert Qwen3TTSConfig().text_config.rope_parameters is None
 
 
 def test_qwen3_tts_factory_forwards_coalescing_params_to_builder(
