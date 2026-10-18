@@ -196,6 +196,7 @@ def overlap_add_inverse(
     rows, bins, frames = real.shape
     components, n_fft = basis.shape
     assert real.is_contiguous() and imaginary.is_contiguous() and components == 2 * bins
+    assert real.dtype == imaginary.dtype == torch.float32
     samples = hop_length * (frames - 1)
     out = real.new_empty(rows, samples)
     grid = (triton.cdiv(samples, OUTPUT_SAMPLES_PER_PROGRAM), rows)
