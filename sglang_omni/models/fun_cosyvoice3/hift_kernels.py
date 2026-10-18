@@ -6,7 +6,6 @@ own inputs in one fixed order, so a row's result does not follow what shares its
 from __future__ import annotations
 
 import torch
-from sglang.srt.utils.custom_op import register_custom_op
 
 from sglang_omni.models.fun_cosyvoice3.causal_conv import HAS_TRITON
 
@@ -122,17 +121,6 @@ else:
     pass
 
 
-def fake_snake(
-    x: torch.Tensor, alpha: torch.Tensor, inverse_alpha: torch.Tensor
-) -> torch.Tensor:
-    return torch.empty_like(x)
-
-
-@register_custom_op(
-    op_name="fun_cosyvoice3_snake",
-    mutates_args=[],
-    fake_impl=fake_snake,
-)
 def snake(
     x: torch.Tensor, alpha: torch.Tensor, inverse_alpha: torch.Tensor
 ) -> torch.Tensor:
@@ -154,21 +142,6 @@ def snake(
     return out
 
 
-def fake_short_time_spectrum(
-    padded_signal: torch.Tensor, basis: torch.Tensor, hop_length: int
-) -> torch.Tensor:
-    rows, padded_samples = padded_signal.shape
-    components, n_fft = basis.shape
-    return padded_signal.new_empty(
-        rows, components, (padded_samples - n_fft) // hop_length + 1
-    )
-
-
-@register_custom_op(
-    op_name="fun_cosyvoice3_short_time_spectrum",
-    mutates_args=[],
-    fake_impl=fake_short_time_spectrum,
-)
 def short_time_spectrum(
     padded_signal: torch.Tensor, basis: torch.Tensor, hop_length: int
 ) -> torch.Tensor:
@@ -195,22 +168,6 @@ def short_time_spectrum(
     return spectrum
 
 
-def fake_overlap_add_inverse(
-    real: torch.Tensor,
-    imag: torch.Tensor,
-    basis: torch.Tensor,
-    squared_window: torch.Tensor,
-    hop_length: int,
-) -> torch.Tensor:
-    rows, _, frames = real.shape
-    return real.new_empty(rows, hop_length * (frames - 1))
-
-
-@register_custom_op(
-    op_name="fun_cosyvoice3_overlap_add_inverse",
-    mutates_args=[],
-    fake_impl=fake_overlap_add_inverse,
-)
 def overlap_add_inverse(
     real: torch.Tensor,
     imag: torch.Tensor,
