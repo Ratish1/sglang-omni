@@ -153,8 +153,11 @@ For same-process stream targets:
 
 - the stage sends consecutive chunks for one target through one
   `LocalStageDispatcher.send_stream_chunks()` call, in order
-- the receiver checks each chunk as before and enqueues one `stream_chunk`
-  message per chunk
+- the receiver checks each chunk (abort, replica binding, the pre-payload rule)
+- a scheduler that sets `accepts_stream_chunk_batches` (the Qwen3-TTS vocoder)
+  gets the call's chunks as one `stream_chunk_batch` message, a list of
+  (request id, stream item) pairs in order; any other scheduler gets one
+  `stream_chunk` message per chunk
 - the receiver gets the original Python object and metadata by reference
 - the same read-only and lifetime caveats as payload LOCAL_OBJECT apply
 
