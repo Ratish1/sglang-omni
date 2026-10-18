@@ -32,36 +32,36 @@ if HAS_TRITON:
     ):
         channel = tl.program_id(1)
         row = tl.program_id(2).to(tl.int64) * channels + channel
-        offsets = tl.program_id(0) * BLOCK_SAMPLES + tl.arange(0, BLOCK_SAMPLES)
-        is_sample = offsets < samples
+        sample_indices = tl.program_id(0) * BLOCK_SAMPLES + tl.arange(0, BLOCK_SAMPLES)
+        is_sample = sample_indices < samples
         alpha = tl.load(alpha_ptr + channel)
         inverse_alpha = tl.load(inverse_alpha_ptr + channel)
-        x = tl.load(x_ptr + row * samples + offsets, mask=is_sample)
+        x = tl.load(x_ptr + row * samples + sample_indices, mask=is_sample)
         sine = libdevice.sin(mul_rn_f32(x, alpha))
         # note (ratish): each product rounds alone, as in the eager ops; an FMA would not.
         out = x + mul_rn_f32(inverse_alpha, mul_rn_f32(sine, sine))
-        tl.store(out_ptr + row * samples + offsets, out, mask=is_sample)
+        tl.store(out_ptr + row * samples + sample_indices, out, mask=is_sample)
 
     @triton.jit(do_not_specialize=["frames", "padded_samples"])
-    def stft_kernel(
+    def short_time_spectrum_kernel(
         padded_signal_ptr,
         basis_ptr,
         spectrum_ptr,
         frames,
         padded_samples,
         N_FFT: tl.constexpr,
-        HOP: tl.constexpr,
+        HOP_LENGTH: tl.constexpr,
         BINS: tl.constexpr,
         BLOCK_FRAMES: tl.constexpr,
     ):
         row = tl.program_id(1).to(tl.int64)
-        frame = tl.program_id(0) * BLOCK_FRAMES + tl.arange(0, BLOCK_FRAMES)
-        is_frame = frame < frames
+        frame_indices = tl.program_id(0) * BLOCK_FRAMES + tl.arange(0, BLOCK_FRAMES)
+        is_frame = frame_indices < frames
         taps = tl.arange(0, N_FFT)
         frame_samples = tl.load(
             padded_signal_ptr
             + row * padded_samples
-            + frame[:, None] * HOP
+            + frame_indices[:, None] * HOP_LENGTH
             + taps[None, :],
             mask=is_frame[:, None],
             other=0.0,
@@ -69,58 +69,66 @@ if HAS_TRITON:
         for component in tl.static_range(2 * BINS):
             basis = tl.load(basis_ptr + component * N_FFT + taps)
             tl.store(
-                spectrum_ptr + (row * 2 * BINS + component) * frames + frame,
+                spectrum_ptr + (row * 2 * BINS + component) * frames + frame_indices,
                 tl.sum(frame_samples * basis[None, :], axis=1),
                 mask=is_frame,
             )
 
     @triton.jit(do_not_specialize=["frames", "samples"])
-    def istft_kernel(
+    def overlap_add_inverse_kernel(
         real_ptr,
-        imag_ptr,
+        imaginary_ptr,
         basis_ptr,
         squared_window_ptr,
         out_ptr,
         frames,
         samples,
         N_FFT: tl.constexpr,
-        HOP: tl.constexpr,
+        HOP_LENGTH: tl.constexpr,
         BINS: tl.constexpr,
-        BINS_BLOCK: tl.constexpr,
+        BLOCK_BINS: tl.constexpr,
         BLOCK_SAMPLES: tl.constexpr,
     ):
         row = tl.program_id(1).to(tl.int64)
-        output = tl.program_id(0) * BLOCK_SAMPLES + tl.arange(0, BLOCK_SAMPLES)
-        is_output = output < samples
-        position = output + N_FFT // 2
-        bins = tl.arange(0, BINS_BLOCK)
-        is_bin = bins < BINS
+        sample_indices = tl.program_id(0) * BLOCK_SAMPLES + tl.arange(0, BLOCK_SAMPLES)
+        is_sample = sample_indices < samples
+        padded_positions = sample_indices + N_FFT // 2
+        bin_indices = tl.arange(0, BLOCK_BINS)
+        is_bin = bin_indices < BINS
         signal = tl.zeros((BLOCK_SAMPLES,), dtype=tl.float32)
         envelope = tl.zeros((BLOCK_SAMPLES,), dtype=tl.float32)
-        for overlap in tl.static_range(N_FFT // HOP):
-            frame = position // HOP - overlap
-            tap = position - frame * HOP
-            is_frame = is_output & (frame >= 0) & (frame < frames)
+        for overlap in tl.static_range(N_FFT // HOP_LENGTH):
+            frame_indices = padded_positions // HOP_LENGTH - overlap
+            tap_indices = padded_positions - frame_indices * HOP_LENGTH
+            is_frame = is_sample & (frame_indices >= 0) & (frame_indices < frames)
             mask = is_frame[:, None] & is_bin[None, :]
-            offsets = (row * BINS + bins[None, :]) * frames + frame[:, None]
-            real = tl.load(real_ptr + offsets, mask=mask, other=0.0)
-            imag = tl.load(imag_ptr + offsets, mask=mask, other=0.0)
+            spectrum_offsets = (
+                row * BINS + bin_indices[None, :]
+            ) * frames + frame_indices[:, None]
+            real = tl.load(real_ptr + spectrum_offsets, mask=mask, other=0.0)
+            imaginary = tl.load(imaginary_ptr + spectrum_offsets, mask=mask, other=0.0)
             cosine = tl.load(
-                basis_ptr + bins[None, :] * N_FFT + tap[:, None], mask=mask, other=0.0
-            )
-            sine = tl.load(
-                basis_ptr + (BINS + bins[None, :]) * N_FFT + tap[:, None],
+                basis_ptr + bin_indices[None, :] * N_FFT + tap_indices[:, None],
                 mask=mask,
                 other=0.0,
             )
-            value = tl.sum(real * cosine + imag * sine, axis=1)
-            signal += tl.where(is_frame, value, 0.0)
-            envelope += tl.load(squared_window_ptr + tap, mask=is_frame, other=0.0)
+            sine = tl.load(
+                basis_ptr
+                + (BINS + bin_indices[None, :]) * N_FFT
+                + tap_indices[:, None],
+                mask=mask,
+                other=0.0,
+            )
+            frame_inverse = tl.sum(real * cosine + imaginary * sine, axis=1)
+            signal += tl.where(is_frame, frame_inverse, 0.0)
+            envelope += tl.load(
+                squared_window_ptr + tap_indices, mask=is_frame, other=0.0
+            )
         # note (ratish): Triton's float32 division is approximate, torch.istft's correctly rounded.
         tl.store(
-            out_ptr + row * samples + output,
+            out_ptr + row * samples + sample_indices,
             div_rn_f32(signal, envelope),
-            mask=is_output,
+            mask=is_sample,
         )
 
 else:
@@ -160,14 +168,14 @@ def short_time_spectrum(
     frames = (padded_samples - n_fft) // hop_length + 1
     spectrum = padded_signal.new_empty(rows, components, frames)
     grid = (triton.cdiv(frames, FRAMES_PER_PROGRAM), rows)
-    stft_kernel[grid](
+    short_time_spectrum_kernel[grid](
         padded_signal,
         basis,
         spectrum,
         frames,
         padded_samples,
         N_FFT=n_fft,
-        HOP=hop_length,
+        HOP_LENGTH=hop_length,
         BINS=components // 2,
         BLOCK_FRAMES=FRAMES_PER_PROGRAM,
     )
@@ -176,34 +184,34 @@ def short_time_spectrum(
 
 def overlap_add_inverse(
     real: torch.Tensor,
-    imag: torch.Tensor,
+    imaginary: torch.Tensor,
     basis: torch.Tensor,
     squared_window: torch.Tensor,
     hop_length: int,
 ) -> torch.Tensor:
-    """real, imag: (rows, bins, frames) float32; basis: (2 * bins, n_fft), the one sided
-    inverse's windowed cosines then negative sines over n_fft. Each frame's inverse,
+    """real, imaginary: (rows, bins, frames) float32; basis: (2 * bins, n_fft), the one
+    sided inverse's windowed cosines then negative sines over n_fft. Each frame's inverse,
     overlap added, divided by the squared window's overlap and trimmed by n_fft / 2 on
     each side, as torch.istft with center=True. Returns (rows, hop_length * (frames - 1)).
     """
     rows, bins, frames = real.shape
     components, n_fft = basis.shape
-    assert real.is_contiguous() and imag.is_contiguous() and components == 2 * bins
+    assert real.is_contiguous() and imaginary.is_contiguous() and components == 2 * bins
     samples = hop_length * (frames - 1)
     out = real.new_empty(rows, samples)
     grid = (triton.cdiv(samples, OUTPUT_SAMPLES_PER_PROGRAM), rows)
-    istft_kernel[grid](
+    overlap_add_inverse_kernel[grid](
         real,
-        imag,
+        imaginary,
         basis,
         squared_window,
         out,
         frames,
         samples,
         N_FFT=n_fft,
-        HOP=hop_length,
+        HOP_LENGTH=hop_length,
         BINS=bins,
-        BINS_BLOCK=triton.next_power_of_2(bins),
+        BLOCK_BINS=triton.next_power_of_2(bins),
         BLOCK_SAMPLES=OUTPUT_SAMPLES_PER_PROGRAM,
     )
     return out
