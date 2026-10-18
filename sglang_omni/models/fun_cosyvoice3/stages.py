@@ -1821,13 +1821,20 @@ class CosyVoice3Vocoder(BatchVocoderBase[FunCosyVoice3State, torch.Tensor]):
             self.stream_context: contextlib.AbstractContextManager[None] = (
                 torch.cuda.stream(stream)
             )
-            if HAS_TRITON and self.hift_autocast_dtype is None:
-                patch_hift_snake(hift)
-                patch_hift_spectra(hift, device)
-            else:
-                pass
         else:
             self.stream_context = contextlib.nullcontext()
+        # note (ratish): the kernels round with NVIDIA PTX, which ROCm cannot compile.
+        self.has_hift_kernels = (
+            device.type == "cuda"
+            and current_platform.is_cuda()
+            and HAS_TRITON
+            and self.hift_autocast_dtype is None
+        )
+        if self.has_hift_kernels:
+            patch_hift_snake(hift)
+            patch_hift_spectra(hift, device)
+        else:
+            pass
 
     def prepare_item(
         self, payload: StagePayload
@@ -2540,14 +2547,9 @@ def create_vocoder_executor(
         and autocast_dtype in FA3_DTYPES
         and len(whole_history_tier_frames) > 0
     )
-    # note (ratish): HiFT's decode captures only with its spectra kernels, which the
-    # vocoder gives a float32 HiFT on CUDA with Triton.
-    has_hift_graphs = (
-        enable_hift_cuda_graph
-        and device_obj.type == "cuda"
-        and HAS_TRITON
-        and vocoder.hift_autocast_dtype is None
-    )
+    # note (ratish): torch.istft reads its window envelope on the host, so HiFT's decode
+    # captures only with the vocoder's kernels.
+    has_hift_graphs = enable_hift_cuda_graph and vocoder.has_hift_kernels
     if has_prefix_graphs or has_whole_history_graphs or has_hift_graphs:
         graph_backend = current_platform.get_device_graph_backend(device_obj)
         assert graph_backend is not None

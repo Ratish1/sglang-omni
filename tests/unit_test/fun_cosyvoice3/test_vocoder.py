@@ -1455,6 +1455,19 @@ def test_vocoder_hift_snake_is_bit_identical_to_cosyvoice() -> None:
 
 @pytest.mark.accelerator
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_vocoder_leaves_hift_unpatched_off_nvidia(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(current_platform, "is_cuda", lambda: False)
+    hift = make_causal_hift(10.0)
+    vocoder = stages.CosyVoice3Vocoder(HiftFlowStub(), hift)
+    assert not vocoder.has_hift_kernels
+    assert all("forward" not in vars(module) for module in hift.modules())
+    assert "_stft" not in vars(hift) and "_istft" not in vars(hift)
+
+
+@pytest.mark.accelerator
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_vocoder_spectra_match_cosyvoice_without_a_host_wait(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
