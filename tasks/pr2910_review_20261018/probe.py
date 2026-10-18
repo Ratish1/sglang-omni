@@ -3,6 +3,7 @@
 import copy
 import json
 import time
+from collections import Counter
 from pathlib import Path
 
 import torch
@@ -10,6 +11,9 @@ from huggingface_hub import hf_hub_download
 from sglang.srt.arg_groups.cuda_graph_hook import (
     generate_prefill_cuda_graph_batch_sizes,
 )
+from torch.autograd import DeviceType
+from torch.nn.utils.parametrize import is_parametrized, remove_parametrizations
+from torch.profiler import ProfilerActivity, profile
 
 from sglang_omni.models.fun_cosyvoice3 import stages
 from sglang_omni.models.fun_cosyvoice3.hift_cuda_graph import HiftDecodeCudaGraphRunner
@@ -86,6 +90,12 @@ def main() -> None:
         {name.removeprefix("generator."): value for name, value in weights.items()},
         strict=True,
     )
+    folded = 0
+    for module in raw.modules():
+        while is_parametrized(module):
+            name = next(iter(module.parametrizations))
+            remove_parametrizations(module, name, leave_parametrized=True)
+            folded += 1
     patched = copy.deepcopy(raw)
     vocoder = stages.CosyVoice3Vocoder(HiftFlowStub(), patched)
     backend = current_platform.get_device_graph_backend(device)
@@ -107,6 +117,7 @@ def main() -> None:
     report = {
         "checkpoint": checkpoint,
         "device": torch.cuda.get_device_name(),
+        "folded_parametrizations": folded,
         "tiers": tiers,
         "defaults": {
             "cudnn_tf32": torch.backends.cudnn.allow_tf32,
@@ -210,6 +221,40 @@ def main() -> None:
                 "arms": timing(fresh, performance_runner, mel, source),
             }
         )
+    report["profile"] = []
+    stock = copy.deepcopy(raw)
+    mel = torch.randn(1, 80, 64, device=device) * 2 - 4
+    source = torch.randn(1, 1, 64 * 480, device=device) * 0.1
+    for arm in ("stock_eager", "patched_eager", "graph_with_copies"):
+        with profile(
+            activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]
+        ) as capture:
+            for iteration in range(3):
+                if arm == "graph_with_copies":
+                    performance_runner.run(mel, source)
+                else:
+                    stock.decode(x=mel, s=source, finalize=True)
+            torch.cuda.synchronize()
+        calls = Counter(
+            event.name
+            for event in capture.events()
+            if event.device_type == DeviceType.CPU
+            and any(word in event.name for word in ("Launch", "Memcpy", "Synchronize"))
+        )
+        report["profile"].append(
+            dict(
+                arm=arm,
+                calls=dict(calls),
+                cuda_activities=sum(
+                    event.device_type == DeviceType.CUDA for event in capture.events()
+                ),
+            )
+        )
+        if arm == "stock_eager":
+            stages.patch_hift_snake(stock)
+            stages.patch_hift_spectra(stock, device)
+        else:
+            pass
     destination = Path("/data/review2910/probe.json")
     destination.write_text(json.dumps(report, indent=2))
     print(json.dumps(report, indent=2), flush=True)
