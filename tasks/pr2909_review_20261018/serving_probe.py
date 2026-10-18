@@ -25,7 +25,7 @@ async def request_audio(
             }
         ],
         "modalities": ["text", "audio"],
-        "audio": {"format": "pcm16" if stream else "wav"},
+        "audio": {"format": "wav"},
         "max_tokens": 80,
         "talker_max_new_tokens": frame_cap,
         "stream": stream,
@@ -57,8 +57,15 @@ async def request_audio(
                     else:
                         pass
             assert finished and chunks
-            assert all(len(chunk) > 0 and len(chunk) % 2 == 0 for chunk in chunks)
-            samples = sum(len(chunk) // 2 for chunk in chunks)
+            samples = 0
+            for chunk in chunks:
+                waveform, sample_rate = sf.read(io.BytesIO(chunk), dtype="float32")
+                assert (
+                    sample_rate == 24000
+                    and waveform.size > 0
+                    and np.isfinite(waveform).all()
+                )
+                samples += int(waveform.size)
             chunk_count = len(chunks)
         else:
             body = await response.json()
