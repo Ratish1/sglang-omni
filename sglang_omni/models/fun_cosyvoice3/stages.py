@@ -2547,9 +2547,30 @@ def create_vocoder_executor(
         and autocast_dtype in FA3_DTYPES
         and len(whole_history_tier_frames) > 0
     )
+    token_mel_ratio = flow.token_mel_ratio
+    if disable_hop_growth:
+        longest_hop_tokens = token_hop_len
+    else:
+        longest_hop_tokens = token_max_hop_len
+    # note (ratish): the shortest window is a first hop's; the longest a final's, the
+    # tokens after the last hop (less than a hop, and the lookahead) with the frames
+    # that hop held and the decode's context before them.
+    shortest_window_frames = token_hop_len * token_mel_ratio
+    longest_window_frames = (
+        (longest_hop_tokens + PRE_LOOKAHEAD_LEN - 1) * token_mel_ratio
+        + vocoder.hift_hold_frames
+        + HIFT_DECODE_CONTEXT_FRAMES
+    )
+    first_tier = bisect.bisect_left(whole_history_tier_frames, shortest_window_frames)
+    last_tier = bisect.bisect_left(whole_history_tier_frames, longest_window_frames)
+    hift_tier_frames = whole_history_tier_frames[first_tier : last_tier + 1]
     # note (ratish): torch.istft reads its window envelope on the host, so HiFT's decode
     # captures only with the vocoder's kernels.
-    has_hift_graphs = enable_hift_cuda_graph and vocoder.has_hift_kernels
+    has_hift_graphs = (
+        enable_hift_cuda_graph
+        and vocoder.has_hift_kernels
+        and len(hift_tier_frames) > 0
+    )
     if has_prefix_graphs or has_whole_history_graphs or has_hift_graphs:
         graph_backend = current_platform.get_device_graph_backend(device_obj)
         assert graph_backend is not None
@@ -2558,11 +2579,6 @@ def create_vocoder_executor(
         )
     else:
         pass
-    token_mel_ratio = flow.token_mel_ratio
-    if disable_hop_growth:
-        longest_hop_tokens = token_hop_len
-    else:
-        longest_hop_tokens = token_max_hop_len
     if has_prefix_graphs:
         assert flow.packed_estimator is not None
         prefix_cuda_graph_runner = PrefixCudaGraphRunner(
@@ -2602,27 +2618,13 @@ def create_vocoder_executor(
     else:
         pass
     if has_hift_graphs:
-        # note (ratish): the shortest window is a first hop's; the longest a final's, the
-        # tokens after the last hop (less than a hop, and the lookahead) with the frames
-        # that hop held and the decode's context before them.
-        shortest_window_frames = token_hop_len * token_mel_ratio
-        longest_window_frames = (
-            (longest_hop_tokens + PRE_LOOKAHEAD_LEN - 1) * token_mel_ratio
-            + vocoder.hift_hold_frames
-            + HIFT_DECODE_CONTEXT_FRAMES
-        )
-        window_ladder = generate_prefill_cuda_graph_batch_sizes(
-            flow_batch_admission_frames
-        )
-        first_tier = bisect.bisect_left(window_ladder, shortest_window_frames)
-        last_tier = bisect.bisect_left(window_ladder, longest_window_frames)
         hift_decode_cuda_graph_runner = HiftDecodeCudaGraphRunner(
             hift,
             graphs=solve_graphs,
             mel_channels=flow.output_size,
             samples_per_frame=vocoder.hift_samples_per_mel_frame,
             row_tiers=row_tiers(max_batch_size),
-            frame_tiers=window_ladder[first_tier : last_tier + 1],
+            frame_tiers=hift_tier_frames,
         )
         hift_decode_cuda_graph_runner.capture()
         vocoder.hift_decode_cuda_graph_runner = hift_decode_cuda_graph_runner
