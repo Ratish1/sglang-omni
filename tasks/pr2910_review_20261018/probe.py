@@ -104,16 +104,10 @@ def main() -> None:
         row_tiers=row_tiers(16),
         frame_tiers=tiers,
     )
-    before = torch.cuda.memory_allocated()
-    started = time.perf_counter()
-    runner.capture()
     report = {
         "checkpoint": checkpoint,
         "device": torch.cuda.get_device_name(),
         "tiers": tiers,
-        "graphs": len(runner.captured),
-        "capture_seconds": time.perf_counter() - started,
-        "capture_allocated_bytes": torch.cuda.memory_allocated() - before,
         "defaults": {
             "cudnn_tf32": torch.backends.cudnn.allow_tf32,
             "matmul_tf32": torch.backends.cuda.matmul.allow_tf32,
@@ -135,6 +129,18 @@ def main() -> None:
         )
     torch.backends.cudnn.allow_tf32 = False
     torch.backends.cuda.matmul.allow_tf32 = False
+    before = torch.cuda.memory_allocated()
+    free_before = torch.cuda.mem_get_info()[0]
+    started = time.perf_counter()
+    runner.capture()
+    report.update(
+        graphs=len(runner.captured),
+        capture_seconds=time.perf_counter() - started,
+        capture_allocated_bytes=torch.cuda.memory_allocated() - before,
+        capture_device_bytes=free_before - torch.cuda.mem_get_info()[0],
+        equivalence_tf32=False,
+    )
+    Path("/data/review2910/probe.json").write_text(json.dumps(report, indent=2))
     report["reuse_checks"] = []
     for rows, frames in (
         (16, 256),
@@ -183,13 +189,26 @@ def main() -> None:
         )
     torch.backends.cudnn.allow_tf32 = report["defaults"]["cudnn_tf32"]
     torch.backends.cuda.matmul.allow_tf32 = report["defaults"]["matmul_tf32"]
+    performance_runner = HiftDecodeCudaGraphRunner(
+        patched,
+        graphs=graphs,
+        mel_channels=80,
+        samples_per_frame=480,
+        row_tiers=[1, 16],
+        frame_tiers=[64],
+    )
+    performance_runner.capture()
     report["decode_timing"] = []
     for rows in (1, 16):
         fresh = copy.deepcopy(raw)
         mel = torch.randn(rows, 80, 64, device=device) * 2 - 4
         source = torch.randn(rows, 1, 64 * 480, device=device) * 0.1
         report["decode_timing"].append(
-            {"rows": rows, "frames": 64, "arms": timing(fresh, runner, mel, source)}
+            {
+                "rows": rows,
+                "frames": 64,
+                "arms": timing(fresh, performance_runner, mel, source),
+            }
         )
     destination = Path("/data/review2910/probe.json")
     destination.write_text(json.dumps(report, indent=2))
