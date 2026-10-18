@@ -44,7 +44,9 @@ def test_middle_chunk_runs_through_real_finalize() -> None:
     runner.codes_event_module = torch.cuda
     result.can_run_cuda_graph = False
     runner.collect_codes(result, forward_batch, None, requests)
-    runner.finalize(result, forward_batch, None, SchedulerOutput(requests=requests))
+    runner.finalize(
+        result, forward_batch, None, SchedulerOutput(requests=requests, batch_data=None)
+    )
     torch.cuda.synchronize()
     assert requests[0].data.generation_steps == 0
     assert requests[0].data.output_codes == []
