@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 import torch
@@ -272,38 +274,25 @@ def test_buffered_flow_route_is_explicit_and_preserves_split_order(
         make_input([1], prompt_token=[2], prompt_value=0.5),
         make_input([3, 4], prompt_token=[5, 6], prompt_value=1.5),
     ]
-    native_calls: list[tuple[object, object]] = []
-    packed_calls: list[tuple[object, object, bool, bool]] = []
-    original_native = stages.generate_flow
-    original_packed = stages.generate_flow_packed
-
-    def record_native(flow_arg, packed_batch):
-        native_calls.append((flow_arg, packed_batch))
-        return original_native(flow_arg, packed_batch)
-
-    def record_packed(flow_arg, packed_batch, *, streaming, finalize):
-        packed_calls.append((flow_arg, packed_batch, streaming, finalize))
-        return original_packed(
-            flow_arg,
-            packed_batch,
-            streaming=streaming,
-            finalize=finalize,
-        )
-
-    monkeypatch.setattr(stages, "generate_flow", record_native)
-    monkeypatch.setattr(stages, "generate_flow_packed", record_packed)
+    native_generate = Mock(wraps=stages.generate_flow)
+    packed_generate = Mock(wraps=stages.generate_flow_packed)
+    monkeypatch.setattr(stages, "generate_flow", native_generate)
+    monkeypatch.setattr(stages, "generate_flow_packed", packed_generate)
 
     generated = packed_flow.inference(items)
 
     expected_shapes = [(1, 4, 2), (1, 4, 4)]
     assert [tuple(mel.shape) for mel in generated] == expected_shapes
     if enable_buffered_packed_flow:
-        assert len(packed_calls) == 1
-        assert packed_calls[0][2:] == (False, True)
-        assert native_calls == []
+        packed_generate.assert_called_once()
+        assert packed_generate.call_args.kwargs == {
+            "streaming": False,
+            "finalize": True,
+        }
+        native_generate.assert_not_called()
     else:
-        assert packed_calls == []
-        assert len(native_calls) == 1
+        packed_generate.assert_not_called()
+        native_generate.assert_called_once()
 
 
 @pytest.mark.parametrize("has_graph_runner", [False, True])
@@ -316,34 +305,19 @@ def test_buffered_packed_flow_inference_uses_packed_eager_without_native_retry(
     packed_flow.enable_buffered_packed_flow = True
     assert flow.packed_estimator.is_compiled is False
 
-    class GraphMiss:
-        def __init__(self) -> None:
-            self.calls = 0
-
-        def run(self, **kwargs):
-            del kwargs
-            self.calls += 1
-            return None
-
-    graph_runner: GraphMiss | None = None
+    graph_runner: Mock | None = None
     if has_graph_runner:
-        graph_runner = GraphMiss()
+        graph_runner = Mock()
+        graph_runner.run.return_value = None
         packed_flow.whole_history_cuda_graph_runner = graph_runner
     else:
         pass
-    packed_calls: list[object] = []
-    original_packed_solve = stages.solve_flow_euler_packed
-
-    def record_packed_solve(*args, **kwargs):
-        packed_calls.append((args, kwargs))
-        return original_packed_solve(*args, **kwargs)
-
-    monkeypatch.setattr(stages, "solve_flow_euler_packed", record_packed_solve)
-    monkeypatch.setattr(
-        stages,
-        "solve_flow_euler",
-        lambda *args, **kwargs: pytest.fail("Packed graph miss retried native Flow"),
+    packed_solve = Mock(wraps=stages.solve_flow_euler_packed)
+    native_solve = Mock(
+        side_effect=AssertionError("Packed graph miss retried native Flow")
     )
+    monkeypatch.setattr(stages, "solve_flow_euler_packed", packed_solve)
+    monkeypatch.setattr(stages, "solve_flow_euler", native_solve)
 
     inputs = [
         make_input([1], prompt_token=[2]),
@@ -351,17 +325,17 @@ def test_buffered_packed_flow_inference_uses_packed_eager_without_native_retry(
     ]
     generated = packed_flow.inference(inputs)
 
-    assert len(packed_calls) == 1
+    packed_solve.assert_called_once()
+    native_solve.assert_not_called()
     assert [tuple(mel.shape) for mel in generated] == [(1, 4, 2), (1, 4, 4)]
     if graph_runner is not None:
-        assert graph_runner.calls == 1
+        graph_runner.run.assert_called_once()
+        assert graph_runner.run.call_args.kwargs["lengths"] == (4, 8)
     else:
         pass
 
-    def fail_packed_solve(*args, **kwargs):
-        raise RuntimeError("packed Flow failed")
-
-    monkeypatch.setattr(stages, "solve_flow_euler_packed", fail_packed_solve)
+    packed_failure = Mock(side_effect=RuntimeError("packed Flow failed"))
+    monkeypatch.setattr(stages, "solve_flow_euler_packed", packed_failure)
     with pytest.raises(RuntimeError, match="packed Flow failed"):
         packed_flow.inference(inputs)
 
@@ -375,30 +349,36 @@ def test_buffered_packed_flow_inference_replays_whole_history_graph(
 
     class GraphHit:
         def __init__(self) -> None:
-            self.lengths: list[tuple[int, ...]] = []
-            self.noises: list[torch.Tensor] = []
+            self.row_lengths: list[tuple[int, ...]] = []
+            self.outputs: list[torch.Tensor] = []
 
-        def run(self, **kwargs: object) -> torch.Tensor:
-            lengths = kwargs["lengths"]
-            noise = kwargs["noise"]
-            assert isinstance(lengths, tuple)
-            assert isinstance(noise, torch.Tensor)
-            self.lengths.append(lengths)
-            self.noises.append(noise.detach().clone())
-            return noise.clone()
+        def run(
+            self,
+            *,
+            noise: torch.Tensor,
+            time_span: torch.Tensor,
+            mu: torch.Tensor,
+            speaker_embeddings: torch.Tensor,
+            mel_conditioning: torch.Tensor,
+            lengths: Sequence[int],
+        ) -> torch.Tensor:
+            assert time_span.ndim == 1
+            assert mu.shape == noise.shape
+            assert mel_conditioning.shape == noise.shape
+            assert speaker_embeddings.shape[0] == len(lengths)
+            self.row_lengths.append(tuple(lengths))
+            generated = torch.arange(
+                noise.numel(), dtype=noise.dtype, device=noise.device
+            ).reshape_as(noise)
+            self.outputs.append(generated)
+            return generated
 
     graph_runner = GraphHit()
     packed_flow.whole_history_cuda_graph_runner = graph_runner
-    monkeypatch.setattr(
-        stages,
-        "solve_flow_euler_packed",
-        lambda *args, **kwargs: pytest.fail("Packed Graph hit ran eager Flow"),
-    )
-    monkeypatch.setattr(
-        stages,
-        "solve_flow_euler",
-        lambda *args, **kwargs: pytest.fail("Packed Graph hit ran native Flow"),
-    )
+    packed_solve = Mock(side_effect=AssertionError("Packed Graph hit ran eager Flow"))
+    native_solve = Mock(side_effect=AssertionError("Packed Graph hit ran native Flow"))
+    monkeypatch.setattr(stages, "solve_flow_euler_packed", packed_solve)
+    monkeypatch.setattr(stages, "solve_flow_euler", native_solve)
 
     inputs = [
         make_input([1], prompt_token=[2]),
@@ -406,22 +386,35 @@ def test_buffered_packed_flow_inference_replays_whole_history_graph(
     ]
     generated = packed_flow.inference(inputs)
 
-    assert graph_runner.lengths == [(4, 8)]
-    assert len(graph_runner.noises) == 1
-    packed_noise = graph_runner.noises[0]
+    assert graph_runner.row_lengths == [(4, 8)]
+    assert len(graph_runner.outputs) == 1
+    packed_output = graph_runner.outputs[0]
+    expected_row_lengths = (4, 8)
+    expected_prompt_frame_counts = (2, 4)
+    expected_packed_frame_count = sum(expected_row_lengths)
+    expected_packed_output = torch.arange(
+        expected_packed_frame_count * flow.output_size,
+        dtype=packed_output.dtype,
+        device=packed_output.device,
+    ).reshape_as(packed_output)
+    torch.testing.assert_close(packed_output, expected_packed_output)
     expected: list[torch.Tensor] = []
-    offset = 0
-    for total_frames, prompt_frames in zip((4, 8), (2, 4), strict=True):
+    start_frame = 0
+    for total_frames, prompt_frames in zip(
+        expected_row_lengths, expected_prompt_frame_counts, strict=True
+    ):
         expected.append(
-            packed_noise[
-                :, offset + prompt_frames : offset + total_frames, :
+            expected_packed_output[
+                :, start_frame + prompt_frames : start_frame + total_frames, :
             ].transpose(1, 2)
         )
-        offset += total_frames
+        start_frame += total_frames
 
     assert [tuple(mel.shape) for mel in generated] == [(1, 4, 2), (1, 4, 4)]
     for actual, expected_mel in zip(generated, expected, strict=True):
         torch.testing.assert_close(actual, expected_mel)
+    packed_solve.assert_not_called()
+    native_solve.assert_not_called()
     assert flow.packed_estimator.calls == []
 
 

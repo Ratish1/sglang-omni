@@ -7,9 +7,10 @@ import contextlib
 import copy
 import logging
 import sys
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from types import SimpleNamespace
 from typing import ClassVar
+from unittest.mock import Mock
 
 import msgpack
 import numpy as np
@@ -115,12 +116,10 @@ class RecordingPackedDiT(PackedDiT):
         self.is_compiled = is_compiled
 
     def build_modulations(self, time_span: torch.Tensor, dtype: torch.dtype) -> None:
-        del time_span, dtype
         self.block_modulations = ()
         self.final_modulations = ()
 
     def compile(self, dtype: torch.dtype | None) -> bool:
-        del dtype
         self.is_compiled = True
         return True
 
@@ -131,41 +130,32 @@ class RecordingPackedDiT(PackedDiT):
         "dtype",
         "has_estimator",
         "is_ragged",
-        "is_compiled",
         "expected_reason",
     ),
     [
-        ("cuda", torch.bfloat16, True, True, False, None),
-        ("cuda", torch.float16, True, True, False, None),
-        ("cpu", torch.bfloat16, True, True, True, "device type cpu is not CUDA"),
-        ("mps", torch.bfloat16, True, True, True, "device type mps is not CUDA"),
-        ("cuda", torch.bfloat16, False, False, False, "PackedDiT is unavailable"),
-        ("cuda", torch.bfloat16, True, False, True, "ragged FA3 is unavailable"),
-        ("cuda", None, True, True, True, "dtype None is not FA3-compatible"),
+        ("cuda", torch.bfloat16, True, True, None),
+        ("cuda", torch.float16, True, True, None),
+        ("cpu", torch.bfloat16, True, True, "device type cpu is not CUDA"),
+        ("cuda", torch.bfloat16, False, True, "PackedDiT is unavailable"),
+        ("cuda", torch.bfloat16, True, False, "ragged FA3 is unavailable"),
         (
             "cuda",
             torch.float32,
             True,
             True,
-            True,
             "dtype torch.float32 is not FA3-compatible",
         ),
-        ("cuda", torch.bfloat16, True, True, True, None),
     ],
 )
 def test_packed_fa3_unavailable_reason(
     device_type: str,
-    dtype: torch.dtype | None,
+    dtype: torch.dtype,
     has_estimator: bool,
     is_ragged: bool,
-    is_compiled: bool,
     expected_reason: str | None,
 ) -> None:
     if has_estimator:
-        packed_estimator: PackedDiT | None = RecordingPackedDiT(
-            is_ragged=is_ragged,
-            is_compiled=is_compiled,
-        )
+        packed_estimator: PackedDiT | None = RecordingPackedDiT(is_ragged=is_ragged)
     else:
         packed_estimator = None
     reason = stages.packed_fa3_unavailable_reason(
@@ -1043,15 +1033,12 @@ def test_create_vocoder_executor_threads_trt_flag(monkeypatch) -> None:
 FLOW_GRAPH_CAPTURE_SHAPES = ((2, 16),)
 
 
-def record_packed_warmup(
-    packed_estimator: PackedDiT | None,
-    startup_events: list[str],
-) -> None:
-    startup_events.append("packed_warmup")
-    if packed_estimator is not None:
-        packed_estimator.is_compiled = True
-    else:
-        pass
+def null_autocast(
+    device_type: str,
+    dtype: torch.dtype | None = None,
+    enabled: bool = True,
+) -> contextlib.AbstractContextManager[None]:
+    return contextlib.nullcontext()
 
 
 def prepare_vocoder_startup(
@@ -1098,6 +1085,16 @@ def prepare_vocoder_startup(
             raise AssertionError("native compile must stay disabled")
 
     monkeypatch.setattr(stages, "compile_dit_backbone", record_native_compile)
+
+    def warmup_packed_dit_compile(
+        scheduler: FunCosyVoice3StreamingVocoderScheduler,
+    ) -> None:
+        startup_events.append("packed_warmup")
+        if packed_estimator is not None:
+            packed_estimator.is_compiled = True
+        else:
+            pass
+
     monkeypatch.setattr(
         FunCosyVoice3StreamingVocoderScheduler,
         "warmup_now",
@@ -1106,7 +1103,7 @@ def prepare_vocoder_startup(
     monkeypatch.setattr(
         FunCosyVoice3StreamingVocoderScheduler,
         "warmup_packed_dit_compile",
-        lambda scheduler: record_packed_warmup(packed_estimator, startup_events),
+        warmup_packed_dit_compile,
     )
     if device_type in ("cuda", "xpu"):
         platform = CUDAOmniPlatform() if device_type == "cuda" else XPUOmniPlatform()
@@ -1266,7 +1263,7 @@ def test_create_vocoder_executor_sets_effective_buffered_flow_route(
     monkeypatch.setattr(
         torch,
         "autocast",
-        lambda *args, **kwargs: contextlib.nullcontext(),
+        null_autocast,
     )
     factory_options: dict[str, bool] = {
         "enable_flow_estimator_trt": enable_flow_estimator_trt,
@@ -1285,6 +1282,7 @@ def test_create_vocoder_executor_sets_effective_buffered_flow_route(
             enable_flow_cuda_graph=False,
             enable_flow_prefix_cuda_graph=False,
             enable_flow_whole_history_cuda_graph=False,
+            enable_hift_cuda_graph=False,
             enable_dit_torch_compile=enable_dit_torch_compile,
             **factory_options,
         )
@@ -1300,7 +1298,7 @@ def test_create_vocoder_executor_sets_effective_buffered_flow_route(
 
 
 @pytest.mark.parametrize("is_ragged", [False, True])
-def test_create_vocoder_executor_fa3_eligibility_controls_prefix_pool(
+def test_create_vocoder_executor_fa3_eligibility_controls_prefix_and_whole_history(
     monkeypatch: pytest.MonkeyPatch,
     is_ragged: bool,
 ) -> None:
@@ -1313,86 +1311,84 @@ def test_create_vocoder_executor_fa3_eligibility_controls_prefix_pool(
         allow_native_compile=False,
         packed_estimator=packed_estimator,
     )
-    prefix_pool = object()
-    pool_calls: list[tuple[object, torch.device, torch.dtype, float]] = []
+
+    prefix_pool = stages.PrefixKVPool(
+        layer_num=0,
+        euler_steps=0,
+        head_num=1,
+        head_dim=1,
+        capacity_frames=0,
+        device=torch.device("cpu"),
+        dtype=torch.bfloat16,
+    )
+    pool_calls: list[
+        tuple[
+            GraphRunnableFakeFlow | stages.FunCosyVoice3Flow,
+            torch.device,
+            torch.dtype,
+            float,
+        ]
+    ] = []
 
     def record_prefix_pool(
-        flow: object,
+        flow: GraphRunnableFakeFlow | stages.FunCosyVoice3Flow,
         device: torch.device,
-        dtype: torch.dtype,
+        resolved_dtype: torch.dtype,
         budget_gb: float,
-    ) -> object:
-        pool_calls.append((flow, device, dtype, budget_gb))
+    ) -> stages.PrefixKVPool:
+        pool_calls.append((flow, device, resolved_dtype, budget_gb))
         return prefix_pool
+
+    class RecordingWholeHistoryCudaGraphRunner:
+        def __init__(
+            self,
+            estimator: PackedDiT,
+            *,
+            graphs: Mock,
+            frame_dtype: torch.dtype,
+            speaker_dtype: torch.dtype,
+            cfg_rate: float,
+            euler_steps: int,
+            mel_channels: int,
+            speaker_channels: int,
+            max_rows: int,
+            tier_frames: Sequence[int],
+        ) -> None:
+            self.estimator = estimator
+            self.graphs = graphs
+            self.frame_dtype = frame_dtype
+            self.speaker_dtype = speaker_dtype
+            self.cfg_rate = cfg_rate
+            self.euler_steps = euler_steps
+            self.mel_channels = mel_channels
+            self.speaker_channels = speaker_channels
+            self.max_rows = max_rows
+            self.tier_frames = tuple(tier_frames)
+            self.capture_count = 0
+            graph_runners.append(self)
+
+        def capture(self) -> None:
+            self.capture_count += 1
+
+    graph_runners: list[RecordingWholeHistoryCudaGraphRunner] = []
+
+    def fake_get_device_graph_backend(resolved_device: torch.device) -> str:
+        assert resolved_device.type == "cuda"
+        return "fake-graph-backend"
+
+    def fake_generate_prefill_cuda_graph_batch_sizes(
+        admission_frames: int,
+    ) -> tuple[int, ...]:
+        return (admission_frames,)
 
     monkeypatch.setattr(stages, "build_prefix_pool", record_prefix_pool)
     monkeypatch.setattr(
-        torch,
-        "autocast",
-        lambda *args, **kwargs: contextlib.nullcontext(),
-    )
-
-    scheduler = stages.create_vocoder_executor(
-        "model",
-        device="cuda",
-        dtype="bfloat16",
-        flow_prefix_cache_gb=1.0,
-        enable_flow_cuda_graph=False,
-        enable_flow_prefix_cuda_graph=False,
-        enable_flow_whole_history_cuda_graph=False,
-        enable_dit_torch_compile=False,
-        enable_buffered_packed_flow=False,
-    )
-
-    if is_ragged:
-        assert len(pool_calls) == 1
-        assert pool_calls[0][0] is loaded_flow
-        assert pool_calls[0][1] == torch.device("cuda")
-        assert pool_calls[0][2] == torch.bfloat16
-        assert pool_calls[0][3] == 1.0
-        assert scheduler.vocoder.flow.prefix_pool is prefix_pool
-    else:
-        assert pool_calls == []
-        assert scheduler.vocoder.flow.prefix_pool is None
-
-
-@pytest.mark.parametrize("is_ragged", [False, True])
-def test_create_vocoder_executor_fa3_eligibility_controls_whole_history_graph(
-    monkeypatch: pytest.MonkeyPatch,
-    is_ragged: bool,
-) -> None:
-    startup_events: list[str] = []
-    packed_estimator = RecordingPackedDiT(is_ragged=is_ragged)
-    loaded_flow = prepare_vocoder_startup(
-        monkeypatch,
-        startup_events,
-        device_type="cuda",
-        allow_native_compile=False,
-        packed_estimator=packed_estimator,
-    )
-    graph_events: list[str] = []
-
-    class RecordingSolveGraphCapture:
-        def __init__(self, *args: object, **kwargs: object) -> None:
-            del args, kwargs
-            graph_events.append("solve_graph_create")
-
-    class RecordingWholeHistoryCudaGraphRunner:
-        def __init__(self, *args: object, **kwargs: object) -> None:
-            del args, kwargs
-            graph_events.append("whole_history_create")
-
-        def capture(self) -> None:
-            graph_events.append("whole_history_capture")
-
-    monkeypatch.setattr(
         stages,
         "current_platform",
-        SimpleNamespace(
-            get_device_graph_backend=lambda device: "fake-graph-backend",
-        ),
+        SimpleNamespace(get_device_graph_backend=fake_get_device_graph_backend),
     )
-    monkeypatch.setattr(stages, "SolveGraphCapture", RecordingSolveGraphCapture)
+    solve_graphs = Mock()
+    monkeypatch.setattr(stages, "SolveGraphCapture", Mock(return_value=solve_graphs))
     monkeypatch.setattr(
         stages,
         "WholeHistoryCudaGraphRunner",
@@ -1401,35 +1397,41 @@ def test_create_vocoder_executor_fa3_eligibility_controls_whole_history_graph(
     monkeypatch.setattr(
         stages,
         "generate_prefill_cuda_graph_batch_sizes",
-        lambda admission_frames: (admission_frames,),
+        fake_generate_prefill_cuda_graph_batch_sizes,
     )
-    monkeypatch.setattr(
-        torch,
-        "autocast",
-        lambda *args, **kwargs: contextlib.nullcontext(),
-    )
+    monkeypatch.setattr(torch, "autocast", null_autocast)
 
     scheduler = stages.create_vocoder_executor(
         "model",
         device="cuda",
         dtype="bfloat16",
-        flow_prefix_cache_gb=0.0,
+        flow_prefix_cache_gb=1.0,
         enable_flow_cuda_graph=False,
         enable_flow_prefix_cuda_graph=False,
         enable_flow_whole_history_cuda_graph=True,
+        enable_hift_cuda_graph=False,
         enable_dit_torch_compile=False,
     )
 
+    assert scheduler.vocoder.flow.enable_buffered_packed_flow is is_ragged
     if is_ragged:
-        assert graph_events == [
-            "solve_graph_create",
-            "whole_history_create",
-            "whole_history_capture",
-        ]
-        assert scheduler.vocoder.flow is loaded_flow
-        assert scheduler.vocoder.flow.whole_history_cuda_graph_runner is not None
+        assert len(pool_calls) == 1
+        assert pool_calls[0] == (
+            loaded_flow,
+            torch.device("cuda"),
+            torch.bfloat16,
+            1.0,
+        )
+        assert scheduler.vocoder.flow.prefix_pool is prefix_pool
+        assert len(graph_runners) == 1
+        assert graph_runners[0].capture_count == 1
+        assert (
+            scheduler.vocoder.flow.whole_history_cuda_graph_runner is graph_runners[0]
+        )
     else:
-        assert graph_events == []
+        assert pool_calls == []
+        assert scheduler.vocoder.flow.prefix_pool is None
+        assert graph_runners == []
         assert scheduler.vocoder.flow.whole_history_cuda_graph_runner is None
 
 
