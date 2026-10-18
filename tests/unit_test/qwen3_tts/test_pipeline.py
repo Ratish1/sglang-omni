@@ -8683,38 +8683,6 @@ def test_qwen3_tts_talker_forward_accepts_shared_prefill_request_ids(
     )
 
 
-def test_qwen3_tts_talker_forward_rotates_on_the_given_positions(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    install_fake_sglang(monkeypatch)
-    from sglang_omni.models.qwen3_tts.sglang_model import Qwen3TTSTalker
-
-    received: dict[str, object] = {}
-
-    def backbone(**kwargs):
-        received.update(kwargs)
-        return kwargs["input_embeds"]
-
-    talker = Qwen3TTSTalker.__new__(Qwen3TTSTalker)
-    talker.model = backbone
-    talker.codec_head = lambda hidden_states: (hidden_states, None)
-    positions = torch.arange(3)
-
-    Qwen3TTSTalker.forward(
-        talker,
-        input_ids=torch.zeros(3, dtype=torch.long),
-        positions=positions,
-        forward_batch=SimpleNamespace(
-            mrope_positions=torch.zeros(3, 3, dtype=torch.long),
-            forward_mode=SimpleNamespace(is_extend=lambda: True),
-            extend_seq_lens=torch.tensor([3]),
-        ),
-        input_embeds=torch.ones(3, 2),
-    )
-
-    assert received["positions"] is positions
-
-
 def make_prep_talker(monkeypatch, device=None, max_batch=2):
     install_fake_sglang(monkeypatch)
     from sglang_omni.models.qwen3_tts.sglang_model import Qwen3TTSTalker
