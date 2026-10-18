@@ -21,6 +21,7 @@ from sglang_omni.models.qwen3_omni.components.code2wav import (
     Qwen3OmniIncrementalCodec,
 )
 from sglang_omni.models.qwen3_omni.components.code2wav_cuda_graph import (
+    Code2WavCudaGraphRunner,
     Code2WavRunResult,
     GraphKey,
 )
@@ -84,9 +85,11 @@ class FakeCudaGraphRunner:
         self.replay_error = replay_error
         self.calls: list[tuple[tuple[int, ...], bool]] = []
 
-    def available_batch_sizes(self, frames: int) -> tuple[int, ...]:
+    def available_batch_sizes(self, frames: int, decode: str) -> tuple[int, ...]:
         return tuple(
-            key.batch_size for key in DEFAULT_GRAPH_KEYS if key.frames == int(frames)
+            key.batch_size
+            for key in DEFAULT_GRAPH_KEYS
+            if key.frames == int(frames) and key.decode == decode
         )
 
     def run(self, codes: torch.Tensor, *, eligible: bool) -> Code2WavRunResult:
@@ -439,6 +442,8 @@ def test_qwen_code2wav_enabled_factory_normalizes_device_and_derives_graph_keys(
         ),
         "model_footprint_bytes": 3 * 4 + 2 * 8,
         "decode_stream": scheduler.decode_stream,
+        "incremental_codec": None,
+        "codec_pool": None,
     }
     assert scheduler.decode_stream.device == torch.device("cuda:3")
     assert scheduler.decode_stream.priority == -2
@@ -491,7 +496,11 @@ def test_qwen_code2wav_stream_done_tail_replays_the_graph_of_its_shape(
     assert tail_metadata["trigger"] == "stream_done"
     assert tail_metadata["window_frames"] == 10
     assert tail_metadata["execution_mode"] == "cuda_graph"
-    assert tail_metadata["graph_key"] == {"batch_size": 1, "frames": 10}
+    assert tail_metadata["graph_key"] == {
+        "batch_size": 1,
+        "frames": 10,
+        "decode": "window",
+    }
     assert tail_metadata["fallback_reason"] is None
 
 
@@ -609,6 +618,7 @@ def test_qwen_code2wav_eligible_key_miss_has_json_safe_fallback_metadata(
     assert decode_end["metadata"]["graph_key"] == {
         "batch_size": 1,
         "frames": 6,
+        "decode": "window",
     }
     assert decode_end["metadata"]["fallback_reason"] == "key_miss"
 
@@ -677,7 +687,7 @@ def test_qwen_code2wav_consumes_borrowed_output_under_state_lock() -> None:
             self.lock_was_held: list[bool] = []
             self.replays = 0
 
-        def available_batch_sizes(self, frames: int) -> tuple[int, ...]:
+        def available_batch_sizes(self, frames: int, decode: str) -> tuple[int, ...]:
             return (1,)
 
         def run(self, codes: torch.Tensor, *, eligible: bool) -> Code2WavRunResult:
@@ -1267,3 +1277,162 @@ def test_slot_decode_rows_at_different_positions_keep_their_own_streams() -> Non
             rtol=2e-2,
             atol=2e-3,
         )
+
+
+def make_incremental_scheduler(
+    model: Qwen3OmniCode2Wav, codec_state_slots: int, *, cuda_graph: bool = False
+) -> Code2WavScheduler:
+    incremental_codec = Qwen3OmniIncrementalCodec(model)
+    device = torch.device("cuda", torch.cuda.current_device())
+    pool = CodecStatePool(
+        incremental_codec.spec,
+        num_slots=codec_state_slots,
+        capture_slots=2,
+        ring_frames=incremental_codec.spec.retained_context + 3,
+        device=device,
+        dtype=torch.bfloat16,
+    )
+    runner = None
+    if cuda_graph:
+        runner = Code2WavCudaGraphRunner.build(
+            model,
+            device=device,
+            num_quantizers=2,
+            total_gpu_memory_fraction=1.0,
+            graph_keys=code2wav_scheduler.window_graph_keys(3, 2, 2)
+            + code2wav_scheduler.incremental_graph_keys(3, 2),
+            best_effort_keys=tuple(
+                GraphKey(batch_size=1, frames=frames, decode="next")
+                for frames in (1, 2)
+            ),
+            model_footprint_bytes=0,
+            decode_stream=None,
+            incremental_codec=incremental_codec,
+            codec_pool=pool,
+        )
+    else:
+        pass
+    return Code2WavScheduler(
+        model,
+        device=str(device),
+        stream_chunk_size=3,
+        left_context_size=2,
+        sample_rate=24000,
+        enable_cuda_graph=cuda_graph,
+        cuda_graph_runner=runner,
+        incremental_codec=incremental_codec,
+        codec_pool=pool,
+    )
+
+
+def run_streams(
+    scheduler: Code2WavScheduler, codes: torch.Tensor, *, first_request: int = 0
+) -> list[np.ndarray]:
+    request_ids = [
+        f"req-{first_request + index}" for index in range(int(codes.shape[0]))
+    ]
+    for request_id in request_ids:
+        scheduler.stream_payloads[request_id] = make_qwen_payload(request_id=request_id)
+    for frame in range(int(codes.shape[-1])):
+        for request_id, request_codes in zip(request_ids, codes):
+            deliver_code2wav_chunk(
+                scheduler,
+                request_id,
+                StreamItem(
+                    frame,
+                    request_codes[:, frame].clone(),
+                    "talker",
+                    metadata={"stream": False},
+                ),
+            )
+    waveforms = []
+    for request_id in request_ids:
+        scheduler.handle_stream_done(request_id)
+        result = scheduler.outbox.get_nowait()
+        waveforms.append(
+            np.frombuffer(result.data.data["audio_waveform"], dtype=np.float32)
+        )
+    return waveforms
+
+
+@pytest.mark.accelerator
+@SLOT_DECODES
+@pytest.mark.parametrize("cuda_graph", [False, True])
+def test_scheduler_decodes_streams_from_their_slots(cuda_graph: bool) -> None:
+    model = make_fused_tiny_code2wav()
+    scheduler = make_incremental_scheduler(
+        model, codec_state_slots=2, cuda_graph=cuda_graph
+    )
+    codes = torch.randint(0, 16, (2, 2, 11), device="cuda")
+
+    waveforms = run_streams(scheduler, codes)
+
+    with torch.inference_mode():
+        expected = decode_in_parts(
+            Qwen3OmniIncrementalCodec(model), codes, (3, 3, 3, 2)
+        )
+    for waveform, wanted in zip(waveforms, expected.reshape(2, -1).float().cpu()):
+        np.testing.assert_allclose(waveform, wanted.numpy(), rtol=2e-2, atol=2e-3)
+    assert scheduler.stateless_fallbacks == 0
+    assert scheduler.codec_pool.available_size() == scheduler.codec_pool.num_slots
+    if cuda_graph:
+        runtime = scheduler.cuda_graph_runner.stats()["runtime"]
+        assert runtime["fallback_counts"] == {}
+        assert runtime["graph_replays"] > 0
+    else:
+        pass
+
+
+@pytest.mark.accelerator
+@SLOT_DECODES
+def test_a_stream_without_a_free_slot_decodes_with_left_context() -> None:
+    model = make_fused_tiny_code2wav()
+    scheduler = make_incremental_scheduler(model, codec_state_slots=1)
+    codes = torch.randint(0, 16, (2, 2, 7), device="cuda")
+
+    waveforms = run_streams(scheduler, codes)
+
+    with torch.inference_mode():
+        expected = decode_in_parts(
+            Qwen3OmniIncrementalCodec(model), codes[:1], (3, 3, 1)
+        )
+    wanted = expected.reshape(-1).float().cpu().numpy()
+    np.testing.assert_allclose(waveforms[0], wanted, rtol=2e-2, atol=2e-3)
+    assert waveforms[1].shape == wanted.shape
+    assert scheduler.stateless_fallbacks == 1
+    assert scheduler.codec_pool.available_size() == scheduler.codec_pool.num_slots
+
+
+@pytest.mark.accelerator
+@SLOT_DECODES
+def test_a_stream_takes_its_slot_with_its_first_codes_and_abort_returns_it() -> None:
+    scheduler = make_incremental_scheduler(
+        make_fused_tiny_code2wav(), codec_state_slots=1
+    )
+    scheduler.stream_payloads["req-0"] = make_qwen_payload(request_id="req-0")
+    deliver_code2wav_chunk(
+        scheduler,
+        "req-0",
+        StreamItem(0, torch.randint(0, 16, (2,)), "talker", metadata={"stream": False}),
+    )
+    assert scheduler.codec_pool.available_size() == 0
+
+    scheduler.abort("req-0")
+
+    assert scheduler.codec_pool.available_size() == scheduler.codec_pool.num_slots
+
+
+@pytest.mark.accelerator
+@SLOT_DECODES
+def test_a_stream_ending_before_its_first_window_decodes_without_slot_state() -> None:
+    model = make_fused_tiny_code2wav()
+    scheduler = make_incremental_scheduler(model, codec_state_slots=1)
+    run_streams(scheduler, torch.randint(0, 16, (1, 2, 7), device="cuda"))
+    short_codes = torch.randint(0, 16, (1, 2, 2), device="cuda")
+
+    waveforms = run_streams(scheduler, short_codes, first_request=1)
+
+    with torch.inference_mode():
+        expected = model(short_codes).reshape(-1).float().cpu().numpy()
+    np.testing.assert_allclose(waveforms[0], expected, rtol=2e-2, atol=2e-3)
+    assert scheduler.codec_pool.available_size() == scheduler.codec_pool.num_slots
