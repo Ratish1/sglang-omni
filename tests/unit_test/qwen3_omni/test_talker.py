@@ -1318,29 +1318,14 @@ def test_real_builder_propagates_prefill_outputs_into_talker_request() -> None:
     assert pending is not None and len(pending) == 1
 
 
-def test_real_builder_derives_per_request_seed_when_missing() -> None:
-    """When request params carry no seed the builder must derive a stable per-request seed."""
-    _, captured1 = drive_real_builder(
+def test_real_builder_leaves_a_request_without_a_seed_unseeded() -> None:
+    _, captured = drive_real_builder(
         prefetched_chunks=[object()] * 5,
         prefetched_stream_done=False,
         request_id="rid-A",
     )
-    _, captured2 = drive_real_builder(
-        prefetched_chunks=[object()] * 5,
-        prefetched_stream_done=False,
-        request_id="rid-A",
-    )
-    _, captured3 = drive_real_builder(
-        prefetched_chunks=[object()] * 5,
-        prefetched_stream_done=False,
-        request_id="rid-B",
-    )
-    seed_a1 = captured1["talker_request_kwargs"]["seed"]
-    seed_a2 = captured2["talker_request_kwargs"]["seed"]
-    seed_b = captured3["talker_request_kwargs"]["seed"]
-    assert seed_a1 is not None and seed_a1 > 0
-    assert seed_a1 == seed_a2, "same request_id must derive the same seed"
-    assert seed_a1 != seed_b, "different request_id must derive different seeds"
+
+    assert captured["talker_request_kwargs"]["seed"] is None
 
 
 def test_real_builder_preserves_explicit_seed_from_request_params() -> None:
