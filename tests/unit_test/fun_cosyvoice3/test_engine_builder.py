@@ -7,6 +7,7 @@ from types import SimpleNamespace
 import pytest
 
 from sglang_omni.models.fun_cosyvoice3.engine_builder import FunCosyVoice3EngineBuilder
+from sglang_omni.platforms import current_platform
 from sglang_omni.scheduling.generation_batch_policy import (
     build_generation_batch_overrides,
 )
@@ -55,3 +56,16 @@ def test_operator_max_total_tokens_is_kept() -> None:
     _, overrides = cuda_overrides(max_total_tokens=5000)
 
     assert overrides["max_total_tokens"] == 5000
+
+
+@pytest.mark.parametrize("is_cuda", [False, True])
+def test_async_decode_reaches_the_scheduler_only_on_cuda(
+    monkeypatch: pytest.MonkeyPatch, is_cuda: bool
+) -> None:
+    monkeypatch.setattr(current_platform, "is_cuda", lambda: is_cuda)
+
+    extras = FunCosyVoice3EngineBuilder(
+        enable_async_decode=True
+    ).extra_scheduler_kwargs()
+
+    assert extras["enable_async_decode"] is is_cuda

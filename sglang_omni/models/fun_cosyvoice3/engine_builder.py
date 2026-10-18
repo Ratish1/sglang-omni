@@ -53,6 +53,8 @@ class FunCosyVoice3EngineBuilder(TtsEngineBuilder[CosyVoice3SGLangRequestData]):
         *,
         token_hop_len: int = TOKEN_HOP_LEN,
         onnx_intra_op_threads: int = 16,
+        enable_async_decode: bool = False,
+        async_decode_min_batch_size: int = 1,
     ) -> None:
         super().__init__()
         hop = int(token_hop_len)
@@ -61,6 +63,8 @@ class FunCosyVoice3EngineBuilder(TtsEngineBuilder[CosyVoice3SGLangRequestData]):
         else:
             pass
         self.token_hop_len = hop
+        self.enable_async_decode = enable_async_decode
+        self.async_decode_min_batch_size = async_decode_min_batch_size
         self.checkpoint_root: str | None = None
         self.device: str | None = None
 
@@ -224,7 +228,14 @@ class FunCosyVoice3EngineBuilder(TtsEngineBuilder[CosyVoice3SGLangRequestData]):
     def extra_scheduler_kwargs(self) -> SchedulerExtras[CosyVoice3SGLangRequestData]:
         # note (ratish): the vocoder shares this process and card on its own stream, and
         # at equal priority the AR's decode replays wait behind its kernels.
-        return {"should_run_top_priority_stream": current_platform.is_cuda()}
+        is_cuda = current_platform.is_cuda()
+        return {
+            "should_run_top_priority_stream": is_cuda,
+            # note (ratish): the device repeat window and penalty scatter that let a step
+            # launch ahead are measured on CUDA; Torch MPS samples on the host.
+            "enable_async_decode": self.enable_async_decode and is_cuda,
+            "async_decode_min_batch_size": self.async_decode_min_batch_size,
+        }
 
     def make_abort_callback(self) -> Callable[[str], None]:
         return request_builders.cleanup_prepared_cosyvoice3_request
