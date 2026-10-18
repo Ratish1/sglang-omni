@@ -49,6 +49,9 @@ from sglang_omni.utils.audio_payload import audio_waveform_payload
 logger = logging.getLogger(__name__)
 
 SAMPLE_RATE = 24000
+# note (ratish): a ready row yields its turn once, so a first audio's lighter step can go
+# ahead of it; each further yield would add a whole step to its stream's gap.
+MAX_PASSED_OVER = 1
 
 NextDecode = Literal["causal_window", "leftover", "fallback", "wait"]
 
@@ -75,6 +78,7 @@ class CosyVoice3StreamState:
     done: bool = False
     ready_since: float | None = None
     first_emit_at: float | None = None
+    passed_over_count: int = 0
 
     def next_decode(self) -> NextDecode:
         causal_token_end = self.token_offset + self.hop_len + PRE_LOOKAHEAD_LEN
@@ -412,35 +416,50 @@ class FunCosyVoice3StreamingVocoderScheduler(
         self,
     ) -> list[tuple[str, CosyVoice3StreamState]]:
         now = self.clock()
-        started: list[tuple[float, float, str, CosyVoice3StreamState]] = []
-        unstarted: list[tuple[float, str, CosyVoice3StreamState]] = []
+        ranked: list[tuple[bool, float, float, str, CosyVoice3StreamState]] = []
         for request_id, state in self.stream_state_items():
             if state.next_decode() == "wait" or self.is_aborted(request_id):
                 continue
-            elif state.first_emit_at is None:
-                assert state.ready_since is not None
-                unstarted.append((state.ready_since, request_id, state))
             else:
                 assert state.ready_since is not None
-                playback_slack = state.speech_offset / self.sample_rate - (
-                    now - state.first_emit_at
-                )
-                started.append((playback_slack, state.ready_since, request_id, state))
-        ranked = [(request_id, state) for _, _, request_id, state in sorted(started)]
-        ranked += [(request_id, state) for _, request_id, state in sorted(unstarted)]
+            # note (ratish): a stream without audio is due now, its listener waiting, as
+            # SGLang runs a new prefill before the running decode; a started one when
+            # the audio it emitted runs out.
+            if state.first_emit_at is None:
+                due = now
+            else:
+                due = state.first_emit_at + state.speech_offset / self.sample_rate
+            can_yield = state.passed_over_count < MAX_PASSED_OVER
+            ranked.append((can_yield, due, state.ready_since, request_id, state))
         if not ranked:
             return []
         else:
-            head_decode = ranked[0][1].next_decode()
-            if head_decode == "fallback":
-                return ranked[:1]
+            ranked.sort()
+        head = ranked[0][4]
+        head_decode = head.next_decode()
+        if head_decode == "fallback":
+            chosen = [(ranked[0][3], head)]
+        else:
+            # note (ratish): a step carrying a first audio leaves out the streams that can
+            # still yield and whose audio outlasts a step as long as the last one.
+            is_first_audio_step = head.first_emit_at is None
+            chosen = [
+                (request_id, state)
+                for can_yield, due, _, request_id, state in ranked
+                if state.next_decode() == head_decode
+                and (
+                    not is_first_audio_step
+                    or not can_yield
+                    or due <= now + self.last_step_seconds
+                )
+            ][: self.max_batch_size]
+        chosen_ids = {request_id for request_id, _ in chosen}
+        for _, _, _, request_id, state in ranked:
+            if request_id in chosen_ids:
+                state.passed_over_count = 0
             else:
-                peers = [
-                    (request_id, state)
-                    for request_id, state in ranked
-                    if state.next_decode() == head_decode
-                ]
-                return peers[: self.max_batch_size]
+                state.passed_over_count += 1
+        return chosen
 
     def build_step_plan(
         self, participants: list[tuple[str, CosyVoice3StreamState]]

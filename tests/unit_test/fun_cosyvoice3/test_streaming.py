@@ -583,11 +583,14 @@ def test_pump_drains_backlog_across_one_hop_steps() -> None:
 
 def test_hops_of_different_token_windows_share_one_causal_flow_batch() -> None:
     flow, scheduler = make_scheduler()
+    clock = Clock()
+    scheduler.clock = clock
     for request_id in ("req-a", "req-b"):
         scheduler.handle_streaming_new_request(request_id, stream_payload(request_id))
         scheduler.ingest_stream_item(request_id, item(list(range(28))))
     assert serve(scheduler) == 1
     drain(scheduler)
+    clock.now += 1.0
     scheduler.ingest_stream_item("req-a", item([i % 31 for i in range(28, 78)]))
     scheduler.handle_streaming_new_request("req-c", stream_payload("req-c"))
     scheduler.ingest_stream_item("req-c", item(list(range(28))))
@@ -606,8 +609,8 @@ def test_hops_of_different_token_windows_share_one_causal_flow_batch() -> None:
     assert scheduler.stream_states["req-b"].token_offset == TOKEN_HOP_LEN
 
 
-def test_step_takes_started_streams_before_new_ones_up_to_the_batch_size() -> None:
-    flow, scheduler = make_scheduler(max_batch_size=2)
+def test_first_hops_run_first_without_the_started_streams_holding_audio() -> None:
+    flow, scheduler = make_scheduler(max_batch_size=4)
     scheduler.clock = Clock()
     for request_id in ("req-a", "req-b"):
         scheduler.handle_streaming_new_request(request_id, stream_payload(request_id))
@@ -623,12 +626,31 @@ def test_step_takes_started_streams_before_new_ones_up_to_the_batch_size() -> No
     assert stream_ids(drain(scheduler)) == [
         "req-a",
         "req-b",
-        "req-a",
-        "req-b",
         "req-c",
         "req-d",
+        "req-a",
+        "req-b",
     ]
     assert {len(call["lengths"]) for call in estimator_calls(flow)} == {4}
+
+
+def test_a_passed_over_final_runs_before_a_later_first_hop() -> None:
+    _, scheduler = make_scheduler()
+    scheduler.clock = Clock()
+    scheduler.handle_streaming_new_request("req-a", stream_payload("req-a"))
+    scheduler.ingest_stream_item("req-a", item(list(range(28))))
+    assert serve(scheduler) == 1
+    scheduler.handle_stream_done("req-a")
+    for request_id in ("req-c", "req-d"):
+        scheduler.handle_streaming_new_request(request_id, stream_payload(request_id))
+    scheduler.ingest_stream_item("req-c", item(list(range(28))))
+
+    with scheduler.state_lock:
+        assert scheduler.pump_one_step() == []
+        scheduler.ingest_stream_item("req-d", item(list(range(28))))
+        assert scheduler.pump_one_step() == []
+        assert scheduler.pump_one_step() == []
+    assert stream_ids(drain(scheduler)) == ["req-a", "req-c", "req-a", "req-d"]
 
 
 def test_first_hop_runs_when_no_started_stream_is_runnable() -> None:
