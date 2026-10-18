@@ -627,7 +627,9 @@ def test_qwen_talker_ar_threads_explicit_generation_batch_policy(monkeypatch) ->
         lambda gpu_id: None,
     )
 
-    qwen_stages.create_talker_ar_executor_from_config("dummy")
+    qwen_stages.create_talker_ar_executor_from_config(
+        "dummy", max_running_requests=TALKER_MAX_RUNNING_REQUESTS
+    )
 
     prefill_ladder = qwen_stages.build_default_prefill_cuda_graph_bs(
         qwen_stages.TALKER_PREFILL_CUDA_GRAPH_MAX_TOKENS
@@ -732,7 +734,13 @@ def test_importing_the_stages_module_does_not_load_the_platform_layer() -> None:
     assert result.stdout.strip().splitlines()[-1] == "ABSENT"
 
 
-def talker_overrides(monkeypatch, *, allows: bool, **kwargs) -> dict[str, object]:
+def talker_overrides(
+    monkeypatch,
+    *,
+    allows: bool,
+    max_running_requests: int = TALKER_MAX_RUNNING_REQUESTS,
+    **kwargs,
+) -> dict[str, object]:
     captured: list[dict[str, object]] = []
 
     def recording_builder(model_path, context_length, **overrides):
@@ -767,7 +775,9 @@ def talker_overrides(monkeypatch, *, allows: bool, **kwargs) -> dict[str, object
     )
     monkeypatch.setattr(current_platform, "enable_talker_graph", lambda: allows)
 
-    qwen_stages.create_talker_ar_executor_from_config("dummy", **kwargs)
+    qwen_stages.create_talker_ar_executor_from_config(
+        "dummy", max_running_requests=max_running_requests, **kwargs
+    )
     return captured[-1]
 
 
@@ -780,12 +790,21 @@ def test_talker_decode_graph_follows_the_platform_gate(
     assert overrides["disable_cuda_graph"] is expected
 
 
-def test_the_talker_runs_as_many_requests_as_code2wav_keeps_codec_state_for(
-    monkeypatch,
+@pytest.mark.parametrize(
+    ("server_args_overrides", "expected"),
+    [(None, 40), ({"max_running_requests": 24}, 24)],
+)
+def test_the_talker_runs_its_cap_unless_the_engine_overrides_it(
+    monkeypatch, server_args_overrides: dict[str, int] | None, expected: int
 ) -> None:
-    overrides = talker_overrides(monkeypatch, allows=True)
+    overrides = talker_overrides(
+        monkeypatch,
+        allows=True,
+        max_running_requests=40,
+        server_args_overrides=server_args_overrides,
+    )
 
-    assert overrides["max_running_requests"] == TALKER_MAX_RUNNING_REQUESTS
+    assert overrides["max_running_requests"] == expected
 
 
 def test_talker_graph_stays_available_to_an_explicit_override(monkeypatch) -> None:

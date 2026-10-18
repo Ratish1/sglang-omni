@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 
 from sglang_omni.config import build_stage_placement_plan, resolve_stage_factory_args
+from sglang_omni.config.manager import ConfigManager
 from sglang_omni.config.schema import EndpointsConfig, ProcessConfig
 from sglang_omni.models.qwen3_omni.config import (
     Qwen3OmniSpeechColocatedPipelineConfig,
@@ -170,18 +171,33 @@ def test_factory_kwargs_follow_whether_code2wav_shares_the_talker_process() -> N
     assert sharing_flags(colocated) == (False, False)
 
 
-def test_code2wav_keeps_a_codec_state_slot_per_stream_the_talkers_run() -> None:
-    config = Qwen3OmniSpeechPipelineConfig(model_path="dummy")
+@pytest.mark.parametrize(
+    ("overrides", "replicas", "expected"),
+    [
+        ({}, 1, (32, 32)),
+        ({"talker_ar.factory.max_running_requests": 40}, 1, (40, 40)),
+        (
+            {
+                "talker_ar.factory.max_running_requests": 40,
+                "talker_ar.engine.max_running_requests": 24,
+            },
+            2,
+            (40, 48),
+        ),
+    ],
+)
+def test_code2wav_keeps_a_codec_state_slot_per_stream_the_talkers_run(
+    overrides: dict[str, int], replicas: int, expected: tuple[int, int]
+) -> None:
+    config = ConfigManager(
+        Qwen3OmniSpeechPipelineConfig(model_path="dummy")
+    ).merge_config(overrides)
+    config.processes["talker_ar"] = ProcessConfig(num_replicas=replicas)
 
-    def slots() -> int:
-        return resolve_stage_factory_args(make_stage(config, "code2wav"), config)[
-            "codec_state_slots"
-        ]
+    talker = resolve_stage_factory_args(make_stage(config, "talker_ar"), config)
+    code2wav = resolve_stage_factory_args(make_stage(config, "code2wav"), config)
 
-    assert slots() == 32
-    make_stage(config, "talker_ar").engine.max_running_requests = 24
-    config.processes["talker_ar"] = ProcessConfig(num_replicas=2)
-    assert slots() == 48
+    assert (talker["max_running_requests"], code2wav["codec_state_slots"]) == expected
 
 
 def test_colocated_config_passes_with_explicit_budgets_without_ar_mem_fraction() -> (
