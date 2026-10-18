@@ -22,8 +22,8 @@ CAPTURE_WARMUP_RUNS = 2
 
 
 def row_tiers(max_rows: int) -> list[int]:
-    """SGLang's decode ladder (1, 2, 4, 8, 12, then steps of 8) up to max_rows, which
-    is always a tier."""
+    """The decode ladder (1, 2, 4, 8, 12, then steps of 8) up to max_rows, which is
+    always a tier."""
     return sorted(
         {
             rows

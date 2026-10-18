@@ -39,8 +39,6 @@ class HiftDecodeCudaGraphRunner:
         self.samples_per_frame = samples_per_frame
         self.row_tiers = sorted(row_tiers)
         self.frame_tiers = sorted(frame_tiers)
-        # note (ratish): one static input storage at the largest tier serves every graph,
-        # as SGLang's runners share their input buffers across batch sizes.
         largest_rows, largest_frames = self.row_tiers[-1], self.frame_tiers[-1]
         self.mel_storage = torch.zeros(
             largest_rows * mel_channels * largest_frames, device=self.device
