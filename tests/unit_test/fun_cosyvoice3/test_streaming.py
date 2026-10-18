@@ -737,11 +737,13 @@ def test_finals_share_one_non_streaming_flow_batch() -> None:
 
 def test_a_wide_row_shares_one_step_with_short_rows_at_their_own_lengths() -> None:
     flow, scheduler = make_scheduler()
-    scheduler.clock = Clock()
+    clock = Clock()
+    scheduler.clock = clock
     scheduler.handle_streaming_new_request("req-a", stream_payload("req-a"))
     scheduler.ingest_stream_item("req-a", item([i % 31 for i in range(78)]))
     assert serve(scheduler) == 2
     drain(scheduler)
+    clock.now += 1.0
     scheduler.ingest_stream_item("req-a", item([i % 31 for i in range(78, 178)]))
     for request_id in ("req-b", "req-c"):
         scheduler.handle_streaming_new_request(request_id, stream_payload(request_id))
@@ -791,6 +793,7 @@ def test_finals_of_different_widths_share_one_step_at_their_own_lengths() -> Non
 
 def test_stream_without_tokens_fails_in_its_own_step() -> None:
     flow, scheduler = make_scheduler()
+    scheduler.clock = Clock()
     scheduler.handle_streaming_new_request("req-a", stream_payload("req-a"))
     scheduler.ingest_stream_item("req-a", item(list(range(30))))
     assert serve(scheduler) == 1
@@ -803,9 +806,9 @@ def test_stream_without_tokens_fails_in_its_own_step() -> None:
 
     assert serve(scheduler) == 2
     assert [(m.request_id, m.type) for m in drain(scheduler)] == [
+        ("req-empty", "error"),
         ("req-a", "stream"),
         ("req-a", "result"),
-        ("req-empty", "error"),
     ]
     assert scheduler.is_aborted("req-empty")
     assert scheduler.stream_states == {}
