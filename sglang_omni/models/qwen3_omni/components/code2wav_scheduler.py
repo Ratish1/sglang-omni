@@ -1278,12 +1278,15 @@ def create_code2wav_scheduler(
     incremental_codec = None
     codec_pool = None
     pool_bytes = 0
+    # note (ratish): each row of a slot decode holds its own slot, so no slot graph or capture
+    # scratch slot needs more rows than there are slots.
+    slot_replay_rows = min(max(int(max_replay_rows), 1), codec_state_slots)
     if codec_state_slots > 0 and Qwen3OmniIncrementalCodec.supports(model):
         incremental_codec = Qwen3OmniIncrementalCodec(model)
         codec_pool = CodecStatePool(
             incremental_codec.spec,
             num_slots=codec_state_slots,
-            capture_slots=max(int(max_replay_rows), 1),
+            capture_slots=slot_replay_rows if enable_cuda_graph else 0,
             ring_frames=incremental_codec.spec.retained_context + stream_chunk_size,
             device=concrete_device,
             dtype=model.dtype,
@@ -1323,9 +1326,7 @@ def create_code2wav_scheduler(
         )
         if codec_pool is not None:
             graph_keys += incremental_graph_keys(
-                stream_chunk_size,
-                max(int(max_replay_rows), 1),
-                initial_codec_chunk_frames,
+                stream_chunk_size, slot_replay_rows, initial_codec_chunk_frames
             )
             # note (ratish): a stream with a slot ends on fewer new frames than a window.
             final_window_keys += tuple(

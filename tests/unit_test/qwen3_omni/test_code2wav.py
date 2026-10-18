@@ -1489,3 +1489,46 @@ def test_streams_decoded_in_one_replay_keep_their_own_slots(cuda_graph: bool) ->
     for waveform, wanted in zip(waveforms, expected.reshape(2, -1).float().cpu()):
         np.testing.assert_allclose(waveform, wanted.numpy(), rtol=2e-2, atol=2e-3)
     assert scheduler.codec_pool.available_size() == scheduler.codec_pool.num_slots
+
+
+@pytest.mark.accelerator
+@SLOT_DECODES
+@pytest.mark.parametrize("enable_cuda_graph", [False, True])
+def test_slot_graphs_and_capture_slots_stop_at_the_codec_slot_count(
+    monkeypatch: pytest.MonkeyPatch, enable_cuda_graph: bool
+) -> None:
+    build_call: dict[str, object] = {}
+
+    def build(model: Qwen3OmniCode2Wav, **kwargs: object) -> SimpleNamespace:
+        build_call.update(kwargs)
+        return SimpleNamespace(stats=lambda: {})
+
+    monkeypatch.setattr(
+        code2wav_scheduler,
+        "load_code2wav_model",
+        lambda *args, **kwargs: make_fused_tiny_code2wav(),
+    )
+    monkeypatch.setattr(
+        code2wav_scheduler.Code2WavCudaGraphRunner, "build", staticmethod(build)
+    )
+
+    scheduler = code2wav_scheduler.create_code2wav_scheduler(
+        "dummy",
+        device="cuda",
+        enable_cuda_graph=enable_cuda_graph,
+        total_gpu_memory_fraction=0.5,
+        stream_chunk_size=3,
+        left_context_size=2,
+        max_replay_rows=8,
+        fused_snake_activation=False,
+        codec_state_slots=2,
+    )
+
+    slot_graph_rows = {
+        key.batch_size
+        for key in build_call.get("graph_keys", ())
+        if key.decode != "window"
+    }
+    assert (len(scheduler.codec_pool.scratch_slots), slot_graph_rows) == (
+        (2, {1, 2}) if enable_cuda_graph else (0, set())
+    )
