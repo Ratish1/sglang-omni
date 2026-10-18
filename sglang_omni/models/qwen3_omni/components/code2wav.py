@@ -18,6 +18,7 @@ from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import (
     Qwen3OmniMoeCode2Wav,
     Qwen3OmniMoeCode2WavDecoderBlock,
     Qwen3OmniMoeCode2WavDecoderResidualUnit,
+    Qwen3OmniMoeCode2WavTransformerLayer,
     Qwen3OmniMoeCode2WavTransformerModel,
     Qwen3OmniMoeConvNeXtBlock,
     SnakeBeta,
@@ -155,51 +156,15 @@ class FusedCode2WavTransformer(torch.nn.Module):
             window_mask = (key <= query) & (query - key < sliding_window)
         hidden_states = inputs_embeds.reshape(batch_size * length, hidden_size)
         for layer in self.transformer.layers:
-            attention = layer.self_attn
-            residual = hidden_states
-            normed = rmsnorm(
-                hidden_states,
-                layer.input_layernorm.weight,
-                layer.input_layernorm.variance_epsilon,
+            query, key, value = self.rotated_qkv(layer, hidden_states, positions)
+            attended = self.attend(
+                layer,
+                query.view(batch_size, length, -1, head_dim),
+                key.view(batch_size, length, -1, head_dim),
+                value.view(batch_size, length, -1, head_dim),
+                window_mask,
             )
-            query, key, value = F.linear(normed, attention.qkv_weight).split(
-                [
-                    attention.q_proj.out_features,
-                    attention.k_proj.out_features,
-                    attention.v_proj.out_features,
-                ],
-                dim=-1,
-            )
-            query = query.view(batch_size * length, -1, head_dim)
-            key = key.view(batch_size * length, -1, head_dim)
-            self.rope(query, key, self.cos_sin_cache, positions, is_neox=True)
-            attended = F.scaled_dot_product_attention(
-                query.view(batch_size, length, -1, head_dim).transpose(1, 2),
-                key.view(batch_size, length, -1, head_dim).transpose(1, 2),
-                value.view(batch_size, length, -1, head_dim).transpose(1, 2),
-                attn_mask=window_mask,
-                is_causal=window_mask is None,
-                scale=attention.scaling,
-                enable_gqa=attention.num_key_value_groups > 1,
-            )
-            attended = attended.transpose(1, 2).reshape(batch_size * length, -1)
-            hidden_states = torch.addcmul(
-                residual,
-                layer.self_attn_layer_scale.scale,
-                F.linear(attended, attention.o_proj.weight),
-            )
-            residual = hidden_states
-            normed = rmsnorm(
-                hidden_states,
-                layer.post_attention_layernorm.weight,
-                layer.post_attention_layernorm.variance_epsilon,
-            )
-            activated = silu_and_mul(F.linear(normed, layer.mlp.gate_up_weight))
-            hidden_states = torch.addcmul(
-                residual,
-                layer.mlp_layer_scale.scale,
-                F.linear(activated, layer.mlp.down_proj.weight),
-            )
+            hidden_states = self.layer_output(layer, hidden_states, attended)
         hidden_states = rmsnorm(
             hidden_states,
             self.transformer.norm.weight,
@@ -239,25 +204,8 @@ class FusedCode2WavTransformer(torch.nn.Module):
             window_mask = ((distances >= 0) & (distances < sliding_window))[:, None]
         hidden_states = inputs_embeds.reshape(batch_size * length, hidden_size)
         for layer_index, layer in enumerate(self.transformer.layers):
-            attention = layer.self_attn
-            residual = hidden_states
-            normed = rmsnorm(
-                hidden_states,
-                layer.input_layernorm.weight,
-                layer.input_layernorm.variance_epsilon,
-            )
-            query, key, value = F.linear(normed, attention.qkv_weight).split(
-                [
-                    attention.q_proj.out_features,
-                    attention.k_proj.out_features,
-                    attention.v_proj.out_features,
-                ],
-                dim=-1,
-            )
-            query = query.view(batch_size * length, -1, head_dim)
-            key = key.view(batch_size * length, -1, head_dim)
-            self.rope(
-                query, key, self.cos_sin_cache, addresses.frame_positions, is_neox=True
+            query, key, value = self.rotated_qkv(
+                layer, hidden_states, addresses.frame_positions
             )
             pool.keys[layer_index].index_copy_(
                 0, addresses.write_rows, key.reshape(batch_size * length, -1)
@@ -273,39 +221,94 @@ class FusedCode2WavTransformer(torch.nn.Module):
                 values = pool.values[layer_index][addresses.window_rows].view(
                     batch_size, pool.ring_frames, -1, head_dim
                 )
-            attended = F.scaled_dot_product_attention(
-                query.view(batch_size, length, -1, head_dim).transpose(1, 2),
-                keys.transpose(1, 2),
-                values.transpose(1, 2),
-                attn_mask=window_mask,
-                is_causal=window_mask is None,
-                scale=attention.scaling,
-                enable_gqa=attention.num_key_value_groups > 1,
+            attended = self.attend(
+                layer,
+                query.view(batch_size, length, -1, head_dim),
+                keys,
+                values,
+                window_mask,
             )
-            attended = attended.transpose(1, 2).reshape(batch_size * length, -1)
-            hidden_states = torch.addcmul(
-                residual,
-                layer.self_attn_layer_scale.scale,
-                F.linear(attended, attention.o_proj.weight),
-            )
-            residual = hidden_states
-            normed = rmsnorm(
-                hidden_states,
-                layer.post_attention_layernorm.weight,
-                layer.post_attention_layernorm.variance_epsilon,
-            )
-            activated = silu_and_mul(F.linear(normed, layer.mlp.gate_up_weight))
-            hidden_states = torch.addcmul(
-                residual,
-                layer.mlp_layer_scale.scale,
-                F.linear(activated, layer.mlp.down_proj.weight),
-            )
+            hidden_states = self.layer_output(layer, hidden_states, attended)
         hidden_states = rmsnorm(
             hidden_states,
             self.transformer.norm.weight,
             self.transformer.norm.variance_epsilon,
         )
         return hidden_states.view(batch_size, length, hidden_size)
+
+    def rotated_qkv(
+        self,
+        layer: Qwen3OmniMoeCode2WavTransformerLayer,
+        hidden_states: torch.Tensor,
+        positions: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """The layer's (tokens, heads, head_dim) query and key rotated at positions, and its
+        (tokens, kv_heads * head_dim) value, from one qkv GEMM."""
+        attention = layer.self_attn
+        normed = rmsnorm(
+            hidden_states,
+            layer.input_layernorm.weight,
+            layer.input_layernorm.variance_epsilon,
+        )
+        query, key, value = F.linear(normed, attention.qkv_weight).split(
+            [
+                attention.q_proj.out_features,
+                attention.k_proj.out_features,
+                attention.v_proj.out_features,
+            ],
+            dim=-1,
+        )
+        query = query.view(hidden_states.shape[0], -1, attention.head_dim)
+        key = key.view(hidden_states.shape[0], -1, attention.head_dim)
+        self.rope(query, key, self.cos_sin_cache, positions, is_neox=True)
+        return query, key, value
+
+    def attend(
+        self,
+        layer: Qwen3OmniMoeCode2WavTransformerLayer,
+        query: torch.Tensor,
+        keys: torch.Tensor,
+        values: torch.Tensor,
+        window_mask: torch.Tensor | None,
+    ) -> torch.Tensor:
+        """SDPA of (B, L, heads, head_dim) queries over (B, S, kv_heads, head_dim) keys and
+        values, causal without a mask, as (B * L, heads * head_dim)."""
+        attention = layer.self_attn
+        attended = F.scaled_dot_product_attention(
+            query.transpose(1, 2),
+            keys.transpose(1, 2),
+            values.transpose(1, 2),
+            attn_mask=window_mask,
+            is_causal=window_mask is None,
+            scale=attention.scaling,
+            enable_gqa=attention.num_key_value_groups > 1,
+        )
+        return attended.transpose(1, 2).reshape(query.shape[0] * query.shape[1], -1)
+
+    def layer_output(
+        self,
+        layer: Qwen3OmniMoeCode2WavTransformerLayer,
+        residual: torch.Tensor,
+        attended: torch.Tensor,
+    ) -> torch.Tensor:
+        """The layer's output: its attention projection, then its SwiGLU MLP, each added to the
+        residual by the layer scale in one kernel."""
+        hidden_states = torch.addcmul(
+            residual,
+            layer.self_attn_layer_scale.scale,
+            F.linear(attended, layer.self_attn.o_proj.weight),
+        )
+        normed = rmsnorm(
+            hidden_states,
+            layer.post_attention_layernorm.weight,
+            layer.post_attention_layernorm.variance_epsilon,
+        )
+        activated = silu_and_mul(F.linear(normed, layer.mlp.gate_up_weight))
+        return torch.addcmul(
+            hidden_states,
+            layer.mlp_layer_scale.scale,
+            F.linear(activated, layer.mlp.down_proj.weight),
+        )
 
 
 class Qwen3OmniCode2Wav(Qwen3OmniMoeCode2Wav):
