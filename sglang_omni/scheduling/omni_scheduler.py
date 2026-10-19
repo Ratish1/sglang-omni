@@ -816,8 +816,6 @@ class OmniScheduler(Generic[RequestDataT]):
             max_total_num_tokens=(
                 self.max_total_num_tokens * get_parallel().attn_dcp_size
             ),
-            get_last_batch=lambda: self.last_batch,
-            get_running_batch=lambda: self.running_batch,
         )
         empty_queue = types.SimpleNamespace(queue=[], retracted_queue=[])
         self.total_prefill_uncached_tokens = 0
