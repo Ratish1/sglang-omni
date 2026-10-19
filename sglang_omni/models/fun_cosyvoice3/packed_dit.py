@@ -116,8 +116,8 @@ class PackedRows:
 
 def pack_rows(lengths: Sequence[int], device: torch.device) -> PackedRows:
     lengths = tuple(int(length) for length in lengths)
-    # note (ratish): a pageable upload is staged before the call returns, so on CUDA it
-    # need not wait for the work queued on the stream.
+    # note (ratish): a few ints per row; a pageable copy of 64 KB or less returns without
+    # waiting for the stream's queued work.
     non_blocking = current_platform.is_cuda()
     starts_host = F.pad(torch.tensor(lengths, dtype=torch.int64).cumsum(0), (1, 0))
     starts = starts_host.to(device, non_blocking=non_blocking)
