@@ -8,7 +8,7 @@
 FROM intel/deep-learning-essentials:2026.0.0-devel-ubuntu24.04 AS base
 
 ARG SGLANG_XPU_REPO=https://github.com/sgl-project/sglang.git
-ARG SGLANG_XPU_BRANCH=v0.5.21
+ARG SGLANG_XPU_BRANCH=v0.5.22
 
 ENV DEBIAN_FRONTEND=noninteractive
 ENV PIP_INDEX_URL=https://pypi.org/simple
@@ -73,10 +73,10 @@ RUN add-apt-repository -y ppa:kobuk-team/intel-graphics \
 
 # Minors differ on purpose: the XPU channel ships no torchaudio newer than 2.11+xpu.
 RUN pip install --no-cache-dir --extra-index-url ${TORCH_XPU_INDEX} \
-        torch==2.13.0+xpu \
-        torchvision==0.28.0+xpu \
+        torch==2.14.0+xpu \
+        torchvision==0.29.0+xpu \
         torchaudio==2.11.0+xpu \
-        torchcodec==0.13.0
+        torchcodec==0.17.0
 
 # SGLang's XPU manifest pins the SYCL kernel wheel itself. An isolated build would
 # download torch again and compile Rust extensions this image never loads, so it
