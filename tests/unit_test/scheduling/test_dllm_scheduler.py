@@ -37,7 +37,7 @@ class ReqDouble:
         self.full_untruncated_fill_ids = self.origin_input_ids + array(
             "q", [-1] * block_size
         )
-        self.extend_range = SimpleNamespace(end=len(self.full_untruncated_fill_ids))
+        self.extend_end = len(self.full_untruncated_fill_ids)
         self.output_ids: list[int] = []
         self.output_ids_through_stop: list[int] = self.output_ids
         self.finished_reason = None
@@ -365,7 +365,7 @@ def test_cfg_chunked_admission_rolls_back_and_retries(
     requests[1]._is_uncond = True  # noqa: leading-underscore  # DLLM protocol
     allocator = scheduler.token_to_kv_pool_allocator
     occupied = allocator.alloc(300)
-    original_ranges = [req.extend_range for req in requests]
+    original_spans = [(req.prefix_len, req.extend_end) for req in requests]
     monkeypatch.setattr(
         dllm_scheduler_module,
         "ScheduleBatch",
@@ -378,12 +378,12 @@ def test_cfg_chunked_admission_rolls_back_and_retries(
     with get_context().override_server_args(page_size=1, max_prefill_tokens=64):
         assert scheduler.schedule_next_batch() is None
         assert scheduler.waiting_queue == requests
-        assert [req.extend_range for req in requests] == original_ranges
+        assert [(req.prefix_len, req.extend_end) for req in requests] == original_spans
         allocator.free(occupied)
         batch = scheduler.schedule_next_batch()
 
     assert batch.reqs == requests
-    assert all(req.extend_range.length == 32 for req in batch.reqs)
+    assert all(req.extend_len == 32 for req in batch.reqs)
 
 
 def test_dllm_staging_admission_uses_dllm_config(
@@ -408,7 +408,7 @@ def test_dllm_staging_admission_uses_dllm_config(
         batch = scheduler.schedule_next_batch()
 
     assert batch.reqs == [request]
-    assert request.extend_range.length == scheduler.dllm_config.block_size
+    assert request.extend_len == scheduler.dllm_config.block_size
 
 
 def test_abort_between_blocks_releases_cached_tokens(
@@ -423,7 +423,7 @@ def test_abort_between_blocks_releases_cached_tokens(
     pool.alloc([req])
     req.kv.kv_allocated_len = req.kv.kv_committed_len = 32
     pool.req_to_token[req.kv.req_pool_idx, :32] = allocator.alloc(32).int()
-    req.set_extend_range(0, 32)
+    req.extend_end = 32
     scheduler.post_step(SimpleNamespace(reqs=[req], filter_batch=lambda **kwargs: None))
     scheduler.aborted_request_ids = {req.rid}
 

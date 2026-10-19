@@ -55,8 +55,8 @@ def make_sched_req(
         data=SimpleNamespace(
             req=SimpleNamespace(
                 rid=rid,
-                prefix_indices=list(range(prefix_len)),
-                extend_range=SimpleNamespace(length=extend_len),
+                prefix_len=prefix_len,
+                extend_len=extend_len,
             ),
             prompt_input_embeds=prompt,
             prefill_input_embeds=prompt,
@@ -352,8 +352,8 @@ def test_decode_then_retract_reprefill_roundtrip() -> None:
     assert len(sched_req.data.decode_input_embeds) == n_decode
     assert len(sched_req.data.pending_feedback_queue) == 1
 
-    sched_req.data.req.prefix_indices = []
-    sched_req.data.req.extend_range = SimpleNamespace(length=prompt_len + generated)
+    sched_req.data.req.prefix_len = 0
+    sched_req.data.req.extend_len = prompt_len + generated
     prefill_batch = SimpleNamespace(
         input_ids=torch.zeros(prompt_len + generated, dtype=torch.long)
     )
@@ -457,7 +457,8 @@ def write_slots(state: RadixChunkState, req: Req, start: int, end: int) -> None:
 
 
 def compute_chunk(state: RadixChunkState, req: Req, start: int, end: int) -> None:
-    req.set_extend_range(start, end)
+    req.prefix_len = start
+    req.extend_end = end
     req.kv.kv_committed_len = req.kv.kv_allocated_len = end
 
 
@@ -501,7 +502,7 @@ def test_a_retracted_reprefill_advances_past_its_private_chunk(
     state.scheduler.stash_chunked_request(req)
     admit_next_chunk(state, req)
 
-    assert (req.extend_range.start, req.extend_range.end) == (33, 41)
+    assert (req.prefix_len, req.extend_end) == (33, 41)
     assert req.kv.cache_protected_len == 16
     if release_at_middle:
         pass
@@ -527,7 +528,7 @@ def test_a_fresh_prompt_chunk_enters_the_radix_tree(
     state.scheduler.stash_chunked_request(req)
     admit_next_chunk(state, req)
 
-    assert (req.extend_range.start, req.extend_range.end) == (32, 41)
+    assert (req.prefix_len, req.extend_end) == (32, 41)
     assert state.cache.total_size() == 32
     release_kv_cache(req, state.cache)
     assert_every_slot_returns_once(state, total)

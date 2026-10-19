@@ -369,10 +369,10 @@ def req_from_continuation(
     except Exception:
         req_to_token_pool.free(req)
         raise
-    req.prefix_indices = allocation.slots
+    req.prefix_len = allocation.seq_len
     req.kv.kv_committed_len = allocation.seq_len
     req.kv.kv_allocated_len = allocation.seq_len
-    req.set_extend_range(allocation.seq_len, allocation.seq_len)
+    req.extend_end = allocation.seq_len
     req._omni_terminal_claimed = False  # noqa: leading-underscore  # upstream spelling, or the public name is already taken
     req._coalesce_enqueue_t = 0.0  # noqa: leading-underscore  # upstream spelling, or the public name is already taken
     return req

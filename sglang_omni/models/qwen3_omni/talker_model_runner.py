@@ -370,8 +370,8 @@ class QwenTalkerModelRunner(ModelRunner["SGLangARRequestData"]):
         parts: list[torch.Tensor] = []
         for sched_req in requests:
             req = sched_req.data.req
-            prefix_len = len(req.prefix_indices)
-            extend_len = int(req.extend_range.length)
+            prefix_len = req.prefix_len
+            extend_len = req.extend_len
             part = self.projected_prefill_slice(
                 sched_req=sched_req,
                 prefix_len=prefix_len,

@@ -343,8 +343,8 @@ class MiniCPMOTalkerModelRunner(ModelRunner):
             else:
                 pass
             req = data.req
-            prefix_len = len(req.prefix_indices)
-            end = prefix_len + int(req.extend_range.length)
+            prefix_len = req.prefix_len
+            end = prefix_len + req.extend_len
             prompt_len = int(tensor.shape[0])
             if prefix_len < prompt_len:
                 parts.append(tensor[prefix_len : min(end, prompt_len)])

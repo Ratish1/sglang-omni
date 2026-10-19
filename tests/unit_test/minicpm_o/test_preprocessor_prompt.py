@@ -423,9 +423,9 @@ def test_speech_prefill_advances_by_chunk_in_its_own_cache_namespace() -> None:
         )
     )
     first.kv.req_pool_idx = 0
-    first.set_extend_range(0, 2)
+    first.extend_end = 2
     maybe_cache_unfinished_req(first, chunk_cache, chunked=True)
-    assert first.prefix_indices.tolist() == [0, 1]
+    assert first.prefix_len == 2
 
 
 def test_ordered_inline_media_preserves_turns_and_text_separators(

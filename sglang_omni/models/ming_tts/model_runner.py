@@ -219,8 +219,8 @@ class MingTTSModelRunner(ModelRunner):
             data: MingTTSSGLangRequestData = sched_req.data
             request_state = self.request_states[sched_req.request_id]
             req = data.req
-            prefix_len = len(req.prefix_indices)
-            extend_len = int(req.extend_range.length)
+            prefix_len = req.prefix_len
+            extend_len = req.extend_len
             end = prefix_len + extend_len
             prompt_ids = data.input_ids
             prompt_len = int(prompt_ids.shape[0])

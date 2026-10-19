@@ -149,9 +149,9 @@ def session_prefill_rows(
 ) -> torch.Tensor:
     """Embed the uncached window of a native session request with its spans spliced in."""
     session_request = request_data.req
-    start = session_request.extend_range.start
+    start = session_request.prefix_len
     token_ids = torch.tensor(
-        session_request.get_fill_ids()[start : session_request.extend_range.end],
+        session_request.get_fill_ids()[start : session_request.extend_end],
         dtype=torch.long,
         device=device,
     )

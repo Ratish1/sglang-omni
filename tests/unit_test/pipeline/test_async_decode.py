@@ -558,7 +558,7 @@ def test_prompt_only_radix_reuses_prompt_without_caching_tail():
         first = decoding_req(allocator, req_to_token_pool, "first", prompt, [20])
         first.extra_key = "qwen3_tts:prompt:v1"
         first.init_next_round_input(cache)
-        first.set_extend_range(0, len(prompt))
+        first.extend_end = len(prompt)
         maybe_cache_unfinished_req(first, cache)
 
         first.skip_radix_cache_insert = True
@@ -581,7 +581,7 @@ def test_prompt_only_radix_reuses_prompt_without_caching_tail():
             )
         )
 
-        assert len(second.prefix_indices) == len(prompt) - 1
+        assert second.prefix_len == len(prompt) - 1
         assert len(tail_match.device_indices) == cache.total_size() == len(prompt)
         assert allocator.available_size() + cache.evictable_size() == total
 

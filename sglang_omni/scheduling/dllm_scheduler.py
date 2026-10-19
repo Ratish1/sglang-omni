@@ -573,12 +573,9 @@ class DllmScheduler:
         ready = scheduled_rids == expected_rids
         if ready and len(request_group) > 1:
             self.synchronize_cfg_phases(adder.can_run_list)
-            spans = {
-                (req.extend_range.start, req.extend_range.end)
-                for req in adder.can_run_list
-            }
+            spans = {(req.prefix_len, req.extend_end) for req in adder.can_run_list}
             if len(spans) != 1 or any(
-                req.extend_range.length != self.dllm_config.block_size
+                req.extend_len != self.dllm_config.block_size
                 for req in adder.can_run_list
             ):
                 ready = False
@@ -727,12 +724,12 @@ class DllmScheduler:
             # Commit real denoised tokens into the fill IDs used by the prefix
             # cache. Without this, the next round keys on the mask block.
             req.full_untruncated_fill_ids[
-                req.extend_range.end - new_tokens : req.extend_range.end
+                req.extend_end - new_tokens : req.extend_end
             ] = array("q", req_token_ids)
 
             if fdfo_mode:
                 len_input = len(req.origin_input_ids)
-                len_fill = req.extend_range.end
+                len_fill = req.extend_end
                 if len_fill <= len_input:
                     continue
                 else:

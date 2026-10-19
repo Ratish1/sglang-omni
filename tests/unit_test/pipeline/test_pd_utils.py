@@ -175,7 +175,8 @@ def test_continuation_round_trip_rebuilds_prebuilt_request() -> None:
     assert list(req.origin_input_ids) == [10, 11, 12]
     assert list(req.output_ids) == [42]
     assert req.sampling_params.stop_token_ids == {2}
-    assert req.prefix_indices.tolist() == [7, 8, 9]
+    assert req.prefix_len == 3
+    assert req.extend_end == 3
     assert req.kv.req_pool_idx is not None
     assert req_to_token_pool.req_to_token[req.kv.req_pool_idx, :3].tolist() == [7, 8, 9]
     assert req.kv.kv_committed_len == 3
