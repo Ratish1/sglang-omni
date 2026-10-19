@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1.7
 
-ARG SGLANG_IMAGE=lmsysorg/sglang@sha256:b1259f3ea3275f66237c498ea388919729018bc9f01c3d638391e06e2cf3f469
+ARG SGLANG_IMAGE=lmsysorg/sglang@sha256:5fc09edb6a0bb1d5b6992b543723c66d08f86d7a507e951e87e0d05db4ac766e
 ARG FLASHINFER_CACHE_IMAGE=hongccc/sglang-omni@sha256:ebe4239e29a764ee3a2806385c061c5fd438a26f01458e503d3822dcba5790df
 
 FROM ${FLASHINFER_CACHE_IMAGE} AS flashinfer-cache
@@ -49,7 +49,7 @@ RUN python3 -c 'import tomllib; print("\n".join(tomllib.load(open("/tmp/pyprojec
         --overrides /tmp/omni-overrides.txt -r /tmp/pyproject.toml \
         --extra audar-tts --extra fun-cosyvoice3 \
     && uv pip install --python /opt/sglang/bin/python3 --no-deps qwen-tts==0.1.1 \
-    && uv pip install --python /opt/sglang/bin/python3 --no-deps --reinstall flashinfer-python==0.6.18 \
+    && uv pip install --python /opt/sglang/bin/python3 --no-deps --reinstall flashinfer-python==0.7.1 \
     && python3 -m pip uninstall -y flashinfer-cubin flashinfer-jit-cache \
     && rm /tmp/pyproject.toml /tmp/omni-overrides.txt
 
@@ -73,7 +73,7 @@ EOF
 # Docker builds do not have a GPU to regenerate architecture-specific JIT
 # artifacts. Reuse the Python 3.12 cache validated on Ada (SM89) and Hopper
 # (SM90a); other architectures compile into their own cache directory.
-COPY --from=flashinfer-cache /root/.cache/flashinfer/0.6.18 /root/.cache/flashinfer/0.6.18
+COPY --from=flashinfer-cache /root/.cache/flashinfer/0.7.1 /root/.cache/flashinfer/0.7.1
 
 ENV FLASHINFER_WORKSPACE_BASE=/root \
     FLASHINFER_JIT_DEBUG=0
