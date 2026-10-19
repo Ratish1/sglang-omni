@@ -190,9 +190,9 @@ if HAS_TRITON:
         USE_GDC: tl.constexpr,
     ):
         """One program per head and K split: the weighted input against the head's qkv
-        columns over the split's K range, with the rows' sum of squares alongside; the
-        last program of the head sums the partials, applies the norm scale, then norms
-        and rotates q and k; q to Q_OUT, k and v to the row's slot."""
+        columns over the split's K range in one dot, with the rows' sum of squares
+        alongside; the last program of the head sums the partials, applies the norm
+        scale, then norms and rotates q and k; q to Q_OUT, k and v to the row's slot."""
         if USE_GDC:
             gdc_wait()
         else:
@@ -209,9 +209,12 @@ if HAS_TRITON:
         rows_off = row_offsets(x_stride_row, x_stride_t, T, BLOCK_M)
         lo_cols = head * HEAD_DIM + rh
         hi_cols = lo_cols + HALF
+        # note (ratish): the head's columns as one weight tile, so the scaled input feeds
+        # a single dot: a second dot on the same operand makes the pinned Triton rebuild
+        # that operand per dot.
+        head_cols = head * HEAD_DIM + tl.arange(0, HEAD_DIM)
         square = tl.zeros([BLOCK_M, BLOCK_M], dtype=tl.float32)
-        acc_lo = tl.zeros([BLOCK_M, HALF], dtype=tl.float32)
-        acc_hi = tl.zeros([BLOCK_M, HALF], dtype=tl.float32)
+        acc = tl.zeros([BLOCK_M, HEAD_DIM], dtype=tl.float32)
         for block in range(pid_s * BLOCKS_PER_SPLIT, (pid_s + 1) * BLOCKS_PER_SPLIT):
             k0 = block * BLOCK_K
             x = tl.load(
@@ -221,11 +224,8 @@ if HAS_TRITON:
             )
             square = tl.dot(x, tl.trans(x), square)
             scaled = scaled_tile(x, NORM_W, k0, BLOCK_K)
-            acc_lo = tl.dot(
-                scaled, tl.trans(weight_tile(W, lo_cols, k0, K, BLOCK_K)), acc_lo
-            )
-            acc_hi = tl.dot(
-                scaled, tl.trans(weight_tile(W, hi_cols, k0, K, BLOCK_K)), acc_hi
+            acc = tl.dot(
+                scaled, tl.trans(weight_tile(W, head_cols, k0, K, BLOCK_K)), acc
             )
         if USE_GDC:
             gdc_launch_dependents()
@@ -234,8 +234,7 @@ if HAS_TRITON:
         sum_sq = diagonal(square)
         if SPLIT > 1:
             partial_rows = (pid_s * BLOCK_M + rm)[:, None] * N_TOTAL
-            tl.store(PARTIALS + partial_rows + lo_cols[None, :], acc_lo)
-            tl.store(PARTIALS + partial_rows + hi_cols[None, :], acc_hi)
+            tl.store(PARTIALS + partial_rows + head_cols[None, :], acc)
             tl.store(SUM_SQ_PARTIALS + pid_s * BLOCK_M + rm, sum_sq)
             tl.debug_barrier()
             arrived = tl.atomic_add(COUNTERS + head, 1, sem="acq_rel", scope="gpu")
@@ -244,16 +243,13 @@ if HAS_TRITON:
             is_last = pid_s == 0
         if is_last:
             if SPLIT > 1:
-                acc_lo = tl.zeros([BLOCK_M, HALF], dtype=tl.float32)
-                acc_hi = tl.zeros([BLOCK_M, HALF], dtype=tl.float32)
+                acc = tl.zeros([BLOCK_M, HEAD_DIM], dtype=tl.float32)
                 sum_sq = tl.zeros([BLOCK_M], dtype=tl.float32)
                 for split in tl.static_range(SPLIT):
                     partial_rows = (split * BLOCK_M + rm)[:, None] * N_TOTAL
-                    acc_lo += tl.load(
-                        PARTIALS + partial_rows + lo_cols[None, :], cache_modifier=".cg"
-                    )
-                    acc_hi += tl.load(
-                        PARTIALS + partial_rows + hi_cols[None, :], cache_modifier=".cg"
+                    acc += tl.load(
+                        PARTIALS + partial_rows + head_cols[None, :],
+                        cache_modifier=".cg",
                     )
                     sum_sq += tl.load(
                         SUM_SQ_PARTIALS + split * BLOCK_M + rm, cache_modifier=".cg"
@@ -262,8 +258,10 @@ if HAS_TRITON:
             else:
                 pass
             rstd = libdevice.rsqrt(sum_sq / K + norm_eps)
-            lo = (acc_lo * rstd[:, None]).to(tl.bfloat16).to(tl.float32)
-            hi = (acc_hi * rstd[:, None]).to(tl.bfloat16).to(tl.float32)
+            projected = (acc * rstd[:, None]).to(tl.bfloat16).to(tl.float32)
+            lo, hi = tl.split(
+                tl.permute(tl.reshape(projected, [BLOCK_M, 2, HALF]), [0, 2, 1])
+            )
             pos = tl.load(POS + rm, mask=row_mask, other=0)
             cache_rows = rm // T * cache_stride_row + pos * cache_stride_slot
             if head < NUM_Q_HEADS + NUM_KV_HEADS:
@@ -427,8 +425,8 @@ if HAS_TRITON:
         USE_GDC: tl.constexpr,
     ):
         """One program per activation tile: the weighted input against the tile's gate
-        and up rows with the rows' sum of squares alongside, the norm scale applied to
-        both products, both rounded, then silu(gate) * up rounded once."""
+        and up rows in one dot with the rows' sum of squares alongside, the norm scale
+        applied to both products, both rounded, then silu(gate) * up rounded once."""
         if USE_GDC:
             gdc_wait()
         else:
@@ -436,13 +434,18 @@ if HAS_TRITON:
         pid = tl.program_id(0)
         rm = tl.arange(0, BLOCK_M)
         rk = tl.arange(0, BLOCK_K)
+        rn = tl.arange(0, 2 * BLOCK_N)
         row_mask = rm < rows
         rows_off = row_offsets(x_stride_row, x_stride_t, T, BLOCK_M)
         gate_cols = pid * BLOCK_N + tl.arange(0, BLOCK_N)
-        up_cols = INTERMEDIATE + gate_cols
+        # note (ratish): the tile's gate rows then its up rows as one weight tile, so the
+        # scaled input feeds a single dot: a second dot on the same operand makes the
+        # pinned Triton rebuild that operand per dot, and the launch costs 2.6 times more.
+        stacked_cols = pid * BLOCK_N + tl.where(
+            rn < BLOCK_N, rn, INTERMEDIATE - BLOCK_N + rn
+        )
         square = tl.zeros([BLOCK_M, BLOCK_M], dtype=tl.float32)
-        acc_gate = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
-        acc_up = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
+        acc = tl.zeros([BLOCK_M, 2 * BLOCK_N], dtype=tl.float32)
         for block in range(0, K // BLOCK_K):
             k0 = block * BLOCK_K
             x = tl.load(
@@ -452,19 +455,18 @@ if HAS_TRITON:
             )
             square = tl.dot(x, tl.trans(x), square)
             scaled = scaled_tile(x, NORM_W, k0, BLOCK_K)
-            acc_gate = tl.dot(
-                scaled, tl.trans(weight_tile(W, gate_cols, k0, K, BLOCK_K)), acc_gate
-            )
-            acc_up = tl.dot(
-                scaled, tl.trans(weight_tile(W, up_cols, k0, K, BLOCK_K)), acc_up
+            acc = tl.dot(
+                scaled, tl.trans(weight_tile(W, stacked_cols, k0, K, BLOCK_K)), acc
             )
         if USE_GDC:
             gdc_launch_dependents()
         else:
             pass
         rstd = libdevice.rsqrt(diagonal(square) / K + norm_eps)
-        gate = (acc_gate * rstd[:, None]).to(tl.bfloat16).to(tl.float32)
-        up = (acc_up * rstd[:, None]).to(tl.bfloat16).to(tl.float32)
+        products = (acc * rstd[:, None]).to(tl.bfloat16).to(tl.float32)
+        gate, up = tl.split(
+            tl.permute(tl.reshape(products, [BLOCK_M, 2, BLOCK_N]), [0, 2, 1])
+        )
         activated = gate / (1.0 + libdevice.exp(-gate)) * up
         offsets = rm[:, None] * INTERMEDIATE + gate_cols[None, :]
         tl.store(OUT + offsets, activated.to(tl.bfloat16), mask=row_mask[:, None])
