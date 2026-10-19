@@ -33,7 +33,7 @@ The other places a version lives:
 
 | File | What it carries |
 |---|---|
-| `docker/Dockerfile` | `SGLANG_IMAGE` (digest of the new tag's cu13 manifest), the FlashInfer reinstall version, the JIT cache path `/root/.cache/flashinfer/<version>`, `FLASHINFER_CACHE_IMAGE` |
+| `docker/Dockerfile` | `SGLANG_IMAGE` (digest of the new tag's cu13 manifest) and the FlashInfer reinstall version; the base image's FlashInfer AOT packages stay as shipped |
 | `.github/workflows/*.yaml` | Every `image:` line, pinned by digest |
 | `docker/cpu.Dockerfile` | `SGLANG_IMAGE` (digest of the new tag's `-xeon` manifest) |
 | `docker/xpu.Dockerfile` | `SGLANG_XPU_BRANCH` (the tag); SGLang's XPU manifest pins the `sglang-kernel-xpu` wheel |
@@ -273,18 +273,20 @@ SoX executable. It imports llama.cpp before Torch to catch system NCCL
 conflicts; the image prioritizes Torch's NCCL library. A package listing alone
 does not prove a usable runtime.
 
-Reinstalling even the same FlashInfer wheel refreshes bundled header mtimes.
-The Dockerfile preserves the cache donor's mtimes only for byte-identical
-FlashInfer sources; changed sources remain newer and invalidate their objects.
-After rebuilding, run Ninja with `-n -d explain` in the copied `cached_ops`
-directories before GPU validation to catch unintended object recompilation.
+The base image ships FlashInfer's AOT packages at the pinned version:
+`flashinfer-cubin`, the `flashinfer-jit-cache` umbrella and one provider
+package per architecture (`flashinfer-jit-cache-sm90a` and the rest). The
+Dockerfile keeps them, so every kernel they hold loads without a compile and
+only shapes outside them compile into `FLASHINFER_WORKSPACE_BASE` at run time.
+Uninstalling the umbrella alone leaves the providers behind as a package
+without a version, and the flashinfer import fails on it. The reinstall of
+`flashinfer-python` after the Omni dependencies pins the package back to the
+version the AOT packages were built for.
 
 Whether a bump ships a new image follows from the pin diff. When torch, CUDA,
 Python or FlashInfer move, it does: build `docker/Dockerfile` on the
-`lmsysorg/sglang` digest for the new tag, populate the FlashInfer JIT cache
-on a GPU for the architectures CI runs on (Docker builds have none, so the
-Dockerfile copies the cache from a previous image), push it, and put the new
-digest in the Dockerfile and the workflows. CI on the branch means nothing
+`lmsysorg/sglang` digest for the new tag, push it, and put the new digest in
+the workflows. CI on the branch means nothing
 until the workflows point at the new image: on the old one the setup step
 installs the new torch into the virtualenv and nothing after that reflects
 the shipped stack.
@@ -292,11 +294,10 @@ the shipped stack.
 When only SGLang and the wheels it pins move (`sglang-kernel`,
 `sgl-deep-gemm`), the image stays. The setup step installs those pins into the
 virtualenv, whose site-packages precede the image's, and they are the same
-PyPI wheels upstream's CUDA image installs. The FlashInfer cache in the image
-is keyed by a version that did not change. `SGLANG_IMAGE` in
+PyPI wheels upstream's CUDA image installs. The FlashInfer packages in the
+image carry a version that did not change. `SGLANG_IMAGE` in
 `docker/Dockerfile` still moves to the new tag's digest so the next rebuild
-starts from the right base; the workflow digests and
-`FLASHINFER_CACHE_IMAGE` do not.
+starts from the right base; the workflow digests do not.
 
 ## Validation
 
