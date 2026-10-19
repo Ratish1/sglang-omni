@@ -24,6 +24,7 @@ from sglang.srt.layers.layer_boundary import (
 from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
+    LinearParallelGroup,
     MergedColumnParallelLinear,
     QKVParallelLinear,
     ReplicatedLinear,
@@ -100,6 +101,7 @@ __all__ = [
     "get_layer_id",
     "RMSNorm",
     "SiluAndMul",
+    "LinearParallelGroup",
     "MergedColumnParallelLinear",
     "QKVParallelLinear",
     "ReplicatedLinear",
