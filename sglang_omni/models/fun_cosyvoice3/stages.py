@@ -1321,6 +1321,32 @@ def keep_hift_constants_on_device(hift: "CausalHiFTGenerator", device: str) -> N
     hift.f0_predictor.to(torch.float64)
 
 
+def patch_sine_harmonics(hift: "CausalHiFTGenerator", device: torch.device) -> None:
+    """Give SineGen2 its harmonic multipliers on the device, bit for bit. Its forward
+    builds them on the host every call, and their pageable upload waits for all the work
+    queued on the stream."""
+    sine_generator = hift.m_source.l_sin_gen
+    harmonics = torch.arange(
+        1, sine_generator.harmonic_num + 2, dtype=torch.float32, device=device
+    ).view(1, 1, -1)
+
+    def forward(f0: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        sine_waves = (
+            sine_generator._f02sine(  # noqa: leading-underscore  # upstream name
+                torch.multiply(f0, harmonics)
+            )
+            * sine_generator.sine_amp
+        )
+        uv = sine_generator._f02uv(f0)  # noqa: leading-underscore  # upstream name
+        noise_amp = (
+            uv * sine_generator.noise_std + (1 - uv) * sine_generator.sine_amp / 3
+        )
+        noise = noise_amp * sine_generator.sine_waves[:, : sine_waves.shape[1]]
+        return sine_waves * uv + noise, uv, noise
+
+    sine_generator.forward = forward
+
+
 def patch_hift_snake(hift: "CausalHiFTGenerator") -> None:
     """Run each of HiFT's float32 Snake activations as one kernel, bit for bit, where
     CosyVoice's forward launches seven."""
@@ -1826,6 +1852,10 @@ class CosyVoice3Vocoder(BatchVocoderBase[FunCosyVoice3State, torch.Tensor]):
             if self.has_hift_kernels:
                 patch_hift_snake(hift)
                 patch_hift_spectra(hift, device)
+            else:
+                pass
+            if current_platform.is_cuda():
+                patch_sine_harmonics(hift, device)
             else:
                 pass
         else:
