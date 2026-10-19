@@ -196,7 +196,9 @@ class Qwen3OmniImageEncoder(nn.Module):
         if isinstance(pixel_values, torch.Tensor) and isinstance(
             image_grid_thw, torch.Tensor
         ):
-            image_grid_thw = image_grid_thw.to(self.device, dtype=torch.long)
+            # note (ratish): the grid stays on the host; the encoder derives its
+            # lengths there and every later reader takes it on the host.
+            image_grid_thw = image_grid_thw.to(dtype=torch.long)
             pixel_values = pixel_values.to(device=self.device, dtype=self.visual.dtype)
             image_embeds, image_embeds_multiscale = unpack_visual_output(
                 self.visual(pixel_values, grid_thw=image_grid_thw)
@@ -216,7 +218,7 @@ class Qwen3OmniImageEncoder(nn.Module):
         if isinstance(pixel_values_videos, torch.Tensor) and isinstance(
             video_grid_thw, torch.Tensor
         ):
-            video_grid_thw = video_grid_thw.to(self.device, dtype=torch.long)
+            video_grid_thw = video_grid_thw.to(dtype=torch.long)
             pixel_values_videos = pixel_values_videos.to(
                 device=self.device, dtype=self.visual.dtype
             )
