@@ -43,6 +43,7 @@ from sglang.srt.layers.rotary_embedding.base import RotaryEmbedding
 from sglang.srt.runtime_context import get_exec
 
 from sglang_omni.platforms import current_platform
+from sglang_omni.vendor.sglang.distributed import get_group_rank_size
 
 try:  # keep the module importable where Triton is unavailable
     import triton
@@ -566,7 +567,7 @@ def is_plain_bf16_linear(linear: torch.nn.Module) -> bool:
         isinstance(linear.quant_method, UnquantizedLinearMethod)
         and linear.bias is None
         and linear.weight.dtype == torch.bfloat16
-        and linear.tp_size == 1
+        and get_group_rank_size(linear.tp_group)[1] == 1
     )
 
 
