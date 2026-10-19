@@ -2635,12 +2635,12 @@ class Qwen3TTSStreamingVocoderScheduler(
         deadline = time.monotonic() + batch_wait_s
         while len(batch) < max_batch_size:
             remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                break
-            else:
-                pass
             try:
-                next_queued = work_queue.get(timeout=remaining)
+                next_queued = (
+                    work_queue.get(timeout=remaining)
+                    if remaining > 0
+                    else work_queue.get_nowait()
+                )
             except queue.Empty:
                 break
             if next_queued is None:

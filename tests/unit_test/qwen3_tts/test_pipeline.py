@@ -6311,6 +6311,25 @@ def test_qwen3_tts_async_decode_records_request_events(
     assert [metadata["samples"] for metadata in committed] == [4, 8]
 
 
+@pytest.mark.parametrize(("max_batch_size", "taken"), [(8, 3), (2, 2)])
+def test_qwen3_tts_async_batch_takes_what_is_queued_without_waiting(
+    max_batch_size: int, taken: int
+) -> None:
+    scheduler = Qwen3TTSStreamingVocoderScheduler(
+        FakeQwen3TTSSpeechTokenizer(), device="cpu", async_decode=True
+    )
+    work_queue: Queue[tuple[str, Qwen3TTSStreamState] | None] = Queue()
+    for request_id in ("0", "1", "2"):
+        work_queue.put((request_id, scheduler.create_stream_state(request_id)))
+
+    batch = scheduler.collect_async_batch(
+        work_queue, max_batch_size=max_batch_size, batch_wait_s=0.0
+    )
+
+    assert [request_id for request_id, _ in batch] == ["0", "1", "2"][:taken]
+    assert work_queue.qsize() == 3 - taken
+
+
 def test_qwen3_tts_async_initial_batches_ready_requests() -> None:
     tokenizer = FakeQwen3TTSSpeechTokenizer()
     scheduler = Qwen3TTSStreamingVocoderScheduler(
