@@ -497,6 +497,7 @@ class OmniScheduler(Generic[RequestDataT]):
             self.sliding_window_size = None
         self.min_free_slots_delayer = None
         self.enable_fpm = False
+        self.enable_skip_finishing_decode = False
 
         from sglang.srt.runtime_context import get_context, get_parallel
 
