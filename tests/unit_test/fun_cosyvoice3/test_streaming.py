@@ -187,13 +187,16 @@ def stream_payload(
     codes: list[int] | None = None,
     prompt_feat_frames: int = TOKEN_HOP_LEN * TOKEN_MEL_RATIO,
     prompt_token_len: int = TOKEN_HOP_LEN,
+    prompt_feat_dtype: torch.dtype = torch.float32,
 ) -> StagePayload:
     state = FunCosyVoice3State(
         text="hello",
         stream=True,
         audio_codes=None if codes is None else torch.tensor(codes, dtype=torch.long),
         flow_prompt_speech_token=torch.zeros(1, prompt_token_len, dtype=torch.int32),
-        flow_prompt_speech_feat=torch.zeros(1, prompt_feat_frames, 80),
+        flow_prompt_speech_feat=torch.zeros(
+            1, prompt_feat_frames, 80, dtype=prompt_feat_dtype
+        ),
         flow_embedding=torch.ones(1, 192),
         finish_reason="length",
     )
@@ -677,6 +680,22 @@ def test_a_stream_whose_abort_lands_while_the_pump_holds_its_state_gets_nothing(
         assert scheduler.pump_one_step() == []
         assert scheduler.pump_one_step() is None
     assert drain(scheduler) == []
+
+
+def test_a_streams_prompt_takes_flows_dtype_at_its_latch_and_keeps_it() -> None:
+    _, scheduler = make_scheduler()
+    scheduler.handle_streaming_new_request(
+        "req-a", stream_payload("req-a", prompt_feat_dtype=torch.float16)
+    )
+    state = scheduler.stream_states["req-a"]
+    prompt_feat = state.prompt_feat
+    scheduler.ingest_stream_item("req-a", item(list(range(78))))
+    with scheduler.state_lock:
+        assert scheduler.pump_one_step() == []
+        assert scheduler.pump_one_step() == []
+    assert prompt_feat.dtype == torch.float32
+    assert state.prompt_feat is prompt_feat
+    assert state.token_offset == TOKEN_HOP_LEN + next_stream_hop_len(TOKEN_HOP_LEN)
 
 
 def test_pump_drains_backlog_across_one_hop_steps() -> None:

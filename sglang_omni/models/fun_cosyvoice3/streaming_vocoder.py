@@ -55,6 +55,18 @@ SAMPLE_RATE = 24000
 NextDecode = Literal["causal_window", "leftover", "fallback", "wait"]
 
 
+def upload_prompt(
+    tensor: torch.Tensor, device: torch.device, dtype: torch.dtype
+) -> torch.Tensor:
+    """A host prompt tensor as dtype on device, staged in pinned memory where the
+    platform has it, so the copy does not wait for the work queued on the stream."""
+    host = torch.empty(
+        tensor.shape, dtype=dtype, pin_memory=is_pin_memory_available(device)
+    )
+    host.copy_(tensor)
+    return host.to(device, non_blocking=True)
+
+
 def causal_hop_frames(item: FlowBatchInput, *, token_mel_ratio: int) -> int:
     """Mel frames a causal hop over item solves, prompt included."""
     return (
@@ -370,9 +382,14 @@ class FunCosyVoice3StreamingVocoderScheduler(
             token_mel_ratio=self.vocoder.flow.token_mel_ratio,
         )
         if state.prompt_token is None:
-            state.prompt_token = token
-            state.prompt_feat = feat
-            state.embedding = speaker_embedding
+            # note (ratish): on the vocoder's stream, which every launch reading the
+            # prompt follows; each step's pack then copies it on the device.
+            parameter = next(self.vocoder.flow.parameters())
+            device, dtype = parameter.device, parameter.dtype
+            with self.vocoder.stream_context:
+                state.prompt_token = upload_prompt(token, device, torch.int32)
+                state.prompt_feat = upload_prompt(feat, device, dtype)
+                state.embedding = upload_prompt(speaker_embedding, device, dtype)
         elif (
             tuple(token.shape) != tuple(state.prompt_token.shape)
             or tuple(feat.shape) != tuple(state.prompt_feat.shape)
