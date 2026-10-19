@@ -212,7 +212,7 @@ def test_window_slots_survive_reuse_and_release(
         kv_pool.get_key_buffer(0)[slots[-retained_positions:]],
         expected_keys[-retained_positions:],
     )
-    release_kv_cache(request, cache, is_insert=cache_on_release)
+    release_kv_cache(request, cache, checkpoint=cache_on_release)
     assert request_pool.available_size() == 1
     assert allocator.available_size() == retained_positions
     allocator.free(reused_slots)

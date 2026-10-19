@@ -523,7 +523,7 @@ def test_omni_scheduler_run_batch_failure_emits_error_and_aborts(monkeypatch) ->
         lambda rid, *, status: model_path_events.append(("end", rid, status)),
     )
 
-    def release_kv_cache(req, cache) -> None:
+    def release_kv_cache(req, cache, *, checkpoint) -> None:
         skip_insert = getattr(req, "skip_radix_cache_insert", False)
         release_calls.append((req.rid, cache, skip_insert))
         if len(release_calls) == 1:
@@ -1450,7 +1450,7 @@ def test_omni_scheduler_abort_propagates_immediate_kv_cleanup_failure(
 ) -> None:
     """Immediate abort cleanup must not hide allocator failures."""
 
-    def fail_release(_req, _cache) -> None:
+    def fail_release(_req, _cache, *, checkpoint) -> None:
         raise RuntimeError("kv cleanup failed")
 
     monkeypatch.setattr(omni_scheduler_module, "release_kv_cache", fail_release)
@@ -1493,7 +1493,7 @@ def test_omni_scheduler_abort_marks_running_request_for_finish(monkeypatch) -> N
     monkeypatch.setattr(
         omni_scheduler_module,
         "release_kv_cache",
-        lambda req, _cache: release_calls.append(req.rid),
+        lambda req, _cache, *, checkpoint: release_calls.append(req.rid),
     )
     model_path_ends: list[tuple[str, str]] = []
     monkeypatch.setattr(

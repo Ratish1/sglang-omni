@@ -3318,7 +3318,7 @@ class OmniScheduler(Generic[RequestDataT]):
             return
         else:
             pass
-        release_kv_cache(req, self.tree_cache)
+        release_kv_cache(req, self.tree_cache, checkpoint=True)
 
     # note (0xtoward): with autograd on, writes to reused buffers leak every step.
     @DynamicGradMode()

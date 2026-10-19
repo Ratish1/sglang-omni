@@ -13,7 +13,7 @@ import pytest
 import torch
 from PIL import Image
 from sglang.srt.mem_cache.chunk_cache import ChunkCache
-from sglang.srt.mem_cache.common import maybe_cache_unfinished_req
+from sglang.srt.mem_cache.common import checkpoint_kv_cache
 from transformers import PreTrainedTokenizerBase
 
 from sglang_omni.models.minicpm_o.components import preprocessor as preprocessor_mod
@@ -424,7 +424,7 @@ def test_speech_prefill_advances_by_chunk_in_its_own_cache_namespace() -> None:
     )
     first.kv.req_pool_idx = 0
     first.extend_end = 2
-    maybe_cache_unfinished_req(first, chunk_cache, chunked=True)
+    checkpoint_kv_cache(first, chunk_cache)
     assert first.prefix_len == 2
 
 

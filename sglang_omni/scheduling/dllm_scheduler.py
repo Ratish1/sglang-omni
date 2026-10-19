@@ -23,7 +23,7 @@ from sglang.srt.managers.schedule_batch import FINISH_LENGTH, Req, ScheduleBatch
 from sglang.srt.managers.schedule_policy import AddReqResult, PrefillAdder
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
-from sglang.srt.mem_cache.common import release_kv_cache
+from sglang.srt.mem_cache.common import checkpoint_kv_cache, release_kv_cache
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.runtime_context import get_schedule
@@ -59,7 +59,7 @@ class DllmForwardBatch(ForwardBatch):
 
 def release_kv_once(req: Req, tree_cache: BasePrefixCache) -> None:
     if req.kv.holds_kv:
-        release_kv_cache(req, tree_cache)
+        release_kv_cache(req, tree_cache, checkpoint=True)
     else:
         pass
 
@@ -513,7 +513,7 @@ class DllmScheduler:
         """Undo request and cache mutations from an incomplete group probe."""
         if not from_staging:
             for req in admitted_reqs:
-                self.tree_cache.dec_lock_ref(req.last_node)
+                self.tree_cache.unlock(req.lock)
         else:
             pass
         for req, state in request_snapshots:
@@ -822,7 +822,7 @@ class DllmScheduler:
                 continue
             else:
                 pass
-            self.tree_cache.cache_unfinished_req(req, chunked=True)
+            checkpoint_kv_cache(req, self.tree_cache)
             # Keep the row until finish/abort so release_kv_cache owns both
             # cached tokens and the request slot throughout staging.
             new_staging.append(req)

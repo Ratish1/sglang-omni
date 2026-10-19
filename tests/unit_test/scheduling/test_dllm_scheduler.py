@@ -193,7 +193,7 @@ def test_fdfo_unresolved_block_carries_tokens_state_and_resident_kv() -> None:
     cache_calls = []
     free_calls = []
     scheduler.tree_cache = SimpleNamespace(
-        cache_unfinished_req=lambda *args, **kwargs: cache_calls.append((args, kwargs))
+        checkpoint=lambda *args, **kwargs: cache_calls.append((args, kwargs))
     )
     scheduler.req_to_token_pool = SimpleNamespace(
         free=lambda value: free_calls.append(value)

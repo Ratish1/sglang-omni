@@ -18,7 +18,7 @@ from sglang.srt.mem_cache.allocator.paged import PagedTokenToKVPoolAllocator
 from sglang.srt.mem_cache.allocator.token import TokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import EvictParams, MatchPrefixParams
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
-from sglang.srt.mem_cache.common import release_kv_cache
+from sglang.srt.mem_cache.common import checkpoint_kv_cache, release_kv_cache
 from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool, ReqToTokenPool
 from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey
 from sglang.srt.runtime_context import get_context
@@ -492,7 +492,7 @@ def test_a_retracted_reprefill_advances_past_its_private_chunk(
     req = prompt_only_req(state, prompt_len=20)
     write_slots(state, req, 0, 16)
     compute_chunk(state, req, 0, 16)
-    state.cache.cache_unfinished_req(req, chunked=True)
+    checkpoint_kv_cache(req, state.cache)
     req.output_ids.extend(range(30, 51))
     req.init_next_round_input()
     req.skip_radix_cache_insert = True
@@ -508,11 +508,11 @@ def test_a_retracted_reprefill_advances_past_its_private_chunk(
         pass
     else:
         req.kv.kv_committed_len = req.kv.kv_allocated_len = 41
-    release_kv_cache(req, state.cache)
+    release_kv_cache(req, state.cache, checkpoint=True)
     match = state.cache.match_prefix(
         MatchPrefixParams(key=RadixKey(req.origin_input_ids + req.output_ids))
     )
-    assert len(match.device_indices) == 16
+    assert match.device_prefix_len == 16
     assert_every_slot_returns_once(state, total)
 
 
@@ -530,5 +530,5 @@ def test_a_fresh_prompt_chunk_enters_the_radix_tree(
 
     assert (req.prefix_len, req.extend_end) == (32, 41)
     assert state.cache.total_size() == 32
-    release_kv_cache(req, state.cache)
+    release_kv_cache(req, state.cache, checkpoint=True)
     assert_every_slot_returns_once(state, total)
