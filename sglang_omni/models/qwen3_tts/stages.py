@@ -209,10 +209,8 @@ def create_preprocessing_executor(
         )
     else:
         pass
-    # note (luojiaxuan): preprocessing must admit several requests at once. A
-    # serial executor keeps at most one reference-code request in flight, so
-    # the speech-tokenizer batcher would only ever see batches of one; the
-    # default matches the batcher's max_batch_size.
+    # note (ratish): several requests at once, so later references load and embed
+    # their speaker while earlier ones encode.
     return ThreadedSimpleScheduler(
         functools.partial(
             preprocess_qwen3_tts_payload,
