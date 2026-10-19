@@ -182,24 +182,23 @@ def history_exchange(
     rows, padded_samples, channels = padded.shape
     history_samples = int(history_pool.shape[1])
     tail_samples = padded_samples - history_samples - new_samples
-    with torch.get_device_module(padded.device).device(padded.device):
-        history_exchange_kernel[(rows, triton.cdiv(channels, CHANNEL_BLOCK))](
-            padded,
-            history_pool,
-            slot_index,
-            history_samples,
-            new_samples,
-            tail_samples,
-            channels,
-            *padded.stride(),
-            *history_pool.stride(),
-            IS_COLD=is_cold,
-            IS_SHIFT=new_samples < history_samples,
-            HISTORY_BLOCK=triton.next_power_of_2(max(history_samples, 1)),
-            TAIL_BLOCK=triton.next_power_of_2(max(tail_samples, 1)),
-            CHANNEL_BLOCK=CHANNEL_BLOCK,
-            num_warps=4,
-        )
+    history_exchange_kernel[(rows, triton.cdiv(channels, CHANNEL_BLOCK))](
+        padded,
+        history_pool,
+        slot_index,
+        history_samples,
+        new_samples,
+        tail_samples,
+        channels,
+        *padded.stride(),
+        *history_pool.stride(),
+        IS_COLD=is_cold,
+        IS_SHIFT=new_samples < history_samples,
+        HISTORY_BLOCK=triton.next_power_of_2(max(history_samples, 1)),
+        TAIL_BLOCK=triton.next_power_of_2(max(tail_samples, 1)),
+        CHANNEL_BLOCK=CHANNEL_BLOCK,
+        num_warps=4,
+    )
 
 
 # note (ratish): opaque to torch.compile, which cannot trace the Triton launch
@@ -219,18 +218,17 @@ def overlap_exchange(
     """
     rows, _, channels = output.shape
     overlap_samples = int(overlap_pool.shape[1])
-    with torch.get_device_module(output.device).device(output.device):
-        overlap_exchange_kernel[(rows, triton.cdiv(channels, CHANNEL_BLOCK))](
-            output,
-            overlap_pool,
-            slot_index,
-            overlap_samples,
-            emitted_samples,
-            channels,
-            *output.stride(),
-            *overlap_pool.stride(),
-            IS_COLD=is_cold,
-            OVERLAP_BLOCK=triton.next_power_of_2(max(overlap_samples, 1)),
-            CHANNEL_BLOCK=CHANNEL_BLOCK,
-            num_warps=4,
-        )
+    overlap_exchange_kernel[(rows, triton.cdiv(channels, CHANNEL_BLOCK))](
+        output,
+        overlap_pool,
+        slot_index,
+        overlap_samples,
+        emitted_samples,
+        channels,
+        *output.stride(),
+        *overlap_pool.stride(),
+        IS_COLD=is_cold,
+        OVERLAP_BLOCK=triton.next_power_of_2(max(overlap_samples, 1)),
+        CHANNEL_BLOCK=CHANNEL_BLOCK,
+        num_warps=4,
+    )
