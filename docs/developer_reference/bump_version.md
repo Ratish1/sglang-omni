@@ -249,6 +249,15 @@ that have cost time:
   kernels under `SGLANG_CACHE_DIR`; the CI setup action points it at a
   directory shared across PRs on the persistent CI mount, so only the first
   job after a bump pays the build.
+- Compiled kernels. A Triton upgrade can change the cost of an Omni kernel
+  without changing its output. The torch 2.14 bump brought Triton 3.8, and a
+  `tl.dot` operand computed inside the loop and consumed by two dots was
+  rebuilt per dot: the fused predictor MLP kernel took 2.6 times longer and
+  the Qwen3-TTS decode step grew by a millisecond, with every output bit
+  identical. After a Triton or torch bump, time each fused kernel family
+  alone on both stacks with the torch profiler's GPU durations, and when a
+  step time moves, trace the serving step by kernel name before reading the
+  scheduler.
 
 ## The CI image
 
