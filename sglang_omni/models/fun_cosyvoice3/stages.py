@@ -1214,6 +1214,9 @@ def load_cosyvoice3_flow_hift(
     hift.to(device).eval()
     keep_hift_constants_on_device(hift, device)
     patch_sine_harmonics(hift, device)
+    # note (ratish): a plain attribute, so flow.to(device) leaves it on the host and
+    # every Flow call uploads its slice, waiting for the work queued on the stream.
+    flow.decoder.rand_noise = flow.decoder.rand_noise.to(device)
     patch_causal_conv_cache()
     # note (Dayuxiaoshui): folding weight_norm is the only load-time step
     # batched decode needs.
