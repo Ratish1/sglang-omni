@@ -301,19 +301,22 @@ def pack_flow_inputs(
     total_mel_lengths = tuple(
         length * flow.token_mel_ratio for length in combined_lengths
     )
+    # note (ratish): a pageable upload is staged before the call returns, so on CUDA it
+    # need not wait for the work queued on the stream.
+    non_blocking = current_platform.is_cuda()
     combined_token_lengths_tensor = torch.tensor(
-        combined_lengths, dtype=torch.int64, device=device
-    )
+        combined_lengths, dtype=torch.int64
+    ).to(device, non_blocking=non_blocking)
 
     max_tokens = max(combined_lengths)
     token = torch.zeros(len(inputs), max_tokens, dtype=torch.int32, device=device)
     for index, item in enumerate(inputs):
         prompt_length = prompt_lengths[index]
         token[index, :prompt_length] = item.prompt_token[0].to(
-            device=device, dtype=torch.int32
+            device=device, dtype=torch.int32, non_blocking=non_blocking
         )
         token[index, prompt_length : combined_lengths[index]] = item.token[0].to(
-            device=device, dtype=torch.int32
+            device=device, dtype=torch.int32, non_blocking=non_blocking
         )
     token_mask = (
         torch.arange(max_tokens, device=device).unsqueeze(0)
@@ -326,10 +329,14 @@ def pack_flow_inputs(
     )
     for index, item in enumerate(inputs):
         prompt_feat[index, : prompt_mel_lengths[index]] = item.prompt_feat[0].to(
-            device=device, dtype=dtype
+            device=device, dtype=dtype, non_blocking=non_blocking
         )
     embedding = torch.cat(
-        [item.embedding.to(device=device, dtype=dtype) for item in inputs], dim=0
+        [
+            item.embedding.to(device=device, dtype=dtype, non_blocking=non_blocking)
+            for item in inputs
+        ],
+        dim=0,
     )
     return PackedFlowBatch(
         token=token,

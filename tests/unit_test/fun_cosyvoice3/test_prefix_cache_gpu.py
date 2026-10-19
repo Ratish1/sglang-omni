@@ -171,6 +171,69 @@ def test_prefix_hops_are_bit_identical_to_whole_history_hops(
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_prefix_and_whole_history_hops_launch_without_a_host_wait() -> None:
+    estimator = make_estimator()
+    device = torch.device("cuda")
+    dtype = torch.bfloat16
+    pool = PrefixKVPool(
+        layer_num=LAYERS,
+        euler_steps=10,
+        head_num=HEADS,
+        head_dim=HEAD_DIM,
+        capacity_frames=16 * BLOCK_FRAMES,
+        device=device,
+        dtype=dtype,
+    )
+    torch.manual_seed(1)
+    lengths = [120, 70]
+    noise, mu, cond = (
+        torch.randn(1, sum(lengths), CHANNELS, device=device, dtype=dtype)
+        for _ in range(3)
+    )
+    spks = torch.randn(len(lengths), CHANNELS, device=device, dtype=dtype)
+    unit = torch.linspace(0, 1, 11, device=device, dtype=dtype)
+    time_span = 1 - torch.cos(unit * 0.5 * torch.pi)
+    caches = [(PrefixCacheRow(), PrefixCacheRow()) for _ in lengths]
+    for pair, length in zip(caches, lengths, strict=True):
+        assert grow_rows(pool, list(pair), [length, length])
+    with torch.inference_mode(), torch.autocast("cuda", dtype=dtype):
+        estimator.build_modulations(time_span, dtype)
+        angles = estimator.rope_angles(max(lengths))
+        torch.cuda.synchronize()
+        sync_debug_mode = torch.cuda.get_sync_debug_mode()
+        torch.cuda.set_sync_debug_mode("error")
+        try:
+            twin_rows = pack_rows(lengths * 2, device)
+            whole = solve_flow_euler_packed(
+                estimator,
+                noise,
+                time_span,
+                mu,
+                spks,
+                cond,
+                twin_rows,
+                estimator.row_attention(twin_rows, streaming=True, dtype=dtype),
+                angles,
+                cfg_rate=0.7,
+            )
+            cached = solve_flow_euler_prefix(
+                estimator,
+                pool,
+                noise,
+                time_span,
+                mu,
+                spks,
+                cond,
+                lengths,
+                caches,
+                cfg_rate=0.7,
+            )
+        finally:
+            torch.cuda.set_sync_debug_mode(sync_debug_mode)
+    assert torch.equal(cached, whole)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_compiled_prefix_hops_follow_each_row_across_batches() -> None:
     """Compiled hops over rows with their own prompts, prefixes and lengths,
     one joining fresh beside a cached one and the order flipped on a later hop,
