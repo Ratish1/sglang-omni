@@ -51,8 +51,11 @@ Only PR Test and the selected stages actually run; a stage that is not selected 
 
 | Job | What it runs |
 | --- | --- |
-| `unit-test` | `pytest tests/ -m "not benchmark and not accelerator"`, with CUDA hidden from the process |
+| `unit-test-a` | First runtime-balanced partition of `pytest tests/ -m "not benchmark and not accelerator"`, with CUDA hidden |
+| `unit-test-b` | Second runtime-balanced partition of the same CPU unit-test suite, with CUDA hidden |
 | `unit-test-accelerator` | `pytest tests/ -m "accelerator and not benchmark"`, the unit tests that need a GPU |
+
+The CPU partitions run as independent matrix jobs with fail-fast disabled. Files stay intact and are balanced using `.github/unit_test_durations.json`; files without a timing entry receive a one-second estimate. The initial estimates are elapsed intervals from the complete successful [CPU unit-test log](https://github.com/sgl-project/sglang-omni/actions/runs/39288752772/job/118185861718) at `e98bcf05e6d27d877cfb134900900ca6fad5d76a`, not isolated pytest phase measurements. Local pytest remains unpartitioned unless the CI plugin is explicitly loaded.
 
 `run-unit-test-ci-only` selects PR Test without selecting model or hardware stages. Other stage labels remain additive, so keep them and `run-all-ci` absent for unit tests only. Shared setup still runs, including model-weight provisioning. PR Test also runs whenever any other stage label selects a stage, the hardware stages included.
 
