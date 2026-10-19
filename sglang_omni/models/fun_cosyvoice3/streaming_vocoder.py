@@ -18,6 +18,7 @@ from dataclasses import dataclass, field
 from typing import Literal, Mapping
 
 import torch
+from sglang.srt.utils.common import is_pin_memory_available
 
 from sglang_omni.models.fun_cosyvoice3.packed_dit import PackedDiT
 from sglang_omni.models.fun_cosyvoice3.payload_types import FunCosyVoice3State
@@ -448,6 +449,9 @@ class FunCosyVoice3StreamingVocoderScheduler(
         plan: NextDecode,
     ) -> dict[str, torch.Tensor]:
         assert plan != "wait"
+        pin_memory = is_pin_memory_available(
+            next(self.vocoder.flow.parameters()).device
+        )
         if plan == "fallback":
             request_id, _ = participants[0]
             self.complete_stream_request(request_id, self.finish_stream(request_id))
@@ -455,7 +459,9 @@ class FunCosyVoice3StreamingVocoderScheduler(
         elif plan == "leftover":
             items = [
                 FlowBatchInput(
-                    token=torch.tensor(state.tokens, dtype=torch.int32).unsqueeze(0),
+                    token=torch.tensor(
+                        state.tokens, dtype=torch.int32, pin_memory=pin_memory
+                    ).unsqueeze(0),
                     prompt_token=state.prompt_token,
                     prompt_feat=state.prompt_feat,
                     embedding=state.embedding,
@@ -481,6 +487,7 @@ class FunCosyVoice3StreamingVocoderScheduler(
                             : state.token_offset + state.hop_len + PRE_LOOKAHEAD_LEN
                         ],
                         dtype=torch.int32,
+                        pin_memory=pin_memory,
                     ).unsqueeze(0),
                     prompt_token=state.prompt_token,
                     prompt_feat=state.prompt_feat,

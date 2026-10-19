@@ -25,6 +25,7 @@ from numpy.typing import ArrayLike
 from sglang.srt.arg_groups.cuda_graph_hook import (
     generate_prefill_cuda_graph_batch_sizes,
 )
+from sglang.srt.utils.common import is_pin_memory_available
 from torch._inductor.runtime.compile_tasks import _set_triton_libdevice_path
 from torch.nn.utils.parametrize import is_parametrized, remove_parametrizations
 from x_transformers.x_transformers import apply_rotary_pos_emb
@@ -302,18 +303,20 @@ def pack_flow_inputs(
         length * flow.token_mel_ratio for length in combined_lengths
     )
     combined_token_lengths_tensor = torch.tensor(
-        combined_lengths, dtype=torch.int64, device=device
-    )
+        combined_lengths,
+        dtype=torch.int64,
+        pin_memory=is_pin_memory_available(device),
+    ).to(device, non_blocking=True)
 
     max_tokens = max(combined_lengths)
     token = torch.zeros(len(inputs), max_tokens, dtype=torch.int32, device=device)
     for index, item in enumerate(inputs):
         prompt_length = prompt_lengths[index]
         token[index, :prompt_length] = item.prompt_token[0].to(
-            device=device, dtype=torch.int32
+            device=device, dtype=torch.int32, non_blocking=True
         )
         token[index, prompt_length : combined_lengths[index]] = item.token[0].to(
-            device=device, dtype=torch.int32
+            device=device, dtype=torch.int32, non_blocking=True
         )
     token_mask = (
         torch.arange(max_tokens, device=device).unsqueeze(0)
@@ -326,10 +329,14 @@ def pack_flow_inputs(
     )
     for index, item in enumerate(inputs):
         prompt_feat[index, : prompt_mel_lengths[index]] = item.prompt_feat[0].to(
-            device=device, dtype=dtype
+            device=device, dtype=dtype, non_blocking=True
         )
     embedding = torch.cat(
-        [item.embedding.to(device=device, dtype=dtype) for item in inputs], dim=0
+        [
+            item.embedding.to(device=device, dtype=dtype, non_blocking=True)
+            for item in inputs
+        ],
+        dim=0,
     )
     return PackedFlowBatch(
         token=token,
