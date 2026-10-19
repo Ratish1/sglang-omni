@@ -12,7 +12,7 @@ import threading
 import time
 import types
 from collections import deque
-from collections.abc import Iterable, Iterator
+from collections.abc import Iterable, Iterator, Sequence
 from pathlib import Path
 from queue import Empty, Queue
 from types import SimpleNamespace
@@ -86,6 +86,7 @@ from sglang_omni.models.qwen3_tts.streaming_vocoder import (
     Qwen3TTSInvalidCodeRows,
     Qwen3TTSStreamingVocoderScheduler,
     Qwen3TTSStreamState,
+    ReferenceFill,
 )
 from sglang_omni.models.registry import PIPELINE_CONFIG_REGISTRY
 from sglang_omni.pipeline.stage.stream_queue import StreamItem
@@ -3283,9 +3284,15 @@ def test_qwen3_tts_initial_cohorts_overlap_and_commit_once(
         *,
         stream: torch.Stream | None,
         tail_runner: Qwen3TTSIncrementalCodecCudaGraphRunner | None = None,
+        reference_fills: Sequence[ReferenceFill] = (),
     ) -> PendingIncrementalGroup | None:
         events.append(("launch", decode_entries[0][0]))
-        return launch(decode_entries, stream=stream, tail_runner=tail_runner)
+        return launch(
+            decode_entries,
+            stream=stream,
+            tail_runner=tail_runner,
+            reference_fills=reference_fills,
+        )
 
     def record_finish(
         pending: PendingIncrementalGroup,
@@ -3342,11 +3349,17 @@ def test_qwen3_tts_initial_cohort_interrupt_releases_all_claims(
         *,
         stream: torch.Stream | None,
         tail_runner: Qwen3TTSIncrementalCodecCudaGraphRunner | None = None,
+        reference_fills: Sequence[ReferenceFill] = (),
     ) -> PendingIncrementalGroup | None:
         if decode_entries[0][0] == "1":
             raise KeyboardInterrupt
         else:
-            return launch(decode_entries, stream=stream, tail_runner=tail_runner)
+            return launch(
+                decode_entries,
+                stream=stream,
+                tail_runner=tail_runner,
+                reference_fills=reference_fills,
+            )
 
     monkeypatch.setattr(scheduler, "launch_incremental_group", interrupted_launch)
     with pytest.raises(KeyboardInterrupt):
