@@ -32,7 +32,7 @@ import torch
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.environ import envs
-from sglang.srt.layers.dp_attention import compute_dp_attention_world_info
+from sglang.srt.layers.dp_attention import get_dp_tp_group
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.io_struct import AbortReq
 from sglang.srt.managers.schedule_batch import (
@@ -423,7 +423,6 @@ class OmniScheduler(Generic[RequestDataT]):
         self.tp_size = get_parallel().tp_size
         self.pp_rank = 0
         self.pp_size = get_parallel().pp_size
-        self.dp_size = get_parallel().dp_size
         self.attn_cp_size = get_parallel().attn_cp_size
         self.page_size = get_schedule().page_size
         self.enable_overlap = enable_overlap
@@ -941,33 +940,22 @@ class OmniScheduler(Generic[RequestDataT]):
     def init_parallel_state(self, tp_worker: ModelWorker) -> None:
         from sglang.srt.runtime_context import get_parallel
 
-        enable_dp_attention = get_parallel().enable_dp_attention
-        (
-            self.attn_tp_rank,
-            self.attn_tp_size,
-            self.attn_dp_rank,
-            self.attn_dp_size,
-        ) = compute_dp_attention_world_info(
-            enable_dp_attention,
-            self.tp_rank,
-            self.tp_size,
-            self.dp_size,
-            self.attn_cp_size,
-        )
+        self.attn_tp_rank = get_parallel().attn_tp_rank
+        self.attn_tp_size = get_parallel().attn_tp_size
+        self.attn_dp_rank = get_parallel().attn_dp_rank
+        self.attn_dp_size = get_parallel().attn_dp_size
 
         self.tp_group = tp_worker.get_tp_group()
         self.tp_cpu_group = self.tp_group.cpu_group
         self.attn_tp_group = tp_worker.get_attention_tp_group()
         self.attn_tp_cpu_group = tp_worker.get_attention_tp_cpu_group()
 
-        if enable_dp_attention:
-            self.cpu_group = self.attn_tp_cpu_group
-            self.entry_rank = self.attn_tp_group.first_rank
-            self.is_entry_rank = self.attn_tp_rank == 0
-        else:
-            self.cpu_group = self.tp_cpu_group
-            self.entry_rank = self.tp_group.first_rank
-            self.is_entry_rank = self.tp_group.rank_in_group == 0
+        # note (ratish): the request-plane group is the attention-TP group under
+        # attention DP and the TP group otherwise; its first rank takes requests.
+        dp_tp_group = get_dp_tp_group()
+        self.cpu_group = dp_tp_group.cpu_group
+        self.entry_rank = dp_tp_group.first_rank
+        self.is_entry_rank = dp_tp_group.rank_in_group == 0
 
         self.pad_input_ids_func = tp_worker.get_pad_input_ids_func()
 
