@@ -30,6 +30,7 @@ from sglang_omni.models.fun_cosyvoice3.stages import (
     FlowBatchInput,
     HiftStepRow,
     HiftStepSamples,
+    to_device_pinned,
 )
 from sglang_omni.models.fun_cosyvoice3.streaming import (
     PRE_LOOKAHEAD_LEN,
@@ -495,7 +496,10 @@ class FunCosyVoice3StreamingVocoderScheduler(
             request_id, _ = participants[0]
             self.complete_stream_request(request_id, self.finish_stream(request_id))
             return None
-        elif plan == "leftover":
+        else:
+            pass
+        self.hold_prompts_on_device(participants)
+        if plan == "leftover":
             items = [
                 FlowBatchInput(
                     token=torch.tensor(state.tokens, dtype=torch.int32).unsqueeze(0),
@@ -554,6 +558,20 @@ class FunCosyVoice3StreamingVocoderScheduler(
                 else:
                     state.ready_since = None
             return LaunchedStep(participants=participants, plan=plan, samples=samples)
+
+    def hold_prompts_on_device(
+        self, participants: list[tuple[str, CosyVoice3StreamState]]
+    ) -> None:
+        """Move each stream's prompt to Flow's device and dtypes at its first launch, on
+        the vocoder's stream; every later step's pack copies it on the device."""
+        parameter = next(self.vocoder.flow.parameters())
+        device, dtype = parameter.device, parameter.dtype
+        for _, state in participants:
+            state.prompt_token = to_device_pinned(
+                state.prompt_token, device, torch.int32
+            )
+            state.prompt_feat = to_device_pinned(state.prompt_feat, device, dtype)
+            state.embedding = to_device_pinned(state.embedding, device, dtype)
 
     def complete_step(self, launched: LaunchedStep) -> list[str]:
         """Read a launched step's audio and send it: a hop's chunk, or a final's last

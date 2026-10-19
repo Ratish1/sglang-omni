@@ -1542,6 +1542,21 @@ def test_hift_step_queues_its_samples_without_a_host_wait() -> None:
 
 @pytest.mark.accelerator
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_hift_steps_record_their_copies_on_two_events_in_turn() -> None:
+    vocoder = stages.CosyVoice3Vocoder(HiftFlowStub(), make_causal_hift(10.0))
+    row = stages.HiftStepRow(
+        history=torch.randn(1, 80, 60, device="cuda"),
+        emitted_samples=0,
+        is_final=False,
+    )
+    with torch.inference_mode():
+        events = [vocoder.hift_step([row]).copy_done for _ in range(3)]
+    assert events[0] is not events[1]
+    assert events[2] is events[0]
+
+
+@pytest.mark.accelerator
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_vocoder_sine_source_matches_cosyvoice_without_a_host_wait() -> None:
     hift = make_causal_hift(10.0)
     reference_hift = copy.deepcopy(hift)
