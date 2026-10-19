@@ -113,6 +113,8 @@ def apply_qwen_tts_transformers_compatibility_patches() -> None:
     from transformers.utils import generic
 
     with _APPLY_LOCK:
+        # note (ratish): qwen-tts reads the default rope initializer from the
+        # registry by key, and the pinned Transformers registers only the scaled types.
         ROPE_INIT_FUNCTIONS.setdefault("default", compute_default_rope_parameters)
         patch_mask_factories()
 
