@@ -257,6 +257,19 @@ class PackedFlowBatch:
 logger = logging.getLogger(__name__)
 
 
+def to_device_pinned(
+    tensor: torch.Tensor, device: torch.device, dtype: torch.dtype
+) -> torch.Tensor:
+    """tensor as dtype on device. On CUDA a host tensor is copied from pinned memory,
+    which the copy reads without staging, so the call does not wait for queued work."""
+    if tensor.device == device:
+        return tensor.to(dtype=dtype)
+    elif current_platform.is_cuda():
+        return tensor.to(dtype=dtype).pin_memory().to(device, non_blocking=True)
+    else:
+        return tensor.to(device=device, dtype=dtype)
+
+
 def pack_flow_inputs(
     flow: CausalMaskedDiffWithDiT, inputs: Sequence[FlowBatchInput]
 ) -> PackedFlowBatch:
@@ -320,8 +333,9 @@ def pack_flow_inputs(
     total_mel_lengths = tuple(
         length * flow.token_mel_ratio for length in combined_lengths
     )
-    # note (ratish): a pageable upload is staged before the call returns, so on CUDA it
-    # need not wait for the work queued on the stream.
+    # note (ratish): a pageable copy past 64 KB waits on the host for the stream's queued
+    # work. A streaming step uploads a few tokens and lengths here; its prompt is on the
+    # device already.
     non_blocking = current_platform.is_cuda()
     combined_token_lengths_tensor = torch.tensor(
         combined_lengths, dtype=torch.int64
