@@ -1909,6 +1909,8 @@ class CosyVoice3Vocoder(BatchVocoderBase[FunCosyVoice3State, torch.Tensor]):
             self.stream_context = contextlib.nullcontext()
             self.has_hift_kernels = False
             self.has_async_samples = False
+        self.copy_done_events: list[torch.cuda.Event] = []
+        self.copy_done_slot: int = 0
 
     def prepare_item(
         self, payload: StagePayload
@@ -2209,7 +2211,7 @@ class CosyVoice3Vocoder(BatchVocoderBase[FunCosyVoice3State, torch.Tensor]):
             outputs.update(zip(members, decoded, strict=True))
         ordered = [outputs[index] for index in range(len(rows))]
         if self.has_async_samples:
-            copy_done: torch.cuda.Event | None = torch.cuda.Event()
+            copy_done: torch.cuda.Event | None = self.next_copy_done_event()
             copy_done.record()
         else:
             copy_done = None
@@ -2218,6 +2220,18 @@ class CosyVoice3Vocoder(BatchVocoderBase[FunCosyVoice3State, torch.Tensor]):
             emitted_samples=[emitted for _, emitted in ordered],
             copy_done=copy_done,
         )
+
+    def next_copy_done_event(self) -> torch.cuda.Event:
+        # note (ratish): a new event is created at its first record, which waits while
+        # another thread of the process is inside the CUDA runtime. Two, since a step
+        # completes after the next one is launched.
+        if not self.copy_done_events:
+            self.copy_done_events = [torch.cuda.Event() for _ in range(2)]
+        else:
+            pass
+        event = self.copy_done_events[self.copy_done_slot]
+        self.copy_done_slot ^= 1
+        return event
 
     def hift_group(
         self, windows: Sequence[HiftDecodeWindow]
