@@ -533,9 +533,15 @@ class FunCosyVoice3StreamingVocoderScheduler(
             mels = self.hop_batch_with_prefix(participants, items)
             samples = self.hift_step(participants, mels, is_final=False)
             now = self.clock()
-            for (_, state), offset in zip(
-                participants, samples.emitted_samples, strict=True
+            for (_, state), new_samples, offset in zip(
+                participants, samples.new_samples, samples.emitted_samples, strict=True
             ):
+                # note (ratish): playback starts with the launch of the first samples, so
+                # the next selection, made before their completion, ranks the stream started.
+                if new_samples.numel() > 0 and state.first_emit_at is None:
+                    state.first_emit_at = now
+                else:
+                    pass
                 state.speech_offset = offset
                 state.token_offset += state.hop_len
                 state.hop_len = next_stream_hop_len(
@@ -554,7 +560,6 @@ class FunCosyVoice3StreamingVocoderScheduler(
         chunk and then its result. Streams cleared since the launch get nothing."""
         try:
             deltas = launched.samples.wait()
-            now = self.clock()
             for (request_id, state), delta in zip(
                 launched.participants, deltas, strict=True
             ):
@@ -567,10 +572,6 @@ class FunCosyVoice3StreamingVocoderScheduler(
                         request_id, self.finish_stream(request_id)
                     )
                 elif delta.numel() > 0:
-                    if state.first_emit_at is None:
-                        state.first_emit_at = now
-                    else:
-                        pass
                     self.mark_stream_emitted(request_id)
                     self.outbox.put(self.stream_chunk_message(request_id, delta))
                 else:

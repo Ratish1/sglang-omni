@@ -630,6 +630,24 @@ def test_a_final_launched_behind_its_hop_leaves_after_it_with_its_result_last(
     assert "req-a" not in scheduler.stream_states
 
 
+def test_a_stream_whose_first_hop_is_in_flight_ranks_started(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _, scheduler = make_scheduler(max_batch_size=1)
+    clock = Clock(999.0)
+    scheduler.clock = clock
+    pending_copies(scheduler, monkeypatch)
+    for request_id in ("req-a", "req-c"):
+        scheduler.handle_streaming_new_request(request_id, stream_payload(request_id))
+    scheduler.ingest_stream_item("req-a", item([i % 31 for i in range(78)]))
+    clock.now = 999.5
+    scheduler.ingest_stream_item("req-c", item(list(range(28))))
+    clock.now = 1000.0
+    with scheduler.state_lock:
+        assert scheduler.pump_streams() == []
+    assert stream_ids(drain(scheduler)) == ["req-a", "req-a", "req-c"]
+
+
 def test_a_stream_aborted_while_its_step_is_in_flight_gets_nothing(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
