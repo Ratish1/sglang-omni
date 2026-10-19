@@ -1509,6 +1509,26 @@ def test_vocoder_spectra_match_cosyvoice_without_a_host_wait(
 
 @pytest.mark.accelerator
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_patched_sine_source_matches_cosyvoice_without_a_host_wait() -> None:
+    hift = make_causal_hift(10.0)
+    reference_hift = copy.deepcopy(hift)
+    stages.patch_sine_harmonics(hift, "cuda")
+    torch.manual_seed(4)
+    f0 = torch.rand(3, 4800, 1, device="cuda") * 400
+    with torch.inference_mode():
+        references = reference_hift.m_source.l_sin_gen(f0)
+        sync_debug_mode = torch.cuda.get_sync_debug_mode()
+        torch.cuda.set_sync_debug_mode("error")
+        try:
+            outputs = hift.m_source.l_sin_gen(f0)
+        finally:
+            torch.cuda.set_sync_debug_mode(sync_debug_mode)
+    for output, reference in zip(outputs, references, strict=True):
+        assert torch.equal(output, reference)
+
+
+@pytest.mark.accelerator
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_hift_decode_replay_equals_each_rows_own_decode(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
