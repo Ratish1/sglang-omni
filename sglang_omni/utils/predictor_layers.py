@@ -77,6 +77,10 @@ MIN_BLOCK_M = 16
 # their head, exceed 255 registers per thread; a second program rereads the weights.
 MAX_FUSED_ROWS = 64
 NUM_WARPS = 4
+# note (ratish): the pinned Triton stages the scaled input once more for the head's
+# second dot; at two warps per program that costs nothing against the previous
+# Triton's four-warp time, while merging the two dots costs a tile split instead.
+QKV_NUM_WARPS = 2
 NUM_STAGES = 3
 
 
@@ -190,9 +194,9 @@ if HAS_TRITON:
         USE_GDC: tl.constexpr,
     ):
         """One program per head and K split: the weighted input against the head's qkv
-        columns over the split's K range in one dot, with the rows' sum of squares
-        alongside; the last program of the head sums the partials, applies the norm
-        scale, then norms and rotates q and k; q to Q_OUT, k and v to the row's slot."""
+        columns over the split's K range, with the rows' sum of squares alongside; the
+        last program of the head sums the partials, applies the norm scale, then norms
+        and rotates q and k; q to Q_OUT, k and v to the row's slot."""
         if USE_GDC:
             gdc_wait()
         else:
@@ -209,12 +213,9 @@ if HAS_TRITON:
         rows_off = row_offsets(x_stride_row, x_stride_t, T, BLOCK_M)
         lo_cols = head * HEAD_DIM + rh
         hi_cols = lo_cols + HALF
-        # note (ratish): the head's columns as one weight tile, so the scaled input feeds
-        # a single dot: a second dot on the same operand makes the pinned Triton rebuild
-        # that operand per dot.
-        head_cols = head * HEAD_DIM + tl.arange(0, HEAD_DIM)
         square = tl.zeros([BLOCK_M, BLOCK_M], dtype=tl.float32)
-        acc = tl.zeros([BLOCK_M, HEAD_DIM], dtype=tl.float32)
+        acc_lo = tl.zeros([BLOCK_M, HALF], dtype=tl.float32)
+        acc_hi = tl.zeros([BLOCK_M, HALF], dtype=tl.float32)
         for block in range(pid_s * BLOCKS_PER_SPLIT, (pid_s + 1) * BLOCKS_PER_SPLIT):
             k0 = block * BLOCK_K
             x = tl.load(
@@ -224,8 +225,11 @@ if HAS_TRITON:
             )
             square = tl.dot(x, tl.trans(x), square)
             scaled = scaled_tile(x, NORM_W, k0, BLOCK_K)
-            acc = tl.dot(
-                scaled, tl.trans(weight_tile(W, head_cols, k0, K, BLOCK_K)), acc
+            acc_lo = tl.dot(
+                scaled, tl.trans(weight_tile(W, lo_cols, k0, K, BLOCK_K)), acc_lo
+            )
+            acc_hi = tl.dot(
+                scaled, tl.trans(weight_tile(W, hi_cols, k0, K, BLOCK_K)), acc_hi
             )
         if USE_GDC:
             gdc_launch_dependents()
@@ -234,7 +238,8 @@ if HAS_TRITON:
         sum_sq = diagonal(square)
         if SPLIT > 1:
             partial_rows = (pid_s * BLOCK_M + rm)[:, None] * N_TOTAL
-            tl.store(PARTIALS + partial_rows + head_cols[None, :], acc)
+            tl.store(PARTIALS + partial_rows + lo_cols[None, :], acc_lo)
+            tl.store(PARTIALS + partial_rows + hi_cols[None, :], acc_hi)
             tl.store(SUM_SQ_PARTIALS + pid_s * BLOCK_M + rm, sum_sq)
             tl.debug_barrier()
             arrived = tl.atomic_add(COUNTERS + head, 1, sem="acq_rel", scope="gpu")
@@ -243,13 +248,16 @@ if HAS_TRITON:
             is_last = pid_s == 0
         if is_last:
             if SPLIT > 1:
-                acc = tl.zeros([BLOCK_M, HEAD_DIM], dtype=tl.float32)
+                acc_lo = tl.zeros([BLOCK_M, HALF], dtype=tl.float32)
+                acc_hi = tl.zeros([BLOCK_M, HALF], dtype=tl.float32)
                 sum_sq = tl.zeros([BLOCK_M], dtype=tl.float32)
                 for split in tl.static_range(SPLIT):
                     partial_rows = (split * BLOCK_M + rm)[:, None] * N_TOTAL
-                    acc += tl.load(
-                        PARTIALS + partial_rows + head_cols[None, :],
-                        cache_modifier=".cg",
+                    acc_lo += tl.load(
+                        PARTIALS + partial_rows + lo_cols[None, :], cache_modifier=".cg"
+                    )
+                    acc_hi += tl.load(
+                        PARTIALS + partial_rows + hi_cols[None, :], cache_modifier=".cg"
                     )
                     sum_sq += tl.load(
                         SUM_SQ_PARTIALS + split * BLOCK_M + rm, cache_modifier=".cg"
@@ -258,10 +266,8 @@ if HAS_TRITON:
             else:
                 pass
             rstd = libdevice.rsqrt(sum_sq / K + norm_eps)
-            projected = (acc * rstd[:, None]).to(tl.bfloat16).to(tl.float32)
-            lo, hi = tl.split(
-                tl.permute(tl.reshape(projected, [BLOCK_M, 2, HALF]), [0, 2, 1])
-            )
+            lo = (acc_lo * rstd[:, None]).to(tl.bfloat16).to(tl.float32)
+            hi = (acc_hi * rstd[:, None]).to(tl.bfloat16).to(tl.float32)
             pos = tl.load(POS + rm, mask=row_mask, other=0)
             cache_rows = rm // T * cache_stride_row + pos * cache_stride_slot
             if head < NUM_Q_HEADS + NUM_KV_HEADS:
@@ -727,7 +733,7 @@ def attention_inputs(
         BLOCK_M=block_rows(rows),
         BLOCK_K=BLOCK_K,
         USE_GDC=use_gdc,
-        num_warps=NUM_WARPS,
+        num_warps=QKV_NUM_WARPS,
         num_stages=NUM_STAGES,
         launch_pdl=use_gdc,
     )
