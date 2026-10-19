@@ -43,12 +43,11 @@ class Qwen3OmniVisionAttention(nn.Module):
         hidden_states: torch.Tensor,
         cu_seqlens: torch.Tensor,
         position_embeddings: tuple[torch.Tensor, torch.Tensor] | VisionRotaryInputs,
-        max_seqlen: int | None = None,
+        max_seqlen: int,
         *,
         sequence_metadata: VisionSequenceMetadata,
         **kwargs: Unpack[TransformersKwargs],
     ) -> torch.Tensor:
-        # note (ratish): the block passes max_seqlen; the host patch counts stand in for it.
         sequence_patch_count = hidden_states.shape[0]
         query, key, value = (
             self.qkv(hidden_states)
@@ -86,8 +85,8 @@ class Qwen3OmniVisionAttention(nn.Module):
                 dropout=0.0 if not self.training else self.attention_dropout,
                 cu_seq_lens_q=cu_seqlens,
                 cu_seq_lens_k=cu_seqlens,
-                max_length_q=sequence_metadata.max_sequence_patch_count,
-                max_length_k=sequence_metadata.max_sequence_patch_count,
+                max_length_q=max_seqlen,
+                max_length_k=max_seqlen,
                 is_causal=False,
                 **kwargs,
             )

@@ -8,12 +8,13 @@ from dataclasses import dataclass
 import torch
 from transformers.models.qwen3_omni_moe import modeling_qwen3_omni_moe as hf_modeling
 from transformers.processing_utils import Unpack
-from transformers.utils.generic import TransformersKwargs, merge_with_config_defaults
-from transformers.utils.output_capturing import capture_outputs
-from transformers.vision_utils import (
-    get_vision_attention_seqlens,
-    get_vision_position_ids,
+from transformers.utils.generic import (
+    TransformersKwargs,
+    get_max_seqlen,
+    merge_with_config_defaults,
 )
+from transformers.utils.output_capturing import capture_outputs
+from transformers.vision_utils import get_vision_cu_seqlens, get_vision_position_ids
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -25,7 +26,6 @@ class VisionRotaryInputs:
 @dataclass(frozen=True, kw_only=True)
 class VisionSequenceMetadata:
     sequence_patch_counts: tuple[int, ...]
-    max_sequence_patch_count: int
 
 
 class Qwen3OmniMoeVisionEncoderCompat(hf_modeling.Qwen3OmniMoeVisionEncoder):
@@ -41,7 +41,13 @@ class Qwen3OmniMoeVisionEncoderCompat(hf_modeling.Qwen3OmniMoeVisionEncoder):
     def prepare_attention_metadata(
         self,
         cumulative_sequence_lengths: torch.Tensor,
+        kwargs: dict[str, object],
     ) -> dict[str, VisionSequenceMetadata]:
+        """The extra attention keywords every block receives.
+
+        A subclass holding the host lengths writes max_seqlen into kwargs here,
+        where get_max_seqlen reads it instead of syncing on the device lengths.
+        """
         return {}
 
     def legacy_pos_embed_interpolate(
@@ -140,11 +146,11 @@ class Qwen3OmniMoeVisionEncoderCompat(hf_modeling.Qwen3OmniMoeVisionEncoder):
         position_ids = get_vision_position_ids(
             grid_thw, self.spatial_merge_size, kwargs=kwargs
         )
-        cu_seqlens, max_seqlen = get_vision_attention_seqlens(
-            grid_thw, self.config, kwargs=kwargs
+        cu_seqlens = get_vision_cu_seqlens(grid_thw, kwargs=kwargs)
+        attention_metadata_arguments = self.prepare_attention_metadata(
+            cu_seqlens, kwargs
         )
-
-        attention_metadata_arguments = self.prepare_attention_metadata(cu_seqlens)
+        max_seqlen = get_max_seqlen(cu_seqlens, self.config, kwargs=kwargs)
 
         hidden_states = self.patch_embed(hidden_states)
         pos_embeds = self.legacy_pos_embed_interpolate(grid_thw)

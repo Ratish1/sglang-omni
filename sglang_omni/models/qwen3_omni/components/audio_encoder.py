@@ -85,8 +85,6 @@ class SegmentSplits:
 def forward_with_shared_segments(
     self, hidden_states, cu_seqlens, max_seqlen: int | None = None, **kwargs
 ):
-    # note (ratish): the layer passes max_seqlen; the shared segments split the
-    # sequence themselves, so no window max is read.
     splits = (
         self._omni_segment_splits.value
     )  # noqa: leading-underscore  # upstream spelling, or the public name is already taken
@@ -94,7 +92,7 @@ def forward_with_shared_segments(
         # Note (wenyao): a stale or mismatched split would silently corrupt
         # attention rather than fail, so fall back instead of trusting it.
         return self._omni_unshared_forward(
-            hidden_states, cu_seqlens, **kwargs
+            hidden_states, cu_seqlens, max_seqlen=max_seqlen, **kwargs
         )  # noqa: leading-underscore  # upstream spelling, or the public name is already taken
     else:
         pass
