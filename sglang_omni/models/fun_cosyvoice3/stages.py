@@ -25,6 +25,7 @@ from numpy.typing import ArrayLike
 from sglang.srt.arg_groups.cuda_graph_hook import (
     generate_prefill_cuda_graph_batch_sizes,
 )
+from sglang.srt.utils.common import async_d2h
 from torch._inductor.runtime.compile_tasks import _set_triton_libdevice_path
 from torch.nn.utils.parametrize import is_parametrized, remove_parametrizations
 from x_transformers.x_transformers import apply_rotary_pos_emb
@@ -208,6 +209,24 @@ class HiftStepRow:
     history: torch.Tensor
     emitted_samples: int
     is_final: bool
+
+
+@dataclass(kw_only=True, frozen=True)
+class HiftStepSamples:
+    """A streaming HiFT step's new samples per row and each row's emitted samples after
+    it. On CUDA the new samples view a pinned host copy, complete once copy_done is."""
+
+    new_samples: list[torch.Tensor]
+    emitted_samples: list[int]
+    copy_done: torch.cuda.Event | None
+
+    def wait(self) -> list[torch.Tensor]:
+        """Each row's new samples as a host tensor of its own, once the copy has landed."""
+        if self.copy_done is not None:
+            self.copy_done.synchronize()
+        else:
+            pass
+        return [samples.clone() for samples in self.new_samples]
 
 
 @dataclass(kw_only=True, frozen=True)
@@ -1865,9 +1884,11 @@ class CosyVoice3Vocoder(BatchVocoderBase[FunCosyVoice3State, torch.Tensor]):
                 patch_sine_harmonics(hift, device)
             else:
                 pass
+            self.has_async_samples = current_platform.is_cuda()
         else:
             self.stream_context = contextlib.nullcontext()
             self.has_hift_kernels = False
+            self.has_async_samples = False
 
     def prepare_item(
         self, payload: StagePayload
@@ -2132,9 +2153,9 @@ class CosyVoice3Vocoder(BatchVocoderBase[FunCosyVoice3State, torch.Tensor]):
         return delta, tts_mel.detach(), int(tts_speech.shape[1])
 
     @torch.inference_mode()
-    def hift_step(self, rows: Sequence[HiftStepRow]) -> list[tuple[torch.Tensor, int]]:
-        """HiFT over the rows of a streaming step. Returns each row's new samples
-        and its emitted sample count afterwards."""
+    def hift_step(self, rows: Sequence[HiftStepRow]) -> HiftStepSamples:
+        """HiFT over the rows of a streaming step: each row's new samples and its
+        emitted sample count afterwards."""
         windows: list[HiftDecodeWindow] = []
         for row in rows:
             history_frames = int(row.history.shape[2])
@@ -2166,7 +2187,17 @@ class CosyVoice3Vocoder(BatchVocoderBase[FunCosyVoice3State, torch.Tensor]):
         for members in groups.values():
             decoded = self.hift_group([windows[index] for index in members])
             outputs.update(zip(members, decoded, strict=True))
-        return [outputs[index] for index in range(len(rows))]
+        ordered = [outputs[index] for index in range(len(rows))]
+        if self.has_async_samples:
+            copy_done: torch.cuda.Event | None = torch.cuda.Event()
+            copy_done.record()
+        else:
+            copy_done = None
+        return HiftStepSamples(
+            new_samples=[samples for samples, _ in ordered],
+            emitted_samples=[emitted for _, emitted in ordered],
+            copy_done=copy_done,
+        )
 
     def hift_group(
         self, windows: Sequence[HiftDecodeWindow]
@@ -2256,7 +2287,12 @@ class CosyVoice3Vocoder(BatchVocoderBase[FunCosyVoice3State, torch.Tensor]):
             speech = hift.decode(x=window_mel, s=window_source, finalize=True)
         else:
             speech = runner.run(window_mel, window_source)
-        speech = speech.detach().cpu()
+        # note (ratish): queued on this stream, the copy reads a replay's output before
+        # any later replay of the pool overwrites it.
+        if self.has_async_samples:
+            speech = async_d2h(speech.detach())
+        else:
+            speech = speech.detach().cpu()
         return [
             (
                 speech[
@@ -2264,7 +2300,7 @@ class CosyVoice3Vocoder(BatchVocoderBase[FunCosyVoice3State, torch.Tensor]):
                     (window.emitted_frame - origin)
                     * samples_per_frame : (window.end_frame - origin)
                     * samples_per_frame,
-                ].contiguous(),
+                ],
                 window.end_frame * samples_per_frame,
             )
             for index, (window, origin) in enumerate(
