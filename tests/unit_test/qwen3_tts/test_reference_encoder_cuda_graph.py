@@ -156,7 +156,7 @@ def test_reference_encoder_graph_replays_match_eager_and_miss_above_the_largest_
 
 @pytest.mark.accelerator
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
-def test_reference_code_batcher_replays_captured_buckets_and_encodes_the_rest() -> None:
+def test_reference_code_encoder_replays_captured_buckets_and_encodes_the_rest() -> None:
     torch.manual_seed(5)
     device = torch.device("cuda", torch.cuda.current_device())
     config = small_mimi_config()
@@ -170,19 +170,23 @@ def test_reference_code_batcher_replays_captured_buckets_and_encodes_the_rest() 
             np.asarray(w, dtype=np.float32) for w in waveforms
         ],
     )
-    batcher = qwen3_request_builders.Qwen3TTSRefCodeBatcher(
+    ref_code_encoder = qwen3_request_builders.Qwen3TTSRefCodeEncoder(
         tokenizer, graph_bucket_frames=(4,)
     )
     try:
-        assert batcher.graph_runner is not None
-        inside = batcher.encode(np.random.rand(3 * HOP + 1).astype(np.float32), 24000)
-        beyond = batcher.encode(np.random.rand(5 * HOP).astype(np.float32), 24000)
+        assert ref_code_encoder.graph_runner is not None
+        inside = ref_code_encoder.encode(
+            np.random.rand(3 * HOP + 1).astype(np.float32), 24000
+        )
+        beyond = ref_code_encoder.encode(
+            np.random.rand(5 * HOP).astype(np.float32), 24000
+        )
     finally:
-        batcher.close()
+        ref_code_encoder.close()
 
     assert inside.shape == (4, 2) and inside.is_cuda
     assert beyond.shape == (5, 2) and beyond.is_cuda
-    assert batcher.graph_runner.stats() == {
+    assert ref_code_encoder.graph_runner.stats() == {
         "enabled": True,
         "disable_reason": None,
         "bucket_frames": [4],

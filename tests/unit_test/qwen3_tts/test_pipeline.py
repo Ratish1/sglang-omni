@@ -1560,14 +1560,14 @@ def test_qwen3_tts_reference_codes_resolve_while_a_later_reference_encodes() -> 
             pass
         return torch.full((1, 2, samples // 8), samples, dtype=torch.long)
 
-    batcher = qwen3_request_builders.Qwen3TTSRefCodeBatcher(
+    ref_code_encoder = qwen3_request_builders.Qwen3TTSRefCodeEncoder(
         fake_speech_tokenizer(encode)
     )
     try:
-        futures = [batcher.submit(np.zeros(8, dtype=np.float32), 24000)]
+        futures = [ref_code_encoder.submit(np.zeros(8, dtype=np.float32), 24000)]
         assert gated_encodes.get(timeout=5.0) == 8
         futures += [
-            batcher.submit(np.zeros(samples, dtype=np.float32), 24000)
+            ref_code_encoder.submit(np.zeros(samples, dtype=np.float32), 24000)
             for samples in (16, 24)
         ]
         gates[8].set()
@@ -1579,7 +1579,7 @@ def test_qwen3_tts_reference_codes_resolve_while_a_later_reference_encodes() -> 
     finally:
         for gate in gates.values():
             gate.set()
-        batcher.close()
+        ref_code_encoder.close()
 
     assert [tuple(code.shape) for code in codes] == [(1, 2), (2, 2), (3, 2)]
     assert [int(code[0, 0]) for code in codes] == [8, 16, 24]
@@ -1774,7 +1774,7 @@ def test_qwen3_tts_x_vector_reference_runs_only_the_speaker_encoder() -> None:
     assert ref_text is None
 
 
-def test_qwen3_tts_reference_code_batcher_synchronizes_cuda_fallback_results(
+def test_qwen3_tts_reference_code_encoder_synchronizes_cuda_fallback_results(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     events: list[object] = []
@@ -1792,12 +1792,12 @@ def test_qwen3_tts_reference_code_batcher_synchronizes_cuda_fallback_results(
         ),
     )
     owner = SimpleNamespace(encode_stream=None)
-    qwen3_request_builders.Qwen3TTSRefCodeBatcher.synchronize_codes(owner, code)
+    qwen3_request_builders.Qwen3TTSRefCodeEncoder.synchronize_codes(owner, code)
 
     assert events == ["synchronize"]
 
 
-def test_qwen3_tts_reference_code_batcher_synchronizes_npu_results(
+def test_qwen3_tts_reference_code_encoder_synchronizes_npu_results(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     class FakeNpuDevice:
@@ -1814,31 +1814,31 @@ def test_qwen3_tts_reference_code_batcher_synchronizes_npu_results(
     )
     owner = SimpleNamespace(encode_stream=None)
 
-    qwen3_request_builders.Qwen3TTSRefCodeBatcher.synchronize_codes(owner, code)
+    qwen3_request_builders.Qwen3TTSRefCodeEncoder.synchronize_codes(owner, code)
 
     assert synchronized == [device]
 
 
-def test_qwen3_tts_reference_code_batcher_has_no_stream_for_cpu_device(
+def test_qwen3_tts_reference_code_encoder_has_no_stream_for_cpu_device(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     with caplog.at_level(logging.INFO, logger=qwen3_request_builders.__name__):
-        batcher = qwen3_request_builders.Qwen3TTSRefCodeBatcher(
+        ref_code_encoder = qwen3_request_builders.Qwen3TTSRefCodeEncoder(
             fake_speech_tokenizer(),
             graph_bucket_frames=(4, 8),
         )
     try:
-        assert batcher.encode_stream is None
-        assert batcher.graph_runner is None
+        assert ref_code_encoder.encode_stream is None
+        assert ref_code_encoder.graph_runner is None
     finally:
-        batcher.close()
+        ref_code_encoder.close()
 
     # A device with no stream of its own never reaches the capture, so it has no
     # resolution to report.
     assert "qwen3_tts_reference_encoder_graph" not in caplog.text
 
 
-def test_qwen3_tts_reference_code_batcher_allocates_a_musa_stream(
+def test_qwen3_tts_reference_code_encoder_allocates_a_musa_stream(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     created: list[object] = []
@@ -1856,7 +1856,7 @@ def test_qwen3_tts_reference_code_batcher_allocates_a_musa_stream(
     assert created == [device]
 
 
-def test_qwen3_tts_reference_code_batcher_declines_a_graph_without_host_reads(
+def test_qwen3_tts_reference_code_encoder_declines_a_graph_without_host_reads(
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
@@ -1875,32 +1875,32 @@ def test_qwen3_tts_reference_code_batcher_declines_a_graph_without_host_reads(
     )
 
     with caplog.at_level(logging.INFO, logger=qwen3_request_builders.__name__):
-        batcher = qwen3_request_builders.Qwen3TTSRefCodeBatcher(
+        ref_code_encoder = qwen3_request_builders.Qwen3TTSRefCodeEncoder(
             fake_speech_tokenizer(),
             graph_bucket_frames=(4, 8),
         )
     try:
-        assert batcher.graph_runner is None
+        assert ref_code_encoder.graph_runner is None
     finally:
-        batcher.close()
+        ref_code_encoder.close()
 
     assert "qwen3_tts_reference_encoder_graph resolved=eager" in caplog.text
 
 
-def test_qwen3_tts_reference_code_batcher_pads_to_whole_frames() -> None:
+def test_qwen3_tts_reference_code_encoder_pads_to_whole_frames() -> None:
     shapes: list[tuple[int, ...]] = []
 
     def encode(values):
         shapes.append(tuple(values.shape))
         return torch.arange(values.shape[-1] // 8).view(1, 1, -1).expand(1, 2, -1)
 
-    batcher = qwen3_request_builders.Qwen3TTSRefCodeBatcher(
+    ref_code_encoder = qwen3_request_builders.Qwen3TTSRefCodeEncoder(
         fake_speech_tokenizer(encode)
     )
     try:
-        codes = batcher.encode(np.zeros(21, dtype=np.float32), 24000)
+        codes = ref_code_encoder.encode(np.zeros(21, dtype=np.float32), 24000)
     finally:
-        batcher.close()
+        ref_code_encoder.close()
 
     assert shapes == [(1, 1, 24)]
     assert codes.shape == (3, 2)
@@ -1909,7 +1909,7 @@ def test_qwen3_tts_reference_code_batcher_pads_to_whole_frames() -> None:
 
 @pytest.mark.accelerator
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-def test_qwen3_tts_reference_code_batcher_encodes_on_dedicated_cuda_stream() -> None:
+def test_qwen3_tts_reference_code_encoder_encodes_on_dedicated_cuda_stream() -> None:
     device = torch.device("cuda", torch.cuda.current_device())
     encode_streams: list[object] = []
 
@@ -1919,17 +1919,17 @@ def test_qwen3_tts_reference_code_batcher_encodes_on_dedicated_cuda_stream() -> 
             (1, 2, values.shape[-1] // 8), dtype=torch.long, device=device
         )
 
-    batcher = qwen3_request_builders.Qwen3TTSRefCodeBatcher(
+    ref_code_encoder = qwen3_request_builders.Qwen3TTSRefCodeEncoder(
         fake_speech_tokenizer(encode, device=device),
     )
     try:
-        assert batcher.encode_stream is not None
-        assert batcher.encode_stream != torch.cuda.default_stream(device)
-        result = batcher.encode(np.zeros(16, dtype=np.float32), 24000)
+        assert ref_code_encoder.encode_stream is not None
+        assert ref_code_encoder.encode_stream != torch.cuda.default_stream(device)
+        result = ref_code_encoder.encode(np.zeros(16, dtype=np.float32), 24000)
     finally:
-        batcher.close()
+        ref_code_encoder.close()
 
-    assert encode_streams == [batcher.encode_stream]
+    assert encode_streams == [ref_code_encoder.encode_stream]
     assert result.is_cuda
     assert torch.equal(result.cpu(), torch.zeros((2, 2), dtype=torch.long))
 

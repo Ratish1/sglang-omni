@@ -912,7 +912,7 @@ def record_ref_code_consumer_stream(ref_code: torch.Tensor) -> torch.Tensor:
     return ref_code
 
 
-class Qwen3TTSRefCodeBatcher:
+class Qwen3TTSRefCodeEncoder:
     """Encodes reference clips on one worker thread; submit is safe from any thread."""
 
     def __init__(
@@ -1051,7 +1051,7 @@ class Qwen3TTSAdhocReferenceHook(
     ) -> None:
         self.model = model
         self.wrapper = wrapper
-        self.ref_code_batcher = Qwen3TTSRefCodeBatcher(
+        self.ref_code_encoder = Qwen3TTSRefCodeEncoder(
             model.speech_tokenizer,
             graph_bucket_frames=graph_bucket_frames,
         )
@@ -1074,7 +1074,7 @@ class Qwen3TTSAdhocReferenceHook(
         )
 
     def close(self) -> None:
-        self.ref_code_batcher.close()
+        self.ref_code_encoder.close()
 
     def input_key(self, item: Qwen3TTSAdhocReferenceInput) -> str | None:
         return qwen3_tts_ref_audio_input_key(item.ref_audio)
@@ -1111,7 +1111,7 @@ class Qwen3TTSAdhocReferenceHook(
             # mode runs the speaker encoder alone.
             ref_code_future = None
             if not item.x_vector_only_mode:
-                ref_code_future = self.ref_code_batcher.submit(waveform, sample_rate)
+                ref_code_future = self.ref_code_encoder.submit(waveform, sample_rate)
             else:
                 pass
             speaker_waveform = waveform
