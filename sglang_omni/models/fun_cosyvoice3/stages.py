@@ -214,19 +214,19 @@ class HiftStepRow:
 @dataclass(kw_only=True, frozen=True)
 class HiftStepSamples:
     """A streaming HiFT step's new samples per row and each row's emitted samples after
-    it. On CUDA the rows view a pinned host copy that is complete once copy_done is."""
+    it. On CUDA the new samples view a pinned host copy, complete once copy_done is."""
 
-    rows: list[torch.Tensor]
+    new_samples: list[torch.Tensor]
     emitted_samples: list[int]
     copy_done: torch.cuda.Event | None
 
     def wait(self) -> list[torch.Tensor]:
-        """Each row's samples as a host tensor of its own, once the copy has landed."""
+        """Each row's new samples as a host tensor of its own, once the copy has landed."""
         if self.copy_done is not None:
             self.copy_done.synchronize()
         else:
             pass
-        return [row.clone() for row in self.rows]
+        return [samples.clone() for samples in self.new_samples]
 
 
 @dataclass(kw_only=True, frozen=True)
@@ -2194,7 +2194,7 @@ class CosyVoice3Vocoder(BatchVocoderBase[FunCosyVoice3State, torch.Tensor]):
         else:
             copy_done = None
         return HiftStepSamples(
-            rows=[samples for samples, _ in ordered],
+            new_samples=[samples for samples, _ in ordered],
             emitted_samples=[emitted for _, emitted in ordered],
             copy_done=copy_done,
         )
