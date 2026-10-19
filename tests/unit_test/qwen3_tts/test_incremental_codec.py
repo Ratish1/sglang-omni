@@ -721,6 +721,50 @@ def test_tail_decode_matches_each_row_decoded_whole() -> None:
         )
 
 
+def test_a_restored_reference_state_continues_like_the_whole_first_chunk() -> None:
+    torch.manual_seed(43)
+    decoder = Decoder()
+    incremental, arena = make_arena(decoder, slots=3)
+    emit_frames = 1
+    reference_frames = incremental.tail_frames(emit_frames) + 2
+    first_chunk = torch.randint(0, 16, (1, 2, reference_frames + emit_frames))
+    whole_slot, reference_slot = arena.acquire(), arena.acquire()
+
+    state = arena.gather([whole_slot, reference_slot])
+    tail_waveform = incremental.decode_tail(
+        torch.cat(
+            [
+                first_chunk,
+                torch.nn.functional.pad(
+                    first_chunk[..., :reference_frames], (0, emit_frames)
+                ),
+            ]
+        ),
+        torch.tensor([reference_frames + emit_frames, reference_frames]),
+        state,
+        emit_frames,
+    )
+    arena.scatter([whole_slot, reference_slot], state)
+    restored_slot = arena.acquire(source_slot=reference_slot)
+    restored_state = arena.gather([restored_slot])
+    restored_waveform = incremental.decode(
+        first_chunk[..., reference_frames:], restored_state
+    )
+    arena.scatter([restored_slot], restored_state)
+
+    torch.testing.assert_close(
+        restored_waveform, tail_waveform[:1], rtol=2e-5, atol=2e-6
+    )
+    follow_codes = torch.randint(0, 16, (1, 2, 3))
+    position = reference_frames + emit_frames
+    torch.testing.assert_close(
+        arena_decode(incremental, arena, [restored_slot], [position], follow_codes),
+        arena_decode(incremental, arena, [whole_slot], [position], follow_codes),
+        rtol=2e-5,
+        atol=2e-6,
+    )
+
+
 @pytest.mark.accelerator
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 @pytest.mark.parametrize(

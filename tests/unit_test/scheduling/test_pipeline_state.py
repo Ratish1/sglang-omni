@@ -300,6 +300,7 @@ def test_tts_pipeline_state_round_trips_preserve_payload_fields() -> None:
                 seed=9,
                 audio_codes=torch.tensor([[1, 2], [3, 4]]),
                 ref_code_len=1,
+                reference_key="voice",
                 audio_samples=torch.tensor([0.5, 0.6]),
                 prompt_tokens=9,
                 completion_tokens=11,
