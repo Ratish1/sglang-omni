@@ -14,7 +14,10 @@ from sglang.srt.utils import DynamicGradMode
 from torch._dynamo.utils import counters
 
 import sglang_omni.models.fun_cosyvoice3.model_runner as model_runner_module
-from sglang_omni.models.fun_cosyvoice3.model_runner import FunCosyVoice3ModelRunner
+from sglang_omni.models.fun_cosyvoice3.model_runner import (
+    COSYVOICE3_RAS_WINDOW_SIZE,
+    FunCosyVoice3ModelRunner,
+)
 from sglang_omni.models.fun_cosyvoice3.request_builders import (
     CosyVoice3SGLangRequestData,
 )
@@ -107,6 +110,73 @@ def test_cosyvoice3_runner_samples_before_prefill_and_decode_collection() -> Non
     assert runner.sample_before_post_decode(None, None, []) is True
     assert prefill.next_token_ids is sampled
     assert decode.next_token_ids is sampled
+
+
+def test_cosyvoice3_lookahead_accepts_repetition_penalty_and_min_new_tokens() -> None:
+    runner = object.__new__(FunCosyVoice3ModelRunner)
+
+    def req(frequency_penalty: float) -> SimpleNamespace:
+        return SimpleNamespace(
+            sampling_params=SimpleNamespace(
+                frequency_penalty=frequency_penalty,
+                presence_penalty=0.0,
+                repetition_penalty=1.21,
+                min_new_tokens=40,
+            ),
+            custom_logit_processor=None,
+        )
+
+    assert runner.lookahead_eligible(SimpleNamespace(reqs=[req(0.0), req(0.0)]))
+    assert not runner.lookahead_eligible(SimpleNamespace(reqs=[req(0.0), req(0.5)]))
+
+
+@pytest.mark.parametrize("is_lookahead", [False, True])
+def test_cosyvoice3_lookahead_step_penalizes_the_unresolved_step_ids(
+    is_lookahead: bool,
+) -> None:
+    runner = object.__new__(FunCosyVoice3ModelRunner)
+    runner.device = torch.device("cpu")
+    scaling_penalties = torch.ones((2, 8))
+    scaling_penalties[0, 1] = 1.21
+    forward_batch = SimpleNamespace(
+        input_ids=torch.tensor([3, 5]),
+        sampling_info=SimpleNamespace(acc_scaling_penalties=scaling_penalties),
+    )
+    requests = [ras_request(row, [], request_id=f"req-{row}") for row in range(2)]
+    for sched_req, penalty in zip(requests, (1.21, 1.5)):
+        sched_req.data.req.sampling_params.repetition_penalty = penalty
+
+    runner.before_decode(forward_batch, None, requests, is_lookahead=is_lookahead)
+
+    expected = torch.ones((2, 8))
+    expected[0, 1] = 1.21
+    if is_lookahead:
+        expected[0, 3], expected[1, 5] = 1.21, 1.5
+    else:
+        pass
+    assert torch.equal(scaling_penalties, expected)
+
+
+def test_cosyvoice3_lookahead_resolve_skips_requests_the_step_before_finished() -> None:
+    runner = object.__new__(FunCosyVoice3ModelRunner)
+    runner.outbox = None
+    requests = [
+        SimpleNamespace(
+            data=CosyVoice3SGLangRequestData(
+                req=SimpleNamespace(
+                    finished=lambda finished=finished: finished, is_retracted=False
+                )
+            )
+        )
+        for finished in (False, True)
+    ]
+    result = SimpleNamespace(next_token_ids=None)
+
+    runner.post_decode_resolve(torch.tensor([13, 14]), result, None, None, requests)
+
+    assert [int(code) for code in requests[0].data.output_codes] == [13]
+    assert requests[1].data.output_codes == []
+    assert result.next_token_ids.tolist() == [13, 14]
 
 
 def test_cosyvoice3_torch_mps_seed_avoids_float64_sampler(
@@ -260,6 +330,57 @@ def test_cosyvoice3_torch_mps_clears_ras_history_on_finish() -> None:
     assert runner.cosyvoice3_recent_tokens == {"keep": [2]}
 
 
+def ras_runner(
+    slots: int, *, use_ascend_backend: bool = False, device: str = "cpu"
+) -> FunCosyVoice3ModelRunner:
+    runner = object.__new__(FunCosyVoice3ModelRunner)
+    runner.device = torch.device(device)
+    runner.tp_worker = SimpleNamespace(
+        model_runner=SimpleNamespace(
+            sampler=SimpleNamespace(use_ascend_backend=use_ascend_backend)
+        )
+    )
+    runner.recent_speech_tokens = torch.full(
+        (slots, COSYVOICE3_RAS_WINDOW_SIZE), -1, dtype=torch.long, device=device
+    )
+    runner.recent_speech_token_owners = {}
+    return runner
+
+
+def ras_request(
+    slot: int, output_ids: list[int], *, top_k: int = 20, request_id: str = ""
+) -> SimpleNamespace:
+    return SimpleNamespace(
+        request_id=request_id or f"req-{slot}",
+        data=SimpleNamespace(
+            req=SimpleNamespace(
+                kv=SimpleNamespace(req_pool_idx=slot),
+                output_ids=array("q", output_ids),
+                sampling_params=SimpleNamespace(top_k=top_k),
+            )
+        ),
+    )
+
+
+def decode_batch(
+    top_ks: list[int],
+    *,
+    sampling_seed: torch.Tensor | None = None,
+    device: str = "cpu",
+) -> SimpleNamespace:
+    rows = len(top_ks)
+    return SimpleNamespace(
+        forward_mode=SimpleNamespace(is_decode=lambda: True),
+        req_pool_indices=torch.arange(rows, device=device),
+        sampling_info=SimpleNamespace(
+            is_all_greedy=all(top_k <= 1 for top_k in top_ks),
+            top_ks=torch.tensor(top_ks, dtype=torch.int32, device=device),
+            sampling_seed=sampling_seed,
+        ),
+        positions=torch.arange(rows, device=device),
+    )
+
+
 @pytest.mark.parametrize("use_ascend_backend", [False, True])
 def test_cosyvoice3_ras_masks_and_redraws_repeated_speech_tokens(
     use_ascend_backend: bool,
@@ -271,43 +392,47 @@ def test_cosyvoice3_ras_masks_and_redraws_repeated_speech_tokens(
     probs[1, 5] = probs[2, 9] = probs[3, EOS_ID] = probs[5, 9] = 0.6
     probs[4, 9] = 1.0
     histories = [[9] + [4] * 9, [1, 2, 3], [9], [EOS_ID], [9], [9] + [4] * 10]
-    runner = object.__new__(FunCosyVoice3ModelRunner)
-    runner.outbox = None
-    runner.tp_worker = SimpleNamespace(
-        model_runner=SimpleNamespace(
-            sampler=SimpleNamespace(use_ascend_backend=use_ascend_backend)
-        )
-    )
+    top_ks = [1 if row == 2 else 20 for row in range(6)]
+    runner = ras_runner(6, use_ascend_backend=use_ascend_backend)
     requests = [
-        SimpleNamespace(
-            data=SimpleNamespace(
-                output_codes=[],
-                req=SimpleNamespace(
-                    output_ids=array("q", output_ids),
-                    sampling_params=SimpleNamespace(top_k=1 if row == 2 else 20),
-                ),
-            )
-        )
-        for row, output_ids in enumerate(histories)
+        ras_request(row, history, top_k=top_k)
+        for row, (history, top_k) in enumerate(zip(histories, top_ks))
     ]
-    result = SimpleNamespace(
-        next_token_ids=torch.tensor([9, 5, 9, EOS_ID, 9, 9], dtype=torch.int32),
-        logits_output=SimpleNamespace(
-            next_token_logits=torch.log(probs) + 1 if use_ascend_backend else probs
-        ),
-    )
-    forward_batch = SimpleNamespace(
-        forward_mode=SimpleNamespace(is_decode=lambda: True),
-        sampling_info=SimpleNamespace(sampling_seed=None),
-        positions=torch.arange(6),
+    logits_output = SimpleNamespace(
+        next_token_logits=torch.log(probs) + 1 if use_ascend_backend else probs
     )
 
-    runner.collect_tokens(result, forward_batch, None, requests)
+    token_ids = runner.redraw_repeated_tokens(
+        logits_output,
+        decode_batch(top_ks),
+        requests,
+        torch.tensor([9, 5, 9, EOS_ID, 9, 9], dtype=torch.int32),
+    )
 
-    assert result.next_token_ids.tolist() == [EOS_ID, 5, 9, EOS_ID, 9, 9]
-    assert [
-        [int(code) for code in request.data.output_codes] for request in requests
-    ] == [[], [5], [9], [], [9], [9]]
+    assert token_ids.dtype == torch.int32
+    assert token_ids.tolist() == [EOS_ID, 5, 9, EOS_ID, 9, 9]
+
+
+def test_cosyvoice3_ras_window_holds_the_last_step_before_its_host_ids() -> None:
+    probs = torch.zeros((1, EOS_ID + 1))
+    probs[0, 7], probs[0, EOS_ID] = 0.5, 0.5
+    logits_output = SimpleNamespace(next_token_logits=probs)
+    runner = ras_runner(1)
+    forward_batch = decode_batch([20])
+    requests = [ras_request(0, [4], request_id="first")]
+
+    assert runner.redraw_repeated_tokens(
+        logits_output, forward_batch, requests, torch.tensor([7])
+    ).tolist() == [7]
+    assert runner.redraw_repeated_tokens(
+        logits_output, forward_batch, requests, torch.tensor([7])
+    ).tolist() == [EOS_ID]
+    assert runner.redraw_repeated_tokens(
+        logits_output,
+        forward_batch,
+        [ras_request(0, [4], request_id="next")],
+        torch.tensor([7]),
+    ).tolist() == [7]
 
 
 @pytest.mark.accelerator
@@ -316,41 +441,25 @@ def test_cosyvoice3_seeded_ras_redraw_of_a_row_subset_matches_the_full_draw() ->
     rows = 256
     probs = torch.zeros((rows, 8), device="cuda")
     probs[:, 3], probs[:, 5], probs[:, 6] = 0.9, 0.06, 0.04
-    runner = object.__new__(FunCosyVoice3ModelRunner)
-    runner.token_id_host_bufs = None
-    runner.token_id_host_slot = 0
-    runner.token_id_events = []
-    runner.token_id_event_slot = 0
-    runner.tp_worker = SimpleNamespace(
-        model_runner=SimpleNamespace(sampler=SimpleNamespace(use_ascend_backend=False))
-    )
-    forward_batch = SimpleNamespace(
-        forward_mode=SimpleNamespace(is_decode=lambda: True),
-        sampling_info=SimpleNamespace(
-            sampling_seed=torch.arange(1, rows + 1, device="cuda")
-        ),
-        positions=torch.arange(rows, device="cuda"),
-    )
     subset = range(1, rows, 3)
 
     def redraw(repeating_rows: range) -> list[int]:
-        requests = [
-            SimpleNamespace(
-                data=SimpleNamespace(
-                    req=SimpleNamespace(
-                        output_ids=array("q", [3 if row in repeating_rows else 4]),
-                        sampling_params=SimpleNamespace(top_k=20),
-                    )
-                )
+        return (
+            ras_runner(rows, device="cuda")
+            .redraw_repeated_tokens(
+                SimpleNamespace(next_token_logits=probs),
+                decode_batch(
+                    [20] * rows,
+                    sampling_seed=torch.arange(1, rows + 1, device="cuda"),
+                    device="cuda",
+                ),
+                [
+                    ras_request(row, [3 if row in repeating_rows else 4])
+                    for row in range(rows)
+                ],
+                torch.full((rows,), 3, dtype=torch.int32, device="cuda"),
             )
-            for row in range(rows)
-        ]
-        result = SimpleNamespace(
-            next_token_ids=torch.full((rows,), 3, dtype=torch.int32, device="cuda"),
-            logits_output=SimpleNamespace(next_token_logits=probs),
-        )
-        return runner.redraw_repeated_tokens(
-            result, forward_batch, requests, [3] * rows
+            .tolist()
         )
 
     full = redraw(range(rows))
