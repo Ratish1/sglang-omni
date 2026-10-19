@@ -148,7 +148,7 @@ class CUDAOmniPlatform(CudaDeviceMixin, OmniPlatform):
     def get_paged_window_attention(self) -> PagedWindowAttention | None:
         import torch
 
-        # note (ratish): SGLang's FlashAttention v3 gate for attention without MLA.
+        # note (ratish): FlashAttention 3 runs attention without MLA on SM 8.x and 9.x.
         if torch.cuda.get_device_capability()[0] in (8, 9):
             from sglang.kernels.ops.attention.flash_attention import (
                 flash_attn_with_kvcache,
