@@ -7,6 +7,9 @@ from __future__ import annotations
 import torch
 import torch.nn.functional as F
 from sglang.kernels.ops.activation import silu_and_mul
+from sglang.kernels.ops.attention.flash_attention import flash_attn_with_kvcache
+from sglang.kernels.ops.attention.flash_attention_v3 import _is_fa3_supported
+from sglang.kernels.ops.attention.rope import apply_rope_inplace_with_kvcache
 from sglang.kernels.ops.layernorm import rmsnorm
 from transformers.modeling_outputs import BaseModelOutputWithPast
 from transformers.models.qwen3_omni_moe.configuration_qwen3_omni_moe import (
@@ -35,12 +38,7 @@ from sglang_omni.models.qwen3_omni.components.incremental_codec import (
     conv_stack_state_layout,
     slot_conv_stack,
 )
-from sglang_omni.platforms import current_platform
-from sglang_omni.platforms.interface import (
-    JointRopeInplaceKernel,
-    PagedWindowAttention,
-    RopeKVStoreKernel,
-)
+from sglang_omni.platforms.interface import JointRopeInplaceKernel
 from sglang_omni.utils.channels_last_conv import (
     channels_last_conv1d,
     channels_last_conv_transpose1d,
@@ -161,7 +159,8 @@ class FusedCode2WavTransformer(torch.nn.Module):
             window_mask = (key <= query) & (query - key < sliding_window)
         hidden_states = inputs_embeds.reshape(batch_size * length, hidden_size)
         for layer in self.transformer.layers:
-            query, key, value = self.rotated_qkv(layer, hidden_states, positions)
+            query, key, value = self.projected_qkv(layer, hidden_states)
+            self.rope(query, key, self.cos_sin_cache, positions, is_neox=True)
             attended = self.attend(
                 layer,
                 query.view(batch_size, length, -1, head_dim),
@@ -186,13 +185,11 @@ class FusedCode2WavTransformer(torch.nn.Module):
         addresses: RingAddresses,
         *,
         first_decode: bool,
-        rope_store: RopeKVStoreKernel | None,
-        paged_attention: PagedWindowAttention | None,
+        is_paged_attention: bool,
     ) -> torch.Tensor:
-        """The normed hidden states of the rows' new frames. Every layer stores its new K/V in
-        the rows' rings, in the rope kernel when the platform has rope_store; a first decode
-        attends to its own frames, a later one to its window in the ring, through the ring's
-        page table when the platform has paged_attention."""
+        """The normed hidden states of the rows' new frames. Every layer's rope kernel stores
+        its new K/V in the rows' rings; a first decode attends to its own frames and a later
+        one to its ring window, through the page table when is_paged_attention."""
         batch_size, length, hidden_size = inputs_embeds.shape
         head_dim = self.transformer.layers[0].self_attn.head_dim
         sliding_window = self.transformer.config.sliding_window
@@ -202,7 +199,7 @@ class FusedCode2WavTransformer(torch.nn.Module):
         elif first_decode:
             distances = frame_offsets[:, None] - frame_offsets[None, :]
             window_mask = (distances >= 0) & (distances < sliding_window)
-        elif paged_attention is not None:
+        elif is_paged_attention:
             window_mask = None
             page_table = addresses.window_rows.to(torch.int32)
             window_lengths = addresses.window_lengths.to(torch.int32)
@@ -215,28 +212,19 @@ class FusedCode2WavTransformer(torch.nn.Module):
             window_mask = ((distances >= 0) & (distances < sliding_window))[:, None]
         hidden_states = inputs_embeds.reshape(batch_size * length, hidden_size)
         for layer_index, layer in enumerate(self.transformer.layers):
-            if rope_store is None:
-                query, key, value = self.rotated_qkv(
-                    layer, hidden_states, addresses.frame_positions
-                )
-                pool.keys[layer_index].index_copy_(
-                    0, addresses.write_rows, key.reshape(batch_size * length, -1)
-                )
-                pool.values[layer_index].index_copy_(0, addresses.write_rows, value)
-            else:
-                query, key, value = self.projected_qkv(layer, hidden_states)
-                rope_store(
-                    query,
-                    key,
-                    value.view(batch_size * length, -1, head_dim),
-                    pool.keys[layer_index],
-                    pool.values[layer_index],
-                    self.cos_sin_cache,
-                    addresses.frame_positions,
-                    addresses.write_rows,
-                    is_neox=True,
-                )
-            if first_decode or paged_attention is None:
+            query, key, value = self.projected_qkv(layer, hidden_states)
+            apply_rope_inplace_with_kvcache(
+                query,
+                key,
+                value.view(batch_size * length, -1, head_dim),
+                pool.keys[layer_index],
+                pool.values[layer_index],
+                self.cos_sin_cache,
+                addresses.frame_positions,
+                addresses.write_rows,
+                is_neox=True,
+            )
+            if first_decode or not is_paged_attention:
                 if first_decode:
                     keys = key.view(batch_size, length, -1, head_dim)
                     values = value.view(batch_size, length, -1, head_dim)
@@ -255,7 +243,7 @@ class FusedCode2WavTransformer(torch.nn.Module):
                     window_mask,
                 )
             else:
-                attended = paged_attention(
+                attended = flash_attn_with_kvcache(
                     query.view(batch_size, length, -1, head_dim),
                     pool.keys[layer_index].view(-1, 1, key.shape[1], head_dim),
                     pool.values[layer_index].view(-1, 1, key.shape[1], head_dim),
@@ -272,17 +260,6 @@ class FusedCode2WavTransformer(torch.nn.Module):
             self.transformer.norm.variance_epsilon,
         )
         return hidden_states.view(batch_size, length, hidden_size)
-
-    def rotated_qkv(
-        self,
-        layer: Qwen3OmniMoeCode2WavTransformerLayer,
-        hidden_states: torch.Tensor,
-        positions: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """projected_qkv's query and key rotated at positions, and its value."""
-        query, key, value = self.projected_qkv(layer, hidden_states)
-        self.rope(query, key, self.cos_sin_cache, positions, is_neox=True)
-        return query, key, value
 
     def projected_qkv(
         self,
@@ -414,8 +391,9 @@ class Qwen3OmniIncrementalCodec:
             model
         ), "slot decodes need the fused channels-last code2wav"
         self.model = model
-        self.rope_store = current_platform.get_rope_kv_store_kernel()
-        self.paged_attention = current_platform.get_paged_window_attention()
+        # note (ratish): FlashAttention 3 runs on SM 8.x and 9.x with CUDA 12.3 or newer; other
+        # GPUs gather each row's window out of the ring for SDPA.
+        self.is_paged_attention = _is_fa3_supported()
         transformer = model.pre_transformer.transformer
         conv_histories, transconv_overlaps = conv_stack_state_layout(model)
         self.spec = CodecStateSpec(
@@ -469,8 +447,7 @@ class Qwen3OmniIncrementalCodec:
             pool,
             addresses,
             first_decode=first_decode,
-            rope_store=self.rope_store,
-            paged_attention=self.paged_attention,
+            is_paged_attention=self.is_paged_attention,
         )
         waveform = slot_conv_stack(
             self.model,
