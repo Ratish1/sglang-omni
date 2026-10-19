@@ -831,4 +831,4 @@ class DllmScheduler:
         self.waiting_queue = [r for r in self.waiting_queue if r.rid not in orphaned]
         self.uncond_rids.difference_update(orphaned)
         self.orphaned_uncond_rids.clear()
-        batch.filter_batch(chunked_req_to_exclude=list(exclude))
+        batch.filter_batch(reqs_to_exclude=list(exclude))
