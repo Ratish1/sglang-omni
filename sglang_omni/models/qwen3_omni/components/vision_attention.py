@@ -43,10 +43,13 @@ class Qwen3OmniVisionAttention(nn.Module):
         hidden_states: torch.Tensor,
         cu_seqlens: torch.Tensor,
         position_embeddings: tuple[torch.Tensor, torch.Tensor] | VisionRotaryInputs,
+        max_seqlen: int | None = None,
         *,
         sequence_metadata: VisionSequenceMetadata,
         **kwargs: Unpack[TransformersKwargs],
     ) -> torch.Tensor:
+        # note (ratish): the host patch counts stand in for the block's max_seqlen.
+        del max_seqlen
         sequence_patch_count = hidden_states.shape[0]
         query, key, value = (
             self.qkv(hidden_states)
