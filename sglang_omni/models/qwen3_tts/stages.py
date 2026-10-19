@@ -330,7 +330,7 @@ def create_vocoder_executor(
     stream_chunk_ramp: tuple[int, ...] | list[int] | None = None,
     stream_left_context_frames: int = DEFAULT_QWEN3_TTS_LEFT_CONTEXT_FRAMES,
     initial_max_batch_size: int = 32,
-    initial_batch_wait_ms: int = 2,
+    initial_batch_wait_ms: int = 0,
     followup_max_batch_size: int = 8,
     followup_batch_wait_ms: int = 4,
     followup_worker_count: int = 2,

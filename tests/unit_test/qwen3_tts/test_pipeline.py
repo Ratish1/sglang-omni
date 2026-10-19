@@ -2553,7 +2553,7 @@ def test_qwen3_tts_vocoder_batches_decode_requests(
     assert scheduler.stream_followup_stride == 8
     assert scheduler.followup_stride_ramp == (2, 4)
     assert scheduler.initial_max_batch_size == 32
-    assert scheduler.initial_batch_wait_s == pytest.approx(0.002)
+    assert scheduler.initial_batch_wait_s == 0.0
     assert scheduler.followup_max_batch_size == 8
     assert scheduler.followup_batch_wait_s == pytest.approx(0.004)
     first = make_payload(inputs="first")

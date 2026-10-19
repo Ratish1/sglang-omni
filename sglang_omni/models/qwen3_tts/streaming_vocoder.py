@@ -624,7 +624,7 @@ class Qwen3TTSStreamingVocoderScheduler(
         max_batch_wait_ms: int = 2,
         async_decode: bool | None = None,
         initial_max_batch_size: int = 32,
-        initial_batch_wait_ms: int = 2,
+        initial_batch_wait_ms: int = 0,
         followup_max_batch_size: int = 8,
         followup_batch_wait_ms: int = 1,
         followup_worker_count: int = 2,
