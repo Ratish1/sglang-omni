@@ -1107,13 +1107,6 @@ class Qwen3TTSAdhocReferenceHook(
             else:
                 pass
             waveform, sample_rate = normalized[0]
-            # note(ratish): the codes are only consumed in ICL mode, so x vector
-            # mode runs the speaker encoder alone.
-            ref_code_future = None
-            if not item.x_vector_only_mode:
-                ref_code_future = self.ref_code_encoder.submit(waveform, sample_rate)
-            else:
-                pass
             speaker_waveform = waveform
             speaker_sample_rate = self.model.speaker_encoder_sample_rate
             if sample_rate != speaker_sample_rate:
@@ -1130,6 +1123,13 @@ class Qwen3TTSAdhocReferenceHook(
                 audio=speaker_waveform,
                 sr=speaker_sample_rate,
             )
+            # note(ratish): the codes are only consumed in ICL mode, so x vector
+            # mode runs the speaker encoder alone.
+            ref_code_future = None
+            if not item.x_vector_only_mode:
+                ref_code_future = self.ref_code_encoder.submit(waveform, sample_rate)
+            else:
+                pass
             ref_code = (
                 record_ref_code_consumer_stream(ref_code_future.result(timeout=130.0))
                 if ref_code_future is not None
