@@ -488,10 +488,10 @@ class BailingMoeV2DecoderLayer(nn.Module):
                 prefix=add_prefix("mlp", prefix),
             )
 
-        attention_stage, ffn_stage = self.stage_facts(config, layer_id)
+        attn, ffn = self.stage_facts(config, layer_id)
         self.attn_boundary, self.ffn_boundary = append_stages(
-            (attention_stage, self.input_layernorm),
-            (ffn_stage, self.post_attention_layernorm),
+            (attn, self.input_layernorm),
+            (ffn, self.post_attention_layernorm),
         )
 
     @staticmethod

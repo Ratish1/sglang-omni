@@ -514,8 +514,8 @@ class Qwen3OmniMoeThinkerTextDecoderLayer(nn.Module):
         self.attn_tp_size = get_parallel().attn_tp_size
         self.attn_tp_rank = get_parallel().attn_tp_rank
 
-        attention_stage, ffn_stage = self.stage_facts(config, layer_id)
-        self.is_layer_sparse = ffn_stage.sparse
+        attn, ffn = self.stage_facts(config, layer_id)
+        self.is_layer_sparse = ffn.sparse
 
         if self.is_layer_sparse:
             self.mlp = self.sparse_moe_block_cls(
@@ -535,8 +535,8 @@ class Qwen3OmniMoeThinkerTextDecoderLayer(nn.Module):
         )
 
         self.attn_boundary, self.ffn_boundary = append_stages(
-            (attention_stage, self.input_layernorm),
-            (ffn_stage, self.post_attention_layernorm),
+            (attn, self.input_layernorm),
+            (ffn, self.post_attention_layernorm),
         )
 
     @staticmethod
