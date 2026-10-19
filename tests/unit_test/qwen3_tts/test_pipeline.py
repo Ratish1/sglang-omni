@@ -1545,49 +1545,44 @@ def test_qwen3_tts_adhoc_voice_clone_prompt_uses_reference_service(
     qwen3_request_builders.clear_qwen3_tts_preprocessing_context()
 
 
-def test_qwen3_tts_reference_codes_batch_across_requests() -> None:
-    batch_sizes: list[int] = []
-    encodes = 0
+def test_qwen3_tts_reference_codes_resolve_while_a_later_reference_encodes() -> None:
+    """A queued reference's codes waited for every reference queued behind it."""
+    gates = {8: threading.Event(), 24: threading.Event()}
+    gated_encodes: Queue[int] = Queue()
 
     def encode(values):
-        nonlocal encodes
         assert torch.is_inference_mode_enabled()
-        encodes += 1
-        return torch.full((1, 2, values.shape[-1] // 8), encodes - 1, dtype=torch.long)
+        samples = values.shape[-1]
+        if samples in gates:
+            gated_encodes.put(samples)
+            assert gates[samples].wait(timeout=5.0)
+        else:
+            pass
+        return torch.full((1, 2, samples // 8), samples, dtype=torch.long)
 
-    class DrainRecordingBatcher(qwen3_request_builders.Qwen3TTSRefCodeBatcher):
-        def drain(self):
-            batch, shutdown = super().drain()
-            if batch:
-                batch_sizes.append(len(batch))
-            return batch, shutdown
-
-    batcher = DrainRecordingBatcher(
-        fake_speech_tokenizer(encode),
-        max_batch_size=2,
-        max_batch_wait_ms=50.0,
+    batcher = qwen3_request_builders.Qwen3TTSRefCodeBatcher(
+        fake_speech_tokenizer(encode)
     )
-    barrier = threading.Barrier(3)
-    results: list[torch.Tensor | None] = [None, None]
-
-    def encode(index: int) -> None:
-        barrier.wait()
-        results[index] = batcher.encode(np.zeros(16, dtype=np.float32), 24000)
-
-    threads = [threading.Thread(target=encode, args=(index,)) for index in range(2)]
     try:
-        for thread in threads:
-            thread.start()
-        barrier.wait()
-        for thread in threads:
-            thread.join(timeout=2.0)
+        futures = [batcher.submit(np.zeros(8, dtype=np.float32), 24000)]
+        assert gated_encodes.get(timeout=5.0) == 8
+        futures += [
+            batcher.submit(np.zeros(samples, dtype=np.float32), 24000)
+            for samples in (16, 24)
+        ]
+        gates[8].set()
+        assert gated_encodes.get(timeout=5.0) == 24
+        assert futures[1].done()
+        assert not futures[2].done()
+        gates[24].set()
+        codes = [future.result(timeout=5.0) for future in futures]
     finally:
+        for gate in gates.values():
+            gate.set()
         batcher.close()
 
-    assert all(not thread.is_alive() for thread in threads)
-    assert batch_sizes == [2]
-    assert all(result is not None and result.shape == (2, 2) for result in results)
-    assert sorted(int(result[0, 0]) for result in results) == [0, 1]
+    assert [tuple(code.shape) for code in codes] == [(1, 2), (2, 2), (3, 2)]
+    assert [int(code[0, 0]) for code in codes] == [8, 16, 24]
 
 
 def test_qwen3_tts_preprocessing_executor_admits_concurrent_requests() -> None:
@@ -1595,31 +1590,11 @@ def test_qwen3_tts_preprocessing_executor_admits_concurrent_requests() -> None:
     assert executor.max_concurrency > 1
 
 
-def test_qwen3_tts_preprocess_payload_batches_reference_codes_across_requests(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_qwen3_tts_preprocessing_runs_distinct_references_concurrently() -> None:
     cache = get_speaker_artifact_cache()
     cache.clear()
     qwen3_request_builders.clear_qwen3_tts_preprocessing_context()
-    batch_sizes: list[int] = []
     both_normalizing = threading.Barrier(2)
-
-    class PatientRefCodeBatcher(qwen3_request_builders.Qwen3TTSRefCodeBatcher):
-        def __init__(self, speech_tokenizer, **kwargs):
-            kwargs["max_batch_wait_ms"] = 500.0
-            super().__init__(speech_tokenizer, **kwargs)
-
-        def drain(self):
-            batch, shutdown = super().drain()
-            if batch:
-                batch_sizes.append(len(batch))
-            return batch, shutdown
-
-    monkeypatch.setattr(
-        qwen3_request_builders,
-        "Qwen3TTSRefCodeBatcher",
-        PatientRefCodeBatcher,
-    )
 
     class FakeWrapper:
         def _normalize_audio_inputs(self, ref_audio):
@@ -1674,7 +1649,7 @@ def test_qwen3_tts_preprocess_payload_batches_reference_codes_across_requests(
 
     def make_distinct_payload(index: int) -> StagePayload:
         return StagePayload(
-            request_id=f"req-qwen3-tts-batch-{index}",
+            request_id=f"req-qwen3-tts-concurrent-{index}",
             request=OmniRequest(
                 inputs=f"target-{index}",
                 params={},
@@ -1716,7 +1691,6 @@ def test_qwen3_tts_preprocess_payload_batches_reference_codes_across_requests(
         qwen3_request_builders.clear_qwen3_tts_preprocessing_context()
 
     assert prepared_count == 2
-    assert batch_sizes == [2]
 
 
 def test_qwen3_tts_reference_code_overlaps_speaker_embedding() -> None:
@@ -1818,7 +1792,7 @@ def test_qwen3_tts_reference_code_batcher_synchronizes_cuda_fallback_results(
         ),
     )
     owner = SimpleNamespace(encode_stream=None)
-    qwen3_request_builders.Qwen3TTSRefCodeBatcher.synchronize_outcomes(owner, {0: code})
+    qwen3_request_builders.Qwen3TTSRefCodeBatcher.synchronize_codes(owner, code)
 
     assert events == ["synchronize"]
 
@@ -1840,7 +1814,7 @@ def test_qwen3_tts_reference_code_batcher_synchronizes_npu_results(
     )
     owner = SimpleNamespace(encode_stream=None)
 
-    qwen3_request_builders.Qwen3TTSRefCodeBatcher.synchronize_outcomes(owner, {0: code})
+    qwen3_request_builders.Qwen3TTSRefCodeBatcher.synchronize_codes(owner, code)
 
     assert synchronized == [device]
 
@@ -1921,7 +1895,7 @@ def test_qwen3_tts_reference_code_batcher_pads_to_whole_frames() -> None:
         return torch.arange(values.shape[-1] // 8).view(1, 1, -1).expand(1, 2, -1)
 
     batcher = qwen3_request_builders.Qwen3TTSRefCodeBatcher(
-        fake_speech_tokenizer(encode), max_batch_wait_ms=0
+        fake_speech_tokenizer(encode)
     )
     try:
         codes = batcher.encode(np.zeros(21, dtype=np.float32), 24000)

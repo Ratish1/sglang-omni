@@ -171,7 +171,7 @@ def test_reference_code_batcher_replays_captured_buckets_and_encodes_the_rest() 
         ],
     )
     batcher = qwen3_request_builders.Qwen3TTSRefCodeBatcher(
-        tokenizer, max_batch_wait_ms=0, graph_bucket_frames=(4,)
+        tokenizer, graph_bucket_frames=(4,)
     )
     try:
         assert batcher.graph_runner is not None

@@ -7,7 +7,6 @@ import concurrent.futures
 import contextlib
 import json
 import logging
-import queue
 import threading
 import time
 from collections.abc import Callable, Mapping, Sequence
@@ -71,7 +70,6 @@ QWEN3_TTS_TASK_CUSTOM_VOICE = "CustomVoice"
 QWEN3_TTS_TASK_VOICE_DESIGN = "VoiceDesign"
 QWEN3_TTS_DEFAULT_CUSTOM_VOICE = "Vivian"
 _QWEN3_TTS_PREPARED_MARKER = "_qwen3_tts_prepared_request"
-_QWEN3_TTS_REF_CODE_BATCH_STOP = object()
 
 _GENERATION_FIELDS = (
     "do_sample",
@@ -915,12 +913,12 @@ def record_ref_code_consumer_stream(ref_code: torch.Tensor) -> torch.Tensor:
 
 
 class Qwen3TTSRefCodeBatcher:
+    """Encodes reference clips on one worker thread; submit is safe from any thread."""
+
     def __init__(
         self,
         speech_tokenizer: Qwen3TTSTokenizer,
         *,
-        max_batch_size: int = 8,
-        max_batch_wait_ms: float = 2.0,
         graph_bucket_frames: Sequence[int] = (),
     ) -> None:
         self.speech_tokenizer = speech_tokenizer
@@ -930,8 +928,6 @@ class Qwen3TTSRefCodeBatcher:
         param = next(self.encoder.parameters())
         self.encoder_device = param.device
         self.encoder_dtype = param.dtype
-        self.max_batch_size = max(int(max_batch_size), 1)
-        self.max_batch_wait_s = max(float(max_batch_wait_ms), 0.0) / 1000.0
         self.encode_stream = new_encode_stream(self.encoder_device)
         self.graph_runner: Qwen3TTSReferenceEncoderCudaGraphRunner | None = None
         if self.encode_stream is not None and graph_bucket_frames:
@@ -952,17 +948,14 @@ class Qwen3TTSRefCodeBatcher:
                 )
         else:
             pass
-        self.queue: queue.Queue[object] = queue.Queue()
-        self.thread = threading.Thread(
-            target=self.run,
-            name="qwen3-tts-ref-code",
-            daemon=True,
+        # note (ratish): one worker, because the captured graphs share their input
+        # buffers, and a thread of its own, so the caller embeds the speaker meanwhile.
+        self.executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="qwen3-tts-ref-code"
         )
-        self.thread.start()
 
     def close(self) -> None:
-        self.queue.put(_QWEN3_TTS_REF_CODE_BATCH_STOP)
-        self.thread.join(timeout=5.0)
+        self.executor.shutdown(wait=True)
 
     def encode(
         self, waveform: str | npt.NDArray[np.generic], sample_rate: int
@@ -974,40 +967,24 @@ class Qwen3TTSRefCodeBatcher:
     def submit(
         self, waveform: str | npt.NDArray[np.generic], sample_rate: int
     ) -> concurrent.futures.Future[torch.Tensor]:
-        future: concurrent.futures.Future[torch.Tensor] = concurrent.futures.Future()
-        self.queue.put((waveform, int(sample_rate), future))
-        return future
+        return self.executor.submit(
+            self.encode_and_synchronize, waveform, int(sample_rate)
+        )
 
-    def drain(self) -> tuple[list[object], bool]:
-        first = self.queue.get()
-        if first is _QWEN3_TTS_REF_CODE_BATCH_STOP:
-            return [], True
-        else:
-            pass
-        batch = [first]
-        deadline = time.monotonic() + self.max_batch_wait_s
-        shutdown = False
-        while len(batch) < self.max_batch_size:
-            try:
-                remaining = deadline - time.monotonic()
-                queued = (
-                    self.queue.get(timeout=remaining)
-                    if remaining > 0
-                    else self.queue.get_nowait()
-                )
-            except queue.Empty:
-                break
-            if queued is _QWEN3_TTS_REF_CODE_BATCH_STOP:
-                shutdown = True
-                break
-            else:
-                pass
-            batch.append(queued)
-        return batch, shutdown
+    def encode_and_synchronize(
+        self, waveform: str | npt.NDArray[np.generic], sample_rate: int
+    ) -> torch.Tensor:
+        encode_stream_context = (
+            torch.get_device_module(self.encoder_device).stream(self.encode_stream)
+            if self.encode_stream is not None
+            else contextlib.nullcontext()
+        )
+        with torch.inference_mode(), encode_stream_context:
+            codes = self.encode_waveform(waveform, sample_rate)
+        self.synchronize_codes(codes)
+        return codes
 
-    def synchronize_outcomes(
-        self, outcomes: dict[int, torch.Tensor | Exception]
-    ) -> None:
+    def synchronize_codes(self, codes: torch.Tensor) -> None:
         # note (luojiaxuan): resolve futures only after the encode kernels
         # finish so consumer threads may use the codes on any stream. Waiting
         # on the dedicated stream's event leaves the default stream, where
@@ -1016,16 +993,12 @@ class Qwen3TTSRefCodeBatcher:
             handoff = torch.get_device_module(self.encoder_device).Event()
             handoff.record(self.encode_stream)
             handoff.synchronize()
-            return
+        elif codes.device.type != "cpu":
+            torch.get_device_module(codes.device).current_stream(
+                codes.device
+            ).synchronize()
         else:
             pass
-        accelerator_devices = {
-            outcome.device
-            for outcome in outcomes.values()
-            if not isinstance(outcome, Exception) and outcome.device.type != "cpu"
-        }
-        for device in accelerator_devices:
-            torch.get_device_module(device).current_stream(device).synchronize()
 
     def encode_waveform(
         self, waveform: str | npt.NDArray[np.generic], sample_rate: int
@@ -1056,40 +1029,6 @@ class Qwen3TTSRefCodeBatcher:
             values, num_quantizers=self.num_quantizers, return_dict=True
         ).audio_codes
         return codes[0, :, :frames].transpose(0, 1)
-
-    def run(self) -> None:
-        while True:
-            raw_batch, shutdown = self.drain()
-            if not raw_batch:
-                return
-            else:
-                pass
-            batch = [
-                item for item in raw_batch if isinstance(item, tuple) and len(item) == 3
-            ]
-            outcomes: dict[int, torch.Tensor | Exception] = {}
-            encode_stream_ctx = (
-                torch.get_device_module(self.encoder_device).stream(self.encode_stream)
-                if self.encode_stream is not None
-                else contextlib.nullcontext()
-            )
-            with torch.inference_mode(), encode_stream_ctx:
-                for index, (waveform, sample_rate, _) in enumerate(batch):
-                    try:
-                        outcomes[index] = self.encode_waveform(waveform, sample_rate)
-                    except Exception as exc:
-                        outcomes[index] = exc
-            self.synchronize_outcomes(outcomes)
-            for index, (_, _, future) in enumerate(batch):
-                outcome = outcomes[index]
-                if isinstance(outcome, Exception):
-                    future.set_exception(outcome)
-                else:
-                    future.set_result(outcome)
-            if shutdown:
-                return
-            else:
-                pass
 
 
 class Qwen3TTSAdhocReferenceHook(
