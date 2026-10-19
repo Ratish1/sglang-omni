@@ -205,7 +205,7 @@ class FusedCode2WavTransformer(torch.nn.Module):
         elif paged_attention is not None:
             window_mask = None
             page_table = addresses.window_rows.to(torch.int32)
-            cache_seqlens = addresses.window_lengths.to(torch.int32)
+            window_lengths = addresses.window_lengths.to(torch.int32)
         else:
             # note (ratish): window rows run in position order, a row's new frames last.
             query_offsets = (addresses.window_lengths - length)[:, None] + frame_offsets
@@ -260,7 +260,7 @@ class FusedCode2WavTransformer(torch.nn.Module):
                     pool.keys[layer_index].view(-1, 1, key.shape[1], head_dim),
                     pool.values[layer_index].view(-1, 1, key.shape[1], head_dim),
                     page_table=page_table,
-                    cache_seqlens=cache_seqlens,
+                    cache_seqlens=window_lengths,
                     softmax_scale=layer.self_attn.scaling,
                     causal=True,
                     window_size=(pool.retained_frames, 0),
