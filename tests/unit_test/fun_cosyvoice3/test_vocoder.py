@@ -1357,8 +1357,9 @@ def test_hift_step_matches_the_whole_history_chain(
                         is_final=is_final,
                     )
                 )
-            for (delta, emitted_after), (reference, reference_after) in zip(
-                vocoder.hift_step(rows), expected, strict=True
+            samples = vocoder.hift_step(rows)
+            for delta, emitted_after, (reference, reference_after) in zip(
+                samples.wait(), samples.emitted_samples, expected, strict=True
             ):
                 assert emitted_after == reference_after
                 torch.testing.assert_close(delta, reference, atol=1e-4, rtol=0)
@@ -1386,7 +1387,7 @@ def test_hift_step_window_is_bit_identical_to_the_whole_history_call(
             speech_offset=emitted_samples,
             finalize=is_final,
         )
-        ((delta, _),) = vocoder.hift_step(
+        (delta,) = vocoder.hift_step(
             [
                 stages.HiftStepRow(
                     history=mel[:, :, :end_frame],
@@ -1394,7 +1395,7 @@ def test_hift_step_window_is_bit_identical_to_the_whole_history_call(
                     is_final=is_final,
                 )
             ]
-        )
+        ).wait()
     assert torch.equal(delta, reference)
 
 
@@ -1425,12 +1426,12 @@ def test_hift_step_final_is_bit_identical_beside_finals_of_other_widths(
     ]
     with torch.inference_mode():
         batched = vocoder.hift_step(rows)
-        alone = [vocoder.hift_step([row])[0] for row in rows]
-    for (delta, emitted_after), (reference, reference_after) in zip(
-        batched, alone, strict=True
+        alone = [vocoder.hift_step([row]) for row in rows]
+    for delta, emitted_after, single in zip(
+        batched.wait(), batched.emitted_samples, alone, strict=True
     ):
-        assert emitted_after == reference_after
-        assert torch.equal(delta, reference)
+        assert single.emitted_samples == [emitted_after]
+        assert torch.equal(delta, single.wait()[0])
 
 
 @pytest.mark.accelerator
@@ -1505,6 +1506,55 @@ def test_vocoder_spectra_match_cosyvoice_without_a_host_wait(
             torch.cuda.set_sync_debug_mode(sync_debug_mode)
     for output, reference in zip(outputs, references, strict=True):
         torch.testing.assert_close(output, reference)
+
+
+@pytest.mark.accelerator
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_hift_step_queues_its_samples_without_a_host_wait() -> None:
+    hift = make_causal_hift(10.0)
+    stages.patch_sine_harmonics(hift, "cuda")
+    vocoder = stages.CosyVoice3Vocoder(HiftFlowStub(), hift)
+    samples_per_frame = vocoder.hift_samples_per_mel_frame
+    torch.manual_seed(6)
+    rows = [
+        stages.HiftStepRow(
+            history=torch.randn(1, 80, total_frames, device="cuda") * 3,
+            emitted_samples=emitted_frames * samples_per_frame,
+            is_final=is_final,
+        )
+        for total_frames, emitted_frames, is_final in (
+            (120, 50, False),
+            (200, 140, True),
+            (30, 0, True),
+        )
+    ]
+    with torch.inference_mode():
+        reference = vocoder.hift_step(rows)
+        torch.cuda.synchronize()
+        sync_debug_mode = torch.cuda.get_sync_debug_mode()
+        torch.cuda.set_sync_debug_mode("error")
+        try:
+            samples = vocoder.hift_step(rows)
+        finally:
+            torch.cuda.set_sync_debug_mode(sync_debug_mode)
+    assert samples.emitted_samples == reference.emitted_samples
+    for delta, expected in zip(samples.wait(), reference.wait(), strict=True):
+        assert torch.equal(delta, expected)
+
+
+@pytest.mark.accelerator
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_hift_steps_record_their_copies_on_two_events_in_turn() -> None:
+    vocoder = stages.CosyVoice3Vocoder(HiftFlowStub(), make_causal_hift(10.0))
+    row = stages.HiftStepRow(
+        history=torch.randn(1, 80, 60, device="cuda"),
+        emitted_samples=0,
+        is_final=False,
+    )
+    with torch.inference_mode():
+        events = [vocoder.hift_step([row]).copy_done for _ in range(3)]
+    assert events[0] is not events[1]
+    assert events[2] is events[0]
 
 
 @pytest.mark.accelerator
@@ -1601,10 +1651,8 @@ def test_hift_step_through_the_decode_graphs_equals_the_eager_step(
         eager = vocoder.hift_step(rows)
         vocoder.hift_decode_cuda_graph_runner = runner
         replayed = vocoder.hift_step(rows)
-    for (delta, emitted_after), (reference, reference_after) in zip(
-        replayed, eager, strict=True
-    ):
-        assert emitted_after == reference_after
+    assert replayed.emitted_samples == eager.emitted_samples
+    for delta, reference in zip(replayed.wait(), eager.wait(), strict=True):
         assert torch.equal(delta, reference)
 
 

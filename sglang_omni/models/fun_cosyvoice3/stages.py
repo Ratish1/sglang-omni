@@ -25,7 +25,7 @@ from numpy.typing import ArrayLike
 from sglang.srt.arg_groups.cuda_graph_hook import (
     generate_prefill_cuda_graph_batch_sizes,
 )
-from sglang.srt.utils.common import is_pin_memory_available
+from sglang.srt.utils.common import async_d2h, is_pin_memory_available
 from torch._inductor.runtime.compile_tasks import _set_triton_libdevice_path
 from torch.nn.utils.parametrize import is_parametrized, remove_parametrizations
 from x_transformers.x_transformers import apply_rotary_pos_emb
@@ -209,6 +209,24 @@ class HiftStepRow:
     history: torch.Tensor
     emitted_samples: int
     is_final: bool
+
+
+@dataclass(kw_only=True, frozen=True)
+class HiftStepSamples:
+    """A streaming HiFT step's new samples per row and each row's emitted samples after
+    it. With copy_done the new samples view a pinned host copy, complete once it is."""
+
+    new_samples: list[torch.Tensor]
+    emitted_samples: list[int]
+    copy_done: torch.cuda.Event | None
+
+    def wait(self) -> list[torch.Tensor]:
+        """Each row's new samples on the host, once the copy has landed."""
+        if self.copy_done is not None:
+            self.copy_done.synchronize()
+        else:
+            pass
+        return self.new_samples
 
 
 @dataclass(kw_only=True, frozen=True)
@@ -1862,9 +1880,17 @@ class CosyVoice3Vocoder(BatchVocoderBase[FunCosyVoice3State, torch.Tensor]):
                 patch_hift_spectra(hift, device)
             else:
                 pass
+            # note (ratish): a step completes after the next one is launched, so two
+            # events serve every step in turn; a new event's first record waits while
+            # another thread of the process is inside the CUDA runtime.
+            self.copy_done_events: list[torch.cuda.Event] = [
+                torch.cuda.Event() for _ in range(2)
+            ]
         else:
             self.stream_context = contextlib.nullcontext()
             self.has_hift_kernels = False
+            self.copy_done_events = []
+        self.copy_done_slot: int = 0
 
     def prepare_item(
         self, payload: StagePayload
@@ -2129,9 +2155,9 @@ class CosyVoice3Vocoder(BatchVocoderBase[FunCosyVoice3State, torch.Tensor]):
         return delta, tts_mel.detach(), int(tts_speech.shape[1])
 
     @torch.inference_mode()
-    def hift_step(self, rows: Sequence[HiftStepRow]) -> list[tuple[torch.Tensor, int]]:
-        """HiFT over the rows of a streaming step. Returns each row's new samples
-        and its emitted sample count afterwards."""
+    def hift_step(self, rows: Sequence[HiftStepRow]) -> HiftStepSamples:
+        """HiFT over the rows of a streaming step: each row's new samples and its
+        emitted sample count afterwards."""
         windows: list[HiftDecodeWindow] = []
         for row in rows:
             history_frames = int(row.history.shape[2])
@@ -2163,7 +2189,20 @@ class CosyVoice3Vocoder(BatchVocoderBase[FunCosyVoice3State, torch.Tensor]):
         for members in groups.values():
             decoded = self.hift_group([windows[index] for index in members])
             outputs.update(zip(members, decoded, strict=True))
-        return [outputs[index] for index in range(len(rows))]
+        ordered = [outputs[index] for index in range(len(rows))]
+        if self.copy_done_events:
+            copy_done: torch.cuda.Event | None = self.copy_done_events[
+                self.copy_done_slot
+            ]
+            self.copy_done_slot ^= 1
+            copy_done.record()
+        else:
+            copy_done = None
+        return HiftStepSamples(
+            new_samples=[samples for samples, _ in ordered],
+            emitted_samples=[emitted for _, emitted in ordered],
+            copy_done=copy_done,
+        )
 
     def hift_group(
         self, windows: Sequence[HiftDecodeWindow]
@@ -2253,7 +2292,12 @@ class CosyVoice3Vocoder(BatchVocoderBase[FunCosyVoice3State, torch.Tensor]):
             speech = hift.decode(x=window_mel, s=window_source, finalize=True)
         else:
             speech = runner.run(window_mel, window_source)
-        speech = speech.detach().cpu()
+        # note (ratish): queued on this stream, the copy reads a replay's output before
+        # any later replay of the pool overwrites it.
+        if self.copy_done_events:
+            speech = async_d2h(speech.detach())
+        else:
+            speech = speech.detach().cpu()
         return [
             (
                 speech[
@@ -2261,7 +2305,7 @@ class CosyVoice3Vocoder(BatchVocoderBase[FunCosyVoice3State, torch.Tensor]):
                     (window.emitted_frame - origin)
                     * samples_per_frame : (window.end_frame - origin)
                     * samples_per_frame,
-                ].contiguous(),
+                ],
                 window.end_frame * samples_per_frame,
             )
             for index, (window, origin) in enumerate(
