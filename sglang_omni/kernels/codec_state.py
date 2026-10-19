@@ -5,162 +5,147 @@ and a transposed conv's overlap added into its output."""
 from __future__ import annotations
 
 import torch
+import triton
+import triton.language as tl
 from sglang.srt.utils.custom_op import register_custom_op
-
-try:  # keep the module importable when Triton is unavailable
-    import triton
-    import triton.language as tl
-
-    HAS_TRITON = True
-except Exception:  # pragma: no cover
-    triton = None
-    tl = None
-    HAS_TRITON = False
 
 CHANNEL_BLOCK = 64
 
-if HAS_TRITON:
 
-    @triton.jit
-    def history_exchange_kernel(
-        padded_ptr,
-        history_pool_ptr,
-        slot_index_ptr,
-        history_samples,
-        new_samples,
-        tail_samples,
-        channels,
-        padded_row_stride,
-        padded_sample_stride,
-        padded_channel_stride,
-        pool_slot_stride,
-        pool_sample_stride,
-        pool_channel_stride,
-        IS_COLD: tl.constexpr,
-        IS_SHIFT: tl.constexpr,
-        HISTORY_BLOCK: tl.constexpr,
-        TAIL_BLOCK: tl.constexpr,
-        CHANNEL_BLOCK: tl.constexpr,
-    ):
-        # note (ratish): one program owns a row's channel block over the whole history, so
-        # every read of the slot's old history precedes every write of its new one.
-        row = tl.program_id(0).to(tl.int64)
-        channel = tl.program_id(1) * CHANNEL_BLOCK + tl.arange(0, CHANNEL_BLOCK)
-        channel_mask = channel < channels
-        slot = tl.load(slot_index_ptr + row).to(tl.int64)
-        sample = tl.arange(0, HISTORY_BLOCK)
-        history_mask = (sample < history_samples)[:, None] & channel_mask[None, :]
-        padded_base = (
-            padded_ptr
-            + row * padded_row_stride
-            + channel[None, :] * padded_channel_stride
+@triton.jit
+def history_exchange_kernel(
+    padded_ptr,
+    history_pool_ptr,
+    slot_index_ptr,
+    history_samples,
+    new_samples,
+    tail_samples,
+    channels,
+    padded_row_stride,
+    padded_sample_stride,
+    padded_channel_stride,
+    pool_slot_stride,
+    pool_sample_stride,
+    pool_channel_stride,
+    IS_COLD: tl.constexpr,
+    IS_SHIFT: tl.constexpr,
+    HISTORY_BLOCK: tl.constexpr,
+    TAIL_BLOCK: tl.constexpr,
+    CHANNEL_BLOCK: tl.constexpr,
+):
+    # note (ratish): one program owns a row's channel block over the whole history, so
+    # every read of the slot's old history precedes every write of its new one.
+    row = tl.program_id(0).to(tl.int64)
+    channel = tl.program_id(1) * CHANNEL_BLOCK + tl.arange(0, CHANNEL_BLOCK)
+    channel_mask = channel < channels
+    slot = tl.load(slot_index_ptr + row).to(tl.int64)
+    sample = tl.arange(0, HISTORY_BLOCK)
+    history_mask = (sample < history_samples)[:, None] & channel_mask[None, :]
+    padded_base = (
+        padded_ptr + row * padded_row_stride + channel[None, :] * padded_channel_stride
+    )
+    pool_base = (
+        history_pool_ptr
+        + slot * pool_slot_stride
+        + channel[None, :] * pool_channel_stride
+    )
+    source = sample + new_samples
+    from_new = (source >= history_samples)[:, None] & history_mask
+    newest = tl.load(
+        padded_base + source[:, None] * padded_sample_stride, mask=from_new, other=0
+    )
+    if IS_COLD:
+        old = tl.zeros(
+            [HISTORY_BLOCK, CHANNEL_BLOCK], dtype=padded_ptr.dtype.element_ty
         )
-        pool_base = (
-            history_pool_ptr
-            + slot * pool_slot_stride
-            + channel[None, :] * pool_channel_stride
-        )
-        source = sample + new_samples
-        from_new = (source >= history_samples)[:, None] & history_mask
-        newest = tl.load(
-            padded_base + source[:, None] * padded_sample_stride, mask=from_new, other=0
-        )
-        if IS_COLD:
-            old = tl.zeros(
-                [HISTORY_BLOCK, CHANNEL_BLOCK], dtype=padded_ptr.dtype.element_ty
-            )
-            new_history = newest
-        else:
-            old = tl.load(
-                pool_base + sample[:, None] * pool_sample_stride,
-                mask=history_mask,
-                other=0,
-            )
-            if IS_SHIFT:
-                kept = tl.load(
-                    pool_base + source[:, None] * pool_sample_stride,
-                    mask=history_mask & (source < history_samples)[:, None],
-                    other=0,
-                )
-                new_history = tl.where(from_new, newest, kept)
-                # note (ratish): with fewer new samples than the history, a kept sample is
-                # read by one thread and overwritten by another.
-                tl.debug_barrier()
-            else:
-                new_history = newest
-        tl.store(
-            padded_base + sample[:, None] * padded_sample_stride, old, mask=history_mask
-        )
-        tl.store(
+        new_history = newest
+    else:
+        old = tl.load(
             pool_base + sample[:, None] * pool_sample_stride,
-            new_history,
             mask=history_mask,
-        )
-        tail = tl.arange(0, TAIL_BLOCK)
-        tl.store(
-            padded_base
-            + (history_samples + new_samples + tail)[:, None] * padded_sample_stride,
-            tl.zeros([TAIL_BLOCK, CHANNEL_BLOCK], dtype=padded_ptr.dtype.element_ty),
-            mask=(tail < tail_samples)[:, None] & channel_mask[None, :],
-        )
-
-    @triton.jit
-    def overlap_exchange_kernel(
-        output_ptr,
-        overlap_pool_ptr,
-        slot_index_ptr,
-        overlap_samples,
-        emitted_samples,
-        channels,
-        output_row_stride,
-        output_sample_stride,
-        output_channel_stride,
-        pool_slot_stride,
-        pool_sample_stride,
-        pool_channel_stride,
-        IS_COLD: tl.constexpr,
-        OVERLAP_BLOCK: tl.constexpr,
-        CHANNEL_BLOCK: tl.constexpr,
-    ):
-        row = tl.program_id(0).to(tl.int64)
-        channel = tl.program_id(1) * CHANNEL_BLOCK + tl.arange(0, CHANNEL_BLOCK)
-        channel_mask = channel < channels
-        slot = tl.load(slot_index_ptr + row).to(tl.int64)
-        sample = tl.arange(0, OVERLAP_BLOCK)
-        mask = (sample < overlap_samples)[:, None] & channel_mask[None, :]
-        output_base = (
-            output_ptr
-            + row * output_row_stride
-            + channel[None, :] * output_channel_stride
-        )
-        pool_base = (
-            overlap_pool_ptr
-            + slot * pool_slot_stride
-            + channel[None, :] * pool_channel_stride
-        )
-        tail = tl.load(
-            output_base + (emitted_samples + sample)[:, None] * output_sample_stride,
-            mask=mask,
             other=0,
         )
-        if IS_COLD:
-            pass
+        if IS_SHIFT:
+            kept = tl.load(
+                pool_base + source[:, None] * pool_sample_stride,
+                mask=history_mask & (source < history_samples)[:, None],
+                other=0,
+            )
+            new_history = tl.where(from_new, newest, kept)
+            # note (ratish): with fewer new samples than the history, a kept sample is
+            # read by one thread and overwritten by another.
+            tl.debug_barrier()
         else:
-            previous = tl.load(
-                pool_base + sample[:, None] * pool_sample_stride, mask=mask, other=0
-            )
-            head = tl.load(
-                output_base + sample[:, None] * output_sample_stride, mask=mask, other=0
-            )
-            tl.store(
-                output_base + sample[:, None] * output_sample_stride,
-                (head.to(tl.float32) + previous.to(tl.float32)).to(head.dtype),
-                mask=mask,
-            )
-        tl.store(pool_base + sample[:, None] * pool_sample_stride, tail, mask=mask)
+            new_history = newest
+    tl.store(
+        padded_base + sample[:, None] * padded_sample_stride, old, mask=history_mask
+    )
+    tl.store(
+        pool_base + sample[:, None] * pool_sample_stride,
+        new_history,
+        mask=history_mask,
+    )
+    tail = tl.arange(0, TAIL_BLOCK)
+    tl.store(
+        padded_base
+        + (history_samples + new_samples + tail)[:, None] * padded_sample_stride,
+        tl.zeros([TAIL_BLOCK, CHANNEL_BLOCK], dtype=padded_ptr.dtype.element_ty),
+        mask=(tail < tail_samples)[:, None] & channel_mask[None, :],
+    )
 
-else:
-    pass
+
+@triton.jit
+def overlap_exchange_kernel(
+    output_ptr,
+    overlap_pool_ptr,
+    slot_index_ptr,
+    overlap_samples,
+    emitted_samples,
+    channels,
+    output_row_stride,
+    output_sample_stride,
+    output_channel_stride,
+    pool_slot_stride,
+    pool_sample_stride,
+    pool_channel_stride,
+    IS_COLD: tl.constexpr,
+    OVERLAP_BLOCK: tl.constexpr,
+    CHANNEL_BLOCK: tl.constexpr,
+):
+    row = tl.program_id(0).to(tl.int64)
+    channel = tl.program_id(1) * CHANNEL_BLOCK + tl.arange(0, CHANNEL_BLOCK)
+    channel_mask = channel < channels
+    slot = tl.load(slot_index_ptr + row).to(tl.int64)
+    sample = tl.arange(0, OVERLAP_BLOCK)
+    mask = (sample < overlap_samples)[:, None] & channel_mask[None, :]
+    output_base = (
+        output_ptr + row * output_row_stride + channel[None, :] * output_channel_stride
+    )
+    pool_base = (
+        overlap_pool_ptr
+        + slot * pool_slot_stride
+        + channel[None, :] * pool_channel_stride
+    )
+    tail = tl.load(
+        output_base + (emitted_samples + sample)[:, None] * output_sample_stride,
+        mask=mask,
+        other=0,
+    )
+    if IS_COLD:
+        pass
+    else:
+        previous = tl.load(
+            pool_base + sample[:, None] * pool_sample_stride, mask=mask, other=0
+        )
+        head = tl.load(
+            output_base + sample[:, None] * output_sample_stride, mask=mask, other=0
+        )
+        tl.store(
+            output_base + sample[:, None] * output_sample_stride,
+            (head.to(tl.float32) + previous.to(tl.float32)).to(head.dtype),
+            mask=mask,
+        )
+    tl.store(pool_base + sample[:, None] * pool_sample_stride, tail, mask=mask)
 
 
 # note (ratish): opaque to torch.compile, which cannot trace the Triton launch
