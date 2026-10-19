@@ -116,8 +116,12 @@ class Qwen3TTSCodecStateArena:
                 self._num_slots - len(self.free) - len(self.retired)
             )  # noqa: leading-underscore
 
-    def acquire(self) -> int | None:
-        """Take a zeroed slot, or ``None`` when the arena is full."""
+    def has_free_slot(self) -> bool:
+        with self.lock:
+            return bool(self.free)
+
+    def acquire(self, *, source_slot: int | None = None) -> int | None:
+        """Take a slot, zeroed or holding a copy of source_slot's state; None when the arena is full."""
         with self.lock:
             if not self.free:
                 self._exhausted_count += 1  # noqa: leading-underscore
@@ -130,7 +134,10 @@ class Qwen3TTSCodecStateArena:
             self.device_module.current_stream(self.device).wait_event(released)
         else:
             pass
-        self.zero_slot(slot)
+        if source_slot is None:
+            self.zero_slot(slot)
+        else:
+            self.copy_slot(source_slot, slot)
         return slot
 
     def release(self, slot: int) -> None:
@@ -186,6 +193,16 @@ class Qwen3TTSCodecStateArena:
             [buffer[slot] for buffer in self._buffers(self.storage)]
         )
         self.storage.frame_positions[slot].zero_()
+
+    def copy_slot(self, source_slot: int, slot: int) -> None:
+        buffers = self._buffers(self.storage)
+        torch._foreach_copy_(  # noqa: leading-underscore  # upstream spelling, or the public name is already taken
+            [buffer[slot] for buffer in buffers],
+            [buffer[source_slot] for buffer in buffers],
+        )
+        self.storage.frame_positions[slot].copy_(
+            self.storage.frame_positions[source_slot]
+        )
 
     STAGING_RING = 4
 
