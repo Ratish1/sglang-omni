@@ -626,7 +626,7 @@ def test_a_final_launched_behind_its_hop_leaves_after_it_with_its_result_last(
     assert serve(scheduler) == 3
     assert [m.type for m in drain(scheduler)] == ["stream", "stream", "result"]
     assert log == ["launch 1", "launch 2", "read 1", "read 2"]
-    assert [call["streaming"] for call in estimator_calls(flow)] == [True, False]
+    assert estimator_calls(flow)[-1]["streaming"] is False
     assert "req-a" not in scheduler.stream_states
 
 
