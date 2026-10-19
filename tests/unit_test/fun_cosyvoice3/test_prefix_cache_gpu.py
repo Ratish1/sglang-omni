@@ -20,6 +20,8 @@ from sglang_omni.models.fun_cosyvoice3.prefix_cache import (
     BLOCK_FRAMES,
     PrefixCacheRow,
     PrefixKVPool,
+    PrefixRowAttention,
+    PrefixStepLayout,
     compile_forward_prefix,
     grow_rows,
     release_rows,
@@ -352,6 +354,48 @@ def test_compiled_prefix_hops_follow_each_row_across_batches() -> None:
     for pair in caches.values():
         release_rows(pool, list(pair))
     assert len(pool.free_blocks) == 32
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_prefix_layouts_upload_behind_queued_work_without_a_host_wait() -> None:
+    device = torch.device("cuda")
+    pool = PrefixKVPool(
+        layer_num=1,
+        euler_steps=1,
+        head_num=HEADS,
+        head_dim=HEAD_DIM,
+        capacity_frames=128 * BLOCK_FRAMES,
+        device=device,
+        dtype=torch.bfloat16,
+    )
+    rows = [PrefixCacheRow(), PrefixCacheRow()]
+    assert grow_rows(pool, rows, [2048, 2048])
+    layout = PrefixStepLayout(
+        half_frames=4096,
+        row_slots=1,
+        segment_count=2 * (-(-4096 // CHUNK) + 2),
+        page_table_width=4096,
+    )
+
+    def build() -> PrefixRowAttention:
+        return PrefixRowAttention(
+            rows=rows,
+            new_frames=[2048, 2048],
+            layout=layout,
+            padding_block=pool.padding_block,
+            chunk_size=CHUNK,
+            device=device,
+        )
+
+    build()
+    torch.cuda.synchronize()
+    torch.cuda._sleep(1_000_000_000)  # noqa: leading-underscore  # upstream name
+    queued = torch.cuda.Event()
+    queued.record()
+    for _ in range(4):
+        build()
+    assert not queued.query()
+    torch.cuda.synchronize()
 
 
 def test_grow_rows_takes_nothing_on_a_shortfall() -> None:
