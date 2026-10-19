@@ -12,8 +12,9 @@ from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.managers.schedule_batch import ReqKvInfo
 from sglang.srt.mem_cache.allocator.token import TokenToKVPoolAllocator
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
-from sglang.srt.mem_cache.chunk_cache import ChunkCache
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
+from sglang.srt.mem_cache.unified_cache.components import ComponentType
+from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.srt.runtime_context import get_context
 from sglang.srt.sampling.sampling_params import SamplingParams
 
@@ -329,12 +330,13 @@ def chunked_scheduler() -> DllmScheduler:
     scheduler.token_to_kv_pool_allocator = TokenToKVPoolAllocator(
         512, torch.float32, "cpu", None, False
     )
-    scheduler.tree_cache = ChunkCache(
+    scheduler.tree_cache = UnifiedRadixCache(
         CacheInitParams(
             disable=True,
             req_to_token_pool=scheduler.req_to_token_pool,
             token_to_kv_pool_allocator=scheduler.token_to_kv_pool_allocator,
             page_size=1,
+            tree_components=(ComponentType.FULL,),
         )
     )
     scheduler.chunked_prefill_size = 32

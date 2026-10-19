@@ -18,10 +18,10 @@ from sglang.srt.mem_cache.allocator.swa import (
 )
 from sglang.srt.mem_cache.allocator.token import TokenToKVPoolAllocator
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
-from sglang.srt.mem_cache.chunk_cache import ChunkCache
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool, ReqToTokenPool
+from sglang.srt.mem_cache.unified_cache.components import ComponentType
+from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.srt.runtime_context import get_context
-from sglang.srt.session.streaming_session import StreamingSession
 
 from sglang_omni.comm import KVPageTransfer
 from sglang_omni.scheduling import pd_utils
@@ -772,18 +772,21 @@ def test_pd_rejects_retained_session_adapter(
         validate_pd_runtime(scheduler)
 
 
-@pytest.mark.parametrize("session_wrapper", [False, True])
-def test_pd_rebuilt_request_releases_real_kv_once(session_wrapper: bool) -> None:
+def test_pd_rebuilt_request_releases_real_kv_once() -> None:
     with get_context().override_server_args(
         speculative_algorithm=None, strip_thinking_cache=False
     ):
         allocator = TokenToKVPoolAllocator(8, torch.float32, "cpu", None, False)
         request_pool = ReqToTokenPool(2, 32, "cpu", enable_memory_saver=False)
-        cache = ChunkCache(CacheInitParams(True, request_pool, allocator, 1))
-        if session_wrapper:
-            cache = StreamingSession(cache)
-        else:
-            pass
+        cache = UnifiedRadixCache(
+            CacheInitParams(
+                True,
+                request_pool,
+                allocator,
+                1,
+                tree_components=(ComponentType.FULL,),
+            )
+        )
         scheduler = decode_scheduler()
         scheduler.tree_cache = cache
         initial_free = allocator.available_size()
