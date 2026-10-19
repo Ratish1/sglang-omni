@@ -39,10 +39,7 @@ _MASK_FACTORY_NAMES = (
 def compute_default_rope_parameters(
     config: PretrainedConfig,
     device: torch.device | None = None,
-    seq_len: int | None = None,
-    layer_type: str | None = None,
 ) -> tuple[torch.Tensor, float]:
-    del seq_len, layer_type
     base = getattr(config, "rope_theta", getattr(config, "default_theta", 10000.0))
     partial_rotary_factor = getattr(config, "partial_rotary_factor", 1.0)
     head_dim = getattr(config, "head_dim", None)
