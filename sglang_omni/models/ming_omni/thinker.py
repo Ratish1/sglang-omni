@@ -20,7 +20,6 @@ import math
 from typing import Iterable, Optional, Tuple
 
 import torch
-from sglang.srt.layers.layer_boundary import enable_moe_dense_fully_dp
 from sglang.srt.runtime_context import get_parallel
 from torch import nn
 from transformers import PretrainedConfig
@@ -47,6 +46,7 @@ from sglang_omni.vendor.sglang.layers import (
     declare_ffn,
     get_moe_impl_class,
     get_rope,
+    is_dense_ffn_fully_dp,
     make_stages,
     residual_batch,
     should_use_flashinfer_cutlass_moe_fp4_allgather,
@@ -492,7 +492,7 @@ class BailingMoeV2DecoderLayer(nn.Module):
             config.hidden_size, eps=config.rms_norm_eps
         )
         if self.is_dense:
-            if enable_moe_dense_fully_dp():
+            if is_dense_ffn_fully_dp():
                 mlp_tp_rank, mlp_tp_size = 0, 1
             else:
                 mlp_tp_rank, mlp_tp_size = None, None

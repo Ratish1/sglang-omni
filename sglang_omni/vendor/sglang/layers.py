@@ -14,7 +14,13 @@ from typing import Optional, Tuple, Union
 import torch
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.aux_hidden_states import AuxHiddenStateList
-from sglang.srt.layers.layer_boundary import declare_attn, declare_ffn, make_stages
+from sglang.srt.layers.layer_boundary import (
+    append_stages,
+    declare_attn,
+    declare_ffn,
+    is_dense_ffn_fully_dp,
+    layer_stack,
+)
 from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
@@ -107,9 +113,11 @@ __all__ = [
     "RoutingMethodType",
     "QuantizationConfig",
     "AuxHiddenStateList",
+    "append_stages",
     "declare_attn",
     "declare_ffn",
-    "make_stages",
+    "is_dense_ffn_fully_dp",
+    "layer_stack",
     "residual_batch",
     "FusedMoE",
 ]
