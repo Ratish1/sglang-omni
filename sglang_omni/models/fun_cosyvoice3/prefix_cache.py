@@ -319,6 +319,11 @@ class PrefixRowAttention:
             torch.tensor(offsets),
             block_table.view(-1),
         )
+        # note (ratish): one upload from pinned memory; a pageable copy past 64 KB waits on
+        # the host for the stream's queued work.
+        packed_host = torch.empty(
+            sum(len(part) for part in host_parts), dtype=torch.int64, pin_memory=True
+        )
         (
             self.positions,
             self.conv_output_index,
@@ -331,7 +336,7 @@ class PrefixRowAttention:
             offsets_tensor,
             block_table,
         ) = (
-            torch.cat(host_parts)
+            torch.cat(host_parts, out=packed_host)
             .to(device, non_blocking=True)
             .split([len(part) for part in host_parts])
         )
