@@ -119,7 +119,22 @@ upstream's layer forward with Omni's hooks in it. Diff upstream's layer for
 the same architecture between the tags and mirror the change in order: which
 boundary prepares, which finishes, what the exit scope publishes for the MoE
 reduction. Outputs of a boundary are modified in place or through its
-accessors; the boundary checks the stream identity.
+accessors; the boundary checks the stream identity. A layer appends its
+stages to the stack that `make_layers` opens and gives the stack a
+`stage_facts` function that declares them without building the layer, which
+is how a neighbouring pipeline rank binds them. The boundary completes every
+output sum: the MoE blocks return partial sums, every projection under a
+boundary is built with `reduce_results=False`, and the model loader rejects
+a model where one is not.
+
+**The tree cache.** `sglang_omni/scheduling/sglang_backend/cache.py` builds
+upstream's unified radix cache for the radix-disabled stages and for the
+streaming-session stages, with the tree components the pools call for (full
+attention, a sliding window, hybrid state), and keeps the evict-heap radix
+tree for the radix-enabled stages without sessions. The session records live
+inside that cache and are read through `session_records()`. A cache class
+that upstream no longer builds for its own models is a surface to re-check at
+every bump: its base-class contract moves with the one upstream does build.
 
 **The vendor layer.** `sglang_omni/vendor/sglang/layers.py` patches
 `RMSNorm.forward_cuda` and `models.py` patches `apply_qk_norm`; the module
@@ -147,7 +162,15 @@ several write-then-read-back sites into hard errors.
 third-party package to the pinned stack, and each carries its removal
 condition in its docstring. Read the condition against the new stack and
 delete the overlay when it is met. A new overlay is one module that every
-import of the package goes through, with the condition written down.
+import of the package goes through, with the condition written down. The
+Transformers overlays, `qwen3_omni/components/vision_compat.py`,
+`audio_encoder.py` and `code2wav.py`, with the config copy in
+`qwen3_omni/hf_config.py` that carries upstream's defaults, are diffed the
+same way when Transformers moves: the helper names and call shapes they call
+into, and the defaults the copy repeats. A shim is dead only when the new
+stack serves the call itself; qwen-tts reads the rope initializer registry
+by key, which Transformers fills for its scaled types and not for the
+default one, so that shim stays.
 
 **Copies of upstream code.** Omni re-implements a few upstream helpers where
 it needs a different shape, for example the seeded sampling transform in
@@ -230,7 +253,9 @@ that have cost time:
 ## The CI image
 
 GPU CI runs inside `hongccc/sglang-omni`, pinned by digest in every
-workflow. The CI virtualenv uses Python 3.12 with system site-packages and
+workflow. The base image installs its Python with uv, so `/usr/bin/python3`
+is a wrapper for the `/opt/sglang` interpreter; the CI virtualenv is created
+from `/opt/sglang/bin/python3` with system site-packages and
 loads `/opt/sglang/lib/python3.12/site-packages` with `site.addsitedir`, including
 the upstream SGLang editable-install `.pth` file. Torch, FlashInfer and SGLang
 come from the image and only what
