@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import threading
+from collections import OrderedDict
 from collections.abc import Sequence
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, TypedDict
 
 import torch
@@ -34,6 +36,16 @@ class CodecCudaGraphStats(TypedDict):
     warm: list[IncrementalCodecGraphStats]
 
 
+class ReferenceStateStats(TypedDict):
+    """Reference states and the arena slots they hold, which streams take back on demand."""
+
+    references: int
+    slots: int
+    hits: int
+    fills: int
+    evictions: int
+
+
 class CodecStateStats(TypedDict, total=False):
     """Arena/scheduler snapshot; a disabled decoder reports only enabled."""
 
@@ -45,6 +57,7 @@ class CodecStateStats(TypedDict, total=False):
     enabled: bool
     left_context_fallbacks: int
     cuda_graphs: CodecCudaGraphStats
+    reference_states: ReferenceStateStats
 
 
 class Qwen3TTSCodecStateArena:
@@ -347,4 +360,137 @@ class Qwen3TTSCodecStateArena:
         }
 
 
-__all__ = ["Qwen3TTSCodecStateArena"]
+# note (ratish): a reference's state is filled at its second use, so a voice used
+# once never adds a fill row to its first chunk's decode.
+REFERENCE_STATE_FILL_USES = 2
+
+
+@dataclass(eq=False)
+class ReferenceState:
+    """One reference's codec state; slot is None until its fill is admitted."""
+
+    uses: int = 0
+    slot: int | None = None
+    is_ready: bool = False
+    lock_count: int = 0
+
+
+class Qwen3TTSReferenceStateCache:
+    """Codec state after a voice's reference codes, keyed by the codes' SHA-256.
+
+    Entries hold arena slots and give them back, least recent first, when a stream
+    needs one. Only the initial worker thread calls it, on its decode stream.
+    """
+
+    def __init__(self, arena: Qwen3TTSCodecStateArena) -> None:
+        self.arena = arena
+        self.states: OrderedDict[str, ReferenceState] = OrderedDict()
+        self.hits = 0
+        self.fills = 0
+        self.evictions = 0
+
+    def use(self, reference_key: str) -> ReferenceState:
+        """Count one first chunk of the reference and make it the most recent."""
+        reference_state = self.states.get(reference_key)
+        if reference_state is None:
+            if len(self.states) >= self.arena.num_slots:
+                self.evict_least_recent(needs_slot=False)
+            else:
+                pass
+            reference_state = ReferenceState()
+            self.states[reference_key] = reference_state
+        else:
+            self.states.move_to_end(reference_key)
+        reference_state.uses += 1
+        return reference_state
+
+    def acquire_stream_slot(self, reference_state: ReferenceState | None) -> int | None:
+        """A stream's slot: a copy of the reference's state once it is ready, zeroed otherwise."""
+        if reference_state is not None and reference_state.is_ready:
+            slot = self.acquire_slot(reference_state, source_slot=reference_state.slot)
+            if slot is not None:
+                self.hits += 1
+            else:
+                pass
+            return slot
+        else:
+            return self.acquire_slot(reference_state, source_slot=None)
+
+    def start_fill(self, reference_state: ReferenceState) -> int | None:
+        """A zeroed slot for the reference's state, locked until finish_fill."""
+        if (
+            reference_state.uses < REFERENCE_STATE_FILL_USES
+            or reference_state.slot is not None
+        ):
+            return None
+        else:
+            pass
+        slot = self.acquire_slot(reference_state, source_slot=None)
+        if slot is None:
+            return None
+        else:
+            pass
+        reference_state.slot = slot
+        reference_state.lock_count += 1
+        self.fills += 1
+        return slot
+
+    def finish_fill(self, reference_state: ReferenceState, *, is_filled: bool) -> None:
+        slot = reference_state.slot
+        assert slot is not None
+        reference_state.lock_count -= 1
+        if is_filled:
+            reference_state.is_ready = True
+        else:
+            self.arena.release(slot)
+            reference_state.slot = None
+
+    def acquire_slot(
+        self, reference_state: ReferenceState | None, *, source_slot: int | None
+    ) -> int | None:
+        """Acquire from the arena, evicting least recent entries other than reference_state first."""
+        if reference_state is not None:
+            reference_state.lock_count += 1
+        else:
+            pass
+        while not self.arena.has_free_slot() and self.evict_least_recent(
+            needs_slot=True
+        ):
+            pass
+        if reference_state is not None:
+            reference_state.lock_count -= 1
+        else:
+            pass
+        return self.arena.acquire(source_slot=source_slot)
+
+    def evict_least_recent(self, *, needs_slot: bool) -> bool:
+        """Drop the least recent unlocked entry, one holding a slot when needs_slot."""
+        for reference_key, reference_state in self.states.items():
+            if reference_state.lock_count == 0 and (
+                reference_state.slot is not None or not needs_slot
+            ):
+                self.states.pop(reference_key)
+                if reference_state.slot is not None:
+                    self.arena.release(reference_state.slot)
+                    self.evictions += 1
+                else:
+                    pass
+                return True
+            else:
+                pass
+        return False
+
+    def describe(self) -> ReferenceStateStats:
+        return {
+            "references": len(self.states),
+            "slots": sum(
+                reference_state.slot is not None
+                for reference_state in self.states.values()
+            ),
+            "hits": self.hits,
+            "fills": self.fills,
+            "evictions": self.evictions,
+        }
+
+
+__all__ = ["Qwen3TTSCodecStateArena", "Qwen3TTSReferenceStateCache"]
