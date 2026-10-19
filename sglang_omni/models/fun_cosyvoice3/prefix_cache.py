@@ -331,7 +331,9 @@ class PrefixRowAttention:
             offsets_tensor,
             block_table,
         ) = (
-            torch.cat(host_parts).to(device).split([len(part) for part in host_parts])
+            torch.cat(host_parts)
+            .to(device, non_blocking=True)
+            .split([len(part) for part in host_parts])
         )
         self.tail_index = tail_index.view(2 * row_slots, CONV_CONTEXT_FRAMES)
         block_table = block_table.view(len(block_lists), block_width)
