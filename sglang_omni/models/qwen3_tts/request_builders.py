@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import concurrent.futures
 import contextlib
+import hashlib
 import json
 import logging
 import queue
@@ -156,6 +157,7 @@ class Qwen3TTSSGLangRequestData(SGLangARRequestData):
     mask_leading_silence: bool = False
     ref_code: torch.Tensor | None = None
     ref_code_len: int = 0
+    reference_key: str | None = None
     prompt_input_embeds: torch.Tensor | None = None
     semantic_sampling_seed: int = field(default_factory=new_qwen3_tts_sampling_seed)
     subtalker_dosample: bool = True
@@ -1375,6 +1377,24 @@ def validate_qwen3_tts_model_task(model: PromptModel, state: Qwen3TTSState) -> N
         pass
 
 
+def qwen3_tts_reference_key(
+    reference_codes: Sequence[torch.Tensor | None] | None,
+) -> str | None:
+    """SHA-256 of a voice's reference codes, which keys its codec state in the vocoder."""
+    if reference_codes is None or reference_codes[0] is None:
+        return None
+    else:
+        pass
+    reference_code = reference_codes[0]
+    if reference_code.device.type != "cpu":
+        # note (ratish): a reference the encode service cannot cache keeps its codes on the
+        # device, and hashing them would block preprocessing on a copy.
+        return None
+    else:
+        pass
+    return hashlib.sha256(reference_code.numpy().tobytes()).hexdigest()
+
+
 def prepare_qwen3_tts_base_request(
     *,
     state: Qwen3TTSState,
@@ -1392,22 +1412,24 @@ def prepare_qwen3_tts_base_request(
     )
     if cached_prompt is not None:
         voice_clone_prompt, ref_text = cached_prompt
+        reference_codes = voice_clone_prompt.get("ref_code")
     elif cache_key is None:
         reference_service = get_qwen3_tts_adhoc_reference_service(model, wrapper)
         voice_clone_prompt, ref_text = reference_service.get_or_encode(
             state,
             desc="Qwen3-TTS ad-hoc reference",
         )
+        reference_codes = voice_clone_prompt.get("ref_code")
     else:
         hook = get_qwen3_tts_adhoc_reference_service(model, wrapper).hook
         voice_clone_prompt, ref_text = hook.encode_one(hook.normalize_input(state))
-        speaker_cache.put(
-            cache_key,
-            cacheable_qwen3_tts_voice_prompt(
-                voice_clone_prompt,
-                ref_text=ref_text,
-            ),
+        stored_prompt = cacheable_qwen3_tts_voice_prompt(
+            voice_clone_prompt,
+            ref_text=ref_text,
         )
+        speaker_cache.put(cache_key, stored_prompt)
+        reference_codes = stored_prompt.get("ref_code")
+    state.reference_key = qwen3_tts_reference_key(reference_codes)
 
     input_id = wrapper._tokenize_texts([wrapper._build_assistant_text(state.text)])[
         0
@@ -1785,6 +1807,7 @@ def build_sglang_qwen3_tts_request(
         req=req,
         ref_code=prepared.ref_code,
         ref_code_len=ref_code_len,
+        reference_key=state.reference_key,
         prompt_input_embeds=prepared.prompt_input_embeds,
         prefill_input_embeds=prepared.prompt_input_embeds,
         semantic_sampling_seed=semantic_sampling_seed,
@@ -1971,6 +1994,10 @@ def make_qwen3_tts_scheduler_adapters(
             else:
                 pass
             metadata["ref_code_len"] = ref_code_len
+            if data.reference_key is not None:
+                metadata["reference_key"] = data.reference_key
+            else:
+                pass
             if INITIAL_CODEC_CHUNK_FRAMES_PARAM in params:
                 metadata[INITIAL_CODEC_CHUNK_FRAMES_PARAM] = params[
                     INITIAL_CODEC_CHUNK_FRAMES_PARAM
