@@ -42,6 +42,7 @@ from sglang_omni.vendor.sglang.layers import (
     RMSNorm,
     RowParallelLinear,
     SiluAndMul,
+    StageDeclaration,
     VocabParallelEmbedding,
     append_stages,
     declare_attn,
@@ -487,14 +488,16 @@ class BailingMoeV2DecoderLayer(nn.Module):
                 prefix=add_prefix("mlp", prefix),
             )
 
-        attn, ffn = self.stage_facts(config, layer_id)
+        attention_stage, ffn_stage = self.stage_facts(config, layer_id)
         self.attn_boundary, self.ffn_boundary = append_stages(
-            (attn, self.input_layernorm),
-            (ffn, self.post_attention_layernorm),
+            (attention_stage, self.input_layernorm),
+            (ffn_stage, self.post_attention_layernorm),
         )
 
     @staticmethod
-    def stage_facts(config: BailingMoeV2Config, layer_id: int):
+    def stage_facts(
+        config: BailingMoeV2Config, layer_id: int
+    ) -> tuple[StageDeclaration, StageDeclaration]:
         """The stages the layer declares, from the config alone (see make_layers)."""
         is_layer_sparse = layer_id >= config.first_k_dense_replace
         is_next_layer_sparse = layer_id + 1 >= config.first_k_dense_replace

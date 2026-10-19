@@ -27,6 +27,7 @@ from sglang_omni.vendor.sglang.layers import (
     RMSNorm,
     RoutingMethodType,
     RowParallelLinear,
+    StageDeclaration,
     TopK,
     VocabParallelEmbedding,
     append_stages,
@@ -513,8 +514,8 @@ class Qwen3OmniMoeThinkerTextDecoderLayer(nn.Module):
         self.attn_tp_size = get_parallel().attn_tp_size
         self.attn_tp_rank = get_parallel().attn_tp_rank
 
-        attn, ffn = self.stage_facts(config, layer_id)
-        self.is_layer_sparse = ffn.sparse
+        attention_stage, ffn_stage = self.stage_facts(config, layer_id)
+        self.is_layer_sparse = ffn_stage.sparse
 
         if self.is_layer_sparse:
             self.mlp = self.sparse_moe_block_cls(
@@ -534,12 +535,14 @@ class Qwen3OmniMoeThinkerTextDecoderLayer(nn.Module):
         )
 
         self.attn_boundary, self.ffn_boundary = append_stages(
-            (attn, self.input_layernorm),
-            (ffn, self.post_attention_layernorm),
+            (attention_stage, self.input_layernorm),
+            (ffn_stage, self.post_attention_layernorm),
         )
 
     @staticmethod
-    def stage_facts(config: Qwen3OmniMoeTextConfig, layer_id: int):
+    def stage_facts(
+        config: Qwen3OmniMoeTextConfig, layer_id: int
+    ) -> tuple[StageDeclaration, StageDeclaration]:
         """The stages the layer declares, from the config alone (see make_layers)."""
         # Qwen3MoE all layers are sparse and have no nextn now
         is_layer_sparse = True

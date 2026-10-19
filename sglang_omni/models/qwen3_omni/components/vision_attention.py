@@ -48,8 +48,7 @@ class Qwen3OmniVisionAttention(nn.Module):
         sequence_metadata: VisionSequenceMetadata,
         **kwargs: Unpack[TransformersKwargs],
     ) -> torch.Tensor:
-        # note (ratish): the host patch counts stand in for the block's max_seqlen.
-        del max_seqlen
+        # note (ratish): the block passes max_seqlen; the host patch counts stand in for it.
         sequence_patch_count = hidden_states.shape[0]
         query, key, value = (
             self.qkv(hidden_states)
