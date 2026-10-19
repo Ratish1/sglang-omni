@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import dataclasses
+import os
 
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.allocator.swa import (
@@ -62,9 +63,15 @@ def create_tree_cache(
         token_to_kv_pool_allocator, PureSWATokenToKVPoolAllocator
     ):
         return PureSWARadixCache(params)
-    elif get_memory().disable_radix_cache or get_serving().enable_streaming_session:
+    elif (
+        get_memory().disable_radix_cache
+        or get_serving().enable_streaming_session
+        or os.environ.get("SGLANG_OMNI_UNIFIED_RADIX") == "1"
+    ):
         # note (ratish): streaming sessions live inside the unified cache, so a
-        # session stage takes it whether or not its radix tree is enabled.
+        # session stage takes it whether or not its radix tree is enabled; the
+        # environment switch is the experiment that measures the enabled tree
+        # on the unified cache against the evict heap.
         tree_components = [ComponentType.FULL]
         if isinstance(token_to_kv_pool_allocator, SWATokenToKVPoolAllocator):
             tree_components.append(ComponentType.SWA)
