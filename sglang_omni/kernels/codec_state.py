@@ -164,14 +164,21 @@ else:
 
 
 # note (ratish): opaque to torch.compile, which cannot trace the Triton launch
-@register_custom_op(mutates_args=["padded", "history_pool"])
-def launch_history_exchange(
+@register_custom_op(
+    op_name="codec_history_exchange", mutates_args=["padded", "history_pool"]
+)
+def history_exchange(
     padded: torch.Tensor,
     history_pool: torch.Tensor,
     slot_index: torch.Tensor,
     new_samples: int,
     is_cold: bool,
 ) -> None:
+    """Fill a causal conv's (rows, history + new + tail, channels) input around the new samples
+    a producer already wrote: the slot's history in front (zeros for a cold slot), the dilation's
+    zeros after; then keep the last history samples of history and new samples as the slot's
+    history. history_pool is (slots, history, channels); slot_index names each row's slot.
+    """
     rows, padded_samples, channels = padded.shape
     history_samples = int(history_pool.shape[1])
     tail_samples = padded_samples - history_samples - new_samples
@@ -196,14 +203,20 @@ def launch_history_exchange(
 
 
 # note (ratish): opaque to torch.compile, which cannot trace the Triton launch
-@register_custom_op(mutates_args=["output", "overlap_pool"])
-def launch_overlap_exchange(
+@register_custom_op(
+    op_name="codec_overlap_exchange", mutates_args=["output", "overlap_pool"]
+)
+def overlap_exchange(
     output: torch.Tensor,
     overlap_pool: torch.Tensor,
     slot_index: torch.Tensor,
     emitted_samples: int,
     is_cold: bool,
 ) -> None:
+    """Add each slot's overlap into the front of a transposed conv's (rows, emitted + overlap,
+    channels) output (not for a cold slot) and keep the samples past the emitted ones as the
+    slot's overlap. Needs emitted_samples >= the overlap, so the two ranges never meet.
+    """
     rows, _, channels = output.shape
     overlap_samples = int(overlap_pool.shape[1])
     with torch.get_device_module(output.device).device(output.device):
@@ -220,82 +233,4 @@ def launch_overlap_exchange(
             OVERLAP_BLOCK=triton.next_power_of_2(max(overlap_samples, 1)),
             CHANNEL_BLOCK=CHANNEL_BLOCK,
             num_warps=4,
-        )
-
-
-def history_exchange_reference(
-    padded: torch.Tensor,
-    history_pool: torch.Tensor,
-    slot_index: torch.Tensor,
-    new_samples: int,
-    is_cold: bool,
-) -> None:
-    history_samples = int(history_pool.shape[1])
-    if is_cold:
-        padded[:, :history_samples].zero_()
-    else:
-        padded[:, :history_samples].copy_(history_pool.index_select(0, slot_index))
-    padded[:, history_samples + new_samples :].zero_()
-    history_pool.index_copy_(
-        0, slot_index, padded[:, new_samples : new_samples + history_samples]
-    )
-
-
-def overlap_exchange_reference(
-    output: torch.Tensor,
-    overlap_pool: torch.Tensor,
-    slot_index: torch.Tensor,
-    emitted_samples: int,
-    is_cold: bool,
-) -> None:
-    overlap_samples = int(overlap_pool.shape[1])
-    if is_cold:
-        pass
-    else:
-        output[:, :overlap_samples] += overlap_pool.index_select(0, slot_index)
-    overlap_pool.index_copy_(
-        0, slot_index, output[:, emitted_samples : emitted_samples + overlap_samples]
-    )
-
-
-def history_exchange(
-    padded: torch.Tensor,
-    history_pool: torch.Tensor,
-    slot_index: torch.Tensor,
-    *,
-    new_samples: int,
-    is_cold: bool,
-) -> None:
-    """Fill a causal conv's (rows, history + new + tail, channels) input around the new samples
-    a producer already wrote: the slot's history in front (zeros for a cold slot), the dilation's
-    zeros after; then keep the last history samples of history and new samples as the slot's
-    history. history_pool is (slots, history, channels); slot_index names each row's slot.
-    """
-    if padded.device.type == "cuda":
-        launch_history_exchange(padded, history_pool, slot_index, new_samples, is_cold)
-    else:
-        history_exchange_reference(
-            padded, history_pool, slot_index, new_samples, is_cold
-        )
-
-
-def overlap_exchange(
-    output: torch.Tensor,
-    overlap_pool: torch.Tensor,
-    slot_index: torch.Tensor,
-    *,
-    emitted_samples: int,
-    is_cold: bool,
-) -> None:
-    """Add each slot's overlap into the front of a transposed conv's (rows, emitted + overlap,
-    channels) output (not for a cold slot) and keep the samples past the emitted ones as the
-    slot's overlap. Needs emitted_samples >= the overlap, so the two ranges never meet.
-    """
-    if output.device.type == "cuda":
-        launch_overlap_exchange(
-            output, overlap_pool, slot_index, emitted_samples, is_cold
-        )
-    else:
-        overlap_exchange_reference(
-            output, overlap_pool, slot_index, emitted_samples, is_cold
         )

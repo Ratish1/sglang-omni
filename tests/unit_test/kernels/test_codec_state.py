@@ -6,17 +6,51 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from sglang_omni.kernels.codec_state import (
-    history_exchange,
-    history_exchange_reference,
-    launch_history_exchange,
-    launch_overlap_exchange,
-    overlap_exchange,
-    overlap_exchange_reference,
-)
+from sglang_omni.kernels.codec_state import history_exchange, overlap_exchange
 from sglang_omni.platforms import current_platform
 
+REQUIRES_CUDA = pytest.mark.skipif(
+    not current_platform.is_cuda(), reason="the exchange kernels run on CUDA"
+)
 
+
+def history_exchange_reference(
+    padded: torch.Tensor,
+    history_pool: torch.Tensor,
+    slot_index: torch.Tensor,
+    new_samples: int,
+    is_cold: bool,
+) -> None:
+    history_samples = int(history_pool.shape[1])
+    if is_cold:
+        padded[:, :history_samples].zero_()
+    else:
+        padded[:, :history_samples].copy_(history_pool.index_select(0, slot_index))
+    padded[:, history_samples + new_samples :].zero_()
+    history_pool.index_copy_(
+        0, slot_index, padded[:, new_samples : new_samples + history_samples]
+    )
+
+
+def overlap_exchange_reference(
+    output: torch.Tensor,
+    overlap_pool: torch.Tensor,
+    slot_index: torch.Tensor,
+    emitted_samples: int,
+    is_cold: bool,
+) -> None:
+    overlap_samples = int(overlap_pool.shape[1])
+    if is_cold:
+        pass
+    else:
+        output[:, :overlap_samples] += overlap_pool.index_select(0, slot_index)
+    overlap_pool.index_copy_(
+        0, slot_index, output[:, emitted_samples : emitted_samples + overlap_samples]
+    )
+
+
+@pytest.mark.accelerator
+@REQUIRES_CUDA
 @pytest.mark.parametrize("history_samples", [2, 6, 54])
 @pytest.mark.parametrize("chunks", [(10, 10, 7), (1, 2, 1, 3, 40), (32, 1, 32)])
 def test_history_exchange_builds_the_causal_window_of_the_whole_stream(
@@ -24,14 +58,16 @@ def test_history_exchange_builds_the_causal_window_of_the_whole_stream(
 ) -> None:
     torch.manual_seed(history_samples + len(chunks))
     slots, channels = 5, 3
-    slot_index = torch.tensor([3, 1])
-    history_pool = torch.randn(slots, history_samples, channels)
+    slot_index = torch.tensor([3, 1], device="cuda")
+    history_pool = torch.randn(slots, history_samples, channels, device="cuda")
     untouched = history_pool[[0, 2, 4]].clone()
-    stream = torch.randn(2, sum(chunks), channels)
+    stream = torch.randn(2, sum(chunks), channels, device="cuda")
     whole = F.pad(stream, (0, 0, history_samples, 0))
     start = 0
     for index, new_samples in enumerate(chunks):
-        padded = torch.full((2, history_samples + new_samples + 2, channels), 7.0)
+        padded = torch.full(
+            (2, history_samples + new_samples + 2, channels), 7.0, device="cuda"
+        )
         padded[:, history_samples : history_samples + new_samples] = stream[
             :, start : start + new_samples
         ]
@@ -58,17 +94,20 @@ def test_history_exchange_builds_the_causal_window_of_the_whole_stream(
     torch.testing.assert_close(history_pool[[0, 2, 4]], untouched, rtol=0, atol=0)
 
 
+@pytest.mark.accelerator
+@REQUIRES_CUDA
 @pytest.mark.parametrize("stride", [3, 5, 8])
 @pytest.mark.parametrize("chunks", [(4, 4, 2), (1, 1, 1, 5)])
 def test_overlap_exchange_streams_the_whole_transposed_conv(
-    stride: int, chunks: tuple[int, ...]
+    monkeypatch: pytest.MonkeyPatch, stride: int, chunks: tuple[int, ...]
 ) -> None:
+    monkeypatch.setattr(torch.backends.cudnn, "allow_tf32", False)
     torch.manual_seed(stride + len(chunks))
-    weight = torch.randn(4, 3, 2 * stride)
-    inputs = torch.randn(2, 4, sum(chunks))
+    weight = torch.randn(4, 3, 2 * stride, device="cuda")
+    inputs = torch.randn(2, 4, sum(chunks), device="cuda")
     whole = F.conv_transpose1d(inputs, weight, stride=stride)
-    overlap_pool = torch.randn(4, stride, 3)
-    slot_index = torch.tensor([2, 0])
+    overlap_pool = torch.randn(4, stride, 3, device="cuda")
+    slot_index = torch.tensor([2, 0], device="cuda")
     emitted = []
     start = 0
     for index, frames in enumerate(chunks):
@@ -92,9 +131,7 @@ def test_overlap_exchange_streams_the_whole_transposed_conv(
 
 
 @pytest.mark.accelerator
-@pytest.mark.skipif(
-    not current_platform.is_cuda(), reason="the exchange kernels run on CUDA"
-)
+@REQUIRES_CUDA
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
 @pytest.mark.parametrize("is_channels_first", [False, True])
 @pytest.mark.parametrize("is_cold", [False, True])
@@ -134,16 +171,14 @@ def test_history_exchange_kernel_equals_the_reference(
     history_exchange_reference(
         expected_padded, expected_pool, slot_index, new_samples, is_cold
     )
-    launch_history_exchange(padded, history_pool, slot_index, new_samples, is_cold)
+    history_exchange(padded, history_pool, slot_index, new_samples, is_cold)
 
     assert torch.equal(padded, expected_padded)
     assert torch.equal(history_pool, expected_pool)
 
 
 @pytest.mark.accelerator
-@pytest.mark.skipif(
-    not current_platform.is_cuda(), reason="the exchange kernels run on CUDA"
-)
+@REQUIRES_CUDA
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
 @pytest.mark.parametrize("is_channels_first", [False, True])
 @pytest.mark.parametrize("is_cold", [False, True])
@@ -173,7 +208,7 @@ def test_overlap_exchange_kernel_equals_the_reference(
     overlap_exchange_reference(
         expected_output, expected_pool, slot_index, emitted_samples, is_cold
     )
-    launch_overlap_exchange(output, overlap_pool, slot_index, emitted_samples, is_cold)
+    overlap_exchange(output, overlap_pool, slot_index, emitted_samples, is_cold)
 
     assert torch.equal(output, expected_output)
     assert torch.equal(overlap_pool, expected_pool)
