@@ -5,7 +5,7 @@ owners' op rows by the source line that launched them: the decoder transformer (
 incremental attention, rope and K/V in incremental_codec.py, and HF's norm, layer scale and
 MLP), conv kernels and their glue, the arena gather and scatter, the quantizer decode,
 SnakeBeta, and the conv bias adds of PyTorch's cuDNN path. The line ranges are those of
-incremental_codec.py and modeling_qwen3_tts_tokenizer_v2.py at main b97f66d98 to ddbb1c779.
+incremental_codec.py at main bcd0d8c68 and modeling_qwen3_tts_tokenizer_v2.py at qwen-tts 0.1.1.
 
 usage: python vocoder_function_census.py census_Gall.txt
 """
@@ -32,14 +32,16 @@ def category(op: str, where: str, kernel: str) -> str:
         else:
             return f"HF other {line}"
     elif "incremental_codec.py" in path:
-        if line == 895:
+        if 851 <= line <= 903:
             return "quantizer decode"
-        elif 363 <= line <= 527:
+        elif 363 <= line <= 551:
             return "transformer (incremental attention, rope, kv)"
-        elif 528 <= line <= 556:
+        elif 552 <= line <= 580:
             return "convnext"
-        elif 557 <= line <= 576:
+        elif 581 <= line <= 600:
             return "residual add"
+        elif 970 <= line <= 1018:
+            return "frame gather"
         elif 234 <= line <= 322:
             return "conv glue (cat, pad, clone, overlap, bias)"
         elif 147 <= line <= 233:
