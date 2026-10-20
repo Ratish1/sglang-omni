@@ -1,0 +1,11 @@
+s16|16|||1||
+zh16|16|||1|/data/c20261011/mixed/zh/meta.lst|
+lref16|16|||1|/data/c20261011/mixed/longref/meta.lst|
+sref16|16|||1|/data/c20261011/mixed/shortref/meta.lst|
+sr48k16|16|||1|/data/c20261011/mixed/sr48k/meta.lst|
+sr8k16|16|||1|/data/c20261011/mixed/sr8k/meta.lst|
+ins16|16|128||1||--instructions "You are a helpful assistant. Please speak slowly and calmly."
+b32|32|||0||
+L16|16|||1|/data/c20261011/longform/meta.lst|
+WT16|16|16|1234|1|/data/c20261011/worst/meta.lst|--max-new-tokens 3000
+tail|1|4|1234|1||
