@@ -24,9 +24,13 @@ def main() -> None:
     parser.add_argument("output")
     parser.add_argument("--widths", type=int, nargs="+", default=[1, 2, 8])
     parser.add_argument("--buckets", type=int, nargs="+", default=[1, 4])
+    parser.add_argument("--card", type=int, default=0)
     args = parser.parse_args()
-    device = torch.device("cuda")
-    decoder = load_qwen3_tts_tokenizer(MODEL, device="cuda", dtype="bfloat16", attn_implementation=None).model.decoder
+    torch.cuda.set_device(args.card)
+    device = torch.device("cuda", args.card)
+    decoder = load_qwen3_tts_tokenizer(
+        MODEL, device=f"cuda:{args.card}", dtype="bfloat16", attn_implementation=None
+    ).model.decoder
     num_quantizers = int(decoder.config.num_quantizers)
     incremental = Qwen3TTSIncrementalDecoder(decoder)
     arena = Qwen3TTSCodecStateArena(incremental, num_slots=max(args.buckets), device=device, dtype=torch.bfloat16)
