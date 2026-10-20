@@ -12,6 +12,7 @@ from sglang_omni.config import (
     StageConfig,
 )
 from sglang_omni.config.schema import stage_process_name
+from sglang_omni.platforms import current_platform
 
 _PKG = "sglang_omni.models.fun_cosyvoice3"
 
@@ -180,6 +181,25 @@ class FunCosyVoice3PipelineConfig(PipelineConfig):
                 # note(chenye): SGLang pins Torch CPU threads to 1 for its GPU process.
                 # Apply the same policy at spawn to every stage colocated with the engine.
                 env_defaults["OMP_NUM_THREADS"] = "1"
+            else:
+                pass
+        else:
+            pass
+        if (
+            stage_name == "vocoder"
+            and current_platform.is_cuda()
+            and "PYTORCH_ALLOC_CONF" not in env_defaults
+        ):
+            process_name = stage_process_name(self.stage_named(stage_name))
+            if not any(
+                "PYTORCH_ALLOC_CONF" in stage.env
+                for stage in self.stages
+                if stage_process_name(stage) == process_name
+            ):
+                # note (ratish): the vocoder's steps vary in size, and segments that grow
+                # in place hold the allocator near the live peak (serving grew 1.6 against
+                # 6.1 GiB on H100). Torch reads this name last, so a written one wins.
+                env_defaults["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
             else:
                 pass
         else:
