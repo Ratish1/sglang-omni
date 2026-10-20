@@ -70,6 +70,7 @@ ARMS = {
     "s3zb": ("s3z", [], [0.7769]),
     "upq": ("upq", [], [0.7769]),
     "cip": ("cip", [], [0.7769]),
+    "cis": ("cis", [], [0.7769]),
 }
 # arm: benchmark args every pass of the arm adds
 ARM_BENCH_ARGS: dict[str, list[str]] = {}
@@ -415,6 +416,14 @@ def main() -> None:
         return
     elif args.rounds is None:
         parser.error("--rounds is required unless --score-only")
+    else:
+        pass
+    # note (ratish): an arm missing from ARMS fails its boot in every round while the other arm runs alone, which
+    # leaves a one-armed run; refuse it before any server starts.
+    unknown_arms = {entry.split("@")[0] for round_spec in args.rounds.split(";") for entry in round_spec.split(",")}
+    unknown_arms -= ARMS.keys()
+    if unknown_arms:
+        parser.error(f"arms not in ARMS: {sorted(unknown_arms)}")
     else:
         pass
     (out / "driver.pgid").write_text(str(os.getpgrp()))
