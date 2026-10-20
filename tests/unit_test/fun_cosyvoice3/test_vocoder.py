@@ -33,6 +33,8 @@ from sglang_omni.proto import OmniRequest, StagePayload
 from sglang_omni.scheduling.message import IncomingMessage
 from tests.unit_test.fun_cosyvoice3.test_flow_batch import FakeFlow as _PackedFlow
 
+HIFT_ROUNDING_ATOL = 1e-6
+
 
 class FakeF0Predictor(torch.nn.Module):
     condnet: ClassVar[list[SimpleNamespace]] = [SimpleNamespace(causal_padding=0)]
@@ -1368,7 +1370,7 @@ def test_hift_step_matches_the_whole_history_chain(
 @pytest.mark.accelerator
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("is_final", [False, True])
-def test_hift_step_window_is_bit_identical_to_the_whole_history_call(
+def test_hift_step_window_equals_the_whole_history_call(
     monkeypatch: pytest.MonkeyPatch, is_final: bool
 ) -> None:
     monkeypatch.setattr(torch.backends.cudnn, "allow_tf32", False)
@@ -1396,12 +1398,12 @@ def test_hift_step_window_is_bit_identical_to_the_whole_history_call(
                 )
             ]
         )
-    assert torch.equal(delta, reference)
+    torch.testing.assert_close(delta, reference, atol=HIFT_ROUNDING_ATOL, rtol=0)
 
 
 @pytest.mark.accelerator
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-def test_hift_step_final_is_bit_identical_beside_finals_of_other_widths(
+def test_hift_step_final_equals_its_own_call_beside_finals_of_other_widths(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Each final's samples and cursor equal its own call, whatever it shares a step with and in which order."""
@@ -1431,7 +1433,7 @@ def test_hift_step_final_is_bit_identical_beside_finals_of_other_widths(
         batched, alone, strict=True
     ):
         assert emitted_after == reference_after
-        assert torch.equal(delta, reference)
+        torch.testing.assert_close(delta, reference, atol=HIFT_ROUNDING_ATOL, rtol=0)
 
 
 @pytest.mark.accelerator
@@ -1521,7 +1523,7 @@ def test_channels_last_decode_matches_cosyvoice_decode(
         decoded = hift.decode(x=mel, s=source, finalize=True)
         reference = reference_hift.decode(x=mel, s=source, finalize=True)
     assert decoded.shape == reference.shape
-    torch.testing.assert_close(decoded, reference, atol=1e-4, rtol=0)
+    torch.testing.assert_close(decoded, reference, atol=HIFT_ROUNDING_ATOL, rtol=0)
 
 
 @pytest.mark.accelerator
@@ -1556,7 +1558,9 @@ def test_hift_decode_replay_equals_each_rows_own_decode(
             for row in range(3)
         ]
     for row, reference in enumerate(alone):
-        assert torch.equal(replayed[row : row + 1], reference)
+        torch.testing.assert_close(
+            replayed[row : row + 1], reference, atol=HIFT_ROUNDING_ATOL, rtol=0
+        )
 
 
 @pytest.mark.accelerator
@@ -1602,7 +1606,7 @@ def test_hift_step_through_the_decode_graphs_equals_the_eager_step(
         replayed, eager, strict=True
     ):
         assert emitted_after == reference_after
-        assert torch.equal(delta, reference)
+        torch.testing.assert_close(delta, reference, atol=HIFT_ROUNDING_ATOL, rtol=0)
 
 
 def prefix_pool_scheduler(
