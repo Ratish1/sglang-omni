@@ -433,6 +433,17 @@ def patch_scheduler(module):
         scheduler.process_batch_result,
         lambda self, batch, result: batch_label("sched.result", batch),
     )
+    scheduler.run_batch_launch = ranged(
+        scheduler.run_batch_launch,
+        lambda self, batch: batch_label("sched.launch", batch),
+    )
+    scheduler.resolve_and_process = ranged(
+        scheduler.resolve_and_process,
+        lambda self, batch, *args, **kwargs: batch_label("sched.resolve", batch),
+    )
+    scheduler.resolve_pending_async = ranged(
+        scheduler.resolve_pending_async, fixed("sched.drain")
+    )
     scheduler.run_request_builder = ranged(
         scheduler.run_request_builder,
         lambda self, payload, active_stage: f"sched.build rid={payload.request_id}",
@@ -464,6 +475,8 @@ def patch_base_runner(module):
     runner = module.ModelRunner
     for name, label in (
         ("execute", "mr.execute"),
+        ("execute_launch", "mr.launch"),
+        ("execute_resolve", "mr.resolve"),
         ("build_forward_batch", "mr.build_fb"),
         ("prepare_and_forward", "mr.prepare_forward"),
         ("finalize", "mr.finalize"),
@@ -482,17 +495,24 @@ def patch_worker(module):
 
 
 def patch_qwen_runner(module):
+    # A branch may rename a target (the lookahead's launch_code_step replaces collect_codes), so each
+    # present one is ranged and each absent one is named on stderr, never dropping the rest.
     runner = module.Qwen3TTSModelRunner
     for name, label in (
         ("before_prefill", "mr.before_prefill"),
         ("before_decode", "mr.before_decode"),
         ("sample_next_token_ids", "mr.sample"),
         ("apply_codec_suppress_tokens", "mr.suppress"),
+        ("mask_leading_silence", "mr.silence"),
         ("collect_codes", "mr.collect"),
+        ("launch_code_step", "mr.collect"),
         ("post_process_outputs", "mr.post"),
         ("write_feedback_buffers", "mr.feedback"),
     ):
-        setattr(runner, name, ranged(getattr(runner, name), fixed(label)))
+        if hasattr(runner, name):
+            setattr(runner, name, ranged(getattr(runner, name), fixed(label)))
+        else:
+            print(f"pipeline_nvtx Qwen3TTSModelRunner has no {name}", file=sys.stderr)
 
 
 def patch_runner(module):
