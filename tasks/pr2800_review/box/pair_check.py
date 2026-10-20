@@ -60,6 +60,10 @@ ARMS = {
     "upn": ("upn", [], [0.7769]),
     "s3z": ("s3z", [], [0.7769]),
     "s4z": ("s4z", [], [0.7769]),
+    # note (ratish): the same trees under second names, for drivers that key output by arm and run each arm on
+    # both cards.
+    "upnb": ("upn", [], [0.7769]),
+    "s3zb": ("s3z", [], [0.7769]),
 }
 # arm: benchmark args every pass of the arm adds
 ARM_BENCH_ARGS: dict[str, list[str]] = {}
