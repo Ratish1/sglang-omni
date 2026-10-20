@@ -14,6 +14,8 @@ Served references (formal traces, 10-20): at bs 1 qkv 9.3 us, gate-up 8.0, gemv_
 
 import argparse
 import statistics
+import subprocess
+import sys
 from collections import defaultdict
 from types import SimpleNamespace
 
@@ -35,7 +37,10 @@ KV_HEADS = 8
 INTERMEDIATE = 3072
 LAYERS = 5
 SLOTS = 17
-FAMILIES = ("norm_qkv_rope_store", "norm_gate_up_silu", "gemv_add", "decode_attention", "sdpa", "flash", "cudnn")
+FAMILIES = ("norm_qkv_rope_store", "norm_gate_up_silu", "gemv_add", "attention", "sdpa", "flash", "cudnn")
+# note (ratish): a second stream's eighth eager launch slows every later graph replay of the context and takes away
+# programmatic dependent launch's early start, until another context runs; the bench times both modes.
+SLOW_MODE_LAUNCHES = 16
 
 
 def make_layers(device: torch.device) -> list[SimpleNamespace]:
@@ -96,6 +101,26 @@ def family_of(name: str) -> str:
     return "other"
 
 
+def clear_slow_mode() -> None:
+    """Another process's context running a kernel on the GPU ends the slow mode (memory: two-stream eager slow mode)."""
+    subprocess.run(
+        [sys.executable, "-c", "import torch; torch.ones(1, device='cuda').add_(1); torch.cuda.synchronize()"],
+        check=True,
+    )
+
+
+def replay_median_ms(graph: torch.cuda.CUDAGraph, replays: int) -> float:
+    times = []
+    for _ in range(replays):
+        start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+        start.record()
+        graph.replay()
+        end.record()
+        end.synchronize()
+        times.append(start.elapsed_time(end))
+    return statistics.median(times)
+
+
 def bench(batch_size: int, replays: int, device: torch.device) -> None:
     layers = make_layers(device)
     shape = make_shape(device)
@@ -122,23 +147,21 @@ def bench(batch_size: int, replays: int, device: torch.device) -> None:
                 cache_len=cache_len, positions=slot_positions[cache_len], k_cache=k_cache, v_cache=v_cache,
             )
 
-    stream = torch.cuda.Stream()
-    stream.wait_stream(torch.cuda.current_stream())
-    with torch.cuda.stream(stream):
-        for _ in range(3):
-            step()
-    torch.cuda.current_stream().wait_stream(stream)
+    clear_slow_mode()
+    for _ in range(3):
+        step()
+    torch.cuda.synchronize()
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         step()
-    times = []
-    for _ in range(replays):
-        start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
-        start.record()
-        graph.replay()
-        end.record()
-        end.synchronize()
-        times.append(start.elapsed_time(end))
+    fast_ms = replay_median_ms(graph, replays)
+    side = torch.cuda.Stream()
+    scratch = torch.zeros(1, device=device)
+    with torch.cuda.stream(side):
+        for _ in range(SLOW_MODE_LAUNCHES):
+            scratch.add_(1)
+    torch.cuda.synchronize()
+    slow_ms = replay_median_ms(graph, replays)
     profiled = 20
     with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CUDA]) as profiler:
         for _ in range(profiled):
@@ -150,7 +173,10 @@ def bench(batch_size: int, replays: int, device: torch.device) -> None:
             durations[family_of(event.name)].append(event.time_range.elapsed_us())
         else:
             pass
-    print(f"bs {batch_size}: pair pass {'fused' if has_pair else 'left out'}, step replay median {statistics.median(times):.3f} ms")
+    print(
+        f"bs {batch_size}: pair pass {'fused' if has_pair else 'left out'}, step replay median fast {fast_ms:.3f} ms, "
+        f"slow {slow_ms:.3f} ms (per kernel below in slow mode)"
+    )
     for family in (*FAMILIES, "other"):
         values = durations.get(family, [])
         if values:
