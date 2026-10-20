@@ -13,7 +13,7 @@ import torch
 from sglang.srt.server_args import ServerArgs
 
 from sglang_omni.model_runner.model_worker import ModelWorker
-from sglang_omni.models.fun_cosyvoice3 import request_builders
+from sglang_omni.models.fun_cosyvoice3 import CAPABILITIES, request_builders
 from sglang_omni.models.fun_cosyvoice3.request_builders import (
     CosyVoice3SGLangRequestData,
 )
@@ -30,6 +30,7 @@ from sglang_omni.scheduling.engine_factory import (
     SchedulerExtras,
     TtsEngineBuilder,
 )
+from sglang_omni.scheduling.generation_batch_policy import CudaGraphBackend
 from sglang_omni.scheduling.sglang_backend.output_processor import SGLangOutputProcessor
 from sglang_omni.utils.checkpoint import resolve_checkpoint as _resolve_checkpoint
 
@@ -47,6 +48,10 @@ class FunCosyVoice3EngineBuilder(TtsEngineBuilder[CosyVoice3SGLangRequestData]):
     model_name = "Fun-CosyVoice3"
     context_length = 4096
     model_arch_override = "FunCosyVoice3SGLangModel"
+    supports_breakable_prefill_cuda_graph = (
+        CAPABILITIES.supports_breakable_prefill_cuda_graph
+    )
+    supports_full_prefill_cuda_graph = CAPABILITIES.supports_full_prefill_cuda_graph
 
     def __init__(
         self,
@@ -116,6 +121,13 @@ class FunCosyVoice3EngineBuilder(TtsEngineBuilder[CosyVoice3SGLangRequestData]):
             "max_prefill_tokens": 4096,
             "sampling_backend": (
                 "flashinfer" if current_platform.is_cuda() else "pytorch"
+            ),
+            # note (ratish): run eagerly, a prefill launches about 320 kernels for 2 ms of
+            # device work while every running row waits for it.
+            "cuda_graph_backend_prefill": (
+                CudaGraphBackend.FULL
+                if current_platform.is_cuda()
+                else CudaGraphBackend.DISABLED
             ),
             "trust_remote_code": True,
         }
