@@ -14,28 +14,11 @@ import torch
 from sglang.srt.model_executor.runner.base_cuda_graph_runner import freeze_gc
 from sglang.srt.utils.common import get_available_gpu_memory
 
-from sglang_omni.platforms import current_platform
 from sglang_omni.platforms.device_graph import DeviceGraphBackend, ReplayableGraph
 
 logger = logging.getLogger(__name__)
 
 CAPTURE_WARMUP_RUNS = 2
-
-
-@contextmanager
-def cudnn_autotune() -> Iterator[None]:
-    """cuDNN autotune on while graphs capture; the engines it picks stay in them."""
-    if current_platform.is_cuda():
-        # note (ratish): the pinned cuDNN's heuristics pick slow engines for several
-        # vocoder convolutions; autotuned once here, the captured graphs keep theirs.
-        benchmark = torch.backends.cudnn.benchmark
-        torch.backends.cudnn.benchmark = True
-        try:
-            yield
-        finally:
-            torch.backends.cudnn.benchmark = benchmark
-    else:
-        yield
 
 
 def row_tiers(max_rows: int) -> list[int]:
@@ -82,7 +65,7 @@ class SolveGraphCapture:
         before_mem = get_available_gpu_memory(self.device.type, self.device.index)
         # note (ratish): a collection during capture can free what a reference cycle
         # holds, an onnxruntime session among them, and invalidate the graph.
-        with freeze_gc(enable_cudagraph_gc=False), cudnn_autotune():
+        with freeze_gc(enable_cudagraph_gc=False):
             yield
         after_mem = get_available_gpu_memory(self.device.type, self.device.index)
         logger.info(
