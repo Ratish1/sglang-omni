@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import sys
+import threading
 import types
+from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 import pytest
@@ -116,9 +118,10 @@ def test_cosyvoice3_reference_encoders_pin_onnx_providers(
         model_path: str,
         sess_options: SessionOptions,
         providers: list[str | tuple[str, dict[str, str]]],
-    ) -> None:
+    ) -> types.SimpleNamespace:
         captured.append(providers)
         session_configs.append(sess_options.config_entries)
+        return types.SimpleNamespace(get_providers=lambda: ["CPUExecutionProvider"])
 
     fake_onnxruntime = types.SimpleNamespace(
         SessionOptions=SessionOptions,
@@ -133,10 +136,93 @@ def test_cosyvoice3_reference_encoders_pin_onnx_providers(
 
     assert captured == [
         [
-            ("CUDAExecutionProvider", {"cudnn_conv_algo_search": "HEURISTIC"}),
+            (
+                "CUDAExecutionProvider",
+                {
+                    "cudnn_conv_algo_search": "HEURISTIC",
+                    "use_ep_level_unified_stream": "1",
+                },
+            ),
             "CPUExecutionProvider",
         ],
         ["CPUExecutionProvider"],
         ["CPUExecutionProvider"],
     ]
     assert session_configs == [{}, {}, {"session.intra_op.allow_spinning": "0"}]
+
+
+@pytest.mark.parametrize("is_on_cuda", [True, False])
+def test_speech_tokenizer_on_cuda_runs_its_longest_input_first_and_one_at_a_time(
+    monkeypatch: pytest.MonkeyPatch, is_on_cuda: bool
+) -> None:
+    run_frames: list[int] = []
+    first_started = threading.Event()
+    second_started = threading.Event()
+    release_first = threading.Event()
+
+    class GatedSession:
+        def get_providers(self) -> list[str]:
+            if is_on_cuda:
+                return ["CUDAExecutionProvider", "CPUExecutionProvider"]
+            else:
+                return ["CPUExecutionProvider"]
+
+        def get_inputs(self) -> list[types.SimpleNamespace]:
+            return [
+                types.SimpleNamespace(name="feats"),
+                types.SimpleNamespace(name="feats_length"),
+            ]
+
+        def run(
+            self, output_names: None, feeds: dict[str, np.ndarray]
+        ) -> list[np.ndarray]:
+            frames = int(feeds["feats_length"][0])
+            run_frames.append(frames)
+            if frames == 1:
+                first_started.set()
+                assert release_first.wait(timeout=2)
+            elif frames == 2:
+                second_started.set()
+            else:
+                pass
+            return [np.zeros(frames, dtype=np.int64)]
+
+    monkeypatch.setitem(
+        sys.modules,
+        "onnxruntime",
+        types.SimpleNamespace(
+            SessionOptions=types.SimpleNamespace,
+            GraphOptimizationLevel=types.SimpleNamespace(ORT_ENABLE_ALL=99),
+            InferenceSession=lambda model_path, sess_options, providers: (
+                GatedSession()
+            ),
+        ),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "whisper",
+        types.SimpleNamespace(
+            log_mel_spectrogram=lambda audio, n_mels: torch.zeros(
+                1, n_mels, audio.shape[1] // 160
+            )
+        ),
+    )
+    tokenizer = utils.SpeechTokenizerV3("speech_tokenizer_v3.onnx", device="cuda:0")
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        first = pool.submit(
+            tokenizer.extract_speech_token, np.zeros(160, dtype=np.float32)
+        )
+        assert first_started.wait(timeout=2)
+        second = pool.submit(
+            tokenizer.extract_speech_token, np.zeros(320, dtype=np.float32)
+        )
+        if is_on_cuda:
+            assert not second_started.wait(timeout=0.2)
+        else:
+            assert second_started.wait(timeout=2)
+        release_first.set()
+        first.result(timeout=2)
+        second.result(timeout=2)
+
+    assert run_frames == ([3000] if is_on_cuda else []) + [1, 2]
