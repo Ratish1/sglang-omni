@@ -508,7 +508,9 @@ class Qwen3TTSModelRunner(ModelRunner):
                     data.output_codes[generated_start:generated_stop]
                 )
                 text_indices = torch.arange(
-                    generated_start, generated_stop, device=frame_codes.device
+                    generated_start,
+                    generated_start + frame_codes.shape[0],
+                    device=frame_codes.device,
                 ).clamp_max(data.text_rows.shape[0] - 1)
                 request_pieces.append(
                     self.model.feedback_rows_from_codes(frame_codes)
