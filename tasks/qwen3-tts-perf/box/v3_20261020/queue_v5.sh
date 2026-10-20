@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # V5 (perf/qwen3-tts-codebook-tables a962e3db6, stacked on V3 6f6039ba6: the vocoder's codebook tables computed once
 # at load) against V3: the touched units, a seeded c1 pair that must be byte identical (no arithmetic changes), then
-# c16 and c64 pairs in both card orders with each arm's SM Issue, full corpus, WER and SIM. Waits for queue_v3.sh.
+# c16 and c64 pairs in both card orders with each arm's SM Issue, full corpus, WER and SIM. Waits for
+# queue_precompile.sh, which follows queue_v3.sh.
 set -u
 D=/data/v3_20261020
 T=${T:-/workspace/t_marks}
@@ -9,7 +10,7 @@ IN=$T/tasks/qwen3-tts-perf/box/v3_20261020
 V3=/workspace/v3_6f6039ba6
 V5=/workspace/v5_a962e3db6
 L=$D/queue.log
-until grep -q queue_v3_done $L; do sleep 30; done
+until grep -q queue_precompile_done $L; do sleep 30; done
 echo "queue v5 start $(date +%T) v3 $(git -C $V3 rev-parse HEAD:sglang_omni) v5 $(git -C $V5 rev-parse HEAD:sglang_omni)" >> $L
 (cd $V5 && PYTHONPATH=$V5 timeout 3600 python3 -m pytest tests/unit_test/qwen3_tts -q -p no:cacheprovider -rfE \
   > $D/units/v5.log 2>&1)
