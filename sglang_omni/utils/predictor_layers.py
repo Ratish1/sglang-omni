@@ -78,8 +78,9 @@ MIN_BLOCK_M = 16
 MAX_FUSED_ROWS = 64
 NUM_WARPS = 4
 # note (ratish): the pinned Triton stages the scaled input once more for the head's
-# second dot; two warps per program absorb that, while merging the dots costs a tile split.
-QKV_NUM_WARPS = 2
+# second dot; two warps per program absorb that at the 16-row block and spill past it
+# (255 registers, 130 spills and 20 against 11.5 us at 64 rows on H200).
+QKV_SMALL_BLOCK_WARPS = 2
 NUM_STAGES = 3
 
 
@@ -698,6 +699,7 @@ def attention_inputs(
     into the caches at each row's position. x is (rows, hidden) with unit column stride;
     the caches are (rows // tokens_per_row, slots, kv heads, head dim)."""
     rows = x.shape[0]
+    block_m = block_rows(rows)
     heads = shape.num_q_heads + 2 * shape.num_kv_heads
     use_gdc = is_arch_support_pdl()
     norm_qkv_rope_store_kernel[(heads, shape.split_qkv)](
@@ -728,10 +730,10 @@ def attention_inputs(
         NUM_Q_HEADS=shape.num_q_heads,
         NUM_KV_HEADS=shape.num_kv_heads,
         SPLIT=shape.split_qkv,
-        BLOCK_M=block_rows(rows),
+        BLOCK_M=block_m,
         BLOCK_K=BLOCK_K,
         USE_GDC=use_gdc,
-        num_warps=QKV_NUM_WARPS,
+        num_warps=QKV_SMALL_BLOCK_WARPS if block_m == MIN_BLOCK_M else NUM_WARPS,
         num_stages=NUM_STAGES,
         launch_pdl=use_gdc,
     )
