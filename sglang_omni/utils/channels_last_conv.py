@@ -27,16 +27,20 @@ def channels_last_conv1d(
     conv: torch.nn.Conv1d,
     weight: torch.Tensor,
     length: int,
+    *,
+    stride: int = 1,
 ) -> torch.Tensor:
-    """The stride-one conv of a (B, L, C) activation that carries its left context
-    and, for a dilated conv, a length divisible by the dilation; returns
-    (B, length, C_out)."""
+    """The conv of a (B, L, C) activation that carries its left context and, for a
+    dilated conv, a length divisible by the dilation; returns (B, length, C_out) for a
+    stride-one conv and every output row of a strided, undilated one."""
     dilation = conv.dilation[0]
+    assert stride == 1 or dilation == 1, "a strided conv is undilated"
     if dilation == 1:
         output = F.conv2d(
             hidden_states.transpose(1, 2).unsqueeze(2),
             weight.unsqueeze(2),
             conv.bias,
+            stride=(1, stride),
             groups=conv.groups,
         )
         return output.squeeze(2).transpose(1, 2)
