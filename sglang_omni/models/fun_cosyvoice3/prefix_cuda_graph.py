@@ -8,6 +8,9 @@ import dataclasses
 from dataclasses import dataclass
 
 import torch
+from sglang.srt.arg_groups.cuda_graph_hook import (
+    generate_prefill_cuda_graph_batch_sizes,
+)
 
 from sglang_omni.models.fun_cosyvoice3.packed_dit import CONV_CONTEXT_FRAMES, PackedDiT
 from sglang_omni.models.fun_cosyvoice3.prefix_cache import (
@@ -18,10 +21,7 @@ from sglang_omni.models.fun_cosyvoice3.prefix_cache import (
     forward_prefix,
     run_prefix_solve,
 )
-from sglang_omni.models.fun_cosyvoice3.solve_graph_capture import (
-    SolveGraphCapture,
-    row_tiers,
-)
+from sglang_omni.models.fun_cosyvoice3.solve_graph_capture import SolveGraphCapture
 from sglang_omni.platforms.device_graph import ReplayableGraph
 
 
@@ -67,7 +67,18 @@ class PrefixCudaGraphRunner:
         self.euler_steps = len(pool.keys)
         self.mel_channels = mel_channels
         self.speaker_channels = speaker_channels
-        self.tier_frames = [rows * hop_frames for rows in row_tiers(max_rows)]
+        # note (ratish): the prefill graph ladder over frames, from the first tier that
+        # holds a shortest hop to max_rows longest hops; tiers of whole longest hops
+        # padded a quarter of the replayed frames.
+        top_frames = max_rows * hop_frames
+        self.tier_frames = [
+            *(
+                frames
+                for frames in generate_prefill_cuda_graph_batch_sizes(top_frames - 1)
+                if frames >= min_hop_frames
+            ),
+            top_frames,
+        ]
         chunk_size = estimator.chunk_size
         self.layouts: list[PrefixStepLayout] = []
         for frames in self.tier_frames:
