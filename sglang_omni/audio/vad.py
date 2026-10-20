@@ -8,7 +8,6 @@ from typing import Protocol
 
 import numpy as np
 import torch
-from silero_vad import load_silero_vad
 
 logger = logging.getLogger(__name__)
 
@@ -50,6 +49,10 @@ class SileroSpeechModel:
     """Per-frame speech probability. Holds no turn state, only the RNN's."""
 
     def __init__(self) -> None:
+        # note (ratish): importing silero_vad sets torch to one intra-op thread
+        # for the process, so only the process that runs the model imports it.
+        from silero_vad import load_silero_vad
+
         self.model = load_silero_vad(onnx=True)
 
     def predict(self, frame: np.ndarray, sample_rate: int) -> float:
