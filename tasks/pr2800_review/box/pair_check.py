@@ -53,6 +53,7 @@ TREES = {
     "upq": ("upq_bcd0d8c68", "upstream", "bcd0d8c6831c146b4f0a5bd726b8062f777543e4"),
     "cip": ("cip_ca00439a1", "origin", "ca00439a1abbb57bc61f3b004a80a1a4af76ddfa"),
     "cif": ("cif_0a6e3799d", "origin", "0a6e3799d3b934243afafa1d51d04486c33dd4f5"),
+    "cis": ("cis_68e3a0e5f", "origin", "68e3a0e5fbe40dc6dd3cf3eb5982175b203ba661"),
 }
 # note (ratish): every arm is measured by one client, main's benchmark plus each chunk's audio length, so the
 # playback continuity is the client's own whatever the arm's window walk.
