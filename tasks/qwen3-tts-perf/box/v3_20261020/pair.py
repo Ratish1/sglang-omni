@@ -48,45 +48,47 @@ def wait_healthy(port: int, server: subprocess.Popen) -> None:
     raise TimeoutError(f"server on port {port} not healthy in {HEALTH_TIMEOUT_S} s")
 
 
-def group_members(pgid: int) -> list[tuple[int, str, str]]:
-    """(pid, state, command line) of every process in the group."""
-    listing = subprocess.run(["ps", "-eo", "pid=,pgid=,stat=,args="], capture_output=True, text=True).stdout
-    members = []
+def serve_groups(port: int) -> set[int]:
+    """Process groups of live serve processes on port: under nsys the server runs in a group of its own."""
+    listing = subprocess.run(["ps", "-eo", "pgid=,stat=,args="], capture_output=True, text=True).stdout
+    groups = set()
     for line in listing.splitlines():
-        fields = line.split(None, 3)
-        if len(fields) == 4 and fields[1] == str(pgid):
-            members.append((int(fields[0]), fields[2], fields[3]))
+        fields = line.split(None, 2)
+        if (
+            len(fields) == 3
+            and not fields[1].startswith("Z")
+            and "sglang_omni.cli serve" in fields[2]
+            and f"--port {port} " in f"{fields[2]} "
+        ):
+            groups.add(int(fields[0]))
         else:
             pass
-    return members
+    return groups
 
 
-def stop_group(server: subprocess.Popen, is_profiled: bool) -> None:
-    """A profiled arm stops its serve process first, so nsys finalizes its report; then the whole group goes."""
-    if is_profiled:
-        for pid, _, command in group_members(server.pid):
-            if "sglang_omni.cli serve" in command and not command.startswith("nsys"):
-                os.kill(pid, signal.SIGTERM)
-            else:
-                pass
-        try:
-            server.wait(timeout=STOP_TIMEOUT_S)
-        except subprocess.TimeoutExpired:
-            pass
-    else:
-        pass
+def stop_group(server: subprocess.Popen, port: int) -> None:
+    """TERM to the leader's group: a bare server exits; nsys ends its target and writes its report. Then any serve
+    process still on the port, in its own group under nsys, is stopped the same way."""
     try:
         os.killpg(server.pid, signal.SIGTERM)
     except ProcessLookupError:
-        return
-    deadline = time.monotonic() + STOP_TIMEOUT_S
-    while time.monotonic() < deadline:
-        if not any(not state.startswith("Z") for _, state, _ in group_members(server.pid)):
-            return
+        pass
+    try:
+        server.wait(timeout=STOP_TIMEOUT_S)
+    except subprocess.TimeoutExpired:
+        os.killpg(server.pid, signal.SIGKILL)
+    for group in serve_groups(port):
+        try:
+            os.killpg(group, signal.SIGTERM)
+        except ProcessLookupError:
+            continue
+        deadline = time.monotonic() + STOP_TIMEOUT_S
+        while time.monotonic() < deadline and group in serve_groups(port):
+            time.sleep(1)
+        if group in serve_groups(port):
+            os.killpg(group, signal.SIGKILL)
         else:
             pass
-        time.sleep(1)
-    os.killpg(server.pid, signal.SIGKILL)
 
 
 def gpu_snapshot() -> str:
@@ -176,8 +178,8 @@ def main() -> None:
         for arm in arms:
             (outs[arm] / "gpu_after_bench.txt").write_text(gpu_snapshot(), encoding="utf-8")
     finally:
-        for server in servers.values():
-            stop_group(server, args.gpu_metrics)
+        for arm, server in servers.items():
+            stop_group(server, arms[arm][2])
     if args.gpu_metrics:
         for arm in arms:
             report = outs[arm] / "metrics.nsys-rep"
