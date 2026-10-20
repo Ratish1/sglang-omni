@@ -9,7 +9,7 @@ from typing import TYPE_CHECKING
 
 from sglang.srt.managers.mm_utils import init_mm_embedding_cache
 from sglang.srt.server_args import ServerArgs
-from transformers import AutoFeatureExtractor, AutoTokenizer, PreTrainedTokenizerBase
+from transformers import AutoTokenizer, PreTrainedTokenizerBase
 
 from sglang_omni.model_runner.base import ModelRunner
 from sglang_omni.model_runner.model_worker import ModelWorker
@@ -118,7 +118,10 @@ class FunASREngineBuilder(AsrEngineBuilder[request_builders.FunASRRequestData]):
         self.tokenizer = AutoTokenizer.from_pretrained(
             checkpoint_dir, trust_remote_code=True
         )
-        self.feature_extractor = AutoFeatureExtractor.from_pretrained(
+        # note (ratish): the auto loader resolves the checkpoint's extractor name
+        # through the installed transformers first, which may carry a class of
+        # that name without this package's frame accounting.
+        self.feature_extractor = FunAsrNanoFeatureExtractor.from_pretrained(
             checkpoint_dir, trust_remote_code=True
         )
         encoder_token_count = int(
