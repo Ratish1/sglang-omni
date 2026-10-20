@@ -1,18 +1,21 @@
 #!/usr/bin/env bash
-# S2a (decode inputs from device slot state, replay from committed frames) against its base S1: touched units, c1
-# seeded byte identity, forced retraction at c16 against the same tree, a c16 pair and c64 pairs in both card orders.
+# S2a (decode inputs from device slot state, replay from committed frames) against its base S1: touched units on both
+# heads (S1's test doubles fixed in d1eef0380, same runtime tree as the S1 pairs), c1 seeded byte identity, forced
+# retraction at c16 against the same tree, a c16 pair and c64 pairs in both card orders.
 # Waits for queue_s1 to finish so the cards hold one run at a time.
 set -u
 D=/data/async_decode_20261020
 IN=${T:-/workspace/t_marks}/tasks/qwen3-tts-perf/box/async_decode_20261020
-S1=/workspace/s1_7173ba3de
-S2A=/workspace/s2a_66b5971e8
+S1=/workspace/s1_d1eef0380
+S2A=/workspace/s2a_9db6227f1
 L=$D/queue.log
 until grep -q queue_s1_done $L; do sleep 30; done
 echo "queue s2a start $(date +%T) s1 $(git -C $S1 rev-parse HEAD:sglang_omni) s2a $(git -C $S2A rev-parse HEAD:sglang_omni)" >> $L
-(cd $S2A && PYTHONPATH=$S2A timeout 3600 python3 -m pytest tests/unit_test/qwen3_tts tests/unit_test/model_runner \
-  tests/unit_test/scheduling -q -p no:cacheprovider -rfE > $D/units/$(basename $S2A).log 2>&1)
-echo "units $(basename $S2A) rc $? $(date +%T)" >> $L
+for TREE in $S1 $S2A; do
+  (cd $TREE && PYTHONPATH=$TREE timeout 3600 python3 -m pytest tests/unit_test/qwen3_tts tests/unit_test/model_runner \
+    tests/unit_test/scheduling -q -p no:cacheprovider -rfE > $D/units/$(basename $TREE).log 2>&1)
+  echo "units $(basename $TREE) rc $? $(date +%T)" >> $L
+done
 python3 $IN/pair.py --label s2a_c1_seed --tree $S1 --b-tree $S2A --concurrency 1 --a-card 0 --b-card 1 \
   --port 33000 --seed 1234 > $D/s2a_c1_seed.out 2>&1
 echo "s2a_c1_seed rc $? $(date +%T)" >> $L
