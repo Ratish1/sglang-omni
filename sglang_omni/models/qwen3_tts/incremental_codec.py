@@ -23,6 +23,7 @@ from sglang_omni.utils.channels_last_conv import (
 
 if TYPE_CHECKING:
     from qwen_tts.core.tokenizer_12hz.modeling_qwen3_tts_tokenizer_v2 import (
+        EuclideanCodebook,
         Qwen3TTSTokenizerV2CausalConvNet,
         Qwen3TTSTokenizerV2CausalTransConvNet,
         Qwen3TTSTokenizerV2ConvNeXtBlock,
@@ -728,6 +729,37 @@ class FusedIncrementalTransformer:
         return transformer.output_proj(
             hidden_states.view(batch_size, fresh_frames, hidden_size)
         )
+
+
+class PrecomputedCodebook(torch.nn.Module):
+    """A quantizer codebook whose decode table, the embedding sums over their clamped cluster
+    usage, is computed once at load instead of on every decode."""
+
+    def __init__(self, codebook: "EuclideanCodebook") -> None:
+        super().__init__()
+        with torch.no_grad():
+            embedding_table = (
+                codebook.embedding_sum
+                / codebook.cluster_usage.clamp(min=codebook.epsilon)[:, None]
+            )
+        self.register_buffer("embedding_table", embedding_table, persistent=False)
+
+    def decode(self, codes: torch.Tensor) -> torch.Tensor:
+        return F.embedding(codes, self.embedding_table)
+
+
+def precompute_codebook_tables(decoder: torch.nn.Module) -> int:
+    """Replace every quantizer codebook in decoder with its PrecomputedCodebook; returns how
+    many were replaced."""
+    replacements = [
+        (module, name)
+        for module in decoder.modules()
+        for name, child in module.named_children()
+        if type(child).__name__ == "EuclideanCodebook"
+    ]
+    for parent, name in replacements:
+        setattr(parent, name, PrecomputedCodebook(getattr(parent, name)))
+    return len(replacements)
 
 
 def incremental_convnext(

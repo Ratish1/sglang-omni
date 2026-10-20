@@ -379,7 +379,7 @@ def test_qwen3_tts_speech_tokenizer_is_loaded_once_per_process_key(
     loads: list[tuple[str, dict[str, object]]] = []
 
     class FakeQwen3TTSTokenizer:
-        model = SimpleNamespace(encoder=torch.nn.Module())
+        model = SimpleNamespace(encoder=torch.nn.Module(), decoder=torch.nn.Module())
 
         @classmethod
         def from_pretrained(cls, path, **kwargs):
@@ -1248,6 +1248,7 @@ def fake_speech_tokenizer(encode=None, *, hop=8, quantizers=2, device="cpu"):
             encoder=FakeReferenceEncoder(
                 encode or default, quantizers=quantizers, device=device
             ),
+            decoder=torch.nn.Module(),
             encode_downsample_rate=hop,
             encoder_valid_num_quantizers=quantizers,
         ),

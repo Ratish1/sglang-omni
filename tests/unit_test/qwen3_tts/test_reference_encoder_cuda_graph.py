@@ -69,7 +69,9 @@ def test_speech_tokenizer_loader_moves_the_encoder_padding_to_host(
         @classmethod
         def from_pretrained(cls, path, **kwargs):
             tokenizer = cls()
-            tokenizer.model = SimpleNamespace(encoder=MimiModel(config).encoder)
+            tokenizer.model = SimpleNamespace(
+                encoder=MimiModel(config).encoder, decoder=torch.nn.Module()
+            )
             return tokenizer
 
     qwen_tts_module = types.ModuleType("qwen_tts")

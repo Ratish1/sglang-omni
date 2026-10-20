@@ -24,6 +24,7 @@ from sglang_omni.models.qwen3_tts.incremental_codec import (
     incremental_causal_conv1d,
     incremental_causal_transconv1d,
     incremental_transformer,
+    precompute_codebook_tables,
 )
 from sglang_omni.models.qwen3_tts.incremental_codec_cuda_graph import (
     IncrementalCodecGraphPool,
@@ -534,6 +535,38 @@ def test_fused_transformer_tracks_fp32_as_closely_as_the_plain_step() -> None:
     assert relative_error(compiled_output, expected) <= 1.1 * relative_error(
         plain_output, expected
     )
+
+
+def test_precomputed_codebook_tables_decode_bit_identically() -> None:
+    apply_qwen_tts_transformers_compatibility_patches()
+    from qwen_tts.core.tokenizer_12hz.modeling_qwen3_tts_tokenizer_v2 import (
+        SplitResidualVectorQuantizer,
+    )
+
+    torch.manual_seed(7)
+    quantizer = SplitResidualVectorQuantizer(
+        dimension=16,
+        n_q=4,
+        n_q_semantic=1,
+        bins=32,
+        input_dimension=32,
+        output_dimension=32,
+    ).bfloat16()
+    with torch.no_grad():
+        for module in quantizer.modules():
+            if type(module).__name__ == "EuclideanCodebook":
+                module.embedding_sum.normal_()
+                module.cluster_usage.uniform_(0.5, 3.0)
+                module.cluster_usage[:4] = 0.0
+            else:
+                pass
+    codes = torch.randint(0, 32, (3, 4, 9))
+    with torch.no_grad():
+        expected = quantizer.decode(codes)
+        assert precompute_codebook_tables(quantizer) == 4
+        actual = quantizer.decode(codes)
+
+    assert torch.equal(actual, expected)
 
 
 def test_incremental_codec_state_clone_owns_tensor_storage() -> None:
