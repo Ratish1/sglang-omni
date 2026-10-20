@@ -42,6 +42,7 @@ from onnx import numpy_helper
 from sglang.srt.arg_groups.cuda_graph_hook import (
     generate_prefill_cuda_graph_batch_sizes,
 )
+from sglang.srt.utils.common import async_d2h
 
 # note (ratish): 30 s of whisper's mel at 100 frames a second, the longest input the
 # tokenizer takes.
@@ -258,8 +259,8 @@ class CapturedTokenizerGraph:
 
 class SpeechTokenizerCudaGraphs:
     """One graph per mel width on the prefill ladder up to the tokenizer's 30 s
-    limit, in one pool: callers share the default stream, so replays run one at a
-    time and copy their codes out before the next."""
+    limit, in one pool: replays run one at a time on the graphs' stream, and each
+    copies its codes out before the next."""
 
     def __init__(self, model: SpeechTokenizerV3Model, device: torch.device) -> None:
         # note (ratish): the graphs read the model's parameters and buffers in place.
@@ -271,22 +272,22 @@ class SpeechTokenizerCudaGraphs:
         self.lock = threading.Lock()
         self.graphs: dict[int, CapturedTokenizerGraph] = {}
         pool = torch.cuda.graph_pool_handle()
-        stream = torch.cuda.Stream(device)
+        self.stream = torch.cuda.Stream(device)
         # note (ratish): TF32 matmuls, as ONNX Runtime ran this graph; full fp32 took
-        # 2.6 times the device time and slowed the vocoder beside it. The graphs keep
-        # the math mode they are captured with, and the process keeps its own.
+        # 2.6 times the device time. The graphs keep the math mode they are captured
+        # with, and the process keeps its own.
         allow_tf32 = torch.backends.cuda.matmul.allow_tf32
         torch.backends.cuda.matmul.allow_tf32 = True
         with torch.inference_mode():
             for width in reversed(self.widths):
                 mel = torch.zeros(1, model.conv1.in_channels, width, device=device)
                 frames = torch.full((1,), width, dtype=torch.int64, device=device)
-                stream.wait_stream(torch.cuda.current_stream(device))
-                with torch.cuda.stream(stream):
+                self.stream.wait_stream(torch.cuda.current_stream(device))
+                with torch.cuda.stream(self.stream):
                     for _ in range(2):
                         model(mel, frames)
                 graph = torch.cuda.CUDAGraph()
-                with torch.cuda.graph(graph, pool=pool, stream=stream):
+                with torch.cuda.graph(graph, pool=pool, stream=self.stream):
                     codes = model(mel, frames)
                 self.graphs[width] = CapturedTokenizerGraph(
                     graph=graph, mel=mel, frames=frames, codes=codes
@@ -298,9 +299,15 @@ class SpeechTokenizerCudaGraphs:
         """Codes of a CPU mel (1, mels, frames) of at most MAX_FRAMES frames."""
         frames = mel.shape[2]
         captured = self.graphs[self.widths[bisect.bisect_left(self.widths, frames)]]
-        with self.lock, torch.inference_mode():
-            captured.mel[:, :, :frames].copy_(mel)
+        # note (ratish): pageable copies wait for the replay inside the copy call, and
+        # the AR's and the vocoder's CUDA calls in this process wait with them, so the
+        # copies go through pinned memory and the caller waits on an event.
+        with self.lock, torch.inference_mode(), torch.cuda.stream(self.stream):
+            captured.mel[:, :, :frames].copy_(mel.pin_memory(), non_blocking=True)
             captured.frames.fill_(frames)
             captured.graph.replay()
-            codes = captured.codes[0, : conv_frames(conv_frames(frames))].clone()
+            codes = async_d2h(captured.codes[0, : conv_frames(conv_frames(frames))])
+            copy_done = torch.cuda.Event()
+            copy_done.record()
+        copy_done.synchronize()
         return codes.tolist()
