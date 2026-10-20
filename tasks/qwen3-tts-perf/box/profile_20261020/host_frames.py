@@ -3,9 +3,12 @@
 usage: python3 host_frames.py <trace.json.gz> [--depth 8] [--min-ms 0.05]
        python3 host_frames.py --self-test
 The profiler's python_function events carry their own call tree ("Python id", "Python parent id"). On the thread that
-carries the omni.step spans, every frame below the event loop frame is aggregated by its call path (names from the
-loop's direct child down), and the tree is printed with inclusive milliseconds per decode step and calls per step.
-A frame's inclusive time contains the native calls it makes and any wait for the interpreter lock inside it.
+carries the omni.step spans, the event loop frame's children are cut into loop iterations at each
+process_admin_requests call (the first call of an iteration of event_loop_normal), each iteration labeled by the
+omni.step span inside it (decode or prefill, its batch size). For each label, every frame below the loop is aggregated
+by its call path (names from the loop's direct child down) and printed as a tree with inclusive milliseconds per
+iteration and calls per iteration; the share of the loop's time the iterations cover is printed as a check. A frame's
+inclusive time contains the native calls it makes and any wait for the interpreter lock inside it.
 --self-test profiles a known program (f spins 2 ms and calls g; g spins 1 ms and runs a torch op) and checks that
 the reader recovers f at 3 ms and g at 1 ms per iteration.
 """
@@ -15,6 +18,7 @@ import gzip
 import json
 import os
 import re
+import statistics
 import sys
 import tempfile
 import time
@@ -30,13 +34,19 @@ def load(path: str) -> list[dict]:
         return json.load(handle)["traceEvents"]
 
 
-def aggregate(frames: list[dict], root_ids: list[int], depth: int) -> dict[tuple[str, ...], list[float]]:
-    """Inclusive time and calls per call path under the given roots (paths start at the roots' children)."""
+def children_of(frames: list[dict]) -> dict[int, list[dict]]:
     children: dict[int, list[dict]] = defaultdict(list)
     for frame in frames:
         children[frame["args"]["Python parent id"]].append(frame)
+    return children
+
+
+def aggregate(
+    children: dict[int, list[dict]], top: list[dict], depth: int
+) -> dict[tuple[str, ...], list[float]]:
+    """Inclusive time and calls per call path under the given top frames (paths start at them)."""
     totals: dict[tuple[str, ...], list[float]] = defaultdict(lambda: [0.0, 0])
-    stack = [(child, (str(child["name"]),)) for root in root_ids for child in children.get(root, [])]
+    stack = [(frame, (str(frame["name"]),)) for frame in top]
     while stack:
         frame, path = stack.pop()
         totals[path][0] += frame["dur"]
@@ -90,8 +100,9 @@ def self_test() -> None:
     prof.export_chrome_trace(path)
     events = load(path)
     frames = [e for e in events if e.get("cat") == "python_function" and e.get("ph") == "X"]
+    children = children_of(frames)
     roots = [e["args"]["Python id"] for e in frames if re.search(r"\): loop$", str(e["name"]))]
-    totals = aggregate(frames, roots, depth=4)
+    totals = aggregate(children, [child for root in roots for child in children.get(root, [])], depth=4)
     f_path = next(p for p in totals if len(p) == 1 and p[0].endswith(": f"))
     g_path = next(p for p in totals if len(p) == 2 and p[0] == f_path[0] and p[1].endswith(": g"))
     f_ms = totals[f_path][0] / totals[f_path][1] / 1e3
@@ -115,21 +126,51 @@ def main() -> None:
     else:
         pass
     events = load(args.trace)
-    steps = [e for e in events if e.get("cat") == "user_annotation" and STEP.match(str(e.get("name")))]
+    steps = sorted(
+        (e for e in events if e.get("cat") == "user_annotation" and STEP.match(str(e.get("name")))), key=lambda e: e["ts"]
+    )
     thread = steps[0]["tid"]
-    decode_steps = sum(1 for s in steps if STEP.match(s["name"]).group(1) == "decode")
     frames = [e for e in events if e.get("cat") == "python_function" and e.get("ph") == "X" and e["tid"] == thread]
-    roots = [e["args"]["Python id"] for e in frames if LOOP_FRAME.search(str(e["name"]))]
-    if not roots:
-        sys.exit("no event loop frame on the scheduler thread")
+    children = children_of(frames)
+    loops = [e for e in frames if LOOP_FRAME.search(str(e["name"]))]
+    if len(loops) != 1:
+        sys.exit(f"expected one event loop frame on the scheduler thread, found {len(loops)}")
     else:
         pass
-    totals = aggregate(frames, roots, args.depth)
-    kinds = defaultdict(int)
-    for s in steps:
-        kinds[(STEP.match(s["name"]).group(1), int(STEP.match(s["name"]).group(4)))] += 1
-    print(f"scheduler thread {thread}: {len(steps)} steps ({dict(sorted(kinds.items()))}); per decode step over {decode_steps}")
-    print_tree(totals, max(decode_steps, 1), args.min_ms)
+    loop = loops[0]
+    loop_children = sorted(children.get(loop["args"]["Python id"], []), key=lambda e: e["ts"])
+    iterations: list[list[dict]] = []
+    for child in loop_children:
+        if str(child["name"]).endswith(": process_admin_requests") or not iterations:
+            iterations.append([child])
+        else:
+            iterations[-1].append(child)
+    step_starts = [s["ts"] for s in steps]
+    groups: dict[str, list[list[dict]]] = defaultdict(list)
+    unlabeled = 0
+    for iteration in iterations:
+        start, end = iteration[0]["ts"], max(f["ts"] + f["dur"] for f in iteration)
+        inside = [steps[i] for i in range(len(steps)) if start <= step_starts[i] <= end]
+        if len(inside) != 1:
+            unlabeled += 1
+            continue
+        else:
+            pass
+        kind, _, _, batch = STEP.match(inside[0]["name"]).groups()
+        bucket = "bs 1" if int(batch) == 1 else f"bs {int(batch) // 8 * 8} to {int(batch) // 8 * 8 + 7}"
+        groups[f"{kind} {bucket}"].append(iteration)
+    loop_children_ms = sum(f["dur"] for f in loop_children) / 1e3
+    labeled_ms = sum(f["dur"] for its in groups.values() for it in its for f in it) / 1e3
+    window = (steps[-1]["ts"] + steps[-1]["dur"] - steps[0]["ts"]) / 1e3
+    print(
+        f"scheduler thread {thread}: {len(steps)} steps, {len(iterations)} loop iterations, {unlabeled} without exactly "
+        f"one step (window edges); loop children {loop_children_ms:.1f} ms of which labeled {labeled_ms:.1f} ms; "
+        f"steps span {window:.1f} ms"
+    )
+    for label, its in sorted(groups.items()):
+        wall = statistics.median(max(f["ts"] + f["dur"] for f in it) - it[0]["ts"] for it in its) / 1e3
+        print(f"\n## {label}: {len(its)} iterations, median iteration wall {wall:.3f} ms")
+        print_tree(aggregate(children, [f for it in its for f in it], args.depth), len(its), args.min_ms)
 
 
 if __name__ == "__main__":
