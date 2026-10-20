@@ -10,8 +10,7 @@ import torch
 
 from sglang_omni.models.fun_cosyvoice3.causal_conv import HAS_TRITON
 
-ROWS_PER_PROGRAM = 64
-CHANNELS_PER_PROGRAM = 64
+ELEMENTS_PER_PROGRAM = 1024
 FRAMES_PER_PROGRAM = 128
 OUTPUT_SAMPLES_PER_PROGRAM = 256
 
@@ -21,37 +20,22 @@ if HAS_TRITON:
     from sglang.kernels.ops.diffusion.common.numerics import div_rn_f32, mul_rn_f32
     from triton.language.extra import libdevice
 
-    # note (ratish): row counts change every step, one binary serves them all.
-    @triton.jit(do_not_specialize=["rows", "channels"])
+    # note (ratish): element counts change every step, one binary serves them all.
+    @triton.jit(do_not_specialize=["numel"])
     def snake_kernel(
         x_ptr,
         alpha_ptr,
         inverse_alpha_ptr,
         out_ptr,
-        rows,
-        channels,
-        BLOCK_ROWS: tl.constexpr,
-        BLOCK_CHANNELS: tl.constexpr,
+        numel,
+        CHANNELS: tl.constexpr,
+        BLOCK: tl.constexpr,
     ):
-        row_indices = tl.program_id(0).to(tl.int64) * BLOCK_ROWS + tl.arange(
-            0, BLOCK_ROWS
-        )
-        channel_indices = tl.program_id(1) * BLOCK_CHANNELS + tl.arange(
-            0, BLOCK_CHANNELS
-        )
-        is_channel = channel_indices < channels
-        mask = (row_indices < rows)[:, None] & is_channel[None, :]
-        offsets = row_indices[:, None] * channels + channel_indices[None, :]
-        alpha = tl.broadcast_to(
-            tl.load(alpha_ptr + channel_indices, mask=is_channel, other=1.0)[None, :],
-            [BLOCK_ROWS, BLOCK_CHANNELS],
-        )
-        inverse_alpha = tl.broadcast_to(
-            tl.load(inverse_alpha_ptr + channel_indices, mask=is_channel, other=1.0)[
-                None, :
-            ],
-            [BLOCK_ROWS, BLOCK_CHANNELS],
-        )
+        offsets = tl.program_id(0).to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
+        mask = offsets < numel
+        channels = offsets % CHANNELS
+        alpha = tl.load(alpha_ptr + channels, mask=mask, other=1.0)
+        inverse_alpha = tl.load(inverse_alpha_ptr + channels, mask=mask, other=1.0)
         x = tl.load(x_ptr + offsets, mask=mask, other=0.0)
         sine = libdevice.sin(mul_rn_f32(x, alpha))
         # note (ratish): each product rounds alone, as in the eager ops; an FMA would not.
@@ -145,23 +129,18 @@ def snake(
     """x: (batch, samples, channels) float32, the channels contiguous; alpha and
     inverse_alpha: (channels,), the latter 1 / (alpha + 1e-9) as the module computes it.
     """
-    batch, samples, channels = x.shape
+    channels = x.shape[2]
     assert x.is_contiguous() and x.dtype == torch.float32
     out = torch.empty_like(x)
-    rows = batch * samples
-    grid = (
-        triton.cdiv(rows, ROWS_PER_PROGRAM),
-        triton.cdiv(channels, CHANNELS_PER_PROGRAM),
-    )
+    grid = (triton.cdiv(x.numel(), ELEMENTS_PER_PROGRAM),)
     snake_kernel[grid](
         x,
         alpha,
         inverse_alpha,
         out,
-        rows,
-        channels,
-        BLOCK_ROWS=ROWS_PER_PROGRAM,
-        BLOCK_CHANNELS=CHANNELS_PER_PROGRAM,
+        x.numel(),
+        CHANNELS=channels,
+        BLOCK=ELEMENTS_PER_PROGRAM,
     )
     return out
 
