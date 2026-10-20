@@ -46,6 +46,33 @@ def test_channels_last_conv1d_matches_the_causal_conv1d(
 @pytest.mark.skipif(
     not current_platform.is_cuda(), reason="channels-last convs run on NVIDIA CUDA only"
 )
+@pytest.mark.parametrize("stride,kernel_size", [(3, 6), (15, 30)])
+def test_channels_last_conv1d_matches_the_strided_causal_conv1d(
+    monkeypatch: pytest.MonkeyPatch, stride: int, kernel_size: int
+) -> None:
+    monkeypatch.setattr(torch.backends.cudnn, "allow_tf32", False)
+    torch.manual_seed(stride)
+    conv = torch.nn.Conv1d(4, 6, kernel_size, stride=stride).cuda()
+    inputs = torch.randn(2, 61, 4, device="cuda")
+    expected = F.conv1d(
+        F.pad(inputs.transpose(1, 2), (stride - 1, 0)),
+        conv.weight,
+        conv.bias,
+        stride=stride,
+    ).transpose(1, 2)
+
+    padded = F.pad(inputs, (0, 0, stride - 1, 0))
+    actual = channels_last_conv1d(
+        padded, conv, channels_last_weight(conv), 61, stride=stride
+    )
+
+    torch.testing.assert_close(actual, expected)
+
+
+@pytest.mark.accelerator
+@pytest.mark.skipif(
+    not current_platform.is_cuda(), reason="channels-last convs run on NVIDIA CUDA only"
+)
 @pytest.mark.parametrize("has_bias", [True, False])
 @pytest.mark.parametrize("stride,padding,output_padding", [(2, 0, 0), (4, 1, 1)])
 def test_channels_last_conv_transpose1d_matches_the_conv_transpose1d(
