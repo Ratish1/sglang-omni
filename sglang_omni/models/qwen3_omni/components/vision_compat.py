@@ -155,7 +155,12 @@ class Qwen3OmniMoeVisionEncoderCompat(hf_modeling.Qwen3OmniMoeVisionEncoder):
         hidden_states = self.patch_embed(hidden_states)
         pos_embeds = self.legacy_pos_embed_interpolate(host_grid_thw)
         hidden_states = hidden_states + pos_embeds.to(hidden_states.dtype)
-        cos, sin = self.rotary_pos_emb(hidden_states, position_ids)
+        # note (ratish): main's angles, the integer positions times the bf16
+        # inverse-frequency buffer, for the stage 8 comparison on the box.
+        inv_freq = self.rotary_pos_emb.inv_freq.to(hidden_states.dtype)
+        rotary_pos_emb = (position_ids.unsqueeze(-1) * inv_freq).flatten(1)
+        emb = torch.cat((rotary_pos_emb, rotary_pos_emb), dim=-1)
+        cos, sin = emb.cos(), emb.sin()
 
         seq_len, _ = hidden_states.size()
         hidden_states = hidden_states.reshape(seq_len, -1)
