@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import os
+import threading
 import time
 
 FLUSH_INTERVAL_S = 2.0
@@ -61,10 +62,17 @@ class StepPhases:
             totals[1] += seconds
         if self.wall - self.last_flush >= FLUSH_INTERVAL_S:
             self.last_flush = self.wall
+            # note (ratish): native thread ids name the threads in a /proc CPU snapshot.
+            record = {
+                "time": time.time(),
+                "scheduler_thread": threading.get_native_id(),
+                "threads": {
+                    thread.native_id: thread.name for thread in threading.enumerate()
+                },
+                "totals": self.totals,
+            }
             with open(self.path, "a", encoding="utf-8") as output:
-                output.write(
-                    json.dumps({"time": time.time(), "totals": self.totals}) + "\n"
-                )
+                output.write(json.dumps(record) + "\n")
         else:
             pass
 
