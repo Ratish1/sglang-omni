@@ -24,6 +24,7 @@ from sglang_omni.models.registry import PIPELINE_CONFIG_REGISTRY
 from sglang_omni.pipeline.mp_runner import build_stage_groups
 from sglang_omni.pipeline.runtime_config import prepare_pipeline_runtime
 from sglang_omni.pipeline.stage_workers import patched_spawn_env
+from sglang_omni.platforms import current_platform
 from tests.unit_test.fixtures.pipeline_fakes import FakeMpContext
 from tests.unit_test.pipeline.helpers import build_compiled_process_topology
 
@@ -111,6 +112,57 @@ def test_fun_cosyvoice3_engine_process_spawns_with_a_written_omp_setting(
 
         with patched_spawn_env(engine_process_spec):
             assert os.environ["OMP_NUM_THREADS"] == "3"
+    finally:
+        prepared_runtime.runtime_dir.close()
+
+
+@pytest.mark.parametrize(
+    ("written_setting", "is_cuda", "expected_alloc_conf"),
+    [
+        (None, True, "expandable_segments:True"),
+        (("env_defaults.PYTORCH_ALLOC_CONF", "backend:native"), True, "backend:native"),
+        (
+            ("tts_engine.env.PYTORCH_ALLOC_CONF", "backend:native"),
+            True,
+            "backend:native",
+        ),
+        (None, False, None),
+    ],
+)
+def test_fun_cosyvoice3_vocoder_process_spawns_with_expandable_segments_on_cuda(
+    monkeypatch: pytest.MonkeyPatch,
+    written_setting: tuple[str, str] | None,
+    is_cuda: bool,
+    expected_alloc_conf: str | None,
+) -> None:
+    monkeypatch.delenv("PYTORCH_ALLOC_CONF", raising=False)
+    monkeypatch.setattr(current_platform, "is_cuda", lambda: is_cuda)
+    config = ConfigManager(
+        FunCosyVoice3PipelineConfig(model_path="model")
+    ).merge_config([] if written_setting is None else [written_setting])
+    prepared_runtime = prepare_pipeline_runtime(config)
+    try:
+        stage_groups = build_stage_groups(
+            config,
+            ctx=FakeMpContext(),
+            stages_cfg=prepared_runtime.stages_cfg,
+            endpoints=prepared_runtime.endpoints,
+            placement_plan=prepared_runtime.placement_plan,
+            process_plan=prepared_runtime.process_plan,
+            replica_topology=prepared_runtime.replica_topology,
+        )
+        (vocoder_process_spec,) = [
+            process_spec
+            for stage_group in stage_groups
+            for process_spec in stage_group.process_specs
+            if any(
+                stage_spec.stage_name == "vocoder"
+                for stage_spec in process_spec.stage_specs
+            )
+        ]
+
+        with patched_spawn_env(vocoder_process_spec):
+            assert os.environ.get("PYTORCH_ALLOC_CONF") == expected_alloc_conf
     finally:
         prepared_runtime.runtime_dir.close()
 
