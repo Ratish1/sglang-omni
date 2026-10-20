@@ -196,8 +196,6 @@ class Qwen3OmniImageEncoder(nn.Module):
         if isinstance(pixel_values, torch.Tensor) and isinstance(
             image_grid_thw, torch.Tensor
         ):
-            # note (ratish): the grid stays on the host; the encoder derives its
-            # lengths there and every later reader takes it on the host.
             image_grid_thw = image_grid_thw.to(dtype=torch.long)
             pixel_values = pixel_values.to(device=self.device, dtype=self.visual.dtype)
             image_embeds, image_embeds_multiscale = unpack_visual_output(

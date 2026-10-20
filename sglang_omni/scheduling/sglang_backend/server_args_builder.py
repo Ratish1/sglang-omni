@@ -126,7 +126,7 @@ def build_sglang_server_args(
     server_args = ServerArgs(**kwargs)
     server_args.resolve_once()
     resolved = resolved_view(server_args)
-    # Attention DP is unsupported; reject at configuration time. Mixed
+    # DP attention is unsupported; reject at configuration time. Mixed
     # chunked prefill stays allowed (the bridge handles it natively).
     if resolved.attn_dp_size > 1:
         raise ValueError("sglang-omni does not support attention data parallelism")

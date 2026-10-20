@@ -55,8 +55,8 @@ class Qwen3OmniMoeVisionEncoderCompat(hf_modeling.Qwen3OmniMoeVisionEncoder):
         weight_list = [[] for _ in range(4)]
 
         # Keep these coordinate and weight operations byte-for-byte equivalent
-        # to the legacy implementation. In particular, linspace runs on CPU
-        # and the materialized weights use the embedding table dtype.
+        # to the Transformers 5.6 implementation. In particular, linspace runs
+        # on CPU and the materialized weights use the embedding table dtype.
         for _, h, w in grid_thw_list:
             h_idxs = torch.linspace(0, self.num_grid_per_side - 1, h)
             w_idxs = torch.linspace(0, self.num_grid_per_side - 1, w)

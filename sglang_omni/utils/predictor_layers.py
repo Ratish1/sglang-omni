@@ -78,8 +78,7 @@ MIN_BLOCK_M = 16
 MAX_FUSED_ROWS = 64
 NUM_WARPS = 4
 # note (ratish): the pinned Triton stages the scaled input once more for the head's
-# second dot; at two warps per program that costs nothing against the previous
-# Triton's four-warp time, while merging the two dots costs a tile split instead.
+# second dot; two warps per program absorb that, while merging the dots costs a tile split.
 QKV_NUM_WARPS = 2
 NUM_STAGES = 3
 
@@ -445,8 +444,7 @@ if HAS_TRITON:
         rows_off = row_offsets(x_stride_row, x_stride_t, T, BLOCK_M)
         gate_cols = pid * BLOCK_N + tl.arange(0, BLOCK_N)
         # note (ratish): the tile's gate rows then its up rows as one weight tile, so the
-        # scaled input feeds a single dot: a second dot on the same operand makes the
-        # pinned Triton rebuild that operand per dot, and the launch costs 2.6 times more.
+        # scaled input feeds a single dot; the pinned Triton rebuilds an operand per dot.
         stacked_cols = pid * BLOCK_N + tl.where(
             rn < BLOCK_N, rn, INTERMEDIATE - BLOCK_N + rn
         )
