@@ -62,19 +62,24 @@ class SpeechTokenizerV3:
 
         # note (db-ol): the cuDNN conv plan is rebuilt whenever the input shape differs
         # from the previous call, and the default search setting makes rebuilds slow.
-        # note (ratish): one stream for every thread. By default each calling thread
-        # gets its own, and a run ends waiting on the legacy stream the AR runs on.
+        cuda_options: dict[str, str] = {"cudnn_conv_algo_search": "HEURISTIC"}
+        self.compute_stream: torch.cuda.Stream | None = None
+        if (
+            device.startswith("cuda")
+            and "CUDAExecutionProvider" in onnxruntime.get_available_providers()
+        ):
+            # note (ratish): one stream for every thread, since each calling thread's own
+            # stream and handles hold memory. The top priority, since this is first
+            # audio work and would otherwise queue behind the vocoder's kernels.
+            self.compute_stream = torch.cuda.Stream(
+                device=torch.device(device),
+                priority=torch.cuda.Stream.priority_range()[1],
+            )
+            cuda_options["user_compute_stream"] = str(self.compute_stream.cuda_stream)
+        else:
+            pass
         providers = (
-            [
-                (
-                    "CUDAExecutionProvider",
-                    {
-                        "cudnn_conv_algo_search": "HEURISTIC",
-                        "use_ep_level_unified_stream": "1",
-                    },
-                ),
-                "CPUExecutionProvider",
-            ]
+            [("CUDAExecutionProvider", cuda_options), "CPUExecutionProvider"]
             if device.startswith("cuda")
             else ["CPUExecutionProvider"]
         )
@@ -83,8 +88,8 @@ class SpeechTokenizerV3:
         )
         self.device = device
         is_on_cuda = "CUDAExecutionProvider" in self.session.get_providers()
-        # note (ratish): on the one stream every run shares a cuDNN handle, which
-        # cuDNN allows from one thread at a time.
+        # note (ratish): on the one stream every run shares the creating thread's cuDNN
+        # handle, which cuDNN allows from one thread at a time.
         self.run_lock: threading.Lock | nullcontext[None] = (
             threading.Lock() if is_on_cuda else nullcontext()
         )
