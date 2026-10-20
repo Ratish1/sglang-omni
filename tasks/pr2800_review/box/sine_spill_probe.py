@@ -26,10 +26,27 @@ def fast_sine_kernel(x_ptr, y_ptr, BLOCK: tl.constexpr):
     tl.store(y_ptr + offsets, tl.sin(tl.load(x_ptr + offsets)))
 
 
+@triton.jit
+def copy_kernel(x_ptr, y_ptr, BLOCK: tl.constexpr):
+    offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    tl.store(y_ptr + offsets, tl.load(x_ptr + offsets) * 2.0)
+
+
+@triton.jit
+def approximate_sine_kernel(x_ptr, y_ptr, BLOCK: tl.constexpr):
+    offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    values = tl.load(x_ptr + offsets)
+    sine = tl.inline_asm_elementwise(
+        "sin.approx.f32 $0, $1;", "=r,r", [values], dtype=tl.float32, is_pure=True, pack=1
+    )
+    tl.store(y_ptr + offsets, sine)
+
+
 def main() -> None:
     x = torch.randn(4096, device="cuda")
     y = torch.empty_like(x)
-    for name, kernel in (("libdevice.sin", precise_sine_kernel), ("tl.sin", fast_sine_kernel)):
+    for name, kernel in (("libdevice.sin", precise_sine_kernel), ("tl.sin", fast_sine_kernel),
+                         ("no sine", copy_kernel), ("sin.approx", approximate_sine_kernel)):
         compiled = kernel[(4,)](x, y, BLOCK=1024, num_warps=4)
         print(f"{name}: registers {compiled.n_regs}, spills {compiled.n_spills}")
 
