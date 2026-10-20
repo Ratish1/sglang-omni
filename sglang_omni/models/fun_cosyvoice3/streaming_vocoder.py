@@ -22,10 +22,7 @@ from sglang.srt.utils.common import is_pin_memory_available
 
 from sglang_omni.models.fun_cosyvoice3.packed_dit import PackedDiT
 from sglang_omni.models.fun_cosyvoice3.payload_types import FunCosyVoice3State
-from sglang_omni.models.fun_cosyvoice3.prefix_cache import (
-    PrefixCacheRow,
-    compile_forward_prefix,
-)
+from sglang_omni.models.fun_cosyvoice3.prefix_cache import PrefixCacheRow
 from sglang_omni.models.fun_cosyvoice3.stages import (
     CosyVoice3Vocoder,
     FlowBatchInput,
@@ -249,11 +246,6 @@ class FunCosyVoice3StreamingVocoderScheduler(
             return
         else:
             pass
-        prefix_pool = self.vocoder.flow.prefix_pool
-        if prefix_pool is not None:
-            prefix_pool.forward = compile_forward_prefix()
-        else:
-            pass
         hop_tokens = self.token_hop_len + PRE_LOOKAHEAD_LEN
         first = [self.make_warmup_flow_input(hop_tokens)]
         # note(ratish): a second row count and length,
@@ -267,14 +259,64 @@ class FunCosyVoice3StreamingVocoderScheduler(
             for items in (first, second):
                 self.vocoder.hop_batch(items)
                 self.vocoder.leftover_batch(items)
-            if prefix_pool is not None:
-                self.warmup_prefix_hops(first[0])
-            else:
-                pass
         logger.info(
             f"Fun-CosyVoice3 PackedDiT compile warmup, hop and final, with "
             f"torch_num_threads={torch.get_num_threads()} "
             f"({time.monotonic() - started:.1f} s)"
+        )
+
+    def measure_peak_step_bytes(
+        self, device: torch.device, *, rows: int, tokens: int
+    ) -> int:
+        """Device memory the largest step this scheduler admits maps beyond what stays
+        resident: rows streams of tokens tokens each, prompt included, as uncached hops
+        and as finals over their whole history, each followed by HiFT."""
+        hop_frames = self.token_max_hop_len * self.vocoder.flow.token_mel_ratio
+        samples_per_frame = self.vocoder.hift_samples_per_mel_frame
+        items = [
+            self.make_warmup_flow_input(tokens - self.token_hop_len)
+            for _ in range(rows)
+        ]
+        torch.cuda.synchronize(device)
+        torch.cuda.empty_cache()
+        resident_bytes = torch.cuda.memory_reserved(device)
+        torch.cuda.reset_peak_memory_stats(device)
+        started = time.monotonic()
+        with self.vocoder.stream_context:
+            for decode, is_final in (
+                (self.vocoder.hop_batch, False),
+                (self.vocoder.leftover_batch, True),
+            ):
+                mels = decode(items)
+                self.vocoder.hift_step(
+                    [
+                        HiftStepRow(
+                            history=mel,
+                            emitted_samples=max(int(mel.shape[2]) - hop_frames, 0)
+                            * samples_per_frame,
+                            is_final=is_final,
+                        )
+                        for mel in mels
+                    ]
+                )
+        torch.cuda.synchronize(device)
+        peak_bytes = torch.cuda.max_memory_reserved(device) - resident_bytes
+        logger.info(
+            f"Fun-CosyVoice3 largest admitted step, {rows} rows of {tokens} tokens: "
+            f"{peak_bytes / 2**30:.2f} GB mapped ({time.monotonic() - started:.1f} s)"
+        )
+        return peak_bytes
+
+    def warmup_prefix_compile(self) -> None:
+        """The pool's compiled prefix forward through its hops, so its graphs capture
+        compiled code."""
+        started = time.monotonic()
+        with self.vocoder.stream_context:
+            self.warmup_prefix_hops(
+                self.make_warmup_flow_input(self.token_hop_len + PRE_LOOKAHEAD_LEN)
+            )
+        logger.info(
+            f"Fun-CosyVoice3 prefix compile warmup ({time.monotonic() - started:.1f} s)"
         )
 
     def warmup_prefix_hops(self, item: FlowBatchInput) -> None:
