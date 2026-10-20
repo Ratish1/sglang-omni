@@ -7,7 +7,7 @@ from __future__ import annotations
 import logging
 from collections.abc import Iterator, Sequence
 from dataclasses import dataclass
-from itertools import pairwise
+from itertools import accumulate, pairwise
 
 import torch
 import torch._dynamo as dynamo
@@ -17,10 +17,10 @@ from sglang.kernels.ops.attention.flash_attention import (
     flash_attn_with_kvcache,
 )
 from sglang.kernels.ops.attention.flash_attention_v3 import _is_fa3_supported
+from sglang.srt.utils.common import is_pin_memory_available
 from sglang.srt.utils.custom_op import register_custom_op
 
 from sglang_omni.models.fun_cosyvoice3.causal_conv import FusedConvPositionEmbedding
-from sglang_omni.platforms import current_platform
 
 logger = logging.getLogger(__name__)
 
@@ -116,15 +116,17 @@ class PackedRows:
 
 def pack_rows(lengths: Sequence[int], device: torch.device) -> PackedRows:
     lengths = tuple(int(length) for length in lengths)
-    # note (ratish): a few ints per row; a pageable copy of 64 KB or less returns without
-    # waiting for the stream's queued work.
-    non_blocking = current_platform.is_cuda()
-    starts_host = F.pad(torch.tensor(lengths, dtype=torch.int64).cumsum(0), (1, 0))
-    starts = starts_host.to(device, non_blocking=non_blocking)
+    pin_memory = is_pin_memory_available(device)
+    starts_host = torch.tensor(
+        (0, *accumulate(lengths)), dtype=torch.int64, pin_memory=pin_memory
+    )
+    starts = starts_host.to(device, non_blocking=True)
     total = int(starts_host[-1])
     row_ids = torch.repeat_interleave(
         torch.arange(len(lengths), device=device),
-        torch.tensor(lengths, dtype=torch.int64).to(device, non_blocking=non_blocking),
+        torch.tensor(lengths, dtype=torch.int64, pin_memory=pin_memory).to(
+            device, non_blocking=True
+        ),
         output_size=total,
     )
     frames = torch.arange(total, device=device)
@@ -201,9 +203,9 @@ class RowAttention:
         self.heads = heads
         width = rows.width
         device = rows.row_ids.device
-        lengths = torch.tensor(rows.lengths).to(
-            device, non_blocking=current_platform.is_cuda()
-        )
+        lengths = torch.tensor(
+            rows.lengths, pin_memory=is_pin_memory_available(device)
+        ).to(device, non_blocking=True)
         keys = torch.arange(width, device=device).unsqueeze(0) < lengths.unsqueeze(1)
         if chunk_size is None:
             mask = keys.unsqueeze(1).expand(-1, width, -1)
@@ -242,14 +244,20 @@ class RaggedRowAttention:
         self.head_dim = head_dim
         device = rows.row_ids.device
         segment_rows, segment_ends, offsets = chunk_segments(rows.lengths, chunk_size)
-        self.cache_seqlens = torch.tensor(segment_ends, dtype=torch.int32).to(
-            device, non_blocking=True
-        )
-        self.cu_seqlens_q = torch.tensor(offsets, dtype=torch.int32).to(
-            device, non_blocking=True
-        )
+        row_starts = rows.starts_host.tolist()
+        pin_memory = is_pin_memory_available(device)
+        self.cache_seqlens = torch.tensor(
+            segment_ends, dtype=torch.int32, pin_memory=pin_memory
+        ).to(device, non_blocking=True)
+        self.cu_seqlens_q = torch.tensor(
+            offsets, dtype=torch.int32, pin_memory=pin_memory
+        ).to(device, non_blocking=True)
         self.max_seqlen_q = max(end - start for start, end in pairwise(offsets))
-        starts = rows.starts_host[list(segment_rows)].to(device, non_blocking=True)
+        starts = torch.tensor(
+            [row_starts[row] for row in segment_rows],
+            dtype=torch.int32,
+            pin_memory=pin_memory,
+        ).to(device, non_blocking=True)
         # note (ratish): FA3 page ids must land inside the packed keys; pad with page 0.
         page = torch.arange(max(segment_ends), dtype=torch.int32, device=device)
         self.page_table = torch.where(

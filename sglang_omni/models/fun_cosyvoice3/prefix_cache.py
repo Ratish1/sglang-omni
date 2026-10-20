@@ -18,6 +18,7 @@ from typing import Protocol
 import torch
 import torch._dynamo as dynamo
 import torch.nn.functional as F
+from sglang.srt.utils.common import is_pin_memory_available
 
 from sglang_omni.models.fun_cosyvoice3.packed_dit import (
     CONV_CONTEXT_FRAMES,
@@ -322,7 +323,9 @@ class PrefixRowAttention:
         # note (ratish): one upload from pinned memory; a pageable copy past 64 KB waits on
         # the host for the stream's queued work.
         packed_host = torch.empty(
-            sum(len(part) for part in host_parts), dtype=torch.int64, pin_memory=True
+            sum(len(part) for part in host_parts),
+            dtype=torch.int64,
+            pin_memory=is_pin_memory_available(device),
         )
         (
             self.positions,

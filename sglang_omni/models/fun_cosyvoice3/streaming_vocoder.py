@@ -18,6 +18,7 @@ from dataclasses import dataclass, field
 from typing import Literal, Mapping
 
 import torch
+from sglang.srt.utils.common import is_pin_memory_available
 
 from sglang_omni.models.fun_cosyvoice3.packed_dit import PackedDiT
 from sglang_omni.models.fun_cosyvoice3.payload_types import FunCosyVoice3State
@@ -30,7 +31,6 @@ from sglang_omni.models.fun_cosyvoice3.stages import (
     FlowBatchInput,
     HiftStepRow,
     HiftStepSamples,
-    to_device_pinned,
 )
 from sglang_omni.models.fun_cosyvoice3.streaming import (
     PRE_LOOKAHEAD_LEN,
@@ -53,6 +53,18 @@ logger = logging.getLogger(__name__)
 SAMPLE_RATE = 24000
 
 NextDecode = Literal["causal_window", "leftover", "fallback", "wait"]
+
+
+def upload_prompt(
+    tensor: torch.Tensor, device: torch.device, dtype: torch.dtype
+) -> torch.Tensor:
+    """A host prompt tensor as dtype on device, staged in pinned memory where the
+    platform has it, so the copy does not wait for the work queued on the stream."""
+    host = torch.empty(
+        tensor.shape, dtype=dtype, pin_memory=is_pin_memory_available(device)
+    )
+    host.copy_(tensor)
+    return host.to(device, non_blocking=True)
 
 
 def causal_hop_frames(item: FlowBatchInput, *, token_mel_ratio: int) -> int:
@@ -175,7 +187,7 @@ class FunCosyVoice3StreamingVocoderScheduler(
             failed.extend(self.complete_step(previous))
         else:
             pass
-        # note (ratish): samples already on the host need no wait, so off CUDA a step
+        # note (ratish): samples already on the host need no wait, so such a step
         # completes at its launch, as before.
         if launched is not None and launched.samples.copy_done is None:
             failed.extend(self.complete_step(launched))
@@ -370,9 +382,14 @@ class FunCosyVoice3StreamingVocoderScheduler(
             token_mel_ratio=self.vocoder.flow.token_mel_ratio,
         )
         if state.prompt_token is None:
-            state.prompt_token = token
-            state.prompt_feat = feat
-            state.embedding = speaker_embedding
+            # note (ratish): on the vocoder's stream, which every launch reading the
+            # prompt follows; each step's pack then copies it on the device.
+            parameter = next(self.vocoder.flow.parameters())
+            device, dtype = parameter.device, parameter.dtype
+            with self.vocoder.stream_context:
+                state.prompt_token = upload_prompt(token, device, torch.int32)
+                state.prompt_feat = upload_prompt(feat, device, dtype)
+                state.embedding = upload_prompt(speaker_embedding, device, dtype)
         elif (
             tuple(token.shape) != tuple(state.prompt_token.shape)
             or tuple(feat.shape) != tuple(state.prompt_feat.shape)
@@ -498,11 +515,15 @@ class FunCosyVoice3StreamingVocoderScheduler(
             return None
         else:
             pass
-        self.hold_prompts_on_device(participants)
+        pin_memory = is_pin_memory_available(
+            next(self.vocoder.flow.parameters()).device
+        )
         if plan == "leftover":
             items = [
                 FlowBatchInput(
-                    token=torch.tensor(state.tokens, dtype=torch.int32).unsqueeze(0),
+                    token=torch.tensor(
+                        state.tokens, dtype=torch.int32, pin_memory=pin_memory
+                    ).unsqueeze(0),
                     prompt_token=state.prompt_token,
                     prompt_feat=state.prompt_feat,
                     embedding=state.embedding,
@@ -526,6 +547,7 @@ class FunCosyVoice3StreamingVocoderScheduler(
                             : state.token_offset + state.hop_len + PRE_LOOKAHEAD_LEN
                         ],
                         dtype=torch.int32,
+                        pin_memory=pin_memory,
                     ).unsqueeze(0),
                     prompt_token=state.prompt_token,
                     prompt_feat=state.prompt_feat,
@@ -558,20 +580,6 @@ class FunCosyVoice3StreamingVocoderScheduler(
                 else:
                     state.ready_since = None
             return LaunchedStep(participants=participants, plan=plan, samples=samples)
-
-    def hold_prompts_on_device(
-        self, participants: list[tuple[str, CosyVoice3StreamState]]
-    ) -> None:
-        """Move each stream's prompt to Flow's device and dtypes at its first launch, on
-        the vocoder's stream; every later step's pack copies it on the device."""
-        parameter = next(self.vocoder.flow.parameters())
-        device, dtype = parameter.device, parameter.dtype
-        for _, state in participants:
-            state.prompt_token = to_device_pinned(
-                state.prompt_token, device, torch.int32
-            )
-            state.prompt_feat = to_device_pinned(state.prompt_feat, device, dtype)
-            state.embedding = to_device_pinned(state.embedding, device, dtype)
 
     def complete_step(self, launched: LaunchedStep) -> list[str]:
         """Read a launched step's audio and send it: a hop's chunk, or a final's last

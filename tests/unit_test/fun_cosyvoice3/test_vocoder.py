@@ -1511,7 +1511,9 @@ def test_vocoder_spectra_match_cosyvoice_without_a_host_wait(
 @pytest.mark.accelerator
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_hift_step_queues_its_samples_without_a_host_wait() -> None:
-    vocoder = stages.CosyVoice3Vocoder(HiftFlowStub(), make_causal_hift(10.0))
+    hift = make_causal_hift(10.0)
+    stages.patch_sine_harmonics(hift, "cuda")
+    vocoder = stages.CosyVoice3Vocoder(HiftFlowStub(), hift)
     samples_per_frame = vocoder.hift_samples_per_mel_frame
     torch.manual_seed(6)
     rows = [
@@ -1557,10 +1559,10 @@ def test_hift_steps_record_their_copies_on_two_events_in_turn() -> None:
 
 @pytest.mark.accelerator
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-def test_vocoder_sine_source_matches_cosyvoice_without_a_host_wait() -> None:
+def test_patched_sine_source_matches_cosyvoice_without_a_host_wait() -> None:
     hift = make_causal_hift(10.0)
     reference_hift = copy.deepcopy(hift)
-    stages.CosyVoice3Vocoder(HiftFlowStub(), hift)
+    stages.patch_sine_harmonics(hift, "cuda")
     torch.manual_seed(4)
     f0 = torch.rand(3, 4800, 1, device="cuda") * 400
     with torch.inference_mode():

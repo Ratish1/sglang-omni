@@ -682,17 +682,16 @@ def test_a_stream_whose_abort_lands_while_the_pump_holds_its_state_gets_nothing(
     assert drain(scheduler) == []
 
 
-def test_a_streams_prompt_takes_flows_dtype_at_its_first_launch_and_keeps_it() -> None:
+def test_a_streams_prompt_takes_flows_dtype_at_its_latch_and_keeps_it() -> None:
     _, scheduler = make_scheduler()
     scheduler.handle_streaming_new_request(
         "req-a", stream_payload("req-a", prompt_feat_dtype=torch.float16)
     )
-    scheduler.ingest_stream_item("req-a", item(list(range(78))))
     state = scheduler.stream_states["req-a"]
+    prompt_feat = state.prompt_feat
+    scheduler.ingest_stream_item("req-a", item(list(range(78))))
     with scheduler.state_lock:
         assert scheduler.pump_one_step() == []
-    prompt_feat = state.prompt_feat
-    with scheduler.state_lock:
         assert scheduler.pump_one_step() == []
     assert prompt_feat.dtype == torch.float32
     assert state.prompt_feat is prompt_feat

@@ -25,7 +25,7 @@ from numpy.typing import ArrayLike
 from sglang.srt.arg_groups.cuda_graph_hook import (
     generate_prefill_cuda_graph_batch_sizes,
 )
-from sglang.srt.utils.common import async_d2h
+from sglang.srt.utils.common import async_d2h, is_pin_memory_available
 from torch._inductor.runtime.compile_tasks import _set_triton_libdevice_path
 from torch.nn.utils.parametrize import is_parametrized, remove_parametrizations
 from x_transformers.x_transformers import apply_rotary_pos_emb
@@ -214,19 +214,19 @@ class HiftStepRow:
 @dataclass(kw_only=True, frozen=True)
 class HiftStepSamples:
     """A streaming HiFT step's new samples per row and each row's emitted samples after
-    it. On CUDA the new samples view a pinned host copy, complete once copy_done is."""
+    it. With copy_done the new samples view a pinned host copy, complete once it is."""
 
     new_samples: list[torch.Tensor]
     emitted_samples: list[int]
     copy_done: torch.cuda.Event | None
 
     def wait(self) -> list[torch.Tensor]:
-        """Each row's new samples as a host tensor of its own, once the copy has landed."""
+        """Each row's new samples on the host, once the copy has landed."""
         if self.copy_done is not None:
             self.copy_done.synchronize()
         else:
             pass
-        return [samples.clone() for samples in self.new_samples]
+        return self.new_samples
 
 
 @dataclass(kw_only=True, frozen=True)
@@ -255,19 +255,6 @@ class PackedFlowBatch:
 
 
 logger = logging.getLogger(__name__)
-
-
-def to_device_pinned(
-    tensor: torch.Tensor, device: torch.device, dtype: torch.dtype
-) -> torch.Tensor:
-    """tensor as dtype on device. On CUDA a host tensor is copied from pinned memory,
-    which the copy reads without staging, so the call does not wait for queued work."""
-    if tensor.device == device:
-        return tensor.to(dtype=dtype)
-    elif current_platform.is_cuda():
-        return tensor.to(dtype=dtype).pin_memory().to(device, non_blocking=True)
-    else:
-        return tensor.to(device=device, dtype=dtype)
 
 
 def pack_flow_inputs(
@@ -333,23 +320,21 @@ def pack_flow_inputs(
     total_mel_lengths = tuple(
         length * flow.token_mel_ratio for length in combined_lengths
     )
-    # note (ratish): a pageable copy past 64 KB waits on the host for the stream's queued
-    # work. A streaming step uploads a few tokens and lengths here; its prompt is on the
-    # device already.
-    non_blocking = current_platform.is_cuda()
     combined_token_lengths_tensor = torch.tensor(
-        combined_lengths, dtype=torch.int64
-    ).to(device, non_blocking=non_blocking)
+        combined_lengths,
+        dtype=torch.int64,
+        pin_memory=is_pin_memory_available(device),
+    ).to(device, non_blocking=True)
 
     max_tokens = max(combined_lengths)
     token = torch.zeros(len(inputs), max_tokens, dtype=torch.int32, device=device)
     for index, item in enumerate(inputs):
         prompt_length = prompt_lengths[index]
         token[index, :prompt_length] = item.prompt_token[0].to(
-            device=device, dtype=torch.int32, non_blocking=non_blocking
+            device=device, dtype=torch.int32, non_blocking=True
         )
         token[index, prompt_length : combined_lengths[index]] = item.token[0].to(
-            device=device, dtype=torch.int32, non_blocking=non_blocking
+            device=device, dtype=torch.int32, non_blocking=True
         )
     token_mask = (
         torch.arange(max_tokens, device=device).unsqueeze(0)
@@ -362,11 +347,11 @@ def pack_flow_inputs(
     )
     for index, item in enumerate(inputs):
         prompt_feat[index, : prompt_mel_lengths[index]] = item.prompt_feat[0].to(
-            device=device, dtype=dtype, non_blocking=non_blocking
+            device=device, dtype=dtype, non_blocking=True
         )
     embedding = torch.cat(
         [
-            item.embedding.to(device=device, dtype=dtype, non_blocking=non_blocking)
+            item.embedding.to(device=device, dtype=dtype, non_blocking=True)
             for item in inputs
         ],
         dim=0,
@@ -1228,12 +1213,10 @@ def load_cosyvoice3_flow_hift(
     flow.to(device).eval()
     hift.to(device).eval()
     keep_hift_constants_on_device(hift, device)
-    if current_platform.is_cuda():
-        # note (ratish): a plain attribute, so flow.to(device) leaves it on the host and
-        # every Flow call uploads its slice, waiting for the work queued on the stream.
-        flow.decoder.rand_noise = flow.decoder.rand_noise.to(device)
-    else:
-        pass
+    patch_sine_harmonics(hift, device)
+    # note (ratish): a plain attribute, so flow.to(device) leaves it on the host and
+    # every Flow call uploads its slice, waiting for the work queued on the stream.
+    flow.decoder.rand_noise = flow.decoder.rand_noise.to(device)
     patch_causal_conv_cache()
     # note (Dayuxiaoshui): folding weight_norm is the only load-time step
     # batched decode needs.
@@ -1367,7 +1350,7 @@ def keep_hift_constants_on_device(hift: "CausalHiFTGenerator", device: str) -> N
     hift.f0_predictor.to(torch.float64)
 
 
-def patch_sine_harmonics(hift: "CausalHiFTGenerator", device: torch.device) -> None:
+def patch_sine_harmonics(hift: "CausalHiFTGenerator", device: str) -> None:
     """Give SineGen2 its harmonic multipliers on the device, bit for bit. Its forward
     builds them on the host every call, and their pageable upload waits for all the work
     queued on the stream."""
@@ -1900,16 +1883,16 @@ class CosyVoice3Vocoder(BatchVocoderBase[FunCosyVoice3State, torch.Tensor]):
                 patch_hift_spectra(hift, device)
             else:
                 pass
-            if current_platform.is_cuda():
-                patch_sine_harmonics(hift, device)
-            else:
-                pass
-            self.has_async_samples = current_platform.is_cuda()
+            # note (ratish): a step completes after the next one is launched, so two
+            # events serve every step in turn; a new event's first record waits while
+            # another thread of the process is inside the CUDA runtime.
+            self.copy_done_events: list[torch.cuda.Event] = [
+                torch.cuda.Event() for _ in range(2)
+            ]
         else:
             self.stream_context = contextlib.nullcontext()
             self.has_hift_kernels = False
-            self.has_async_samples = False
-        self.copy_done_events: list[torch.cuda.Event] = []
+            self.copy_done_events = []
         self.copy_done_slot: int = 0
 
     def prepare_item(
@@ -2210,8 +2193,11 @@ class CosyVoice3Vocoder(BatchVocoderBase[FunCosyVoice3State, torch.Tensor]):
             decoded = self.hift_group([windows[index] for index in members])
             outputs.update(zip(members, decoded, strict=True))
         ordered = [outputs[index] for index in range(len(rows))]
-        if self.has_async_samples:
-            copy_done: torch.cuda.Event | None = self.next_copy_done_event()
+        if self.copy_done_events:
+            copy_done: torch.cuda.Event | None = self.copy_done_events[
+                self.copy_done_slot
+            ]
+            self.copy_done_slot ^= 1
             copy_done.record()
         else:
             copy_done = None
@@ -2220,18 +2206,6 @@ class CosyVoice3Vocoder(BatchVocoderBase[FunCosyVoice3State, torch.Tensor]):
             emitted_samples=[emitted for _, emitted in ordered],
             copy_done=copy_done,
         )
-
-    def next_copy_done_event(self) -> torch.cuda.Event:
-        # note (ratish): a new event is created at its first record, which waits while
-        # another thread of the process is inside the CUDA runtime. Two, since a step
-        # completes after the next one is launched.
-        if not self.copy_done_events:
-            self.copy_done_events = [torch.cuda.Event() for _ in range(2)]
-        else:
-            pass
-        event = self.copy_done_events[self.copy_done_slot]
-        self.copy_done_slot ^= 1
-        return event
 
     def hift_group(
         self, windows: Sequence[HiftDecodeWindow]
@@ -2323,7 +2297,7 @@ class CosyVoice3Vocoder(BatchVocoderBase[FunCosyVoice3State, torch.Tensor]):
             speech = runner.run(window_mel, window_source)
         # note (ratish): queued on this stream, the copy reads a replay's output before
         # any later replay of the pool overwrites it.
-        if self.has_async_samples:
+        if self.copy_done_events:
             speech = async_d2h(speech.detach())
         else:
             speech = speech.detach().cpu()
