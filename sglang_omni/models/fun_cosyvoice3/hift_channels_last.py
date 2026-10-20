@@ -17,8 +17,14 @@ from sglang_omni.models.fun_cosyvoice3.hift_kernels import (
 )
 from sglang_omni.utils.channels_last_conv import (
     channels_last_conv1d,
+    channels_last_folded_weight,
+    channels_last_strides,
     channels_last_weight,
 )
+
+# note (ratish): cuDNN's channels-last tensor-core engines take channel counts in
+# multiples of eight; the spectrum's n_fft + 2 channels are zero padded to the next.
+CHANNEL_ALIGNMENT = 8
 
 
 class ChannelsLastHiftDecode:
@@ -29,8 +35,12 @@ class ChannelsLastHiftDecode:
     def __init__(self, hift: torch.nn.Module, device: torch.device) -> None:
         self.hift = hift
         self.spectrum_frames_per_mel_frame = math.prod(hift.upsample_rates)
+        self.n_fft = hift.istft_params["n_fft"]
+        self.hop_length = hift.istft_params["hop_len"]
+        self.bins = self.n_fft // 2 + 1
+        self.spectrum_channel_padding = (-(self.n_fft + 2)) % CHANNEL_ALIGNMENT
         blocks = [*hift.source_resblocks, *hift.resblocks]
-        convs = [hift.conv_pre, *hift.ups, *hift.source_downs, hift.conv_post]
+        convs = [hift.conv_pre, *hift.ups]
         for block in blocks:
             convs.extend((*block.convs1, *block.convs2))
         # note (ratish): copies with channels-last strides; the modules keep their own
@@ -38,6 +48,27 @@ class ChannelsLastHiftDecode:
         self.channels_last_weights: dict[int, torch.Tensor] = {
             id(conv): channels_last_weight(conv) for conv in convs
         }
+        for source_down in hift.source_downs:
+            weight = F.pad(
+                source_down.weight.data, (0, 0, 0, self.spectrum_channel_padding)
+            )
+            stride = source_down.stride[0]
+            if stride > 1:
+                # note (ratish): a strided conv runs stride one over its phases laid
+                # along the channels, the layout cuDNN has fast engines for.
+                weight = channels_last_folded_weight(weight, stride)
+            else:
+                weight = channels_last_strides(weight)
+            self.channels_last_weights[id(source_down)] = weight
+        self.channels_last_weights[id(hift.conv_post)] = channels_last_strides(
+            F.pad(
+                hift.conv_post.weight.data,
+                (0, 0, 0, 0, 0, self.spectrum_channel_padding),
+            )
+        )
+        self.conv_post_bias = F.pad(
+            hift.conv_post.bias.data, (0, self.spectrum_channel_padding)
+        )
         self.snake_alphas: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
         for block in blocks:
             for activation in (*block.activations1, *block.activations2):
@@ -47,9 +78,6 @@ class ChannelsLastHiftDecode:
                     alpha,
                     1.0 / (alpha + activation.no_div_by_zero),
                 )
-        self.n_fft = hift.istft_params["n_fft"]
-        self.hop_length = hift.istft_params["hop_len"]
-        self.bins = self.n_fft // 2 + 1
         window = hift.stft_window.to(device=device, dtype=torch.float64)
         angle = (2 * math.pi / self.n_fft) * torch.outer(
             torch.arange(self.bins, device=device, dtype=torch.float64),
@@ -97,16 +125,23 @@ class ChannelsLastHiftDecode:
         left_padding: int,
         right_padding: int = 0,
         stride: int = 1,
+        bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """The conv of (rows, samples, channels) with zeros for its causal context."""
         length = hidden_states.shape[1]
-        alignment = (-(left_padding + length + right_padding)) % module.dilation[0]
+        if stride > 1:
+            outputs = (left_padding + length - module.kernel_size[0]) // stride + 1
+            alignment = (-(left_padding + length)) % stride
+        else:
+            outputs = length
+            alignment = (-(left_padding + length + right_padding)) % module.dilation[0]
         padded = F.pad(hidden_states, (0, 0, left_padding, right_padding + alignment))
         return channels_last_conv1d(
             padded,
             module,
             self.channels_last_weights[id(module)],
-            length,
+            outputs,
+            bias=bias,
             stride=stride,
         )
 
@@ -139,7 +174,10 @@ class ChannelsLastHiftDecode:
         hift = self.hift
         # note (ratish): three small transposes, the mel, the source spectrum and the
         # output spectrum, in place of one per convolution inside cuDNN.
-        source_spectrum = self.spectrum(s.squeeze(1)).transpose(1, 2).contiguous()
+        source_spectrum = F.pad(
+            self.spectrum(s.squeeze(1)).transpose(1, 2),
+            (0, self.spectrum_channel_padding),
+        ).contiguous()
         if finalize:
             right_padding = hift.conv_pre.causal_padding
         else:
@@ -187,10 +225,13 @@ class ChannelsLastHiftDecode:
             hidden_states = summed / hift.num_kernels
         hidden_states = F.leaky_relu(hidden_states)
         hidden_states = self.conv(
-            hift.conv_post, hidden_states, left_padding=hift.conv_post.causal_padding
+            hift.conv_post,
+            hidden_states,
+            left_padding=hift.conv_post.causal_padding,
+            bias=self.conv_post_bias,
         )
         magnitude = torch.exp(hidden_states[..., : self.bins]).transpose(1, 2)
-        phase = torch.sin(hidden_states[..., self.bins :]).transpose(1, 2)
+        phase = torch.sin(hidden_states[..., self.bins : 2 * self.bins]).transpose(1, 2)
         audio = self.inverse(magnitude, phase)
         if finalize:
             pass
