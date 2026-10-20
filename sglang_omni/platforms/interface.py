@@ -43,6 +43,26 @@ class JointRopeInplaceKernel(Protocol):
     ) -> None: ...
 
 
+# note (ratish): FA3's tile schedule for one paged batch, passed as scheduler_metadata
+# to every flash_attn_with_kvcache call over that batch with the same arguments.
+class Fa3SchedulerMetadata(Protocol):
+    def __call__(
+        self,
+        *,
+        batch_size: int,
+        max_seqlen_q: int,
+        max_seqlen_k: int,
+        num_heads: int,
+        num_heads_k: int,
+        headdim: int,
+        cache_seqlens: torch.Tensor,
+        qkv_dtype: torch.dtype,
+        cu_seqlens_q: torch.Tensor,
+        page_size: int,
+        num_splits: int,
+    ) -> torch.Tensor: ...
+
+
 class OmniPlatform(DeviceMixin):
     _omni_platform_qualname: str | None = None
 
@@ -80,6 +100,10 @@ class OmniPlatform(DeviceMixin):
     def get_joint_rope_inplace_kernel(self) -> JointRopeInplaceKernel | None:
         # Note(yzxiao): None means this platform has no implementation. The
         # model decides whether this capability is required or optional.
+        return None
+
+    def get_fa3_scheduler_metadata(self) -> Fa3SchedulerMetadata | None:
+        """FA3's scheduler metadata precompute, or None when every call computes its own."""
         return None
 
     def apply_model_worker_backend_policy(
