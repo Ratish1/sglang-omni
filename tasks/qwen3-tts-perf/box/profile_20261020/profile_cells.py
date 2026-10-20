@@ -29,13 +29,15 @@ MAPPING_ARGS = (
     "--vocoder.factory.followup_cuda_graph false --vocoder.factory.incremental_codec_cuda_graph false "
     "--vocoder.factory.incremental_codec_compile false"
 ).split()
-WINDOW_LEAD_S = {"W3": 10.0, "W4": 10.0}
+WINDOW_LEAD_S = {"W3": 10.0, "W4": 10.0, "W5": 2.0}
 # note (ratish): a mapping window only has to hold each call site once, and stacks make it large.
 WINDOW_S = {"formal": 2.0, "mapping": 1.0}
 HOST_STEPS = {"W2": 60, "W3": 60, "W4": 40}
 HOST_LEAD_S = {"W2": 2.0, "W3": 10.0, "W4": 10.0}
 LONG_TEXT_SENTENCES = 8
 LONG_TEXT_REQUESTS = 3
+# The engine's max running requests (engine_builder.py), the batch of the degenerate W5 and W6 cells.
+MAX_BATCH = 64
 
 
 def run(command: list[str], cwd: str, log: Path, timeout: float = 3600) -> None:
@@ -66,13 +68,25 @@ reference = by_seconds[len(by_seconds) // 2]
 folder = Path({str(folder)!r})
 folder.mkdir(parents=True, exist_ok=True)
 shutil.copyfile(reference.ref_audio, folder / "ref.wav")
-rows = []
-for row in range({LONG_TEXT_REQUESTS} + 1):
+def text_of(row):
     picked = samples[row * {LONG_TEXT_SENTENCES}:(row + 1) * {LONG_TEXT_SENTENCES}]
-    text = " ".join(sample.target_text for sample in picked)
-    rows.append(f"long_{{row}}|{{reference.ref_text}}|ref.wav|{{text}}")
+    return " ".join(sample.target_text for sample in picked)
+rows = [f"long_{{row}}|{{reference.ref_text}}|ref.wav|{{text_of(row)}}" for row in range({LONG_TEXT_REQUESTS} + 1)]
 (folder / "meta.lst").write_text(rows[0] + "\\n", encoding="utf-8")
 (folder / "meta_profiled.lst").write_text("\\n".join(rows[1:]) + "\\n", encoding="utf-8")
+# W5 rows say their text twice so the batch outlasts the window; W6 rows come from later sentences, so no W6
+# prompt is a prefix of a W5 prompt the radix cache already holds.
+first = {LONG_TEXT_REQUESTS} + 1
+decode_rows = [
+    f"decode_{{row}}|{{reference.ref_text}}|ref.wav|{{text_of(row)}} {{text_of(row)}}"
+    for row in range(first, first + {MAX_BATCH})
+]
+prefill_rows = [
+    f"prefill_{{row}}|{{reference.ref_text}}|ref.wav|{{text_of(row)}}"
+    for row in range(first + {MAX_BATCH}, first + 2 * {MAX_BATCH})
+]
+(folder / "meta_decode.lst").write_text("\\n".join(decode_rows) + "\\n", encoding="utf-8")
+(folder / "meta_prefill.lst").write_text("\\n".join(prefill_rows) + "\\n", encoding="utf-8")
 print(reference.sample_id, soundfile.info(reference.ref_audio).duration)
 """
     output = subprocess.run(
@@ -148,8 +162,14 @@ def cell_workload(cell: str, meta: Path, warm: bool) -> tuple[int, list[str]]:
         return 1, ["--warmup", "0", "--meta", str(listing)]
     elif cell == "W3":
         return 16, ["--warmup", "1"]
-    else:
+    elif cell == "W4":
         return 64, ["--warmup", "1"]
+    elif cell == "W5":
+        listing = meta / ("meta_prefill.lst" if warm else "meta_decode.lst")
+        return MAX_BATCH, ["--warmup", "0", "--meta", str(listing)]
+    else:
+        listing = meta / ("meta_decode.lst" if warm else "meta_prefill.lst")
+        return MAX_BATCH, ["--warmup", "0", "--meta", str(listing), "--max-new-tokens", "1"]
 
 
 def capture_cell(cell: str, tree: str, port: int, meta: Path, out: Path, window_s: float) -> None:
