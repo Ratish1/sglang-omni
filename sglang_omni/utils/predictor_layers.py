@@ -77,9 +77,7 @@ MIN_BLOCK_M = 16
 # their head, exceed 255 registers per thread; a second program rereads the weights.
 MAX_FUSED_ROWS = 64
 NUM_WARPS = 4
-# note (ratish): the pinned Triton stages the scaled input once more for the head's
-# second dot; two warps per program absorb that at the 16-row block and spill past it
-# (255 registers, 130 spills and 20 against 11.5 us at 64 rows on H200).
+# note (ratish): the 16-row block runs faster on two warps; wider blocks spill there.
 QKV_SMALL_BLOCK_WARPS = 2
 NUM_STAGES = 3
 
