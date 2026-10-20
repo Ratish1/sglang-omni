@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# P6 (perf/qwen3-tts-predictor-triton-attention 28eec6850, stacked on V4 a6214172d: a Triton decode attention in place
-# of SDPA in the fused predictor layer, releasing o_proj to launch under programmatic dependent launch) against V4.
+# P6 (perf/qwen3-tts-predictor-triton-attention ce72dc3ca, stacked on V4 a6214172d: a Triton decode attention in place
+# of SDPA in the fused predictor layer, one program per row group and kv head on the tensor cores, releasing o_proj
+# after its store so o_proj launches under programmatic dependent launch) against V4.
 # P5 (the weight prefetch) is out of the stack: its predictor bench ran 3.0 to 3.6 % slower than V4 per step. The
 # predictor bench on both trees back to back (per kernel from a graph with PDL, and the step replay), the touched units
 # (Qwen3-TTS and the Qwen3-Omni predictor suites, which share the module), an unseeded c1 pair (the attention changes
@@ -12,7 +13,7 @@ T=${T:-/workspace/t_marks}
 IN=$T/tasks/qwen3-tts-perf/box/v3_20261020
 S=$T/tasks/omni_step_profiling_20260918/scripts
 V4=/workspace/v4_a6214172d
-P6=/workspace/p6_28eec6850
+P6=/workspace/p6_ce72dc3ca
 L=$D/queue.log
 echo "queue p6 start $(date +%T) v4 $(git -C $V4 rev-parse HEAD:sglang_omni) p6 $(git -C $P6 rev-parse HEAD:sglang_omni)" >> $L
 for TREE in $V4 $P6; do
