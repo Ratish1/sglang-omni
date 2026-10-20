@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import contextlib
-from collections import deque
 from collections.abc import Iterator
 from dataclasses import dataclass
 from types import SimpleNamespace
@@ -28,16 +27,31 @@ from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang_omni.models.qwen3_tts.model_runner import Qwen3TTSModelRunner
 from sglang_omni.scheduling.omni_scheduler import OmniScheduler
 
+HIDDEN = 2
+CODEBOOKS = 3
 
-class TinyModel(torch.nn.Module):
-    def __init__(self, hidden: int = 4) -> None:
+
+class FeedbackModel(torch.nn.Module):
+    def __init__(self) -> None:
         super().__init__()
-        self.p = torch.nn.Parameter(torch.zeros(hidden))
+        self.decode_feedback_embedding = torch.nn.Embedding(4, HIDDEN)
+        self.decode_feedback_embedding.weight.requires_grad_(False)
+        self.frame_weights = torch.nn.Parameter(
+            torch.arange(CODEBOOKS * HIDDEN, dtype=torch.float32).reshape(
+                CODEBOOKS, HIDDEN
+            ),
+            requires_grad=False,
+        )
+
+    def feedback_rows_from_codes(self, frame_codes: torch.Tensor) -> torch.Tensor:
+        return frame_codes.to(torch.float32) @ self.frame_weights
 
 
 def make_runner() -> Qwen3TTSModelRunner:
     runner = Qwen3TTSModelRunner.__new__(Qwen3TTSModelRunner)
-    runner.model = TinyModel()
+    runner.row_ids_cache = None
+    runner.model = FeedbackModel()
+    runner.feedback_pool = torch.zeros(8, HIDDEN)
     return runner
 
 
@@ -46,152 +60,82 @@ def make_sched_req(
     prompt: torch.Tensor,
     extend_len: int,
     prefix_len: int = 0,
-    history: list[torch.Tensor] | None = None,
-    pending_feedback: list[torch.Tensor] | None = None,
-    pending_text: list[torch.Tensor] | None = None,
+    frame_codes: list[list[int]] | None = None,
+    text_rows: torch.Tensor | None = None,
     rid: str = "req",
 ) -> SimpleNamespace:
     return SimpleNamespace(
+        request_id=rid,
         data=SimpleNamespace(
             req=SimpleNamespace(
                 rid=rid,
                 prefix_indices=list(range(prefix_len)),
                 extend_range=SimpleNamespace(length=extend_len),
+                origin_input_ids=list(range(prompt.shape[0])),
             ),
             prompt_input_embeds=prompt,
             prefill_input_embeds=prompt,
-            decode_input_embeds=list(history or []),
-            pending_feedback_queue=deque(pending_feedback or []),
-            pending_text_queue=deque(pending_text or []),
-            thinker_chunks_done=True,
-            tts_pad_embed=torch.zeros(prompt.shape[-1], dtype=prompt.dtype),
-        )
-    )
-
-
-def test_write_feedback_buffers_records_decode_input_history() -> None:
-    embedding = torch.nn.Embedding(4, 2)
-    runner = Qwen3TTSModelRunner.__new__(Qwen3TTSModelRunner)
-    runner.row_ids_cache = None
-    runner.model = SimpleNamespace(
-        decode_feedback_embedding=embedding,
-        get_input_embeddings=lambda: embedding,
-    )
-    sched_req = SimpleNamespace(
-        data=SimpleNamespace(
-            pending_feedback_queue=deque([torch.tensor([1.0, 2.0])]),
-            pending_text_queue=deque([torch.tensor([20.0, 30.0])]),
-            decode_input_embeds=[],
-            thinker_chunks_done=True,
-            tts_pad_embed=torch.zeros(2),
-        )
-    )
-    forward_batch = SimpleNamespace(input_ids=torch.tensor([99], dtype=torch.long))
-
-    runner.write_feedback_buffers(forward_batch, [sched_req])
-
-    assert len(sched_req.data.decode_input_embeds) == 1
-    assert torch.equal(
-        sched_req.data.decode_input_embeds[0],
-        torch.tensor([21.0, 32.0]),
-    )
-    assert torch.equal(embedding.weight[0].detach(), torch.tensor([21.0, 32.0]))
-    assert forward_batch.input_ids.tolist() == [0]
-    assert list(sched_req.data.pending_feedback_queue) == []
-    assert list(sched_req.data.pending_text_queue) == []
-
-
-def test_write_feedback_buffers_batches_text_and_pad_rows() -> None:
-    embedding = torch.nn.Embedding(4, 2)
-    with torch.no_grad():
-        embedding.weight.copy_(torch.arange(8, dtype=torch.float32).reshape(4, 2))
-    runner = Qwen3TTSModelRunner.__new__(Qwen3TTSModelRunner)
-    runner.row_ids_cache = None
-    runner.model = SimpleNamespace(
-        decode_feedback_embedding=embedding,
-        get_input_embeddings=lambda: embedding,
-    )
-
-    def data(feedback, text, pad):
-        return SimpleNamespace(
-            pending_feedback_queue=deque(feedback),
-            pending_text_queue=deque(text),
-            decode_input_embeds=[],
-            thinker_chunks_done=True,
-            tts_pad_embed=pad,
-        )
-
-    staged = SimpleNamespace(
-        data=data(
-            [torch.tensor([1.0, 2.0])], [torch.tensor([20.0, 30.0])], torch.zeros(2)
-        )
-    )
-    padded = SimpleNamespace(
-        data=data([torch.tensor([3.0, 4.0])], [], torch.tensor([0.5, 0.5]))
-    )
-    forward_batch = SimpleNamespace(input_ids=torch.tensor([9, 9], dtype=torch.long))
-
-    runner.write_feedback_buffers(forward_batch, [staged, padded])
-
-    expected = torch.tensor([[21.0, 32.0], [3.5, 4.5]])
-    assert torch.equal(embedding.weight[:2].detach(), expected)
-    for row_idx, sched_req in enumerate((staged, padded)):
-        assert len(sched_req.data.decode_input_embeds) == 1
-        assert torch.equal(sched_req.data.decode_input_embeds[0], expected[row_idx])
-    assert forward_batch.input_ids.tolist() == [0, 1]
-    assert list(staged.data.pending_feedback_queue) == []
-    assert list(staged.data.pending_text_queue) == []
-    assert list(padded.data.pending_feedback_queue) == []
-
-
-def test_write_feedback_buffers_rejects_a_row_without_queued_feedback() -> None:
-    runner = Qwen3TTSModelRunner.__new__(Qwen3TTSModelRunner)
-    runner.row_ids_cache = None
-    runner.model = SimpleNamespace(decode_feedback_embedding=torch.nn.Embedding(4, 2))
-    sched_req = SimpleNamespace(
-        request_id="req",
-        data=SimpleNamespace(
-            pending_feedback_queue=deque(),
-            pending_text_queue=deque([torch.tensor([40.0, 50.0])]),
-            decode_input_embeds=[],
-            thinker_chunks_done=True,
-            tts_pad_embed=torch.zeros(2),
+            output_codes=[torch.tensor(codes) for codes in frame_codes or []],
+            text_rows=(
+                torch.zeros(1, prompt.shape[-1]) if text_rows is None else text_rows
+            ),
         ),
     )
-    forward_batch = SimpleNamespace(input_ids=torch.tensor([3], dtype=torch.long))
 
-    with pytest.raises(RuntimeError, match="no queued feedback"):
-        runner.write_feedback_buffers(forward_batch, [sched_req])
+
+def test_decode_rows_add_each_slot_feedback_to_the_text_row_of_its_position() -> None:
+    runner = make_runner()
+    runner.feedback_pool[2] = torch.tensor([1.0, 2.0])
+    runner.feedback_pool[5] = torch.tensor([3.0, 4.0])
+    text_rows = torch.tensor([[10.0, 20.0], [30.0, 40.0], [0.5, 0.5]])
+    in_text = make_sched_req(
+        prompt=torch.zeros(4, HIDDEN), extend_len=0, text_rows=text_rows
+    )
+    past_text = make_sched_req(
+        prompt=torch.zeros(6, HIDDEN), extend_len=0, text_rows=text_rows, rid="late"
+    )
+    forward_batch = SimpleNamespace(
+        input_ids=torch.tensor([9, 9], dtype=torch.long),
+        req_pool_indices=torch.tensor([2, 5]),
+        seq_lens_cpu=torch.tensor([4 + 2, 6 + 7]),
+    )
+
+    runner.write_feedback_buffers(forward_batch, [in_text, past_text])
+
+    assert torch.equal(
+        runner.model.decode_feedback_embedding.weight[:2],
+        torch.tensor([[31.0, 42.0], [3.5, 4.5]]),
+    )
+    assert forward_batch.input_ids.tolist() == [0, 1]
 
 
 def test_reprefill_after_retract_replays_prompt_plus_generated() -> None:
     # note (Richard Wang): 460 plus 134 is the #1555 594 vs 460 mismatch
-    prompt_len, generated_len, hidden = 460, 134, 4
-    prompt = torch.arange(prompt_len * hidden, dtype=torch.float32).reshape(
-        prompt_len, hidden
+    prompt_len, generated_len = 460, 134
+    prompt = torch.arange(prompt_len * HIDDEN, dtype=torch.float32).reshape(
+        prompt_len, HIDDEN
     )
-    history = [
-        torch.full((hidden,), float(1000 + i), dtype=torch.float32)
-        for i in range(generated_len - 1)
-    ]
-    leftover = torch.full((hidden,), 2000.0, dtype=torch.float32)
+    frame_codes = [[step, step + 1, step + 2] for step in range(generated_len)]
+    text_rows = torch.tensor([[100.0, 200.0], [300.0, 400.0], [0.0, 0.0]])
+    runner = make_runner()
     extend_len = prompt_len + generated_len
     sched_req = make_sched_req(
         prompt=prompt,
         extend_len=extend_len,
-        history=history,
-        pending_feedback=[leftover],
+        frame_codes=frame_codes,
+        text_rows=text_rows,
     )
     forward_batch = SimpleNamespace(input_ids=torch.zeros(extend_len, dtype=torch.long))
 
-    out = make_runner().build_prefill_input_embeds(forward_batch, [sched_req])
+    out = runner.build_prefill_input_embeds(forward_batch, [sched_req])
 
+    feedback_rows = runner.model.feedback_rows_from_codes(torch.tensor(frame_codes))
     assert out.shape[0] == extend_len
     assert torch.equal(out[:prompt_len], prompt)
-    assert torch.equal(out[prompt_len:-1], torch.stack(history))
-    assert torch.equal(out[-1], leftover)
-    assert list(sched_req.data.pending_feedback_queue) == []
-    assert len(sched_req.data.decode_input_embeds) == generated_len
+    assert torch.equal(
+        out[prompt_len : prompt_len + 2], feedback_rows[:2] + text_rows[:2]
+    )
+    assert torch.equal(out[prompt_len + 2 :], feedback_rows[2:] + text_rows[2])
 
 
 def test_reprefill_restores_retained_repetition_penalty_history() -> None:
@@ -263,111 +207,78 @@ def test_reprefill_restores_retained_repetition_penalty_history() -> None:
     assert torch.equal(logits[2], original_logits[2])
 
 
-def test_reprefill_replays_prompt_tail_and_generated_tail() -> None:
+@pytest.mark.parametrize(
+    ("prefix_len", "extend_len", "replayed_frames"),
+    [(8, 5, slice(0, 3)), (11, 2, slice(1, 3))],
+)
+def test_reprefill_replays_the_frames_of_its_extend_window(
+    prefix_len: int, extend_len: int, replayed_frames: slice
+) -> None:
     prompt = torch.arange(20, dtype=torch.float32).reshape(10, 2)
-    history = [
-        torch.tensor([100.0, 101.0]),
-        torch.tensor([200.0, 201.0]),
-        torch.tensor([300.0, 301.0]),
-    ]
-    sched_req = make_sched_req(
-        prompt=prompt, prefix_len=8, extend_len=5, history=history
-    )
-    forward_batch = SimpleNamespace(input_ids=torch.zeros(5, dtype=torch.long))
-
-    out = make_runner().build_prefill_input_embeds(forward_batch, [sched_req])
-
-    expected = torch.cat([prompt[8:10], torch.stack(history)], dim=0)
-    assert torch.equal(out, expected)
-
-
-def test_reprefill_drains_leftover_feedback_when_history_is_short() -> None:
-    prompt = torch.arange(8, dtype=torch.float32).reshape(4, 2)
-    history = [torch.tensor([10.0, 11.0])]
+    frame_codes = [[1, 0, 0], [0, 1, 0], [0, 0, 1]]
+    runner = make_runner()
     sched_req = make_sched_req(
         prompt=prompt,
-        extend_len=6,
-        history=history,
-        pending_feedback=[torch.tensor([3.0, 4.0])],
-        pending_text=[torch.tensor([30.0, 40.0])],
+        prefix_len=prefix_len,
+        extend_len=extend_len,
+        frame_codes=frame_codes,
     )
-    forward_batch = SimpleNamespace(input_ids=torch.zeros(6, dtype=torch.long))
+    forward_batch = SimpleNamespace(input_ids=torch.zeros(extend_len, dtype=torch.long))
 
-    out = make_runner().build_prefill_input_embeds(forward_batch, [sched_req])
+    out = runner.build_prefill_input_embeds(forward_batch, [sched_req])
 
     expected = torch.cat(
         [
-            prompt,
-            torch.stack([torch.tensor([10.0, 11.0]), torch.tensor([33.0, 44.0])]),
+            prompt[prefix_len:],
+            runner.model.feedback_rows_from_codes(
+                torch.tensor(frame_codes[replayed_frames])
+            ),
         ],
         dim=0,
     )
     assert torch.equal(out, expected)
-    assert len(sched_req.data.decode_input_embeds) == 2
-    assert list(sched_req.data.pending_feedback_queue) == []
-    assert list(sched_req.data.pending_text_queue) == []
 
 
-def test_reprefill_without_generated_history_fails_loudly() -> None:
-    prompt = torch.randn(460, 4)
-    sched_req = make_sched_req(prompt=prompt, extend_len=594)
-    forward_batch = SimpleNamespace(input_ids=torch.zeros(594, dtype=torch.long))
+def test_reprefill_without_its_committed_frames_fails_loudly() -> None:
+    prompt = torch.zeros(4, HIDDEN)
+    sched_req = make_sched_req(prompt=prompt, extend_len=7, frame_codes=[[1, 2, 3]])
+    forward_batch = SimpleNamespace(input_ids=torch.zeros(7, dtype=torch.long))
 
-    with pytest.raises(RuntimeError, match="missing feedback/text input embeds"):
+    with pytest.raises(RuntimeError, match="prefill embed mismatch"):
         make_runner().build_prefill_input_embeds(forward_batch, [sched_req])
 
 
-def test_decode_then_retract_reprefill_roundtrip() -> None:
-    """N completed decodes leave G=N+1 tokens: history N plus one queued row."""
-    hidden, prompt_len, n_decode = 2, 8, 3
-    prompt = torch.arange(prompt_len * hidden, dtype=torch.float32).reshape(
-        prompt_len, hidden
+def test_a_replayed_row_equals_the_row_its_decode_staged() -> None:
+    prompt_len = 4
+    frame_codes = [[2, 1, 0], [0, 3, 1], [1, 1, 1]]
+    runner = make_runner()
+    sched_req = make_sched_req(
+        prompt=torch.zeros(prompt_len, HIDDEN),
+        extend_len=0,
+        text_rows=torch.tensor([[10.0, 20.0], [0.0, 0.0]]),
     )
-
-    class Model(torch.nn.Module):
-        def __init__(self) -> None:
-            super().__init__()
-            self.decode_feedback_embedding = torch.nn.Embedding(8, hidden)
-            self.embed = torch.nn.Embedding(8, hidden)
-
-        def get_input_embeddings(self):
-            return self.embed
-
-    runner = Qwen3TTSModelRunner.__new__(Qwen3TTSModelRunner)
-    runner.row_ids_cache = None
-    runner.model = Model()
-    generated = n_decode + 1
-    sched_req = make_sched_req(prompt=prompt, extend_len=prompt_len)
-    decode_batch = SimpleNamespace(input_ids=torch.tensor([99], dtype=torch.long))
-    for step in range(n_decode):
-        sched_req.data.pending_feedback_queue.append(
-            torch.full((hidden,), float(step + 1), dtype=torch.float32)
+    staged_rows = []
+    for step, codes in enumerate(frame_codes):
+        sched_req.data.output_codes.append(torch.tensor(codes))
+        runner.feedback_pool[3] = runner.model.feedback_rows_from_codes(
+            torch.tensor([codes])
+        )[0]
+        decode_batch = SimpleNamespace(
+            input_ids=torch.zeros(1, dtype=torch.long),
+            req_pool_indices=torch.tensor([3]),
+            seq_lens_cpu=torch.tensor([prompt_len + step + 1]),
         )
-        sched_req.data.pending_text_queue.append(torch.zeros(hidden))
         runner.write_feedback_buffers(decode_batch, [sched_req])
+        staged_rows.append(runner.model.decode_feedback_embedding.weight[0].clone())
 
-    leftover = torch.full((hidden,), float(generated), dtype=torch.float32)
-    sched_req.data.pending_feedback_queue.append(leftover)
-    sched_req.data.pending_text_queue.append(torch.zeros(hidden))
-    assert len(sched_req.data.decode_input_embeds) == n_decode
-    assert len(sched_req.data.pending_feedback_queue) == 1
-
-    sched_req.data.req.prefix_indices = []
-    sched_req.data.req.extend_range = SimpleNamespace(length=prompt_len + generated)
+    replayed_length = prompt_len + len(frame_codes)
+    sched_req.data.req.extend_range = SimpleNamespace(length=replayed_length)
     prefill_batch = SimpleNamespace(
-        input_ids=torch.zeros(prompt_len + generated, dtype=torch.long)
+        input_ids=torch.zeros(replayed_length, dtype=torch.long)
     )
     out = runner.build_prefill_input_embeds(prefill_batch, [sched_req])
 
-    assert out.shape[0] == prompt_len + generated
-    assert torch.equal(out[:prompt_len], prompt)
-    assert torch.equal(
-        out[prompt_len:-1],
-        torch.stack([torch.full((hidden,), float(i + 1)) for i in range(n_decode)]),
-    )
-    assert torch.equal(out[-1], leftover)
-    assert list(sched_req.data.pending_feedback_queue) == []
-    assert len(sched_req.data.decode_input_embeds) == generated
+    assert torch.equal(out[prompt_len:], torch.stack(staged_rows))
 
 
 def test_fresh_prefill_still_uses_prompt_only_buffer() -> None:

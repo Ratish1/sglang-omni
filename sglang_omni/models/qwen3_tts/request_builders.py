@@ -38,7 +38,6 @@ from sglang_omni.sampling.seed import (
     new_random_sampling_seed,
 )
 from sglang_omni.scheduling.message import OutgoingMessage
-from sglang_omni.scheduling.pending_text_queue import PendingTextTensorQueue
 from sglang_omni.scheduling.reference_encoder import (
     KeyedReferenceEncodeHook,
     ReferenceEncodeService,
@@ -166,6 +165,9 @@ class Qwen3TTSSGLangRequestData(SGLangARRequestData):
     subtalker_sampling_seed: int = field(default_factory=new_qwen3_tts_sampling_seed)
     engine_start_s: float = 0.0
     decode_prep_epoch: int | None = None
+    # note (ratish): the trailing text rows then the pad row; decode step k reads row k - 1,
+    # or the pad once past the text.
+    text_rows: torch.Tensor | None = None
 
 
 @dataclass
@@ -1832,11 +1834,10 @@ def build_sglang_qwen3_tts_request(
         # leading pause continues the reference's trailing pause.
         mask_leading_silence=state.x_vector_only_mode,
         engine_start_s=time.perf_counter(),
+        text_rows=torch.cat(
+            (prepared.trailing_text_hidden, prepared.tts_pad_embed.reshape(1, -1))
+        ),
     )
-    data.pending_text_queue = PendingTextTensorQueue.from_tensor(
-        prepared.trailing_text_hidden
-    )
-    data.tts_pad_embed = prepared.tts_pad_embed
     data.input_embeds_are_projected = True
     data.stage_payload = payload
     return data

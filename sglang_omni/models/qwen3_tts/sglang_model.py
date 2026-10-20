@@ -1739,6 +1739,26 @@ class Qwen3TTSTalker(Qwen3TTSPromptBuilderMixin, nn.Module):
         result = graph.replay(layer0_codes, talker_hidden, semantic_positions)
         return result
 
+    def feedback_rows_from_codes(self, frame_codes: torch.Tensor) -> torch.Tensor:
+        """The feedback rows the predictor summed for (frames, codebooks) codes, added in
+        its order and dtype, so each equals the row its frame fed back."""
+        predictor_dtype = self.predictor_k_cache.dtype
+        feedback_rows = torch.zeros(
+            frame_codes.shape[0],
+            self.output_embeds.shape[-1],
+            device=frame_codes.device,
+            dtype=self.output_embeds.dtype,
+        )
+        feedback_rows.add_(
+            self.get_input_embeddings()(frame_codes[:, 0]).to(dtype=predictor_dtype)
+        )
+        residual_rows = self.code_predictor.model.codec_embedding(
+            frame_codes[:, 1:]
+        ).to(dtype=predictor_dtype)
+        for codebook_index in range(residual_rows.shape[1]):
+            feedback_rows.add_(residual_rows[:, codebook_index])
+        return feedback_rows
+
     def code_predictor_forward_incremental(
         self,
         layer0_codes: torch.Tensor,

@@ -3,8 +3,9 @@
 
 The layer 0 token id is the only value the host reads from a step, so its
 pinned copy is enqueued before the predictor and the finalize wait returns
-while the predictor still runs. The code and feedback rows keep coming from a
-snapshot taken behind the predictor. The runner is sync only: its collect has
+while the predictor still runs. The code rows keep coming from a snapshot taken
+behind the predictor, and each slot's feedback row is written right after it.
+The runner is sync only: its collect has
 no launch and resolve halves, so it never takes the lookahead path.
 """
 
@@ -40,6 +41,7 @@ def make_runner(code_predictor_forward, device: torch.device) -> Qwen3TTSModelRu
         output_codes=torch.zeros((4, 3), dtype=torch.long, device=device),
         output_embeds=torch.zeros((4, 2), device=device),
     )
+    runner.feedback_pool = torch.zeros((8, 2), device=device)
     return runner
 
 
@@ -54,6 +56,7 @@ def step(ids: torch.Tensor):
     forward_batch = SimpleNamespace(
         forward_mode=SimpleNamespace(is_decode=lambda: True),
         positions=torch.full((batch_size,), 3, dtype=torch.long, device=ids.device),
+        req_pool_indices=torch.tensor([5, 2, 7][:batch_size], device=ids.device),
     )
     requests = [
         SimpleNamespace(
@@ -85,6 +88,11 @@ def test_collect_codes_stages_the_ids_before_the_predictor_runs():
 
     assert len(staged_when_called) == 1
     assert staged_when_called[0] is ids
+    assert runner.feedback_pool[[5, 2, 7]].tolist() == [
+        [7.0, 7.0],
+        [42.0, 42.0],
+        [9.0, 9.0],
+    ]
 
     outputs = {
         req.request_id: RequestOutput(req.request_id, data=int(ids[row]))
@@ -95,11 +103,8 @@ def test_collect_codes_stages_the_ids_before_the_predictor_runs():
     runner.model.output_embeds.zero_()
 
     assert [c.tolist() for c in requests[0].data.output_codes] == [[7, 8, 9]]
-    assert requests[0].data.pending_feedback_queue[0].tolist() == [7.0, 7.0]
     assert requests[1].data.output_codes == []
-    assert len(requests[1].data.pending_feedback_queue) == 0
     assert [c.tolist() for c in requests[2].data.output_codes] == [[9, 10, 11]]
-    assert requests[2].data.pending_feedback_queue[0].tolist() == [9.0, 9.0]
 
 
 def test_a_middle_prefill_chunk_adds_no_frame_feedback_or_stream_chunk():
@@ -120,7 +125,6 @@ def test_a_middle_prefill_chunk_adds_no_frame_feedback_or_stream_chunk():
     runner.post_process_outputs(result, SimpleNamespace(requests=requests), outputs)
 
     assert requests[0].data.output_codes == []
-    assert len(requests[0].data.pending_feedback_queue) == 0
     assert requests[0].data.latest_stream_code_chunk is None
     assert [c.tolist() for c in requests[1].data.output_codes] == [[9, 10, 11]]
     assert requests[1].data.latest_stream_code_chunk is not None

@@ -381,6 +381,30 @@ def test_missing_embedding_buffer_uses_original_graph_path():
     assert torch.equal(fused_embeds, fallback_embeds)
 
 
+@pytest.mark.accelerator
+@pytest.mark.parametrize("batch_size", [1, 4, 16])
+def test_feedback_rows_rebuilt_from_codes_equal_the_predictor_sum(batch_size: int):
+    device = torch.device("cuda")
+    graph_talker = build_talker(device)
+    unfused_talker = build_talker(device)
+    graph_talker.prepare_decode_buffers(uniform_requests(batch_size))
+    unfused_talker.prepare_decode_buffers(uniform_requests(batch_size))
+    object.__delattr__(unfused_talker, "predictor_embedding_buffer")
+    layer0, hidden, positions = step_inputs(batch_size, device)
+
+    graph_codes, graph_embeds = run_forward(graph_talker, layer0, hidden, positions)
+    eager_codes, eager_embeds = run_eager(unfused_talker, layer0, hidden, positions)
+
+    assert torch.equal(
+        graph_talker.feedback_rows_from_codes(graph_codes[:, :, 0]),
+        graph_embeds[:, 0],
+    )
+    assert torch.equal(
+        unfused_talker.feedback_rows_from_codes(eager_codes[:, :, 0]),
+        eager_embeds[:, 0],
+    )
+
+
 def with_projected_tables(talker: Qwen3TTSTalker) -> Qwen3TTSTalker:
     device = talker.predictor_k_cache.device
     talker.predictor_projected_embeddings = torch.empty(
