@@ -1,4 +1,4 @@
-# 🚀 Installation — Intel CPU
+# Installation — Intel CPU
 
 Installs `sglang-omni` for **CPU-only inference**. The default
 [installation](./installation.md) targets CUDA, so this path uses the separate
@@ -56,7 +56,7 @@ Install the matching CPU SGLang build:
 ```bash
 git clone https://github.com/sgl-project/sglang ../sglang
 cd ../sglang
-git checkout v0.5.20
+git checkout v0.5.21
 
 cd python
 cp pyproject_cpu.toml pyproject.toml

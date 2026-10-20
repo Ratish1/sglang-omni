@@ -9,7 +9,6 @@ from copy import copy
 from typing import TYPE_CHECKING, Iterable, Optional, Sequence, Tuple
 
 import torch
-from sglang.srt.distributed import get_pp_group, get_tensor_model_parallel_world_size
 from sglang.srt.layers.logits_processor import (
     LogitsMetadata,
     LogitsProcessor,
@@ -28,7 +27,7 @@ from sglang.srt.model_executor.forward_batch_info import (
 )
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.qwen3 import Qwen3Model
-from sglang.srt.runtime_context import get_schedule
+from sglang.srt.runtime_context import get_parallel, get_schedule
 from sglang.srt.utils import add_prefix
 from transformers import PretrainedConfig, Qwen3Config
 
@@ -43,6 +42,10 @@ from sglang_omni.models.moss_tts.sampling_cuda_graph import (
     MossTTSDelaySamplingCudaGraphRunner,
 )
 from sglang_omni.platforms import current_platform
+from sglang_omni.sampling.sampler_compile import (
+    SamplerCompileForms,
+    compile_sampler_functions,
+)
 
 if TYPE_CHECKING:
     from sglang_omni.models.moss_tts.request_builders import MossTTSSGLangRequestData
@@ -105,7 +108,7 @@ class MossTTSDelaySGLangModel(torch.nn.Module):
         prefix: str = "",
     ) -> None:
         super().__init__()
-        self.pp_group = get_pp_group()
+        self.pp_group = get_parallel().pp_group
         self.config = self.normalize_config(config)
         self.quant_config = quant_config
         self.hidden_size = int(self.config.hidden_size)
@@ -299,7 +302,11 @@ class MossTTSDelaySGLangModel(torch.nn.Module):
             dtype=weight.dtype,
         )
         for idx, embed_layer in enumerate(self.embedding_list):
-            embeds = embeds + embed_layer(input_ids_2d[:, idx])
+            channel_embeddings = embed_layer(input_ids_2d[:, idx])
+            if embeds.dtype == channel_embeddings.dtype:
+                embeds.add_(channel_embeddings)
+            else:
+                embeds = embeds + channel_embeddings
         return embeds
 
     @torch.no_grad()
@@ -457,7 +464,7 @@ class MossTTSDelaySGLangModel(torch.nn.Module):
             first is not None
             and first.ndim == 2
             and first.dtype in (torch.bfloat16, torch.float16, torch.float32)
-            and get_tensor_model_parallel_world_size() == 1
+            and get_parallel().tp_size == 1
             and getattr(self.config, "final_logit_softcapping", None) in (None, 0)
             and all(
                 type(head).__name__ == "ParallelLMHead" for head in self.lm_heads[1:]
@@ -806,6 +813,17 @@ class MossTTSDelaySGLangModel(torch.nn.Module):
             - 1
         )
         return hidden_states[last_index]
+
+    def precompile_kernels_after_loading(self) -> None:
+        """Compile the seeded draw every request's eager text step reaches, on float32
+        scores."""
+        compile_sampler_functions(
+            SamplerCompileForms(
+                device=self.device,
+                vocab_size=int(self.config.vocab_size_list[0]),
+                seeded_log_probability_dtype=torch.float32,
+            )
+        )
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> None:
         stacked_params_mapping = [
