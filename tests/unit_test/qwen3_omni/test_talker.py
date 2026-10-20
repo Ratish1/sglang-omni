@@ -892,31 +892,31 @@ def thinker_token(token_id: int) -> SimpleNamespace:
     return SimpleNamespace(metadata={"token_id": token_id})
 
 
-def test_a_finished_reply_of_one_spoken_token_is_not_generated() -> None:
-    """Its talker would never sample codec EOS, so the reply passes on without audio."""
+def test_a_finished_reply_without_spoken_tokens_is_not_generated() -> None:
+    """A reply of im_end alone passes on without audio; one spoken token is generated."""
     scheduler = fresh_partial_scheduler()
     scheduler.im_end_token_id = 99
     adapter = Mock()
     scheduler.session_bridge = SimpleNamespace(adapter=adapter)
-    one_token = StagePayload(request_id="r0", request=OmniRequest(inputs=[]), data={})
-    one_token.prefetched_chunks = [thinker_token(5), thinker_token(99)]
-    one_token.prefetched_stream_done = True
-    assert scheduler.complete_without_generation(one_token, None).data == {
+    no_token = StagePayload(request_id="r0", request=OmniRequest(inputs=[]), data={})
+    no_token.prefetched_chunks = [thinker_token(99)]
+    no_token.prefetched_stream_done = True
+    assert scheduler.complete_without_generation(no_token, None).data == {
         NO_SPEECH: True
     }
     unit = SimpleNamespace(session_identity="session", chunk="unit-chunk")
     assert (
-        scheduler.complete_without_generation(one_token, unit)
+        scheduler.complete_without_generation(no_token, unit)
         is adapter.complete_without_generation.return_value
     )
     adapter.complete_without_generation.assert_called_once_with(
-        "session", "unit-chunk", one_token
+        "session", "unit-chunk", no_token
     )
-    two_tokens = make_payload(
-        prefetched_chunks=[thinker_token(5), thinker_token(6), thinker_token(99)],
+    one_token = make_payload(
+        prefetched_chunks=[thinker_token(5), thinker_token(99)],
         prefetched_stream_done=True,
     )
-    assert scheduler.complete_without_generation(two_tokens, None) is None
+    assert scheduler.complete_without_generation(one_token, None) is None
     unfinished = make_payload(prefetched_chunks=[thinker_token(5)])
     assert scheduler.complete_without_generation(unfinished, None) is None
 
