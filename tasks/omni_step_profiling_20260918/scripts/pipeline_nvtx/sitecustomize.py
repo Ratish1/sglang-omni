@@ -541,13 +541,15 @@ def patch_vocoder(module):
         scheduler.run_followup_batch,
         lambda self, batch: f"voc.followup rows={len(batch)}",
     )
-    scheduler.decode_incremental_group = ranged(
-        scheduler.decode_incremental_group,
+    scheduler.decode_group = ranged(
+        scheduler.decode_group,
         lambda self, group, **kwargs: f"voc.group rows={len(group)}",
     )
     scheduler.launch_incremental_group = ranged(
         scheduler.launch_incremental_group,
-        lambda self, group, **kwargs: f"voc.launch rows={len(group)}",
+        lambda self, group, **kwargs: (
+            f"voc.launch rows={len(group)} tail={int(kwargs.get('tail_runner') is not None)}"
+        ),
     )
     scheduler.finish_incremental_group = ranged(
         scheduler.finish_incremental_group, fixed("voc.finish")
