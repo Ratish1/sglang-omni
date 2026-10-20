@@ -10,6 +10,8 @@ from collections.abc import Callable
 from typing import TYPE_CHECKING
 
 import torch
+from sglang.srt.arg_groups.model_override_base import resolved_view
+from sglang.srt.model_executor.cuda_graph_config import Phase, with_phase
 from sglang.srt.server_args import ServerArgs
 
 from sglang_omni.model_runner.model_worker import ModelWorker
@@ -30,9 +32,13 @@ from sglang_omni.scheduling.engine_factory import (
     SchedulerExtras,
     TtsEngineBuilder,
 )
-from sglang_omni.scheduling.generation_batch_policy import CudaGraphBackend
+from sglang_omni.scheduling.generation_batch_policy import (
+    CudaGraphBackend,
+    nested_prefill_overrides,
+)
 from sglang_omni.scheduling.sglang_backend.output_processor import SGLangOutputProcessor
 from sglang_omni.utils.checkpoint import resolve_checkpoint as _resolve_checkpoint
+from sglang_omni.vendor.sglang.server_args import override_server_args
 
 if TYPE_CHECKING:
 
@@ -131,6 +137,29 @@ class FunCosyVoice3EngineBuilder(TtsEngineBuilder[CosyVoice3SGLangRequestData]):
             ),
             "trust_remote_code": True,
         }
+
+    def customize_server_args(self, server_args: ServerArgs) -> None:
+        graph_config = resolved_view(server_args).cuda_graph_config
+        prefill = graph_config.prefill
+        # note (ratish): a prompt the radix cache holds re-prefills only its last token,
+        # which the ladder's first bucket of 4 pads past twice its size and runs eagerly;
+        # every eager prefill measured at c16 and c64 was such a one-token batch.
+        if (
+            prefill.backend in (CudaGraphBackend.BREAKABLE, CudaGraphBackend.FULL)
+            and prefill.bs
+            and prefill.bs[0] != 1
+            and self.server_args_overrides.get("cuda_graph_bs_prefill") is None
+            and "bs" not in nested_prefill_overrides(self.server_args_overrides)
+        ):
+            override_server_args(
+                server_args,
+                "fun_cosyvoice3.prefill_cuda_graph_shape",
+                cuda_graph_config=with_phase(
+                    graph_config, Phase.PREFILL, bs=[1, *prefill.bs]
+                ),
+            )
+        else:
+            pass
 
     def adjust_overrides(self, overrides: dict[str, Any]) -> None:
         # Note (Jiaxin Deng): the fraction alone sized a 62 GB pool on an
