@@ -127,6 +127,7 @@ def test_cosyvoice3_reference_encoders_pin_onnx_providers(
         SessionOptions=SessionOptions,
         GraphOptimizationLevel=types.SimpleNamespace(ORT_ENABLE_ALL=99),
         InferenceSession=fake_session,
+        get_available_providers=lambda: ["CPUExecutionProvider"],
     )
     monkeypatch.setitem(sys.modules, "onnxruntime", fake_onnxruntime)
 
@@ -136,19 +137,59 @@ def test_cosyvoice3_reference_encoders_pin_onnx_providers(
 
     assert captured == [
         [
-            (
-                "CUDAExecutionProvider",
-                {
-                    "cudnn_conv_algo_search": "HEURISTIC",
-                    "use_ep_level_unified_stream": "1",
-                },
-            ),
+            ("CUDAExecutionProvider", {"cudnn_conv_algo_search": "HEURISTIC"}),
             "CPUExecutionProvider",
         ],
         ["CPUExecutionProvider"],
         ["CPUExecutionProvider"],
     ]
     assert session_configs == [{}, {}, {"session.intra_op.allow_spinning": "0"}]
+
+
+@pytest.mark.accelerator
+def test_cuda_speech_tokenizer_runs_on_a_top_priority_stream(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: list[list[str | tuple[str, dict[str, str]]]] = []
+
+    def fake_session(
+        model_path: str,
+        sess_options: types.SimpleNamespace,
+        providers: list[str | tuple[str, dict[str, str]]],
+    ) -> types.SimpleNamespace:
+        captured.append(providers)
+        return types.SimpleNamespace(get_providers=lambda: ["CPUExecutionProvider"])
+
+    monkeypatch.setitem(
+        sys.modules,
+        "onnxruntime",
+        types.SimpleNamespace(
+            SessionOptions=types.SimpleNamespace,
+            GraphOptimizationLevel=types.SimpleNamespace(ORT_ENABLE_ALL=99),
+            InferenceSession=fake_session,
+            get_available_providers=lambda: [
+                "CUDAExecutionProvider",
+                "CPUExecutionProvider",
+            ],
+        ),
+    )
+
+    tokenizer = utils.SpeechTokenizerV3("speech_tokenizer_v3.onnx", device="cuda:0")
+
+    assert tokenizer.compute_stream is not None
+    assert tokenizer.compute_stream.priority == torch.cuda.Stream.priority_range()[1]
+    assert captured == [
+        [
+            (
+                "CUDAExecutionProvider",
+                {
+                    "cudnn_conv_algo_search": "HEURISTIC",
+                    "user_compute_stream": str(tokenizer.compute_stream.cuda_stream),
+                },
+            ),
+            "CPUExecutionProvider",
+        ]
+    ]
 
 
 @pytest.mark.parametrize("is_on_cuda", [True, False])
@@ -196,6 +237,7 @@ def test_speech_tokenizer_on_cuda_runs_its_longest_input_first_and_one_at_a_time
             InferenceSession=lambda model_path, sess_options, providers: (
                 GatedSession()
             ),
+            get_available_providers=lambda: ["CPUExecutionProvider"],
         ),
     )
     monkeypatch.setitem(
