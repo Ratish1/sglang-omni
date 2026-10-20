@@ -1314,6 +1314,24 @@ class Qwen3OmniTalker(nn.Module):
             positions = forward_batch.mrope_positions.contiguous()
         else:
             positions = forward_batch.positions
+        self.position_log_count = getattr(self, "position_log_count", 0) + 1
+        if forward_batch.forward_mode.is_extend() or self.position_log_count <= 400:
+            window = positions[..., :3].tolist(), positions[..., -3:].tolist()
+            logger.info(
+                "talker positions mode=%s dims=%d carried_mrope=%s seq_lens=%s first=%s last=%s",
+                forward_batch.forward_mode.name,
+                positions.dim(),
+                forward_batch.mrope_positions is not None,
+                (
+                    forward_batch.seq_lens_cpu.tolist()[:8]
+                    if forward_batch.seq_lens_cpu is not None
+                    else None
+                ),
+                window[0],
+                window[1],
+            )
+        else:
+            pass
 
         hidden_states = self.model(
             input_ids=input_ids,
