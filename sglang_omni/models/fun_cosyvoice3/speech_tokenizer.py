@@ -153,8 +153,8 @@ class SpeechTokenizerBlock(torch.nn.Module):
 
 
 class SpeechTokenizerV3Model(torch.nn.Module):
-    """The tokenizer's encoder and FSQ code, exact for the first frames of a mel
-    whatever fills the rest of its width."""
+    """The tokenizer's encoder and FSQ code, masked so nothing past a mel's first
+    frames reaches their codes."""
 
     def __init__(
         self,
@@ -272,6 +272,11 @@ class SpeechTokenizerCudaGraphs:
         self.graphs: dict[int, CapturedTokenizerGraph] = {}
         pool = torch.cuda.graph_pool_handle()
         stream = torch.cuda.Stream(device)
+        # note (ratish): TF32 matmuls, as ONNX Runtime ran this graph; full fp32 took
+        # 2.6 times the device time and slowed the vocoder beside it. The graphs keep
+        # the math mode they are captured with, and the process keeps its own.
+        allow_tf32 = torch.backends.cuda.matmul.allow_tf32
+        torch.backends.cuda.matmul.allow_tf32 = True
         with torch.inference_mode():
             for width in reversed(self.widths):
                 mel = torch.zeros(1, model.conv1.in_channels, width, device=device)
@@ -286,6 +291,7 @@ class SpeechTokenizerCudaGraphs:
                 self.graphs[width] = CapturedTokenizerGraph(
                     graph=graph, mel=mel, frames=frames, codes=codes
                 )
+        torch.backends.cuda.matmul.allow_tf32 = allow_tf32
         torch.cuda.synchronize(device)
 
     def tokenize(self, mel: torch.Tensor) -> list[int]:

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import bisect
 import gc
 import weakref
 
@@ -36,17 +37,27 @@ def test_codes_of_a_mel_ignore_what_fills_its_padded_width() -> None:
 
 
 @pytest.mark.accelerator
-def test_graph_replays_match_the_eager_model_at_the_mel_width() -> None:
+def test_graph_replays_match_the_tf32_model_at_their_width(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     device = torch.device("cuda")
     model = small_model().to(device)
+    monkeypatch.setattr(torch.backends.cuda.matmul, "allow_tf32", False)
     graphs = SpeechTokenizerCudaGraphs(model, device)
+    assert not torch.backends.cuda.matmul.allow_tf32
+    torch.backends.cuda.matmul.allow_tf32 = True
 
     for frames in (300, 290, 37):
         mel = torch.randn(1, 128, frames)
+        width = graphs.widths[bisect.bisect_left(graphs.widths, frames)]
+        padded = torch.cat((mel, torch.zeros(1, 128, width - frames)), dim=2)
         with torch.inference_mode():
-            expected = model(mel.to(device), torch.tensor([frames], device=device))
+            expected = model(padded.to(device), torch.tensor([frames], device=device))
 
-        assert graphs.tokenize(mel) == expected[0].tolist()
+        assert (
+            graphs.tokenize(mel)
+            == expected[0, : conv_frames(conv_frames(frames))].tolist()
+        )
 
 
 @pytest.mark.accelerator
