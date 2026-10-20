@@ -78,6 +78,7 @@ from sglang_omni.profiler.event_recorder import (
     emit_model_path_start as _emit_model_path_start,
 )
 from sglang_omni.profiler.event_recorder import get_active_stage as _get_active_stage
+from sglang_omni.profiler.step_phases import STEP_PHASES, batch_kind
 from sglang_omni.proto.admin import (
     ADMIN_CONTINUE_GENERATION,
     ADMIN_DESTROY_WEIGHTS_UPDATE_GROUP,
@@ -3378,7 +3379,12 @@ class OmniScheduler(Generic[RequestDataT]):
         # AR scheduler loop pins the GIL and the audio_encoder forward pass
         # (which is mostly Python-side dispatch into many small CUDA kernels)
         # slows ~600x, dropping audio QPS from >10 to <0.5.
+        meter = STEP_PHASES
         while self.running:
+            if meter is not None:
+                meter.begin()
+            else:
+                pass
             self.process_admin_requests()
             recv_reqs = self.recv_requests()
             recv_reqs.extend(self.take_deferred_request_payloads())
@@ -3389,24 +3395,50 @@ class OmniScheduler(Generic[RequestDataT]):
                 continue
             else:
                 pass
+            if meter is not None:
+                meter.mark("recv")
+            else:
+                pass
 
             batch = self.get_next_batch_to_run()
             self.cur_batch = batch
+            if meter is not None:
+                kind = batch_kind(batch)
+                batch_size = len(batch.reqs) if batch else 0
+                meter.mark("pick")
+            else:
+                pass
 
             if batch:
                 result = self.run_batch(batch)
+                if meter is not None:
+                    meter.mark("run")
+                else:
+                    pass
                 if result is not _FAILED_BATCH_RESULT:
                     self.process_batch_result(batch, result)
+                    if meter is not None:
+                        meter.mark("result")
+                    else:
+                        pass
                 else:
                     pass
             else:
                 self._sched_idled = True  # noqa: leading-underscore
                 self.self_check_during_idle()
                 self.sleep_during_idle()
+                if meter is not None:
+                    meter.mark("idle")
+                else:
+                    pass
 
             self.last_batch = batch
             if envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.get():
                 self.self_check_during_busy()
+            else:
+                pass
+            if meter is not None:
+                meter.end(kind, batch_size)
             else:
                 pass
 
@@ -3691,7 +3723,12 @@ class OmniScheduler(Generic[RequestDataT]):
         D1 in design.md section 1.3). Prefill / empty batches flush any in-flight
         decode first and run synchronously (the in-flight step is never stranded).
         """
+        meter = STEP_PHASES
         while self.running:
+            if meter is not None:
+                meter.begin()
+            else:
+                pass
             self.process_admin_requests()
             recv_reqs = self.recv_requests()
             recv_reqs.extend(self.take_deferred_request_payloads())
@@ -3701,6 +3738,10 @@ class OmniScheduler(Generic[RequestDataT]):
                 self.resolve_pending_async()
                 time.sleep(0.001)
                 continue
+            else:
+                pass
+            if meter is not None:
+                meter.mark("recv")
             else:
                 pass
 
@@ -3713,18 +3754,32 @@ class OmniScheduler(Generic[RequestDataT]):
                 )
             ):
                 self.resolve_pending_async()
+                if meter is not None:
+                    meter.mark("mixed_drain")
+                else:
+                    pass
             elif (
                 self.async_decode_resolve_before_prefill
                 and self.async_pending is not None
                 and self.is_prefill_expected()
             ):
                 self.resolve_pending_async()
+                if meter is not None:
+                    meter.end("prefill_drain", 0)
+                else:
+                    pass
                 continue
             else:
                 pass
 
             batch = self.get_next_batch_to_run()
             self.cur_batch = batch
+            if meter is not None:
+                kind = batch_kind(batch)
+                batch_size = len(batch.reqs) if batch else 0
+                meter.mark("pick")
+            else:
+                pass
 
             # Route through sync when the runner's collect has a sync-only
             # fallback (default True for runners not overriding lookahead_eligible).
@@ -3737,6 +3792,10 @@ class OmniScheduler(Generic[RequestDataT]):
             )
 
             if use_lookahead:
+                if meter is not None:
+                    kind = "lookahead"
+                else:
+                    pass
                 try:
                     sched_output, pending_step = self.run_batch_launch(batch)
                 except Exception as exc:
@@ -3748,6 +3807,10 @@ class OmniScheduler(Generic[RequestDataT]):
                         scheduler_output=sched_output,
                         device_step=pending_step,
                     )
+                    if meter is not None:
+                        meter.mark("launch")
+                    else:
+                        pass
                     if prev_pending is not None:
                         if self.session_bridge is not None:
                             self.previous_pending_decode = prev_pending
@@ -3765,6 +3828,10 @@ class OmniScheduler(Generic[RequestDataT]):
                                 )
                             except Exception as exc:
                                 self.handle_batch_failure(prev_pending.batch, exc)
+                        if meter is not None:
+                            meter.mark("resolve")
+                        else:
+                            pass
                     else:
                         pass
             else:
@@ -3783,22 +3850,42 @@ class OmniScheduler(Generic[RequestDataT]):
                     # KV). Fast-path analogue of the _resolve_and_process drop.
                     batch = self.drop_stale_overrun(batch)
                     self.cur_batch = batch
+                    if meter is not None:
+                        meter.mark("drain")
+                    else:
+                        pass
                 else:
                     pass
                 if batch:
                     result = self.run_batch(batch)
+                    if meter is not None:
+                        meter.mark("run")
+                    else:
+                        pass
                     if result is not _FAILED_BATCH_RESULT:
                         self.process_batch_result(batch, result)
+                        if meter is not None:
+                            meter.mark("result")
+                        else:
+                            pass
                     else:
                         pass
                 else:
                     self._sched_idled = True  # noqa: leading-underscore
                     self.self_check_during_idle()
                     self.sleep_during_idle()
+                    if meter is not None:
+                        meter.mark("idle")
+                    else:
+                        pass
 
             self.last_batch = batch
             if envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.get():
                 self.self_check_during_busy()
+            else:
+                pass
+            if meter is not None:
+                meter.end(kind, batch_size)
             else:
                 pass
 
