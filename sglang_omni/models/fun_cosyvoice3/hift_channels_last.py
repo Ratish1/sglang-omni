@@ -22,11 +22,13 @@ from sglang_omni.utils.channels_last_conv import (
 
 
 class ChannelsLastHiftDecode:
-    """CosyVoice's decode written over (rows, samples, channels) activations, for the
-    finalized call every CUDA caller makes."""
+    """CosyVoice's decode written over (rows, samples, channels) activations: the
+    finalized call, and the non-final one that keeps the look-right frames as context.
+    """
 
     def __init__(self, hift: torch.nn.Module, device: torch.device) -> None:
         self.hift = hift
+        self.spectrum_frames_per_mel_frame = math.prod(hift.upsample_rates)
         blocks = [*hift.source_resblocks, *hift.resblocks]
         convs = [hift.conv_pre, *hift.ups, *hift.source_downs, hift.conv_post]
         for block in blocks:
@@ -134,16 +136,21 @@ class ChannelsLastHiftDecode:
     def __call__(
         self, x: torch.Tensor, s: torch.Tensor, finalize: bool = True
     ) -> torch.Tensor:
-        assert finalize, "every CUDA caller decodes finalized"
         hift = self.hift
         # note (ratish): three small transposes, the mel, the source spectrum and the
         # output spectrum, in place of one per convolution inside cuDNN.
         source_spectrum = self.spectrum(s.squeeze(1)).transpose(1, 2).contiguous()
+        if finalize:
+            right_padding = hift.conv_pre.causal_padding
+        else:
+            right_padding = 0
+            held_frames = self.spectrum_frames_per_mel_frame * hift.conv_pre_look_right
+            source_spectrum = source_spectrum[:, :-held_frames].contiguous()
         hidden_states = self.conv(
             hift.conv_pre,
             x.transpose(1, 2).contiguous(),
             left_padding=0,
-            right_padding=hift.conv_pre.causal_padding,
+            right_padding=right_padding,
         )
         last_stage = hift.num_upsamples - 1
         for stage in range(hift.num_upsamples):
@@ -184,6 +191,9 @@ class ChannelsLastHiftDecode:
         )
         magnitude = torch.exp(hidden_states[..., : self.bins]).transpose(1, 2)
         phase = torch.sin(hidden_states[..., self.bins :]).transpose(1, 2)
-        return torch.clamp(
-            self.inverse(magnitude, phase), -hift.audio_limit, hift.audio_limit
-        )
+        audio = self.inverse(magnitude, phase)
+        if finalize:
+            pass
+        else:
+            audio = audio[:, : -(self.spectrum_frames_per_mel_frame * self.hop_length)]
+        return torch.clamp(audio, -hift.audio_limit, hift.audio_limit)
