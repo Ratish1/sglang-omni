@@ -35,7 +35,7 @@ KV_HEADS = 8
 INTERMEDIATE = 3072
 LAYERS = 5
 SLOTS = 17
-FAMILIES = ("norm_qkv_rope_store", "norm_gate_up_silu", "gemv_add", "sdpa", "flash")
+FAMILIES = ("norm_qkv_rope_store", "norm_gate_up_silu", "gemv_add", "decode_attention", "sdpa", "flash", "cudnn")
 
 
 def make_layers(device: torch.device) -> list[SimpleNamespace]:
