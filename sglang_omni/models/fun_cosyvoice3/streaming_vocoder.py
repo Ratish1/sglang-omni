@@ -286,7 +286,7 @@ class FunCosyVoice3StreamingVocoderScheduler(
                         )
                         for mel in mels
                     ]
-                )
+                ).wait()
         torch.cuda.synchronize(device)
         peak_bytes = torch.cuda.max_memory_reserved(device) - resident_bytes
         logger.info(
