@@ -17,6 +17,7 @@ import torch
 
 from sglang_omni.client.client import Client
 from sglang_omni.models.fun_cosyvoice3 import stages
+from sglang_omni.models.fun_cosyvoice3.hift_channels_last import ChannelsLastHiftDecode
 from sglang_omni.models.fun_cosyvoice3.hift_cuda_graph import HiftDecodeCudaGraphRunner
 from sglang_omni.models.fun_cosyvoice3.packed_dit import PackedDiT
 from sglang_omni.models.fun_cosyvoice3.payload_types import FunCosyVoice3State
@@ -1442,19 +1443,16 @@ def test_vocoder_hift_snake_is_bit_identical_to_cosyvoice() -> None:
     with torch.no_grad():
         for snake in snakes:
             snake.alpha.copy_(torch.linspace(0.125, 4.0, snake.in_features))
-    reference_hift = copy.deepcopy(hift)
     stages.CosyVoice3Vocoder(HiftFlowStub(), hift)
-    pairs = [
-        (module, reference)
-        for module, reference in zip(hift.modules(), reference_hift.modules())
-        if isinstance(reference, snake_class)
-    ]
-    assert pairs
+    decode = hift.decode
+    assert isinstance(decode, ChannelsLastHiftDecode)
+    assert snakes
     torch.manual_seed(3)
     with torch.inference_mode():
-        for module, reference in pairs:
-            x = torch.randn(3, reference.in_features, 2049, device="cuda") * 30
-            assert torch.equal(module(x), reference(x))
+        for module in snakes:
+            x = torch.randn(3, module.in_features, 2049, device="cuda") * 30
+            output = decode.snake(module, x.transpose(1, 2).contiguous())
+            assert torch.equal(output.transpose(1, 2), module(x))
 
 
 @pytest.mark.accelerator
@@ -1466,8 +1464,8 @@ def test_vocoder_leaves_hift_unpatched_off_nvidia(
     hift = make_causal_hift(10.0)
     vocoder = stages.CosyVoice3Vocoder(HiftFlowStub(), hift)
     assert not vocoder.has_hift_kernels
+    assert "decode" not in vars(hift)
     assert all("forward" not in vars(module) for module in hift.modules())
-    assert "_stft" not in vars(hift) and "_istft" not in vars(hift)
 
 
 @pytest.mark.accelerator
@@ -1477,34 +1475,53 @@ def test_vocoder_spectra_match_cosyvoice_without_a_host_wait(
 ) -> None:
     monkeypatch.setattr(torch.backends.cuda.matmul, "allow_tf32", False)
     hift = make_causal_hift(10.0)
-    reference_hift = copy.deepcopy(hift)
     stages.CosyVoice3Vocoder(HiftFlowStub(), hift)
+    decode = hift.decode
+    assert isinstance(decode, ChannelsLastHiftDecode)
     torch.manual_seed(2)
     waveforms = torch.randn(3, 4800, device="cuda") * 0.3
     magnitude = torch.rand(3, 9, 1201, device="cuda") * 2
     phase = (torch.rand(3, 9, 1201, device="cuda") * 2 - 1) * torch.pi
     with torch.inference_mode():
         references = (
-            *reference_hift._stft(
-                waveforms
-            ),  # noqa: leading-underscore  # upstream name
-            reference_hift._istft(  # noqa: leading-underscore  # upstream name
-                magnitude, phase
-            ),
+            *hift._stft(waveforms),  # noqa: leading-underscore  # upstream name
+            hift._istft(magnitude, phase),  # noqa: leading-underscore  # upstream name
         )
         sync_debug_mode = torch.cuda.get_sync_debug_mode()
         torch.cuda.set_sync_debug_mode("error")
         try:
+            spectrum = decode.spectrum(waveforms)
             outputs = (
-                *hift._stft(waveforms),  # noqa: leading-underscore  # upstream name
-                hift._istft(  # noqa: leading-underscore  # upstream name
-                    magnitude, phase
-                ),
+                spectrum[:, :9],
+                spectrum[:, 9:],
+                decode.inverse(magnitude, phase),
             )
         finally:
             torch.cuda.set_sync_debug_mode(sync_debug_mode)
     for output, reference in zip(outputs, references, strict=True):
         torch.testing.assert_close(output, reference)
+
+
+@pytest.mark.accelerator
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_channels_last_decode_matches_cosyvoice_decode(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(torch.backends.cudnn, "allow_tf32", False)
+    monkeypatch.setattr(torch.backends.cuda.matmul, "allow_tf32", False)
+    hift = make_causal_hift(10.0)
+    reference_hift = copy.deepcopy(hift)
+    stages.CosyVoice3Vocoder(HiftFlowStub(), hift)
+    assert isinstance(hift.decode, ChannelsLastHiftDecode)
+    samples_per_frame = int(np.prod(hift.upsample_rates)) * hift.istft_params["hop_len"]
+    torch.manual_seed(5)
+    mel = torch.randn(2, 80, 100, device="cuda") * 3
+    source = torch.randn(2, 1, 100 * samples_per_frame, device="cuda") * 0.1
+    with torch.inference_mode():
+        decoded = hift.decode(x=mel, s=source, finalize=True)
+        reference = reference_hift.decode(x=mel, s=source, finalize=True)
+    assert decoded.shape == reference.shape
+    torch.testing.assert_close(decoded, reference, atol=1e-4, rtol=0)
 
 
 @pytest.mark.accelerator

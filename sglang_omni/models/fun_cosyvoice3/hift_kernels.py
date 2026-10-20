@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
-"""HiFT's Snake, short time Fourier transform and its inverse as Triton kernels. Snake equals
-CosyVoice's Snake bit for bit; the transforms match torch.stft and torch.istft to float32
-rounding with one fixed sum order per output, so a row's result does not follow its batch."""
+"""HiFT's Snake over channels-last activations, its short time Fourier transform and the
+inverse as Triton kernels. Snake equals CosyVoice's Snake bit for bit; the transforms match
+torch.stft and torch.istft to float32 rounding with one fixed sum order per output, so a
+row's result does not follow its batch."""
 
 from __future__ import annotations
 
@@ -9,7 +10,8 @@ import torch
 
 from sglang_omni.models.fun_cosyvoice3.causal_conv import HAS_TRITON
 
-SAMPLES_PER_PROGRAM = 1024
+ROWS_PER_PROGRAM = 64
+CHANNELS_PER_PROGRAM = 64
 FRAMES_PER_PROGRAM = 128
 OUTPUT_SAMPLES_PER_PROGRAM = 256
 
@@ -19,28 +21,42 @@ if HAS_TRITON:
     from sglang.kernels.numerics import div_rn_f32, mul_rn_f32
     from triton.language.extra import libdevice
 
-    # note (ratish): sample counts change every step, one binary serves them all.
-    @triton.jit(do_not_specialize=["samples", "channels"])
+    # note (ratish): row counts change every step, one binary serves them all.
+    @triton.jit(do_not_specialize=["rows", "channels"])
     def snake_kernel(
         x_ptr,
         alpha_ptr,
         inverse_alpha_ptr,
         out_ptr,
-        samples,
+        rows,
         channels,
-        BLOCK_SAMPLES: tl.constexpr,
+        BLOCK_ROWS: tl.constexpr,
+        BLOCK_CHANNELS: tl.constexpr,
     ):
-        channel = tl.program_id(1)
-        row = tl.program_id(2).to(tl.int64) * channels + channel
-        sample_indices = tl.program_id(0) * BLOCK_SAMPLES + tl.arange(0, BLOCK_SAMPLES)
-        is_sample = sample_indices < samples
-        alpha = tl.load(alpha_ptr + channel)
-        inverse_alpha = tl.load(inverse_alpha_ptr + channel)
-        x = tl.load(x_ptr + row * samples + sample_indices, mask=is_sample)
+        row_indices = tl.program_id(0).to(tl.int64) * BLOCK_ROWS + tl.arange(
+            0, BLOCK_ROWS
+        )
+        channel_indices = tl.program_id(1) * BLOCK_CHANNELS + tl.arange(
+            0, BLOCK_CHANNELS
+        )
+        is_channel = channel_indices < channels
+        mask = (row_indices < rows)[:, None] & is_channel[None, :]
+        offsets = row_indices[:, None] * channels + channel_indices[None, :]
+        alpha = tl.broadcast_to(
+            tl.load(alpha_ptr + channel_indices, mask=is_channel, other=1.0)[None, :],
+            [BLOCK_ROWS, BLOCK_CHANNELS],
+        )
+        inverse_alpha = tl.broadcast_to(
+            tl.load(inverse_alpha_ptr + channel_indices, mask=is_channel, other=1.0)[
+                None, :
+            ],
+            [BLOCK_ROWS, BLOCK_CHANNELS],
+        )
+        x = tl.load(x_ptr + offsets, mask=mask, other=0.0)
         sine = libdevice.sin(mul_rn_f32(x, alpha))
         # note (ratish): each product rounds alone, as in the eager ops; an FMA would not.
         out = x + mul_rn_f32(inverse_alpha, mul_rn_f32(sine, sine))
-        tl.store(out_ptr + row * samples + sample_indices, out, mask=is_sample)
+        tl.store(out_ptr + offsets, out, mask=mask)
 
     @triton.jit(do_not_specialize=["frames", "padded_samples"])
     def short_time_spectrum_kernel(
@@ -126,20 +142,26 @@ else:
 def snake(
     x: torch.Tensor, alpha: torch.Tensor, inverse_alpha: torch.Tensor
 ) -> torch.Tensor:
-    """x: (batch, channels, samples) float32; alpha and inverse_alpha: (channels,), the
-    latter 1 / (alpha + 1e-9) as the module computes it."""
-    batch, channels, samples = x.shape
+    """x: (batch, samples, channels) float32, the channels contiguous; alpha and
+    inverse_alpha: (channels,), the latter 1 / (alpha + 1e-9) as the module computes it.
+    """
+    batch, samples, channels = x.shape
     assert x.is_contiguous() and x.dtype == torch.float32
     out = torch.empty_like(x)
-    grid = (triton.cdiv(samples, SAMPLES_PER_PROGRAM), channels, batch)
+    rows = batch * samples
+    grid = (
+        triton.cdiv(rows, ROWS_PER_PROGRAM),
+        triton.cdiv(channels, CHANNELS_PER_PROGRAM),
+    )
     snake_kernel[grid](
         x,
         alpha,
         inverse_alpha,
         out,
-        samples,
+        rows,
         channels,
-        BLOCK_SAMPLES=SAMPLES_PER_PROGRAM,
+        BLOCK_ROWS=ROWS_PER_PROGRAM,
+        BLOCK_CHANNELS=CHANNELS_PER_PROGRAM,
     )
     return out
 
