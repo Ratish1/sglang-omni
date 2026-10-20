@@ -46,6 +46,7 @@ if TYPE_CHECKING:
 
     from sglang_omni.models.dots_tts.model_runner import DotsFlowLaunchBuf
     from sglang_omni.models.personaplex.model_runner import PersonaPlexFrameBatch
+    from sglang_omni.models.qwen3_tts.model_runner import Qwen3TTSCodeStep
     from sglang_omni.scheduling.sglang_backend.output_processor import (
         SGLangOutputProcessor,
     )
@@ -62,6 +63,7 @@ if TYPE_CHECKING:
         ]
         | DotsFlowLaunchBuf
         | PersonaPlexFrameBatch
+        | Qwen3TTSCodeStep
         | None
     )
 else:

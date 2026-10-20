@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from types import ModuleType
 from typing import TYPE_CHECKING, TypedDict
 
@@ -45,13 +46,22 @@ class Qwen3TTSModelInfo(TypedDict):
     predictor_cuda_graph: PredictorGraphStats
 
 
+@dataclass(frozen=True, kw_only=True)
+class Qwen3TTSCodeStep:
+    """One step's frames, cloned from the predictor's buffers when the step launched, and
+    the event that marks them complete."""
+
+    codes: torch.Tensor
+    codes_ready: torch.Event | None
+
+
 class Qwen3TTSModelRunner(ModelRunner):
     """Runs Qwen3-TTS AR steps and stores generated codec frames per request."""
 
     model: Qwen3TTSTalker
     tp_worker: ModelWorker
-    # Resolved in __init__: post_process_outputs records a readiness event per
-    # decode step, and the device cannot change under the runner.
+    # Resolved in __init__: each launched step records a readiness event, and the
+    # device cannot change under the runner.
     codes_event_module: ModuleType | None = None
 
     def __init__(
@@ -63,7 +73,7 @@ class Qwen3TTSModelRunner(ModelRunner):
         silence_codec_ids: torch.Tensor,
     ) -> None:
         super().__init__(tp_worker, output_processor)
-        self.has_pending_code_step = False
+        self.resolving_code_step: Qwen3TTSCodeStep | None = None
         self.row_ids_cache: torch.Tensor | None = None
         self.leading_silence_mask_frames = leading_silence_mask_frames
         self.silence_codec_ids = silence_codec_ids
@@ -162,20 +172,45 @@ class Qwen3TTSModelRunner(ModelRunner):
     def post_prefill(
         self,
         result: GenerationBatchResult,
-        forward_batch: ForwardBatch | None,
+        forward_batch: ForwardBatch,
         schedule_batch: ScheduleBatch | None,
         requests: list[SchedulerRequest],
     ) -> None:
-        self.collect_codes(result, forward_batch, schedule_batch, requests)
+        del schedule_batch
+        self.resolving_code_step = self.launch_code_step(
+            result, forward_batch, requests
+        )
 
     def post_decode(
         self,
         result: GenerationBatchResult,
-        forward_batch: ForwardBatch | None,
+        forward_batch: ForwardBatch,
         schedule_batch: ScheduleBatch | None,
         requests: list[SchedulerRequest],
     ) -> None:
-        self.collect_codes(result, forward_batch, schedule_batch, requests)
+        del schedule_batch
+        self.resolving_code_step = self.launch_code_step(
+            result, forward_batch, requests
+        )
+
+    def post_decode_launch(
+        self,
+        result: GenerationBatchResult,
+        forward_batch: ForwardBatch,
+        requests: list[SchedulerRequest],
+    ) -> Qwen3TTSCodeStep | None:
+        return self.launch_code_step(result, forward_batch, requests)
+
+    def post_decode_resolve(
+        self,
+        launch_buf: Qwen3TTSCodeStep | None,
+        result: GenerationBatchResult,
+        forward_batch: ForwardBatch,
+        schedule_batch: ScheduleBatch,
+        requests: list[SchedulerRequest],
+    ) -> None:
+        del result, forward_batch, schedule_batch, requests
+        self.resolving_code_step = launch_buf
 
     def sample_before_post_prefill(
         self,
@@ -194,12 +229,6 @@ class Qwen3TTSModelRunner(ModelRunner):
     ) -> bool:
         del forward_batch, schedule_batch, requests
         return True
-
-    def lookahead_eligible(self, batch: ScheduleBatch | None) -> bool:
-        # note(ratish): the lookahead's launch and resolve hooks do not run the
-        # codec collect, they would feed token embeddings back.
-        del batch
-        return False
 
     # ------------------------------------------------------------------
     # Qwen3-TTS logit shaping
@@ -232,23 +261,32 @@ class Qwen3TTSModelRunner(ModelRunner):
         else:
             active_logits[:, suppress_start:suppress_stop] = float("-inf")
 
+    def mask_leading_silence(
+        self,
+        logits_output: LogitsProcessorOutput,
+        forward_batch: ForwardBatch,
+        requests: list[SchedulerRequest],
+    ) -> None:
+        """The frame a row samples is its position past the prompt, which holds whether
+        or not the frames before it are committed yet."""
+        logits = logits_output.next_token_logits
+        sequence_lengths = forward_batch.seq_lens_cpu[: len(requests)].tolist()
         # note (luojiaxuan): a cold-start clone that samples a silence id first
         # tends to stay silent for several frames, so silence ids are excluded
         # from its opening frames.
-        if self.leading_silence_mask_frames > 0:
-            for row_index, scheduled_request in enumerate(requests):
-                if (
-                    scheduled_request.data.mask_leading_silence
-                    and len(scheduled_request.data.output_codes)
-                    < self.leading_silence_mask_frames
-                ):
-                    active_logits[row_index].index_fill_(
-                        0, self.silence_codec_ids, float("-inf")
-                    )
-                else:
-                    pass
-        else:
-            pass
+        for row_index, (scheduled_request, sequence_length) in enumerate(
+            zip(requests, sequence_lengths, strict=True)
+        ):
+            frame_index = sequence_length - len(
+                scheduled_request.data.req.origin_input_ids
+            )
+            if (
+                scheduled_request.data.mask_leading_silence
+                and frame_index < self.leading_silence_mask_frames
+            ):
+                logits[row_index].index_fill_(0, self.silence_codec_ids, float("-inf"))
+            else:
+                pass
 
     def install_sampling_seeds(
         self,
@@ -284,6 +322,10 @@ class Qwen3TTSModelRunner(ModelRunner):
             logits_output.next_token_logits[: len(requests)],
             self.repetition_scales.index_select(0, request_slots),
         )
+        if self.leading_silence_mask_frames > 0:
+            self.mask_leading_silence(logits_output, forward_batch, requests)
+        else:
+            pass
         next_token_ids = super().sample_next_token_ids(
             logits_output, forward_batch, schedule_batch, requests
         )
@@ -310,16 +352,16 @@ class Qwen3TTSModelRunner(ModelRunner):
         )
         return next_token_ids
 
-    def collect_codes(
+    def launch_code_step(
         self,
         result: GenerationBatchResult,
-        forward_batch: ForwardBatch | None,
-        schedule_batch: ScheduleBatch | None,
+        forward_batch: ForwardBatch,
         requests: list[SchedulerRequest],
-    ) -> None:
-        self.has_pending_code_step = False
+    ) -> Qwen3TTSCodeStep | None:
+        """Enqueue the step's device work after its sample: the predictor, the slots' next
+        feedback rows, and a snapshot of the frames that its resolve reads."""
         if result.next_token_ids is None:
-            return
+            return None
         else:
             pass
         layer0_codes = result.next_token_ids
@@ -347,7 +389,16 @@ class Qwen3TTSModelRunner(ModelRunner):
             forward_batch.req_pool_indices[: len(requests)],
             self.model.output_embeds[: len(requests)],
         )
-        self.has_pending_code_step = True
+        # Note: (Jiaxin Deng) per-row clones were a c32 decode-loop hot spot;
+        # rows must stay views of a snapshot, never of the reused graph buffers.
+        codes = self.model.output_codes[: len(requests)].detach().clone()
+        codes_ready = None
+        if self.codes_event_module is not None:
+            codes_ready = self.codes_event_module.Event()
+            codes_ready.record()
+        else:
+            pass
+        return Qwen3TTSCodeStep(codes=codes, codes_ready=codes_ready)
 
     def post_process_outputs(
         self,
@@ -356,38 +407,33 @@ class Qwen3TTSModelRunner(ModelRunner):
         outputs: dict[str, RequestOutput],
     ) -> None:
         del result
-        if not self.has_pending_code_step:
+        code_step = self.resolving_code_step
+        self.resolving_code_step = None
+        if code_step is None:
             return
         else:
             pass
-        self.has_pending_code_step = False
         eos_id = int(self.model.config.codec_eos_token_id)
-        # Note: (Jiaxin Deng) per-row clones were a c32 decode-loop hot spot;
-        # rows must stay views of a snapshot, never of the reused graph buffers.
-        batch_size = len(scheduler_output.requests)
-        codes_snap = self.model.output_codes[:batch_size].detach().clone()
-        codes_ready = None
-        if self.codes_event_module is not None:
-            codes_ready = self.codes_event_module.Event()
-            codes_ready.record()
-        else:
-            pass
         for row_idx, sched_req in enumerate(scheduler_output.requests):
+            sglang_request = sched_req.data.req
             req_output = outputs[sched_req.request_id]
             # note (ratish): a middle prefill chunk samples at a prompt row; SGLang drops
-            # that token, so it gives no frame or stream chunk either.
+            # that token, so it gives no frame or stream chunk either. A request that
+            # finished or was retracted after this step launched gets nothing from it.
             if (
-                sched_req.data.req.inflight_middle_chunks > 0
+                sglang_request.inflight_middle_chunks > 0
+                or sglang_request.finished()
+                or sglang_request.is_retracted
                 or req_output.data is None
                 or int(req_output.data) == eos_id
             ):
                 continue
             else:
                 pass
-            code_chunk = codes_snap[row_idx]
+            code_chunk = code_step.codes[row_idx]
             sched_req.data.output_codes.append(code_chunk)
             sched_req.data.latest_stream_code_chunk = code_chunk
-            sched_req.data.codes_ready_event = codes_ready
+            sched_req.data.codes_ready_event = code_step.codes_ready
 
     def finalize_skip_rids(self, scheduler_output: SchedulerOutput) -> set[str]:
         return {

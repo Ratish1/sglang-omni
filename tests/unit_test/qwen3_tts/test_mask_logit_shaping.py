@@ -33,12 +33,13 @@ def make_runner(
 
 
 def make_scheduled_request(
-    *, mask_leading_silence: bool, generated_frames: int
+    *, mask_leading_silence: bool, prompt_length: int, committed_frames: int
 ) -> types.SimpleNamespace:
     return types.SimpleNamespace(
         data=types.SimpleNamespace(
             mask_leading_silence=mask_leading_silence,
-            output_codes=[torch.zeros(16)] * generated_frames,
+            output_codes=[torch.zeros(16)] * committed_frames,
+            req=types.SimpleNamespace(origin_input_ids=[0] * prompt_length),
         )
     )
 
@@ -78,37 +79,40 @@ def test_qwen3_tts_suppression_skips_empty_request_batch() -> None:
     assert torch.equal(logits, original)
 
 
-def test_qwen3_tts_masks_silence_ids_only_in_opening_frames_of_flagged_requests() -> (
-    None
-):
+def test_qwen3_tts_masks_silence_ids_in_the_opening_frames_its_position_names() -> None:
     configured_vocab = 3072
     silence_ids = (5, 7, 11)
+    prompt_length = 6
     runner = make_runner(
         vocab_size=configured_vocab,
         codec_eos_token_id=2150,
         leading_silence_mask_frames=2,
         silence_codec_ids=silence_ids,
     )
+    rows = [(True, 0, 0), (True, 1, 0), (True, 2, 1), (False, 0, 0)]
     requests = [
-        make_scheduled_request(mask_leading_silence=True, generated_frames=0),
-        make_scheduled_request(mask_leading_silence=True, generated_frames=1),
-        make_scheduled_request(mask_leading_silence=True, generated_frames=2),
-        make_scheduled_request(mask_leading_silence=False, generated_frames=0),
+        make_scheduled_request(
+            mask_leading_silence=mask_leading_silence,
+            prompt_length=prompt_length,
+            committed_frames=committed_frames,
+        )
+        for mask_leading_silence, _, committed_frames in rows
     ]
-    logits = torch.randn(len(requests), 6144)
+    forward_batch = types.SimpleNamespace(
+        seq_lens_cpu=torch.tensor([prompt_length + frame for _, frame, _ in rows])
+    )
+    logits = torch.randn(len(requests), configured_vocab)
     original = logits.clone()
 
-    runner.apply_codec_suppress_tokens(
-        types.SimpleNamespace(next_token_logits=logits), requests
+    runner.mask_leading_silence(
+        types.SimpleNamespace(next_token_logits=logits), forward_batch, requests
     )
 
     silence = list(silence_ids)
-    speech = [
-        token for token in range(configured_vocab - 1024) if token not in silence_ids
-    ]
+    speech = [token for token in range(configured_vocab) if token not in silence_ids]
     assert torch.isneginf(logits[:2, silence]).all()
     assert torch.equal(logits[:2, speech], original[:2, speech])
-    assert torch.equal(logits[2:, silence], original[2:, silence])
+    assert torch.equal(logits[2:], original[2:])
 
 
 @pytest.mark.accelerator

@@ -157,8 +157,10 @@ class Qwen3TtsEngineBuilder(TtsEngineBuilder[Qwen3TTSSGLangRequestData]):
         leading_silence_mask_frames: int = (
             qwen3_stages.DEFAULT_LEADING_SILENCE_MASK_FRAMES
         ),
+        enable_async_decode: bool = False,
     ) -> None:
         self.attn_implementation = attn_implementation
+        self.enable_async_decode = enable_async_decode
         self.prefill_coalesce_requests = prefill_coalesce_requests
         self.prefill_coalesce_wait_ms = prefill_coalesce_wait_ms
         self.reference_encoder_cuda_graph_bucket_frames = tuple(
@@ -449,6 +451,7 @@ class Qwen3TtsEngineBuilder(TtsEngineBuilder[Qwen3TTSSGLangRequestData]):
             "stream_output_builder": self.stream_output_builder,
             "prefill_coalesce_requests": self.prefill_coalesce_requests,
             "prefill_coalesce_wait_ms": self.prefill_coalesce_wait_ms,
+            "enable_async_decode": self.enable_async_decode,
         }
 
     def make_abort_callback(self) -> Callable[[str], None]:

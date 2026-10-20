@@ -45,6 +45,7 @@ class Qwen3TTSStageFactoryKwargs(TypedDict, total=False):
     followup_cuda_graph: bool
     async_decode: bool
     running_stream_count: int
+    enable_async_decode: bool
 
 
 class Qwen3TTSPipelineConfig(PipelineConfig):
@@ -159,6 +160,12 @@ class Qwen3TTSPipelineConfig(PipelineConfig):
             not current_platform.enable_tts_vocoder_fast_path()
         ):
             kwargs["async_decode"] = False
+        else:
+            pass
+        # note (ratish): the engine launches each decode step before resolving the last one
+        # on CUDA, the platform it is measured on.
+        if stage_name == "tts_engine":
+            kwargs["enable_async_decode"] = current_platform.is_cuda()
         else:
             pass
         if not self.enable_deterministic_inference:

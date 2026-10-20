@@ -2692,6 +2692,9 @@ def test_qwen3_tts_config_starts_a_declining_platform_decoding_synchronously(
         lambda: False,
         raising=False,
     )
+    monkeypatch.setattr(
+        qwen3_tts_config.current_platform, "is_cuda", lambda: False, raising=False
+    )
 
     assert config.stage_factory_kwargs("vocoder") == {
         "async_decode": False,
@@ -2699,7 +2702,7 @@ def test_qwen3_tts_config_starts_a_declining_platform_decoding_synchronously(
             "max_running_requests"
         ],
     }
-    assert config.stage_factory_kwargs("tts_engine") == {}
+    assert config.stage_factory_kwargs("tts_engine") == {"enable_async_decode": False}
 
 
 def test_qwen3_tts_config_leaves_a_measured_platform_alone(
@@ -2712,13 +2715,16 @@ def test_qwen3_tts_config_leaves_a_measured_platform_alone(
         lambda: True,
         raising=False,
     )
+    monkeypatch.setattr(
+        qwen3_tts_config.current_platform, "is_cuda", lambda: True, raising=False
+    )
 
     assert config.stage_factory_kwargs("vocoder") == {
         "running_stream_count": config.generation_admission_defaults()[
             "max_running_requests"
         ]
     }
-    assert config.stage_factory_kwargs("tts_engine") == {}
+    assert config.stage_factory_kwargs("tts_engine") == {"enable_async_decode": True}
 
 
 def test_qwen3_tts_vocoder_factory_leaves_the_decode_policy_to_its_caller(
@@ -7901,14 +7907,14 @@ def test_qwen3_tts_sampling_installs_semantic_seeds_for_a_seeded_batch(
     assert sample_calls == [sampled_seeds]
 
 
-def test_qwen3_tts_collect_codes_excludes_semantic_eos(
+def test_qwen3_tts_decode_step_excludes_semantic_eos(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     install_fake_sglang(monkeypatch)
     from sglang_omni.models.qwen3_tts.model_runner import Qwen3TTSModelRunner
 
     runner = Qwen3TTSModelRunner.__new__(Qwen3TTSModelRunner)
-    runner.has_pending_code_step = False
+    runner.resolving_code_step = None
 
     def code_predictor_forward(layer0_codes, hidden, semantic_positions=None):
         assert layer0_codes.tolist() == [[7], [42]]
@@ -7934,20 +7940,19 @@ def test_qwen3_tts_collect_codes_excludes_semantic_eos(
     )
     requests = [
         SimpleNamespace(
-            request_id="active",
+            request_id=request_id,
             data=Qwen3TTSSGLangRequestData(
-                req=SimpleNamespace(inflight_middle_chunks=0)
+                req=SimpleNamespace(
+                    inflight_middle_chunks=0,
+                    is_retracted=False,
+                    finished=lambda: False,
+                )
             ),
-        ),
-        SimpleNamespace(
-            request_id="eos",
-            data=Qwen3TTSSGLangRequestData(
-                req=SimpleNamespace(inflight_middle_chunks=0)
-            ),
-        ),
+        )
+        for request_id in ("active", "eos")
     ]
 
-    runner.collect_codes(result, forward_batch, schedule_batch, requests)
+    runner.post_decode(result, forward_batch, schedule_batch, requests)
 
     assert requests[0].data.output_codes == []
     assert requests[1].data.output_codes == []
@@ -9432,7 +9437,7 @@ def test_qwen3_tts_config_loads_frontend_only_outside_engine_process(
         split.stages[index] = stage.model_copy(update=update)
     assert split.preprocessing_in_own_process() is True
     assert split.stage_factory_kwargs("preprocessing") == {"load_frontend": True}
-    assert split.stage_factory_kwargs("tts_engine") == {}
+    assert "load_frontend" not in split.stage_factory_kwargs("tts_engine")
     # The edge this change unpins: compiling it used to raise because
     # process_local_edges pinned preprocessing to the engine process.
     topology = build_compiled_process_topology(split)
