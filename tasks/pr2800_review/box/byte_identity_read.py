@@ -35,6 +35,10 @@ def main() -> None:
         else:
             pass
         for pass_name in pass_names:
+            if not all((directories[arm] / pass_name / "speed_results.json").exists() for arm in (arm_a, arm_b)):
+                continue
+            else:
+                pass
             rows_a = requests(directories[arm_a] / pass_name)
             rows_b = requests(directories[arm_b] / pass_name)
             prompts = sorted(set(rows_a) & set(rows_b))
