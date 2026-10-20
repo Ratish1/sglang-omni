@@ -14,6 +14,7 @@ Results under /data/async_decode_20261020/pairs/<label>/{a,b}.
 
 import argparse
 import hashlib
+import json
 import os
 import shlex
 import signal
@@ -78,6 +79,26 @@ def gpu_snapshot() -> str:
     return subprocess.run(
         ["nvidia-smi", "--query-gpu=index,memory.used", "--format=csv,noheader"], capture_output=True, text=True
     ).stdout
+
+
+def thread_cpu(pgid: int) -> dict[str, float]:
+    """CPU seconds (user plus system) of every thread of the server's process group, keyed pid/tid."""
+    ticks = os.sysconf("SC_CLK_TCK")
+    listing = subprocess.run(["ps", "-eo", "pid=,pgid="], capture_output=True, text=True).stdout
+    seconds = {}
+    for pid in (fields[0] for fields in (line.split() for line in listing.splitlines()) if fields[1:] == [str(pgid)]):
+        try:
+            tasks = list(Path(f"/proc/{pid}/task").iterdir())
+        except FileNotFoundError:
+            continue
+        for task in tasks:
+            try:
+                stat = (task / "stat").read_text()
+            except FileNotFoundError:
+                continue
+            fields = stat[stat.rindex(")") + 2:].split()
+            seconds[f"{pid}/{task.name}"] = (int(fields[11]) + int(fields[12])) / ticks
+    return seconds
 
 
 def audio_hashes(out: Path) -> dict[str, str]:
@@ -175,6 +196,7 @@ def main() -> None:
             (outs[arm] / "gpu_healthy.txt").write_text(gpu_snapshot(), encoding="utf-8")
         benches = {}
         bench_start = time.time()
+        start_cpu = {arm: thread_cpu(servers[arm].pid) for arm in arms} if args.step_phases else {}
         stream_args = [] if args.no_stream else ["--stream"]
         for arm, (_, _, port) in arms.items():
             command = [sys.executable, "-m", "benchmarks.eval.benchmark_tts_seedtts", "--model", model,
@@ -193,6 +215,12 @@ def main() -> None:
         for arm, bench in benches.items():
             print(f"{arm} bench rc {bench.wait(timeout=BENCH_TIMEOUT_S)}", flush=True)
             (outs[arm] / "bench_window.txt").write_text(f"{bench_start} {time.time()}\n", encoding="utf-8")
+            if args.step_phases:
+                (outs[arm] / "thread_cpu.json").write_text(
+                    json.dumps({"start": start_cpu[arm], "end": thread_cpu(servers[arm].pid)}), encoding="utf-8"
+                )
+            else:
+                pass
         for arm in arms:
             (outs[arm] / "gpu_after_bench.txt").write_text(gpu_snapshot(), encoding="utf-8")
         for arm, (_, _, port) in arms.items():

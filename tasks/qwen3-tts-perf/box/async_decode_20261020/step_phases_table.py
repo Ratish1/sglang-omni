@@ -88,6 +88,24 @@ def rows(window: dict) -> list[str]:
     return lines
 
 
+def thread_rows(directory: Path, seconds: float) -> list[str]:
+    """CPU cores per server thread over the bench window, named from the probe's last snapshot."""
+    cpu = json.loads((directory / "thread_cpu.json").read_text(encoding="utf-8"))
+    last = json.loads((directory / "step_phases.jsonl").read_text(encoding="utf-8").splitlines()[-1])
+    names = {int(tid): name for tid, name in last["threads"].items()}
+    names[last["scheduler_thread"]] = f"{names.get(last['scheduler_thread'], '')} (scheduler loop)"
+    used = {
+        key: cpu["end"][key] - cpu["start"].get(key, 0.0)
+        for key in cpu["end"]
+        if cpu["end"][key] - cpu["start"].get(key, 0.0) > 0.0
+    }
+    lines = [f"threads: {sum(used.values()) / seconds:.2f} cores over {seconds:.1f} s, {len(used)} threads busy"]
+    for key, value in sorted(used.items(), key=lambda item: -item[1])[:14]:
+        tid = int(key.split("/")[1])
+        lines.append(f"  {value / seconds:.3f} cores  {key}  {names.get(tid, '(native)')}")
+    return lines
+
+
 def main() -> None:
     for label in sys.argv[1:]:
         for arm in ("a", "b"):
@@ -98,6 +116,8 @@ def main() -> None:
             print(f"{label} {arm} {tree}")
             print("kind band | iterations | window | wall / cpu ms per iteration | phase wall/cpu ms | waits")
             for line in rows(difference(after, before)):
+                print(line)
+            for line in thread_rows(directory, end - start):
                 print(line)
 
 

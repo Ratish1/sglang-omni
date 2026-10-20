@@ -5,8 +5,8 @@
 set -u
 D=/data/async_decode_20261020
 IN=${T:-/workspace/t_marks}/tasks/qwen3-tts-perf/box/async_decode_20261020
-S2A=/workspace/p_s2a_1a714a3fb
-S3=/workspace/p_s3_6aac49d8a
+S2A=/workspace/p_s2a_3a3639810
+S3=/workspace/p_s3_86ed86b97
 L=$D/queue.log
 until grep -q queue_s3_done $L; do sleep 30; done
 echo "queue phases start $(date +%T) s2a $(git -C $S2A rev-parse HEAD:sglang_omni) s3 $(git -C $S3 rev-parse HEAD:sglang_omni)" >> $L
