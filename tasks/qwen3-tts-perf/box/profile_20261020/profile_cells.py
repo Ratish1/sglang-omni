@@ -1,9 +1,11 @@
 """Capture torch profiler traces of the plan's cells (PLAN.md 2) from one Qwen3-TTS Base server, or its clean bench.
 
-usage: python3 profile_cells.py --tree /workspace/sglang-omni --card 0 --port 31000 --mode formal|mapping|clean \
+usage: python3 profile_cells.py --tree /workspace/sglang-omni --card 0 --port 31000 --mode formal|mapping|clean|host \
        --out /data/prof_20261020/formal [--cells W1 W2 W3 W4]
 formal: the served config, stacks off. mapping: every graph and compile off, stacks on. clean: the served config
-without a profiler, benches c1 (200), c16 and c64 on the full corpus. Each boot archives the tree identity, the serve
+without a profiler, benches c1 (200), c16 and c64 on the full corpus. host: the served config, and per cell one step
+window of the engine's forwards with stacks on (the profiling branch's num_steps and step_stage), opened once the
+cell's load is steady; it stops itself. Each boot archives the tree identity, the serve
 command and log, and samples /proc/loadavg and the card's processes every 5 s. Every cell runs once unprofiled to warm
 its shapes, then once inside /start_profile (torch trace plus request events) and /stop_profile; the trace is complete
 when its .trace.json sibling is gone (the server gzips in the background).
@@ -30,6 +32,8 @@ MAPPING_ARGS = (
 WINDOW_LEAD_S = {"W3": 10.0, "W4": 10.0}
 # note (ratish): a mapping window only has to hold each call site once, and stacks make it large.
 WINDOW_S = {"formal": 2.0, "mapping": 1.0}
+HOST_STEPS = {"W2": 60, "W3": 60, "W4": 40}
+HOST_LEAD_S = {"W2": 2.0, "W3": 10.0, "W4": 10.0}
 LONG_TEXT_SENTENCES = 8
 LONG_TEXT_REQUESTS = 3
 
@@ -119,6 +123,10 @@ def stop_profile(port: int, cell: str, cell_dir: Path) -> None:
     httpx.post(
         f"http://127.0.0.1:{port}/stop_profile", json={"run_id": cell}, timeout=600, trust_env=False
     ).raise_for_status()
+    wait_for_trace(cell, cell_dir)
+
+
+def wait_for_trace(cell: str, cell_dir: Path) -> None:
     deadline = time.monotonic() + 900
     while time.monotonic() < deadline:
         traces = list(cell_dir.glob("trace*.trace.json.gz"))
@@ -172,12 +180,42 @@ def capture_cell(cell: str, tree: str, port: int, meta: Path, out: Path, window_
     print(f"{cell} captured {time.strftime('%H:%M:%S')}", flush=True)
 
 
+def capture_host_window(cell: str, tree: str, port: int, meta: Path, out: Path) -> None:
+    """One step window of the engine's forwards with stacks, armed once the cell's load is steady."""
+    cell_dir = out / cell
+    cell_dir.mkdir(parents=True, exist_ok=True)
+    concurrency, extra = cell_workload(cell, meta, warm=True)
+    if cell in WINDOW_LEAD_S:
+        warm_extra = [*extra, "--max-samples", "128"]
+    else:
+        warm_extra = extra
+    run(bench_command(port, concurrency, cell_dir / "warm", warm_extra), tree, cell_dir / "warm.log")
+    concurrency, extra = cell_workload(cell, meta, warm=False)
+    body = {
+        "run_id": cell, "trace_path_template": str(cell_dir / "trace"), "num_steps": HOST_STEPS[cell],
+        "step_stage": "tts_engine", "with_stack": True,
+    }
+    with open(cell_dir / "bench.log", "w", encoding="utf-8") as log:
+        bench = subprocess.Popen(
+            bench_command(port, concurrency, cell_dir / "bench", extra), cwd=tree,
+            env=dict(os.environ, PYTHONPATH=tree), stdout=log, stderr=subprocess.STDOUT,
+        )
+        time.sleep(HOST_LEAD_S[cell])
+        httpx.post(f"http://127.0.0.1:{port}/start_profile", json=body, timeout=60, trust_env=False).raise_for_status()
+        wait_for_trace(cell, cell_dir)
+        bench.wait(timeout=3600)
+    httpx.post(
+        f"http://127.0.0.1:{port}/stop_profile", json={"run_id": cell}, timeout=60, trust_env=False
+    ).raise_for_status()
+    print(f"{cell} captured {time.strftime('%H:%M:%S')}", flush=True)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--tree", required=True)
     parser.add_argument("--card", type=int, required=True)
     parser.add_argument("--port", type=int, required=True)
-    parser.add_argument("--mode", choices=("formal", "mapping", "clean"), required=True)
+    parser.add_argument("--mode", choices=("formal", "mapping", "clean", "host"), required=True)
     parser.add_argument("--out", required=True)
     parser.add_argument("--cells", nargs="*", default=["W1", "W2", "W3", "W4"])
     args = parser.parse_args()
@@ -221,7 +259,10 @@ def main() -> None:
         else:
             meta = write_long_text_meta(args.tree, out / "meta_w2")
             for cell in args.cells:
-                capture_cell(cell, args.tree, args.port, meta, out, WINDOW_S[args.mode])
+                if args.mode == "host":
+                    capture_host_window(cell, args.tree, args.port, meta, out)
+                else:
+                    capture_cell(cell, args.tree, args.port, meta, out, WINDOW_S[args.mode])
     finally:
         os.killpg(server.pid, signal.SIGTERM)
         try:
