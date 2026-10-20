@@ -6,7 +6,9 @@ Per shape and row count: one CUDA graph of 28 calls, each on its own weight (mor
 its weight from HBM as served), per call time (median replay over 28) and its share of the floor at 3.35 TB/s, for
 cuBLAS (F.linear), SGLang's Hopper GEMV (one row only), and a Triton split-K GEMM (fp32 partials summed in split order
 by a second launch, so deterministic) over a small grid of tile and split choices, the best of which is printed with
-its relative distance to an fp32 product.
+its relative distance to an fp32 product. The Triton GEMM runs twice: launched plainly, and under programmatic
+dependent launch, each launch asking L2 for its weight lines before it waits on its predecessor, which hides the
+boundary between consecutive launches the way the fused predictor kernels do.
 """
 
 import argparse
@@ -18,6 +20,8 @@ import torch.nn.functional as F
 import triton
 import triton.language as tl
 from sglang.kernels.ops.gemm.hopper_bf16_gemv import hopper_bf16_gemv
+from triton.language.extra.cuda import gdc_launch_dependents, gdc_wait
+from triton.runtime.errors import OutOfResources
 
 LAYERS = 28
 HBM_BYTES_PER_SECOND = 3.35e12
@@ -46,17 +50,31 @@ def split_k_kernel(
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
+    USE_GDC: tl.constexpr,
 ):
     pid_n = tl.program_id(0)
     pid_s = tl.program_id(1)
     rm = tl.arange(0, BLOCK_M)
     rn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
     rk = tl.arange(0, BLOCK_K)
+    if USE_GDC:
+        for k0 in range(pid_s * (K // SPLIT), (pid_s + 1) * (K // SPLIT), BLOCK_K):
+            lines = W + rn[:, None] * K + (k0 + tl.arange(0, BLOCK_K // 64) * 64)[None, :]
+            tl.inline_asm_elementwise(
+                "mov.u32 $0, 0;\n\tprefetch.global.L2 [$1];", "=r,l", [lines], dtype=tl.int32, is_pure=False, pack=1
+            )
+        gdc_wait()
+    else:
+        pass
     acc = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
     for k0 in range(pid_s * (K // SPLIT), (pid_s + 1) * (K // SPLIT), BLOCK_K):
         x = tl.load(X + rm[:, None] * K + (k0 + rk)[None, :], mask=(rm < rows)[:, None], other=0.0)
         w = tl.load(W + rn[:, None] * K + (k0 + rk)[None, :], eviction_policy="evict_first")
         acc = tl.dot(x, tl.trans(w), acc)
+    if USE_GDC:
+        gdc_launch_dependents()
+    else:
+        pass
     if SPLIT == 1:
         tl.store(OUT + rm[:, None] * N + rn[None, :], acc.to(tl.bfloat16), mask=(rm < rows)[:, None])
     else:
@@ -64,7 +82,15 @@ def split_k_kernel(
 
 
 @triton.jit
-def split_sum_kernel(PARTIALS, OUT, rows, N: tl.constexpr, SPLIT: tl.constexpr, BLOCK_M: tl.constexpr, BLOCK: tl.constexpr):
+def split_sum_kernel(
+    PARTIALS, OUT, rows, N: tl.constexpr, SPLIT: tl.constexpr, BLOCK_M: tl.constexpr, BLOCK: tl.constexpr,
+    USE_GDC: tl.constexpr,
+):
+    if USE_GDC:
+        gdc_wait()
+        gdc_launch_dependents()
+    else:
+        pass
     offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
     row = offsets // N
     total = tl.zeros([BLOCK], dtype=tl.float32)
@@ -73,19 +99,23 @@ def split_sum_kernel(PARTIALS, OUT, rows, N: tl.constexpr, SPLIT: tl.constexpr, 
     tl.store(OUT + offsets, total.to(tl.bfloat16), mask=row < rows)
 
 
-def split_k_gemm(x: torch.Tensor, w: torch.Tensor, partials: torch.Tensor, out: torch.Tensor, config: tuple) -> None:
+def split_k_gemm(
+    x: torch.Tensor, w: torch.Tensor, partials: torch.Tensor, out: torch.Tensor, config: tuple, use_gdc: bool
+) -> None:
     block_n, block_k, split, warps, stages = config
     rows, k = x.shape
     n = w.shape[0]
     block_m = max(16, triton.next_power_of_2(rows))
     split_k_kernel[(n // block_n, split)](
         x, w, partials, out, rows, N=n, K=k, SPLIT=split, BLOCK_M=block_m, BLOCK_N=block_n, BLOCK_K=block_k,
-        num_warps=warps, num_stages=stages,
+        USE_GDC=use_gdc, num_warps=warps, num_stages=stages, launch_pdl=use_gdc,
     )
     if split == 1:
         pass
     else:
-        split_sum_kernel[(triton.cdiv(rows * n, 1024),)](partials, out, rows, N=n, SPLIT=split, BLOCK_M=block_m, BLOCK=1024)
+        split_sum_kernel[(triton.cdiv(rows * n, 1024),)](
+            partials, out, rows, N=n, SPLIT=split, BLOCK_M=block_m, BLOCK=1024, USE_GDC=use_gdc, launch_pdl=use_gdc
+        )
 
 
 def graph_us(calls) -> float:
@@ -118,7 +148,7 @@ def configs(n: int, k: int, sm_count: int) -> list[tuple]:
             pass
         for split in (1, 2, 4, 8, 16):
             programs = n // block_n * split
-            if (k // split) % block_k or programs > 4 * sm_count:
+            if (k // split) % block_k or programs > 4 * sm_count or 2 * programs < sm_count:
                 continue
             else:
                 pass
@@ -148,17 +178,22 @@ def main() -> None:
                 block_m = max(16, triton.next_power_of_2(rows))
                 partials = torch.empty(16 * block_m * n, device=device)
                 out = torch.empty(rows, n, device=device, dtype=torch.bfloat16)
-                best = None
-                for config in configs(n, k, sm_count):
-                    us = graph_us(lambda: [split_k_gemm(x, w, partials, out, config) for w in weights])
-                    if best is None or us < best[1]:
-                        best = (config, us)
-                    else:
-                        pass
-                split_k_gemm(x, weights[0], partials, out, best[0])
-                error = ((out.float() - reference).norm() / reference.norm()).item()
                 cublas_error = ((F.linear(x, weights[0]).float() - reference).norm() / reference.norm()).item()
-                results.append((f"triton split-k {best[0]} (error {error:.2e}, cublas {cublas_error:.2e})", best[1]))
+                for use_gdc in (False, True):
+                    best = None
+                    for config in configs(n, k, sm_count):
+                        try:
+                            us = graph_us(lambda: [split_k_gemm(x, w, partials, out, config, use_gdc) for w in weights])
+                        except OutOfResources:
+                            continue
+                        if best is None or us < best[1]:
+                            best = (config, us)
+                        else:
+                            pass
+                    split_k_gemm(x, weights[0], partials, out, best[0], use_gdc)
+                    error = ((out.float() - reference).norm() / reference.norm()).item()
+                    label = "triton split-k pdl" if use_gdc else "triton split-k"
+                    results.append((f"{label} {best[0]} (error {error:.2e}, cublas {cublas_error:.2e})", best[1]))
                 line = "; ".join(f"{label} {us:.2f} us ({floor_us / us:.0%})" for label, us in results)
                 print(f"{name} {n}x{k} rows {rows}, floor {floor_us:.2f} us: {line}", flush=True)
 

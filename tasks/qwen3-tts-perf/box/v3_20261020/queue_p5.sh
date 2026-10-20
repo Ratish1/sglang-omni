@@ -3,7 +3,8 @@
 # prefetches its weight lines into L2 before waiting on its predecessor) against V4: the predictor bench on both trees
 # (per kernel from a graph with PDL), the prefetch present in the compiled PTX, the touched units (Qwen3-TTS and the
 # Qwen3-Omni predictor suites, which share the module), a seeded c1 pair that must be byte identical (no arithmetic
-# changes), then c16 and c64 pairs in both card orders with each arm's SM Issue. Waits for queue_v4.sh.
+# changes), then c16 and c64 pairs in both card orders with each arm's SM Issue. Waits for queue_bench3.sh, which
+# follows queue_v4.sh.
 set -u
 D=/data/v3_20261020
 T=${T:-/workspace/t_marks}
@@ -12,7 +13,7 @@ S=$T/tasks/omni_step_profiling_20260918/scripts
 V4=/workspace/v4_a6214172d
 P5=/workspace/p5_07b655c23
 L=$D/queue.log
-until grep -q queue_v4_done $L; do sleep 30; done
+until grep -q queue_bench3_done $L; do sleep 30; done
 echo "queue p5 start $(date +%T) v4 $(git -C $V4 rev-parse HEAD:sglang_omni) p5 $(git -C $P5 rev-parse HEAD:sglang_omni)" >> $L
 for TREE in $V4 $P5; do
   (cd $TREE && TRITON_CACHE_DIR=$D/triton_$(basename $TREE) PYTHONPATH=$TREE timeout 1800 python3 $S/predictor_layers_bench.py \
