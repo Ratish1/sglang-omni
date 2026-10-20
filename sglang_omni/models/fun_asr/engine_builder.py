@@ -118,9 +118,6 @@ class FunASREngineBuilder(AsrEngineBuilder[request_builders.FunASRRequestData]):
         self.tokenizer = AutoTokenizer.from_pretrained(
             checkpoint_dir, trust_remote_code=True
         )
-        # note (ratish): the auto loader resolves the checkpoint's extractor name
-        # through the installed transformers first, which may carry a class of
-        # that name without this package's frame accounting.
         self.feature_extractor = FunAsrNanoFeatureExtractor.from_pretrained(
             checkpoint_dir, trust_remote_code=True
         )
