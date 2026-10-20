@@ -8,7 +8,8 @@ latency median row. Later on 10-18: the open loop cells r12 and r16 (Poisson arr
 from one arrival seed, so both arms and both orders get one schedule; 64 slots, never the bound).
 10-20 copy under /data/c20261020 (this lease's paths and Inductor caches), with the open loop cell r20 (20 requests a
 second, near the c64 cell's throughput, where a faster vocoder cannot refill the AR's queue as a closed loop does).
-Later on 10-20: the long form cell L16 (the 48 entries of make_longform_meta.py at concurrency 16, item 3's cell).
+Later on 10-20: the long form cell L16 (the 48 entries of make_longform_meta.py at concurrency 16, item 3's cell), and
+c1f, every reference seeded at concurrency 1, whose tails rest on 1,088 requests where c1's p99 is one of 64.
 usage: python3 serve_pair_c20261020.py <first tree> <second tree> <out dir>"""
 
 import json
@@ -29,6 +30,7 @@ CPUS = ("0-15,64-79", "16-31,80-95")
 ALL_CELLS = {
     "c1": (["--max-concurrency", "1", "--max-samples", "64", "--seed", "1234"], True),
     "c1u": (["--max-concurrency", "1", "--max-samples", "256"], True),
+    "c1f": (["--max-concurrency", "1", "--seed", "1234"], True),
     "c16": (["--max-concurrency", "16"], True),
     "c64": (["--max-concurrency", "64"], True),
     "b1": (["--max-concurrency", "1", "--max-samples", "256"], False),
