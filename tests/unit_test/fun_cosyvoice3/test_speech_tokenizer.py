@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import gc
+import weakref
+
 import pytest
 import torch
 
@@ -44,3 +47,20 @@ def test_graph_replays_match_the_eager_model_at_the_mel_width() -> None:
             expected = model(mel.to(device), torch.tensor([frames], device=device))
 
         assert graphs.tokenize(mel) == expected[0].tolist()
+
+
+@pytest.mark.accelerator
+def test_graphs_keep_the_model_their_replays_read() -> None:
+    """The graphs keep the model whose weights their replays read for as long as
+    they live, with no other reference to it."""
+    device = torch.device("cuda")
+    model = small_model().to(device)
+    model_reference = weakref.ref(model)
+    graphs = SpeechTokenizerCudaGraphs(model, device)
+    del model
+    gc.collect()
+
+    assert model_reference() is not None
+    del graphs
+    gc.collect()
+    assert model_reference() is None

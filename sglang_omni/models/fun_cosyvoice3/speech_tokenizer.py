@@ -262,6 +262,8 @@ class SpeechTokenizerCudaGraphs:
     time and copy their codes out before the next."""
 
     def __init__(self, model: SpeechTokenizerV3Model, device: torch.device) -> None:
+        # note (ratish): the graphs read the model's parameters and buffers in place.
+        self.model = model
         self.widths = [
             *generate_prefill_cuda_graph_batch_sizes(MAX_FRAMES - 1),
             MAX_FRAMES,
