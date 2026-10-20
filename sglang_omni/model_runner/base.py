@@ -7,6 +7,7 @@ pass, sampling, logit post-processing, and output extraction.
 
 from __future__ import annotations
 
+import time
 from collections import Counter
 from collections.abc import Mapping
 from contextlib import AbstractContextManager
@@ -20,6 +21,7 @@ from sglang_omni.model_runner.model_worker import ModelWorker
 from sglang_omni.model_runner.prefill_inputs import clear_omni_prefill_inputs
 from sglang_omni.model_runner.sglang_execution import SGLangExecutionBridge
 from sglang_omni.platforms import current_platform
+from sglang_omni.profiler.step_phases import STEP_PHASES
 from sglang_omni.sampling.seed import (
     SAMPLING_SEED_MASK,
     derive_sampling_seed,
@@ -259,7 +261,12 @@ class ModelRunner(Generic[RequestDataInput]):
             result, "_host_token_ids_event", None
         )  # noqa: leading-underscore  # upstream spelling, or the public name is already taken
         if event is not None:
-            event.synchronize()
+            if STEP_PHASES is not None:
+                start = time.perf_counter()
+                event.synchronize()
+                STEP_PHASES.wait("ids", time.perf_counter() - start)
+            else:
+                event.synchronize()
             result._host_token_ids_event = None  # noqa: leading-underscore  # upstream spelling, or the public name is already taken
         else:
             pass
@@ -525,9 +532,18 @@ class ModelRunner(Generic[RequestDataInput]):
             pass
         if pending.event.query():
             self.async_query_hit += 1
+            if STEP_PHASES is not None:
+                STEP_PHASES.wait("step_ready", 0.0)
+            else:
+                pass
         else:
+            start = time.perf_counter()
             pending.event.synchronize()
             self.async_query_miss += 1
+            if STEP_PHASES is not None:
+                STEP_PHASES.wait("step_waited", time.perf_counter() - start)
+            else:
+                pass
         # Skip reqs finished or retracted in a prior (lagged) step so _finalize
         # neither re-emits nor re-frees their KV (mirrors _resolve_and_process).
         skip_rids = {
