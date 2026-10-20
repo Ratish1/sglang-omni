@@ -84,6 +84,7 @@ from sglang_omni.models.fun_cosyvoice3.request_builders import (
 )
 from sglang_omni.models.fun_cosyvoice3.solve_graph_capture import (
     SolveGraphCapture,
+    cudnn_autotune,
     row_tiers,
 )
 from sglang_omni.models.fun_cosyvoice3.streaming import (
@@ -520,6 +521,7 @@ class FlowCudaGraphRunner:
             current_platform.graph_capture_attention(),
             self.device_module.device(self.device),
             self.device_module.stream(stream),
+            cudnn_autotune(),
         ):
             self.pool = graph_backend.graph_pool_handle()
             for batch_size, mel_frame in capture_shapes:
