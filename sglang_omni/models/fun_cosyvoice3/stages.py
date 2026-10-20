@@ -48,6 +48,7 @@ from sglang_omni.models.fun_cosyvoice3.causal_conv import (
     FusedConvPositionEmbedding,
 )
 from sglang_omni.models.fun_cosyvoice3.config import reject_conflicting_dit_accelerators
+from sglang_omni.models.fun_cosyvoice3.engine_builder import FunCosyVoice3EngineBuilder
 from sglang_omni.models.fun_cosyvoice3.flow_estimator_trt import (
     execute_flow_estimator,
     is_flow_estimator_trt,
@@ -70,8 +71,11 @@ from sglang_omni.models.fun_cosyvoice3.packed_dit import (
 )
 from sglang_omni.models.fun_cosyvoice3.payload_types import FunCosyVoice3State
 from sglang_omni.models.fun_cosyvoice3.prefix_cache import (
+    BLOCK_FRAMES,
     PrefixCacheRow,
     PrefixKVPool,
+    compile_forward_prefix,
+    forward_prefix,
     grow_rows,
     release_rows,
     solve_flow_euler_prefix,
@@ -128,6 +132,9 @@ CAUSAL_CONV_CACHE_PATCHED = False
 FLOW_CUDA_GRAPH_FRAME_BUCKET = 16
 # note(ratish): the Flow's Euler steps per solve, CosyVoice's n_timesteps.
 FLOW_EULER_STEPS = 10
+# note (ratish): the throwaway prefix pool the prefix graphs are measured on, 4 blocks:
+# a first warmup hop for both CFG twins at the default hop.
+DRY_PREFIX_POOL_GB = 0.25
 # Note (chenyang):
 # Mel-frame step size for buffered flow CUDA Graph keys. Capture shapes
 # must use a T that is a multiple of this step size. For example, 489
@@ -1566,8 +1573,12 @@ def build_prefix_pool(
     flow: FunCosyVoice3Flow,
     device: torch.device,
     dtype: torch.dtype,
-    budget_gb: float,
-) -> PrefixKVPool:
+    *,
+    size_gb: float | None,
+    reserve_bytes: int,
+) -> PrefixKVPool | None:
+    """The pool at size_gb, or when None at the memory this process can still take
+    minus reserve_bytes; None when that holds no block."""
     estimator = flow.decoder.estimator
     attention = estimator.transformer_blocks[0].attn
     layer_num = len(estimator.transformer_blocks)
@@ -1580,23 +1591,39 @@ def build_prefix_pool(
         head_dim=head_dim,
         dtype=dtype,
     )
-    # Note (Jiaxin Deng): built before the AR engine sizes its KV pool from free
-    # memory, so a quarter of the device is the ceiling.
-    device_bytes = torch.cuda.get_device_properties(device).total_memory
-    budget_bytes = min(float(budget_gb) * 2**30, 0.25 * device_bytes)
+    if size_gb is None:
+        # note (ratish): a stage with a declared footprint caps this process's
+        # allocator below the device's free memory.
+        torch.cuda.empty_cache()
+        free_bytes, total_bytes = torch.cuda.mem_get_info(device)
+        cap_bytes = torch.cuda.get_per_process_memory_fraction(device) * total_bytes
+        under_cap_bytes = cap_bytes - torch.cuda.memory_reserved(device)
+        budget_bytes = min(free_bytes, under_cap_bytes) - reserve_bytes
+    else:
+        budget_bytes = size_gb * 2**30
+    capacity_frames = int(budget_bytes // bytes_per_frame)
+    if capacity_frames < BLOCK_FRAMES:
+        logger.warning(
+            f"Fun-CosyVoice3 Flow prefix cache off: {budget_bytes / 2**30:.2f} GB "
+            f"left after the {reserve_bytes / 2**30:.2f} GB reserve"
+        )
+        return None
+    else:
+        pass
     pool = PrefixKVPool(
         layer_num=layer_num,
         euler_steps=FLOW_EULER_STEPS,
         head_num=head_num,
         head_dim=head_dim,
-        capacity_frames=int(budget_bytes // bytes_per_frame),
+        capacity_frames=capacity_frames,
         device=device,
         dtype=dtype,
     )
     logger.info(
         f"Fun-CosyVoice3 Flow prefix cache: {pool.free_frames} frames "
         f"({pool.free_frames * bytes_per_frame / 2**30:.1f} GB, "
-        f"{bytes_per_frame} bytes per frame)"
+        f"{bytes_per_frame} bytes per frame, size_gb={size_gb}, "
+        f"reserve {reserve_bytes / 2**30:.2f} GB)"
     )
     return pool
 
@@ -1629,10 +1656,6 @@ def create_sglang_tts_engine_executor(
     onnx_intra_op_threads: int = 16,
     token_hop_len: int = TOKEN_HOP_LEN,
 ) -> OmniScheduler[CosyVoice3SGLangRequestData]:
-    from sglang_omni.models.fun_cosyvoice3.engine_builder import (
-        FunCosyVoice3EngineBuilder,
-    )
-
     return FunCosyVoice3EngineBuilder(
         token_hop_len=token_hop_len,
         onnx_intra_op_threads=onnx_intra_op_threads,
@@ -2378,7 +2401,8 @@ def create_vocoder_executor(
     token_hop_len: int = TOKEN_HOP_LEN,
     token_max_hop_len: int = TOKEN_MAX_HOP_LEN,
     disable_hop_growth: bool = False,
-    flow_prefix_cache_gb: float,
+    flow_prefix_cache_gb: float | None,
+    flow_prefix_cache_reserve_gb: float,
 ) -> FunCosyVoice3StreamingVocoderScheduler:
     from sglang_omni.models.fun_cosyvoice3.streaming_vocoder import (
         FunCosyVoice3StreamingVocoderScheduler,
@@ -2388,8 +2412,12 @@ def create_vocoder_executor(
         raise ValueError("flow_batch_admission_frames must be greater than zero")
     else:
         pass
-    if flow_prefix_cache_gb < 0:
+    if flow_prefix_cache_gb is not None and flow_prefix_cache_gb < 0:
         raise ValueError("flow_prefix_cache_gb must be >= 0")
+    else:
+        pass
+    if flow_prefix_cache_reserve_gb < 0:
+        raise ValueError("flow_prefix_cache_reserve_gb must be >= 0")
     else:
         pass
 
@@ -2453,18 +2481,13 @@ def create_vocoder_executor(
     else:
         pass
 
-    if (
-        flow_prefix_cache_gb > 0
+    has_prefix_pool = (
+        (flow_prefix_cache_gb is None or flow_prefix_cache_gb > 0)
         and device_obj.type == "cuda"
         and flow.packed_estimator is not None
         and flow.packed_estimator.is_ragged
         and autocast_dtype in (torch.float16, torch.bfloat16)
-    ):
-        flow.prefix_pool = build_prefix_pool(
-            flow, device_obj, autocast_dtype, flow_prefix_cache_gb
-        )
-    else:
-        pass
+    )
 
     if enable_flow_cuda_graph:
         capture_shapes = verify_flow_cuda_graph_capture_shapes(
@@ -2529,7 +2552,7 @@ def create_vocoder_executor(
         scheduler.warmup_packed_dit_compile()
     else:
         pass
-    has_prefix_graphs = enable_flow_prefix_cuda_graph and flow.prefix_pool is not None
+    has_prefix_graphs = enable_flow_prefix_cuda_graph and has_prefix_pool
     # note(ratish): sglang's ladder starts at 4 frames, so a smaller admission budget
     # has no tier and every final keeps the eager solve.
     whole_history_tier_frames = generate_prefill_cuda_graph_batch_sizes(
@@ -2575,26 +2598,6 @@ def create_vocoder_executor(
         )
     else:
         pass
-    if has_prefix_graphs:
-        assert flow.packed_estimator is not None
-        prefix_cuda_graph_runner = PrefixCudaGraphRunner(
-            flow.packed_estimator,
-            flow.prefix_pool,
-            graphs=solve_graphs,
-            frame_dtype=conditioning.noisy_mel.dtype,
-            speaker_dtype=conditioning.speaker_embedding.dtype,
-            cfg_rate=flow.decoder.inference_cfg_rate,
-            mel_channels=flow.output_size,
-            speaker_channels=flow.spk_embed_affine_layer.out_features,
-            max_rows=max_batch_size,
-            hop_frames=longest_hop_tokens * token_mel_ratio,
-            min_hop_frames=token_hop_len * token_mel_ratio,
-            max_frames=flow.decoder.rand_noise.shape[2],
-        )
-        prefix_cuda_graph_runner.capture()
-        flow.prefix_cuda_graph_runner = prefix_cuda_graph_runner
-    else:
-        pass
     if has_whole_history_graphs:
         assert flow.packed_estimator is not None
         whole_history_cuda_graph_runner = WholeHistoryCudaGraphRunner(
@@ -2624,6 +2627,107 @@ def create_vocoder_executor(
         )
         hift_decode_cuda_graph_runner.capture()
         vocoder.hift_decode_cuda_graph_runner = hift_decode_cuda_graph_runner
+    else:
+        pass
+
+    def make_prefix_runner(
+        pool: PrefixKVPool, graphs: SolveGraphCapture
+    ) -> PrefixCudaGraphRunner:
+        assert flow.packed_estimator is not None
+        return PrefixCudaGraphRunner(
+            flow.packed_estimator,
+            pool,
+            graphs=graphs,
+            frame_dtype=conditioning.noisy_mel.dtype,
+            speaker_dtype=conditioning.speaker_embedding.dtype,
+            cfg_rate=flow.decoder.inference_cfg_rate,
+            mel_channels=flow.output_size,
+            speaker_channels=flow.spk_embed_affine_layer.out_features,
+            max_rows=max_batch_size,
+            hop_frames=longest_hop_tokens * token_mel_ratio,
+            min_hop_frames=token_hop_len * token_mel_ratio,
+            max_frames=flow.decoder.rand_noise.shape[2],
+        )
+
+    if has_prefix_pool:
+        assert flow.packed_estimator is not None
+        is_prefix_compiled = flow.packed_estimator.is_compiled
+        # note (ratish): one compiled callable for the throwaway pool and the real
+        # one, so the real pool reuses what compiled on the throwaway one.
+        if is_prefix_compiled:
+            prefix_forward = compile_forward_prefix()
+        else:
+            prefix_forward = forward_prefix
+        if flow_prefix_cache_gb is None:
+            # note (ratish): the pool takes what is free, so it leaves the largest step
+            # the scheduler admits: max_batch_size rows, each at most the AR's context.
+            step_bytes = scheduler.measure_peak_step_bytes(
+                device_obj,
+                rows=max_batch_size,
+                tokens=FunCosyVoice3EngineBuilder.context_length,
+            )
+            if has_prefix_graphs:
+                # note (ratish): the prefix graphs capture after the pool they read, so
+                # their memory is measured first on a throwaway pool and graph pool.
+                flow.prefix_pool = build_prefix_pool(
+                    flow,
+                    device_obj,
+                    autocast_dtype,
+                    size_gb=DRY_PREFIX_POOL_GB,
+                    reserve_bytes=0,
+                )
+                assert flow.prefix_pool is not None
+                flow.prefix_pool.forward = prefix_forward
+                if is_prefix_compiled:
+                    scheduler.warmup_prefix_compile()
+                else:
+                    pass
+                torch.cuda.empty_cache()
+                free_bytes = torch.cuda.mem_get_info(device_obj)[0]
+                dry_prefix_runner = make_prefix_runner(
+                    flow.prefix_pool,
+                    SolveGraphCapture(
+                        graph_backend, device=device_obj, autocast_dtype=autocast_dtype
+                    ),
+                )
+                dry_prefix_runner.capture()
+                torch.cuda.empty_cache()
+                prefix_graph_bytes = free_bytes - torch.cuda.mem_get_info(device_obj)[0]
+                del dry_prefix_runner
+                flow.prefix_pool = None
+            else:
+                prefix_graph_bytes = 0
+            serving_bytes = int(flow_prefix_cache_reserve_gb * 2**30)
+            logger.info(
+                f"Fun-CosyVoice3 Flow prefix cache reserve: step "
+                f"{step_bytes / 2**30:.2f} GB, prefix graphs "
+                f"{prefix_graph_bytes / 2**30:.2f} GB, serving "
+                f"{serving_bytes / 2**30:.2f} GB"
+            )
+            reserve_bytes = step_bytes + prefix_graph_bytes + serving_bytes
+        else:
+            reserve_bytes = 0
+        flow.prefix_pool = build_prefix_pool(
+            flow,
+            device_obj,
+            autocast_dtype,
+            size_gb=flow_prefix_cache_gb,
+            reserve_bytes=reserve_bytes,
+        )
+        if flow.prefix_pool is not None:
+            flow.prefix_pool.forward = prefix_forward
+            if is_prefix_compiled:
+                scheduler.warmup_prefix_compile()
+            else:
+                pass
+        else:
+            pass
+    else:
+        pass
+    if has_prefix_graphs and flow.prefix_pool is not None:
+        prefix_cuda_graph_runner = make_prefix_runner(flow.prefix_pool, solve_graphs)
+        prefix_cuda_graph_runner.capture()
+        flow.prefix_cuda_graph_runner = prefix_cuda_graph_runner
     else:
         pass
     scheduler.warmup_now()
