@@ -189,6 +189,7 @@ def main() -> None:
                 subprocess.run([sys.executable, str(KIT / "gpu_metrics_window.py"), str(outs[arm] / "metrics.sqlite"),
                                 "--bench-log", str(outs[arm] / "bench.log")], cwd=KIT, stdout=metrics,
                                stderr=subprocess.STDOUT, check=False)
+            (outs[arm] / "metrics.sqlite").unlink(missing_ok=True)
         print("metrics read", flush=True)
     else:
         pass
