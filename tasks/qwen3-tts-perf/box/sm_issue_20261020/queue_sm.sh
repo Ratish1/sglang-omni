@@ -20,7 +20,7 @@ echo "queue sm start $(date +%T) marks $(git -C $T rev-parse HEAD) tree $(git -C
   && nsys export --type sqlite --force-overwrite=true -o $D/known/known.sqlite $D/known/known.nsys-rep > export.log 2>&1 \
   && python3 $S/known_answer_ranges.py $D/known/known.sqlite > $D/known/known_answers.txt 2>&1)
 echo "known rc $? $(date +%T)" >> $L
-PORT=25000
+PORT=11000
 for C in 16 64; do
   OUT=$D/metrics_c$C
   NSYS_ARGS="--trace=cuda,nvtx --cuda-graph-trace=graph --sample=none --cpuctxsw=none --gpu-metrics-devices=0 --gpu-metrics-set=gh100" \
