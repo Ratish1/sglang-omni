@@ -519,6 +519,22 @@ def test_fused_transformer_tracks_fp32_as_closely_as_the_plain_step() -> None:
             for state in states.values():
                 state.advance(width)
 
+    compiled = torch.compile(fused.__call__, dynamic=False, fullgraph=True)
+    states = {
+        name: Qwen3TTSIncrementalCodecState(frame_positions=starts.clone())
+        for name in ("reference", "plain", "compiled")
+    }
+    inputs = torch.randn(3, 8, 1024, device="cuda")
+    with torch.no_grad():
+        expected = incremental_transformer(reference, inputs, states["reference"])
+        plain_output = incremental_transformer(
+            plain, inputs.bfloat16(), states["plain"]
+        )
+        compiled_output = compiled(inputs.bfloat16(), states["compiled"])
+    assert relative_error(compiled_output, expected) <= 1.1 * relative_error(
+        plain_output, expected
+    )
+
 
 def test_incremental_codec_state_clone_owns_tensor_storage() -> None:
     state = Qwen3TTSIncrementalCodecState(

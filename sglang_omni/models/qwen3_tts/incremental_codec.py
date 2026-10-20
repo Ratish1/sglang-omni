@@ -29,6 +29,7 @@ if TYPE_CHECKING:
         Qwen3TTSTokenizerV2Decoder,
         Qwen3TTSTokenizerV2DecoderAttention,
         Qwen3TTSTokenizerV2DecoderDecoderResidualUnit,
+        Qwen3TTSTokenizerV2DecoderRMSNorm,
         Qwen3TTSTokenizerV2DecoderTransformerModel,
     )
 else:
@@ -597,6 +598,21 @@ class FusedIncrementalTransformer:
             mlp.gate_proj.weight.data = mlp.gate_up_weight[: mlp.intermediate_size]
             mlp.up_proj.weight.data = mlp.gate_up_weight[mlp.intermediate_size :]
 
+    @staticmethod
+    def normalize(
+        hidden_states: torch.Tensor, norm: "Qwen3TTSTokenizerV2DecoderRMSNorm"
+    ) -> torch.Tensor:
+        # note (ratish): the precompiled shapes trace SGLang's pure-torch RMSNorm, as SGLang's
+        # torch.compile mode does; its device kernel's dispatch cannot be traced.
+        if torch.compiler.is_dynamo_compiling():
+            normalized = hidden_states.float()
+            normalized = normalized * torch.rsqrt(
+                normalized.pow(2).mean(dim=-1, keepdim=True) + norm.variance_epsilon
+            )
+            return (normalized * norm.weight).to(hidden_states.dtype)
+        else:
+            return rmsnorm(hidden_states, norm.weight, norm.variance_epsilon)
+
     def __call__(
         self,
         hidden_states: torch.Tensor,
@@ -641,11 +657,7 @@ class FusedIncrementalTransformer:
             attention = layer.self_attn
             head_dim = int(attention.head_dim)
             residual = hidden_states
-            normalized = rmsnorm(
-                hidden_states,
-                layer.input_layernorm.weight,
-                layer.input_layernorm.variance_epsilon,
-            )
+            normalized = self.normalize(hidden_states, layer.input_layernorm)
             query, key, value = F.linear(normalized, attention.qkv_weight).split(
                 [
                     attention.q_proj.out_features,
@@ -686,12 +698,13 @@ class FusedIncrementalTransformer:
                 ),
             )
             residual = hidden_states
-            normalized = rmsnorm(
-                hidden_states,
-                layer.post_attention_layernorm.weight,
-                layer.post_attention_layernorm.variance_epsilon,
-            )
-            activated = silu_and_mul(F.linear(normalized, layer.mlp.gate_up_weight))
+            normalized = self.normalize(hidden_states, layer.post_attention_layernorm)
+            gate_up = F.linear(normalized, layer.mlp.gate_up_weight)
+            if torch.compiler.is_dynamo_compiling():
+                gate, up = gate_up.chunk(2, dim=-1)
+                activated = F.silu(gate) * up
+            else:
+                activated = silu_and_mul(gate_up)
             hidden_states = torch.addcmul(
                 residual,
                 layer.mlp_layer_scale.scale,
@@ -711,9 +724,7 @@ class FusedIncrementalTransformer:
 
         state.transformer_keys = next_keys
         state.transformer_values = next_values
-        hidden_states = rmsnorm(
-            hidden_states, transformer.norm.weight, transformer.norm.variance_epsilon
-        )
+        hidden_states = self.normalize(hidden_states, transformer.norm)
         return transformer.output_proj(
             hidden_states.view(batch_size, fresh_frames, hidden_size)
         )
