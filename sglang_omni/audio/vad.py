@@ -45,15 +45,19 @@ class SpeechProbabilityModel(Protocol):
     def reset(self) -> None: ...
 
 
+def silero_model():
+    # note (ratish): importing silero_vad sets torch to one intra-op thread for
+    # the process, so only the process that runs the model imports it.
+    from silero_vad import load_silero_vad
+
+    return load_silero_vad(onnx=True)
+
+
 class SileroSpeechModel:
     """Per-frame speech probability. Holds no turn state, only the RNN's."""
 
     def __init__(self) -> None:
-        # note (ratish): importing silero_vad sets torch to one intra-op thread
-        # for the process, so only the process that runs the model imports it.
-        from silero_vad import load_silero_vad
-
-        self.model = load_silero_vad(onnx=True)
+        self.model = silero_model()
 
     def predict(self, frame: np.ndarray, sample_rate: int) -> float:
         with torch.inference_mode():
@@ -182,7 +186,7 @@ class StreamingVAD:
 
     def __init__(self, config: VADConfig | None = None) -> None:
         self.config = config or VADConfig()
-        self.vad_model = load_silero_vad(onnx=True)
+        self.vad_model = silero_model()
         self.leftover_pcm = bytearray()
         self.samples_consumed = 0
         self.is_speech = False
