@@ -112,7 +112,6 @@ from sglang_omni.scheduling.generation_batch_policy import (
 )
 from sglang_omni.scheduling.message import IncomingMessage, OutgoingMessage
 from sglang_omni.scheduling.omni_scheduler import OmniScheduler
-from sglang_omni.scheduling.pending_text_queue import PendingTextTensorQueue
 from sglang_omni.scheduling.sglang_backend.server_args_builder import (
     build_sglang_server_args,
 )
@@ -8323,12 +8322,13 @@ def test_qwen3_tts_request_data_keeps_decode_tensors_on_prepared_device(
     assert data.prompt_input_embeds is prepared.prompt_input_embeds
     assert data.prefill_input_embeds is prepared.prompt_input_embeds
     assert data.ref_code is prepared.ref_code
-    assert data.tts_pad_embed is prepared.tts_pad_embed
     assert data.stream_codec_output is True
-    assert isinstance(data.pending_text_queue, PendingTextTensorQueue)
-    assert data.pending_text_queue.rows is not None
-    assert data.pending_text_queue.rows.device == prepared.trailing_text_hidden.device
-    assert data.pending_text_queue.rows.dtype == prepared.trailing_text_hidden.dtype
+    assert torch.equal(
+        data.text_rows,
+        torch.cat(
+            (prepared.trailing_text_hidden, prepared.tts_pad_embed.reshape(1, -1))
+        ),
+    )
     assert isinstance(data.semantic_sampling_seed, int)
     assert 0 <= data.semantic_sampling_seed <= 0x7FFFFFFF
     assert data.req.sampling_params.sampling_seed is None
@@ -9056,6 +9056,7 @@ def test_qwen3_tts_collect_codes_excludes_semantic_eos(
         output_codes=torch.tensor([[1, 2], [3, 4]], dtype=torch.long),
         output_embeds=torch.tensor([[0.1, 0.2], [0.3, 0.4]]),
     )
+    runner.feedback_pool = torch.zeros(4, 2)
     result = SimpleNamespace(
         next_token_ids=torch.tensor([7, 42], dtype=torch.long),
         logits_output=SimpleNamespace(hidden_states=torch.ones((2, 4))),
@@ -9064,6 +9065,7 @@ def test_qwen3_tts_collect_codes_excludes_semantic_eos(
     forward_batch = SimpleNamespace(
         forward_mode=SimpleNamespace(is_decode=lambda: True),
         positions=torch.tensor([3, 3], dtype=torch.long),
+        req_pool_indices=torch.tensor([1, 2]),
     )
     requests = [
         SimpleNamespace(
@@ -9096,9 +9098,7 @@ def test_qwen3_tts_collect_codes_excludes_semantic_eos(
 
     assert [chunk.tolist() for chunk in requests[0].data.output_codes] == [[1, 2]]
     assert requests[0].data.latest_stream_code_chunk.tolist() == [1, 2]
-    assert len(requests[0].data.pending_feedback_queue) == 1
     assert requests[1].data.output_codes == []
-    assert len(requests[1].data.pending_feedback_queue) == 0
 
     runner.post_process_outputs(result, SimpleNamespace(requests=requests), {})
     assert len(requests[0].data.output_codes) == 1
@@ -9118,6 +9118,8 @@ def test_qwen3_tts_steady_decode_reports_cuda_graph_ready(
         forward_mode=SimpleNamespace(is_decode=lambda: True),
         positions=torch.tensor([0]),
         mrope_positions=None,
+        req_pool_indices=torch.tensor([1]),
+        seq_lens_cpu=torch.tensor([5]),
     )
     monkeypatch.setattr(
         forward_batch_info.ForwardBatch,
@@ -9176,17 +9178,18 @@ def test_qwen3_tts_steady_decode_reports_cuda_graph_ready(
     runner.device = torch.device("cpu")
     runner.row_ids_cache = None
     runner.model = runner.tp_worker.model_runner.model
+    runner.feedback_pool = torch.zeros(2, 4)
+    runner.feedback_pool[1] = torch.ones(4)
     runner.bind_execution_bridge(FakeExecutionBridge())
 
     data = SimpleNamespace(
         req=SimpleNamespace(
             sampling_params=SimpleNamespace(repetition_penalty=1.0),
             inflight_middle_chunks=0,
+            origin_input_ids=[0, 0, 0, 0],
         ),
         output_codes=[],
-        pending_feedback_queue=[torch.ones(4)],
-        pending_text_queue=[torch.zeros(4)],
-        decode_input_embeds=[],
+        text_rows=torch.zeros(2, 4),
         generation_steps=0,
         extra_model_outputs={},
     )
@@ -10621,7 +10624,9 @@ def test_qwen3_tts_request_builder_consumes_prepared_payload(
     assert data.req.origin_input_ids == [11, 12, 13, 14, 15]
     assert data.max_new_tokens == 8
     assert data.req.sampling_params.top_k == 7
-    assert torch.equal(data.pending_text_queue.rows, prepared.trailing_text_hidden)
+    assert torch.equal(
+        data.text_rows[:-1], prepared.trailing_text_hidden.to(data.text_rows.dtype)
+    )
     assert not [key for key in payload.data if key.startswith("prepared_")]
 
 
