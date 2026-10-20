@@ -17,7 +17,8 @@
 # usage (in the container): [PEER=<other out>] [EXTRA_PATH=<dir>] bash cosy_profile_run_c20261020.sh <tree> <card>
 #   <cpus> <port> <out>
 TREE=$1 CARD=$2 CPUS=$3 PORT=$4 R=$5
-IN=/data/c20261020/in
+# The scripts and the probe come from the checkout of prof/cosyvoice3-trace-marks this file sits in.
+IN=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 MODEL=FunAudioLLM/Fun-CosyVoice3-0.5B-2512
 SESSION=cosyprof_$CARD
 mkdir -p $R
