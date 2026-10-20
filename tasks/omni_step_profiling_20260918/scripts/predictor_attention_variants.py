@@ -1,7 +1,10 @@
 """The code predictor's step with decode attention variants swapped into the fused layer of the tree on PYTHONPATH
 (perf/qwen3-tts-predictor-triton-attention), one process, step replay per variant and batch.
 
-usage: PYTHONPATH=<P6 tree> python3 predictor_attention_variants.py [--batch 1 16 64]
+usage: PYTHONPATH=<P6 tree> python3 predictor_attention_variants.py [--batch 1 16 64] [--variant NAME]
+
+Only the first variant a process times is comparable at batch 1 (later ones in the same process ran 0.15 ms slower
+per step, the same kernels included), so a comparison runs one variant per process with --variant.
 
 Variants with o_proj under PDL as the branch launches it: p6 (the branch's kernel, one program per row and q head,
 releasing o_proj right after its wait), p6 released at end (the same, releasing after its store), grouped released at
@@ -178,6 +181,7 @@ def plain_o_proj_add(*, attention_output, tokens_per_row, weight, residual_in, r
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--batch", type=int, nargs="+", default=[1, 16, 64])
+    parser.add_argument("--variant", default=None)
     args = parser.parse_args()
     device = torch.device("cuda")
     pdl_o_proj_add = predictor_layers.o_proj_add
@@ -191,6 +195,10 @@ def main() -> None:
     }
     with torch.inference_mode():
         for name, (attention, o_proj) in variants.items():
+            if args.variant is not None and name != args.variant:
+                continue
+            else:
+                pass
             predictor_layers.decode_attention = attention
             predictor_layers.o_proj_add = o_proj
             print(f"== {name}", flush=True)
