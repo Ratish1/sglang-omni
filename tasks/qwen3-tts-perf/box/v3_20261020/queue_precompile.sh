@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # V3's startup regression (about 60 s per boot, warm cache included, inside the codec runner phases): per served
 # shape, the first eager decode and the precompile on main and on V3, each twice on its own fresh inductor cache so
-# the first process is a cold boot and the second a warm one. Runs alone on card 0 between queue_v3.sh and
-# queue_v5.sh, since a compile's CPU load would perturb a pair.
+# the first process is a cold boot and the second a warm one. Then the talker's dense GEMMs at the served row counts
+# against their weight floors (main). Runs alone on card 0 between queue_v3.sh and queue_v5.sh, since a compile's CPU
+# load would perturb a pair.
 set -u
 D=/data/v3_20261020
 T=${T:-/workspace/t_marks}
@@ -21,4 +22,6 @@ for TREE in $M $V3; do
     echo "precompile $NAME $PASS rc $? $(grep -h '^total' $D/precompile/${NAME}_$PASS.txt) $(date +%T)" >> $L
   done
 done
+(cd $M && PYTHONPATH=$M timeout 900 python3 $S/talker_gemm_bench.py > $D/talker_gemm_bench.txt 2>&1)
+echo "talker gemm bench rc $? $(date +%T)" >> $L
 echo "queue_precompile_done $(date +%T)" >> $L
