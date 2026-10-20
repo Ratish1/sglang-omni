@@ -9,6 +9,11 @@ T=${T:-/workspace/t_marks}
 S=$T/tasks/omni_step_profiling_20260918/scripts
 L=$D/queue.log
 until grep -q queue_v5_done $L; do sleep 30; done
+# note (ratish): v5_c16_a's arm a transcription found port 9400 held by a listener outside both containers.
+(cd /workspace/v3_6f6039ba6 && PYTHONPATH=/workspace/v3_6f6039ba6 SGLANG_OMNI_STRICT_PORT=1 timeout 1800 python3 -m \
+  benchmarks.eval.benchmark_tts_seedtts --model Qwen/Qwen3-TTS-12Hz-1.7B-Base --transcribe-only --lang en --port 31400 \
+  --output-dir $D/pairs/v5_c16_a/a/bench > $D/pairs/v5_c16_a/a/score--transcribe-only.log 2>&1)
+echo "rescored v5_c16_a a rc $? $(date +%T)" >> $L
 for TREE in /workspace/v3_6f6039ba6 /workspace/v5_a962e3db6; do
   (cd $TREE && PYTHONPATH=$TREE timeout 1200 python3 $S/codec_paths_dump.py $D/codec_paths_$(basename $TREE).pt \
     > $D/codec_paths_$(basename $TREE).txt 2>&1)

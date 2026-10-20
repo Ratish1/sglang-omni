@@ -29,8 +29,8 @@ run_pair() {
   echo "$1 rc $? $(date +%T) capture or compile failures a $(grep -ciE 'capture_failed|capture disabled|Unsupported:' $D/pairs/$1/a/serve.log) b $(grep -ciE 'capture_failed|capture disabled|Unsupported:' $D/pairs/$1/b/serve.log)" >> $L
 }
 run_pair p6_c1 1 0 1 7000
-run_pair p6_c16_a 16 0 1 9000 --gpu-metrics
-run_pair p6_c16_b 16 1 0 11000 --gpu-metrics
+run_pair p6_c16_a 16 0 1 13000 --gpu-metrics
+run_pair p6_c16_b 16 1 0 18500 --gpu-metrics
 run_pair p6_c64_a 64 0 1 22000 --gpu-metrics
 run_pair p6_c64_b 64 1 0 30000 --gpu-metrics
 python3 $IN/pair_table.py p6_c1 p6_c16_a p6_c16_b p6_c64_a p6_c64_b > $D/table_p6.txt 2>&1

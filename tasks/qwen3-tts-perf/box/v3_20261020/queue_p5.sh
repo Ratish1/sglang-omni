@@ -28,8 +28,8 @@ run_pair() {
   echo "$1 rc $? $(date +%T) $(grep -h 'byte identical' $D/$1.out) capture or compile failures a $(grep -ciE 'capture_failed|capture disabled|Unsupported:' $D/pairs/$1/a/serve.log) b $(grep -ciE 'capture_failed|capture disabled|Unsupported:' $D/pairs/$1/b/serve.log)" >> $L
 }
 run_pair p5_c1_seed 1 0 1 7000 "--seed 1234"
-run_pair p5_c16_a 16 0 1 9000 --gpu-metrics
-run_pair p5_c16_b 16 1 0 11000 --gpu-metrics
+run_pair p5_c16_a 16 0 1 13000 --gpu-metrics
+run_pair p5_c16_b 16 1 0 18500 --gpu-metrics
 run_pair p5_c64_a 64 0 1 22000 --gpu-metrics
 run_pair p5_c64_b 64 1 0 30000 --gpu-metrics
 python3 $IN/pair_table.py p5_c1_seed p5_c16_a p5_c16_b p5_c64_a p5_c64_b > $D/table_p5.txt 2>&1
