@@ -2,9 +2,15 @@
 
 from __future__ import annotations
 
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from sglang.srt.arg_groups.cuda_graph_hook import (
+    generate_prefill_cuda_graph_batch_sizes,
+)
+from sglang.srt.arg_groups.model_override_base import resolved_view
+from sglang.srt.server_args import ServerArgs
 
 import sglang_omni.models.fun_cosyvoice3.engine_builder as engine_builder_module
 from sglang_omni.models.fun_cosyvoice3.engine_builder import FunCosyVoice3EngineBuilder
@@ -12,6 +18,10 @@ from sglang_omni.scheduling.generation_batch_policy import (
     CudaGraphBackend,
     build_generation_batch_overrides,
 )
+from sglang_omni.scheduling.sglang_backend.server_args_builder import (
+    build_sglang_server_args,
+)
+from tests.unit_test.fixtures.mini_checkpoint import write_mini_llama_checkpoint
 
 
 def test_torch_mps_uses_single_request_native_attention() -> None:
@@ -76,3 +86,55 @@ def test_prefill_replays_from_full_graphs_only_on_cuda(
     )
     assert CudaGraphBackend.FULL in builder.allowed_prefill_cuda_graph_backends()
     assert builder.supports_breakable_prefill_cuda_graph
+
+
+def resolved_cuda_server_args(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    server_args_overrides: dict[str, object],
+) -> ServerArgs:
+    monkeypatch.setattr(
+        engine_builder_module, "current_platform", SimpleNamespace(is_cuda=lambda: True)
+    )
+    checkpoint = write_mini_llama_checkpoint(tmp_path)
+    builder = FunCosyVoice3EngineBuilder()
+    builder.device = "cuda:0"
+    builder.server_args_overrides = {
+        "attention_backend": "fa3",
+        **server_args_overrides,
+    }
+    overrides = build_generation_batch_overrides(
+        server_args_overrides=builder.server_args_overrides,
+        **builder.generation_defaults(dtype="bfloat16"),
+    )
+    builder.adjust_overrides(overrides)
+    server_args = build_sglang_server_args(
+        checkpoint, context_length=builder.context_length, device="cuda", **overrides
+    )
+    builder.customize_server_args(server_args)
+    return server_args
+
+
+@pytest.mark.parametrize("declared_ladder", [None, [4, 8]])
+def test_a_cached_prompts_one_token_prefill_has_a_graph_bucket(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, declared_ladder: list[int] | None
+) -> None:
+    server_args = resolved_cuda_server_args(
+        tmp_path,
+        monkeypatch,
+        (
+            {}
+            if declared_ladder is None
+            else {
+                "cuda_graph_bs_prefill": declared_ladder,
+                "cuda_graph_max_bs_prefill": 8,
+            }
+        ),
+    )
+    resolved = resolved_view(server_args)
+
+    assert resolved.cuda_graph_config.prefill.bs == (
+        [1, *generate_prefill_cuda_graph_batch_sizes(resolved.chunked_prefill_size)]
+        if declared_ladder is None
+        else declared_ladder
+    )
