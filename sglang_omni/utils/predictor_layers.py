@@ -156,6 +156,20 @@ if HAS_TRITON:
         return tl.load(W + cols[:, None] * K + (k0 + rk)[None, :])
 
     @triton.jit
+    def prefetch_weight_tile(W, cols, k0, K: tl.constexpr, BLOCK_K: tl.constexpr):
+        """Ask L2 for weight_tile's bf16 lines, one request per 128 bytes; nothing is
+        loaded into registers."""
+        lines = W + cols[:, None] * K + (k0 + tl.arange(0, BLOCK_K // 64) * 64)[None, :]
+        tl.inline_asm_elementwise(
+            "mov.u32 $0, 0;\n\tprefetch.global.L2 [$1];",
+            "=r,l",
+            [lines],
+            dtype=tl.int32,
+            is_pure=False,
+            pack=1,
+        )
+
+    @triton.jit
     def norm_qkv_rope_store_kernel(
         X,
         x_stride_row,
@@ -192,15 +206,27 @@ if HAS_TRITON:
         columns over the split's K range, with the rows' sum of squares alongside; the
         last program of the head sums the partials, applies the norm scale, then norms
         and rotates q and k; q to Q_OUT, k and v to the row's slot."""
-        if USE_GDC:
-            gdc_wait()
-        else:
-            pass
         head = tl.program_id(0)
         pid_s = tl.program_id(1)
         HALF: tl.constexpr = HEAD_DIM // 2
         N_TOTAL: tl.constexpr = (NUM_Q_HEADS + 2 * NUM_KV_HEADS) * HEAD_DIM
         BLOCKS_PER_SPLIT: tl.constexpr = K // BLOCK_K // SPLIT
+        if USE_GDC:
+            # note (ratish): the weights do not depend on the predecessor, so their lines
+            # stream into L2 while it finishes; the loads below then hit L2.
+            for block in range(
+                pid_s * BLOCKS_PER_SPLIT, (pid_s + 1) * BLOCKS_PER_SPLIT
+            ):
+                prefetch_weight_tile(
+                    W,
+                    head * HEAD_DIM + tl.arange(0, HEAD_DIM),
+                    block * BLOCK_K,
+                    K,
+                    BLOCK_K,
+                )
+            gdc_wait()
+        else:
+            pass
         rm = tl.arange(0, BLOCK_M)
         rh = tl.arange(0, HALF)
         rk = tl.arange(0, BLOCK_K)
@@ -348,18 +374,21 @@ if HAS_TRITON:
         """One program per output tile and K split: X against the tile's weight rows
         over the split's K range; the last program of the tile sums the partials in
         index order, rounds the product, then writes the rounded sum with RES_IN."""
-        if USE_GDC:
-            gdc_wait()
-        else:
-            pass
         pid_n = tl.program_id(0)
         pid_s = tl.program_id(1)
         HEADS_PER_SPLIT: tl.constexpr = K // D // SPLIT
+        cols = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+        if USE_GDC:
+            for head in range(pid_s * HEADS_PER_SPLIT, (pid_s + 1) * HEADS_PER_SPLIT):
+                for kk in tl.static_range(0, D, BLOCK_K):
+                    prefetch_weight_tile(W, cols, head * D + kk, K, BLOCK_K)
+            gdc_wait()
+        else:
+            pass
         rm = tl.arange(0, BLOCK_M)
         rk = tl.arange(0, BLOCK_K)
         row_mask = rm < rows
         rows_off = row_offsets(x_stride_row, x_stride_t, T, BLOCK_M)
-        cols = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
         acc = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
         for head in range(pid_s * HEADS_PER_SPLIT, (pid_s + 1) * HEADS_PER_SPLIT):
             for kk in tl.static_range(0, D, BLOCK_K):
@@ -428,17 +457,20 @@ if HAS_TRITON:
         """One program per activation tile: the weighted input against the tile's gate
         and up rows with the rows' sum of squares alongside, the norm scale applied to
         both products, both rounded, then silu(gate) * up rounded once."""
+        pid = tl.program_id(0)
+        gate_cols = pid * BLOCK_N + tl.arange(0, BLOCK_N)
+        up_cols = INTERMEDIATE + gate_cols
         if USE_GDC:
+            for block in range(0, K // BLOCK_K):
+                prefetch_weight_tile(W, gate_cols, block * BLOCK_K, K, BLOCK_K)
+                prefetch_weight_tile(W, up_cols, block * BLOCK_K, K, BLOCK_K)
             gdc_wait()
         else:
             pass
-        pid = tl.program_id(0)
         rm = tl.arange(0, BLOCK_M)
         rk = tl.arange(0, BLOCK_K)
         row_mask = rm < rows
         rows_off = row_offsets(x_stride_row, x_stride_t, T, BLOCK_M)
-        gate_cols = pid * BLOCK_N + tl.arange(0, BLOCK_N)
-        up_cols = INTERMEDIATE + gate_cols
         square = tl.zeros([BLOCK_M, BLOCK_M], dtype=tl.float32)
         acc_gate = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
         acc_up = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
