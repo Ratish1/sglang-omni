@@ -35,8 +35,10 @@ cat /proc/loadavg > "$OUT/loadavg_before.txt"
 LOADS=$!
 nvidia-smi dmon -i "$CARD" -s pucm -d 1 > "$OUT/dmon.log" 2>&1 &
 DMON=$!
-env CUDA_VISIBLE_DEVICES=$CARD PYTHONPATH=$TREE${PROBE_PATH:+:$PROBE_PATH} ${PROBE_ENV:-} \
-  $WRAP $PY -u -m sglang_omni.cli serve --model-path $MODEL --port $PORT ${SERVE_ARGS:-} > "$OUT/serve.log" 2>&1 &
+# note (ratish): the card by the stages' placement flags, never CUDA_VISIBLE_DEVICES (radix containers)
+env PYTHONPATH=$TREE${PROBE_PATH:+:$PROBE_PATH} SGLANG_OMNI_STRICT_PORT=1 ${PROBE_ENV:-} \
+  $WRAP $PY -u -m sglang_omni.cli serve --model-path $MODEL --host 127.0.0.1 --port $PORT \
+  --tts_engine.gpu $CARD --vocoder.gpu $CARD ${SERVE_ARGS:-} > "$OUT/serve.log" 2>&1 &
 NSYS_PID=$!
 echo "serve args: ${SERVE_ARGS:-}" >> "$OUT/progress.txt"
 
