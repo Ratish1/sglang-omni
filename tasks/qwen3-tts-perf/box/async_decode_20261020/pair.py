@@ -102,6 +102,11 @@ def main() -> None:
     parser.add_argument("--config", default="")
     parser.add_argument("--bench-extra", default="")
     parser.add_argument("--b-env", default="", help="KEY=VALUE pairs set for arm b's server only")
+    parser.add_argument(
+        "--step-phases", action="store_true",
+        help="each arm's server writes its loop phase totals to step_phases.jsonl (trees carrying the probe), and the "
+        "bench window goes to bench_window.txt",
+    )
     parser.add_argument("--b-pythonpath", default="", help="a directory put ahead of the tree for arm b's server")
     parser.add_argument(
         "--b-tree", default="",
@@ -132,6 +137,10 @@ def main() -> None:
         else:
             pass
         server_env = dict(os.environ, PYTHONPATH=tree, SGLANG_OMNI_STRICT_PORT="1")
+        if args.step_phases:
+            server_env["OMNI_STEP_PHASES"] = str(outs[arm] / "step_phases.jsonl")
+        else:
+            pass
         if arm == "b":
             server_env.update(item.split("=", 1) for item in shlex.split(args.b_env))
             if args.b_pythonpath:
@@ -165,6 +174,7 @@ def main() -> None:
         for arm in arms:
             (outs[arm] / "gpu_healthy.txt").write_text(gpu_snapshot(), encoding="utf-8")
         benches = {}
+        bench_start = time.time()
         stream_args = [] if args.no_stream else ["--stream"]
         for arm, (_, _, port) in arms.items():
             command = [sys.executable, "-m", "benchmarks.eval.benchmark_tts_seedtts", "--model", model,
@@ -182,6 +192,7 @@ def main() -> None:
                 )
         for arm, bench in benches.items():
             print(f"{arm} bench rc {bench.wait(timeout=BENCH_TIMEOUT_S)}", flush=True)
+            (outs[arm] / "bench_window.txt").write_text(f"{bench_start} {time.time()}\n", encoding="utf-8")
         for arm in arms:
             (outs[arm] / "gpu_after_bench.txt").write_text(gpu_snapshot(), encoding="utf-8")
         for arm, (_, _, port) in arms.items():
