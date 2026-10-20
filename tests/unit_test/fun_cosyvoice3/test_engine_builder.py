@@ -6,8 +6,10 @@ from types import SimpleNamespace
 
 import pytest
 
+import sglang_omni.models.fun_cosyvoice3.engine_builder as engine_builder_module
 from sglang_omni.models.fun_cosyvoice3.engine_builder import FunCosyVoice3EngineBuilder
 from sglang_omni.scheduling.generation_batch_policy import (
+    CudaGraphBackend,
     build_generation_batch_overrides,
 )
 
@@ -55,3 +57,22 @@ def test_operator_max_total_tokens_is_kept() -> None:
     _, overrides = cuda_overrides(max_total_tokens=5000)
 
     assert overrides["max_total_tokens"] == 5000
+
+
+@pytest.mark.parametrize("is_cuda", [True, False])
+def test_prefill_replays_from_full_graphs_only_on_cuda(
+    monkeypatch: pytest.MonkeyPatch, is_cuda: bool
+) -> None:
+    monkeypatch.setattr(
+        engine_builder_module,
+        "current_platform",
+        SimpleNamespace(is_cuda=lambda: is_cuda),
+    )
+
+    builder, overrides = cuda_overrides()
+
+    assert overrides["cuda_graph_backend_prefill"] == (
+        CudaGraphBackend.FULL if is_cuda else CudaGraphBackend.DISABLED
+    )
+    assert CudaGraphBackend.FULL in builder.allowed_prefill_cuda_graph_backends()
+    assert builder.supports_breakable_prefill_cuda_graph
