@@ -90,6 +90,7 @@ def test_factory_serves_hybrid_state_pools_from_the_unified_cache() -> None:
     with get_context().override_server_args(
         disable_radix_cache=True,
         chunked_prefill_size=100,
+        _mamba_cache_chunk_size=64,
     ):
         cache = create_tree_cache(
             hybrid_pool, Mock(spec=BaseTokenToKVPoolAllocator, device="cpu"), 1, None

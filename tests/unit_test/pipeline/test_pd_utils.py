@@ -212,9 +212,10 @@ def test_continuation_preserves_the_hidden_state_mode() -> None:
 
 def test_continuation_strips_the_live_req_out_of_custom_params() -> None:
     source = prefill_req(custom_params={"segment_timestamps": True})
+    source.sampling_params.custom_params["__req__"] = source
     req = rebuilt_req(source)
     assert req.sampling_params.custom_params["segment_timestamps"] is True
-    assert req.sampling_params.custom_params["__req__"] is req
+    assert "__req__" not in req.sampling_params.custom_params
     assert source.sampling_params.custom_params["__req__"] is source
 
 

@@ -21,7 +21,7 @@ import pytest
 import sglang.srt.managers.scheduler as sglang_scheduler_module
 import torch
 from sglang.srt.environ import envs
-from sglang.srt.managers.schedule_batch import ReqKvInfo
+from sglang.srt.managers.schedule_batch import Req, ReqKvInfo
 from sglang.srt.mem_cache.allocator.paged import PagedTokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import (
     CacheRequestHandle,
@@ -646,6 +646,8 @@ def test_upstream_queue_limit_abort_is_translated_to_omni_output() -> None:
     trace_aborts: list[dict] = []
     req = SimpleNamespace(
         rid="req-over-limit",
+        release_mm_inputs_on_abort=Mock(),
+        session=None,
         cache_request_handle=CacheRequestHandle(rid="req-over-limit", attempt_id=0),
         priority=None,
         weight_version_events=[],
@@ -1186,6 +1188,7 @@ def test_upstream_kv_exhaustion_abort_is_translated_to_omni_output() -> None:
     scheduler.is_entry_rank = True
     scheduler.enable_hierarchical_cache = False
     scheduler.forward_ct = 1
+    scheduler.enable_skip_finishing_decode = False
     scheduler.server_args = SimpleNamespace()
     scheduler.decode_offload_manager = None
     scheduler.token_to_kv_pool_allocator = SimpleNamespace(available_size=lambda: 0)
@@ -1221,8 +1224,8 @@ def test_upstream_kv_exhaustion_abort_is_translated_to_omni_output() -> None:
         def batch_size(self) -> int:
             return len(self.reqs)
 
-        def filter_batch(self) -> None:
-            pass
+        def filter_batch(self, *, reqs_to_exclude: set[Req]) -> None:
+            assert not reqs_to_exclude
 
         def is_empty(self) -> bool:
             return not self.reqs

@@ -50,7 +50,7 @@ RUN python3 -c 'import tomllib; print("\n".join(tomllib.load(open("/tmp/pyprojec
     && CMAKE_ARGS='-DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=89;90;100;120' \
         CMAKE_BUILD_PARALLEL_LEVEL=8 uv pip install --no-cache --python /opt/sglang/bin/python3 \
         --overrides /tmp/omni-overrides.txt -r /tmp/pyproject.toml \
-        --extra audar-tts --extra fun-cosyvoice3 \
+        --extra audar-tts --extra fun-cosyvoice3 --extra minicpm-o \
     && uv pip install --python /opt/sglang/bin/python3 --no-deps qwen-tts==0.1.1 \
     && uv pip install --python /opt/sglang/bin/python3 --no-deps --reinstall flashinfer-python==0.7.1 \
     && rm /tmp/pyproject.toml /tmp/omni-overrides.txt

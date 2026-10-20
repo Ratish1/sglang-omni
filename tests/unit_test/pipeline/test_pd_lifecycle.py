@@ -619,6 +619,7 @@ def test_memory_pressure_fails_one_request_without_upstream_rebootstrap():
     scheduler = decode_scheduler()
     scheduler.disaggregation_mode = DisaggregationMode.DECODE
     scheduler.new_token_ratio_tracker = SimpleNamespace(current=0.5)
+    scheduler.enable_skip_finishing_decode = False
     scheduler.tree_cache = SimpleNamespace(req_to_token_pool=SimpleNamespace())
     scheduler.metrics_reporter = SimpleNamespace(enable_metrics=False)
     scheduler.server_args = SimpleNamespace()
@@ -626,7 +627,7 @@ def test_memory_pressure_fails_one_request_without_upstream_rebootstrap():
     scheduler.emit_request_error = Mock()
     batch = SimpleNamespace(
         batch_size=lambda: 1,
-        filter_batch=lambda: None,
+        filter_batch=lambda *, reqs_to_exclude: None,
         is_empty=lambda: False,
         check_decode_mem=lambda: False,
         retract_decode=lambda: ([SimpleNamespace(rid="full")], 0.5, []),

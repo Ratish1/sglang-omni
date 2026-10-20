@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
+from array import array
 from types import SimpleNamespace
 
 import pytest
@@ -103,7 +104,8 @@ class AdmissionScheduler:
             else:
                 self.tree_cache.match_prefix(
                     MatchPrefixParams(
-                        key=RadixKey(request.origin_input_ids[:-1]), req=request
+                        key=RadixKey(array("q", request.origin_input_ids[:-1])),
+                        req=request,
                     )
                 )
                 admitted_requests.append(request)

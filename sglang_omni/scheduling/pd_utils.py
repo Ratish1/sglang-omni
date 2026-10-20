@@ -383,8 +383,7 @@ def sampling_params_to_dict(params: SamplingParams) -> dict[str, object]:
     values = {name: getattr(params, name) for name in allowed if hasattr(params, name)}
     custom = values.get("custom_params")
     if isinstance(custom, dict):
-        # Note(Yue Yin): Req.__init__ injects the live Req under "__req__", and
-        # injects it again on the Decode side. Do not serialize it.
+        # note (Yue Yin): Legacy custom parameters can retain a live Req; it must not cross the PD transport.
         values["custom_params"] = {
             key: value for key, value in custom.items() if key != "__req__"
         }
