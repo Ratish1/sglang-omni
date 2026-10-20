@@ -10,6 +10,7 @@ from sglang_omni.platforms import current_platform
 from sglang_omni.utils.channels_last_conv import (
     channels_last_conv1d,
     channels_last_conv_transpose1d,
+    channels_last_folded_weight,
     channels_last_weight,
 )
 
@@ -61,9 +62,14 @@ def test_channels_last_conv1d_matches_the_strided_causal_conv1d(
         stride=stride,
     ).transpose(1, 2)
 
-    padded = F.pad(inputs, (0, 0, stride - 1, 0))
+    outputs = (stride - 1 + 61 - kernel_size) // stride + 1
+    padded = F.pad(inputs, (0, 0, stride - 1, (-(stride - 1 + 61)) % stride))
     actual = channels_last_conv1d(
-        padded, conv, channels_last_weight(conv), 61, stride=stride
+        padded,
+        conv,
+        channels_last_folded_weight(conv.weight.data, stride),
+        outputs,
+        stride=stride,
     )
 
     torch.testing.assert_close(actual, expected)
