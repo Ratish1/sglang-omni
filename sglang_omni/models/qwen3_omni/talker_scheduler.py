@@ -29,7 +29,7 @@ logger = logging.getLogger(__name__)
 _CHUNK_WAIT_LOG_INTERVAL_S = 10.0
 
 # note (ratish): a reply with no spoken token has nothing to speak; a reply of one
-# token terminates (measured on the request path and on the realtime session).
+# token terminates.
 MIN_SPOKEN_TOKENS = 1
 
 
