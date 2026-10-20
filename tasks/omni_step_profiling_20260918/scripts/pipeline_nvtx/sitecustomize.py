@@ -499,7 +499,7 @@ def patch_runner(module):
     runner = module.Qwen3TTSIncrementalCodecCudaGraphRunner
     runner.decode_slots = ranged(
         runner.decode_slots,
-        lambda self, codes, slots: (
+        lambda self, codes, slots, *args, **kwargs: (
             f"voc.replay {self.mode} w={int(codes.shape[2])} rows={int(codes.shape[0])}"
         ),
     )
