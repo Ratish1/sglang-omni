@@ -78,6 +78,79 @@ def grouped_attention_kernel(
         gdc_launch_dependents()
 
 
+@triton.jit
+def mma_attention_kernel(
+    Q,
+    K_CACHE,
+    V_CACHE,
+    cache_stride_row,
+    cache_stride_slot,
+    cache_stride_head,
+    OUT,
+    end,
+    scale,
+    T: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+    NUM_Q_HEADS: tl.constexpr,
+    NUM_KV_HEADS: tl.constexpr,
+    BLOCK_S: tl.constexpr,
+    RELEASE_EARLY: tl.constexpr,
+):
+    """One program per row group and kv head: its tokens' q heads of that kv head as the MMA rows (padded to 16), the
+    scores and the weighted values on the tensor cores, the softmax in fp32, its unnormalized weights rounded to bf16
+    for the second product and the sum divided after."""
+    group_index = tl.program_id(0)
+    kv_head = tl.program_id(1)
+    GROUP: tl.constexpr = NUM_Q_HEADS // NUM_KV_HEADS
+    gdc_wait()
+    if RELEASE_EARLY:
+        gdc_launch_dependents()
+    else:
+        pass
+    rq = tl.arange(0, 16)
+    rs = tl.arange(0, BLOCK_S)
+    rd = tl.arange(0, HEAD_DIM)
+    token = rq // GROUP
+    is_query = rq < T * GROUP
+    q_offsets = (
+        (group_index * T + token)[:, None] * (NUM_Q_HEADS * HEAD_DIM)
+        + (kv_head * GROUP + rq % GROUP)[:, None] * HEAD_DIM
+        + rd[None, :]
+    )
+    cache_offsets = (
+        group_index * cache_stride_row + kv_head * cache_stride_head + rs[:, None] * cache_stride_slot + rd[None, :]
+    )
+    q = tl.load(Q + q_offsets, mask=is_query[:, None], other=0.0)
+    k = tl.load(K_CACHE + cache_offsets, mask=(rs < end)[:, None], other=0.0)
+    v = tl.load(V_CACHE + cache_offsets, mask=(rs < end)[:, None], other=0.0)
+    scores = tl.dot(q, tl.trans(k)) * scale
+    visible = rs[None, :] < end - T + token[:, None] + 1
+    scores = tl.where(visible, scores, float("-inf"))
+    weights = libdevice.exp(scores - tl.max(scores, 1)[:, None])
+    attended = tl.dot(weights.to(tl.bfloat16), v) / tl.sum(weights, 1)[:, None]
+    tl.store(OUT + q_offsets, attended.to(tl.bfloat16), mask=is_query[:, None])
+    if RELEASE_EARLY:
+        pass
+    else:
+        gdc_launch_dependents()
+
+
+def mma_variant(release: str):
+    sm_count = torch.cuda.get_device_properties(0).multi_processor_count
+
+    def decode_attention(*, q, tokens_per_row, k_cache, v_cache, end, attention_output, shape) -> None:
+        programs = q.shape[0] // tokens_per_row * shape.num_kv_heads
+        release_early = release == "early" or (release == "one wave" and programs <= sm_count)
+        mma_attention_kernel[(q.shape[0] // tokens_per_row, shape.num_kv_heads)](
+            q, k_cache, v_cache, k_cache.stride(0), k_cache.stride(1), k_cache.stride(2), attention_output, end,
+            shape.head_dim**-0.5, T=tokens_per_row, HEAD_DIM=shape.head_dim, NUM_Q_HEADS=shape.num_q_heads,
+            NUM_KV_HEADS=shape.num_kv_heads, BLOCK_S=max(16, triton.next_power_of_2(k_cache.shape[1])),
+            RELEASE_EARLY=release_early, num_warps=predictor_layers.NUM_WARPS, launch_pdl=True,
+        )
+
+    return decode_attention
+
+
 def attention_variant(grouped: bool, release_early: bool):
     def decode_attention(*, q, tokens_per_row, k_cache, v_cache, end, attention_output, shape) -> None:
         heads = shape.num_kv_heads if grouped else shape.num_q_heads
@@ -109,12 +182,12 @@ def main() -> None:
     device = torch.device("cuda")
     pdl_o_proj_add = predictor_layers.o_proj_add
     variants = {
+        "mma released early": (mma_variant("early"), pdl_o_proj_add),
+        "mma released at end": (mma_variant("end"), pdl_o_proj_add),
+        "mma released early in one wave": (mma_variant("one wave"), pdl_o_proj_add),
+        "mma, o_proj plain": (mma_variant("end"), plain_o_proj_add),
         "p6": (predictor_layers.decode_attention, pdl_o_proj_add),
-        "p6 released at end": (attention_variant(False, False), pdl_o_proj_add),
-        "grouped released at end": (attention_variant(True, False), pdl_o_proj_add),
-        "grouped released early": (attention_variant(True, True), pdl_o_proj_add),
         "p6 kernel, o_proj plain": (attention_variant(False, False), plain_o_proj_add),
-        "grouped, o_proj plain": (attention_variant(True, False), plain_o_proj_add),
     }
     with torch.inference_mode():
         for name, (attention, o_proj) in variants.items():
