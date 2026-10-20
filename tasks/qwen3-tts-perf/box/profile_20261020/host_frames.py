@@ -10,7 +10,8 @@ by its call path (names from the loop's direct child down) and printed as a tree
 iteration and calls per iteration; the share of the loop's time the iterations cover is printed as a check. A frame's
 inclusive time contains the native calls it makes and any wait for the interpreter lock inside it.
 --self-test profiles a known program (f spins 2 ms and calls g; g spins 1 ms and runs a torch op) and checks that
-the reader recovers f at 3 ms and g at 1 ms per iteration.
+the reader recovers the two spins at 2 and 1 ms per call (wall-clock exact by construction), 20 calls each, and every
+parent's inclusive time covering its children's.
 """
 
 import argparse
@@ -103,13 +104,21 @@ def self_test() -> None:
     children = children_of(frames)
     roots = [e["args"]["Python id"] for e in frames if re.search(r"\): loop$", str(e["name"]))]
     totals = aggregate(children, [child for root in roots for child in children.get(root, [])], depth=4)
+
+    def mean_ms(path: tuple[str, ...]) -> float:
+        return totals[path][0] / totals[path][1] / 1e3
+
     f_path = next(p for p in totals if len(p) == 1 and p[0].endswith(": f"))
     g_path = next(p for p in totals if len(p) == 2 and p[0] == f_path[0] and p[1].endswith(": g"))
-    f_ms = totals[f_path][0] / totals[f_path][1] / 1e3
-    g_ms = totals[g_path][0] / totals[g_path][1] / 1e3
-    print(f"self-test: f {f_ms:.3f} ms x{totals[f_path][1]}, g {g_ms:.3f} ms x{totals[g_path][1]} (expect 3 and 1, 20 calls)")
+    f_spin = next(p for p in totals if len(p) == 2 and p[0] == f_path[0] and p[1].endswith(": spin"))
+    g_spin = next(p for p in totals if len(p) == 3 and p[:2] == g_path and p[2].endswith(": spin"))
+    print(
+        f"self-test: f {mean_ms(f_path):.3f} (spin {mean_ms(f_spin):.3f}), g {mean_ms(g_path):.3f} (spin "
+        f"{mean_ms(g_spin):.3f}) ms per call, calls {totals[f_path][1]}, {totals[g_path][1]}; spins expected 2 and 1"
+    )
     assert totals[f_path][1] == 20 and totals[g_path][1] == 20
-    assert abs(f_ms - 3.0) < 0.4 and abs(g_ms - 1.0) < 0.3
+    assert abs(mean_ms(f_spin) - 2.0) < 0.15 and abs(mean_ms(g_spin) - 1.0) < 0.15
+    assert mean_ms(f_path) >= mean_ms(f_spin) + mean_ms(g_path) and mean_ms(g_path) >= mean_ms(g_spin)
     print("self-test passed")
 
 
@@ -157,8 +166,7 @@ def main() -> None:
         else:
             pass
         kind, _, _, batch = STEP.match(inside[0]["name"]).groups()
-        bucket = "bs 1" if int(batch) == 1 else f"bs {int(batch) // 8 * 8} to {int(batch) // 8 * 8 + 7}"
-        groups[f"{kind} {bucket}"].append(iteration)
+        groups[f"{kind} bs {int(batch):02d}"].append(iteration)
     loop_children_ms = sum(f["dur"] for f in loop_children) / 1e3
     labeled_ms = sum(f["dur"] for its in groups.values() for it in its for f in it) / 1e3
     window = (steps[-1]["ts"] + steps[-1]["dur"] - steps[0]["ts"]) / 1e3
