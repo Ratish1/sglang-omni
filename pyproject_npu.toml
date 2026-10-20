@@ -110,6 +110,7 @@ fun-cosyvoice3 = [
     "hydra-core",
     "wget",
     "x_transformers",
+    "onnx>=1.18.0",
 ]
 
 [project.scripts]

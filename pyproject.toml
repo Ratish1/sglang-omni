@@ -118,6 +118,7 @@ fun-cosyvoice3 = [
     "wget==3.2",
     "lightning==2.6.5",
     "matplotlib",
+    "onnx>=1.18.0",  # the speech tokenizer's weights, read from its ONNX graph on CUDA
 ]
 
 minicpm-o = [

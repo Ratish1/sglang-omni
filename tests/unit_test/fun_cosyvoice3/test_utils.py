@@ -126,6 +126,7 @@ def test_cosyvoice3_reference_encoders_pin_onnx_providers(
         InferenceSession=fake_session,
     )
     monkeypatch.setitem(sys.modules, "onnxruntime", fake_onnxruntime)
+    monkeypatch.setattr(utils.current_platform, "is_cuda", lambda: False)
 
     utils.SpeechTokenizerV3("speech_tokenizer_v3.onnx", device="cuda:0")
     utils.SpeechTokenizerV3("speech_tokenizer_v3.onnx", device="cpu")
