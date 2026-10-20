@@ -64,6 +64,8 @@ import os
 import sys
 import threading
 
+import green_streams
+
 ENABLED = os.environ.get("OMNI_PIPE_NVTX") == "1"
 LINES = os.environ.get("OMNI_PIPE_LINES", "")
 ROOTS = (
@@ -490,6 +492,23 @@ def patch_cosy_stages(module):
         flow.inference, lambda self, inputs: f"flow.buffered rows={len(inputs)}"
     )
     vocoder = module.CosyVoice3Vocoder
+    if green_streams.AR_SMS:
+        init = vocoder.__init__
+
+        @functools.wraps(init)
+        def green_init(self, *args, **kwargs):
+            init(self, *args, **kwargs)
+            import torch
+
+            if next(self.flow.parameters()).device.type == "cuda":
+                _, vocoder_stream = green_streams.streams()
+                vocoder_stream.wait_stream(torch.cuda.current_stream())
+                self.stream_context = torch.cuda.stream(vocoder_stream)
+                print("cosy_green vocoder on its partition", file=sys.stderr, flush=True)
+            else:
+                pass
+
+        vocoder.__init__ = green_init
     vocoder.hop_batch = ranged(
         vocoder.hop_batch,
         lambda self, items: f"flow.hop rows={len(items)} tok={token_count(items)}",
