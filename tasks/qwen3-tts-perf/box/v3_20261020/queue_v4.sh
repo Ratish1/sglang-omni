@@ -2,7 +2,7 @@
 # V4 (perf/qwen3-tts-flat-codec-arena a6214172d, stacked on V5 a962e3db6: each codec arena slot one flat row, one
 # gather and one scatter per decode) against V5: the touched units, a seeded c1 pair that must be byte identical (data
 # movement only), then c16 and c64 pairs in both card orders with each arm's SM Issue, full corpus, WER and SIM. Waits
-# for queue_v5.sh.
+# for queue_bench2.sh, which follows queue_v5.sh.
 set -u
 D=/data/v3_20261020
 T=${T:-/workspace/t_marks}
@@ -10,7 +10,7 @@ IN=$T/tasks/qwen3-tts-perf/box/v3_20261020
 V5=/workspace/v5_a962e3db6
 V4=/workspace/v4_a6214172d
 L=$D/queue.log
-until grep -q queue_v5_done $L; do sleep 30; done
+until grep -q queue_bench2_done $L; do sleep 30; done
 echo "queue v4 start $(date +%T) v5 $(git -C $V5 rev-parse HEAD:sglang_omni) v4 $(git -C $V4 rev-parse HEAD:sglang_omni)" >> $L
 (cd $V4 && PYTHONPATH=$V4 timeout 3600 python3 -m pytest tests/unit_test/qwen3_tts -q -p no:cacheprovider -rfE \
   > $D/units/v4.log 2>&1)
