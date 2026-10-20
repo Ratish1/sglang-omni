@@ -165,6 +165,7 @@ class Qwen3OmniMoeTextConfig(PretrainedConfig):
         mlp_only_layers=None,
         **kwargs,
     ):
+        rope_parameters = kwargs.pop("rope_parameters", None)
         super().__init__(
             tie_word_embeddings=tie_word_embeddings,
             **kwargs,
@@ -186,7 +187,11 @@ class Qwen3OmniMoeTextConfig(PretrainedConfig):
         self.rms_norm_eps = rms_norm_eps
         self.use_cache = use_cache
         self.rope_theta = rope_theta
-        self.rope_scaling = normalize_rope_scaling(rope_scaling)
+        # note (ratish): transformers 5 serializes the rope as rope_parameters, so
+        # a config rebuilt from to_dict carries the mrope sections there only.
+        self.rope_scaling = normalize_rope_scaling(
+            rope_scaling if rope_scaling is not None else rope_parameters
+        )
         self.partial_rotary_factor = partial_rotary_factor
         self.attention_bias = attention_bias
         self.attention_dropout = attention_dropout
