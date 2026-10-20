@@ -7870,6 +7870,7 @@ def test_qwen3_tts_sampling_installs_semantic_seeds_for_a_seeded_batch(
     runner.tp_worker = SimpleNamespace(model_runner=SimpleNamespace(sample=sample))
     runner.repetition_scales = torch.ones(3, 4)
     runner.repetition_penalties = torch.ones(3)
+    runner.leading_silence_mask_frames = 0
     forward_batch = SimpleNamespace(
         sampling_info=SimpleNamespace(
             sampling_seed=preset_seeds,
@@ -8056,6 +8057,8 @@ def test_qwen3_tts_steady_decode_reports_cuda_graph_ready(
         req=SimpleNamespace(
             sampling_params=SimpleNamespace(repetition_penalty=1.0),
             inflight_middle_chunks=0,
+            is_retracted=False,
+            finished=lambda: False,
             origin_input_ids=[0, 0, 0, 0],
         ),
         output_codes=[],
