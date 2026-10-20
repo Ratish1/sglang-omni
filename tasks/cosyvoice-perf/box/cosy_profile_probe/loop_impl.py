@@ -20,8 +20,6 @@ import importlib.util
 import os
 import sys
 
-import green_streams
-
 SCHEDULER = "sglang_omni.scheduling.omni_scheduler"
 
 LOOP_METHODS = {
@@ -135,23 +133,6 @@ def patch_scheduler(module):
 
     cls.__init__ = instrumented_init
     cls.bind_model_runner = instrumented_bind
-    if green_streams.AR_SMS:
-        start = cls.start
-
-        @functools.wraps(start)
-        def green_start(self):
-            if not self.should_run_top_priority_stream:
-                return start(self)
-            import torch
-
-            ar_stream, _ = green_streams.streams()
-            self.should_run_top_priority_stream = False
-            ar_stream.wait_stream(torch.cuda.current_stream())
-            print(f"cosy_green AR loop on its partition ({type(self).__name__})", file=sys.stderr, flush=True)
-            with torch.cuda.stream(ar_stream):
-                return start(self)
-
-        cls.start = green_start
 
 
 class PatchOnImport(importlib.abc.MetaPathFinder):
