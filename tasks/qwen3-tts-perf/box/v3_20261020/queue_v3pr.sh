@@ -1,14 +1,15 @@
 #!/usr/bin/env bash
-# V3's PR head (perf/qwen3-tts-vocoder-transformer-fused-kernels 1eeebe666, one commit on upstream main 4809648d4)
-# against the V3 head the pairs measured (6f6039ba6): the PR calls the rope kernel directly, gates on the CUDA platform
-# and rewords two notes, so its audio must be byte identical. The touched units, then a seeded c1 pair. Waits for
+# V3's PR head (perf/qwen3-tts-vocoder-transformer-fused-kernels 0e573ef55, one commit on upstream main 4809648d4)
+# against the V3 head the pairs measured (6f6039ba6): the PR calls the rope kernel directly, gates on the CUDA platform,
+# rewords two notes and shares the position, mask and retention helpers between the plain and fused steps, so its
+# audio must be byte identical. The touched units (the plain step's tests included), then a seeded c1 pair. Waits for
 # queue_landing.sh.
 set -u
 D=/data/v3_20261020
 T=${T:-/workspace/t_marks}
 IN=$T/tasks/qwen3-tts-perf/box/v3_20261020
 V3=/workspace/v3_6f6039ba6
-PR=/workspace/v3pr_1eeebe666
+PR=/workspace/v3pr_0e573ef55
 L=$D/queue.log
 until grep -q queue_landing_done $L; do sleep 30; done
 echo "queue v3pr start $(date +%T) v3 $(git -C $V3 rev-parse HEAD:sglang_omni) pr $(git -C $PR rev-parse HEAD:sglang_omni)" >> $L
