@@ -9,7 +9,11 @@ from typing import TYPE_CHECKING
 
 import torch
 import torch.nn.functional as F
+from sglang.kernels.ops.activation import silu_and_mul
+from sglang.kernels.ops.layernorm import rmsnorm
 
+from sglang_omni.platforms import current_platform
+from sglang_omni.platforms.interface import JointRopeInplaceKernel
 from sglang_omni.utils.channels_last_conv import (
     channels_last_conv1d,
     channels_last_conv_transpose1d,
@@ -549,6 +553,172 @@ def incremental_transformer(
     return transformer.output_proj(transformer.norm(hidden_states))
 
 
+class FusedIncrementalTransformer:
+    """incremental_transformer with one qkv and one gate-up GEMM per layer, and RMSNorm, rotary,
+    SwiGLU and LayerScale plus residual one kernel each."""
+
+    def __init__(
+        self,
+        transformer: "Qwen3TTSTokenizerV2DecoderTransformerModel",
+        rope: JointRopeInplaceKernel,
+    ) -> None:
+        rotary = transformer.rotary_emb
+        assert (
+            not transformer.config.attention_bias
+        ), "the decoder attention has no bias"
+        assert transformer.config.hidden_act == "silu", "the decoder MLP is SwiGLU"
+        assert rotary.rope_type == "default", "cos and sin come from inv_freq"
+        assert transformer.window_size > 1, "the decoder retains a sliding window"
+        self.transformer = transformer
+        self.rope = rope
+        self.inverse_frequencies = rotary.inv_freq.float()
+        self.attention_scaling = float(rotary.attention_scaling)
+        # note (ratish): q, k, v and gate, up become views of one matrix each, so the
+        # fused GEMMs read the loaded weights without a second copy.
+        for layer in transformer.layers:
+            attention, mlp = layer.self_attn, layer.mlp
+            assert isinstance(attention.q_norm, torch.nn.Identity) and isinstance(
+                attention.k_norm, torch.nn.Identity
+            ), "the decoder attention has no q or k norm"
+            projections = (attention.q_proj, attention.k_proj, attention.v_proj)
+            attention.qkv_weight = torch.cat(
+                [projection.weight.data for projection in projections]
+            )
+            start = 0
+            for projection in projections:
+                output_features = projection.weight.shape[0]
+                projection.weight.data = attention.qkv_weight[
+                    start : start + output_features
+                ]
+                start += output_features
+            mlp.gate_up_weight = torch.cat(
+                (mlp.gate_proj.weight.data, mlp.up_proj.weight.data)
+            )
+            mlp.gate_proj.weight.data = mlp.gate_up_weight[: mlp.intermediate_size]
+            mlp.up_proj.weight.data = mlp.gate_up_weight[mlp.intermediate_size :]
+
+    def __call__(
+        self,
+        hidden_states: torch.Tensor,
+        state: Qwen3TTSIncrementalCodecState,
+        valid_frames: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        transformer = self.transformer
+        hidden_states = transformer.input_proj(hidden_states)
+        batch_size = int(hidden_states.shape[0])
+        fresh_frames = int(hidden_states.shape[1])
+        hidden_size = int(hidden_states.shape[2])
+        rows = batch_size * fresh_frames
+        device = hidden_states.device
+        frame_positions = state.row_frame_positions(batch_size, device)
+        prior_key = state.transformer_keys.get(0)
+        prior_length = 0 if prior_key is None else int(prior_key.shape[-2])
+        key_positions = frame_positions.unsqueeze(1) + torch.arange(
+            -prior_length, fresh_frames, device=device, dtype=torch.long
+        ).unsqueeze(0)
+        query_positions = frame_positions.unsqueeze(1) + torch.arange(
+            fresh_frames, device=device, dtype=torch.long
+        ).unsqueeze(0)
+        sliding_window = int(transformer.layers[0].self_attn.sliding_window)
+        keys_by_row = key_positions.unsqueeze(1)
+        queries_by_row = query_positions.unsqueeze(2)
+        allowed = keys_by_row <= queries_by_row
+        allowed &= keys_by_row > (queries_by_row - sliding_window)
+        allowed &= (key_positions >= 0).unsqueeze(1)
+        attention_mask = allowed.unsqueeze(1)
+        # note (ratish): one cos/sin row per query, from its absolute frame position,
+        # which a stream's reference prefix can carry past max_position_embeddings.
+        angles = query_positions.reshape(rows, 1).float() * self.inverse_frequencies
+        cos_sin = torch.cat((angles.cos(), angles.sin()), dim=-1) * (
+            self.attention_scaling
+        )
+        rotary_rows = torch.arange(rows, device=device)
+        hidden_states = hidden_states.reshape(rows, hidden_size)
+        next_keys: dict[int, torch.Tensor] = {}
+        next_values: dict[int, torch.Tensor] = {}
+        retained_context = int(transformer.window_size) - 1
+        for layer_index, layer in enumerate(transformer.layers):
+            attention = layer.self_attn
+            head_dim = int(attention.head_dim)
+            residual = hidden_states
+            normalized = rmsnorm(
+                hidden_states,
+                layer.input_layernorm.weight,
+                layer.input_layernorm.variance_epsilon,
+            )
+            query, key, value = F.linear(normalized, attention.qkv_weight).split(
+                [
+                    attention.q_proj.out_features,
+                    attention.k_proj.out_features,
+                    attention.v_proj.out_features,
+                ],
+                dim=-1,
+            )
+            query = query.view(rows, -1, head_dim)
+            key = key.view(rows, -1, head_dim)
+            self.rope(query, key, cos_sin, rotary_rows, is_neox=True)
+            key = key.view(batch_size, fresh_frames, -1, head_dim).transpose(1, 2)
+            value = value.view(batch_size, fresh_frames, -1, head_dim).transpose(1, 2)
+            prior_key = state.transformer_keys.get(layer_index)
+            prior_value = state.transformer_values.get(layer_index)
+            if (prior_key is None) != (prior_value is None):
+                raise RuntimeError(
+                    f"incomplete transformer state for layer {layer_index}"
+                )
+            elif prior_key is not None:
+                key = torch.cat((prior_key, key), dim=-2)
+                value = torch.cat((prior_value, value), dim=-2)
+            else:
+                pass
+            attended = F.scaled_dot_product_attention(
+                query.view(batch_size, fresh_frames, -1, head_dim).transpose(1, 2),
+                key,
+                value,
+                attn_mask=attention_mask,
+                scale=float(attention.scaling),
+                enable_gqa=int(attention.num_key_value_groups) > 1,
+            )
+            hidden_states = torch.addcmul(
+                residual,
+                layer.self_attn_layer_scale.scale,
+                F.linear(
+                    attended.transpose(1, 2).reshape(rows, -1), attention.o_proj.weight
+                ),
+            )
+            residual = hidden_states
+            normalized = rmsnorm(
+                hidden_states,
+                layer.post_attention_layernorm.weight,
+                layer.post_attention_layernorm.variance_epsilon,
+            )
+            activated = silu_and_mul(F.linear(normalized, layer.mlp.gate_up_weight))
+            hidden_states = torch.addcmul(
+                residual,
+                layer.mlp_layer_scale.scale,
+                F.linear(activated, layer.mlp.down_proj.weight),
+            )
+            if valid_frames is not None:
+                retained_end = prior_length + valid_frames
+                next_keys[layer_index] = frames_ending_at(
+                    key, retained_end, retained_context, -2
+                )
+                next_values[layer_index] = frames_ending_at(
+                    value, retained_end, retained_context, -2
+                )
+            else:
+                next_keys[layer_index] = key[..., -retained_context:, :].clone()
+                next_values[layer_index] = value[..., -retained_context:, :].clone()
+
+        state.transformer_keys = next_keys
+        state.transformer_values = next_values
+        hidden_states = rmsnorm(
+            hidden_states, transformer.norm.weight, transformer.norm.variance_epsilon
+        )
+        return transformer.output_proj(
+            hidden_states.view(batch_size, fresh_frames, hidden_size)
+        )
+
+
 def incremental_convnext(
     module: "Qwen3TTSTokenizerV2ConvNeXtBlock",
     hidden_states: torch.Tensor,
@@ -718,6 +888,18 @@ class Qwen3TTSIncrementalDecoder:
                     )
         else:
             self.channels_last_weights = None
+        rope = current_platform.get_joint_rope_inplace_kernel()
+        transformer_weight = decoder.pre_transformer.input_proj.weight
+        if (
+            rope is not None
+            and transformer_weight.device.type == "cuda"
+            and transformer_weight.dtype in (torch.bfloat16, torch.float16)
+        ):
+            self.fused_transformer: FusedIncrementalTransformer | None = (
+                FusedIncrementalTransformer(decoder.pre_transformer, rope)
+            )
+        else:
+            self.fused_transformer = None
         self._state_spec: Qwen3TTSIncrementalCodecStateSpec | None = (
             None  # noqa: leading-underscore  # upstream spelling, or the public name is already taken
         )
@@ -1004,17 +1186,21 @@ class Qwen3TTSIncrementalDecoder:
             )
         else:
             pass
-        if is_channels_last:
-            return incremental_transformer(
-                self.decoder.pre_transformer, hidden_states, state, valid_frames
+        transformer_inputs = (
+            hidden_states if is_channels_last else hidden_states.transpose(1, 2)
+        )
+        if self.fused_transformer is not None:
+            transformer_outputs = self.fused_transformer(
+                transformer_inputs, state, valid_frames
             )
         else:
-            return incremental_transformer(
-                self.decoder.pre_transformer,
-                hidden_states.transpose(1, 2),
-                state,
-                valid_frames,
-            ).permute(0, 2, 1)
+            transformer_outputs = incremental_transformer(
+                self.decoder.pre_transformer, transformer_inputs, state, valid_frames
+            )
+        if is_channels_last:
+            return transformer_outputs
+        else:
+            return transformer_outputs.permute(0, 2, 1)
 
     def conv_stack_tensors(
         self, hidden_states: torch.Tensor, state: Qwen3TTSIncrementalCodecState
