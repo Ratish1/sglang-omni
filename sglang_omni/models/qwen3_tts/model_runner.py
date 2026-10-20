@@ -7,6 +7,8 @@ from types import ModuleType
 from typing import TYPE_CHECKING, TypedDict
 
 import torch
+from sglang.srt.sampling.penaltylib.repetition_penalty import apply_scaling_penalties
+from sglang.srt.utils.common import is_pin_memory_available
 
 from sglang_omni.model_runner.base import ModelRunner
 from sglang_omni.model_runner.model_worker import ModelWorker
@@ -71,6 +73,19 @@ class Qwen3TTSModelRunner(ModelRunner):
             if supports_device_streams(self.device)
             else None
         )
+        request_slot_count = int(
+            tp_worker.model_runner.req_to_token_pool.req_to_token.shape[0]
+        )
+        # note (ratish): each request slot's repetition state lives on the device and takes a
+        # step's ids when they are sampled, so no step waits for the host to commit the last one.
+        self.repetition_scales = torch.ones(
+            (request_slot_count, int(self.model.config.vocab_size)),
+            dtype=torch.float32,
+            device=self.device,
+        )
+        self.repetition_penalties = torch.ones(
+            request_slot_count, dtype=torch.float32, device=self.device
+        )
 
     def model_info(self) -> Qwen3TTSModelInfo:
         return {"predictor_cuda_graph": self.model.predictor_graph_stats()}
@@ -83,6 +98,38 @@ class Qwen3TTSModelRunner(ModelRunner):
     ) -> None:
         del schedule_batch
         self.model.prepare_decode_buffers(requests)
+        # note (ratish): a prefilled slot restarts from its committed ids, which a retracted
+        # request carries into its re-prefill.
+        request_slots = forward_batch.req_pool_indices[: len(requests)]
+        self.repetition_scales.index_fill_(0, request_slots, 1.0)
+        self.repetition_penalties.index_copy_(
+            0,
+            request_slots,
+            torch.tensor(
+                [sched_req.data.repetition_penalty for sched_req in requests],
+                dtype=torch.float32,
+                pin_memory=is_pin_memory_available(self.device),
+            ).to(self.device, non_blocking=True),
+        )
+        committed_row_indices: list[int] = []
+        committed_token_ids: list[int] = []
+        for row_index, sched_req in enumerate(requests):
+            output_ids = sched_req.data.req.output_ids
+            committed_row_indices.extend([row_index] * len(output_ids))
+            committed_token_ids.extend(output_ids)
+        if committed_row_indices:
+            committed_slots = request_slots[
+                torch.tensor(committed_row_indices, device=request_slots.device)
+            ]
+            self.repetition_scales.index_put_(
+                (
+                    committed_slots,
+                    torch.tensor(committed_token_ids, device=request_slots.device),
+                ),
+                self.repetition_penalties[committed_slots],
+            )
+        else:
+            pass
         attach_omni_prefill_inputs(
             forward_batch,
             OmniPrefillInputs(
@@ -216,6 +263,46 @@ class Qwen3TTSModelRunner(ModelRunner):
         sampling_info.sampling_seed = self.model.semantic_sampling_seed_tensor[
             : len(requests)
         ]
+
+    def sample_next_token_ids(
+        self,
+        logits_output: LogitsProcessorOutput,
+        forward_batch: ForwardBatch,
+        schedule_batch: ScheduleBatch | None,
+        requests: list[SchedulerRequest],
+    ) -> torch.Tensor:
+        request_slots = forward_batch.req_pool_indices[: len(requests)]
+        # note (ratish): the scaling commutes with the codec suppression that follows, which
+        # leaves a masked logit at -inf either way.
+        apply_scaling_penalties(
+            logits_output.next_token_logits[: len(requests)],
+            self.repetition_scales.index_select(0, request_slots),
+        )
+        next_token_ids = super().sample_next_token_ids(
+            logits_output, forward_batch, schedule_batch, requests
+        )
+        if forward_batch.forward_mode.is_extend():
+            # note (ratish): a middle prefill chunk's token is dropped, so it never counts as
+            # generated.
+            recorded_row_indices = torch.tensor(
+                [
+                    row_index
+                    for row_index, sched_req in enumerate(requests)
+                    if sched_req.data.req.inflight_middle_chunks <= 0
+                ],
+                dtype=torch.long,
+                device=request_slots.device,
+            )
+            recorded_slots = request_slots[recorded_row_indices]
+            recorded_token_ids = next_token_ids[recorded_row_indices]
+        else:
+            recorded_slots = request_slots
+            recorded_token_ids = next_token_ids
+        self.repetition_scales.index_put_(
+            (recorded_slots, recorded_token_ids),
+            self.repetition_penalties[recorded_slots],
+        )
+        return next_token_ids
 
     def collect_codes(
         self,

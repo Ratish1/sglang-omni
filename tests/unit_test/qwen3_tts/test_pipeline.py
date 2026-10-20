@@ -7200,7 +7200,8 @@ def test_qwen3_tts_request_data_keeps_decode_tensors_on_prepared_device(
     assert isinstance(data.semantic_sampling_seed, int)
     assert 0 <= data.semantic_sampling_seed <= 0x7FFFFFFF
     assert data.req.sampling_params.sampling_seed is None
-    assert data.req.sampling_params.repetition_penalty == 1.1
+    assert data.repetition_penalty == 1.1
+    assert data.req.sampling_params.repetition_penalty == 1.0
     assert isinstance(data.subtalker_sampling_seed, int)
     assert 0 <= data.subtalker_sampling_seed <= 0x7FFFFFFF
 
