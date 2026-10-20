@@ -6,8 +6,10 @@ process (OMP_NUM_THREADS=1). Modes:
   unified      prerequisite 1: one stream, the run lock, a 30 s warm run
   unified_nospin   prerequisite 1 with session.intra_op.allow_spinning=0
   unified_1thread  prerequisite 1 with intra_op_num_threads=1
+  pool2, pool8     main's session called through a pool of 2 or 8 worker threads the tokenizer owns, so each worker
+                   keeps its stream and handles, warmed by that many concurrent 30 s runs (later on 10-20)
 Each mode's tokens are compared with main's.
-usage: CUDA_VISIBLE_DEVICES=<card> python3 tokenizer_modes_c20261020.py <out dir> [mode]"""
+usage: CUDA_VISIBLE_DEVICES=<card> [TOKENIZER_MODES=a,b] python3 tokenizer_modes_c20261020.py <out dir> [mode]"""
 
 import json
 import os
@@ -20,7 +22,8 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 MODEL = "FunAudioLLM/Fun-CosyVoice3-0.5B-2512"
-MODES = ("main", "unified", "unified_nospin", "unified_1thread")
+MODES = ("main", "unified", "unified_nospin", "unified_1thread", "pool2", "pool8")
+POOL_WORKERS = {"pool2": 2, "pool8": 8}
 THREADS = 8
 MAX_SECONDS = 30
 
@@ -51,7 +54,7 @@ def run_mode(out: Path, mode: str) -> None:
     else:
         pass
     cuda_options = {"cudnn_conv_algo_search": "HEURISTIC"}
-    if mode != "main":
+    if mode.startswith("unified"):
         cuda_options["use_ep_level_unified_stream"] = "1"
     else:
         pass
@@ -60,8 +63,13 @@ def run_mode(out: Path, mode: str) -> None:
         sess_options=option,
         providers=[("CUDAExecutionProvider", cuda_options), "CPUExecutionProvider"],
     )
-    lock = threading.Lock() if mode != "main" else None
+    lock = threading.Lock() if mode.startswith("unified") else None
+    workers = POOL_WORKERS.get(mode)
+    pool = ThreadPoolExecutor(max_workers=workers) if workers else None
     names = [item.name for item in session.get_inputs()]
+
+    def session_run(feeds: dict[str, np.ndarray]) -> np.ndarray:
+        return session.run(None, feeds)[0]
 
     def tokenize(audio: np.ndarray) -> tuple[list[int], float, float, float]:
         started = time.perf_counter()
@@ -74,7 +82,10 @@ def run_mode(out: Path, mode: str) -> None:
             pass
         locked = time.perf_counter()
         try:
-            result = session.run(None, feeds)[0]
+            if pool is not None:
+                result = pool.submit(session_run, feeds).result()
+            else:
+                result = session_run(feeds)
         finally:
             if lock is not None:
                 lock.release()
@@ -84,8 +95,19 @@ def run_mode(out: Path, mode: str) -> None:
         return result.flatten().tolist(), mel_done - started, locked - mel_done, ended - locked
 
     after_session = torch.cuda.mem_get_info()[0]
-    if mode != "main":
+    if mode.startswith("unified"):
         tokenize(np.zeros(MAX_SECONDS * 16000, dtype=np.float32))
+    elif pool is not None:
+        barrier = threading.Barrier(workers)
+        longest = np.zeros((1, MAX_SECONDS * 16000), dtype=np.float32)
+        feat = whisper.log_mel_spectrogram(torch.from_numpy(longest), n_mels=128)
+        feeds = {names[0]: feat.numpy(), names[1]: np.array([feat.shape[2]], dtype=np.int32)}
+
+        def warm_one(_: int) -> None:
+            barrier.wait()
+            session_run(feeds)
+
+        list(pool.map(warm_one, range(workers)))
     else:
         pass
     after_warm = torch.cuda.mem_get_info()[0]
@@ -132,11 +154,12 @@ def main() -> None:
         return
     else:
         pass
-    for mode in MODES:
+    modes = os.environ.get("TOKENIZER_MODES", ",".join(MODES)).split(",")
+    for mode in modes:
         rc = subprocess.run([sys.executable, __file__, str(out), mode], env={**os.environ, "OMP_NUM_THREADS": "1"}).returncode
         print(f"mode {mode} rc {rc}", flush=True)
     reference = json.loads((out / "main.tokens.json").read_text())
-    for mode in MODES:
+    for mode in modes:
         report = json.loads((out / f"{mode}.json").read_text())
         same = json.loads((out / f"{mode}.tokens.json").read_text()) == reference
         print(json.dumps({**report, "tokens_equal_main": same}))
