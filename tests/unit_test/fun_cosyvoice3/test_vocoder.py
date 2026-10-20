@@ -17,6 +17,7 @@ import torch
 
 from sglang_omni.client.client import Client
 from sglang_omni.models.fun_cosyvoice3 import stages
+from sglang_omni.models.fun_cosyvoice3.engine_builder import FunCosyVoice3EngineBuilder
 from sglang_omni.models.fun_cosyvoice3.hift_cuda_graph import HiftDecodeCudaGraphRunner
 from sglang_omni.models.fun_cosyvoice3.packed_dit import PackedDiT
 from sglang_omni.models.fun_cosyvoice3.payload_types import FunCosyVoice3State
@@ -823,6 +824,7 @@ def test_flow_admission_defers_request_after_long_singleton(monkeypatch) -> None
     scheduler = stages.create_vocoder_executor(
         "model",
         flow_prefix_cache_gb=0.0,
+        flow_prefix_cache_reserve_gb=0.0,
         enable_flow_prefix_cuda_graph=True,
         enable_flow_whole_history_cuda_graph=True,
         enable_hift_cuda_graph=False,
@@ -867,6 +869,7 @@ def test_admission_budget_below_the_first_tier_keeps_finals_eager(monkeypatch) -
         device="cuda",
         dtype="float16",
         flow_prefix_cache_gb=0.0,
+        flow_prefix_cache_reserve_gb=0.0,
         enable_flow_cuda_graph=False,
         enable_flow_prefix_cuda_graph=True,
         enable_flow_whole_history_cuda_graph=True,
@@ -912,6 +915,7 @@ def test_create_vocoder_executor_threads_batch_configuration(monkeypatch) -> Non
     scheduler = stages.create_vocoder_executor(
         "model",
         flow_prefix_cache_gb=0.0,
+        flow_prefix_cache_reserve_gb=0.0,
         enable_flow_prefix_cuda_graph=True,
         enable_flow_whole_history_cuda_graph=True,
         enable_hift_cuda_graph=False,
@@ -964,6 +968,7 @@ def test_create_vocoder_executor_threads_trt_flag(monkeypatch) -> None:
     stages.create_vocoder_executor(
         "model",
         flow_prefix_cache_gb=0.0,
+        flow_prefix_cache_reserve_gb=0.0,
         enable_flow_prefix_cuda_graph=True,
         enable_flow_whole_history_cuda_graph=True,
         enable_hift_cuda_graph=False,
@@ -1062,6 +1067,7 @@ def test_create_vocoder_executor_compiles_before_flow_graph_capture(
     _scheduler = stages.create_vocoder_executor(
         "model",
         flow_prefix_cache_gb=0.0,
+        flow_prefix_cache_reserve_gb=0.0,
         enable_flow_prefix_cuda_graph=True,
         enable_flow_whole_history_cuda_graph=True,
         enable_hift_cuda_graph=False,
@@ -1097,6 +1103,7 @@ def test_create_vocoder_executor_on_xpu_captures_flow_graphs_only_for_an_eager_d
     stages.create_vocoder_executor(
         "model",
         flow_prefix_cache_gb=0.0,
+        flow_prefix_cache_reserve_gb=0.0,
         enable_flow_prefix_cuda_graph=True,
         enable_flow_whole_history_cuda_graph=True,
         enable_hift_cuda_graph=False,
@@ -1114,6 +1121,7 @@ def test_create_vocoder_executor_rejects_trt_and_compile() -> None:
         stages.create_vocoder_executor(
             "model",
             flow_prefix_cache_gb=0.0,
+            flow_prefix_cache_reserve_gb=0.0,
             enable_flow_prefix_cuda_graph=True,
             enable_flow_whole_history_cuda_graph=True,
             enable_hift_cuda_graph=False,
@@ -1243,6 +1251,157 @@ def test_onnx_intra_op_threads_reaches_both_encoders(monkeypatch) -> None:
     assert seen == {"speech_tokenizer": 6, "speaker_encoder": 6}
 
 
+def tiny_prefix_flow() -> SimpleNamespace:
+    attention = SimpleNamespace(heads=2, inner_dim=8)
+    return SimpleNamespace(
+        decoder=SimpleNamespace(
+            estimator=SimpleNamespace(
+                transformer_blocks=[SimpleNamespace(attn=attention)] * 2
+            )
+        )
+    )
+
+
+def tiny_prefix_bytes_per_frame() -> int:
+    return stages.PrefixKVPool.bytes_per_frame(
+        layer_num=2,
+        euler_steps=stages.FLOW_EULER_STEPS,
+        head_num=2,
+        head_dim=4,
+        dtype=torch.bfloat16,
+    )
+
+
+@pytest.mark.parametrize(
+    ("free_blocks", "capped_blocks", "expected_blocks"),
+    [(10.0, 100.0, 10), (10.0, 4.5, 4), (0.5, 100.0, None)],
+)
+def test_derived_prefix_pool_takes_the_memory_left_after_its_reserve(
+    monkeypatch: pytest.MonkeyPatch,
+    free_blocks: float,
+    capped_blocks: float,
+    expected_blocks: int | None,
+) -> None:
+    block_bytes = stages.BLOCK_FRAMES * tiny_prefix_bytes_per_frame()
+    reserve_bytes = 2**30
+    total_bytes = 2**36
+    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: None)
+    monkeypatch.setattr(
+        torch.cuda,
+        "mem_get_info",
+        lambda device: (int(reserve_bytes + free_blocks * block_bytes), total_bytes),
+    )
+    monkeypatch.setattr(
+        torch.cuda, "get_per_process_memory_fraction", lambda device: 0.5
+    )
+    monkeypatch.setattr(
+        torch.cuda,
+        "memory_reserved",
+        lambda device: int(
+            total_bytes / 2 - reserve_bytes - capped_blocks * block_bytes
+        ),
+    )
+
+    pool = stages.build_prefix_pool(
+        tiny_prefix_flow(),
+        torch.device("cpu"),
+        torch.bfloat16,
+        size_gb=None,
+        reserve_bytes=reserve_bytes,
+    )
+
+    if expected_blocks is None:
+        assert pool is None
+    else:
+        assert pool is not None
+        assert pool.free_frames == expected_blocks * stages.BLOCK_FRAMES
+
+
+def test_sized_prefix_pool_ignores_free_memory(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(torch.cuda, "mem_get_info", lambda device: (0, 2**36))
+
+    pool = stages.build_prefix_pool(
+        tiny_prefix_flow(),
+        torch.device("cpu"),
+        torch.bfloat16,
+        size_gb=2**-10,
+        reserve_bytes=2**30,
+    )
+
+    assert pool is not None
+    expected_frames = 2**20 // tiny_prefix_bytes_per_frame()
+    assert (
+        pool.free_frames == expected_frames // stages.BLOCK_FRAMES * stages.BLOCK_FRAMES
+    )
+
+
+def test_derived_prefix_pool_leaves_the_largest_admitted_step(monkeypatch) -> None:
+    """The derived pool leaves the largest step the scheduler admits, max_batch_size
+    rows at the engine's context length, measured before the pool, plus
+    flow_prefix_cache_reserve_gb."""
+    fake_flow = RunnableFakeFlow()
+    fake_flow.packed_estimator.is_ragged = True
+    flow = stages.FunCosyVoice3Flow(
+        fake_flow, packed_estimator=fake_flow.packed_estimator
+    )
+    monkeypatch.setattr(
+        stages, "resolve_concrete_device", lambda device, gpu_id: torch.device("cuda")
+    )
+    monkeypatch.setattr(stages, "resolve_checkpoint", lambda model_path: "/checkpoint")
+    monkeypatch.setattr(stages, "patch_chunk_mask", lambda: None)
+    monkeypatch.setattr(
+        stages,
+        "load_cosyvoice3_flow_hift",
+        lambda checkpoint_dir, device, fp16, **kwargs: (flow, FakeHiFT()),
+    )
+    events: list[tuple[str, object]] = []
+
+    def measure(
+        scheduler: FunCosyVoice3StreamingVocoderScheduler,
+        device: torch.device,
+        *,
+        rows: int,
+        tokens: int,
+    ) -> int:
+        events.append(("measure", (rows, tokens)))
+        return 3 * 2**30
+
+    def build(
+        flow: stages.FunCosyVoice3Flow,
+        device: torch.device,
+        dtype: torch.dtype,
+        *,
+        size_gb: float | None,
+        reserve_bytes: int,
+    ) -> None:
+        events.append(("pool", reserve_bytes))
+
+    monkeypatch.setattr(
+        FunCosyVoice3StreamingVocoderScheduler, "measure_peak_step_bytes", measure
+    )
+    monkeypatch.setattr(stages, "build_prefix_pool", build)
+
+    stages.create_vocoder_executor(
+        "model",
+        device="cuda",
+        dtype="float16",
+        max_batch_size=4,
+        flow_prefix_cache_gb=None,
+        flow_prefix_cache_reserve_gb=1.5,
+        enable_flow_cuda_graph=False,
+        enable_flow_prefix_cuda_graph=False,
+        enable_flow_whole_history_cuda_graph=True,
+        enable_hift_cuda_graph=False,
+        flow_batch_admission_frames=3,
+        enable_dit_torch_compile=False,
+    )
+
+    assert events == [
+        ("measure", (4, FunCosyVoice3EngineBuilder.context_length)),
+        ("pool", int(4.5 * 2**30)),
+    ]
+
+
 def test_create_vocoder_executor_rejects_non_positive_admission_budget(
     monkeypatch,
 ) -> None:
@@ -1254,6 +1413,7 @@ def test_create_vocoder_executor_rejects_non_positive_admission_budget(
         stages.create_vocoder_executor(
             "model",
             flow_prefix_cache_gb=0.0,
+            flow_prefix_cache_reserve_gb=0.0,
             enable_flow_prefix_cuda_graph=True,
             enable_flow_whole_history_cuda_graph=True,
             enable_hift_cuda_graph=False,
