@@ -78,10 +78,35 @@ class Qwen3TTSCodecStateArena:
         self.dtype = dtype
         self._num_slots = int(num_slots)  # noqa: leading-underscore
         self.scratch_slot = self._num_slots  # noqa: leading-underscore
-        self.storage = decoder.init_state(
-            self._num_slots + 1,
+        self.spec = decoder.state_spec()
+        key_value_size = (
+            self.spec.num_key_value_heads
+            * self.spec.retained_context
+            * self.spec.head_dim
+        )
+        self.buffer_sizes = [
+            *(channels * length for _, channels, length in self.spec.conv_histories),
+            *(
+                channels * length
+                for _, channels, length in self.spec.transconv_overlaps
+            ),
+            *([key_value_size] * (2 * self.spec.num_layers)),
+        ]
+        # note (ratish): a slot's buffers are column blocks of one row of flat_storage, so a
+        # cohort's gather and scatter are one launch each instead of one per buffer.
+        self.flat_storage = torch.zeros(
+            self._num_slots + 1,  # noqa: leading-underscore
+            sum(self.buffer_sizes),
             device=self.device,
-            dtype=dtype,  # noqa: leading-underscore
+            dtype=dtype,
+        )
+        self.storage = self.state_of(
+            self.flat_storage,
+            torch.zeros(
+                self._num_slots + 1,  # noqa: leading-underscore
+                device=self.device,
+                dtype=torch.long,
+            ),
         )
         self.lock = threading.Lock()
         self.staging = threading.local()
@@ -91,8 +116,9 @@ class Qwen3TTSCodecStateArena:
         )  # noqa: leading-underscore
         self.retired: set[int] = set()
         self._exhausted_count = 0  # noqa: leading-underscore
-        spec = decoder.state_spec()
-        self._bytes_per_slot = spec.bytes_per_stream(dtype)  # noqa: leading-underscore
+        self._bytes_per_slot = self.spec.bytes_per_stream(
+            dtype
+        )  # noqa: leading-underscore
 
     @property
     def num_slots(self) -> int:
@@ -171,20 +197,38 @@ class Qwen3TTSCodecStateArena:
             else:
                 pass
 
-    def _buffers(self, state: Qwen3TTSIncrementalCodecState) -> list[torch.Tensor]:
-        return [
-            *state.conv_histories.values(),
-            *state.transconv_overlaps.values(),
-            *state.transformer_keys.values(),
-            *state.transformer_values.values(),
-        ]
+    def state_of(
+        self, rows: torch.Tensor, frame_positions: torch.Tensor
+    ) -> Qwen3TTSIncrementalCodecState:
+        """A state whose buffers are views of rows, one flat row per stream in the order of
+        buffer_sizes."""
+        spec = self.spec
+        state = Qwen3TTSIncrementalCodecState(
+            frame_positions=frame_positions,
+            transformer_context_length=spec.retained_context,
+        )
+        row_count = int(rows.shape[0])
+        columns = iter(rows.split(self.buffer_sizes, dim=1))
+        for key, channels, length in spec.conv_histories:
+            state.conv_histories[key] = next(columns).view(row_count, channels, length)
+        for key, channels, length in spec.transconv_overlaps:
+            state.transconv_overlaps[key] = next(columns).view(
+                row_count, channels, length
+            )
+        key_value_shape = (
+            row_count,
+            spec.num_key_value_heads,
+            spec.retained_context,
+            spec.head_dim,
+        )
+        for layer_index in range(spec.num_layers):
+            state.transformer_keys[layer_index] = next(columns).view(key_value_shape)
+        for layer_index in range(spec.num_layers):
+            state.transformer_values[layer_index] = next(columns).view(key_value_shape)
+        return state
 
     def zero_slot(self, slot: int) -> None:
-        # note (ratish): one multi-tensor launch for the slot's buffers: an initial decode resets
-        # a fresh slot per row, and every row of its batch waits for all the resets before launch.
-        torch._foreach_zero_(  # noqa: leading-underscore  # upstream spelling, or the public name is already taken
-            [buffer[slot] for buffer in self._buffers(self.storage)]
-        )
+        self.flat_storage[slot].zero_()
         self.storage.frame_positions[slot].zero_()
 
     STAGING_RING = 4
@@ -249,20 +293,10 @@ class Qwen3TTSCodecStateArena:
         Capturable: with a static index this is the gather half of a graph
         that reads the arena directly.
         """
-        storage = self.storage
-        state = Qwen3TTSIncrementalCodecState(
-            transformer_context_length=storage.transformer_context_length,
-            frame_positions=storage.frame_positions.index_select(0, index),
+        return self.state_of(
+            self.flat_storage.index_select(0, index),
+            self.storage.frame_positions.index_select(0, index),
         )
-        for key, buffer in storage.conv_histories.items():
-            state.conv_histories[key] = buffer.index_select(0, index)
-        for key, buffer in storage.transconv_overlaps.items():
-            state.transconv_overlaps[key] = buffer.index_select(0, index)
-        for layer_index, buffer in storage.transformer_keys.items():
-            state.transformer_keys[layer_index] = buffer.index_select(0, index)
-        for layer_index, buffer in storage.transformer_values.items():
-            state.transformer_values[layer_index] = buffer.index_select(0, index)
-        return state
 
     def scatter(
         self, slots: Sequence[int], state: Qwen3TTSIncrementalCodecState
@@ -281,25 +315,42 @@ class Qwen3TTSCodecStateArena:
             )
         else:
             pass
-        self.copy_rows(storage.frame_positions, index, state.frame_positions)
-        for key, buffer in storage.conv_histories.items():
-            self.copy_rows(buffer, index, state.conv_histories[key], key)
-        for key, buffer in storage.transconv_overlaps.items():
-            self.copy_rows(buffer, index, state.transconv_overlaps[key], key)
-        for layer_index, buffer in storage.transformer_keys.items():
-            self.copy_rows(
-                buffer, index, state.transformer_keys[layer_index], f"key.{layer_index}"
-            )
-        for layer_index, buffer in storage.transformer_values.items():
-            self.copy_rows(
-                buffer,
-                index,
-                state.transformer_values[layer_index],
-                f"value.{layer_index}",
-            )
+        self.check_rows(storage.frame_positions, index, state.frame_positions)
+        named_rows = [
+            *(
+                (key, buffer, state.conv_histories[key])
+                for key, buffer in storage.conv_histories.items()
+            ),
+            *(
+                (key, buffer, state.transconv_overlaps[key])
+                for key, buffer in storage.transconv_overlaps.items()
+            ),
+            *(
+                (f"key.{layer_index}", buffer, state.transformer_keys[layer_index])
+                for layer_index, buffer in storage.transformer_keys.items()
+            ),
+            *(
+                (f"value.{layer_index}", buffer, state.transformer_values[layer_index])
+                for layer_index, buffer in storage.transformer_values.items()
+            ),
+        ]
+        cohort_size = int(index.shape[0])
+        for key, buffer, rows in named_rows:
+            self.check_rows(buffer, index, rows, key)
+        packed = torch.cat(
+            [
+                rows.reshape(cohort_size, size)
+                for (_, _, rows), size in zip(
+                    named_rows, self.buffer_sizes, strict=True
+                )
+            ],
+            dim=1,
+        )
+        self.flat_storage.index_copy_(0, index, packed)
+        storage.frame_positions.index_copy_(0, index, state.frame_positions)
 
     @staticmethod
-    def copy_rows(
+    def check_rows(
         buffer: torch.Tensor,
         index: torch.Tensor,
         rows: torch.Tensor,
@@ -318,7 +369,6 @@ class Qwen3TTSCodecStateArena:
             )
         else:
             pass
-        buffer.index_copy_(0, index, rows.contiguous())
 
     def describe(self) -> CodecStateStats:
         return {
