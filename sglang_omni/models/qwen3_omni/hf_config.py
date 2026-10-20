@@ -166,6 +166,10 @@ class Qwen3OmniMoeTextConfig(PretrainedConfig):
         **kwargs,
     ):
         rope_parameters = kwargs.pop("rope_parameters", None)
+        if rope_parameters is not None:
+            rope_theta = rope_parameters.get("rope_theta", rope_theta)
+        else:
+            pass
         super().__init__(
             tie_word_embeddings=tie_word_embeddings,
             **kwargs,
