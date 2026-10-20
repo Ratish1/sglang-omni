@@ -46,17 +46,16 @@ from sglang.srt.arg_groups.cuda_graph_hook import (
 # note (ratish): 30 s of whisper's mel at 100 frames a second, the longest input the
 # tokenizer takes.
 MAX_FRAMES = 3000
-MEL_CHANNELS = 128
-STATE_CHANNELS = 1280
+# note (ratish): constants of speech_tokenizer_v3.onnx's graph, which its initializers
+# do not record.
 HEAD_COUNT = 20
-FSMN_KERNEL = 31
 ROTARY_POSITIONS = 2048
 ROTARY_THETA = 10000.0
-# note (ratish): constants of speech_tokenizer_v3.onnx's graph, not its initializers.
 LAYER_NORM_EPS = 1e-5
 FSQ_SCALE = 0.9990000128746033
 FSQ_LEVELS = 3
 FSQ_DIMS = 8
+# note (ratish): large enough that a masked key's softmax weight is zero in float32.
 MASK_BIAS = -1.0e10
 BLOCK_NODE_PARAMETERS = {
     "attn_ln/Mul": "attn_ln.weight",
@@ -106,23 +105,24 @@ def rotate(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tenso
 
 
 class SpeechTokenizerBlock(torch.nn.Module):
-    def __init__(self) -> None:
+    def __init__(self, state_channels: int, head_count: int, fsmn_kernel: int) -> None:
         super().__init__()
-        self.attn_ln = torch.nn.LayerNorm(STATE_CHANNELS, eps=LAYER_NORM_EPS)
-        self.query = torch.nn.Linear(STATE_CHANNELS, STATE_CHANNELS)
-        self.key = torch.nn.Linear(STATE_CHANNELS, STATE_CHANNELS, bias=False)
-        self.value = torch.nn.Linear(STATE_CHANNELS, STATE_CHANNELS)
-        self.out = torch.nn.Linear(STATE_CHANNELS, STATE_CHANNELS)
+        self.head_count = head_count
+        self.attn_ln = torch.nn.LayerNorm(state_channels, eps=LAYER_NORM_EPS)
+        self.query = torch.nn.Linear(state_channels, state_channels)
+        self.key = torch.nn.Linear(state_channels, state_channels, bias=False)
+        self.value = torch.nn.Linear(state_channels, state_channels)
+        self.out = torch.nn.Linear(state_channels, state_channels)
         self.fsmn = torch.nn.Conv1d(
-            STATE_CHANNELS,
-            STATE_CHANNELS,
-            FSMN_KERNEL,
-            groups=STATE_CHANNELS,
+            state_channels,
+            state_channels,
+            fsmn_kernel,
+            groups=state_channels,
             bias=False,
         )
-        self.mlp_ln = torch.nn.LayerNorm(STATE_CHANNELS, eps=LAYER_NORM_EPS)
-        self.mlp_in = torch.nn.Linear(STATE_CHANNELS, 4 * STATE_CHANNELS)
-        self.mlp_out = torch.nn.Linear(4 * STATE_CHANNELS, STATE_CHANNELS)
+        self.mlp_ln = torch.nn.LayerNorm(state_channels, eps=LAYER_NORM_EPS)
+        self.mlp_in = torch.nn.Linear(state_channels, 4 * state_channels)
+        self.mlp_out = torch.nn.Linear(4 * state_channels, state_channels)
 
     def forward(
         self,
@@ -132,20 +132,22 @@ class SpeechTokenizerBlock(torch.nn.Module):
         cos: torch.Tensor,
         sin: torch.Tensor,
     ) -> torch.Tensor:
-        positions = x.shape[1]
+        heads = (1, x.shape[1], self.head_count, -1)
         hidden = self.attn_ln(x)
-        query = rotate(self.query(hidden).view(1, positions, HEAD_COUNT, -1), cos, sin)
-        key = rotate(self.key(hidden).view(1, positions, HEAD_COUNT, -1), cos, sin)
+        query = rotate(self.query(hidden).view(heads), cos, sin)
+        key = rotate(self.key(hidden).view(heads), cos, sin)
         value = self.value(hidden)
         memory_input = value * position_mask
+        left = (self.fsmn.kernel_size[0] - 1) // 2
+        right = self.fsmn.kernel_size[0] - 1 - left
         memory = self.fsmn(
-            F.pad(memory_input.transpose(1, 2), (FSMN_KERNEL // 2, FSMN_KERNEL // 2))
+            F.pad(memory_input.transpose(1, 2), (left, right))
         ).transpose(1, 2)
         memory = (memory + memory_input) * position_mask
         scale = query.shape[-1] ** -0.25
         scores = (query.permute(0, 2, 1, 3) * scale) @ (key.permute(0, 2, 3, 1) * scale)
         weights = torch.softmax(scores + attention_bias, dim=-1)
-        attended = weights @ value.view(1, positions, HEAD_COUNT, -1).transpose(1, 2)
+        attended = weights @ value.view(heads).transpose(1, 2)
         x = x + (self.out(attended.transpose(1, 2).reshape_as(x)) + memory)
         return x + self.mlp_out(F.gelu(self.mlp_in(self.mlp_ln(x))))
 
@@ -154,19 +156,28 @@ class SpeechTokenizerV3Model(torch.nn.Module):
     """The tokenizer's encoder and FSQ code, exact for the first frames of a mel
     whatever fills the rest of its width."""
 
-    def __init__(self, layer_count: int) -> None:
+    def __init__(
+        self,
+        *,
+        layer_count: int,
+        mel_channels: int,
+        state_channels: int,
+        head_count: int,
+        fsmn_kernel: int,
+    ) -> None:
         super().__init__()
         self.conv1 = torch.nn.Conv1d(
-            MEL_CHANNELS, STATE_CHANNELS, 3, stride=2, padding=1
+            mel_channels, state_channels, 3, stride=2, padding=1
         )
         self.conv2 = torch.nn.Conv1d(
-            STATE_CHANNELS, STATE_CHANNELS, 3, stride=2, padding=1
+            state_channels, state_channels, 3, stride=2, padding=1
         )
         self.blocks = torch.nn.ModuleList(
-            SpeechTokenizerBlock() for _ in range(layer_count)
+            SpeechTokenizerBlock(state_channels, head_count, fsmn_kernel)
+            for _ in range(layer_count)
         )
-        self.project_down = torch.nn.Linear(STATE_CHANNELS, FSQ_DIMS)
-        cos, sin = rotary_tables(STATE_CHANNELS // HEAD_COUNT)
+        self.project_down = torch.nn.Linear(state_channels, FSQ_DIMS)
+        cos, sin = rotary_tables(state_channels // head_count)
         self.register_buffer("rotary_cos", cos, persistent=False)
         self.register_buffer("rotary_sin", sin, persistent=False)
         self.register_buffer(
@@ -225,7 +236,14 @@ def load_speech_tokenizer(
             )
             # note (ratish): an ONNX MatMul's weight is (in, out), a Linear's (out, in).
             state_dict[name] = tensor.t() if node.op_type == "MatMul" else tensor
-    model = SpeechTokenizerV3Model(layer_count)
+    state_channels, mel_channels, _ = state_dict["conv1.weight"].shape
+    model = SpeechTokenizerV3Model(
+        layer_count=layer_count,
+        mel_channels=mel_channels,
+        state_channels=state_channels,
+        head_count=HEAD_COUNT,
+        fsmn_kernel=state_dict["blocks.0.fsmn.weight"].shape[-1],
+    )
     model.load_state_dict(state_dict, strict=True)
     return model.to(device)
 
@@ -240,8 +258,8 @@ class CapturedTokenizerGraph:
 
 class SpeechTokenizerCudaGraphs:
     """One graph per mel width on the prefill ladder up to the tokenizer's 30 s
-    limit, in one pool: replays run one at a time on the callers' stream and copy
-    their codes out before the next."""
+    limit, in one pool: callers share the default stream, so replays run one at a
+    time and copy their codes out before the next."""
 
     def __init__(self, model: SpeechTokenizerV3Model, device: torch.device) -> None:
         self.widths = [
@@ -254,7 +272,7 @@ class SpeechTokenizerCudaGraphs:
         stream = torch.cuda.Stream(device)
         with torch.inference_mode():
             for width in reversed(self.widths):
-                mel = torch.zeros(1, MEL_CHANNELS, width, device=device)
+                mel = torch.zeros(1, model.conv1.in_channels, width, device=device)
                 frames = torch.full((1,), width, dtype=torch.int64, device=device)
                 stream.wait_stream(torch.cuda.current_stream(device))
                 with torch.cuda.stream(stream):
