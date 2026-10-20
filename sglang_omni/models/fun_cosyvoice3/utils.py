@@ -4,10 +4,14 @@
 
 from __future__ import annotations
 
+import threading
+from contextlib import nullcontext
 from typing import Callable
 
 import numpy as np
 import torch
+
+SPEECH_TOKENIZER_MAX_SECONDS = 30
 
 
 class CosyVoice3Tokenizer:
@@ -58,9 +62,17 @@ class SpeechTokenizerV3:
 
         # note (db-ol): the cuDNN conv plan is rebuilt whenever the input shape differs
         # from the previous call, and the default search setting makes rebuilds slow.
+        # note (ratish): one stream for every thread. By default each calling thread
+        # gets its own, and a run ends waiting on the legacy stream the AR runs on.
         providers = (
             [
-                ("CUDAExecutionProvider", {"cudnn_conv_algo_search": "HEURISTIC"}),
+                (
+                    "CUDAExecutionProvider",
+                    {
+                        "cudnn_conv_algo_search": "HEURISTIC",
+                        "use_ep_level_unified_stream": "1",
+                    },
+                ),
                 "CPUExecutionProvider",
             ]
             if device.startswith("cuda")
@@ -70,6 +82,20 @@ class SpeechTokenizerV3:
             model_path, sess_options=option, providers=providers
         )
         self.device = device
+        is_on_cuda = "CUDAExecutionProvider" in self.session.get_providers()
+        # note (ratish): on the one stream every run shares a cuDNN handle, which
+        # cuDNN allows from one thread at a time.
+        self.run_lock: threading.Lock | nullcontext[None] = (
+            threading.Lock() if is_on_cuda else nullcontext()
+        )
+        if is_on_cuda:
+            # note (ratish): the CUDA arena grows to a run's peak and keeps it, so
+            # the longest input runs now, before free memory sizes the pools.
+            self.extract_speech_token(
+                np.zeros(SPEECH_TOKENIZER_MAX_SECONDS * 16000, dtype=np.float32)
+            )
+        else:
+            pass
 
     def extract_speech_token(
         self, audio: np.ndarray, sample_rate: int = 16000
@@ -88,7 +114,7 @@ class SpeechTokenizerV3:
         else:
             pass
 
-        if audio.shape[1] / sample_rate > 30:
+        if audio.shape[1] / sample_rate > SPEECH_TOKENIZER_MAX_SECONDS:
             raise ValueError(
                 "Audio longer than 30s is not supported for speech token extraction"
             )
@@ -97,13 +123,16 @@ class SpeechTokenizerV3:
 
         feat = whisper.log_mel_spectrogram(torch.from_numpy(audio), n_mels=128)
         feat_len = feat.shape[2]
-        result = self.session.run(
-            None,
-            {
-                self.session.get_inputs()[0].name: feat.detach().cpu().numpy(),
-                self.session.get_inputs()[1].name: np.array([feat_len], dtype=np.int32),
-            },
-        )[0]
+        with self.run_lock:
+            result = self.session.run(
+                None,
+                {
+                    self.session.get_inputs()[0].name: feat.detach().cpu().numpy(),
+                    self.session.get_inputs()[1].name: np.array(
+                        [feat_len], dtype=np.int32
+                    ),
+                },
+            )[0]
         return torch.tensor([result.flatten().tolist()], dtype=torch.int32)
 
 
