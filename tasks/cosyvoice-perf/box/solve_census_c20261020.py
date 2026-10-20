@@ -1,6 +1,7 @@
 """The Flow's Euler solve, kernel by kernel (10-20, L7 of DESIGN_PR_STACK_20261020.md 5): a replay of either graph kind
 costs about 9 ms before any frame, so the census counts what one solve launches. The vocoder is built as serving
-builds it (config.py's vocoder arguments) with the prefix and whole history graphs off and a 4 GB prefix pool, so the
+builds it (config.py's vocoder arguments) with the prefix and whole history graphs off and an 8 GB prefix pool (8 rows
+of the longest hop on both CFG twins take 5,120 frames), so the
 steps run the compiled forward the graphs capture, kernel by kernel under torch.profiler: an 8 row follow-up hop of
 the longest hop over filled prefixes (c64's typical prefix replay) and a 4 row whole history final. Per step: kernels,
 their device time, kernels under 5 us and their time, and the top kernels by count and by time.
@@ -53,7 +54,7 @@ def main() -> None:
     arguments.update(
         enable_flow_prefix_cuda_graph=False,
         enable_flow_whole_history_cuda_graph=False,
-        flow_prefix_cache_gb=4.0,
+        flow_prefix_cache_gb=8.0,
         flow_prefix_cache_reserve_gb=0.0,
     )
     scheduler = stages.create_vocoder_executor(MODEL, device="cuda", gpu_id=0, **arguments)
