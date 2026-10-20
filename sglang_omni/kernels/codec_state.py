@@ -7,7 +7,6 @@ from __future__ import annotations
 import torch
 import triton
 import triton.language as tl
-from sglang.srt.utils.custom_op import register_custom_op
 
 CHANNEL_BLOCK = 64
 
@@ -148,10 +147,6 @@ def overlap_exchange_kernel(
     tl.store(pool_base + sample[:, None] * pool_sample_stride, tail, mask=mask)
 
 
-# note (ratish): opaque to torch.compile, which cannot trace the Triton launch
-@register_custom_op(
-    op_name="codec_history_exchange", mutates_args=["padded", "history_pool"]
-)
 def history_exchange(
     padded: torch.Tensor,
     history_pool: torch.Tensor,
@@ -186,10 +181,6 @@ def history_exchange(
     )
 
 
-# note (ratish): opaque to torch.compile, which cannot trace the Triton launch
-@register_custom_op(
-    op_name="codec_overlap_exchange", mutates_args=["output", "overlap_pool"]
-)
 def overlap_exchange(
     output: torch.Tensor,
     overlap_pool: torch.Tensor,
