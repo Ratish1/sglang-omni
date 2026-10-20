@@ -77,6 +77,7 @@ PASSES = (
     ("c1_seeded", ["--max-concurrency", "1", "--seed", "1234", "--max-samples", "200"]),
     ("c1", ["--max-concurrency", "1", "--max-samples", "200"]),
     ("c16_seeded", ["--max-concurrency", "16", "--seed", "1234"]),
+    ("c64_seeded", ["--max-concurrency", "64", "--seed", "1234"]),
     ("c1_seeded_full", ["--max-concurrency", "1", "--seed", "1234"]),
     ("c1_greedy_seeded_full", ["--max-concurrency", "1", "--seed", "1234", "--temperature", "0"]),
 )
