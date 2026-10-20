@@ -172,10 +172,6 @@ stack serves the call itself; qwen-tts reads the rope initializer registry
 by key, which Transformers fills for its scaled types and not for the
 default one, so that shim stays.
 
-Ming-TTS's fixed AudioVAE cache implements `CacheLayerMixin.get_max_length` on Transformers 5.19. Run its streaming transition tests, including inactive rows and reset/reuse, when changing that interface. Synthetic Drama 3 checkpoints retain the Fish `moe` spelling on disk but use Transformers' `sparse` spelling when constructing the reference backbone.
-
-Torch 2.14 can produce BF16 complex tensors from BF16 phase values; Ming AudioVAE explicitly constructs a complex64 spectrum because CUDA does not implement the required BF16 complex arithmetic. Keep TF32 disabled in strict FP32 batched-versus-single comparisons: cuDNN may select different convolution precision for different batch shapes.
-
 **Copies of upstream code.** Omni re-implements a few upstream helpers where
 it needs a different shape, for example the seeded sampling transform in
 `moss_tts/sampling_kernels.py` and `qwen3_tts/sampling_kernels.py`. A copy
