@@ -54,11 +54,13 @@ TREES = {
     "cip": ("cip_ca00439a1", "origin", "ca00439a1abbb57bc61f3b004a80a1a4af76ddfa"),
     "cif": ("cif_0a6e3799d", "origin", "0a6e3799d3b934243afafa1d51d04486c33dd4f5"),
     "cis": ("cis_68e3a0e5f", "origin", "68e3a0e5fbe40dc6dd3cf3eb5982175b203ba661"),
+    "upr": ("upr_057d97629", "upstream", "057d97629da4093ea7b02ae9487803cf27f88749"),
+    "cit": ("cit_b42d0b332", "origin", "b42d0b332637cc7794ee1fbeb80a4d7128e6b280"),
 }
-# note (ratish): every arm is measured by one client, main's benchmark plus each chunk's audio length, so the
-# playback continuity is the client's own whatever the arm's window walk.
-BENCH_TREE = "bench2"
-ASR_TREE = "up2"
+# note (ratish): every arm is measured by one client and scored by one ASR server, both from main; from the SGLang
+# 0.5.22 stack on (057d97629) a tree from before it no longer runs, and main's client records each chunk's length.
+BENCH_TREE = "upr"
+ASR_TREE = "upr"
 # arm: (tree, extra serve args, leading chunk seconds of the window walk before the 0.8 s windows)
 ARMS = {
     "upn": ("upn", [], [0.7769]),
@@ -71,6 +73,8 @@ ARMS = {
     "upq": ("upq", [], [0.7769]),
     "cip": ("cip", [], [0.7769]),
     "cis": ("cis", [], [0.7769]),
+    "upr": ("upr", [], [0.7769]),
+    "cit": ("cit", [], [0.7769]),
 }
 # arm: benchmark args every pass of the arm adds
 ARM_BENCH_ARGS: dict[str, list[str]] = {}

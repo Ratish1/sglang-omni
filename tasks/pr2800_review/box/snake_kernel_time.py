@@ -17,7 +17,7 @@ from pathlib import Path
 
 import torch
 from transformers import AutoConfig
-from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import SnakeBeta
+from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import Qwen3OmniMoeSnakeBeta
 
 from sglang_omni.kernels.bias_snake_beta import SnakeBetaCoefficients, fused_bias_snake_beta
 
@@ -37,7 +37,7 @@ def main() -> None:
     for rows in (1, 8):
         for shape in snakes:
             channels, length = shape["channels"], shape["length"]
-            activation = SnakeBeta(channels).to(device="cuda", dtype=DTYPE).eval()
+            activation = Qwen3OmniMoeSnakeBeta(channels).to(device="cuda", dtype=DTYPE).eval()
             with torch.no_grad():
                 activation.alpha.normal_(0.0, 0.5)
                 activation.beta.normal_(0.0, 0.5)
