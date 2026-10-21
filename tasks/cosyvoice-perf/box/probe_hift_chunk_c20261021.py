@@ -52,13 +52,15 @@ def main():
         compare(*arguments.compare)
         return
     stages = importlib.import_module("sglang_omni.models.fun_cosyvoice3.stages")
-    channels_last = importlib.import_module("sglang_omni.models.fun_cosyvoice3.hift_channels_last")
     if arguments.channel_alignment is not None:
+        channels_last = importlib.import_module("sglang_omni.models.fun_cosyvoice3.hift_channels_last")
         channels_last.CHANNEL_ALIGNMENT = arguments.channel_alignment
+    else:
+        pass
     flow, hift = stages.load_cosyvoice3_flow_hift(arguments.checkpoint, "cuda", autocast_dtype=None)
     stages.CosyVoice3Vocoder(flow, hift, autocast_dtype=None)
     identity = {"decode": type(hift.decode).__name__, "torch": torch.__version__, "cudnn": torch.backends.cudnn.version(),
-                "channel_alignment": getattr(channels_last, "CHANNEL_ALIGNMENT", None), "module": stages.__file__}
+                "channel_alignment": arguments.channel_alignment, "module": stages.__file__}
     print(json.dumps(identity))
     samples_per_frame = int(np.prod(hift.upsample_rates)) * hift.istft_params["hop_len"]
     with torch.inference_mode():
