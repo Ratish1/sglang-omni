@@ -388,8 +388,8 @@ if HAS_TRITON:
         weights = libdevice.exp(scores - tl.max(scores, 1)[:, None])
         attended = tl.dot(weights.to(tl.bfloat16), v) / tl.sum(weights, 1)[:, None]
         tl.store(OUT + q_offsets, attended.to(tl.bfloat16), mask=is_query[:, None])
-        # note (ratish): released after the store; released at the start, o_proj's waiting
-        # programs held the SM slots the attention's later waves needed (bs 16: +2.5 % a step).
+        # note (ratish): released after the store, so o_proj's waiting programs do not hold
+        # the SM slots the attention's later waves need.
         if USE_GDC:
             gdc_launch_dependents()
         else:
