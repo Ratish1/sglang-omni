@@ -9,11 +9,12 @@ the window SM Issue and GR Active over the arm's benchmark.
 """
 
 import json
+import os
 import re
 import sys
 from pathlib import Path
 
-ROOT = Path("/data/v3_20261020/pairs")
+ROOT = Path(os.environ.get("PAIR_ROOT", "/data/v3_20261020/pairs"))
 CAP_TOKENS = 2048
 
 

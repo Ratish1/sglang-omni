@@ -23,7 +23,7 @@ from pathlib import Path
 import httpx
 
 MODEL = "Qwen/Qwen3-TTS-12Hz-1.7B-Base"
-ROOT = Path("/data/v3_20261020/pairs")
+ROOT = Path(os.environ.get("PAIR_ROOT", "/data/v3_20261020/pairs"))
 KIT = Path("/workspace/t_marks/tasks/omni_step_profiling_20260918/scripts")
 HEALTH_TIMEOUT_S = 1800.0
 STOP_TIMEOUT_S = 300.0
@@ -114,6 +114,7 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=None)
     parser.add_argument("--no-stream", action="store_true")
     parser.add_argument("--gpu-metrics", action="store_true")
+    parser.add_argument("--decode-digest", action="store_true")
     args = parser.parse_args()
     arms = {"a": (args.a_card, "", args.port), "b": (args.b_card, args.b_args, args.port + 200)}
     outs = {arm: ROOT / args.label / arm for arm in arms}
@@ -129,6 +130,12 @@ def main() -> None:
         ).stdout
         placement = f"--tts_engine.gpu {card} --vocoder.gpu {card}"
         server_env = dict(os.environ, PYTHONPATH=tree, SGLANG_OMNI_STRICT_PORT="1")
+        if args.decode_digest:
+            (outs[arm] / "digest").mkdir(exist_ok=True)
+            server_env["PYTHONPATH"] = f"{KIT / 'decode_digest'}:{tree}"
+            server_env["OMNI_DECODE_DIGEST"] = str(outs[arm] / "digest")
+        else:
+            pass
         imported = subprocess.run(
             [sys.executable, "-c", "import sglang_omni; print(sglang_omni.__file__)"],
             cwd=tree, env=server_env, capture_output=True, text=True,
