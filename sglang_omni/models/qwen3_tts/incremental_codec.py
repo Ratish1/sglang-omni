@@ -78,14 +78,14 @@ class Qwen3TTSIncrementalCodecStateSpec:
 
 @dataclass
 class Qwen3TTSKVRings:
-    """Every layer's keys and values for a cohort's slots, read and written in place: slot s
-    keeps frame p at row s * ring_frames + p % ring_frames, and a row's frames past its valid
-    frames go to trash_row."""
+    """Every layer's keys and values for a cohort's slots, read and written in place: the
+    cohort's row i keeps frame p at row slot_rows[i] + p % ring_frames, and a row's frames
+    past its valid frames go to trash_row."""
 
     keys: list[torch.Tensor]
     values: list[torch.Tensor]
     ring_frames: int
-    slot_index: torch.Tensor
+    slot_rows: torch.Tensor
     trash_row: int
 
 
@@ -857,7 +857,7 @@ class FusedIncrementalTransformer:
         key_positions = start_positions.unsqueeze(1) + torch.arange(
             -retained_context, frames, device=device
         )
-        slot_rows = rings.slot_index.unsqueeze(1) * rings.ring_frames
+        slot_rows = rings.slot_rows.unsqueeze(1)
         # note (ratish): a frame past its row's valid frames would take the ring row of a
         # retained frame a ring length before it, so it goes to the trash row instead.
         write_rows = torch.where(

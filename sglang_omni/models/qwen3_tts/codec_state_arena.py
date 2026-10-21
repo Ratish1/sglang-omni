@@ -292,11 +292,13 @@ class Qwen3TTSCodecStateArena:
         for layer_index, buffer in storage.transformer_values.items():
             state.transformer_values[layer_index] = buffer.index_select(0, index)
         if self.key_rings is not None:
+            # note (ratish): computed here, not passed through, so a compiled decode sees a
+            # tensor of the gather's grad mode, as it does every other gathered tensor.
             state.kv_rings = Qwen3TTSKVRings(
                 keys=self.key_rings,
                 values=self.value_rings,
                 ring_frames=self.ring_frames,
-                slot_index=index,
+                slot_rows=index * self.ring_frames,
                 trash_row=self.scratch_slot * self.ring_frames,
             )
         else:

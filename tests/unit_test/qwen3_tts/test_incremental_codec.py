@@ -603,7 +603,7 @@ def test_ring_decodes_track_fp32_as_closely_as_the_plain_step() -> None:
                 for index in range(len(reference.layers))
             ],
             ring_frames=ring_frames,
-            slot_index=torch.tensor([3, 0, 5], device="cuda"),
+            slot_rows=torch.tensor([3, 0, 5], device="cuda") * ring_frames,
             trash_row=6 * ring_frames,
         )
         return Qwen3TTSIncrementalCodecState(
