@@ -17,7 +17,7 @@ OUTPUT_SAMPLES_PER_PROGRAM = 256
 if HAS_TRITON:
     import triton
     import triton.language as tl
-    from sglang.kernels.ops.diffusion.common.numerics import div_rn_f32, mul_rn_f32
+    from sglang.kernels.numerics import div_rn_f32, mul_rn_f32
     from triton.language.extra import libdevice
 
     # note (ratish): element counts change every step, one binary serves them all.
