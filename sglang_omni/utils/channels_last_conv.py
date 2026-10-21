@@ -27,16 +27,19 @@ def channels_last_conv1d(
     conv: torch.nn.Conv1d,
     weight: torch.Tensor,
     length: int,
+    *,
+    add_bias: bool = True,
 ) -> torch.Tensor:
     """The stride-one conv of a (B, L, C) activation that carries its left context
     and, for a dilated conv, a length divisible by the dilation; returns
-    (B, length, C_out)."""
+    (B, length, C_out), without the conv's bias when add_bias is False."""
+    bias = conv.bias if add_bias else None
     dilation = conv.dilation[0]
     if dilation == 1:
         output = F.conv2d(
             hidden_states.transpose(1, 2).unsqueeze(2),
             weight.unsqueeze(2),
-            conv.bias,
+            bias,
             groups=conv.groups,
         )
         return output.squeeze(2).transpose(1, 2)
@@ -48,7 +51,7 @@ def channels_last_conv1d(
         output = F.conv2d(
             hidden_states.view(batch_size, -1, dilation, channels).permute(0, 3, 1, 2),
             weight.unsqueeze(3),
-            conv.bias,
+            bias,
             groups=conv.groups,
         )
         return (
