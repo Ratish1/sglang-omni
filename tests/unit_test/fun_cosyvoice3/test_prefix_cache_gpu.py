@@ -357,7 +357,9 @@ def test_compiled_prefix_hops_follow_each_row_across_batches() -> None:
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-def test_prefix_layouts_upload_behind_queued_work_without_a_host_wait() -> None:
+def test_prefix_layouts_upload_from_pinned_memory_without_blocking(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     device = torch.device("cuda")
     pool = PrefixKVPool(
         layer_num=1,
@@ -377,25 +379,32 @@ def test_prefix_layouts_upload_behind_queued_work_without_a_host_wait() -> None:
         page_table_width=4096,
     )
 
-    def build() -> PrefixRowAttention:
-        return PrefixRowAttention(
-            rows=rows,
-            new_frames=[2048, 2048],
-            layout=layout,
-            padding_block=pool.padding_block,
-            chunk_size=CHUNK,
-            device=device,
-        )
+    uploads: list[tuple[bool, bool]] = []
+    to = torch.Tensor.to
 
-    build()
-    torch.cuda.synchronize()
-    torch.cuda._sleep(1_000_000_000)  # noqa: leading-underscore  # upstream name
-    queued = torch.cuda.Event()
-    queued.record()
-    for _ in range(4):
-        build()
-    assert not queued.query()
-    torch.cuda.synchronize()
+    def recording_to(
+        tensor: torch.Tensor,
+        target: torch.device | torch.dtype,
+        non_blocking: bool = False,
+    ) -> torch.Tensor:
+        moved = to(tensor, target, non_blocking=non_blocking)
+        if tensor.device.type == "cpu" and moved.device.type == "cuda":
+            uploads.append((tensor.is_pinned(), non_blocking))
+        else:
+            pass
+        return moved
+
+    monkeypatch.setattr(torch.Tensor, "to", recording_to)
+    PrefixRowAttention(
+        rows=rows,
+        new_frames=[2048, 2048],
+        layout=layout,
+        padding_block=pool.padding_block,
+        chunk_size=CHUNK,
+        device=device,
+    )
+    assert uploads
+    assert all(pinned and non_blocking for pinned, non_blocking in uploads)
 
 
 def test_grow_rows_takes_nothing_on_a_shortfall() -> None:
