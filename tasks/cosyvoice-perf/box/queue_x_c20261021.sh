@@ -1,13 +1,14 @@
 #!/usr/bin/env bash
 # 10-21, cards 0 and 1: what is left of queues u and v, cut to the runs that decide, each PR judged by its own head
-# against ours. Queue u's bash was stopped while its pair p_u1 (main against #2260 as is) ran on; this queue waits
-# for that pair and scores its b16 audio (the PR's own claim). #2260: p_x1 the PR with main merged (t_b0) against our
-# branch (t_b1) at b1f, seeded for byte identity, and b16; p_u2 the one call arm at b16 and long form; the profiled
-# b16 pair main against t_b1. #2944: the PR with main merged (t_p44, tmp/pr-2944-main 1b0e74b65) against ours (t_s)
-# at b1f for byte identity; the startup check t_b1 against t_s (the skipped startup itself, and whether a pool moved,
-# one boot per card order), with streaming c16 and c64 only if a pool moved. Last, the profiled c64 pair of L2.
-# Dropped as deciding nothing: b64 (the vocoder batches 16 requests whatever the concurrency), #2260 on #3019 (#2260
-# lands on main), a second boot per order, c1f identity (b1f reads the RoPE angles every packed path takes).
+# against ours, at c1 and c16 only. Queue u's bash was stopped while its pair p_u1 (main against #2260 as is) ran on;
+# this queue stops that pair once its second order has b16, writes its table for b1f and b16, and scores its b16 audio
+# (the PR's own claim). #2260: p_x1 the PR with main merged (t_b0) against our branch (t_b1) at b1f, seeded for byte
+# identity, and b16; p_u2 the one call arm at b16 (at c1 a batch has one request, nothing to group); the profiled b16
+# pair main against t_b1. #2944: the PR with main merged (t_p44, tmp/pr-2944-main 1b0e74b65) against ours (t_s) at
+# b1f for byte identity; the startup check t_b1 against t_s (one boot per card order), with streaming c1f and c16 only
+# if a pool's size moved. Cut as deciding nothing: b64 and long form (the vocoder batches 16 requests whatever the
+# concurrency, and the route and the grouping act the same on long rows), #2260 on #3019 (#2260 lands on main), a
+# second boot per order, c1f identity (b1f reads the RoPE angles every packed path takes).
 # usage (in the container): setsid bash -c 'echo $$ > /data/c20261021/queue_x.pgid; exec bash /workspace/t_marks/tasks/cosyvoice-perf/box/queue_x_c20261021.sh'
 D=/data/c20261021
 IN=/workspace/t_marks/tasks/cosyvoice-perf/box
@@ -47,14 +48,24 @@ profiled() {
   wait
   log "profiled $name $(tail -n 1 $D/$name/$first/progress.txt) ; $(tail -n 1 $D/$name/$second/progress.txt)"
 }
-
 # note (ratish): the container's PID 1 reaps nothing, so a finished queue stays as zombies; wait on live members.
-while ps -o stat= -g "$(cat $D/queue_u.pgid)" | grep -qv '^Z'; do sleep 60; done
-log "queue start t_marks $(git -C /workspace/t_marks rev-parse --short HEAD); p_u1 table rows $(grep -c '^| [ab] |' $D/p_u1.log)"
+live() { ps -o pid=,stat= -g "$1" | awk '$2 !~ /^Z/ {print $1}'; }
+
+U=$(cat $D/queue_u.pgid)
+until [ -s $D/p_u1/b/gpu0/b16/speed_results.json ] && [ -s $D/p_u1/b/gpu1/b16/speed_results.json ]; do
+  [ -z "$(live $U)" ] && break
+  sleep 20
+done
+# note (ratish): SIGINT reaches the pair driver's finally, which stops both servers by their process groups.
+pkill -INT -g $U -f serve_pair_c20261021.py
+for i in $(seq 1 30); do [ -z "$(live $U)" ] && break; sleep 5; done
+[ -n "$(live $U)" ] && kill -TERM $(live $U)
+(cd $IN && PAIR_CELLS=b1f,b16 python3 -c "import sys; from pathlib import Path; import serve_pair_c20261021 as pair; pair.report(Path('$D/p_u1'), ('t_m22', 't_b0'))" > $D/p_u1.log 2>&1)
+log "queue start t_marks $(git -C /workspace/t_marks rev-parse --short HEAD); p_u1 stopped after b16, table rows $(grep -c '^| [ab] |' $D/p_u1.log)"
 for dir in a/gpu0 a/gpu1 b/gpu0 b/gpu1; do score $D/p_u1/$dir/b16; done
 pair t_b0 t_b1 p_x1 b1f,b16
 identity p_x1 b1f
-pair t_b1 t_b1c p_u2 b16,Lb16
+pair t_b1 t_b1c p_u2 b16
 profiled t_m22 t_b1 prof_u1 b16:16:320::::b
 
 cd /workspace/sglang-omni
@@ -90,9 +101,8 @@ rows = json.load(open('$D/startup_v/startup.json'))
 print(int(len({tuple(row['pools']) for row in rows}) != 1))")
 log "pools moved $pools_moved"
 if [ "$pools_moved" = 1 ]; then
-  pair t_b1 t_s p_v1 c16,c64
+  pair t_b1 t_s p_v1 c1f,c16
 else
   log "no pool moved, streaming untouched"
 fi
-profiled t_pr t_l2 prof_u2 c64:64:640
 log "queue done"
