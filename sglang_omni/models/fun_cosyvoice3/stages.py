@@ -2463,7 +2463,11 @@ def create_vocoder_executor(
 
     patch_chunk_mask()
 
-    if enable_dit_torch_compile:
+    # note (ratish): the packed route leaves the padded DiT only the fallback decode,
+    # which runs it eagerly, so its compile and graphs would serve no request.
+    if enable_dit_torch_compile and flow.is_buffered_packed:
+        set_dit_compile_config()
+    elif enable_dit_torch_compile:
         compile_dit_backbone(flow, autocast_dtype=autocast_dtype)
     else:
         pass
@@ -2475,7 +2479,7 @@ def create_vocoder_executor(
     else:
         pass
 
-    if enable_flow_cuda_graph:
+    if enable_flow_cuda_graph and not flow.is_buffered_packed:
         capture_shapes = verify_flow_cuda_graph_capture_shapes(
             flow_cuda_graph_capture_shapes,
         )
