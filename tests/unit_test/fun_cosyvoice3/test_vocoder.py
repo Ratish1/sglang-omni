@@ -1506,8 +1506,9 @@ def test_vocoder_spectra_match_cosyvoice_without_a_host_wait(
 
 @pytest.mark.accelerator
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("finalize", [False, True])
 def test_channels_last_decode_matches_cosyvoice_decode(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, finalize: bool
 ) -> None:
     monkeypatch.setattr(torch.backends.cudnn, "allow_tf32", False)
     monkeypatch.setattr(torch.backends.cuda.matmul, "allow_tf32", False)
@@ -1520,8 +1521,8 @@ def test_channels_last_decode_matches_cosyvoice_decode(
     mel = torch.randn(2, 80, 100, device="cuda") * 3
     source = torch.randn(2, 1, 100 * samples_per_frame, device="cuda") * 0.1
     with torch.inference_mode():
-        decoded = hift.decode(x=mel, s=source, finalize=True)
-        reference = reference_hift.decode(x=mel, s=source, finalize=True)
+        decoded = hift.decode(x=mel, s=source, finalize=finalize)
+        reference = reference_hift.decode(x=mel, s=source, finalize=finalize)
     assert decoded.shape == reference.shape
     torch.testing.assert_close(decoded, reference, atol=HIFT_ROUNDING_ATOL, rtol=0)
 
