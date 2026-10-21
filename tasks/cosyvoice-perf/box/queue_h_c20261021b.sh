@@ -115,6 +115,21 @@ elif [ "$1" = fix ]; then
   score $D/p_h2/b/gpu1/c16 1 27000 &
   wait
   log "queue fix done"
+elif [ "$1" = quality ]; then
+  # Phase quality: p_h2's seeded c1f cells scored, then t_h1's SIM per clip against t_main's in each order (order a
+  # has t_main in slot 0, order b in slot 1), over every clip and the clips of the same length.
+  log "queue quality start t_marks $(git -C /workspace/t_marks rev-parse --short HEAD)"
+  score $D/p_h2/a/gpu0/c1f 0 26000 &
+  score $D/p_h2/a/gpu1/c1f 1 27000 &
+  wait
+  score $D/p_h2/b/gpu0/c1f 0 26000 &
+  score $D/p_h2/b/gpu1/c1f 1 27000 &
+  wait
+  python3 $IN/paired_sim_c20261021.py $D/p_h2/a/gpu0/c1f $D/p_h2/a/gpu1/c1f > $D/paired_sim_p_h2_a.txt 2>&1
+  python3 $IN/paired_sim_c20261021.py $D/p_h2/b/gpu1/c1f $D/p_h2/b/gpu0/c1f > $D/paired_sim_p_h2_b.txt 2>&1
+  log "paired sim order a (main, t_h1): $(tr '\n' ' ' < $D/paired_sim_p_h2_a.txt)"
+  log "paired sim order b (main, t_h1): $(tr '\n' ' ' < $D/paired_sim_p_h2_b.txt)"
+  log "queue quality done"
 else
   log "unknown phase $1"
 fi
