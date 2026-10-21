@@ -9,6 +9,7 @@ from typing import Any
 
 import numpy as np
 import pytest
+import silero_vad
 from starlette.websockets import WebSocketState
 
 from sglang_omni.audio import vad as vad_module
@@ -635,7 +636,7 @@ class ContentStreamingVAD(StreamingVAD):
 async def test_frame_vad_reports_the_same_boundaries_as_streaming_vad(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(vad_module, "load_silero_vad", lambda onnx: None)
+    monkeypatch.setattr(silero_vad, "load_silero_vad", lambda onnx: None)
     reference = ContentStreamingVAD(VADConfig())
     session, websocket = vad_session(monkeypatch)
     audio = (
