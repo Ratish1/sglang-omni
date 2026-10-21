@@ -77,6 +77,34 @@ if [ "$1" = a ]; then
   pooled p_r2 c16 t_l1 t_l2
   pooled p_r2 c64 t_l1 t_l2
   log "queue a done"
+elif [ "$1" = b ]; then
+  # Phase b: t_l3 (L3 with the capture and import fixes) and t_l4 (L4 with the allocator check), each on the one
+  # below; their touched suites on a card; warms; once the CPU unit run in /data/c20261022r/ci has ended, p_r3 t_l2
+  # against t_l3 (c1f seeded, c16) with c16 scored, then p_r4 t_l3 against t_l4 (c16, c64), every gap pooled.
+  log "queue b start t_marks $(git -C /workspace/t_marks rev-parse --short HEAD)"
+  tree t_l3 origin perf/cosyvoice3-speech-tokenizer-graphs
+  tree t_l4 origin perf/cosyvoice3-prefix-pool-sized-v2
+  units t_l3 0 tests/unit_test/fun_cosyvoice3/test_speech_tokenizer.py tests/unit_test/fun_cosyvoice3/test_utils.py &
+  units t_l4 1 tests/unit_test/fun_cosyvoice3/test_vocoder.py tests/unit_test/fun_cosyvoice3/test_pipeline.py \
+    tests/unit_test/fun_cosyvoice3/test_flow_batch.py &
+  wait
+  warm t_l3 0 51600 &
+  warm t_l4 1 52000 &
+  wait
+  while pgrep -f "pytest tests/ -q" > /dev/null; do sleep 30; done
+  log "cpu unit run ended"
+  pair t_l2 t_l3 p_r3 c1f,c16
+  pooled p_r3 c16 t_l2 t_l3
+  score $D/p_r3/a/gpu0/c16 0 26000 &
+  score $D/p_r3/a/gpu1/c16 1 27000 &
+  wait
+  score $D/p_r3/b/gpu0/c16 0 28000 &
+  score $D/p_r3/b/gpu1/c16 1 29000 &
+  wait
+  pair t_l3 t_l4 p_r4 c16,c64
+  pooled p_r4 c16 t_l3 t_l4
+  pooled p_r4 c64 t_l3 t_l4
+  log "queue b done"
 elif [ "$1" = score_r1 ]; then
   # Phase score_r1: p_r1's b16 audio scored, WER and SIM per arm.
   log "queue score_r1 start t_marks $(git -C /workspace/t_marks rev-parse --short HEAD)"
