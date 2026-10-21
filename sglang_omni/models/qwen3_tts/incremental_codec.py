@@ -20,6 +20,7 @@ from sglang_omni.utils.channels_last_conv import (
     channels_last_weight,
     is_channels_last_conv_device,
 )
+from sglang_omni.utils.merged_projections import merge_projection_weights
 
 if TYPE_CHECKING:
     from qwen_tts.core.tokenizer_12hz.modeling_qwen3_tts_tokenizer_v2 import (
@@ -592,29 +593,12 @@ class FusedIncrementalTransformer:
         self.transformer = transformer
         self.inverse_frequencies = rotary.inv_freq.float()
         self.attention_scaling = float(rotary.attention_scaling)
-        # note (ratish): q, k, v and gate, up become views of one matrix each, so the
-        # fused GEMMs read the loaded weights without a second copy.
-        for layer in transformer.layers:
-            attention, mlp = layer.self_attn, layer.mlp
-            assert isinstance(attention.q_norm, torch.nn.Identity) and isinstance(
-                attention.k_norm, torch.nn.Identity
-            ), "the decoder attention has no q or k norm"
-            projections = (attention.q_proj, attention.k_proj, attention.v_proj)
-            attention.qkv_weight = torch.cat(
-                [projection.weight.data for projection in projections]
-            )
-            start = 0
-            for projection in projections:
-                output_features = projection.weight.shape[0]
-                projection.weight.data = attention.qkv_weight[
-                    start : start + output_features
-                ]
-                start += output_features
-            mlp.gate_up_weight = torch.cat(
-                (mlp.gate_proj.weight.data, mlp.up_proj.weight.data)
-            )
-            mlp.gate_proj.weight.data = mlp.gate_up_weight[: mlp.intermediate_size]
-            mlp.up_proj.weight.data = mlp.gate_up_weight[mlp.intermediate_size :]
+        assert all(
+            isinstance(layer.self_attn.q_norm, torch.nn.Identity)
+            and isinstance(layer.self_attn.k_norm, torch.nn.Identity)
+            for layer in transformer.layers
+        ), "the decoder attention has no q or k norm"
+        merge_projection_weights(transformer.layers)
 
     @staticmethod
     def normalize(
