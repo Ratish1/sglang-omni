@@ -42,6 +42,7 @@ from onnx import numpy_helper
 from sglang.srt.arg_groups.cuda_graph_hook import (
     generate_prefill_cuda_graph_batch_sizes,
 )
+from sglang.srt.model_executor.runner.base_cuda_graph_runner import freeze_gc
 from sglang.srt.utils.common import async_d2h
 
 # note (ratish): 30 s of whisper's mel at 100 frames a second, the longest input the
@@ -278,7 +279,7 @@ class SpeechTokenizerCudaGraphs:
         # with, and the process keeps its own.
         allow_tf32 = torch.backends.cuda.matmul.allow_tf32
         torch.backends.cuda.matmul.allow_tf32 = True
-        with torch.inference_mode():
+        with torch.inference_mode(), freeze_gc(enable_cudagraph_gc=False):
             for width in reversed(self.widths):
                 mel = torch.zeros(1, model.conv1.in_channels, width, device=device)
                 frames = torch.full((1,), width, dtype=torch.int64, device=device)
