@@ -12,6 +12,7 @@ Later on 10-20: the long form cell L16 (the 48 entries of make_longform_meta.py 
 c1f, every reference seeded at concurrency 1, whose tails rest on 1,088 requests where c1's p99 is one of 64.
 10-21 copy under /data/c20261021, the new lease's home, on cards 0 and 1. Later on 10-21: the buffered cells b1f (every
 reference at concurrency 1, seeded) and Lb16 (the long form list at concurrency 16), for #2260's buffered route.
+Later on 10-21: PAIR_HOME names the run home (default /data/c20261021), for the 0.5.22 container's /data/c20261021b.
 usage: python3 serve_pair_c20261021.py <first tree> <second tree> <out dir>"""
 
 import json
@@ -23,7 +24,7 @@ import time
 import urllib.request
 from pathlib import Path
 
-D = "/data/c20261021"
+D = os.environ.get("PAIR_HOME", "/data/c20261021")
 MODEL = "FunAudioLLM/Fun-CosyVoice3-0.5B-2512"
 COSYVOICE = "/workspace/CosyVoice:/workspace/CosyVoice/third_party/Matcha-TTS"
 PORTS = (24000, 25000)
