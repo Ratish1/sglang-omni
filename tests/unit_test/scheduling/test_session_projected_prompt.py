@@ -142,12 +142,21 @@ def test_projected_session_prefill_rows_come_from_the_spans_and_fed_back_tokens(
         return token_ids.to(torch.float32)[:, None].repeat(1, WIDTH)
 
     rows = session_projected_prefill_rows(
-        data, embed_tokens, torch.device("cpu"), torch.float32
+        data,
+        embed_tokens,
+        torch.device("cpu"),
+        torch.float32,
+        prefix_len=4,
+        extend_len=3,
     )
     assert rows.tolist() == [[1.0] * WIDTH, [2.0] * WIDTH, [2.0] * WIDTH]
-    data.req.prefix_len = 2
     rows = session_projected_prefill_rows(
-        data, embed_tokens, torch.device("cpu"), torch.float32
+        data,
+        embed_tokens,
+        torch.device("cpu"),
+        torch.float32,
+        prefix_len=2,
+        extend_len=5,
     )
     assert rows[:2].tolist() == [[5.0] * WIDTH, [1.0] * WIDTH]
 

@@ -77,6 +77,12 @@ def prefill_sidecar(
     forward_batch: SimpleNamespace,
     requests: list[SimpleNamespace],
 ):
+    forward_batch.extend_prefix_lens_cpu = [
+        request.data.req.prefix_len for request in requests
+    ]
+    forward_batch.extend_seq_lens_cpu = [
+        request.data.req.extend_len for request in requests
+    ]
     runner.before_prefill(forward_batch, schedule_batch=None, requests=requests)
     return get_omni_prefill_inputs(forward_batch)
 

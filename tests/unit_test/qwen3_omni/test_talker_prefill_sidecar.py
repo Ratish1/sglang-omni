@@ -52,11 +52,19 @@ def unprojected_req(extend_len: int) -> SimpleNamespace:
     )
 
 
-def make_forward_batch(num_tokens: int, *, input_embeds=None) -> SimpleNamespace:
+def make_forward_batch(
+    num_tokens: int,
+    *,
+    input_embeds=None,
+    rows: list[tuple[int, int]] | None = None,
+) -> SimpleNamespace:
+    spans = rows if rows is not None else [(0, num_tokens)]
     return SimpleNamespace(
         input_embeds=input_embeds,
         replace_embeds=None,
         input_ids=torch.zeros(num_tokens, dtype=torch.long),
+        extend_prefix_lens_cpu=[prefix_len for prefix_len, _ in spans],
+        extend_seq_lens_cpu=[extend_len for _, extend_len in spans],
         rids=["r0"],
     )
 
@@ -121,7 +129,7 @@ def test_sidecar_composes_the_logical_rows_for_each_request() -> None:
     ]
     num_tokens = 5 + 7
 
-    sidecar_batch = make_forward_batch(num_tokens)
+    sidecar_batch = make_forward_batch(num_tokens, rows=[(3, 5), (2, 7)])
     make_runner().before_prefill(sidecar_batch, schedule_batch=None, requests=requests)
 
     payload = get_omni_prefill_inputs(sidecar_batch)
