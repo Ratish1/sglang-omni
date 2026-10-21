@@ -1455,6 +1455,17 @@ def load_cosyvoice3_flow_hift_lightweight(
     )
 
 
+def set_dit_compile_config() -> None:
+    """Process-wide Dynamo and Inductor settings every DiT compile reads."""
+    inductor_config.fx_graph_cache = True
+    dynamo.config.cache_size_limit = 1024
+    dynamo.config.accumulated_cache_size_limit = 1024
+    # note(ratish): Inductor picks CUDA's libdevice on its first kernel build;
+    # cache entries record the file, so a warm boot's first lookups would miss.
+    with inductor_config.patch({"eager_numerics.use_pytorch_libdevice": True}):
+        _set_triton_libdevice_path()
+
+
 def compile_dit_backbone(
     flow: FunCosyVoice3Flow,
     *,
@@ -1482,13 +1493,7 @@ def compile_dit_backbone(
         raise RuntimeError(COSYVOICE_INSTALL_HINT) from exc
 
     original_forward = estimator.forward
-    inductor_config.fx_graph_cache = True
-    dynamo.config.cache_size_limit = 1024
-    dynamo.config.accumulated_cache_size_limit = 1024
-    # note(ratish): Inductor picks CUDA's libdevice on its first kernel build;
-    # cache entries record the file, so a warm boot's first lookups would miss.
-    with inductor_config.patch({"eager_numerics.use_pytorch_libdevice": True}):
-        _set_triton_libdevice_path()
+    set_dit_compile_config()
     # note(ratish): the AOT cache refuses the autocast-disabled regions around RoPE;
     # these match without them: an outer product and elementwise ops.
     rotary = estimator.rotary_embed
