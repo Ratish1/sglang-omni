@@ -19,7 +19,8 @@ pair() {
   log "pair $name rc $? token cap hits $(grep -E '\| at the token cap \|' $D/$name.log | awk -F'|' '{printf "%s:%s/%s ", $3, $5, $6}')"
 }
 
-while pgrep -g "$(cat $D/queue_u.pgid)" > /dev/null; do sleep 60; done
+# note (ratish): the container's PID 1 reaps nothing, so a finished queue stays as zombies; wait on live members.
+while ps -o stat= -g "$(cat $D/queue_u.pgid)" | grep -qv '^Z'; do sleep 60; done
 log "queue start t_marks $(git -C /workspace/t_marks rev-parse --short HEAD)"
 cd /workspace/sglang-omni
 git fetch -q origin perf/cosyvoice3-skip-native-startup

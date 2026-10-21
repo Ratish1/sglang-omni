@@ -40,7 +40,8 @@ profiled() {
   log "profiled $name $(tail -n 1 $D/$name/$first/progress.txt) ; $(tail -n 1 $D/$name/$second/progress.txt)"
 }
 
-while pgrep -g "$(cat $D/queue_t.pgid)" > /dev/null; do sleep 60; done
+# note (ratish): the container's PID 1 reaps nothing, so a finished queue stays as zombies; wait on live members.
+while ps -o stat= -g "$(cat $D/queue_t.pgid)" | grep -qv '^Z'; do sleep 60; done
 log "queue start t_marks $(git -C /workspace/t_marks rev-parse --short HEAD)"
 cd /workspace/sglang-omni
 git fetch -q origin perf/cosyvoice3-buffered-packed-flow perf/cosyvoice3-buffered-packed-one-call tmp/l1-buffered-packed
