@@ -19,6 +19,7 @@ from sglang_omni.models.qwen3_tts.incremental_codec import (
     FusedIncrementalTransformer,
     Qwen3TTSIncrementalCodecState,
     Qwen3TTSIncrementalDecoder,
+    Qwen3TTSKVRings,
     channels_last_causal_conv1d,
     channels_last_causal_transconv1d,
     incremental_causal_conv1d,
@@ -528,6 +529,125 @@ def test_fused_transformer_tracks_fp32_as_closely_as_the_plain_step() -> None:
             plain, inputs.bfloat16(), states["plain"]
         )
         compiled_output = compiled(inputs.bfloat16(), states["compiled"])
+    assert relative_error(compiled_output, expected) <= 1.1 * relative_error(
+        plain_output, expected
+    )
+
+
+@pytest.mark.accelerator
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_ring_decodes_track_fp32_as_closely_as_the_plain_step() -> None:
+    apply_qwen_tts_transformers_compatibility_patches()
+    from qwen_tts.core.tokenizer_12hz.configuration_qwen3_tts_tokenizer_v2 import (
+        Qwen3TTSTokenizerV2DecoderConfig,
+    )
+    from qwen_tts.core.tokenizer_12hz.modeling_qwen3_tts_tokenizer_v2 import (
+        Qwen3TTSTokenizerV2DecoderTransformerModel,
+    )
+
+    torch.manual_seed(7)
+    config = Qwen3TTSTokenizerV2DecoderConfig(
+        hidden_size=512,
+        latent_dim=1024,
+        num_attention_heads=16,
+        num_key_value_heads=16,
+        head_dim=64,
+        intermediate_size=1024,
+        num_hidden_layers=2,
+        max_position_embeddings=64,
+    )
+    reference = Qwen3TTSTokenizerV2DecoderTransformerModel(config).cuda().eval()
+    with torch.no_grad():
+        for layer in reference.layers:
+            layer.self_attn_layer_scale.scale.uniform_(0.3, 0.7)
+            layer.mlp_layer_scale.scale.uniform_(0.3, 0.7)
+    plain = copy.deepcopy(reference).bfloat16()
+    fused = FusedIncrementalTransformer(copy.deepcopy(reference).bfloat16())
+    retained = reference.window_size - 1
+    ring_frames = retained + 16
+
+    def full_width_state(dtype: torch.dtype) -> Qwen3TTSIncrementalCodecState:
+        shape = (3, 16, retained, 64)
+        return Qwen3TTSIncrementalCodecState(
+            frame_positions=torch.zeros(3, dtype=torch.long, device="cuda"),
+            transformer_keys={
+                index: torch.zeros(shape, device="cuda", dtype=dtype)
+                for index in range(len(reference.layers))
+            },
+            transformer_values={
+                index: torch.zeros(shape, device="cuda", dtype=dtype)
+                for index in range(len(reference.layers))
+            },
+        )
+
+    def ring_state(source: Qwen3TTSKVRings | None) -> Qwen3TTSIncrementalCodecState:
+        rings = Qwen3TTSKVRings(
+            keys=[
+                (
+                    torch.zeros(
+                        7 * ring_frames, 1024, device="cuda", dtype=torch.bfloat16
+                    )
+                    if source is None
+                    else source.keys[index].clone()
+                )
+                for index in range(len(reference.layers))
+            ],
+            values=[
+                (
+                    torch.zeros(
+                        7 * ring_frames, 1024, device="cuda", dtype=torch.bfloat16
+                    )
+                    if source is None
+                    else source.values[index].clone()
+                )
+                for index in range(len(reference.layers))
+            ],
+            ring_frames=ring_frames,
+            slot_index=torch.tensor([3, 0, 5], device="cuda"),
+            trash_row=6 * ring_frames,
+        )
+        return Qwen3TTSIncrementalCodecState(
+            frame_positions=torch.zeros(3, dtype=torch.long, device="cuda"),
+            kv_rings=rings,
+        )
+
+    states = {
+        "reference": full_width_state(torch.float32),
+        "plain": full_width_state(torch.bfloat16),
+        "ring": ring_state(None),
+    }
+    steps = [(5, None), (17, [17, 14, 9]), (64, None), (1, None), (40, [40, 33, 21])]
+    with torch.no_grad():
+        for width, valid_frames in steps:
+            inputs = torch.randn(3, width, 1024, device="cuda")
+            valid = (
+                torch.full((3,), width, device="cuda")
+                if valid_frames is None
+                else torch.tensor(valid_frames, device="cuda")
+            )
+            expected = incremental_transformer(
+                reference, inputs, states["reference"], valid
+            )
+            plain_output = incremental_transformer(
+                plain, inputs.bfloat16(), states["plain"], valid
+            )
+            ring_output = fused(inputs.bfloat16(), states["ring"], valid)
+            kept = torch.arange(width, device="cuda") < valid[:, None]
+            assert relative_error(
+                ring_output[kept], expected[kept]
+            ) <= 1.1 * relative_error(plain_output[kept], expected[kept])
+            for state in states.values():
+                state.frame_positions = state.frame_positions + valid
+
+        compiled = torch.compile(fused.__call__, dynamic=False, fullgraph=True)
+        compiled_state = ring_state(states["ring"].kv_rings)
+        compiled_state.frame_positions = states["ring"].frame_positions.clone()
+        inputs = torch.randn(3, 24, 1024, device="cuda")
+        expected = incremental_transformer(reference, inputs, states["reference"])
+        plain_output = incremental_transformer(
+            plain, inputs.bfloat16(), states["plain"]
+        )
+        compiled_output = compiled(inputs.bfloat16(), compiled_state)
     assert relative_error(compiled_output, expected) <= 1.1 * relative_error(
         plain_output, expected
     )

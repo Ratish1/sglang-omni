@@ -11,6 +11,7 @@ import torch
 from sglang_omni.models.qwen3_tts.incremental_codec import (
     Qwen3TTSIncrementalCodecState,
     Qwen3TTSIncrementalDecoder,
+    Qwen3TTSKVRings,
 )
 from sglang_omni.utils.cuda_staging import PinnedTransferSlot
 from sglang_omni.utils.device import has_device_streams
@@ -53,12 +54,18 @@ class Qwen3TTSCodecStateArena:
     Every buffer from ``Qwen3TTSIncrementalDecoder.state_spec`` carries a
     leading slot dimension, so the arena is exactly the state a decode of
     ``num_slots`` rows would use: ``gather`` selects a cohort's rows into a
-    contiguous state and ``scatter`` writes the advanced state back.
+    contiguous state and ``scatter`` writes the advanced state back. With a
+    fused transformer the K/V instead live in per-layer rings, which a decode
+    reads and writes in place.
 
     Note (Qihao Liu): ``acquire`` zeroes a slot before handing it out, so a
     reused slot is provably a cold start; ``release`` therefore returns a slot
     without clearing it.
     """
+
+    # note (ratish): a ring holds this many frames past the retained window, the widest
+    # window a first chunk is split into, so warm decodes run as one ring chunk.
+    RING_CHUNK_FRAMES = 64
 
     def __init__(
         self,
@@ -78,10 +85,34 @@ class Qwen3TTSCodecStateArena:
         self.dtype = dtype
         self._num_slots = int(num_slots)  # noqa: leading-underscore
         self.scratch_slot = self._num_slots  # noqa: leading-underscore
+        spec = decoder.state_spec()
+        self._bytes_per_slot = spec.bytes_per_stream(dtype)  # noqa: leading-underscore
+        if decoder.fused_transformer is not None:
+            self.ring_frames = spec.retained_context + self.RING_CHUNK_FRAMES
+            ring_width = spec.num_key_value_heads * spec.head_dim
+            ring_rows = (self.num_slots + 1) * self.ring_frames
+            self.key_rings: list[torch.Tensor] | None = [
+                torch.zeros(ring_rows, ring_width, device=self.device, dtype=dtype)
+                for _ in range(spec.num_layers)
+            ]
+            self.value_rings: list[torch.Tensor] | None = [
+                torch.zeros_like(ring) for ring in self.key_rings
+            ]
+            self._bytes_per_slot += (  # noqa: leading-underscore
+                2
+                * spec.num_layers
+                * self.RING_CHUNK_FRAMES
+                * ring_width
+                * dtype.itemsize
+            )
+        else:
+            self.key_rings = None
+            self.value_rings = None
         self.storage = decoder.init_state(
-            self._num_slots + 1,
+            self._num_slots + 1,  # noqa: leading-underscore
             device=self.device,
-            dtype=dtype,  # noqa: leading-underscore
+            dtype=dtype,
+            transformer_kv=self.key_rings is None,
         )
         self.lock = threading.Lock()
         self.staging = threading.local()
@@ -91,8 +122,6 @@ class Qwen3TTSCodecStateArena:
         )  # noqa: leading-underscore
         self.retired: set[int] = set()
         self._exhausted_count = 0  # noqa: leading-underscore
-        spec = decoder.state_spec()
-        self._bytes_per_slot = spec.bytes_per_stream(dtype)  # noqa: leading-underscore
 
     @property
     def num_slots(self) -> int:
@@ -262,6 +291,16 @@ class Qwen3TTSCodecStateArena:
             state.transformer_keys[layer_index] = buffer.index_select(0, index)
         for layer_index, buffer in storage.transformer_values.items():
             state.transformer_values[layer_index] = buffer.index_select(0, index)
+        if self.key_rings is not None:
+            state.kv_rings = Qwen3TTSKVRings(
+                keys=self.key_rings,
+                values=self.value_rings,
+                ring_frames=self.ring_frames,
+                slot_index=index,
+                trash_row=self.scratch_slot * self.ring_frames,
+            )
+        else:
+            pass
         return state
 
     def scatter(

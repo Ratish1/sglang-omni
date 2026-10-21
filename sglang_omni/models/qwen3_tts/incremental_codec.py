@@ -10,7 +10,12 @@ from typing import TYPE_CHECKING
 import torch
 import torch.nn.functional as F
 from sglang.kernels.ops.activation import silu_and_mul
-from sglang.kernels.ops.attention.rope import apply_rope_inplace
+from sglang.kernels.ops.attention.flash_attention import flash_attn_with_kvcache
+from sglang.kernels.ops.attention.flash_attention_v3 import _is_fa3_supported
+from sglang.kernels.ops.attention.rope import (
+    apply_rope_inplace,
+    apply_rope_inplace_with_kvcache,
+)
 from sglang.kernels.ops.layernorm import rmsnorm
 
 from sglang_omni.platforms import current_platform
@@ -31,6 +36,7 @@ if TYPE_CHECKING:
         Qwen3TTSTokenizerV2DecoderAttention,
         Qwen3TTSTokenizerV2DecoderDecoderResidualUnit,
         Qwen3TTSTokenizerV2DecoderRMSNorm,
+        Qwen3TTSTokenizerV2DecoderTransformerLayer,
         Qwen3TTSTokenizerV2DecoderTransformerModel,
     )
 else:
@@ -71,6 +77,19 @@ class Qwen3TTSIncrementalCodecStateSpec:
 
 
 @dataclass
+class Qwen3TTSKVRings:
+    """Every layer's keys and values for a cohort's slots, read and written in place: slot s
+    keeps frame p at row s * ring_frames + p % ring_frames, and a row's frames past its valid
+    frames go to trash_row."""
+
+    keys: list[torch.Tensor]
+    values: list[torch.Tensor]
+    ring_frames: int
+    slot_index: torch.Tensor
+    trash_row: int
+
+
+@dataclass
 class Qwen3TTSIncrementalCodecState:
     frame_position: int = 0
     transformer_context_length: int = 0
@@ -83,6 +102,7 @@ class Qwen3TTSIncrementalCodecState:
     # A cohort assembled from a state arena sets this so streams at different
     # playback positions can execute in one launch.
     frame_positions: torch.Tensor | None = None
+    kv_rings: Qwen3TTSKVRings | None = None
 
     def row_frame_positions(
         self, batch_size: int, device: torch.device
@@ -111,6 +131,10 @@ class Qwen3TTSIncrementalCodecState:
             pass
 
     def clone(self) -> Qwen3TTSIncrementalCodecState:
+        if self.kv_rings is not None:
+            raise RuntimeError("a state whose K/V live in rings cannot be cloned")
+        else:
+            pass
         return Qwen3TTSIncrementalCodecState(
             frame_position=self.frame_position,
             transformer_context_length=self.transformer_context_length,
@@ -578,7 +602,8 @@ def incremental_transformer(
 
 class FusedIncrementalTransformer:
     """incremental_transformer with one qkv and one gate-up GEMM per layer, and RMSNorm, rotary,
-    SwiGLU and LayerScale plus residual one kernel each."""
+    SwiGLU and LayerScale plus residual one kernel each; on an arena cohort the K/V stay in
+    the arena's rings (ring_step)."""
 
     def __init__(
         self, transformer: "Qwen3TTSTokenizerV2DecoderTransformerModel"
@@ -599,6 +624,10 @@ class FusedIncrementalTransformer:
             for layer in transformer.layers
         ), "the decoder attention has no q or k norm"
         merge_projection_weights(transformer.layers)
+        # note (ratish): FlashAttention 3 reads a ring window through its page table where it
+        # runs (SM 8.x and 9.x, CUDA 12.3 or newer); elsewhere, and under Dynamo, the window
+        # is gathered for SDPA.
+        self.paged_attention = _is_fa3_supported()
 
     @staticmethod
     def normalize(
@@ -615,12 +644,100 @@ class FusedIncrementalTransformer:
         else:
             return rmsnorm(hidden_states, norm.weight, norm.variance_epsilon)
 
+    def cos_sin_rows(
+        self, query_positions: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """The rope kernels' cos/sin table, one row per query, and each query's row."""
+        # note (ratish): one cos/sin row per query, from its absolute frame position,
+        # which a stream's reference prefix can carry past max_position_embeddings.
+        rows = query_positions.numel()
+        angles = query_positions.reshape(rows, 1).float() * self.inverse_frequencies
+        cos_sin = torch.cat((angles.cos(), angles.sin()), dim=-1) * (
+            self.attention_scaling
+        )
+        return cos_sin, torch.arange(rows, device=query_positions.device)
+
+    def projected_qkv(
+        self,
+        layer: "Qwen3TTSTokenizerV2DecoderTransformerLayer",
+        hidden_states: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """The layer's (rows, heads, head_dim) query and key before rotary and its (rows,
+        kv_heads * head_dim) value, from one qkv GEMM on the normed rows."""
+        attention = layer.self_attn
+        head_dim = int(attention.head_dim)
+        rows = int(hidden_states.shape[0])
+        normalized = self.normalize(hidden_states, layer.input_layernorm)
+        query, key, value = F.linear(normalized, attention.qkv_weight).split(
+            [
+                attention.q_proj.out_features,
+                attention.k_proj.out_features,
+                attention.v_proj.out_features,
+            ],
+            dim=-1,
+        )
+        return query.view(rows, -1, head_dim), key.view(rows, -1, head_dim), value
+
+    @staticmethod
+    def attend(
+        layer: "Qwen3TTSTokenizerV2DecoderTransformerLayer",
+        query: torch.Tensor,
+        keys: torch.Tensor,
+        values: torch.Tensor,
+        attention_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        """SDPA of (B, heads, L, head_dim) queries over (B, kv_heads, S, head_dim) keys and
+        values under a (B, 1, L, S) mask, as (B * L, heads * head_dim)."""
+        attention = layer.self_attn
+        attended = F.scaled_dot_product_attention(
+            query,
+            keys,
+            values,
+            attn_mask=attention_mask,
+            scale=float(attention.scaling),
+            enable_gqa=int(attention.num_key_value_groups) > 1,
+        )
+        return attended.transpose(1, 2).reshape(
+            -1, int(attended.shape[1]) * int(attended.shape[3])
+        )
+
+    def layer_output(
+        self,
+        layer: "Qwen3TTSTokenizerV2DecoderTransformerLayer",
+        residual: torch.Tensor,
+        attended: torch.Tensor,
+    ) -> torch.Tensor:
+        """The layer's attention projection, then its SwiGLU MLP, each added to the residual
+        by its layer scale in one kernel."""
+        hidden_states = torch.addcmul(
+            residual,
+            layer.self_attn_layer_scale.scale,
+            F.linear(attended, layer.self_attn.o_proj.weight),
+        )
+        normalized = self.normalize(hidden_states, layer.post_attention_layernorm)
+        gate_up = F.linear(normalized, layer.mlp.gate_up_weight)
+        # note (ratish): torch ops under Dynamo, as in normalize.
+        if torch.compiler.is_dynamo_compiling():
+            gate, up = gate_up.chunk(2, dim=-1)
+            activated = F.silu(gate) * up
+        else:
+            activated = silu_and_mul(gate_up)
+        return torch.addcmul(
+            hidden_states,
+            layer.mlp_layer_scale.scale,
+            F.linear(activated, layer.mlp.down_proj.weight),
+        )
+
     def __call__(
         self,
         hidden_states: torch.Tensor,
         state: Qwen3TTSIncrementalCodecState,
         valid_frames: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        if state.kv_rings is not None:
+            return self.ring_step(hidden_states, state, valid_frames)
+        else:
+            pass
         transformer = self.transformer
         hidden_states = transformer.input_proj(hidden_states)
         batch_size = int(hidden_states.shape[0])
@@ -634,33 +751,15 @@ class FusedIncrementalTransformer:
         attention_mask = allowed_keys(
             key_positions, query_positions, int(transformer.window_size)
         ).unsqueeze(1)
-        # note (ratish): one cos/sin row per query, from its absolute frame position,
-        # which a stream's reference prefix can carry past max_position_embeddings.
-        angles = query_positions.reshape(rows, 1).float() * self.inverse_frequencies
-        cos_sin = torch.cat((angles.cos(), angles.sin()), dim=-1) * (
-            self.attention_scaling
-        )
-        rotary_rows = torch.arange(rows, device=device)
+        cos_sin, rotary_rows = self.cos_sin_rows(query_positions)
         hidden_states = hidden_states.reshape(rows, hidden_size)
         next_keys: dict[int, torch.Tensor] = {}
         next_values: dict[int, torch.Tensor] = {}
         retained_context = int(transformer.window_size) - 1
         retained_end = None if valid_frames is None else prior_length + valid_frames
         for layer_index, layer in enumerate(transformer.layers):
-            attention = layer.self_attn
-            head_dim = int(attention.head_dim)
-            residual = hidden_states
-            normalized = self.normalize(hidden_states, layer.input_layernorm)
-            query, key, value = F.linear(normalized, attention.qkv_weight).split(
-                [
-                    attention.q_proj.out_features,
-                    attention.k_proj.out_features,
-                    attention.v_proj.out_features,
-                ],
-                dim=-1,
-            )
-            query = query.view(rows, -1, head_dim)
-            key = key.view(rows, -1, head_dim)
+            head_dim = int(layer.self_attn.head_dim)
+            query, key, value = self.projected_qkv(layer, hidden_states)
             apply_rope_inplace(query, key, cos_sin, rotary_rows, is_neox=True)
             key = key.view(batch_size, fresh_frames, -1, head_dim).transpose(1, 2)
             value = value.view(batch_size, fresh_frames, -1, head_dim).transpose(1, 2)
@@ -675,35 +774,14 @@ class FusedIncrementalTransformer:
                 value = torch.cat((prior_value, value), dim=-2)
             else:
                 pass
-            attended = F.scaled_dot_product_attention(
+            attended = self.attend(
+                layer,
                 query.view(batch_size, fresh_frames, -1, head_dim).transpose(1, 2),
                 key,
                 value,
-                attn_mask=attention_mask,
-                scale=float(attention.scaling),
-                enable_gqa=int(attention.num_key_value_groups) > 1,
+                attention_mask,
             )
-            hidden_states = torch.addcmul(
-                residual,
-                layer.self_attn_layer_scale.scale,
-                F.linear(
-                    attended.transpose(1, 2).reshape(rows, -1), attention.o_proj.weight
-                ),
-            )
-            residual = hidden_states
-            normalized = self.normalize(hidden_states, layer.post_attention_layernorm)
-            gate_up = F.linear(normalized, layer.mlp.gate_up_weight)
-            # note (ratish): torch ops under Dynamo, as in normalize.
-            if torch.compiler.is_dynamo_compiling():
-                gate, up = gate_up.chunk(2, dim=-1)
-                activated = F.silu(gate) * up
-            else:
-                activated = silu_and_mul(gate_up)
-            hidden_states = torch.addcmul(
-                residual,
-                layer.mlp_layer_scale.scale,
-                F.linear(activated, layer.mlp.down_proj.weight),
-            )
+            hidden_states = self.layer_output(layer, hidden_states, attended)
             next_keys[layer_index] = retained_frames(
                 key, retained_end, retained_context
             )
@@ -717,6 +795,138 @@ class FusedIncrementalTransformer:
         return transformer.output_proj(
             hidden_states.view(batch_size, fresh_frames, hidden_size)
         )
+
+    def ring_step(
+        self,
+        hidden_states: torch.Tensor,
+        state: Qwen3TTSIncrementalCodecState,
+        valid_frames: torch.Tensor | None,
+    ) -> torch.Tensor:
+        """The step for a cohort whose K/V live in an arena's rings, in chunks that fit a ring
+        past its retained window: every layer stores a chunk's K/V before the next chunk.
+        """
+        transformer = self.transformer
+        rings = state.kv_rings
+        hidden_states = transformer.input_proj(hidden_states)
+        batch_size = int(hidden_states.shape[0])
+        fresh_frames = int(hidden_states.shape[1])
+        hidden_size = int(hidden_states.shape[2])
+        start_positions = state.row_frame_positions(batch_size, hidden_states.device)
+        valid_ends = start_positions + (
+            fresh_frames if valid_frames is None else valid_frames
+        )
+        chunk_frames = rings.ring_frames - (int(transformer.window_size) - 1)
+        outputs = [
+            self.ring_chunk(
+                hidden_states[:, start : start + chunk_frames],
+                rings,
+                start_positions + start,
+                valid_ends,
+            )
+            for start in range(0, fresh_frames, chunk_frames)
+        ]
+        hidden_states = torch.cat(outputs, dim=1) if len(outputs) > 1 else outputs[0]
+        hidden_states = self.normalize(
+            hidden_states.reshape(batch_size * fresh_frames, hidden_size),
+            transformer.norm,
+        )
+        return transformer.output_proj(
+            hidden_states.view(batch_size, fresh_frames, hidden_size)
+        )
+
+    def ring_chunk(
+        self,
+        hidden_states: torch.Tensor,
+        rings: Qwen3TTSKVRings,
+        start_positions: torch.Tensor,
+        valid_ends: torch.Tensor,
+    ) -> torch.Tensor:
+        """Every layer on the (B, L, hidden) frames starting at start_positions: the rope
+        kernel stores each frame's K/V in its ring row, then each frame attends its retained
+        window and the frames before it, read in the ring."""
+        transformer = self.transformer
+        batch_size = int(hidden_states.shape[0])
+        frames = int(hidden_states.shape[1])
+        hidden_size = int(hidden_states.shape[2])
+        rows = batch_size * frames
+        device = hidden_states.device
+        retained_context = int(transformer.window_size) - 1
+        query_positions = start_positions.unsqueeze(1) + torch.arange(
+            frames, device=device
+        )
+        key_positions = start_positions.unsqueeze(1) + torch.arange(
+            -retained_context, frames, device=device
+        )
+        slot_rows = rings.slot_index.unsqueeze(1) * rings.ring_frames
+        # note (ratish): a frame past its row's valid frames would take the ring row of a
+        # retained frame a ring length before it, so it goes to the trash row instead.
+        write_rows = torch.where(
+            query_positions < valid_ends.unsqueeze(1),
+            slot_rows + query_positions % rings.ring_frames,
+            rings.trash_row,
+        ).reshape(rows)
+        cos_sin, rotary_rows = self.cos_sin_rows(query_positions)
+        is_paged = self.paged_attention and not torch.compiler.is_dynamo_compiling()
+        if is_paged:
+            window_starts = (start_positions - retained_context).clamp(min=0)
+            page_table = (
+                slot_rows
+                + (
+                    window_starts.unsqueeze(1)
+                    + torch.arange(retained_context + frames, device=device)
+                )
+                % rings.ring_frames
+            ).to(torch.int32)
+            window_lengths = (start_positions - window_starts + frames).to(torch.int32)
+        else:
+            window_rows = slot_rows + key_positions.clamp(min=0) % rings.ring_frames
+            attention_mask = allowed_keys(
+                key_positions, query_positions, int(transformer.window_size)
+            ).unsqueeze(1)
+        hidden_states = hidden_states.reshape(rows, hidden_size)
+        for layer_index, layer in enumerate(transformer.layers):
+            attention = layer.self_attn
+            head_dim = int(attention.head_dim)
+            query, key, value = self.projected_qkv(layer, hidden_states)
+            key_ring = rings.keys[layer_index]
+            value_ring = rings.values[layer_index]
+            apply_rope_inplace_with_kvcache(
+                query,
+                key,
+                value.view(rows, -1, head_dim),
+                key_ring,
+                value_ring,
+                cos_sin,
+                rotary_rows,
+                write_rows,
+                is_neox=True,
+            )
+            kv_heads = int(key.shape[1])
+            if is_paged:
+                attended = flash_attn_with_kvcache(
+                    query.view(batch_size, frames, -1, head_dim),
+                    key_ring.view(-1, 1, kv_heads, head_dim),
+                    value_ring.view(-1, 1, kv_heads, head_dim),
+                    page_table=page_table,
+                    cache_seqlens=window_lengths,
+                    softmax_scale=float(attention.scaling),
+                    causal=True,
+                    window_size=(retained_context, 0),
+                ).reshape(rows, -1)
+            else:
+                attended = self.attend(
+                    layer,
+                    query.view(batch_size, frames, -1, head_dim).transpose(1, 2),
+                    key_ring[window_rows]
+                    .view(batch_size, -1, kv_heads, head_dim)
+                    .transpose(1, 2),
+                    value_ring[window_rows]
+                    .view(batch_size, -1, kv_heads, head_dim)
+                    .transpose(1, 2),
+                    attention_mask,
+                )
+            hidden_states = self.layer_output(layer, hidden_states, attended)
+        return hidden_states.view(batch_size, frames, hidden_size)
 
 
 def incremental_convnext(
@@ -992,8 +1202,10 @@ class Qwen3TTSIncrementalDecoder:
         *,
         device: torch.device,
         dtype: torch.dtype,
+        transformer_kv: bool = True,
     ) -> Qwen3TTSIncrementalCodecState:
-        """Allocate a zeroed state with full-width buffers.
+        """Allocate a zeroed state with full-width buffers, the transformer's K/V among them
+        unless transformer_kv is False.
 
         Note (Qihao Liu): unlike the lazily grown state, the Transformer K/V
         buffers start at their retained width. A stream that has not filled
@@ -1014,7 +1226,7 @@ class Qwen3TTSIncrementalDecoder:
             state.transconv_overlaps[key] = torch.zeros(
                 batch_size, channels, length, device=device, dtype=dtype
             )
-        for layer_index in range(spec.num_layers):
+        for layer_index in range(spec.num_layers if transformer_kv else 0):
             shape = (
                 batch_size,
                 spec.num_key_value_heads,
