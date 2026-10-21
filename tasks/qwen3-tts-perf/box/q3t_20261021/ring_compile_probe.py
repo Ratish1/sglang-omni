@@ -66,6 +66,20 @@ def ring_step(q, k, v, key_ring, value_ring, cos_sin, positions, write_rows, pag
     )
 
 
+def ring_step_sdpa(q, k, v, key_ring, value_ring, cos_sin, positions, write_rows, page_table, lengths, rows, width):
+    apply_rope_inplace_with_kvcache(q, k, v, key_ring, value_ring, cos_sin, positions, write_rows, is_neox=True)
+    window_rows = page_table.long()
+    keys = key_ring[window_rows].view(rows, RING, HEADS, HEAD_DIM).transpose(1, 2)
+    values = value_ring[window_rows].view(rows, RING, HEADS, HEAD_DIM).transpose(1, 2)
+    query_offsets = (lengths.long() - width)[:, None] + torch.arange(width, device=q.device)
+    distances = query_offsets[:, :, None] - torch.arange(RING, device=q.device)
+    window_mask = ((distances >= 0) & (distances <= RETAINED))[:, None]
+    return torch.nn.functional.scaled_dot_product_attention(
+        q.view(rows, width, HEADS, HEAD_DIM).transpose(1, 2), keys, values, attn_mask=window_mask,
+        scale=HEAD_DIM**-0.5,
+    ).transpose(1, 2)
+
+
 def fresh(inputs: dict) -> dict:
     return {key: value.clone() if isinstance(value, torch.Tensor) else value for key, value in inputs.items()}
 
@@ -80,21 +94,33 @@ def main() -> None:
     with torch.inference_mode():
         eager_inputs = fresh(inputs)
         expected = ring_step(**eager_inputs).clone()
-        print(f"eager: ok, output {tuple(expected.shape)}", flush=True)
-        compiled = torch.compile(ring_step, fullgraph=True, dynamic=False)
-        try:
-            compiled_inputs = fresh(inputs)
-            actual = compiled(**compiled_inputs)
-            print(
-                f"compiled fullgraph: ok, max abs difference {(actual.float() - expected.float()).abs().max().item():.3e}, "
-                f"rings equal {torch.equal(compiled_inputs['key_ring'], eager_inputs['key_ring'])} "
-                f"{torch.equal(compiled_inputs['value_ring'], eager_inputs['value_ring'])}",
-                flush=True,
-            )
-        except Exception:
-            print("compiled fullgraph: FAILED", flush=True)
-            traceback.print_exc()
+        print(f"eager FA3: ok, output {tuple(expected.shape)}", flush=True)
+        gathered = ring_step_sdpa(**fresh(inputs))
+        print(
+            f"eager gathered window and SDPA: max abs difference from FA3 "
+            f"{(gathered.float() - expected.float()).abs().max().item():.3e}",
+            flush=True,
+        )
+        compiled = None
+        for name, step in (("FA3", ring_step), ("gathered window and SDPA", ring_step_sdpa)):
+            candidate = torch.compile(step, fullgraph=True, dynamic=False)
+            try:
+                compiled_inputs = fresh(inputs)
+                actual = candidate(**compiled_inputs)
+                print(
+                    f"compiled fullgraph {name}: ok, max abs difference from eager FA3 "
+                    f"{(actual.float() - expected.float()).abs().max().item():.3e}, rings equal to eager's "
+                    f"{torch.equal(compiled_inputs['key_ring'], eager_inputs['key_ring'])} "
+                    f"{torch.equal(compiled_inputs['value_ring'], eager_inputs['value_ring'])}",
+                    flush=True,
+                )
+                compiled = candidate if compiled is None else compiled
+            except Exception as exc:
+                print(f"compiled fullgraph {name}: FAILED, {type(exc).__name__}: {str(exc).splitlines()[0]}", flush=True)
+        if compiled is None:
             return
+        else:
+            pass
         graph_inputs = fresh(inputs)
         stream = torch.cuda.Stream()
         stream.wait_stream(torch.cuda.current_stream())
