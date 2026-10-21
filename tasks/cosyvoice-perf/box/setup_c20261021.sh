@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# 10-21 lease (host-85-234-79-62, cards 2 and 3 of our 4, a fresh container: the new lease wiped the home): the
+# 10-21 lease (host-85-234-79-62, cards 0 and 1 of our 4, a fresh container: the new lease wiped the home): the
 # install (sox, the editable tree at upstream main with the fun-cosyvoice3 extra, CosyVoice and Matcha-TTS at the
 # pinned commits on a .pth, the checkpoint), then the worktrees t_m22 at upstream main f31cf9e9a and t_pr at the L1
 # PR head, and t_marks at the trace marks branch.

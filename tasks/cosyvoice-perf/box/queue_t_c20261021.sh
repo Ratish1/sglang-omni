@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# 10-21, cards 2 and 3. The stack L2 to L6 rebased onto the L1 PR branch (perf/cosyvoice3-overlapped-vocoder-steps,
+# 10-21, cards 0 and 1. The stack L2 to L6 rebased onto the L1 PR branch (perf/cosyvoice3-overlapped-vocoder-steps,
 # tree t_pr), each layer paired alone on the one below, both orders, every reference: p_t2 (t_pr against t_l2),
 # p_t3 (t_l2 against t_l3, WER and SIM), p_t4 (t_l3 against t_l4, the worst step check at 16 and 32 rows), p_t5
 # (t_l4 against t_l5), p_t6 (t_l5 against t_l6, WER and SIM); L16 where the layer touches the vocoder. First the
@@ -15,11 +15,11 @@ SUITES="tests/unit_test/fun_cosyvoice3 tests/unit_test/model_runner tests/unit_t
 log() { echo "$* $(date +%T)" >> $D/queue_t.txt; }
 score() {
   local dir=$1
-  (cd /workspace/t_m22 && CUDA_VISIBLE_DEVICES=2 taskset -c 0-15,64-79 python3 -u -m benchmarks.eval.benchmark_tts_seedtts \
+  (cd /workspace/t_m22 && CUDA_VISIBLE_DEVICES=0 taskset -c 0-15,64-79 python3 -u -m benchmarks.eval.benchmark_tts_seedtts \
     --transcribe-only --skip-gpu-cleanup --model $MODEL --host 127.0.0.1 --port 26000 --lang en \
     --output-dir $dir > $dir/score_wer.log 2>&1)
   log "wer $dir rc $? $(grep 'WER mean' $dir/score_wer.log | tr -s ' ')"
-  (cd /workspace/t_m22 && CUDA_VISIBLE_DEVICES=2 taskset -c 0-15,64-79 python3 -u -m benchmarks.eval.benchmark_tts_seedtts \
+  (cd /workspace/t_m22 && CUDA_VISIBLE_DEVICES=0 taskset -c 0-15,64-79 python3 -u -m benchmarks.eval.benchmark_tts_seedtts \
     --similarity-only --model $MODEL --lang en --output-dir $dir > $dir/score_sim.log 2>&1)
   log "sim $dir rc $? $(grep 'speaker similarity' $dir/score_sim.log | cut -c1-40)"
 }
@@ -51,8 +51,8 @@ log "lists rc $? long form $(wc -l < $D/longform/meta.lst) worst $(wc -l < $D/wo
 port=40000
 for trees in "t_pr t_l2" "t_l3 t_l4" "t_l5 t_l6"; do
   set -- $trees
-  bash $IN/warm_c20261021.sh $1 2 0-15,64-79 $port $D/warm_$1 &
-  bash $IN/warm_c20261021.sh $2 3 16-31,80-95 $((port + 400)) $D/warm_$2 &
+  bash $IN/warm_c20261021.sh $1 0 0-15,64-79 $port $D/warm_$1 &
+  bash $IN/warm_c20261021.sh $2 1 16-31,80-95 $((port + 400)) $D/warm_$2 &
   wait
   port=$((port + 800))
   for tree in $trees; do
@@ -61,7 +61,7 @@ for trees in "t_pr t_l2" "t_l3 t_l4" "t_l5 t_l6"; do
 done
 
 for tree in t_l2 t_l3 t_l4 t_l5 t_l6; do
-  (cd /workspace/$tree && CUDA_VISIBLE_DEVICES=3 PYTHONPATH=/workspace/$tree:$COSYVOICE taskset -c 16-31,80-95 \
+  (cd /workspace/$tree && CUDA_VISIBLE_DEVICES=1 PYTHONPATH=/workspace/$tree:$COSYVOICE taskset -c 16-31,80-95 \
     python3 -m pytest -q -p no:cacheprovider $SUITES > $D/units/units_$tree.log 2>&1)
   log "units $tree rc $? $(grep -E 'passed|failed' $D/units/units_$tree.log | tail -n 1)"
 done
@@ -69,9 +69,9 @@ done
 pair t_pr t_l2 p_t2 c1f,c16,c64,r16,L16
 pair t_l2 t_l3 p_t3 c1f,c16,c64,r16
 for dir in a/gpu0 a/gpu1 b/gpu0 b/gpu1; do score $D/p_t3/$dir/c16; done
-python3 $IN/worst_step_c20261021.py /workspace/t_l4 3 16-31,80-95 46000 $D/worst_l4_16 16 $D/worst/meta.lst \
+python3 $IN/worst_step_c20261021.py /workspace/t_l4 1 16-31,80-95 46000 $D/worst_l4_16 16 $D/worst/meta.lst \
   > $D/worst_l4_16.txt 2>&1 &
-python3 $IN/worst_step_c20261021.py /workspace/t_l4 2 0-15,64-79 46400 $D/worst_l4_32 32 $D/worst32/meta.lst \
+python3 $IN/worst_step_c20261021.py /workspace/t_l4 0 0-15,64-79 46400 $D/worst_l4_32 32 $D/worst32/meta.lst \
   > $D/worst_l4_32.txt 2>&1 &
 wait
 for rows in 16 32; do
