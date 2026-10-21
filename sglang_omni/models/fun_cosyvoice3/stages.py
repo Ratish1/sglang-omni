@@ -979,16 +979,12 @@ class FunCosyVoice3Flow:
 
     @torch.inference_mode()
     def inference(self, inputs: Sequence[FlowBatchInput]) -> list[torch.Tensor]:
-        packed = pack_flow_inputs(self.flow, inputs)
         if self.enable_buffered_packed_flow:
-            generated = generate_flow_packed(
-                self,
-                packed,
-                streaming=False,
-                finalize=True,
-            )
+            return self.inference_leftover(inputs)
         else:
-            generated = generate_flow(self, packed)
+            pass
+        packed = pack_flow_inputs(self.flow, inputs)
+        generated = generate_flow(self, packed)
         return split_generated_mels(
             self.flow,
             packed,
@@ -1001,8 +997,8 @@ class FunCosyVoice3Flow:
     def inference_leftover(
         self, inputs: Sequence[FlowBatchInput]
     ) -> list[torch.Tensor]:
-        """Non-streaming Flow over each row's whole token history, using the
-        existing PackedDiT graph/eager path when the estimator is available."""
+        """Non-streaming Flow over each row's whole token history, the rows
+        packed along the sequence."""
         if self.packed_estimator is None:
             return self.inference(inputs)
         else:
