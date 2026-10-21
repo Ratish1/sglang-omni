@@ -15,7 +15,8 @@
 # 10-20 copy (S0 of DESIGN_VOCODER_STANDARD_20261019.md): this lease's paths (/data/c20261020), an optional sixth
 # cell field, a seed-tts meta.lst (the long form cell), and the vocoder selection analysis after the ledgers.
 # 10-21 copy: this lease's paths (/data/c20261021), and an optional seventh cell field, b for a buffered cell (no
-# --stream: the whole utterance path, #2260's buffered route).
+# --stream: the whole utterance path, #2260's buffered route). PAIR_HOME names another run home for the inductor
+# caches (10-22, /data/c20261022r).
 # usage (in the container): [PEER=<other out>] [EXTRA_PATH=<dir>] [CELLS=...] [PYSPY=0] bash cosy_profile_run_c20261021.sh
 #   <tree> <card> <cpus> <port> <out>
 TREE=$1 CARD=$2 CPUS=$3 PORT=$4 R=$5
@@ -33,7 +34,7 @@ echo "start $(date +%T) tree $TREE head $(git rev-parse --short HEAD) card $CARD
 } > $R/identity.txt 2>&1
 
 setsid env CUDA_VISIBLE_DEVICES=$CARD SGLANG_OMNI_STRICT_PORT=1 OMNI_LOOP_PROBE=1 OMNI_PIPE_NVTX=1 \
-  TORCHINDUCTOR_CACHE_DIR=/data/c20261021/inductor_$TREE \
+  TORCHINDUCTOR_CACHE_DIR=${PAIR_HOME:-/data/c20261021}/inductor_$TREE \
   PYTHONPATH=/workspace/$TREE:${EXTRA_PATH:+$EXTRA_PATH:}$IN/cosy_profile_probe \
   taskset -c $CPUS nsys launch --session-new=$SESSION --trace=cuda,nvtx,osrt \
   --cuda-graph-trace=graph \
