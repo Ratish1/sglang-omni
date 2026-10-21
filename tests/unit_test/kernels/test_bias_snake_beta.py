@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import pytest
 import torch
-from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import SnakeBeta
+from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import (
+    Qwen3OmniMoeSnakeBeta,
+)
 
 from sglang_omni.kernels.bias_snake_beta import (
     SnakeBetaCoefficients,
@@ -24,7 +26,7 @@ def test_bias_snake_matches_the_eager_adds_and_snake(
     dtype: torch.dtype, channels: int, with_residual: bool, with_sum: bool
 ) -> None:
     torch.manual_seed(0)
-    original = SnakeBeta(channels).to(device="cuda", dtype=dtype).eval()
+    original = Qwen3OmniMoeSnakeBeta(channels).to(device="cuda", dtype=dtype).eval()
     with torch.no_grad():
         original.alpha.normal_(0.0, 0.5)
         original.beta.normal_(0.0, 0.5)
