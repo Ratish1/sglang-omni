@@ -121,6 +121,7 @@ from sglang_omni.utils import cuda_staging
 from sglang_omni.vendor.sglang.layers import RMSNorm
 from tests.unit_test.fakes import FakeExecutionBridge
 from tests.unit_test.fixtures.mini_checkpoint import write_mini_llama_checkpoint
+from tests.unit_test.pipeline.helpers import make_stage
 
 
 def placeholder_prompt_constants(
@@ -465,6 +466,9 @@ def test_qwen3_tts_engine_attaches_the_vocoder_speech_tokenizer_before_the_pool(
             self.tokenizer = tokenizer
 
         def warmup_now(self) -> None:
+            pass
+
+        def log_cuda_graph_coverage(self, running_stream_count: int | None) -> None:
             pass
 
     class FakeTalker:
@@ -2592,6 +2596,9 @@ def test_qwen3_tts_vocoder_factory_forwards_incremental_graph_config(
         def warmup_now(self) -> None:
             captured["warmed"] = True
 
+        def log_cuda_graph_coverage(self, running_stream_count: int | None) -> None:
+            captured["running_stream_count"] = running_stream_count
+
     monkeypatch.setattr(
         qwen3_stages,
         "load_qwen3_tts_tokenizer",
@@ -2649,6 +2656,9 @@ def vocoder_factory_capture(
         def warmup_now(self) -> None:
             captured["warmed"] = True
 
+        def log_cuda_graph_coverage(self, running_stream_count: int | None) -> None:
+            captured["running_stream_count"] = running_stream_count
+
     monkeypatch.setattr(
         qwen3_stages,
         "load_qwen3_tts_tokenizer",
@@ -2684,7 +2694,12 @@ def test_qwen3_tts_config_starts_a_declining_platform_decoding_synchronously(
         raising=False,
     )
 
-    assert config.stage_factory_kwargs("vocoder") == {"async_decode": False}
+    assert config.stage_factory_kwargs("vocoder") == {
+        "async_decode": False,
+        "running_stream_count": config.generation_admission_defaults()[
+            "max_running_requests"
+        ],
+    }
     assert config.stage_factory_kwargs("tts_engine") == {}
 
 
@@ -2699,7 +2714,11 @@ def test_qwen3_tts_config_leaves_a_measured_platform_alone(
         raising=False,
     )
 
-    assert config.stage_factory_kwargs("vocoder") == {}
+    assert config.stage_factory_kwargs("vocoder") == {
+        "running_stream_count": config.generation_admission_defaults()[
+            "max_running_requests"
+        ]
+    }
     assert config.stage_factory_kwargs("tts_engine") == {}
 
 
@@ -9805,6 +9824,120 @@ def test_qwen3_tts_scheduler_adopts_prepared_tensors_after_the_preprocessing_eve
     assert any(tensor is embeds for tensor, _ in recorded)
 
 
+@pytest.mark.parametrize(
+    ("running_stream_count", "warning_count"), [(None, 0), (64, 0), (65, 1)]
+)
+def test_qwen3_tts_vocoder_warns_when_streams_can_outnumber_codec_slots(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    running_stream_count: int | None,
+    warning_count: int,
+) -> None:
+    scheduler, _ = stateful_qwen3_tts_scheduler(monkeypatch)
+
+    caplog.clear()
+    with caplog.at_level(logging.INFO, logger=qwen3_streaming_vocoder.logger.name):
+        scheduler.log_cuda_graph_coverage(running_stream_count)
+
+    info_messages = [
+        record.getMessage()
+        for record in caplog.records
+        if record.levelno == logging.INFO
+    ]
+    warning_messages = [
+        record.getMessage()
+        for record in caplog.records
+        if record.levelno == logging.WARNING
+    ]
+    assert any(
+        message.startswith("Qwen3-TTS vocoder CUDA graphs: cold ")
+        and message.endswith("; Codec slots 64")
+        for message in info_messages
+    )
+    assert len(warning_messages) == warning_count
+    assert all(
+        message.endswith(f"to at least {running_stream_count}.")
+        for message in warning_messages
+    )
+
+
+def test_qwen3_tts_vocoder_lists_every_decode_graph_runner(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    scheduler, _ = stateful_qwen3_tts_scheduler(monkeypatch)
+    two_graphs = {
+        "enabled": True,
+        "disable_reason": None,
+        "build": {"captured_keys": [{"batch": 1}, {"batch": 2}]},
+    }
+    one_graph = {
+        "enabled": True,
+        "disable_reason": None,
+        "build": {"captured_keys": [{"batch": 4}]},
+    }
+    failed_capture = {
+        "enabled": False,
+        "disable_reason": "capture_failed: out of memory",
+        "build": {"captured_keys": []},
+    }
+    monkeypatch.setattr(
+        scheduler,
+        "codec_state_stats",
+        lambda: {
+            "enabled": True,
+            "slots": 8,
+            "cuda_graphs": {
+                "cold": two_graphs,
+                "window": {"enabled": False},
+                "tail": failed_capture,
+                "warm": [two_graphs, one_graph],
+            },
+        },
+    )
+
+    caplog.clear()
+    with caplog.at_level(logging.INFO, logger=qwen3_streaming_vocoder.logger.name):
+        scheduler.log_cuda_graph_coverage(8)
+
+    assert [record.getMessage() for record in caplog.records] == [
+        "Qwen3-TTS vocoder CUDA graphs: cold 2 captured, window off (not built), "
+        "tail off (capture_failed: out of memory), warm0 2 captured, "
+        "warm1 1 captured; Codec slots 8"
+    ]
+
+
+def test_qwen3_tts_vocoder_without_stateful_decoder_logs_the_left_context_path(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    scheduler = Qwen3TTSStreamingVocoderScheduler(
+        FakeQwen3TTSSpeechTokenizer(),
+        device="cpu",
+        enable_stateful_codec_decoder=False,
+    )
+
+    caplog.clear()
+    with caplog.at_level(logging.INFO, logger=qwen3_streaming_vocoder.logger.name):
+        scheduler.log_cuda_graph_coverage(128)
+
+    assert [record.getMessage() for record in caplog.records] == [
+        "Qwen3-TTS vocoder: stateful Codec decoder off, so every stream decodes on "
+        "the left-context path"
+    ]
+
+
+def test_qwen3_tts_vocoder_factory_checks_coverage_against_the_running_stream_count(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    assert (
+        vocoder_factory_capture(monkeypatch, running_stream_count=96)[
+            "running_stream_count"
+        ]
+        == 96
+    )
+    assert vocoder_factory_capture(monkeypatch)["running_stream_count"] is None
+
+
 def test_qwen3_tts_vocoder_codec_state_reaches_model_info(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -10071,3 +10204,185 @@ def test_base_vocoder_policy_keeps_model_device_and_explicit_overrides(
     )
     assert overridden["max_batch_size"] == 6
     assert overridden["max_batch_wait_ms"] == 5
+
+
+def reference_graph_stats(
+    *, captured: list[int], disable_reason: str | None = None
+) -> dict[str, object]:
+    return {
+        "enabled": bool(captured),
+        "disable_reason": disable_reason,
+        "bucket_frames": [32, 64, 256],
+        "captured": captured,
+        "replays": 3,
+        "misses": 1,
+    }
+
+
+def test_qwen3_tts_reference_encoder_stats_read_the_encoders_preprocessing_uses(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeRefCodeBatcher:
+        def __init__(self, speech_tokenizer, *, graph_bucket_frames) -> None:
+            self.graph_runner = None
+
+        def close(self) -> None:
+            pass
+
+    class FakeModel:
+        model = SimpleNamespace(codec_embedding=torch.nn.Embedding(1, 4))
+        speech_tokenizer = object()
+        tts_model_type = "base"
+        speaker_encoder_graph_runner = None
+
+        def build_prompt_constants(self):
+            return placeholder_prompt_constants()
+
+    monkeypatch.setattr(
+        qwen3_request_builders, "Qwen3TTSRefCodeBatcher", FakeRefCodeBatcher
+    )
+    model, wrapper = FakeModel(), SimpleNamespace()
+    qwen3_request_builders.clear_qwen3_tts_preprocessing_context()
+    assert qwen3_request_builders.qwen3_tts_reference_encoder_stats() is None
+    qwen3_request_builders.set_qwen3_tts_preprocessing_context(
+        model=model, wrapper=wrapper
+    )
+    try:
+        assert qwen3_request_builders.qwen3_tts_reference_encoder_stats() == {
+            "codec": None,
+            "speaker": None,
+        }
+
+        codec_stats = reference_graph_stats(captured=[32, 64, 256])
+        speaker_stats = reference_graph_stats(
+            captured=[], disable_reason="capture_failed: RuntimeError: boom"
+        )
+        hook = qwen3_request_builders.get_qwen3_tts_adhoc_reference_service(
+            model, wrapper
+        ).hook
+        hook.ref_code_batcher.graph_runner = SimpleNamespace(stats=lambda: codec_stats)
+        model.speaker_encoder_graph_runner = SimpleNamespace(
+            stats=lambda: speaker_stats
+        )
+
+        assert qwen3_request_builders.qwen3_tts_reference_encoder_stats() == {
+            "codec": codec_stats,
+            "speaker": speaker_stats,
+        }
+
+        model.tts_model_type = "custom_voice"
+        assert qwen3_request_builders.qwen3_tts_reference_encoder_stats() is None
+    finally:
+        qwen3_request_builders.clear_qwen3_tts_preprocessing_context()
+
+
+@pytest.mark.parametrize(
+    ("encoder_stats", "messages"),
+    [
+        (None, []),
+        (
+            {
+                "codec": reference_graph_stats(captured=[32, 64, 256]),
+                "speaker": reference_graph_stats(captured=[240, 480, 1920]),
+            },
+            [
+                "Qwen3-TTS reference encoder CUDA graphs: codec 3 graphs up to 256 "
+                "codec frames, speaker 3 graphs up to 1920 mel frames; longer "
+                "references and encoders without graphs run eagerly"
+            ],
+        ),
+        (
+            {
+                "codec": None,
+                "speaker": reference_graph_stats(
+                    captured=[], disable_reason="capture_failed: RuntimeError: boom"
+                ),
+            },
+            [
+                "Qwen3-TTS reference encoder CUDA graphs: codec off (not built), "
+                "speaker off (capture_failed: RuntimeError: boom); longer "
+                "references and encoders without graphs run eagerly"
+            ],
+        ),
+        (
+            {"codec": None, "speaker": reference_graph_stats(captured=[])},
+            [
+                "Qwen3-TTS reference encoder CUDA graphs: codec off (not built), "
+                "speaker off (not captured); longer references and encoders "
+                "without graphs run eagerly"
+            ],
+        ),
+    ],
+    ids=["no_base_context", "base", "speaker_capture_failed", "graphs_disabled"],
+)
+def test_qwen3_tts_preprocessing_logs_the_reference_encoder_coverage(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    encoder_stats: dict[str, object] | None,
+    messages: list[str],
+) -> None:
+    monkeypatch.setattr(
+        qwen3_stages, "qwen3_tts_reference_encoder_stats", lambda: encoder_stats
+    )
+    scheduler = qwen3_stages.create_preprocessing_executor("model")
+
+    caplog.clear()
+    with caplog.at_level(logging.INFO, logger=qwen3_stages.logger.name):
+        scheduler.log_reference_encoder_coverage()
+
+    assert [record.getMessage() for record in caplog.records] == messages
+
+
+def test_qwen3_tts_preprocessing_stage_reports_ready_after_the_coverage_log(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The preprocessing stage reported ready before it logged the reference
+    encoder coverage."""
+    stats_threads: list[str] = []
+    monkeypatch.setattr(
+        qwen3_stages,
+        "qwen3_tts_reference_encoder_stats",
+        lambda: stats_threads.append(threading.current_thread().name),
+    )
+    scheduler = qwen3_stages.create_preprocessing_executor("model")
+    # note (Haoling Pu): with no serving loop, only work done before the stage
+    # reports ready can read the stats.
+    monkeypatch.setattr(scheduler, "start", lambda: None)
+
+    async def run() -> None:
+        stage_obj = make_stage(name="preprocessing", scheduler=scheduler)
+        await stage_obj.start()
+        assert stats_threads == ["scheduler-preprocessing"]
+        await stage_obj.stop()
+
+    asyncio.run(run())
+
+
+def test_qwen3_tts_preprocessing_reference_encoders_reach_model_info(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    encoder_stats = {
+        "codec": reference_graph_stats(captured=[32, 64, 256]),
+        "speaker": None,
+    }
+    monkeypatch.setattr(
+        qwen3_stages, "qwen3_tts_reference_encoder_stats", lambda: encoder_stats
+    )
+    scheduler = qwen3_stages.create_preprocessing_executor("model")
+
+    model_info = scheduler.admin("model_info", {})
+    pause = scheduler.admin("pause_generation", {"mode": "abort"})
+
+    assert extract_model_info_stage_data(
+        {
+            "success": True,
+            "results": [{"stage": "preprocessing", "success": True, **model_info}],
+        }
+    ) == [
+        {
+            "reference_encoders": encoder_stats,
+            "stage": "preprocessing",
+            "success": True,
+        }
+    ]
+    assert pause["data"] == {"skipped": True, "unsupported": True}
