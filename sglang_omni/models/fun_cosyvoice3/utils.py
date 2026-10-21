@@ -7,7 +7,14 @@ from __future__ import annotations
 from typing import Callable
 
 import numpy as np
+import onnxruntime
 import torch
+
+from sglang_omni.models.fun_cosyvoice3.speech_tokenizer import (
+    SpeechTokenizerCudaGraphs,
+    load_speech_tokenizer,
+)
+from sglang_omni.platforms import current_platform
 
 
 class CosyVoice3Tokenizer:
@@ -48,28 +55,38 @@ class SpeechTokenizerV3:
         device: str = "cpu",
         intra_op_threads: int = 8,
     ):
-        import onnxruntime
-
-        option = onnxruntime.SessionOptions()
-        option.graph_optimization_level = (
-            onnxruntime.GraphOptimizationLevel.ORT_ENABLE_ALL
-        )
-        option.intra_op_num_threads = max(1, int(intra_op_threads))
-
-        # note (db-ol): the cuDNN conv plan is rebuilt whenever the input shape differs
-        # from the previous call, and the default search setting makes rebuilds slow.
-        providers = (
-            [
-                ("CUDAExecutionProvider", {"cudnn_conv_algo_search": "HEURISTIC"}),
-                "CPUExecutionProvider",
-            ]
-            if device.startswith("cuda")
-            else ["CPUExecutionProvider"]
-        )
-        self.session = onnxruntime.InferenceSession(
-            model_path, sess_options=option, providers=providers
-        )
         self.device = device
+        if device.startswith("cuda") and current_platform.is_cuda():
+            # note (ratish): ONNX Runtime runs this graph as about 725 launches, bound
+            # by the host on a busy card; a replay is one launch.
+            resolved_device = torch.device(device)
+            self.cuda_graphs: SpeechTokenizerCudaGraphs | None = (
+                SpeechTokenizerCudaGraphs(
+                    load_speech_tokenizer(model_path, resolved_device),
+                    resolved_device,
+                )
+            )
+        else:
+            self.cuda_graphs = None
+            option = onnxruntime.SessionOptions()
+            option.graph_optimization_level = (
+                onnxruntime.GraphOptimizationLevel.ORT_ENABLE_ALL
+            )
+            option.intra_op_num_threads = max(1, int(intra_op_threads))
+
+            # note (db-ol): the cuDNN conv plan is rebuilt whenever the input shape differs
+            # from the previous call, and the default search setting makes rebuilds slow.
+            providers = (
+                [
+                    ("CUDAExecutionProvider", {"cudnn_conv_algo_search": "HEURISTIC"}),
+                    "CPUExecutionProvider",
+                ]
+                if device.startswith("cuda")
+                else ["CPUExecutionProvider"]
+            )
+            self.session = onnxruntime.InferenceSession(
+                model_path, sess_options=option, providers=providers
+            )
 
     def extract_speech_token(
         self, audio: np.ndarray, sample_rate: int = 16000
@@ -96,6 +113,10 @@ class SpeechTokenizerV3:
             pass
 
         feat = whisper.log_mel_spectrogram(torch.from_numpy(audio), n_mels=128)
+        if self.cuda_graphs is not None:
+            return torch.tensor([self.cuda_graphs.tokenize(feat)], dtype=torch.int32)
+        else:
+            pass
         feat_len = feat.shape[2]
         result = self.session.run(
             None,
@@ -114,8 +135,6 @@ class SpeakerEncoder:
         device: str = "cpu",
         intra_op_threads: int = 8,
     ):
-        import onnxruntime
-
         option = onnxruntime.SessionOptions()
         option.graph_optimization_level = (
             onnxruntime.GraphOptimizationLevel.ORT_ENABLE_ALL
