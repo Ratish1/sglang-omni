@@ -149,6 +149,12 @@ def build_visual(
         device=device,
         strict=True,
     )
+    # note (ratish): load_module casts every floating buffer to the weight dtype, and the
+    # rotary's inverse frequencies rounded to bf16 move the angles by up to 0.3 % per position;
+    # transformers keeps that table in float32, so it is rebuilt from the config after the cast.
+    visual.rotary_pos_emb = type(visual.rotary_pos_emb)(thinker_cfg.vision_config).to(
+        visual.rotary_pos_emb.inv_freq.device
+    )
     optimize_patch_embed(visual)
     return visual
 
