@@ -45,9 +45,18 @@ class SpeechProbabilityModel(Protocol):
     def reset(self) -> None: ...
 
 
-def load_silero_vad(onnx: bool = True):
-    # note (ratish): importing silero_vad sets torch to one intra-op thread for
-    # the process, so only the process that runs the model imports it.
+class SileroModel(Protocol):
+    """Silero's loaded model: a speech probability per frame, and a state reset."""
+
+    def __call__(self, frame: torch.Tensor, sample_rate: int) -> torch.Tensor: ...
+
+    def reset_states(self) -> None: ...
+
+
+def load_silero_vad(onnx: bool) -> SileroModel:
+    # note (ratish): importing silero_vad sets torch to one intra-op thread for the
+    # whole process, so the import waits for the process that runs the model; the one
+    # function-level import in the package, kept for that side effect.
     import silero_vad
 
     return silero_vad.load_silero_vad(onnx=onnx)
