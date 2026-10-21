@@ -7,6 +7,7 @@ from __future__ import annotations
 from typing import Callable
 
 import numpy as np
+import onnxruntime
 import torch
 
 from sglang_omni.models.fun_cosyvoice3.speech_tokenizer import (
@@ -66,8 +67,6 @@ class SpeechTokenizerV3:
                 )
             )
         else:
-            import onnxruntime
-
             self.cuda_graphs = None
             option = onnxruntime.SessionOptions()
             option.graph_optimization_level = (
@@ -136,8 +135,6 @@ class SpeakerEncoder:
         device: str = "cpu",
         intra_op_threads: int = 8,
     ):
-        import onnxruntime
-
         option = onnxruntime.SessionOptions()
         option.graph_optimization_level = (
             onnxruntime.GraphOptimizationLevel.ORT_ENABLE_ALL
