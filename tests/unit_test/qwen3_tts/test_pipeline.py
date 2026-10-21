@@ -2914,6 +2914,7 @@ class FakeIncrementalQwen3TTSDecoder:
     def __init__(self, decoder, *, fail_on_call: int | None = None) -> None:
         self.decoder = decoder
         self.fail_on_call = fail_on_call
+        self.fused_transformer = None
         self.decode_inputs: list[torch.Tensor] = []
         self.decode_positions: list[list[int]] = []
 
@@ -2928,7 +2929,7 @@ class FakeIncrementalQwen3TTSDecoder:
         )
 
     def init_state(
-        self, batch_size: int, *, device, dtype
+        self, batch_size: int, *, device, dtype, transformer_kv: bool = True
     ) -> Qwen3TTSIncrementalCodecState:
         spec = self.state_spec()
         state = Qwen3TTSIncrementalCodecState(
@@ -2939,9 +2940,12 @@ class FakeIncrementalQwen3TTSDecoder:
             state.conv_histories[key] = torch.zeros(
                 batch_size, channels, length, device=device, dtype=dtype
             )
-        shape = (batch_size, spec.num_key_value_heads, spec.retained_context, 1)
-        state.transformer_keys[0] = torch.zeros(shape, device=device, dtype=dtype)
-        state.transformer_values[0] = torch.zeros(shape, device=device, dtype=dtype)
+        if transformer_kv:
+            shape = (batch_size, spec.num_key_value_heads, spec.retained_context, 1)
+            state.transformer_keys[0] = torch.zeros(shape, device=device, dtype=dtype)
+            state.transformer_values[0] = torch.zeros(shape, device=device, dtype=dtype)
+        else:
+            pass
         return state
 
     def decode(
