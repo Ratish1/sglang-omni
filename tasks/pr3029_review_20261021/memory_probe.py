@@ -55,8 +55,8 @@ def main() -> None:
         graphs=SolveGraphCapture(backend, device=device, autocast_dtype=torch.bfloat16),
         mel_channels=80,
         samples_per_frame=480,
-        row_tiers=[1, 4, 16],
-        frame_tiers=[64, 100, 128],
+        row_tiers=[16],
+        frame_tiers=[128],
     )
     with torch.inference_mode(), scheduler.vocoder.stream_context:
         runner.capture()
