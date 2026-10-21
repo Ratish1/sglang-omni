@@ -41,6 +41,16 @@ pair() {
     /workspace/$second $D/$name > $D/$name.log 2>&1)
   log "pair $name rc $? token cap hits $(grep -E '\| at the token cap \|' $D/$name.log | awk -F'|' '{printf "%s:%s/%s ", $3, $5, $6}')"
 }
+score() {
+  local dir=$1 card=$2 port=$3
+  (cd /workspace/t_m && CUDA_VISIBLE_DEVICES=$card taskset -c $(cpus $card) python3 -u -m benchmarks.eval.benchmark_tts_seedtts \
+    --transcribe-only --skip-gpu-cleanup --model FunAudioLLM/Fun-CosyVoice3-0.5B-2512 --host 127.0.0.1 --port $port \
+    --lang en --output-dir $dir > $dir/score_wer.log 2>&1)
+  log "wer $dir rc $? $(grep 'WER mean' $dir/score_wer.log | tr -s ' ')"
+  (cd /workspace/t_m && CUDA_VISIBLE_DEVICES=$card taskset -c $(cpus $card) python3 -u -m benchmarks.eval.benchmark_tts_seedtts \
+    --similarity-only --model FunAudioLLM/Fun-CosyVoice3-0.5B-2512 --lang en --output-dir $dir > $dir/score_sim.log 2>&1)
+  log "sim $dir rc $? $(grep 'speaker similarity' $dir/score_sim.log | cut -c1-40)"
+}
 pooled() {
   local name=$1 cell=$2 first=$3 second=$4
   python3 $IN/pooled_inter_chunk_c20261021.py $D/$name $cell $first $second > $D/pooled_${name}_$cell.txt 2>&1
@@ -67,6 +77,16 @@ if [ "$1" = a ]; then
   pooled p_r2 c16 t_l1 t_l2
   pooled p_r2 c64 t_l1 t_l2
   log "queue a done"
+elif [ "$1" = score_r1 ]; then
+  # Phase score_r1: p_r1's b16 audio scored, WER and SIM per arm.
+  log "queue score_r1 start t_marks $(git -C /workspace/t_marks rev-parse --short HEAD)"
+  score $D/p_r1/a/gpu0/b16 0 26000 &
+  score $D/p_r1/a/gpu1/b16 1 27000 &
+  wait
+  score $D/p_r1/b/gpu0/b16 0 28000 &
+  score $D/p_r1/b/gpu1/b16 1 29000 &
+  wait
+  log "queue score_r1 done"
 else
   log "unknown phase $1"
 fi
