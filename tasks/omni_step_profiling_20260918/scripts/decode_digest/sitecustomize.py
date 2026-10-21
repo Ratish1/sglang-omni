@@ -4,7 +4,8 @@ Put this directory on a server's PYTHONPATH and set OMNI_DECODE_DIGEST=<dir>. Ea
 vocoder decode to <dir>/<pid>.jsonl: the graph runner's mode (a replay) or the eager entry, the shape of the codes, the
 row valid widths of a tail replay, and SHA-1 digests of the input codes and of the returned waveform rows, in call
 order. Calls made while a CUDA graph is captured are skipped. Every record copies to the host and so syncs the device;
-such a run's timings are not used.
+such a run's timings are not used. With OMNI_DECODE_CENSUS=1 a record holds only the kind, mode, thread and shape,
+read from host metadata, so the run's batching is the served one.
 """
 
 import hashlib
@@ -13,6 +14,7 @@ import os
 import threading
 
 DIGEST_DIR = os.environ.get("OMNI_DECODE_DIGEST")
+CENSUS = os.environ.get("OMNI_DECODE_CENSUS") == "1"
 
 if DIGEST_DIR:
     import torch
@@ -40,10 +42,13 @@ if DIGEST_DIR:
             "kind": kind,
             "thread": threading.current_thread().name,
             "codes_shape": list(codes.shape),
-            "codes": digest(codes),
-            "out": digest(waveform),
             **extra,
         }
+        if not CENSUS:
+            entry["codes"] = digest(codes)
+            entry["out"] = digest(waveform)
+        else:
+            pass
         with LOCK:
             COUNTER[0] += 1
             entry["n"] = COUNTER[0]
@@ -60,7 +65,10 @@ if DIGEST_DIR:
                 "replay",
                 codes,
                 waveform,
-                {"mode": self.mode, "valid": None if valid_frames is None else [int(v) for v in valid_frames]},
+                {
+                    "mode": self.mode,
+                    "valid": None if valid_frames is None or CENSUS else [int(v) for v in valid_frames],
+                },
             )
         else:
             pass

@@ -117,6 +117,7 @@ def main() -> None:
     parser.add_argument("--no-stream", action="store_true")
     parser.add_argument("--gpu-metrics", action="store_true")
     parser.add_argument("--decode-digest", action="store_true")
+    parser.add_argument("--decode-census", action="store_true")
     args = parser.parse_args()
     arms = {"a": (args.a_card, "", args.port), "b": (args.b_card, args.b_args, args.port + 200)}
     outs = {arm: ROOT / args.label / arm for arm in arms}
@@ -132,10 +133,11 @@ def main() -> None:
         ).stdout
         placement = f"--tts_engine.gpu {card} --vocoder.gpu {card}"
         server_env = dict(os.environ, PYTHONPATH=tree, SGLANG_OMNI_STRICT_PORT="1")
-        if args.decode_digest:
+        if args.decode_digest or args.decode_census:
             (outs[arm] / "digest").mkdir(exist_ok=True)
             server_env["PYTHONPATH"] = f"{KIT / 'decode_digest'}:{tree}"
             server_env["OMNI_DECODE_DIGEST"] = str(outs[arm] / "digest")
+            server_env["OMNI_DECODE_CENSUS"] = "1" if args.decode_census else "0"
         else:
             pass
         imported = subprocess.run(
