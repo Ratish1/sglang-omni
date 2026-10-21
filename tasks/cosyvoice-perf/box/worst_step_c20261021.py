@@ -4,7 +4,7 @@ text limit from make_worst_meta_c20261011.py, so their finals land in one step n
 Reports the startup memory lines (the step measurement, the reserve, the pool, each graph capture), every request's
 outcome, and per process the peak device use, the memory outside torch and the allocator's out of memory retries and
 failures. The server is stopped by its process group.
-10-21 copy under /data/c20261021.
+10-21 copy under /data/c20261021; PAIR_HOME names another run home (10-22, /data/c20261022r).
 usage: python3 worst_step_c20261021.py <tree> <card> <cpus> <port> <out> <rows> <worst meta>"""
 
 import json
@@ -17,7 +17,7 @@ import time
 import urllib.request
 from pathlib import Path
 
-D = "/data/c20261021"
+D = os.environ.get("PAIR_HOME", "/data/c20261021")
 MODEL = "FunAudioLLM/Fun-CosyVoice3-0.5B-2512"
 COSYVOICE = "/workspace/CosyVoice:/workspace/CosyVoice/third_party/Matcha-TTS"
 PROBE = str(Path(__file__).resolve().parent / "mem_probe_c20261020")
