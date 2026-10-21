@@ -909,6 +909,7 @@ class FunCosyVoice3Flow:
         # note(ratish): the eager DiT over packed rows; None with the TensorRT
         # estimator, whose fixed (2, 80, T) profile keeps the padded layout.
         self.packed_estimator = packed_estimator
+        self.is_buffered_packed = False
         self.prefix_pool: PrefixKVPool | None = None
         self.prefix_cuda_graph_runner: PrefixCudaGraphRunner | None = None
         self.whole_history_cuda_graph_runner: WholeHistoryCudaGraphRunner | None = None
@@ -952,6 +953,10 @@ class FunCosyVoice3Flow:
 
     @torch.inference_mode()
     def inference(self, inputs: Sequence[FlowBatchInput]) -> list[torch.Tensor]:
+        if self.is_buffered_packed:
+            return self.inference_leftover(inputs)
+        else:
+            pass
         packed = pack_flow_inputs(self.flow, inputs)
         generated = generate_flow(self, packed)
         return split_generated_mels(
@@ -967,8 +972,7 @@ class FunCosyVoice3Flow:
         self, inputs: Sequence[FlowBatchInput]
     ) -> list[torch.Tensor]:
         """Non-streaming Flow over each row's whole token history, the rows
-        packed along the sequence; the buffered `inference` keeps the graphed
-        padded call."""
+        packed along the sequence."""
         if self.packed_estimator is None:
             return self.inference(inputs)
         else:
@@ -1375,6 +1379,17 @@ def load_cosyvoice3_flow_hift_lightweight(
     )
 
 
+def set_dit_compile_config() -> None:
+    """Process-wide Dynamo and Inductor settings every DiT compile reads."""
+    inductor_config.fx_graph_cache = True
+    dynamo.config.cache_size_limit = 1024
+    dynamo.config.accumulated_cache_size_limit = 1024
+    # note(ratish): Inductor picks CUDA's libdevice on its first kernel build;
+    # cache entries record the file, so a warm boot's first lookups would miss.
+    with inductor_config.patch({"eager_numerics.use_pytorch_libdevice": True}):
+        _set_triton_libdevice_path()
+
+
 def compile_dit_backbone(
     flow: FunCosyVoice3Flow,
     *,
@@ -1402,13 +1417,7 @@ def compile_dit_backbone(
         raise RuntimeError(COSYVOICE_INSTALL_HINT) from exc
 
     original_forward = estimator.forward
-    inductor_config.fx_graph_cache = True
-    dynamo.config.cache_size_limit = 1024
-    dynamo.config.accumulated_cache_size_limit = 1024
-    # note(ratish): Inductor picks CUDA's libdevice on its first kernel build;
-    # cache entries record the file, so a warm boot's first lookups would miss.
-    with inductor_config.patch({"eager_numerics.use_pytorch_libdevice": True}):
-        _set_triton_libdevice_path()
+    set_dit_compile_config()
     # note(ratish): the AOT cache refuses the autocast-disabled regions around RoPE;
     # these match without them: an outer product and elementwise ops.
     rotary = estimator.rotary_embed
@@ -2351,6 +2360,12 @@ def create_vocoder_executor(
     )
 
     device_obj = torch.device(device)
+    has_ragged_attention = (
+        flow.packed_estimator is not None
+        and flow.packed_estimator.is_ragged
+        and autocast_dtype in FA3_DTYPES
+    )
+    flow.is_buffered_packed = has_ragged_attention
     if enable_flow_cuda_graph and (
         not supports_device_streams(device_obj)
         or current_platform.get_device_graph_backend(device_obj) is None
@@ -2371,25 +2386,23 @@ def create_vocoder_executor(
 
     patch_chunk_mask()
 
-    if enable_dit_torch_compile:
+    # note (ratish): the packed route leaves the padded DiT only the fallback decode,
+    # which runs it eagerly, so its compile and graphs would serve no request.
+    if enable_dit_torch_compile and flow.is_buffered_packed:
+        set_dit_compile_config()
+    elif enable_dit_torch_compile:
         compile_dit_backbone(flow, autocast_dtype=autocast_dtype)
     else:
         pass
 
-    if (
-        flow_prefix_cache_gb > 0
-        and device_obj.type == "cuda"
-        and flow.packed_estimator is not None
-        and flow.packed_estimator.is_ragged
-        and autocast_dtype in (torch.float16, torch.bfloat16)
-    ):
+    if flow_prefix_cache_gb > 0 and has_ragged_attention:
         flow.prefix_pool = build_prefix_pool(
             flow, device_obj, autocast_dtype, flow_prefix_cache_gb
         )
     else:
         pass
 
-    if enable_flow_cuda_graph:
+    if enable_flow_cuda_graph and not flow.is_buffered_packed:
         capture_shapes = verify_flow_cuda_graph_capture_shapes(
             flow_cuda_graph_capture_shapes,
         )
@@ -2460,10 +2473,7 @@ def create_vocoder_executor(
     )
     has_whole_history_graphs = (
         enable_flow_whole_history_cuda_graph
-        and device_obj.type == "cuda"
-        and flow.packed_estimator is not None
-        and flow.packed_estimator.is_ragged
-        and autocast_dtype in FA3_DTYPES
+        and has_ragged_attention
         and len(whole_history_tier_frames) > 0
     )
     token_mel_ratio = flow.token_mel_ratio
