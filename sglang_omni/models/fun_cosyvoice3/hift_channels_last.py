@@ -43,11 +43,11 @@ class ChannelsLastHiftDecode:
         convs = [hift.conv_pre, *hift.ups]
         for block in blocks:
             convs.extend((*block.convs1, *block.convs2))
-        # note (ratish): copies with channels-last strides; the modules keep their own
-        # for the devices that run the module's decode.
-        self.channels_last_weights: dict[int, torch.Tensor] = {
-            id(conv): channels_last_weight(conv) for conv in convs
-        }
+        # note (ratish): restrided in place, so no second copy is kept; the module's
+        # own convs read the same values at these strides.
+        for conv in convs:
+            conv.weight.data = channels_last_weight(conv)
+        self.source_down_weights: list[torch.Tensor] = []
         for source_down in hift.source_downs:
             weight = F.pad(
                 source_down.weight.data, (0, 0, 0, self.spectrum_channel_padding)
@@ -59,8 +59,8 @@ class ChannelsLastHiftDecode:
                 weight = channels_last_folded_weight(weight, stride)
             else:
                 weight = channels_last_strides(weight)
-            self.channels_last_weights[id(source_down)] = weight
-        self.channels_last_weights[id(hift.conv_post)] = channels_last_strides(
+            self.source_down_weights.append(weight)
+        self.conv_post_weight = channels_last_strides(
             F.pad(
                 hift.conv_post.weight.data,
                 (0, 0, 0, 0, 0, self.spectrum_channel_padding),
@@ -121,6 +121,7 @@ class ChannelsLastHiftDecode:
         self,
         module: torch.nn.Conv1d,
         hidden_states: torch.Tensor,
+        weight: torch.Tensor,
         bias: torch.Tensor | None,
         *,
         left_padding: int,
@@ -136,13 +137,7 @@ class ChannelsLastHiftDecode:
             outputs = length
             alignment = (-(left_padding + length + right_padding)) % module.dilation[0]
         padded = F.pad(hidden_states, (0, 0, left_padding, right_padding + alignment))
-        return channels_last_conv1d(
-            padded,
-            module,
-            self.channels_last_weights[id(module)],
-            bias,
-            outputs,
-        )
+        return channels_last_conv1d(padded, module, weight, bias, outputs)
 
     def snake(
         self, activation: torch.nn.Module, hidden_states: torch.Tensor
@@ -162,11 +157,19 @@ class ChannelsLastHiftDecode:
         ):
             residual = self.snake(activation1, hidden_states)
             residual = self.conv(
-                conv1, residual, conv1.bias, left_padding=conv1.causal_padding
+                conv1,
+                residual,
+                conv1.weight,
+                conv1.bias,
+                left_padding=conv1.causal_padding,
             )
             residual = self.snake(activation2, residual)
             residual = self.conv(
-                conv2, residual, conv2.bias, left_padding=conv2.causal_padding
+                conv2,
+                residual,
+                conv2.weight,
+                conv2.bias,
+                left_padding=conv2.causal_padding,
             )
             hidden_states = residual + hidden_states
         return hidden_states
@@ -190,6 +193,7 @@ class ChannelsLastHiftDecode:
         hidden_states = self.conv(
             hift.conv_pre,
             x.transpose(1, 2).contiguous(),
+            hift.conv_pre.weight,
             hift.conv_pre.bias,
             left_padding=0,
             right_padding=right_padding,
@@ -203,6 +207,7 @@ class ChannelsLastHiftDecode:
                 hidden_states.repeat_interleave(
                     int(upsample.upsample.scale_factor), dim=1
                 ),
+                upsample.weight,
                 upsample.bias,
                 left_padding=upsample.causal_padding,
             )
@@ -215,6 +220,7 @@ class ChannelsLastHiftDecode:
             source = self.conv(
                 source_down,
                 source_spectrum,
+                self.source_down_weights[stage],
                 source_down.bias,
                 left_padding=source_down.causal_padding,
             )
@@ -232,6 +238,7 @@ class ChannelsLastHiftDecode:
         hidden_states = self.conv(
             hift.conv_post,
             hidden_states,
+            self.conv_post_weight,
             self.conv_post_bias,
             left_padding=hift.conv_post.causal_padding,
         )
