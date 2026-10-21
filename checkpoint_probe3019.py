@@ -46,6 +46,21 @@ def main():
         [(120, 50, False), (60, 0, False)],
         [(240, 180, True)],
     ]
+    prepared_rows = []
+    for pattern in patterns:
+        rows = []
+        for row, (frames, emitted_frames, is_final) in enumerate(pattern):
+            generator = torch.Generator().manual_seed(3019 + frames + row)
+            history = (torch.randn(1, 80, frames, generator=generator) * 3).cuda()
+            rows.append(
+                HiftStepRow(
+                    history=history,
+                    emitted_samples=emitted_frames * 480,
+                    is_final=is_final,
+                )
+            )
+        prepared_rows.append(rows)
+    torch.cuda.synchronize()
     with torch.inference_mode(), vocoder.stream_context:
         for graph_mode in (False, True):
             if graph_mode:
@@ -65,20 +80,7 @@ def main():
                 vocoder.hift_decode_cuda_graph_runner = runner
             pending = None
             pending_name = None
-            for step, pattern in enumerate(patterns):
-                rows = []
-                for row, (frames, emitted_frames, is_final) in enumerate(pattern):
-                    generator = torch.Generator().manual_seed(3019 + frames + row)
-                    history = (
-                        torch.randn(1, 80, frames, generator=generator) * 3
-                    ).cuda()
-                    rows.append(
-                        HiftStepRow(
-                            history=history,
-                            emitted_samples=emitted_frames * 480,
-                            is_final=is_final,
-                        )
-                    )
+            for step, rows in enumerate(prepared_rows):
                 current = vocoder.hift_step(rows)
                 name = f"graph_{graph_mode}_step_{step}"
                 if pending is not None:
