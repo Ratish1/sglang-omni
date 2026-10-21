@@ -37,6 +37,7 @@ def test_codes_of_a_mel_ignore_what_fills_its_padded_width() -> None:
 
 
 @pytest.mark.accelerator
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_graph_replays_match_the_tf32_model_at_their_width(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -61,6 +62,7 @@ def test_graph_replays_match_the_tf32_model_at_their_width(
 
 
 @pytest.mark.accelerator
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_graphs_keep_the_model_their_replays_read() -> None:
     """The graphs keep the model whose weights their replays read for as long as
     they live, with no other reference to it."""
