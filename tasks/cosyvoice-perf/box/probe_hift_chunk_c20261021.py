@@ -59,8 +59,10 @@ def main():
         pass
     flow, hift = stages.load_cosyvoice3_flow_hift(arguments.checkpoint, "cuda", autocast_dtype=None)
     stages.CosyVoice3Vocoder(flow, hift, autocast_dtype=None)
+    torch.cuda.synchronize()
     identity = {"decode": type(hift.decode).__name__, "torch": torch.__version__, "cudnn": torch.backends.cudnn.version(),
-                "channel_alignment": arguments.channel_alignment, "module": stages.__file__}
+                "channel_alignment": arguments.channel_alignment, "module": stages.__file__,
+                "allocated_mib_after_build": round(torch.cuda.memory_allocated() / 2**20, 1)}
     print(json.dumps(identity))
     samples_per_frame = int(np.prod(hift.upsample_rates)) * hift.istft_params["hop_len"]
     with torch.inference_mode():
