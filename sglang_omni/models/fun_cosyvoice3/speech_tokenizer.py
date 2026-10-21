@@ -288,7 +288,12 @@ class SpeechTokenizerCudaGraphs:
                     for _ in range(2):
                         model(mel, frames)
                 graph = torch.cuda.CUDAGraph()
-                with torch.cuda.graph(graph, pool=pool, stream=self.stream):
+                with torch.cuda.graph(
+                    graph,
+                    pool=pool,
+                    stream=self.stream,
+                    capture_error_mode="thread_local",
+                ):
                     codes = model(mel, frames)
                 self.graphs[width] = CapturedTokenizerGraph(
                     graph=graph, mel=mel, frames=frames, codes=codes
