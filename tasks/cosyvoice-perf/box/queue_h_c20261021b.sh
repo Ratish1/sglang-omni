@@ -118,12 +118,16 @@ elif [ "$1" = fix ]; then
 elif [ "$1" = quality ]; then
   # Phase quality: p_h2's seeded c1f cells scored, then t_h1's SIM per clip against t_main's in each order (order a
   # has t_main in slot 0, order b in slot 1), over every clip and the clips of the same length.
+  # note (ratish): one port per scorer; the fix phase's second c16 round found the first round's ports still held.
   log "queue quality start t_marks $(git -C /workspace/t_marks rev-parse --short HEAD)"
+  score $D/p_h2/b/gpu0/c16 0 30000 &
+  score $D/p_h2/b/gpu1/c16 1 31000 &
+  wait
   score $D/p_h2/a/gpu0/c1f 0 26000 &
   score $D/p_h2/a/gpu1/c1f 1 27000 &
   wait
-  score $D/p_h2/b/gpu0/c1f 0 26000 &
-  score $D/p_h2/b/gpu1/c1f 1 27000 &
+  score $D/p_h2/b/gpu0/c1f 0 28000 &
+  score $D/p_h2/b/gpu1/c1f 1 29000 &
   wait
   python3 $IN/paired_sim_c20261021.py $D/p_h2/a/gpu0/c1f $D/p_h2/a/gpu1/c1f > $D/paired_sim_p_h2_a.txt 2>&1
   python3 $IN/paired_sim_c20261021.py $D/p_h2/b/gpu1/c1f $D/p_h2/b/gpu0/c1f > $D/paired_sim_p_h2_b.txt 2>&1
