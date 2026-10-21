@@ -48,8 +48,25 @@ def main() -> None:
             item.token, item.prompt_token, item.prompt_feat, item.embedding
         )
     assert len(mels) == 1
+    outputs = {"mel": mels[0].cpu(), "wav": wav.cpu()}
+    if args.label == "parent":
+        estimator = flow.decoder.estimator
+        estimator.forward = estimator.forward._torchdynamo_orig_callable
+        torch.manual_seed(2945)
+        with (
+            torch.inference_mode(),
+            vocoder.stream_context,
+            patch.object(flow.flow, "inference", observe_inference),
+        ):
+            eager_wav = vocoder.token2wav(
+                item.token, item.prompt_token, item.prompt_feat, item.embedding
+            )
+        outputs["eager_mel"] = mels[1].cpu()
+        outputs["eager_wav"] = eager_wav.cpu()
+    else:
+        pass
     torch.save(
-        {"mel": mels[0].cpu(), "wav": wav.cpu()},
+        outputs,
         Path(f"/data/review2944/{args.label}_fallback.pt"),
     )
     print(
