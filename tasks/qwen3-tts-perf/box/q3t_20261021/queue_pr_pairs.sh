@@ -18,9 +18,9 @@ L=$D/queue.log
 mkdir -p $D/units $PAIR_ROOT
 until grep -q "$WAIT" $L; do sleep 30; done
 echo "queue $NAME start $(date +%T) main $(git -C $M rev-parse HEAD:sglang_omni) pr $(git -C $PR rev-parse HEAD:sglang_omni)" >> $L
-# the suites' GPU tests use card 0 by name, and cards 0 and 1 are another container's; none of these suites reads
+# the suites' GPU tests use cards 0 and 1 by name, and those are another container's; none of these suites reads
 # the variable (only tests/unit_test/pipeline's wiring tests do)
-(cd $PR && CUDA_VISIBLE_DEVICES=2 PYTHONPATH=$PR timeout 3600 python3 -m pytest $UNITS -q -p no:cacheprovider -rfE \
+(cd $PR && CUDA_VISIBLE_DEVICES=2,3 PYTHONPATH=$PR timeout 3600 python3 -m pytest $UNITS -q -p no:cacheprovider -rfEs \
   > $D/units/$NAME.log 2>&1)
 echo "units $NAME rc $? $(grep -E 'passed|failed' $D/units/$NAME.log | tail -n 1) $(date +%T)" >> $L
 run_pair() {
