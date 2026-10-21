@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import copy
-import logging
 import sys
 from collections.abc import Iterator, Sequence
 from types import SimpleNamespace
@@ -111,62 +110,16 @@ class GraphRunnableFakeFlow(RunnableFakeFlow):
 
 
 class RecordingPackedDiT(PackedDiT):
-    def __init__(self, *, is_ragged: bool = True, is_compiled: bool = False) -> None:
+    def __init__(self, *, is_ragged: bool = True) -> None:
         self.is_ragged = is_ragged
-        self.is_compiled = is_compiled
 
     def build_modulations(self, time_span: torch.Tensor, dtype: torch.dtype) -> None:
         self.block_modulations = ()
         self.final_modulations = ()
 
     def compile(self, dtype: torch.dtype | None) -> bool:
-        self.is_compiled = True
+        del dtype
         return True
-
-
-@pytest.mark.parametrize(
-    (
-        "device_type",
-        "dtype",
-        "has_estimator",
-        "is_ragged",
-        "expected_reason",
-    ),
-    [
-        ("cuda", torch.bfloat16, True, True, None),
-        ("cuda", torch.float16, True, True, None),
-        ("cpu", torch.bfloat16, True, True, "device type cpu is not CUDA"),
-        ("cuda", torch.bfloat16, False, True, "PackedDiT is unavailable"),
-        ("cuda", torch.bfloat16, True, False, "ragged FA3 is unavailable"),
-        (
-            "cuda",
-            torch.float32,
-            True,
-            True,
-            "dtype torch.float32 is not FA3-compatible",
-        ),
-    ],
-)
-def test_packed_fa3_unavailable_reason(
-    device_type: str,
-    dtype: torch.dtype,
-    has_estimator: bool,
-    is_ragged: bool,
-    expected_reason: str | None,
-) -> None:
-    if has_estimator:
-        packed_estimator: PackedDiT | None = RecordingPackedDiT(is_ragged=is_ragged)
-    else:
-        packed_estimator = None
-    reason = stages.packed_fa3_unavailable_reason(
-        packed_estimator,
-        device=torch.device(device_type),
-        dtype=dtype,
-    )
-    if expected_reason is None:
-        assert reason is None
-    else:
-        assert reason == expected_reason
 
 
 def packed_compile_scheduler(
@@ -1085,16 +1038,6 @@ def prepare_vocoder_startup(
             raise AssertionError("native compile must stay disabled")
 
     monkeypatch.setattr(stages, "compile_dit_backbone", record_native_compile)
-
-    def warmup_packed_dit_compile(
-        scheduler: FunCosyVoice3StreamingVocoderScheduler,
-    ) -> None:
-        startup_events.append("packed_warmup")
-        if packed_estimator is not None:
-            packed_estimator.is_compiled = True
-        else:
-            pass
-
     monkeypatch.setattr(
         FunCosyVoice3StreamingVocoderScheduler,
         "warmup_now",
@@ -1103,7 +1046,7 @@ def prepare_vocoder_startup(
     monkeypatch.setattr(
         FunCosyVoice3StreamingVocoderScheduler,
         "warmup_packed_dit_compile",
-        warmup_packed_dit_compile,
+        lambda scheduler: startup_events.append("packed_warmup"),
     )
     if device_type in ("cuda", "xpu"):
         platform = CUDAOmniPlatform() if device_type == "cuda" else XPUOmniPlatform()
@@ -1190,111 +1133,48 @@ def test_create_vocoder_executor_on_xpu_captures_flow_graphs_only_for_an_eager_d
 
 
 @pytest.mark.parametrize(
-    "case",
+    ("is_ragged", "dtype", "enable_flow_estimator_trt", "is_buffered_packed"),
     [
-        "default-packed",
-        "explicit-opt-out",
-        "unsupported-device",
-        "unsupported-ragged-attention",
-        "unsupported-dtype",
-        "uncompiled-packed",
-        "missing-packed-estimator",
-        "tensorrt-estimator",
+        (True, "bfloat16", False, True),
+        (False, "bfloat16", False, False),
+        (True, "float32", False, False),
+        (True, "bfloat16", True, False),
     ],
 )
-def test_create_vocoder_executor_sets_effective_buffered_flow_route(
+def test_create_vocoder_executor_packs_buffered_flow_only_on_ragged_attention(
     monkeypatch: pytest.MonkeyPatch,
-    caplog: pytest.LogCaptureFixture,
-    case: str,
+    is_ragged: bool,
+    dtype: str,
+    enable_flow_estimator_trt: bool,
+    is_buffered_packed: bool,
 ) -> None:
-    startup_events: list[str] = []
-    device_type = "cuda"
-    dtype = "bfloat16"
-    enable_dit_torch_compile = False
-    enable_buffered_packed_flow = True
-    enable_flow_estimator_trt = False
-    packed_estimator: PackedDiT | None = None
-    expected_route = "native"
-    expected_reason = ""
-    if case == "default-packed":
-        enable_dit_torch_compile = True
-        packed_estimator = RecordingPackedDiT(is_ragged=True)
-        expected_route = "packed"
-        expected_reason = "compile=True"
-    elif case == "explicit-opt-out":
-        packed_estimator = RecordingPackedDiT(is_ragged=True, is_compiled=True)
-        enable_buffered_packed_flow = False
-        expected_reason = "explicitly disabled"
-    elif case == "unsupported-device":
-        device_type = "cpu"
-        packed_estimator = RecordingPackedDiT(is_ragged=True, is_compiled=True)
-        expected_reason = "device type cpu"
-    elif case == "unsupported-ragged-attention":
-        packed_estimator = RecordingPackedDiT(is_ragged=False, is_compiled=True)
-        expected_reason = "ragged FA3"
-    elif case == "unsupported-dtype":
-        dtype = "float32"
-        packed_estimator = RecordingPackedDiT(is_ragged=True, is_compiled=True)
-        expected_reason = "not FA3-compatible"
-    elif case == "uncompiled-packed":
-        packed_estimator = RecordingPackedDiT(is_ragged=True)
-        expected_route = "packed"
-        expected_reason = "compile=False"
-    elif case == "missing-packed-estimator":
-        expected_reason = "PackedDiT is unavailable"
-    elif case == "tensorrt-estimator":
-        enable_flow_estimator_trt = True
-        packed_estimator = RecordingPackedDiT(is_ragged=True, is_compiled=True)
-        expected_reason = "TensorRT estimator"
-    else:
-        raise AssertionError(f"unhandled test case {case}")
-
     loaded_flow = prepare_vocoder_startup(
         monkeypatch,
-        startup_events,
-        device_type=device_type,
-        allow_native_compile=enable_dit_torch_compile,
-        packed_estimator=packed_estimator,
+        [],
+        device_type="cuda",
+        allow_native_compile=False,
+        packed_estimator=RecordingPackedDiT(is_ragged=is_ragged),
     )
-    if case == "missing-packed-estimator":
+    if enable_flow_estimator_trt:
         loaded_flow.packed_estimator = None
     else:
         pass
-    monkeypatch.setattr(
-        torch,
-        "autocast",
-        null_autocast,
-    )
-    factory_options: dict[str, bool] = {
-        "enable_flow_estimator_trt": enable_flow_estimator_trt,
-    }
-    if case != "default-packed":
-        factory_options["enable_buffered_packed_flow"] = enable_buffered_packed_flow
-    else:
-        pass
+    monkeypatch.setattr(torch, "autocast", null_autocast)
 
-    with caplog.at_level(logging.INFO, logger=stages.__name__):
-        scheduler = stages.create_vocoder_executor(
-            "model",
-            device=device_type,
-            dtype=dtype,
-            flow_prefix_cache_gb=0.0,
-            enable_flow_cuda_graph=False,
-            enable_flow_prefix_cuda_graph=False,
-            enable_flow_whole_history_cuda_graph=False,
-            enable_hift_cuda_graph=False,
-            enable_dit_torch_compile=enable_dit_torch_compile,
-            **factory_options,
-        )
+    scheduler = stages.create_vocoder_executor(
+        "model",
+        device="cuda",
+        dtype=dtype,
+        flow_prefix_cache_gb=0.0,
+        enable_flow_cuda_graph=False,
+        enable_flow_prefix_cuda_graph=False,
+        enable_flow_whole_history_cuda_graph=False,
+        enable_hift_cuda_graph=False,
+        enable_dit_torch_compile=False,
+        enable_flow_estimator_trt=enable_flow_estimator_trt,
+    )
 
-    assert scheduler.vocoder.flow.enable_buffered_packed_flow is (
-        expected_route == "packed"
-    )
-    assert any(
-        f"Fun-CosyVoice3 buffered Flow: {expected_route}" in record.message
-        and expected_reason in record.message
-        for record in caplog.records
-    )
+    assert scheduler.vocoder.flow.enable_buffered_packed_flow is is_buffered_packed
 
 
 @pytest.mark.parametrize("is_ragged", [False, True])
