@@ -69,7 +69,6 @@ def test_channels_last_conv1d_matches_the_strided_causal_conv1d(
         conv,
         channels_last_folded_weight(conv.weight.data, stride),
         outputs,
-        stride=stride,
     )
 
     torch.testing.assert_close(actual, expected)

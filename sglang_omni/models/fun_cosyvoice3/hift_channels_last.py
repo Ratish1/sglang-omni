@@ -124,11 +124,11 @@ class ChannelsLastHiftDecode:
         *,
         left_padding: int,
         right_padding: int = 0,
-        stride: int = 1,
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """The conv of (rows, samples, channels) with zeros for its causal context."""
         length = hidden_states.shape[1]
+        stride = module.stride[0]
         if stride > 1:
             outputs = (left_padding + length - module.kernel_size[0]) // stride + 1
             alignment = (-(left_padding + length)) % stride
@@ -142,7 +142,6 @@ class ChannelsLastHiftDecode:
             self.channels_last_weights[id(module)],
             outputs,
             bias=bias,
-            stride=stride,
         )
 
     def snake(
@@ -211,7 +210,6 @@ class ChannelsLastHiftDecode:
                 source_down,
                 source_spectrum,
                 left_padding=source_down.causal_padding,
-                stride=source_down.stride[0],
             )
             hidden_states = hidden_states + self.resblock(
                 hift.source_resblocks[stage], source
