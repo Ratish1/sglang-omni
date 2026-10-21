@@ -25,8 +25,8 @@ from sglang_omni.utils.channels_last_conv import (
     channels_last_weight,
 )
 
-# note (ratish): cuDNN's channels-last tensor-core engines take channel counts in
-# multiples of eight; the spectrum's n_fft + 2 channels are zero padded to the next.
+# note (ratish): cuDNN runs the spectrum's n_fft + 2 channels on slow engines; zero
+# padded to a multiple of eight they take its fast ones (a multiple of four measures the same).
 CHANNEL_ALIGNMENT = 8
 # note (ratish): CosyVoice's decode runs its last leaky relu at torch's default slope.
 CONV_POST_LEAKY_RELU_SLOPE = 0.01
