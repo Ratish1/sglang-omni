@@ -10,7 +10,8 @@ from one arrival seed, so both arms and both orders get one schedule; 64 slots, 
 second, near the c64 cell's throughput, where a faster vocoder cannot refill the AR's queue as a closed loop does).
 Later on 10-20: the long form cell L16 (the 48 entries of make_longform_meta.py at concurrency 16, item 3's cell), and
 c1f, every reference seeded at concurrency 1, whose tails rest on 1,088 requests where c1's p99 is one of 64.
-10-21 copy under /data/c20261021, the new lease's home, on cards 0 and 1.
+10-21 copy under /data/c20261021, the new lease's home, on cards 0 and 1. Later on 10-21: the buffered cells b1f (every
+reference at concurrency 1, seeded) and Lb16 (the long form list at concurrency 16), for #2260's buffered route.
 usage: python3 serve_pair_c20261021.py <first tree> <second tree> <out dir>"""
 
 import json
@@ -37,6 +38,8 @@ ALL_CELLS = {
     "b1": (["--max-concurrency", "1", "--max-samples", "256"], False),
     "b16": (["--max-concurrency", "16"], False),
     "b64": (["--max-concurrency", "64"], False),
+    "b1f": (["--max-concurrency", "1", "--seed", "1234"], False),
+    "Lb16": (["--max-concurrency", "16", "--meta", f"{D}/longform/meta.lst"], False),
     "r12": (["--max-concurrency", "64", "--request-rate", "12", "--arrival-seed", "2910"], True),
     "r16": (["--max-concurrency", "64", "--request-rate", "16", "--arrival-seed", "2910"], True),
     "r20": (["--max-concurrency", "64", "--request-rate", "20", "--arrival-seed", "2910"], True),
