@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """HiFT's decode over channels-last activations: cuDNN's NHWC convolution engines without
-their layout transposes, with the Snake and spectrum kernels, as the object the vocoder
-installs in place of the module's decode."""
+their layout transposes, each conv's bias, residual, activation and causal padding in the
+kernel that writes the next conv's input, as the object the vocoder installs in place of
+the module's decode."""
 
 from __future__ import annotations
 
@@ -11,9 +12,11 @@ import torch
 import torch.nn.functional as F
 
 from sglang_omni.models.fun_cosyvoice3.hift_kernels import (
+    add_bias_and_residual,
+    leaky_relu_padded,
     overlap_add_inverse,
     short_time_spectrum,
-    snake,
+    snake_padded,
 )
 from sglang_omni.utils.channels_last_conv import (
     channels_last_conv1d,
@@ -25,6 +28,8 @@ from sglang_omni.utils.channels_last_conv import (
 # note (ratish): cuDNN's channels-last tensor-core engines take channel counts in
 # multiples of eight; the spectrum's n_fft + 2 channels are zero padded to the next.
 CHANNEL_ALIGNMENT = 8
+# note (ratish): CosyVoice's decode runs its last leaky relu at torch's default slope.
+CONV_POST_LEAKY_RELU_SLOPE = 0.01
 
 
 class ChannelsLastHiftDecode:
@@ -117,67 +122,82 @@ class ChannelsLastHiftDecode:
             self.hop_length,
         )
 
-    def conv(
-        self,
-        module: torch.nn.Conv1d,
-        hidden_states: torch.Tensor,
-        weight: torch.Tensor,
-        bias: torch.Tensor | None,
-        *,
-        left_padding: int,
-        right_padding: int = 0,
-    ) -> torch.Tensor:
-        """The conv of (rows, samples, channels) with zeros for its causal context."""
-        length = hidden_states.shape[1]
+    def source_down(self, stage: int, source_spectrum: torch.Tensor) -> torch.Tensor:
+        """The stage's downsampling conv of the (rows, frames, channels) source spectrum."""
+        module = self.hift.source_downs[stage]
+        frames = source_spectrum.shape[1]
+        left_padding = module.causal_padding
         stride = module.stride[0]
-        if stride > 1:
-            outputs = (left_padding + length - module.kernel_size[0]) // stride + 1
-            alignment = (-(left_padding + length)) % stride
-        else:
-            outputs = length
-            alignment = (-(left_padding + length + right_padding)) % module.dilation[0]
-        padded = F.pad(hidden_states, (0, 0, left_padding, right_padding + alignment))
-        return channels_last_conv1d(padded, module, weight, bias, outputs)
+        outputs = (left_padding + frames - module.kernel_size[0]) // stride + 1
+        padded = F.pad(
+            source_spectrum,
+            (0, 0, left_padding, (-(left_padding + frames)) % stride),
+        )
+        return channels_last_conv1d(
+            padded, module, self.source_down_weights[stage], module.bias, outputs
+        )
 
     def snake(
-        self, activation: torch.nn.Module, hidden_states: torch.Tensor
+        self,
+        activation: torch.nn.Module,
+        hidden_states: torch.Tensor,
+        next_conv: torch.nn.Conv1d,
+        *,
+        bias: torch.Tensor | None = None,
+        residual: torch.Tensor | None = None,
+        sum_out: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        """The Snake of hidden_states + bias + residual as next_conv's input: its causal
+        context, then the end rows that make the input divide by its dilation."""
         alpha, inverse_alpha = self.snake_alphas[id(activation)]
-        return snake(hidden_states, alpha, inverse_alpha)
+        left_padding = next_conv.causal_padding
+        dilation = next_conv.dilation[0]
+        right_padding = (-(left_padding + hidden_states.shape[1])) % dilation
+        return snake_padded(
+            hidden_states,
+            alpha,
+            inverse_alpha,
+            left_padding,
+            right_padding,
+            bias=bias,
+            residual=residual,
+            sum_out=sum_out,
+        )
 
     def resblock(
         self, block: torch.nn.Module, hidden_states: torch.Tensor
     ) -> torch.Tensor:
-        for activation1, conv1, activation2, conv2 in zip(
-            block.activations1,
-            block.convs1,
-            block.activations2,
-            block.convs2,
-            strict=True,
-        ):
-            residual = self.snake(activation1, hidden_states)
-            residual = self.conv(
-                conv1,
-                residual,
-                conv1.weight,
-                conv1.bias,
-                left_padding=conv1.causal_padding,
+        length = hidden_states.shape[1]
+        count = len(block.convs1)
+        padded = self.snake(block.activations1[0], hidden_states, block.convs1[0])
+        for index in range(count):
+            conv1 = block.convs1[index]
+            conv2 = block.convs2[index]
+            output = channels_last_conv1d(padded, conv1, conv1.weight, None, length)
+            padded = self.snake(
+                block.activations2[index], output, conv2, bias=conv1.bias
             )
-            residual = self.snake(activation2, residual)
-            residual = self.conv(
-                conv2,
-                residual,
-                conv2.weight,
-                conv2.bias,
-                left_padding=conv2.causal_padding,
-            )
-            hidden_states = residual + hidden_states
+            output = channels_last_conv1d(padded, conv2, conv2.weight, None, length)
+            if index + 1 < count:
+                next_hidden_states = torch.empty_like(output)
+                padded = self.snake(
+                    block.activations1[index + 1],
+                    output,
+                    block.convs1[index + 1],
+                    bias=conv2.bias,
+                    residual=hidden_states,
+                    sum_out=next_hidden_states,
+                )
+                hidden_states = next_hidden_states
+            else:
+                hidden_states = add_bias_and_residual(output, conv2.bias, hidden_states)
         return hidden_states
 
     def __call__(
         self, x: torch.Tensor, s: torch.Tensor, finalize: bool = True
     ) -> torch.Tensor:
         hift = self.hift
+        conv_pre = hift.conv_pre
         # note (ratish): three small transposes, the mel, the source spectrum and the
         # output spectrum, in place of one per convolution inside cuDNN.
         source_spectrum = F.pad(
@@ -185,48 +205,43 @@ class ChannelsLastHiftDecode:
             (0, self.spectrum_channel_padding),
         ).contiguous()
         if finalize:
-            right_padding = hift.conv_pre.causal_padding
+            mel = F.pad(x.transpose(1, 2), (0, 0, 0, conv_pre.causal_padding))
         else:
-            right_padding = 0
+            mel = x.transpose(1, 2).contiguous()
             held_frames = self.spectrum_frames_per_mel_frame * hift.conv_pre_look_right
             source_spectrum = source_spectrum[:, :-held_frames].contiguous()
-        hidden_states = self.conv(
-            hift.conv_pre,
-            x.transpose(1, 2).contiguous(),
-            hift.conv_pre.weight,
-            hift.conv_pre.bias,
-            left_padding=0,
-            right_padding=right_padding,
+        # note (ratish): the kernel that reads a conv's output adds its bias; the source
+        # and post convs keep torch's.
+        hidden_states = channels_last_conv1d(
+            mel, conv_pre, conv_pre.weight, None, mel.shape[1] - conv_pre.causal_padding
         )
         last_stage = hift.num_upsamples - 1
         for stage in range(hift.num_upsamples):
             upsample = hift.ups[stage]
-            hidden_states = F.leaky_relu(hidden_states, hift.lrelu_slope)
-            hidden_states = self.conv(
+            factor = int(upsample.upsample.scale_factor)
+            upsampled = leaky_relu_padded(
+                hidden_states,
+                hift.lrelu_slope,
+                factor,
+                upsample.causal_padding,
+                bias=conv_pre.bias if stage == 0 else None,
+            )
+            hidden_states = channels_last_conv1d(
+                upsampled,
                 upsample,
-                hidden_states.repeat_interleave(
-                    int(upsample.upsample.scale_factor), dim=1
-                ),
                 upsample.weight,
-                upsample.bias,
-                left_padding=upsample.causal_padding,
+                None,
+                hidden_states.shape[1] * factor,
             )
             if stage == last_stage:
                 # note (ratish): the reflection pad of one sample is the second sample.
                 hidden_states = torch.cat((hidden_states[:, 1:2], hidden_states), dim=1)
             else:
                 pass
-            source_down = hift.source_downs[stage]
-            source = self.conv(
-                source_down,
-                source_spectrum,
-                self.source_down_weights[stage],
-                source_down.bias,
-                left_padding=source_down.causal_padding,
+            source = self.resblock(
+                hift.source_resblocks[stage], self.source_down(stage, source_spectrum)
             )
-            hidden_states = hidden_states + self.resblock(
-                hift.source_resblocks[stage], source
-            )
+            hidden_states = add_bias_and_residual(hidden_states, upsample.bias, source)
             blocks = hift.resblocks[
                 stage * hift.num_kernels : (stage + 1) * hift.num_kernels
             ]
@@ -234,13 +249,18 @@ class ChannelsLastHiftDecode:
             for block in blocks[1:]:
                 summed = summed + self.resblock(block, hidden_states)
             hidden_states = summed / hift.num_kernels
-        hidden_states = F.leaky_relu(hidden_states)
-        hidden_states = self.conv(
-            hift.conv_post,
+        padded = leaky_relu_padded(
             hidden_states,
+            CONV_POST_LEAKY_RELU_SLOPE,
+            1,
+            hift.conv_post.causal_padding,
+        )
+        hidden_states = channels_last_conv1d(
+            padded,
+            hift.conv_post,
             self.conv_post_weight,
             self.conv_post_bias,
-            left_padding=hift.conv_post.causal_padding,
+            hidden_states.shape[1],
         )
         magnitude = torch.exp(hidden_states[..., : self.bins]).transpose(1, 2)
         phase = torch.sin(hidden_states[..., self.bins : 2 * self.bins]).transpose(1, 2)

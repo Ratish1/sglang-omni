@@ -14,11 +14,16 @@ import msgpack
 import numpy as np
 import pytest
 import torch
+import torch.nn.functional as F
 
 from sglang_omni.client.client import Client
 from sglang_omni.models.fun_cosyvoice3 import stages
 from sglang_omni.models.fun_cosyvoice3.hift_channels_last import ChannelsLastHiftDecode
 from sglang_omni.models.fun_cosyvoice3.hift_cuda_graph import HiftDecodeCudaGraphRunner
+from sglang_omni.models.fun_cosyvoice3.hift_kernels import (
+    add_bias_and_residual,
+    leaky_relu_padded,
+)
 from sglang_omni.models.fun_cosyvoice3.packed_dit import PackedDiT
 from sglang_omni.models.fun_cosyvoice3.payload_types import FunCosyVoice3State
 from sglang_omni.models.fun_cosyvoice3.solve_graph_capture import SolveGraphCapture
@@ -1438,7 +1443,7 @@ def test_hift_step_final_equals_its_own_call_beside_finals_of_other_widths(
 
 @pytest.mark.accelerator
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-def test_vocoder_hift_snake_is_bit_identical_to_cosyvoice() -> None:
+def test_vocoder_hift_snake_epilogue_is_bit_identical_to_the_eager_chain() -> None:
     snake_class = pytest.importorskip("cosyvoice.transformer.activation").Snake
     hift = make_causal_hift(10.0)
     snakes = [module for module in hift.modules() if isinstance(module, snake_class)]
@@ -1448,13 +1453,52 @@ def test_vocoder_hift_snake_is_bit_identical_to_cosyvoice() -> None:
     stages.CosyVoice3Vocoder(HiftFlowStub(), hift)
     decode = hift.decode
     assert isinstance(decode, ChannelsLastHiftDecode)
-    assert snakes
+    pairs = [
+        (activation, conv)
+        for block in (*hift.source_resblocks, *hift.resblocks)
+        for activation, conv in zip(
+            (*block.activations1, *block.activations2),
+            (*block.convs1, *block.convs2),
+            strict=True,
+        )
+    ]
+    assert len(pairs) == len(snakes)
     torch.manual_seed(3)
     with torch.inference_mode():
-        for module in snakes:
-            x = torch.randn(3, module.in_features, 2049, device="cuda") * 30
-            output = decode.snake(module, x.transpose(1, 2).contiguous())
-            assert torch.equal(output.transpose(1, 2), module(x))
+        for activation, conv in pairs:
+            channels = activation.in_features
+            x = torch.randn(3, 2049, channels, device="cuda") * 30
+            bias = torch.randn(channels, device="cuda")
+            residual = torch.randn(3, 2049, channels, device="cuda") * 30
+            sum_out = torch.empty_like(x)
+            padded = decode.snake(
+                activation, x, conv, bias=bias, residual=residual, sum_out=sum_out
+            )
+            summed = x + bias + residual
+            left = conv.causal_padding
+            right = padded.shape[1] - left - 2049
+            expected = F.pad(activation(summed.transpose(1, 2)), (left, right))
+            assert padded.shape[1] % conv.dilation[0] == 0
+            assert 0 <= right < conv.dilation[0]
+            assert torch.equal(sum_out, summed)
+            assert torch.equal(add_bias_and_residual(x, bias, residual), summed)
+            assert torch.equal(padded, expected.transpose(1, 2))
+
+
+@pytest.mark.accelerator
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("factor", [1, 5])
+def test_leaky_relu_padded_is_bit_identical_to_the_eager_chain(factor: int) -> None:
+    torch.manual_seed(factor)
+    x = torch.randn(3, 101, 128, device="cuda") * 3
+    bias = torch.randn(128, device="cuda")
+    expected = F.pad(
+        F.leaky_relu(x + bias, 0.1).repeat_interleave(factor, dim=1), (0, 0, 10, 0)
+    )
+
+    padded = leaky_relu_padded(x, 0.1, factor, 10, bias=bias)
+
+    assert torch.equal(padded, expected)
 
 
 @pytest.mark.accelerator
