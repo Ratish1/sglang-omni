@@ -12,7 +12,8 @@ Each arm is captured in a CUDA graph and replayed (median of 200 replays, us); k
 one eager call; outputs are compared with the current path run in fp32 (weights and state cast to fp32). --compiled
 times both arms under torch.compile(dynamic=False, fullgraph=True), as the decoder's precompile builds them.
 
-usage: PYTHONPATH=<V3 tree> python vocoder_transformer_bench.py [--widths 1 2 4 8] [--rows 1 4 8 16] [--compiled]
+usage: PYTHONPATH=<V3 tree> python vocoder_transformer_bench.py [--card 0] [--widths 1 2 4 8] [--rows 1 4 8 16]
+       [--compiled]
 """
 
 from __future__ import annotations
@@ -24,7 +25,6 @@ import torch
 
 from sglang_omni.models.qwen3_tts import incremental_codec
 from sglang_omni.models.qwen3_tts.stages import load_qwen3_tts_tokenizer
-from sglang_omni.platforms import current_platform
 
 MODEL = "Qwen/Qwen3-TTS-12Hz-1.7B-Base"
 FRAMES_IN = 200
@@ -97,16 +97,16 @@ def main() -> None:
     parser.add_argument("--widths", type=int, nargs="+", default=[1, 2, 4, 8])
     parser.add_argument("--rows", type=int, nargs="+", default=[1, 4, 8, 16])
     parser.add_argument("--compiled", action="store_true")
+    parser.add_argument("--card", type=int, default=0)
     args = parser.parse_args()
-    device = torch.device("cuda")
+    device = torch.device("cuda", args.card)
+    torch.cuda.set_device(device)
     transformer = load_qwen3_tts_tokenizer(
-        MODEL, device="cuda", dtype="bfloat16", attn_implementation=None
+        MODEL, device=str(device), dtype="bfloat16", attn_implementation=None
     ).model.decoder.pre_transformer.eval()
-    fused = incremental_codec.FusedIncrementalTransformer(
-        transformer, current_platform.get_joint_rope_inplace_kernel()
-    )
+    fused = incremental_codec.FusedIncrementalTransformer(transformer)
     reference = load_qwen3_tts_tokenizer(
-        MODEL, device="cuda", dtype="float32", attn_implementation=None
+        MODEL, device=str(device), dtype="float32", attn_implementation=None
     ).model.decoder.pre_transformer.eval()
     config = transformer.config
     print(

@@ -1,7 +1,7 @@
 """The code predictor's fused layers at the served shapes, timed per kernel from a CUDA graph with programmatic dependent
 launch, on the implementation of the tree on PYTHONPATH (main's or a branch's).
 
-usage: PYTHONPATH=<tree> python3 predictor_layers_bench.py [--batch 1 16 64] [--replays 50]
+usage: PYTHONPATH=<tree> python3 predictor_layers_bench.py [--card 0] [--batch 1 16 64] [--replays 50]
 
 Qwen3-TTS-12Hz-1.7B-Base's predictor dimensions (hidden 1024, 16 q and 8 kv heads of 128, intermediate 3072, 5 layers,
 17 cache slots) with random weights: the dense layers' kernels depend on shapes, not values. One step is the served
@@ -101,10 +101,14 @@ def family_of(name: str) -> str:
     return "other"
 
 
-def clear_slow_mode() -> None:
+def clear_slow_mode(device: torch.device) -> None:
     """Another process's context running a kernel on the GPU ends the slow mode (memory: two-stream eager slow mode)."""
     subprocess.run(
-        [sys.executable, "-c", "import torch; torch.ones(1, device='cuda').add_(1); torch.cuda.synchronize()"],
+        [
+            sys.executable,
+            "-c",
+            f"import torch; torch.ones(1, device='{device}').add_(1); torch.cuda.synchronize('{device}')",
+        ],
         check=True,
     )
 
@@ -147,7 +151,7 @@ def bench(batch_size: int, replays: int, device: torch.device) -> None:
                 cache_len=cache_len, positions=slot_positions[cache_len], k_cache=k_cache, v_cache=v_cache,
             )
 
-    clear_slow_mode()
+    clear_slow_mode(device)
     for _ in range(3):
         step()
     torch.cuda.synchronize()
@@ -190,10 +194,12 @@ def bench(batch_size: int, replays: int, device: torch.device) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser()
+    parser.add_argument("--card", type=int, default=0)
     parser.add_argument("--batch", type=int, nargs="+", default=[1, 16, 64])
     parser.add_argument("--replays", type=int, default=50)
     args = parser.parse_args()
-    device = torch.device("cuda")
+    device = torch.device("cuda", args.card)
+    torch.cuda.set_device(device)
     torch.manual_seed(0)
     with torch.inference_mode():
         for batch_size in args.batch:
