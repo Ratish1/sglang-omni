@@ -45,24 +45,18 @@ def channels_last_conv1d(
     hidden_states: torch.Tensor,
     conv: torch.nn.Conv1d,
     weight: torch.Tensor,
+    bias: torch.Tensor | None,
     length: int,
-    *,
-    bias: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """The conv of a (B, L, C) activation that carries its left context: a stride-one
     conv returns every output row, a dilated one the first length rows of an input
     divisible by the dilation, and a strided one, given its folded weight and an input
-    divisible by the stride, the first length rows over the input's phases. bias
-    replaces the module's, for a weight padded past its channels."""
+    divisible by the stride, the first length rows over the input's phases."""
     dilation = conv.dilation[0]
     stride = conv.stride[0]
     assert stride == 1 or (
         dilation == 1 and conv.groups == 1
     ), "a strided conv folds undilated and ungrouped"
-    if bias is None:
-        bias = conv.bias
-    else:
-        pass
     if stride > 1:
         batch_size, padded_length, channels = hidden_states.shape
         assert padded_length % stride == 0, "the phases fold whole"

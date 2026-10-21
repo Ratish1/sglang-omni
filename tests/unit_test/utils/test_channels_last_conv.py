@@ -38,7 +38,9 @@ def test_channels_last_conv1d_matches_the_causal_conv1d(
     ).transpose(1, 2)
 
     padded = F.pad(inputs, (0, 0, left_context, (-length) % dilation))
-    actual = channels_last_conv1d(padded, conv, channels_last_weight(conv), length)
+    actual = channels_last_conv1d(
+        padded, conv, channels_last_weight(conv), conv.bias, length
+    )
 
     torch.testing.assert_close(actual, expected)
 
@@ -68,6 +70,7 @@ def test_channels_last_conv1d_matches_the_strided_causal_conv1d(
         padded,
         conv,
         channels_last_folded_weight(conv.weight.data, stride),
+        conv.bias,
         outputs,
     )
 

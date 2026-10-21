@@ -121,10 +121,10 @@ class ChannelsLastHiftDecode:
         self,
         module: torch.nn.Conv1d,
         hidden_states: torch.Tensor,
+        bias: torch.Tensor | None,
         *,
         left_padding: int,
         right_padding: int = 0,
-        bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """The conv of (rows, samples, channels) with zeros for its causal context."""
         length = hidden_states.shape[1]
@@ -140,8 +140,8 @@ class ChannelsLastHiftDecode:
             padded,
             module,
             self.channels_last_weights[id(module)],
+            bias,
             outputs,
-            bias=bias,
         )
 
     def snake(
@@ -161,9 +161,13 @@ class ChannelsLastHiftDecode:
             strict=True,
         ):
             residual = self.snake(activation1, hidden_states)
-            residual = self.conv(conv1, residual, left_padding=conv1.causal_padding)
+            residual = self.conv(
+                conv1, residual, conv1.bias, left_padding=conv1.causal_padding
+            )
             residual = self.snake(activation2, residual)
-            residual = self.conv(conv2, residual, left_padding=conv2.causal_padding)
+            residual = self.conv(
+                conv2, residual, conv2.bias, left_padding=conv2.causal_padding
+            )
             hidden_states = residual + hidden_states
         return hidden_states
 
@@ -186,6 +190,7 @@ class ChannelsLastHiftDecode:
         hidden_states = self.conv(
             hift.conv_pre,
             x.transpose(1, 2).contiguous(),
+            hift.conv_pre.bias,
             left_padding=0,
             right_padding=right_padding,
         )
@@ -198,6 +203,7 @@ class ChannelsLastHiftDecode:
                 hidden_states.repeat_interleave(
                     int(upsample.upsample.scale_factor), dim=1
                 ),
+                upsample.bias,
                 left_padding=upsample.causal_padding,
             )
             if stage == last_stage:
@@ -209,6 +215,7 @@ class ChannelsLastHiftDecode:
             source = self.conv(
                 source_down,
                 source_spectrum,
+                source_down.bias,
                 left_padding=source_down.causal_padding,
             )
             hidden_states = hidden_states + self.resblock(
@@ -225,8 +232,8 @@ class ChannelsLastHiftDecode:
         hidden_states = self.conv(
             hift.conv_post,
             hidden_states,
+            self.conv_post_bias,
             left_padding=hift.conv_post.causal_padding,
-            bias=self.conv_post_bias,
         )
         magnitude = torch.exp(hidden_states[..., : self.bins]).transpose(1, 2)
         phase = torch.sin(hidden_states[..., self.bins : 2 * self.bins]).transpose(1, 2)
