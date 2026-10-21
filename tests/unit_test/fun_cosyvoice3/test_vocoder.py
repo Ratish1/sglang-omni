@@ -1449,10 +1449,16 @@ def test_sized_prefix_pool_ignores_free_memory(monkeypatch: pytest.MonkeyPatch) 
     )
 
 
-def test_derived_prefix_pool_leaves_the_largest_admitted_step(monkeypatch) -> None:
-    """The derived pool leaves the largest step the scheduler admits, max_batch_size
-    rows at the engine's context length, measured before the pool, plus
-    flow_prefix_cache_reserve_gb."""
+def run_derived_prefix_pool_executor(
+    monkeypatch: pytest.MonkeyPatch, allocator_settings: str
+) -> list[tuple[str, object]]:
+    """The vocoder factory with a derived prefix pool under allocator_settings: the
+    step measurement and the pool build it reaches, in order."""
+    monkeypatch.setattr(
+        torch._C,  # noqa: leading-underscore  # torch's only reader of the settings it parsed
+        "_accelerator_getAllocatorSettings",
+        lambda: allocator_settings,
+    )
     fake_flow = RunnableFakeFlow()
     fake_flow.packed_estimator.is_ragged = True
     flow = stages.FunCosyVoice3Flow(
@@ -1509,11 +1515,31 @@ def test_derived_prefix_pool_leaves_the_largest_admitted_step(monkeypatch) -> No
         flow_batch_admission_frames=3,
         enable_dit_torch_compile=False,
     )
+    return events
 
-    assert events == [
+
+def test_derived_prefix_pool_leaves_the_largest_admitted_step(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The derived pool leaves the largest step the scheduler admits, max_batch_size
+    rows at the engine's context length, measured before the pool, plus
+    flow_prefix_cache_reserve_gb."""
+    assert run_derived_prefix_pool_executor(
+        monkeypatch, "max_split_size_mb:128, expandable_segments: True"
+    ) == [
         ("measure", (4, FunCosyVoice3EngineBuilder.context_length)),
         ("pool", int(4.5 * 2**30)),
     ]
+
+
+@pytest.mark.parametrize(
+    "allocator_settings", ["max_split_size_mb:128", "expandable_segments:False"]
+)
+def test_derived_prefix_pool_needs_expandable_segments(
+    monkeypatch: pytest.MonkeyPatch, allocator_settings: str
+) -> None:
+    with pytest.raises(ValueError, match="flow_prefix_cache_gb"):
+        run_derived_prefix_pool_executor(monkeypatch, allocator_settings)
 
 
 def test_create_vocoder_executor_rejects_non_positive_admission_budget(

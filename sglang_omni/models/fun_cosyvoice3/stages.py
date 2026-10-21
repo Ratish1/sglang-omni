@@ -2507,6 +2507,27 @@ def create_vocoder_executor(
     has_prefix_pool = (
         flow_prefix_cache_gb is None or flow_prefix_cache_gb > 0
     ) and has_ragged_attention
+    if has_prefix_pool and flow_prefix_cache_gb is None:
+        # note (ratish): the derived size's reserve holds each step at its live peak,
+        # which the allocator keeps only with segments that grow in place; torch reads
+        # PYTORCH_CUDA_ALLOC_CONF before the vocoder's PYTORCH_ALLOC_CONF default.
+        allocator_settings = (
+            torch._C._accelerator_getAllocatorSettings()  # noqa: leading-underscore  # torch's only reader of the settings it parsed
+        )
+        is_expandable = any(
+            field.replace(" ", "").lower() == "expandable_segments:true"
+            for field in allocator_settings.split(",")
+        )
+        if not is_expandable:
+            raise ValueError(
+                "flow_prefix_cache_gb=None sizes the Flow prefix cache from free "
+                "memory and needs expandable_segments:True in the allocator "
+                "settings; set flow_prefix_cache_gb to a size in GB instead"
+            )
+        else:
+            pass
+    else:
+        pass
 
     if enable_flow_cuda_graph and not flow.is_buffered_packed:
         capture_shapes = verify_flow_cuda_graph_capture_shapes(
