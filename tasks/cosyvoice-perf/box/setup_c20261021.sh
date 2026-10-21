@@ -12,6 +12,11 @@ cd /workspace/sglang-omni
 git cat-file -e $MAIN^{commit} 2> /dev/null || git fetch -q --depth 50 upstream main
 git checkout -q --detach $MAIN && git log --oneline -1
 uv pip install -q --python "$(command -v python3)" --prerelease=allow -e ".[fun-cosyvoice3]"
+# note (ratish): the 10-21 image carries flashinfer's 0.7.1 cubin and jit cache wheels, which fail every import of
+# the pinned flashinfer 0.6.18 (pyproject.toml's note on the pin).
+uv pip uninstall -q --python "$(command -v python3)" flashinfer-cubin flashinfer-jit-cache flashinfer-jit-cache-sm100a \
+  flashinfer-jit-cache-sm103a flashinfer-jit-cache-sm120f flashinfer-jit-cache-sm80 flashinfer-jit-cache-sm89 \
+  flashinfer-jit-cache-sm90a
 [ -d /workspace/CosyVoice ] || git clone -q --recursive https://github.com/FunAudioLLM/CosyVoice.git /workspace/CosyVoice
 git -C /workspace/CosyVoice checkout -q 074ca6dc9e80a2f424f1f74b48bdd7d3fea531cc
 git -C /workspace/CosyVoice submodule update -q --init --recursive
