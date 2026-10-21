@@ -682,6 +682,32 @@ def test_a_stream_whose_abort_lands_while_the_pump_holds_its_state_gets_nothing(
     assert drain(scheduler) == []
 
 
+def test_a_failed_launch_still_sends_the_step_in_flight_before_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _, scheduler = make_scheduler()
+    log = pending_copies(scheduler, monkeypatch)
+    for request_id in ("req-a", "req-b"):
+        scheduler.handle_streaming_new_request(request_id, stream_payload(request_id))
+    scheduler.ingest_stream_item("req-a", item(list(range(28))))
+    with scheduler.state_lock:
+        assert scheduler.pump_one_step() == []
+
+    def hop_batch(items: list[stages.FlowBatchInput]) -> list[torch.Tensor]:
+        raise RuntimeError("flow failed")
+
+    monkeypatch.setattr(scheduler.vocoder, "hop_batch", hop_batch)
+    scheduler.ingest_stream_item("req-b", item(list(range(28))))
+    with scheduler.state_lock:
+        assert scheduler.pump_one_step() == ["req-b"]
+        assert scheduler.pump_one_step() is None
+    assert sorted((m.request_id, m.type) for m in drain(scheduler)) == [
+        ("req-a", "stream"),
+        ("req-b", "error"),
+    ]
+    assert log == ["launch 1", "read 1"]
+
+
 def test_a_streams_prompt_takes_flows_dtype_at_its_latch_and_keeps_it() -> None:
     _, scheduler = make_scheduler()
     scheduler.handle_streaming_new_request(
