@@ -84,13 +84,19 @@ def main():
                 current = vocoder.hift_step(rows)
                 name = f"graph_{graph_mode}_step_{step}"
                 if pending is not None:
-                    samples = pending.wait() if hasattr(pending, "wait") else pending[0]
+                    samples = (
+                        pending.wait()
+                        if label == "head"
+                        else [row[0] for row in pending]
+                    )
                     stored[pending_name] = [sample.clone() for sample in samples]
                 pending, pending_name = current, name
                 offsets[name] = (
-                    current.emitted_samples if hasattr(current, "wait") else current[1]
+                    current.emitted_samples
+                    if label == "head"
+                    else [row[1] for row in current]
                 )
-            samples = pending.wait() if hasattr(pending, "wait") else pending[0]
+            samples = pending.wait() if label == "head" else [row[0] for row in pending]
             stored[pending_name] = [sample.clone() for sample in samples]
     scheduler.stop()
     torch.save(stored, root / f"{label}.pt")
