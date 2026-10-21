@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import sys
 import types
 
 import numpy as np
@@ -125,7 +124,8 @@ def test_cosyvoice3_reference_encoders_pin_onnx_providers(
         GraphOptimizationLevel=types.SimpleNamespace(ORT_ENABLE_ALL=99),
         InferenceSession=fake_session,
     )
-    monkeypatch.setitem(sys.modules, "onnxruntime", fake_onnxruntime)
+    monkeypatch.setattr(utils, "onnxruntime", fake_onnxruntime)
+    monkeypatch.setattr(utils.current_platform, "is_cuda", lambda: False)
 
     utils.SpeechTokenizerV3("speech_tokenizer_v3.onnx", device="cuda:0")
     utils.SpeechTokenizerV3("speech_tokenizer_v3.onnx", device="cpu")
