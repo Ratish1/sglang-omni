@@ -63,8 +63,11 @@ def main() -> None:
     print(f"| WER below 50 % | {100 * a['wer_under_half']:.2f} % | {100 * b['wer_under_half']:.2f} % | "
           f"{100 * (b['wer_under_half'] - a['wer_under_half']):+.2f} pt |")
     print(f"| samples over 50 % WER | {a['over_half']} | {b['over_half']} | |")
-    print(f"| speaker similarity | {a['similarity']:.2f} | {b['similarity']:.2f} | "
-          f"{b['similarity'] - a['similarity']:+.2f} |")
+    if a["similarity"] is not None and b["similarity"] is not None:
+        print(f"| speaker similarity | {a['similarity']:.2f} | {b['similarity']:.2f} | "
+              f"{b['similarity'] - a['similarity']:+.2f} |")
+    else:
+        print(f"| speaker similarity | {a['similarity']} | {b['similarity']} | unscored arm |")
     print(f"| card memory | {a['memory_mib']:,} MiB | {b['memory_mib']:,} MiB | |")
 
 
