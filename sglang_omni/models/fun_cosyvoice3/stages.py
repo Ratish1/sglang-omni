@@ -1798,11 +1798,16 @@ class CosyVoice3Vocoder(BatchVocoderBase[FunCosyVoice3State, torch.Tensor]):
             )
 
         results: list[tuple[torch.Tensor, int] | None] = [None] * len(items)
-        flow_groups = adaptive_flow_requests_grouping(
-            prepared,
-            flow_merge_max_gap_frames=self.flow_merge_max_gap_frames,
-            flow_merge_pad_budget_percent=self.flow_merge_pad_budget_percent,
-        )
+        if self.flow.is_buffered_packed:
+            # note (ratish): packed rows pay no padding, and every result leaves at the
+            # batch's end, so a split would only add Flow calls.
+            flow_groups = [prepared]
+        else:
+            flow_groups = adaptive_flow_requests_grouping(
+                prepared,
+                flow_merge_max_gap_frames=self.flow_merge_max_gap_frames,
+                flow_merge_pad_budget_percent=self.flow_merge_pad_budget_percent,
+            )
         flow_device = next(self.flow.parameters()).device
         with self.stream_context:
             for flow_group in flow_groups:

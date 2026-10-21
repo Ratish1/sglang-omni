@@ -617,8 +617,14 @@ def test_decode_payload_size_one_uses_batch_adapter(monkeypatch) -> None:
     assert [len(call) for call in batch_calls] == [1]
 
 
+@pytest.mark.parametrize(
+    ("is_buffered_packed", "expected_flow_calls"),
+    [(False, [[24, 25], [50, 51]]), (True, [[50, 24, 51, 25]])],
+)
 def test_decode_batch_merges_flow_preserving_hift_groups_and_order(
-    monkeypatch,
+    monkeypatch: pytest.MonkeyPatch,
+    is_buffered_packed: bool,
+    expected_flow_calls: list[list[int]],
 ) -> None:
     items = [
         (make_state(sample_rate=16003, prompt_tokens=0), make_codes(50, 3)),
@@ -637,16 +643,16 @@ def test_decode_batch_merges_flow_preserving_hift_groups_and_order(
         flow_merge_max_gap_frames=4,
         flow_merge_pad_budget_percent=25,
     )
+    vocoder.flow.is_buffered_packed = is_buffered_packed
     results = asyncio.run(vocoder.decode_batch(items))
     hift_memberships = [
         tuple(int(value) for value in call[0][:, 0, 0].tolist()) for call in hift.calls
     ]
 
     assert [sample_rate for _, sample_rate in results] == [16003, 16001, 16004, 16002]
-    assert [[item.token.shape[1] for item in call] for call in flow_calls] == [
-        [24, 25],
-        [50, 51],
-    ]
+    assert [
+        [item.token.shape[1] for item in call] for call in flow_calls
+    ] == expected_flow_calls
     # Mel lengths 48/50 vs 100/102 exceed default HiFT waste=1.5, so HiFT
     # keeps the same cut Flow already made. Result order is still original.
     assert hift_memberships == [(1, 2), (3, 4)]
