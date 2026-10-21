@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
-"""HiFT's decode over channels-last activations: cuDNN's NHWC convolution engines without
-their layout transposes, each conv's bias, residual, activation and causal padding in the
-kernel that writes the next conv's input, as the object the vocoder installs in place of
-the module's decode."""
+"""HiFT's decode over channels-last activations: cuDNN's NHWC convolution engines
+without their layout transposes, each conv's bias, residual, activation and causal
+padding in the kernel that writes the next conv's input, as the object the vocoder
+installs in place of the module's decode."""
 
 from __future__ import annotations
 
@@ -26,7 +26,7 @@ from sglang_omni.utils.channels_last_conv import (
 )
 
 # note (ratish): cuDNN runs the spectrum's n_fft + 2 channels on slow engines; zero
-# padded to a multiple of eight they take its fast ones (a multiple of four measures the same).
+# padded to a multiple of eight, or of four, they take its fast ones.
 CHANNEL_ALIGNMENT = 8
 # note (ratish): CosyVoice's decode runs its last leaky relu at torch's default slope.
 CONV_POST_LEAKY_RELU_SLOPE = 0.01
@@ -91,7 +91,8 @@ class ChannelsLastHiftDecode:
         self.forward_basis = (
             torch.cat([torch.cos(angle), -torch.sin(angle)]) * window
         ).float()
-        # note (ratish): a one sided inverse counts the bins between DC and Nyquist twice.
+        # note (ratish): a one sided inverse counts the bins between DC and Nyquist
+        # twice.
         one_sided = torch.full((self.bins, 1), 2.0, device=device, dtype=torch.float64)
         one_sided[0] = 1.0
         one_sided[-1] = 1.0
@@ -103,8 +104,8 @@ class ChannelsLastHiftDecode:
         self.squared_window = hift.stft_window.to(device).pow(2)
 
     def spectrum(self, signal: torch.Tensor) -> torch.Tensor:
-        """The centered short time spectrum of (rows, samples): (rows, 2 * bins, frames),
-        the real parts then the imaginary parts."""
+        """The centered short time spectrum of (rows, samples): (rows, 2 * bins,
+        frames), the real parts then the imaginary parts."""
         half = self.n_fft // 2
         padded_signal = F.pad(signal[:, None], (half, half), mode="reflect")[
             :, 0
@@ -123,7 +124,8 @@ class ChannelsLastHiftDecode:
         )
 
     def source_down(self, stage: int, source_spectrum: torch.Tensor) -> torch.Tensor:
-        """The stage's downsampling conv of the (rows, frames, channels) source spectrum."""
+        """The stage's downsampling conv of the source spectrum, (rows, frames,
+        channels)."""
         module = self.hift.source_downs[stage]
         frames = source_spectrum.shape[1]
         left_padding = module.causal_padding

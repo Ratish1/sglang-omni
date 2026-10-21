@@ -1,9 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
-"""HiFT's conv epilogues over channels-last activations, its short time Fourier transform
-and the inverse as Triton kernels. An epilogue writes the next conv's zero padded input in
-one pass and equals the eager chain it replaces bit for bit, its Snake CosyVoice's; the
-transforms match torch.stft and torch.istft to float32 rounding with one fixed sum order
-per output, so a row's result does not follow its batch."""
+"""HiFT's conv epilogues over channels-last activations, its short time Fourier
+transform and the inverse as Triton kernels. An epilogue writes the next conv's zero
+padded input in one pass and equals the eager chain it replaces bit for bit, its Snake
+CosyVoice's; the transforms match torch.stft and torch.istft to float32 rounding with
+one fixed sum order per output, so a row's result does not follow its batch."""
 
 from __future__ import annotations
 

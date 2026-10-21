@@ -15,15 +15,16 @@ def is_channels_last_conv_device(device: torch.device) -> bool:
 
 
 def channels_last_strides(weight: torch.Tensor) -> torch.Tensor:
-    """A (C_out, C_in, k) weight with channels-last strides, the layout the channels-last
-    convs hand to cuDNN without reformatting it."""
+    """A (C_out, C_in, k) weight with channels-last strides, the layout the
+    channels-last convs hand to cuDNN without reformatting it."""
     return weight.transpose(1, 2).contiguous().transpose(1, 2)
 
 
 def channels_last_weight(
     conv: torch.nn.Conv1d | torch.nn.ConvTranspose1d,
 ) -> torch.Tensor:
-    """The conv's weight with channels-last strides; the module's weight is left as is."""
+    """The conv's weight with channels-last strides; the module's weight is left as
+    is."""
     return channels_last_strides(conv.weight.data)
 
 
