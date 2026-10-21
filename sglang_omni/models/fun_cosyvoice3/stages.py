@@ -2371,7 +2371,6 @@ def create_vocoder_executor(
     flow_merge_max_gap_frames: int = 384,
     flow_merge_pad_budget_percent: float = 25.0,
     enable_dit_torch_compile: bool = True,
-    enable_buffered_packed_flow: bool = True,
     enable_flow_cuda_graph: bool = True,
     enable_flow_prefix_cuda_graph: bool,
     enable_flow_whole_history_cuda_graph: bool,
@@ -2438,9 +2437,7 @@ def create_vocoder_executor(
         and flow.packed_estimator.is_ragged
         and autocast_dtype in FA3_DTYPES
     )
-    flow.enable_buffered_packed_flow = (
-        enable_buffered_packed_flow and has_ragged_attention
-    )
+    flow.enable_buffered_packed_flow = has_ragged_attention
     if enable_flow_cuda_graph and (
         not supports_device_streams(device_obj)
         or current_platform.get_device_graph_backend(device_obj) is None
