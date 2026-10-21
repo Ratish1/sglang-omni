@@ -28,7 +28,8 @@ def source_for(hift, mel):
 
 
 def compare(first_path, second_path):
-    first, second = torch.load(first_path), torch.load(second_path)
+    # note (ratish): files this probe wrote; the identity holds a TorchVersion, which the weights-only loader refuses.
+    first, second = torch.load(first_path, weights_only=False), torch.load(second_path, weights_only=False)
     print(f"A {first['identity']}\nB {second['identity']}")
     for case in first["outputs"]:
         a, b = first["outputs"][case], second["outputs"][case]
