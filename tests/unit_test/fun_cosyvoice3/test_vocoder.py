@@ -1174,7 +1174,7 @@ def test_create_vocoder_executor_packs_buffered_flow_only_on_ragged_attention(
         enable_flow_estimator_trt=enable_flow_estimator_trt,
     )
 
-    assert scheduler.vocoder.flow.enable_buffered_packed_flow is is_buffered_packed
+    assert scheduler.vocoder.flow.is_buffered_packed is is_buffered_packed
 
 
 @pytest.mark.parametrize("is_ragged", [False, True])
@@ -1293,7 +1293,7 @@ def test_create_vocoder_executor_fa3_eligibility_controls_prefix_and_whole_histo
         enable_dit_torch_compile=False,
     )
 
-    assert scheduler.vocoder.flow.enable_buffered_packed_flow is is_ragged
+    assert scheduler.vocoder.flow.is_buffered_packed is is_ragged
     if is_ragged:
         assert len(pool_calls) == 1
         assert pool_calls[0] == (

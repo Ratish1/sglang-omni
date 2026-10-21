@@ -268,8 +268,8 @@ def test_buffered_flow_route_is_explicit_and_preserves_split_order(
 ) -> None:
     flow = FakeFlow(max_frames=128)
     packed_flow = FunCosyVoice3Flow(flow, packed_estimator=flow.packed_estimator)
-    assert packed_flow.enable_buffered_packed_flow is False
-    packed_flow.enable_buffered_packed_flow = enable_buffered_packed_flow
+    assert packed_flow.is_buffered_packed is False
+    packed_flow.is_buffered_packed = enable_buffered_packed_flow
     items = [
         make_input([1], prompt_token=[2], prompt_value=0.5),
         make_input([3, 4], prompt_token=[5, 6], prompt_value=1.5),
@@ -302,7 +302,7 @@ def test_buffered_packed_flow_inference_uses_packed_eager_without_native_retry(
 ) -> None:
     flow = FakeFlow(max_frames=128)
     packed_flow = FunCosyVoice3Flow(flow, packed_estimator=flow.packed_estimator)
-    packed_flow.enable_buffered_packed_flow = True
+    packed_flow.is_buffered_packed = True
     assert flow.packed_estimator.is_compiled is False
 
     graph_runner: Mock | None = None
@@ -345,7 +345,7 @@ def test_buffered_packed_flow_inference_replays_whole_history_graph(
 ) -> None:
     flow = FakeFlow(max_frames=128)
     packed_flow = FunCosyVoice3Flow(flow, packed_estimator=flow.packed_estimator)
-    packed_flow.enable_buffered_packed_flow = True
+    packed_flow.is_buffered_packed = True
 
     class GraphHit:
         def __init__(self) -> None:

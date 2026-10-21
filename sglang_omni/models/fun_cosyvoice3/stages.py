@@ -914,7 +914,7 @@ class FunCosyVoice3Flow:
         # note(ratish): the eager DiT over packed rows; None with the TensorRT
         # estimator, whose fixed (2, 80, T) profile keeps the padded layout.
         self.packed_estimator = packed_estimator
-        self.enable_buffered_packed_flow = False
+        self.is_buffered_packed = False
         self.prefix_pool: PrefixKVPool | None = None
         self.prefix_cuda_graph_runner: PrefixCudaGraphRunner | None = None
         self.whole_history_cuda_graph_runner: WholeHistoryCudaGraphRunner | None = None
@@ -958,7 +958,7 @@ class FunCosyVoice3Flow:
 
     @torch.inference_mode()
     def inference(self, inputs: Sequence[FlowBatchInput]) -> list[torch.Tensor]:
-        if self.enable_buffered_packed_flow:
+        if self.is_buffered_packed:
             return self.inference_leftover(inputs)
         else:
             pass
@@ -2437,7 +2437,7 @@ def create_vocoder_executor(
         and flow.packed_estimator.is_ragged
         and autocast_dtype in FA3_DTYPES
     )
-    flow.enable_buffered_packed_flow = has_ragged_attention
+    flow.is_buffered_packed = has_ragged_attention
     if enable_flow_cuda_graph and (
         not supports_device_streams(device_obj)
         or current_platform.get_device_graph_backend(device_obj) is None
