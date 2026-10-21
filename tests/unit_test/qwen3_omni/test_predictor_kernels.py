@@ -86,18 +86,20 @@ def norm_with_random_scale(device: torch.device, size: int) -> RMSNorm:
     return norm
 
 
-def build_layer(device: torch.device) -> SimpleNamespace:
+def build_layer(
+    device: torch.device, num_kv_heads: int = NUM_KV_HEADS
+) -> SimpleNamespace:
     attention = SimpleNamespace(
         hidden_size=HIDDEN,
         q_size=NUM_HEADS * HEAD_DIM,
-        kv_size=NUM_KV_HEADS * HEAD_DIM,
+        kv_size=num_kv_heads * HEAD_DIM,
         num_heads=NUM_HEADS,
-        num_kv_heads=NUM_KV_HEADS,
+        num_kv_heads=num_kv_heads,
         head_dim=HEAD_DIM,
         q_norm=norm_with_random_scale(device, HEAD_DIM),
         k_norm=norm_with_random_scale(device, HEAD_DIM),
         alt_stream=None,
-        qkv_proj=PlainLinear(HIDDEN, (NUM_HEADS + 2 * NUM_KV_HEADS) * HEAD_DIM).to(
+        qkv_proj=PlainLinear(HIDDEN, (NUM_HEADS + 2 * num_kv_heads) * HEAD_DIM).to(
             device, DTYPE
         ),
         o_proj=PlainLinear(NUM_HEADS * HEAD_DIM, HIDDEN).to(device, DTYPE),
@@ -519,6 +521,22 @@ def test_resolver_keeps_the_plain_path_for_a_partitioned_projection() -> None:
     )
 
 
+@accelerator
+@pytest.mark.accelerator
+@pytest.mark.parametrize(("num_kv_heads", "is_fused"), [(2, True), (1, False)])
+def test_resolver_fuses_only_where_the_opening_pair_fits_one_attention_tile(
+    num_kv_heads: int, is_fused: bool
+) -> None:
+    """Fused only where the opening pair's two tokens by a kv head's q heads fit the
+    16-row attention tile; more rows would leave the pair's second token unwritten."""
+    device = torch.device("cuda")
+    code_predictor = SimpleNamespace(
+        model=SimpleNamespace(layers=[build_layer(device, num_kv_heads)])
+    )
+    shape = resolve_predictor_layer_shape(code_predictor, PREDICTOR_LEN, device)
+    assert (shape is not None) is is_fused
+
+
 def test_without_triton_the_predictor_keeps_the_plain_path(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -627,9 +645,12 @@ def test_codebook_step_matches_argmax_gather_and_add() -> None:
 
 @accelerator
 @pytest.mark.accelerator
-@pytest.mark.parametrize(("tokens_per_row", "cache_len"), [(2, 0), (1, 9)])
+@pytest.mark.parametrize(
+    ("tokens_per_row", "cache_len", "num_kv_heads"),
+    [(2, 0, NUM_KV_HEADS), (1, 9, NUM_KV_HEADS), (2, 0, 2)],
+)
 def test_decode_attention_tracks_fp32_and_reads_no_slot_past_a_rows_position(
-    tokens_per_row: int, cache_len: int
+    tokens_per_row: int, cache_len: int, num_kv_heads: int
 ) -> None:
     device = torch.device("cuda")
     generator = torch.Generator(device=device).manual_seed(34)
@@ -641,7 +662,7 @@ def test_decode_attention_tracks_fp32_and_reads_no_slot_past_a_rows_position(
         device=device,
         generator=generator,
     ).to(DTYPE)
-    cache_shape = (row_groups, PREDICTOR_LEN, NUM_KV_HEADS, HEAD_DIM)
+    cache_shape = (row_groups, PREDICTOR_LEN, num_kv_heads, HEAD_DIM)
     k_cache = torch.randn(cache_shape, device=device, generator=generator).to(DTYPE)
     v_cache = torch.randn(cache_shape, device=device, generator=generator).to(DTYPE)
     k_cache[:, end:] = float("nan")
@@ -658,7 +679,7 @@ def test_decode_attention_tracks_fp32_and_reads_no_slot_past_a_rows_position(
             hidden_size=HIDDEN,
             head_dim=HEAD_DIM,
             num_q_heads=NUM_HEADS,
-            num_kv_heads=NUM_KV_HEADS,
+            num_kv_heads=num_kv_heads,
             intermediate_size=INTERMEDIATE,
             split_qkv=1,
             split_hidden=1,
