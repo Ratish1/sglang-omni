@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
 # 10-22, cards 0 and 1, after queue rescore: the final test's quality rows that read worse in both orders (c1f WER and
-# SIM, b1f WER, b16 SIM), powered. First t_l5b (the chain at L5, 4eb6e93e7) against t_chain, seeded b1f and c1f under
-# two seeds: whether L6, the shared prefix graph inputs and the tokenizer's event leave the audio byte identical (the
-# pair is scored only if not). Then four pairs of t_m1b against t_chain, each order its own seed for c1f and b1f, and
+# SIM, b1f WER, b16 SIM), powered. First two identity pairs, seeded b1f and c1f under two seeds, each scored only if
+# not byte identical: t_l3n (L3 alone, b3a463231) against t_l4b (L2, L3, L4, 4f3ba8bd9), whether L2 and L4 leave the
+# audio of both vocoder routes byte identical (the chain's buffered audio read 0.31 SIM nearer its streaming audio of
+# the same tokens than main's in the final test); t_l5b (the chain at L5, 4eb6e93e7) against t_chain, the same for L6,
+# the shared prefix graph inputs and the tokenizer's event. Then four pairs of t_m1b against t_chain, each order its own seed for c1f and b1f, and
 # c16 and b16, every arm scored: nine seeded draws of c1f and b1f and ten of c16 and b16 with the final test's. The
 # draws reader runs after every pair.
 # usage (in the container): setsid bash -c 'echo $$ > /data/c20261022b/queue_quality.pgid; exec bash /workspace/t_marks/tasks/cosyvoice-perf/box/profile_c20261022/queue_quality.sh'
@@ -25,7 +27,9 @@ tree() {
   fi
   log "tree $name $(git -C /workspace/$name log --oneline -1 | cut -c1-60) sglang_omni $(git -C /workspace/$name rev-parse HEAD:sglang_omni | cut -c1-8) $(git -C /workspace/$name diff --quiet HEAD -- sglang_omni || echo DIRTY)"
 }
-git -C /workspace/sglang-omni fetch -q origin perf/cosyvoice3-items-chain
+git -C /workspace/sglang-omni fetch -q origin perf/cosyvoice3-items-chain perf/cosyvoice3-speech-tokenizer-cuda-graphs
+tree t_l3n b3a463231
+tree t_l4b 4f3ba8bd9
 tree t_l5b 4eb6e93e7
 log "queue quality start t_marks $(git -C /workspace/t_marks rev-parse --short HEAD) t_m1b $(git -C /workspace/t_m1b rev-parse --short HEAD) t_chain $(git -C /workspace/t_chain rev-parse --short HEAD) loadavg $(cut -d' ' -f1-3 /proc/loadavg)"
 pair() {
@@ -60,13 +64,18 @@ score_pair() {
     done
   done
 }
-pair t_l5b t_chain p_id b1f,c1f b1f_s2,c1f_s2
-python3 $HERE/identity.py $Q/p_id > $Q/identity_p_id.txt 2>&1
-log "identity $(tr '\n' ';' < $Q/identity_p_id.txt)"
-if awk '{ if ($5 + 0 != $9 + 0 || $9 + 0 != $12 + 0) bad = 1 } END { exit !bad }' $Q/identity_p_id.txt; then
-  log "p_id not byte identical, scoring it"
-  score_pair p_id
-fi
+identity_pair() {
+  local first=$1 second=$2 name=$3
+  pair $first $second $name b1f,c1f b1f_s2,c1f_s2
+  python3 $HERE/identity.py $Q/$name > $Q/identity_$name.txt 2>&1
+  log "identity $(tr '\n' ';' < $Q/identity_$name.txt)"
+  if awk '{ if ($5 + 0 != $9 + 0 || $9 + 0 != $12 + 0) bad = 1 } END { exit !bad }' $Q/identity_$name.txt; then
+    log "$name not byte identical, scoring it"
+    score_pair $name
+  fi
+}
+identity_pair t_l3n t_l4b p_id1
+identity_pair t_l5b t_chain p_id2
 pairs="final/p_f1 final/p_q1 final/p_q2 final/p_q3"
 seed=10
 for name in p_w1 p_w2 p_w3 p_w4; do
