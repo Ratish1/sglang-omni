@@ -46,6 +46,7 @@ print(f"{{after > before}} {{(used_after - used_before) / 2**20:.0f}}")
 
 
 def main() -> None:
+    # note (ratish): run under PYTHONPATH=hop_probe OMNI_BIND_THREAD_DEVICE=1 to check the binding what-if on each case
     for name, body in CASES.items():
         result = subprocess.run([sys.executable, "-c", CHILD.format(body=body)], capture_output=True, text=True,
                                 timeout=300)

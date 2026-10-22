@@ -25,6 +25,10 @@ import threading
 import time
 
 PREFIX = os.environ.get("OMNI_HOP_PROBE", "")
+# what-if, not a probe: OMNI_BIND_THREAD_DEVICE=1 makes every new thread bind the CUDA device its creator had current,
+# as the stage scheduler thread does (pipeline/stage/runtime.py:278), to check that unbound workers cause the context
+# a stage process placed off device 0 opens on device 0
+BIND_THREAD_DEVICE = os.environ.get("OMNI_BIND_THREAD_DEVICE") == "1"
 LAG_PERIOD_S = 0.005
 LAG_REPORT_S = 0.002
 
@@ -200,6 +204,29 @@ def patch_coordinator(module):
     coordinator.run_completion_loop = run_sampled
 
 
+def bind_thread_device():
+    """New threads set the CUDA device that was current in the creating thread before their target runs."""
+    start, run = threading.Thread.start, threading.Thread.run
+
+    def start_capturing(self, *args, **kwargs):
+        torch = sys.modules.get("torch")
+        if torch is not None and torch.cuda.is_initialized():
+            self.bound_device = torch.cuda.current_device()
+        else:
+            pass
+        return start(self, *args, **kwargs)
+
+    def run_bound(self, *args, **kwargs):
+        device = getattr(self, "bound_device", None)
+        if device is not None:
+            sys.modules["torch"].cuda.set_device(device)
+        else:
+            pass
+        return run(self, *args, **kwargs)
+
+    threading.Thread.start, threading.Thread.run = start_capturing, run_bound
+
+
 PATCHES = {
     "sglang_omni.pipeline.stage.runtime": patch_runtime,
     "sglang_omni.scheduling.omni_scheduler": patch_put_messages,
@@ -239,5 +266,10 @@ if PREFIX:
     threading.Thread(target=flush_forever, name="hop-probe-flush", daemon=True).start()
     atexit.register(flush)
     print(f"hop_probe on, prefix {PREFIX}", file=sys.stderr, flush=True)
+else:
+    pass
+if BIND_THREAD_DEVICE:
+    bind_thread_device()
+    print("hop_probe what-if: new threads bind their creator's CUDA device", file=sys.stderr, flush=True)
 else:
     pass

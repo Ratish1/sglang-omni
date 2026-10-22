@@ -232,6 +232,7 @@ def main() -> None:
     parser.add_argument("--serve-extra", default="")
     parser.add_argument("--probe", action="store_true",
                         help="boot with hop_probe (queue hops, loop lag, GC) writing to <out>/probe/p.<pid>.jsonl")
+    parser.add_argument("--serve-env", default="", help="KEY=VALUE pairs for the server only")
     args = parser.parse_args()
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
@@ -243,6 +244,7 @@ def main() -> None:
                    OMNI_HOP_PROBE=str(out / "probe" / "p"))
     else:
         pass
+    env.update(item.split("=", 1) for item in shlex.split(args.serve_env))
     identity = subprocess.run(
         "git rev-parse HEAD HEAD:sglang_omni; git diff --quiet HEAD -- sglang_omni || echo WORKING_TREE_DIRTY",
         shell=True, cwd=TREE, capture_output=True, text=True,
@@ -259,7 +261,7 @@ def main() -> None:
     ]
     (out / "identity.txt").write_text(
         f"tree {TREE}\n{identity}imports {imported}serve {shlex.join(serve)}\npythonpath {env['PYTHONPATH']}\n"
-        f"loadavg {os.getloadavg()}\n",
+        f"serve env {args.serve_env}\nloadavg {os.getloadavg()}\n",
         encoding="utf-8",
     )
     spawned = time.monotonic()
