@@ -223,7 +223,7 @@ def pyspy_summary(cell: Path, top: int) -> None:
     ticks = meta["rate"] * meta["duration"]
     for path in sorted(cell.glob("pyspy_*.txt")):
         threads = collections.defaultdict(lambda: [0, collections.Counter()])
-        for line in path.open():
+        for line in path.open(errors="replace"):
             stack, _, count = line.rstrip("\n").rpartition(" ")
             if not count.isdigit():
                 continue
