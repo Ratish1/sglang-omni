@@ -277,45 +277,14 @@ class SpeechTokenizerCudaGraphs:
         # note (ratish): TF32 matmuls, as ONNX Runtime ran this graph; full fp32 took
         # 2.6 times the device time. The graphs keep the math mode they are captured
         # with, and the process keeps its own.
-        allow_tf32 = torch.backends.cuda.matmul.allow_tf32
-        torch.backends.cuda.matmul.allow_tf32 = True
-        try:
-            with torch.inference_mode(), freeze_gc(enable_cudagraph_gc=False):
-                for width in reversed(self.widths):
-                    mel = torch.zeros(1, model.conv1.in_channels, width, device=device)
-                    frames = torch.full((1,), width, dtype=torch.int64, device=device)
-                    self.stream.wait_stream(torch.cuda.current_stream(device))
-                    with torch.cuda.stream(self.stream):
-                        for _ in range(2):
-                            model(mel, frames)
-                    graph = torch.cuda.CUDAGraph()
-                    with torch.cuda.graph(
-                        graph,
-                        pool=pool,
-                        stream=self.stream,
-                        capture_error_mode="thread_local",
-                    ):
-                        codes = model(mel, frames)
-                    self.graphs[width] = CapturedTokenizerGraph(
-                        graph=graph, mel=mel, frames=frames, codes=codes
-                    )
-        finally:
-            torch.backends.cuda.matmul.allow_tf32 = allow_tf32
-        torch.cuda.synchronize(device)
+        self.device = device
+        del pool
 
     def tokenize(self, mel: torch.Tensor) -> list[int]:
-        """Codes of a CPU mel (1, mels, frames) of at most MAX_FRAMES frames."""
+        """Codes of a CPU mel (1, mels, frames), the model run eagerly (measurement only)."""
         frames = mel.shape[2]
-        captured = self.graphs[self.widths[bisect.bisect_left(self.widths, frames)]]
-        # note (ratish): pageable copies wait for the replay inside the copy call, and
-        # the AR's and the vocoder's CUDA calls in this process wait with them, so the
-        # copies go through pinned memory and the caller waits on an event.
         with self.lock, torch.inference_mode(), torch.cuda.stream(self.stream):
-            captured.mel[:, :, :frames].copy_(mel.pin_memory(), non_blocking=True)
-            captured.frames.fill_(frames)
-            captured.graph.replay()
-            codes = async_d2h(captured.codes[0, : conv_frames(conv_frames(frames))])
-            copy_done = torch.cuda.Event()
-            copy_done.record()
-        copy_done.synchronize()
-        return codes.tolist()
+            codes = self.model(
+                mel.to(self.device), torch.tensor([frames], device=self.device)
+            )
+            return codes[0, : conv_frames(conv_frames(frames))].tolist()
