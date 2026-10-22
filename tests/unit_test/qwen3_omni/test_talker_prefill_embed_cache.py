@@ -171,21 +171,36 @@ def test_multimodal_prompt_uses_captured_thinker_states(prompt_builder):
     )
 
 
-@pytest.mark.parametrize("positions", [None, [2, 3, 6]])
-def test_multimodal_prompt_rejects_missing_or_wrong_capture(prompt_builder, positions):
-    metadata = {"token_id": 20}
-    if positions is not None:
-        metadata["prompt_hidden_positions"] = positions
+def test_prompt_rows_at_other_than_the_multimodal_rows_are_rejected(prompt_builder):
     chunk = StreamItem(
         chunk_id=0,
         from_stage="thinker",
         data=torch.ones((3, HIDDEN)),
-        metadata=metadata,
+        metadata={"token_id": 20, "prompt_hidden_positions": [2, 3, 6]},
     )
-    with pytest.raises(
-        (ValueError, RuntimeError), match="(?i)(prompt|hidden|position|capture)"
-    ):
+    with pytest.raises(ValueError, match="multimodal rows"):
         build_streamed_prompt(prompt_builder, [1, 2, 3, 4, 5, 8, 9, 1, 6, 7], [chunk])
+
+
+def test_a_session_turn_without_prompt_rows_keeps_zeros_at_multimodal_rows(
+    prompt_builder,
+):
+    prompt_ids = [1, 2, 3, 4, 5, 8, 9, 1, 6, 7]
+    chunk = StreamItem(
+        chunk_id=0,
+        from_stage="thinker",
+        data=torch.tensor([20]),
+        metadata={"token_id": 20},
+    )
+    result = build_streamed_prompt(prompt_builder, prompt_ids, [chunk])
+    expected_user = (
+        torch.arange(VOCAB * HIDDEN, dtype=torch.float32).reshape(VOCAB, HIDDEN)[
+            prompt_ids[:7]
+        ]
+        * 2
+    )
+    expected_user[2:5] = 100.0
+    torch.testing.assert_close(result["input_embeds"][:7], expected_user)
 
 
 def test_text_prompt_needs_only_streamed_token_ids(prompt_builder):

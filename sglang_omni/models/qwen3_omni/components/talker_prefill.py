@@ -197,41 +197,24 @@ class TalkerPrefillBuilder:
         assistant_embed = self.load_prompt_token_embeddings(assistant_token_ids)
 
         thinker_input_ids = torch.cat([prompt_ids, assistant_token_ids], dim=0)
-        multimodal_mask = self.build_multimodal_mask(thinker_input_ids)
         thinker_embed = torch.cat([prompt_embed, assistant_embed], dim=0)
+        multimodal_mask = self.build_multimodal_mask(thinker_input_ids)
         prompt_hidden = torch.zeros_like(prompt_embed)
-        required_positions = [
-            position
-            for position, token_id in enumerate(prompt_ids.tolist())
-            if token_id
-            in (self.audio_token_id, self.image_token_id, self.video_token_id)
-        ]
-        if required_positions:
-            prompt_chunk = thinker_chunks[0]
-            captured_positions = (prompt_chunk.metadata or {}).get(
-                "prompt_hidden_positions"
-            )
-            if (
-                not isinstance(captured_positions, list)
-                or any(type(position) is not int for position in captured_positions)
-                or captured_positions != required_positions
-            ):
+        prompt_chunk = thinker_chunks[0]
+        captured_positions = (prompt_chunk.metadata or {}).get(
+            "prompt_hidden_positions"
+        )
+        # note (ratish): a session turn reuses its slot's KV and sends no prompt rows, so it
+        # keeps zeros at the multimodal rows, the only prompt rows the hidden is read at.
+        if captured_positions is not None:
+            prompt_mask = multimodal_mask[: prompt_ids.shape[0]]
+            if captured_positions != prompt_mask.nonzero(as_tuple=True)[0].tolist():
                 raise ValueError(
-                    "Missing or misaligned multimodal prompt hidden positions"
+                    "the thinker's prompt hidden rows are not the prompt's multimodal rows"
                 )
             else:
                 pass
-            captured_states = prompt_chunk.data
-            if (
-                not isinstance(captured_states, torch.Tensor)
-                or captured_states.shape
-                != (len(required_positions), prompt_embed.shape[1])
-                or not torch.is_floating_point(captured_states)
-            ):
-                raise ValueError("Invalid multimodal prompt hidden state dimensions")
-            else:
-                pass
-            prompt_hidden[required_positions] = captured_states.to(prompt_hidden)
+            prompt_hidden[captured_positions] = prompt_chunk.data.to(prompt_hidden)
         else:
             pass
         thinker_hidden = torch.cat([prompt_hidden, assistant_embed], dim=0)
