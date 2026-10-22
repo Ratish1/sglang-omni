@@ -1,7 +1,7 @@
 """Arms on the H200 box's one card, round by round (two cards: same-time pairs, then swapped).
 
 Run on the box from the box branch's worktree: python3 /workspace/box/tasks/pr2800_review/box/pair_check.py
-    --out /data/pr2800/<run> --rounds upn@0,s3z@1;s3z@0,upn@1
+    --out /data/pr2800/<run> --rounds upn@0,s3z@1;s3z@0,upn@1   (one card: upn@0>s3z@0;s3z@0>upn@0)
 Every tree is fetched from its remote by full commit into its own worktree; nothing comes from a copy.
 Each server is the cookbook's colocated bf16 H100 command (examples/configs/qwen3_omni_colocated_h100_bf16.yaml,
 the TTS CI's profile, its engine settings kept on the H200) on one card, pinned to eight cores of the card's NUMA
@@ -301,13 +301,16 @@ def server_log_facts(log_path: Path) -> dict[str, object]:
     }
 
 
-def run_arm(out: Path, round_index: int, card: int, arm: str, with_c1: bool) -> dict[str, object]:
+def run_arm(
+    out: Path, round_index: int, card: int, arm: str, with_c1: bool, position: int = 0
+) -> dict[str, object]:
     tree_name, extra, leading = ARMS[arm]
     tree_path = tree(tree_name)
     boot_dir = out / f"r{round_index}_card{card}_{arm}"
     boot_dir.mkdir(parents=True, exist_ok=True)
     head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=tree_path, capture_output=True, text=True).stdout.strip()
-    port = SERVER_PORT + 1000 * round_index + 200 * card
+    # note (ratish): a server also binds its port plus 100, so a card's second arm in a round starts 50 above.
+    port = SERVER_PORT + 1000 * round_index + 200 * card + 50 * position
     serve_args = ["--config", CONFIG, "--colocate", *extra]
     (boot_dir / "serve_args.txt").write_text(f"{head}\n{' '.join(serve_args)}\n")
     log(out, f"round {round_index} card {card} {arm} {head[:9]} start, load {open('/proc/loadavg').read().strip()}")
@@ -401,7 +404,8 @@ def main() -> None:
     global PASSES, BENCH_TREE
     parser = argparse.ArgumentParser()
     parser.add_argument("--out", type=Path, required=True)
-    parser.add_argument("--rounds", help="rounds separated by ';', each 'arm@card,arm@card'")
+    parser.add_argument("--rounds", help="rounds separated by ';', each 'arm@card,arm@card' at once or "
+                                         "'arm@card>arm@card' one after another")
     parser.add_argument("--no-score", action="store_true", help="speed only: delete the audio, score nothing")
     parser.add_argument("--score-only", action="store_true", help="score the c16 passes of <out>/summary.json")
     parser.add_argument("--score-card", type=int, default=0, help="the card the ASR server and SIM run on")
@@ -430,7 +434,12 @@ def main() -> None:
         pass
     # note (ratish): an arm missing from ARMS fails its boot in every round while the other arm runs alone, which
     # leaves a one-armed run; refuse it before any server starts.
-    unknown_arms = {entry.split("@")[0] for round_spec in args.rounds.split(";") for entry in round_spec.split(",")}
+    unknown_arms = {
+        entry.split("@")[0]
+        for round_spec in args.rounds.split(";")
+        for chain in round_spec.split(",")
+        for entry in chain.split(">")
+    }
     unknown_arms -= ARMS.keys()
     if unknown_arms:
         parser.error(f"arms not in ARMS: {sorted(unknown_arms)}")
@@ -441,19 +450,29 @@ def main() -> None:
     seen_arms: set[str] = set()
     records: list[dict[str, object]] = []
     for round_index, round_spec in enumerate(args.rounds.split(";"), start=1):
-        placements = [(arm, int(card)) for arm, card in (entry.split("@") for entry in round_spec.split(","))]
-        with ThreadPoolExecutor(max_workers=len(placements)) as pool:
-            futures = {
-                arm: pool.submit(run_arm, out, round_index, card, arm, args.c1_every_round or arm not in seen_arms)
-                for arm, card in placements
-            }
-        for arm, card in placements:
-            try:
-                records.append(futures[arm].result())
-            except Exception as error:  # noqa: BLE001 a failed boot is recorded and the run goes on
-                records.append({"arm": arm, "card": card, "round": round_index, "error": repr(error), "passes": {}})
-                log(out, f"round {round_index} card {card} {arm} failed: {error!r}")
-            seen_arms.add(arm)
+        # note (ratish): arms joined by '>' run one after another on their card, each on its own ports, so one card
+        # holds a round's pair for the readers that pair arms within a round.
+        chains = [
+            [(arm, int(card)) for arm, card in (entry.split("@") for entry in chain.split(">"))]
+            for chain in round_spec.split(",")
+        ]
+        with_c1 = {arm: args.c1_every_round or arm not in seen_arms for chain in chains for arm, _ in chain}
+
+        def run_chain(chain: list[tuple[str, int]]) -> list[dict[str, object]]:
+            chain_records = []
+            for position, (arm, card) in enumerate(chain):
+                try:
+                    chain_records.append(run_arm(out, round_index, card, arm, with_c1[arm], position))
+                except Exception as error:  # noqa: BLE001 a failed boot is recorded and the run goes on
+                    chain_records.append(
+                        {"arm": arm, "card": card, "round": round_index, "error": repr(error), "passes": {}})
+                    log(out, f"round {round_index} card {card} {arm} failed: {error!r}")
+            return chain_records
+
+        with ThreadPoolExecutor(max_workers=len(chains)) as pool:
+            for chain_records in pool.map(run_chain, chains):
+                records.extend(chain_records)
+        seen_arms.update(arm for chain in chains for arm, _ in chain)
         (out / "summary.json").write_text(json.dumps(records, indent=1))
     if args.no_score:
         for wav in out.rglob("*.wav"):
