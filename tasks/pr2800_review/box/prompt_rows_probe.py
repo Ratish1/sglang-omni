@@ -6,7 +6,8 @@ Card 0 serves the arm with prompt_rows/sitecustomize.py on PYTHONPATH, which rec
 receives. The first SAMPLES mmsu-ci-2000 requests go one at a time with the CI's talker prompt, text and audio,
 greedy, MAX_TOKENS tokens (the talker's prompt prefill comes with the first). With --records the serving is skipped and
 that dump is read. Card 1 then runs HF's thinker in fp32 (the truth) and in bf16 (the floor) on each request's own
-prompt ids with HF's audio features, and reads hidden_states[accept_hidden_layer] at the multimodal positions. Per
+prompt ids with HF's audio features (the audio loaded by librosa, or with --omni-audio by the server's own loader), and
+reads hidden_states[accept_hidden_layer] at the multimodal positions. Per
 request: the prompt's audio tokens against HF's feature length, the positions the talker got against the prompt's
 multimodal tokens, and the relative L2 to fp32 of the served rows and of HF bf16's, with their ratio. Writes
 <out>/prompt_rows.json.
@@ -127,6 +128,7 @@ def main() -> None:
     parser.add_argument("--arm")
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--records", type=Path)
+    parser.add_argument("--omni-audio", action="store_true")
     parser.add_argument("--client", action="store_true")
     parser.add_argument("--port", type=int)
     args = parser.parse_args()
@@ -171,9 +173,14 @@ def main() -> None:
             model.config.thinker_config.video_token_id,
         ]
     )
+    from sglang_omni.preprocessing.audio import load_audio_path
+
+    def load_audio(path: str):
+        return load_audio_path(path) if args.omni_audio else librosa.load(path, sr=16000)[0]
+
     features = [
         processor.feature_extractor(
-            librosa.load(sample.audio_path, sr=16000)[0],
+            load_audio(sample.audio_path),
             sampling_rate=16000,
             padding=True,
             truncation=False,
@@ -255,6 +262,7 @@ def main() -> None:
     ratios = torch.tensor([result["ratio"] for result in measured])
     summary = dict(
         arm=args.arm,
+        audio_loader="omni" if args.omni_audio else "librosa",
         recorded=len(records),
         measured=len(measured),
         audio_tokens_equal=sum(result["audio_tokens_equal"] for result in results),
