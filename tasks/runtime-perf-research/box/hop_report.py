@@ -1,5 +1,5 @@
-"""Read hop_probe records of one baseline.py run and print per cell: queue waits, the same-process stream chain, event
-loop lateness and GC pauses.
+"""Read hop_probe records of one baseline.py run and print per cell: queue waits, the stream chain per edge, event
+loop lateness, GC pauses and the stacks taken at each loop stall.
 
 usage: python3 hop_report.py /data/runtime-perf/b3_tts [--cells c16_clean,c64_clean]
 
@@ -135,6 +135,18 @@ def report_cell(name, start_ns, end_ns, queue_records, other):
     for (pid, gen, thread), durations in sorted(collections_by_pid.items()):
         print(f"  gc pid {pid} gen {gen} on {thread}: {len(durations)} collections, total {sum(durations):.1f} ms, "
               f"max {max(durations):.2f} ms")
+    for item in other:
+        if item.get("k") == "stall" and start_ns <= item["ns"] <= end_ns:
+            print(f"  stall loop {item['loop']} pid {item['pid']} quiet {item['quiet_ms']:.0f} ms at capture; "
+                  f"loop thread {item['loop_thread']}")
+            for thread, frames in item["stacks"].items():
+                if thread.startswith("hop-probe"):
+                    continue
+                else:
+                    pass
+                print(f"    {thread}: {' <- '.join(reversed(frames[-5:]))[:400]}")
+        else:
+            pass
 
 
 def main() -> None:

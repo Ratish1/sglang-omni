@@ -11,6 +11,8 @@ clock of the request event recorder, so records join its events per request.
               later than 2 ms on its own
   kind "gc"   each collection of generation 1 or 2, and each of any generation over 1 ms: generation, duration,
               collected objects, thread
+  kind "stall" once per stall of an event loop (its sampler silent for more than 200 ms): every thread's innermost
+              14 frames, taken by a watchdog thread while the stall lasts
 """
 
 import atexit
@@ -31,6 +33,7 @@ PREFIX = os.environ.get("OMNI_HOP_PROBE", "")
 BIND_THREAD_DEVICE = os.environ.get("OMNI_BIND_THREAD_DEVICE") == "1"
 LAG_PERIOD_S = 0.005
 LAG_REPORT_S = 0.002
+STALL_S = 0.2
 
 records = []
 records_lock = threading.Lock()
@@ -115,13 +118,41 @@ def instrument_queue(q, label):
     q.put, q.get = put_recorded, get_recorded
 
 
+def watch_stalls(name, ticks, loop_thread_id):
+    """Records every thread's stack once per stall when the loop's sampler has not ticked for STALL_S."""
+    import traceback
+
+    stalled = False
+    while True:
+        time.sleep(STALL_S / 4)
+        quiet = time.monotonic() - ticks[0]
+        if quiet > STALL_S and not stalled:
+            stalled = True
+            frames = sys._current_frames()
+            names = {thread.ident: thread.name for thread in threading.enumerate()}
+            stacks = {
+                names.get(ident, str(ident)): [f"{f.filename}:{f.lineno} {f.name}" for f in traceback.extract_stack(frame)][-14:]
+                for ident, frame in frames.items()
+            }
+            record({"k": "stall", "loop": name, "quiet_ms": quiet * 1e3,
+                    "loop_thread": names.get(loop_thread_id, str(loop_thread_id)), "stacks": stacks})
+        elif quiet <= STALL_S:
+            stalled = False
+        else:
+            pass
+
+
 async def sample_lag(name):
     import asyncio
 
     loop = asyncio.get_running_loop()
+    ticks = [time.monotonic()]
+    threading.Thread(target=watch_stalls, args=(name, ticks, threading.get_ident()),
+                     name=f"hop-probe-stall-{name}", daemon=True).start()
     window_end = loop.time() + 1.0
     count, total, worst = 0, 0.0, 0.0
     while True:
+        ticks[0] = time.monotonic()
         target = loop.time() + LAG_PERIOD_S
         await asyncio.sleep(LAG_PERIOD_S)
         late = loop.time() - target
