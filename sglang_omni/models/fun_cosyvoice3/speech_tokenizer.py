@@ -278,7 +278,7 @@ class SpeechTokenizerCudaGraphs:
         # 2.6 times the device time. The graphs keep the math mode they are captured
         # with, and the process keeps its own.
         allow_tf32 = torch.backends.cuda.matmul.allow_tf32
-        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cuda.matmul.allow_tf32 = allow_tf32
         try:
             with torch.inference_mode(), freeze_gc(enable_cudagraph_gc=False):
                 for width in reversed(self.widths):
