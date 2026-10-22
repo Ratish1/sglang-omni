@@ -42,7 +42,7 @@ TALKER_START_MIN_CHUNKS = 1
 
 ENABLE_TALKER_START_TOPOLOGY = False
 
-TALKER_MAX_RUNNING_REQUESTS = 32
+THINKER_MAX_RUNNING_REQUESTS = 64
 
 # SGLang reads this when DeepGEMM compile utilities are imported. Qwen AR
 # stages can first hit some dense FP8 shapes after readiness; disable all-M
@@ -404,7 +404,7 @@ class Qwen3OmniBasePipelineConfig(PipelineConfig):
     def topology_gated_custom_all_reduce_stages(cls) -> set[str]:
         return {THINKER_STAGE}
 
-    def stage_factory_kwargs(self, stage_name: str) -> dict[str, bool]:
+    def stage_factory_kwargs(self, stage_name: str) -> dict[str, bool | int]:
         speech_enabled = any(stage.name == "talker_ar" for stage in self.stages)
         if stage_name in ("image_encoder", "audio_encoder"):
             # Device selection is deferred to the worker; the encoders read
@@ -412,11 +412,32 @@ class Qwen3OmniBasePipelineConfig(PipelineConfig):
             return {}
         else:
             pass
-        if stage_name == "thinker" and speech_enabled:
-            return {"speech_enabled": True}
+        if stage_name == "thinker":
+            return {
+                "speech_enabled": speech_enabled,
+                "max_running_requests": THINKER_MAX_RUNNING_REQUESTS,
+            }
         else:
             pass
         return {}
+
+    def stage_max_running_requests(self, stage_name: str, default: int) -> int:
+        """A stage's running-request cap as its factory resolves it: an engine override, then a factory override, then default."""
+        stage = self.stage_named(stage_name)
+        engine_overrides = stage.engine.overrides() if stage.engine is not None else {}
+        factory_overrides = stage.factory.model_extra or {}
+        return int(
+            engine_overrides.get(
+                "max_running_requests",
+                factory_overrides.get("max_running_requests", default),
+            )
+        )
+
+    def thinker_max_running_requests(self) -> int:
+        """The thinker's running-request cap as its factory resolves it."""
+        return self.stage_max_running_requests(
+            THINKER_STAGE, THINKER_MAX_RUNNING_REQUESTS
+        )
 
 
 class Qwen3OmniPipelineConfig(Qwen3OmniBasePipelineConfig):
@@ -471,7 +492,7 @@ class Qwen3OmniSpeechPipelineConfig(Qwen3OmniBasePipelineConfig):
                 "speech_enabled": True,
                 "feedback_enabled": True,
                 "code2wav_in_process": code2wav_shares_talker_process,
-                "max_running_requests": TALKER_MAX_RUNNING_REQUESTS,
+                "max_running_requests": self.thinker_max_running_requests(),
             }
         else:
             pass
@@ -489,20 +510,9 @@ class Qwen3OmniSpeechPipelineConfig(Qwen3OmniBasePipelineConfig):
         return super().stage_factory_kwargs(stage_name)
 
     def talker_max_running_requests(self) -> int:
-        """The talker's running-request cap as its factory resolves it: an engine override, then
-        a factory override, then this pipeline's default."""
-        talker = self.stage_named("talker_ar")
-        engine_overrides = (
-            talker.engine.overrides() if talker.engine is not None else {}
-        )
-        factory_overrides = talker.factory.model_extra or {}
-        return int(
-            engine_overrides.get(
-                "max_running_requests",
-                factory_overrides.get(
-                    "max_running_requests", TALKER_MAX_RUNNING_REQUESTS
-                ),
-            )
+        """The talker's running-request cap; by default every request the thinker runs gets a talker slot."""
+        return self.stage_max_running_requests(
+            "talker_ar", self.thinker_max_running_requests()
         )
 
 
@@ -649,19 +659,15 @@ class Qwen3OmniSessionPipelineConfig(AudioSessionPipelineConfig):
         self, stage_name: str
     ) -> dict[str, float | int | dict[str, int]]:
         if stage_name in {"thinker", "talker_ar"}:
-            kwargs = {
+            max_running_requests = (
+                self.max_sessions + REQUEST_TO_TOKEN_SLOTS_RESERVED_FOR_RETAINED_KV
+            )
+            return {
+                "max_running_requests": max_running_requests,
                 "server_args_overrides": {
-                    "max_running_requests": self.max_sessions
-                    + REQUEST_TO_TOKEN_SLOTS_RESERVED_FOR_RETAINED_KV,
-                }
+                    "max_running_requests": max_running_requests,
+                },
             }
-            if stage_name == "talker_ar":
-                kwargs["max_running_requests"] = (
-                    self.max_sessions + REQUEST_TO_TOKEN_SLOTS_RESERVED_FOR_RETAINED_KV
-                )
-            else:
-                pass
-            return kwargs
         elif stage_name in {"vad", "code2wav"}:
             return {}
         elif stage_name == "dialog":

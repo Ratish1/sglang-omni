@@ -15,7 +15,7 @@ from sglang.srt.runtime_context import get_context, get_schedule
 import sglang_omni.model_runner.sglang_model_runner as runner_mod
 import sglang_omni.models.qwen3_omni.bootstrap as qwen_bootstrap
 import sglang_omni.models.qwen3_omni.stages as qwen_stages
-from sglang_omni.models.qwen3_omni.config import TALKER_MAX_RUNNING_REQUESTS
+from sglang_omni.models.qwen3_omni.config import THINKER_MAX_RUNNING_REQUESTS
 from sglang_omni.platforms import current_platform
 
 
@@ -465,6 +465,7 @@ def test_qwen_colocated_thinker_startup_threads_effective_budget(
     with caplog.at_level(logging.INFO, logger=qwen_stages.logger.name):
         qwen_stages.create_sglang_thinker_executor_from_config(
             "dummy",
+            max_running_requests=THINKER_MAX_RUNNING_REQUESTS,
             total_gpu_memory_fraction=0.75,
             encoder_mem_reserve=0.05,
         )
@@ -491,6 +492,7 @@ def test_qwen_colocated_thinker_explicit_mem_fraction_skips_default_reserve(
     with caplog.at_level(logging.INFO, logger=qwen_stages.logger.name):
         qwen_stages.create_sglang_thinker_executor_from_config(
             "dummy",
+            max_running_requests=THINKER_MAX_RUNNING_REQUESTS,
             server_args_overrides={"mem_fraction_static": 0.75},
             total_gpu_memory_fraction=0.75,
         )
@@ -564,6 +566,7 @@ def test_qwen_thinker_threads_explicit_generation_batch_policy(monkeypatch) -> N
 
     qwen_stages.create_sglang_thinker_executor_from_config(
         "dummy",
+        max_running_requests=THINKER_MAX_RUNNING_REQUESTS,
         server_args_overrides={"max_running_requests": 16},
     )
 
@@ -632,9 +635,7 @@ def test_qwen_talker_ar_threads_explicit_generation_batch_policy(monkeypatch) ->
         lambda gpu_id: None,
     )
 
-    qwen_stages.create_talker_ar_executor_from_config(
-        "dummy", max_running_requests=TALKER_MAX_RUNNING_REQUESTS
-    )
+    qwen_stages.create_talker_ar_executor_from_config("dummy", max_running_requests=32)
 
     prefill_ladder = qwen_stages.build_default_prefill_cuda_graph_bs(
         qwen_stages.TALKER_PREFILL_CUDA_GRAPH_MAX_TOKENS
@@ -684,7 +685,10 @@ def thinker_overrides(monkeypatch, *, allows: bool, **kwargs) -> dict[str, objec
     monkeypatch.setattr(qwen_stages, "build_sglang_server_args", recording_builder)
     monkeypatch.setattr(current_platform, "enable_thinker_decode_graph", lambda: allows)
     qwen_stages.create_sglang_thinker_executor_from_config(
-        "dummy", total_gpu_memory_fraction=0.75, **kwargs
+        "dummy",
+        max_running_requests=THINKER_MAX_RUNNING_REQUESTS,
+        total_gpu_memory_fraction=0.75,
+        **kwargs,
     )
     return captured[-1]
 
@@ -743,7 +747,7 @@ def talker_overrides(
     monkeypatch,
     *,
     allows: bool,
-    max_running_requests: int = TALKER_MAX_RUNNING_REQUESTS,
+    max_running_requests: int = 32,
     **kwargs,
 ) -> dict[str, object]:
     captured: list[dict[str, object]] = []

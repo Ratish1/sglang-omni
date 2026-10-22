@@ -1198,6 +1198,7 @@ def create_sglang_thinker_executor_from_config(
     tp_size: int = 1,
     nccl_port: int | None = None,
     max_seq_len: int | None = None,
+    max_running_requests: int,
     server_args_overrides: Mapping[str, object] | None = None,
     encoder_mem_reserve: float = 0.05,
     speech_enabled: bool = False,
@@ -1234,7 +1235,7 @@ def create_sglang_thinker_executor_from_config(
     else:
         prefill_graph_backend = CudaGraphBackend.DISABLED
     overrides = build_generation_batch_overrides(
-        max_running_requests=64,
+        max_running_requests=max_running_requests,
         server_args_overrides=server_args_overrides,
         disable_cuda_graph=False,
         # note (zhaochenyang20): MoE CUDA graph capture fails on topk_ids dtype under torch compile.

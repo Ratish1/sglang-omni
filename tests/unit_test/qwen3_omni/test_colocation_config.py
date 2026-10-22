@@ -174,7 +174,8 @@ def test_factory_kwargs_follow_whether_code2wav_shares_the_talker_process() -> N
 @pytest.mark.parametrize(
     ("overrides", "replicas", "expected"),
     [
-        ({}, 1, (32, 32)),
+        ({}, 1, (64, 64)),
+        ({"thinker.engine.max_running_requests": 48}, 1, (48, 48)),
         ({"talker_ar.factory.max_running_requests": 40}, 1, (40, 40)),
         (
             {
