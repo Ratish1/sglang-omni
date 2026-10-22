@@ -78,13 +78,13 @@ def main() -> None:
                                     is_success=True, prompt_tokens=int(inputs["input_ids"].shape[1]),
                                     latency_s=round(seconds, 2), audio_duration_s=round(len(wav) / 24000, 2)))
                 print(f"{time.strftime('%H:%M:%S')} {sample['sample_id']} draw {draw}: {len(wav) / 24000:.1f} s audio, "
-                      f"{seconds:.0f} s", flush=True)
+                      f"{seconds:.0f} s, text {text[:100]!r}", flush=True)
         else:
             content = [{"type": "audio", "audio": sample["audio_path"]}, {"type": "text", "text": sample["question"]}]
             inputs = cookbook_inputs(processor, content, model.device, model.dtype)
-            text_ids = model.generate(**inputs, return_audio=False, thinker_return_dict_in_generate=True,
-                                      use_audio_in_video=False, thinker_do_sample=False, thinker_max_new_tokens=32)
-            sequences = text_ids.sequences if hasattr(text_ids, "sequences") else text_ids
+            text_ids, _ = model.generate(**inputs, return_audio=False, thinker_return_dict_in_generate=True,
+                                         use_audio_in_video=False, thinker_do_sample=False, thinker_max_new_tokens=32)
+            sequences = text_ids.sequences
             text = processor.batch_decode(sequences[:, inputs["input_ids"].shape[1]:], skip_special_tokens=True,
                                           clean_up_tokenization_spaces=False)[0]
             records.append(dict(sample_id=sample["sample_id"], response=text.strip(),
