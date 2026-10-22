@@ -10,7 +10,8 @@ Run on the box: python3 /workspace/box9/tasks/pr2800_review/box/hf_standard_queu
    resampling) and #2861 (run239 phx, band limited). Writes <out>/speech_wer.json, <out>/mmsu_analysis.json and
    <out>/summary.txt.
 --speech-cards and --mmsu-card place the jobs (--mmsu-card -1 runs speech only, scored on the first speech card);
---zero-multimodal-hidden, --fp8-talker and --argmax-code-predictor pass on to the reference's speech jobs.
+--zero-multimodal-hidden, --fp8-talker, --argmax-code-predictor and --sampled-fps pass on to the reference's speech
+jobs.
 """
 
 from __future__ import annotations
@@ -125,6 +126,7 @@ def main() -> None:
     parser.add_argument("--fp8-talker", help="speech: the talker on this FP8 checkpoint's weights and W8A8 inputs")
     parser.add_argument("--argmax-code-predictor", action="store_true",
                         help="speech: the residual codes by argmax, as omni takes them")
+    parser.add_argument("--sampled-fps", action="store_true", help="speech: each video timed at its sampled fps")
     args = parser.parse_args()
     if args.score_speech:
         score_speech(args.port, args.out)
@@ -137,6 +139,7 @@ def main() -> None:
         *(["--zero-multimodal-hidden"] if args.zero_multimodal_hidden else []),
         *(["--fp8-talker", args.fp8_talker] if args.fp8_talker else []),
         *(["--argmax-code-predictor"] if args.argmax_code_predictor else []),
+        *(["--sampled-fps"] if args.sampled_fps else []),
     ]
     is_mmsu = args.mmsu_card >= 0
     if is_mmsu:

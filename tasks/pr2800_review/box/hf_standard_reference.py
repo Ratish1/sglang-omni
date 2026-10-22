@@ -13,6 +13,8 @@ mmsu: the talker disabled, the thinker greedy at 32 tokens; writes <out>/mmsu_<s
 quantized to e4m3 per token and 128 features as a W8A8 block-FP8 linear does; the thinker stays bf16.
 --argmax-code-predictor takes the 15 residual codes by argmax, as omni does, where HF's generate samples them
 (top_k 50, top_p 0.8, `prepare_inputs_for_generation`).
+--sampled-fps times each video at its sampled fps (qwen_omni_utils' return_video_kwargs), as omni does; the cookbook
+passes no fps and the processor's default of 1 fps gives every video 2 s per temporal grid.
 """
 
 from __future__ import annotations
@@ -76,12 +78,19 @@ def use_fp8_talker(model: Qwen3OmniMoeForConditionalGeneration, fp8_model: str) 
 
 
 def cookbook_inputs(processor: Qwen3OmniMoeProcessor, content: list[dict[str, object]], device: torch.device,
-                    dtype: torch.dtype) -> dict[str, torch.Tensor]:
+                    dtype: torch.dtype, is_sampled_fps: bool = False) -> dict[str, torch.Tensor]:
+    """is_sampled_fps hands the processor each video's sampled fps (qwen_omni_utils' return_video_kwargs), as omni
+    does; the cookbook passes none and the processor times every video at its default 1 fps."""
     conversation = [{"role": "user", "content": content}]
     text = processor.apply_chat_template(conversation, add_generation_prompt=True, tokenize=False)
-    audios, images, videos = process_mm_info(conversation, use_audio_in_video=False)
+    if is_sampled_fps:
+        audios, images, videos, video_kwargs = process_mm_info(conversation, use_audio_in_video=False,
+                                                               return_video_kwargs=True)
+    else:
+        audios, images, videos = process_mm_info(conversation, use_audio_in_video=False)
+        video_kwargs = {}
     inputs = processor(text=text, audio=audios, images=images, videos=videos, return_tensors="pt", padding=True,
-                       use_audio_in_video=False)
+                       use_audio_in_video=False, **video_kwargs)
     return inputs.to(device).to(dtype)
 
 
@@ -100,6 +109,8 @@ def main() -> None:
     parser.add_argument("--fp8-talker", help="speech: the talker on this FP8 checkpoint's weights and W8A8 inputs")
     parser.add_argument("--argmax-code-predictor", action="store_true",
                         help="speech: the 15 residual codes by argmax, as omni takes them, in place of HF's sampling")
+    parser.add_argument("--sampled-fps", action="store_true",
+                        help="speech: each video timed at its sampled fps, as omni times it")
     args = parser.parse_args()
     spec = json.loads(args.samples.read_text())
     samples = spec["samples"][args.shard::args.shards]
@@ -142,7 +153,7 @@ def main() -> None:
                 {"type": "audio", "audio": sample["audio_path"]},
                 {"type": "text", "text": spec["prompt"]},
             ]
-            inputs = cookbook_inputs(processor, content, model.device, model.dtype)
+            inputs = cookbook_inputs(processor, content, model.device, model.dtype, args.sampled_fps)
             for draw in range(DRAWS):
                 torch.manual_seed(draw)
                 start = time.perf_counter()
