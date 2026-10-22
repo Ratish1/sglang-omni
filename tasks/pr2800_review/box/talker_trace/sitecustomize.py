@@ -13,7 +13,9 @@ the talker's prefill builder and model runner are wrapped once their modules loa
   penalty, the talker hidden state, the sampled code and the step's 16 codes; at prefill also the request's
   projected prompt rows, its talker input ids and positions;
 - QwenTalkerModelRunner.on_request_finished: everything for the request to <TALKER_TRACE_DIR>/<request id>.pt.
-With TALKER_TRACE_EAGER=1 the CUDA platform also declines the talker graph, so the talker runs eager.
+With TALKER_TRACE_EAGER=1 the CUDA platform also declines the talker graph, so the talker runs eager. With
+TALKER_TRACE_COOKBOOK_FPS=1 HF's processor gets no fps, so every video is timed at its default 1 fps (2 s a temporal
+grid) as Qwen's cookbook times it, in place of the sampled fps omni hands it.
 """
 
 import importlib.abc
@@ -24,6 +26,7 @@ import sys
 PREFILL_MODULE = "sglang_omni.models.qwen3_omni.components.talker_prefill"
 RUNNER_MODULE = "sglang_omni.models.qwen3_omni.talker_model_runner"
 PLATFORM_MODULE = "sglang_omni.platforms.cuda"
+PROCESSOR_MODULE = "transformers.models.qwen3_omni_moe.processing_qwen3_omni_moe"
 TRACES = {}
 
 
@@ -196,9 +199,27 @@ def install_eager_talker(module):
     module.CUDAOmniPlatform.enable_talker_graph = lambda self: False
 
 
+def install_cookbook_fps(module):
+    processor_call = module.Qwen3OmniMoeProcessor.__call__
+
+    def call_without_fps(self, *args, **kwargs):
+        videos_kwargs = kwargs.get("videos_kwargs")
+        if isinstance(videos_kwargs, dict) and "fps" in videos_kwargs:
+            kwargs["videos_kwargs"] = {key: value for key, value in videos_kwargs.items() if key != "fps"}
+        else:
+            pass
+        return processor_call(self, *args, **kwargs)
+
+    module.Qwen3OmniMoeProcessor.__call__ = call_without_fps
+
+
 INSTALLERS = {PREFILL_MODULE: install_prefill, RUNNER_MODULE: install_runner}
 if os.environ.get("TALKER_TRACE_EAGER") == "1":
     INSTALLERS[PLATFORM_MODULE] = install_eager_talker
+else:
+    pass
+if os.environ.get("TALKER_TRACE_COOKBOOK_FPS") == "1":
+    INSTALLERS[PROCESSOR_MODULE] = install_cookbook_fps
 else:
     pass
 

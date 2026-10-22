@@ -57,9 +57,10 @@ def kl(value: torch.Tensor, reference: torch.Tensor) -> float:
 
 @torch.no_grad()
 def departures(talker: Qwen3OmniMoeTalkerForConditionalGeneration, trace: dict, threshold: float,
-               position_offset: int = 0) -> list[tuple]:
+               position_offset: float = 0.0, is_fractional: bool = False) -> list[tuple]:
     """The decode steps where the served logits depart from HF's cached pass by more than threshold KL; the decode
-    positions moved by position_offset."""
+    positions moved by position_offset, or with is_fractional continued from the prompt's float positions as HF's
+    generate does (its rope delta is the float largest position plus one, less the length)."""
     vocab = talker.config.text_config.vocab_size
     suppressed = torch.zeros(vocab, dtype=torch.bool, device="cuda")
     suppressed[vocab - 1024:] = True
@@ -67,7 +68,10 @@ def departures(talker: Qwen3OmniMoeTalkerForConditionalGeneration, trace: dict, 
     prompt_rows = trace["prompt_rows"].cuda().to(torch.bfloat16)
     length = prompt_rows.shape[0]
     positions = trace["mrope_positions"].long().cuda()
-    next_position = int(positions.max()) + 1
+    if is_fractional:
+        next_position = float(trace["mrope_positions"].max()) + 1
+    else:
+        next_position = int(positions.max()) + 1
     cache = DynamicCache()
     output = talker.model(inputs_embeds=prompt_rows[None], position_ids=positions[:, None], past_key_values=cache,
                           use_cache=True)
@@ -85,7 +89,8 @@ def departures(talker: Qwen3OmniMoeTalkerForConditionalGeneration, trace: dict, 
             pass
         row = (trace["feedback_rows"][step] + trace["text_rows"][step]).cuda().to(torch.bfloat16)
         output = talker.model(inputs_embeds=row.view(1, 1, -1),
-                              position_ids=torch.full((3, 1, 1), next_position + position_offset + step, device="cuda"),
+                              position_ids=torch.full((3, 1, 1), next_position + position_offset + step,
+                                                      device="cuda", dtype=torch.float32),
                               past_key_values=cache, use_cache=True,
                               cache_position=torch.tensor([length + step], device="cuda"))
     return found
@@ -98,8 +103,11 @@ def main() -> None:
     parser.add_argument("--trace-dir", type=Path, help="every trace: the steps departing from HF by over --threshold")
     parser.add_argument("--threshold", type=float, default=0.5)
     parser.add_argument("--steps", default="118:130")
-    parser.add_argument("--position-offset", type=int, default=0,
+    parser.add_argument("--position-offset", type=float, default=0.0,
                         help="--trace-dir: decode positions moved by this many, as the server places them")
+    parser.add_argument("--fractional", action="store_true",
+                        help="--trace-dir: decode positions continue from the prompt's float positions, as HF's "
+                        "generate places them")
     args = parser.parse_args()
     first, last = (int(bound) for bound in args.steps.split(":"))
     talker = load_talker()
@@ -107,7 +115,7 @@ def main() -> None:
         for path in sorted(args.trace_dir.glob("*.pt")):
             trace = torch.load(path, weights_only=False)
             if trace.get("prompt_rows") is not None and trace.get("feedback_rows"):
-                found = departures(talker, trace, args.threshold, args.position_offset)
+                found = departures(talker, trace, args.threshold, args.position_offset, args.fractional)
                 print(f"{path.stem[:8]} frames {len(trace['logits'])}: {found}", flush=True)
             else:
                 pass
