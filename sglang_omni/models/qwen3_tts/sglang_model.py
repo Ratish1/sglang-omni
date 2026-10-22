@@ -1766,7 +1766,6 @@ class Qwen3TTSTalker(Qwen3TTSPromptBuilderMixin, nn.Module):
         num_groups = self.config.num_code_groups
         result_codes = self.output_codes[:batch_size].unsqueeze(-1)
         summed_embeddings = self.output_embeds[:batch_size].unsqueeze(1)
-        result_codes.zero_()
         summed_embeddings.zero_()
         embedding_buffer = getattr(self, "predictor_embedding_buffer", None)
         if embedding_buffer is not None:
@@ -1787,7 +1786,6 @@ class Qwen3TTSTalker(Qwen3TTSPromptBuilderMixin, nn.Module):
             )
             pos_codes = result_codes[:, :, pos]
             pos_summed = summed_embeddings[:, pos, :]
-            pos_summed.zero_()
             pos_codes[:, 0].copy_(layer0_code[:, 0])
             pos_summed.add_(layer0_embed[:, 0, :])
 
