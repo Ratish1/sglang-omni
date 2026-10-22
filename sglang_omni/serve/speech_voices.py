@@ -529,7 +529,7 @@ def decode_reference_audio(
         from sglang_omni.preprocessing.audio import (
             AudioTooLongError,
             decode_audio_bytes,
-            resample_linear,
+            resample_audio,
         )
 
         # note (Richard Wang): the decode stops at the reference limit, so a
@@ -537,7 +537,7 @@ def decode_reference_audio(
         audio, source_rate = decode_audio_bytes(
             audio_bytes, max_seconds=MAX_REFERENCE_AUDIO_SECONDS
         )
-        samples = resample_linear(audio, source_rate, DEFAULT_SAMPLE_RATE)
+        samples = resample_audio(audio, source_rate, DEFAULT_SAMPLE_RATE)
         sample_rate = DEFAULT_SAMPLE_RATE
     except AudioTooLongError as exc:
         raise bad_request(
