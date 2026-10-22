@@ -47,13 +47,15 @@ def log(message: str) -> None:
 
 
 def card_pins() -> tuple[str, str]:
-    """PR2800_CARD_CPUS and PR2800_NODE for cards 0 and 1: eight cores of each card's affinity and their siblings."""
+    """PR2800_CARD_CPUS and PR2800_NODE for every card the lease holds: eight cores of each card's affinity and their
+    siblings."""
     lines = subprocess.run(["nvidia-smi", "topo", "-m"], capture_output=True, text=True).stdout.splitlines()
     header = lines[0].split("\t")
     cpu_column, node_column = header.index("CPU Affinity"), header.index("NUMA Affinity")
+    cards = [int(line.split("\t")[0][3:]) for line in lines[1:] if line.startswith("GPU")]
     taken: dict[str, int] = {}
     pins, nodes = [], []
-    for card in (0, 1):
+    for card in cards:
         fields = next(line for line in lines if line.startswith(f"GPU{card}\t")).split("\t")
         affinity, node = fields[cpu_column].strip(), fields[node_column].strip()
         offset = taken.get(node, 0)

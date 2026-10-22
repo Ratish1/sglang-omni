@@ -56,6 +56,8 @@ TREES = {
     "cis": ("cis_68e3a0e5f", "origin", "68e3a0e5fbe40dc6dd3cf3eb5982175b203ba661"),
     "upr": ("upr_057d97629", "upstream", "057d97629da4093ea7b02ae9487803cf27f88749"),
     "cit": ("cit_b42d0b332", "origin", "b42d0b332637cc7794ee1fbeb80a4d7128e6b280"),
+    "upm": ("upm_3d7d2c306", "upstream", "3d7d2c3066346cc7bd06c3bda21dc28c0627c04e"),
+    "cim": ("cim_0d422f290", "origin", "0d422f290b416f1881ed56f006884822c293096d"),
 }
 # note (ratish): every arm is measured by one client and scored by one ASR server, both from main; from the SGLang
 # 0.5.22 stack on (057d97629) a tree from before it no longer runs, and main's client records each chunk's length.
