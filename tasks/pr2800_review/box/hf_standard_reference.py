@@ -11,6 +11,8 @@ mmsu: the talker disabled, the thinker greedy at 32 tokens; writes <out>/mmsu_<s
 --zero-multimodal-hidden gives HF's talker zeros at the multimodal prompt rows, as omni's main builds them.
 --fp8-talker <repo> runs every talker linear that checkpoint quantizes on its dequantized FP8 weight, its input
 quantized to e4m3 per token and 128 features as a W8A8 block-FP8 linear does; the thinker stays bf16.
+--argmax-code-predictor takes the 15 residual codes by argmax, as omni does, where HF's generate samples them
+(top_k 50, top_p 0.8, `prepare_inputs_for_generation`).
 """
 
 from __future__ import annotations
@@ -96,12 +98,24 @@ def main() -> None:
         help="speech: the talker's multimodal prompt rows project zeros in place of the thinker's hidden states",
     )
     parser.add_argument("--fp8-talker", help="speech: the talker on this FP8 checkpoint's weights and W8A8 inputs")
+    parser.add_argument("--argmax-code-predictor", action="store_true",
+                        help="speech: the 15 residual codes by argmax, as omni takes them, in place of HF's sampling")
     args = parser.parse_args()
     spec = json.loads(args.samples.read_text())
     samples = spec["samples"][args.shard::args.shards]
     model = Qwen3OmniMoeForConditionalGeneration.from_pretrained(MODEL, dtype="auto", device_map="auto")
     if args.fp8_talker:
         print(f"FP8 talker: {use_fp8_talker(model, args.fp8_talker)} linears", flush=True)
+    else:
+        pass
+    if args.argmax_code_predictor:
+        predictor_generate = model.talker.code_predictor.generate
+
+        def argmax_generate(*generate_args, **generate_kwargs):
+            return predictor_generate(*generate_args, **{**generate_kwargs, "do_sample": False, "top_k": None,
+                                                         "top_p": None})
+
+        model.talker.code_predictor.generate = argmax_generate
     else:
         pass
     if args.zero_multimodal_hidden:
