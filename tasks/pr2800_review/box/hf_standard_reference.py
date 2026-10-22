@@ -8,6 +8,7 @@ chat template, qwen_omni_utils.process_mm_info with use_audio_in_video False, th
 speech: the thinker greedy at 256 tokens, the talker with the checkpoint's sampling, speaker Ethan, DRAWS draws a
 sample each under torch.manual_seed(draw); writes <out>/audio/<id>__<draw>.wav and <out>/speech_<shard>.json.
 mmsu: the talker disabled, the thinker greedy at 32 tokens; writes <out>/mmsu_<shard>.json with each raw response.
+--zero-multimodal-hidden gives HF's talker zeros at the multimodal prompt rows, as omni's main builds them.
 """
 
 from __future__ import annotations
@@ -43,10 +44,26 @@ def main() -> None:
     parser.add_argument("--shard", type=int, required=True)
     parser.add_argument("--shards", type=int, required=True)
     parser.add_argument("--out", type=Path, required=True)
+    parser.add_argument(
+        "--zero-multimodal-hidden",
+        action="store_true",
+        help="speech: the talker's multimodal prompt rows project zeros in place of the thinker's hidden states",
+    )
     args = parser.parse_args()
     spec = json.loads(args.samples.read_text())
     samples = spec["samples"][args.shard::args.shards]
     model = Qwen3OmniMoeForConditionalGeneration.from_pretrained(MODEL, dtype="auto", device_map="auto")
+    if args.zero_multimodal_hidden:
+        user_parts = model._get_talker_user_parts  # noqa: leading-underscore  # HF's own method
+
+        def zero_hidden_user_parts(im_start_index, segment_end_index, multimodal_mask, thinker_hidden,
+                                   thinker_embed):
+            return user_parts(im_start_index, segment_end_index, multimodal_mask, torch.zeros_like(thinker_hidden),
+                              thinker_embed)
+
+        model._get_talker_user_parts = zero_hidden_user_parts  # noqa: leading-underscore  # HF's own method
+    else:
+        pass
     processor = Qwen3OmniMoeProcessor.from_pretrained(MODEL)
     if args.task == "mmsu":
         model.disable_talker()

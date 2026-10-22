@@ -9,6 +9,8 @@ Run on the box: python3 /workspace/box9/tasks/pr2800_review/box/hf_standard_queu
    responses are parsed by the benchmark's parser and compared, clip by clip, with omni's main (run239 ups, linear
    resampling) and #2861 (run239 phx, band limited). Writes <out>/speech_wer.json, <out>/mmsu_analysis.json and
    <out>/summary.txt.
+--speech-cards and --mmsu-card place the jobs (--mmsu-card -1 runs speech only, scored on the first speech card);
+--zero-multimodal-hidden passes on to the reference's speech jobs.
 """
 
 from __future__ import annotations
@@ -60,12 +62,13 @@ def write_mmsu_samples(path: Path) -> None:
         for sample in chosen]}, indent=1))
 
 
-def run_reference(out: Path, task: str, samples: Path, shard: int, shards: int, card: int) -> int:
+def run_reference(out: Path, task: str, samples: Path, shard: int, shards: int, card: int,
+                  reference_args: list[str]) -> int:
     env = {**os.environ, "PYTHONPATH": REFERENCE_PATH, "CUDA_VISIBLE_DEVICES": str(card)}
     log(out, f"{task} shard {shard} card {card} start")
     rc = subprocess.run(
         [sys.executable, str(BOX / "hf_standard_reference.py"), "--task", task, "--samples", str(samples), "--shard",
-         str(shard), "--shards", str(shards), "--out", str(out)],
+         str(shard), "--shards", str(shards), "--out", str(out), *reference_args],
         cwd="/tmp", env=env, stdout=open(out / f"{task}_{shard}.log", "w"), stderr=subprocess.STDOUT).returncode
     log(out, f"{task} shard {shard} card {card} rc {rc}")
     return rc
@@ -74,8 +77,7 @@ def run_reference(out: Path, task: str, samples: Path, shard: int, shards: int, 
 def score_speech(port: int, out: Path) -> None:
     from benchmarks.tasks.asr import compute_text_audio_consistency_from_records
 
-    records = [record for shard in range(len(SPEECH_CARDS))
-               for record in json.loads((out / f"speech_{shard}.json").read_text())]
+    records = [record for path in sorted(out.glob("speech_*.json")) for record in json.loads(path.read_text())]
     wer = compute_text_audio_consistency_from_records(
         records, "en", "cuda:0", audio_dir=str(out / "audio"), asr_router_port=port, asr_concurrency=4)
     (out / "speech_wer.json").write_text(json.dumps(dict(records=records, wer=wer), indent=1))
@@ -116,6 +118,10 @@ def main() -> None:
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--score-speech", action="store_true")
     parser.add_argument("--port", type=int)
+    parser.add_argument("--speech-cards", default=",".join(str(card) for card in SPEECH_CARDS))
+    parser.add_argument("--mmsu-card", type=int, default=MMSU_CARD, help="-1 runs speech only")
+    parser.add_argument("--zero-multimodal-hidden", action="store_true",
+                        help="speech: zeros at the talker's multimodal prompt rows, as omni's main builds them")
     args = parser.parse_args()
     if args.score_speech:
         score_speech(args.port, args.out)
@@ -123,29 +129,41 @@ def main() -> None:
     else:
         pass
     args.out.mkdir(parents=True, exist_ok=True)
-    write_mmsu_samples(args.out / "mmsu_samples.json")
-    log(args.out, "samples written")
-    with ThreadPoolExecutor(max_workers=len(SPEECH_CARDS) + 1) as pool:
-        jobs = [pool.submit(run_reference, args.out, "speech", SPEECH_SAMPLES, shard, len(SPEECH_CARDS), card)
-                for shard, card in enumerate(SPEECH_CARDS)]
-        jobs.append(pool.submit(run_reference, args.out, "mmsu", args.out / "mmsu_samples.json", 0, 1, MMSU_CARD))
+    speech_cards = [int(card) for card in args.speech_cards.split(",")]
+    speech_args = ["--zero-multimodal-hidden"] if args.zero_multimodal_hidden else []
+    is_mmsu = args.mmsu_card >= 0
+    if is_mmsu:
+        write_mmsu_samples(args.out / "mmsu_samples.json")
+        log(args.out, "samples written")
+    else:
+        pass
+    with ThreadPoolExecutor(max_workers=len(speech_cards) + 1) as pool:
+        jobs = [pool.submit(run_reference, args.out, "speech", SPEECH_SAMPLES, shard, len(speech_cards), card,
+                            speech_args)
+                for shard, card in enumerate(speech_cards)]
+        if is_mmsu:
+            jobs.append(pool.submit(run_reference, args.out, "mmsu", args.out / "mmsu_samples.json", 0, 1,
+                                    args.mmsu_card, []))
+        else:
+            pass
         codes = [job.result() for job in jobs]
     if any(codes):
         log(args.out, f"stopped: rcs {codes}")
         return
     else:
         pass
-    lines = analyze_mmsu(args.out)
+    lines = analyze_mmsu(args.out) if is_mmsu else []
+    score_card = speech_cards[0]
     asr_tree = pair_check.tree(pair_check.ASR_TREE)
-    asr = pair_check.serve(0, asr_tree, pair_check.ASR_MODEL, PORT, [], args.out / "asr_server.log")
+    asr = pair_check.serve(score_card, asr_tree, pair_check.ASR_MODEL, PORT, [], args.out / "asr_server.log")
     try:
         rc = subprocess.run(
             [sys.executable, str(Path(__file__).resolve()), "--score-speech", "--port", str(PORT), "--out",
              str(args.out)],
-            cwd=asr_tree, env=pair_check.card_env(0, asr_tree), stdout=open(args.out / "score.log", "w"),
+            cwd=asr_tree, env=pair_check.card_env(score_card, asr_tree), stdout=open(args.out / "score.log", "w"),
             stderr=subprocess.STDOUT).returncode
     finally:
-        pair_check.stop(0, asr)
+        pair_check.stop(score_card, asr)
     if rc == 0:
         wer = json.loads((args.out / "speech_wer.json").read_text())["wer"]
         lines.append(f"speech: {wer['summary']}")
