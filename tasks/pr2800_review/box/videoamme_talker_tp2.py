@@ -105,7 +105,11 @@ def score(port: int, out: Path) -> None:
 
 
 def serve(
-    arm_tree: Path, log_path: Path, cards: tuple[int, int], port: int
+    arm_tree: Path,
+    log_path: Path,
+    cards: tuple[int, int],
+    port: int,
+    code2wav_dump_dir: Path | None,
 ) -> subprocess.Popen:
     env = {
         **pair_check.card_env(cards[0], arm_tree),
@@ -113,6 +117,11 @@ def serve(
         "SGLANG_OMNI_STRICT_PORT": "1",
         "SGLANG_OMNI_STARTUP_TIMEOUT": "1800",
     }
+    if code2wav_dump_dir is not None:
+        env["PYTHONPATH"] = f"{BOX / 'code2wav_dump'}:{arm_tree}"
+        env["CODE2WAV_DUMP_DIR"] = str(code2wav_dump_dir)
+    else:
+        pass
     process = subprocess.Popen(
         [
             "numactl",
@@ -162,13 +171,21 @@ def stop(process: subprocess.Popen, cards: tuple[int, int]) -> None:
     pair_check.stop(cards[1], process)
 
 
-def run_arm(out: Path, arm: str, cards: tuple[int, int], seed: int | None) -> int:
+def run_arm(
+    out: Path, arm: str, cards: tuple[int, int], seed: int | None, is_code2wav_dump: bool
+) -> int:
     arm_out = out / arm
     arm_out.mkdir(parents=True, exist_ok=True)
     arm_tree = pair_check.tree(pair_check.ARMS[arm][0])
     port = PORT + 200 * cards[0]
     log(out, f"{arm} cards {cards} serving")
-    server = serve(arm_tree, arm_out / "server.log", cards, port)
+    server = serve(
+        arm_tree,
+        arm_out / "server.log",
+        cards,
+        port,
+        arm_out / "code2wav_dump" if is_code2wav_dump else None,
+    )
     try:
         log(out, f"{arm} healthy, client")
         rc = subprocess.run(
@@ -210,6 +227,11 @@ def main() -> None:
     parser.add_argument("--port", type=int)
     parser.add_argument("--score-card", type=int, default=0)
     parser.add_argument("--seed", type=int, help="every request's sampling seed, as a seeded client sends it")
+    parser.add_argument(
+        "--code2wav-dump",
+        action="store_true",
+        help="save every request's talker codes and served audio (code2wav_dump/sitecustomize.py)",
+    )
     args = parser.parse_args()
     if args.client:
         client(args.port, args.out, args.seed)
@@ -227,7 +249,10 @@ def main() -> None:
         chains.append((chain_arms.split(","), (first_card, second_card)))
 
     def run_chain(chain_arms: list[str], cards: tuple[int, int]) -> list[int]:
-        return [run_arm(args.out, arm, cards, args.seed) for arm in chain_arms]
+        return [
+            run_arm(args.out, arm, cards, args.seed, args.code2wav_dump)
+            for arm in chain_arms
+        ]
 
     with ThreadPoolExecutor(max_workers=len(chains)) as pool:
         chain_codes = list(pool.map(lambda chain: run_chain(*chain), chains))
