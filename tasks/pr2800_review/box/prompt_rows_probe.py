@@ -4,8 +4,9 @@ Run on the box: python3 /workspace/box/tasks/pr2800_review/box/prompt_rows_probe
     [--records <an earlier run's dump>]
 Card 0 serves the arm with prompt_rows/sitecustomize.py on PYTHONPATH, which records what the talker's prompt prefill
 receives. The first SAMPLES mmsu-ci-2000 requests go one at a time with the CI's talker prompt, text and audio,
-greedy, MAX_TOKENS tokens (the talker's prompt prefill comes with the first). With --records the serving is skipped and
-that dump is read. Card 1 then runs HF's thinker in fp32 (the truth) and in bf16 (the floor) on each request's own
+greedy, MAX_TOKENS tokens (the talker's prompt prefill comes with the first), then the first --repeats of them again: a
+repeat matches its cached prompt, so its rows come from the slots the first request wrote and must equal them. With
+--records the serving is skipped and that dump is read. Card 1 then runs HF's thinker in fp32 (the truth) and in bf16 (the floor) on each request's own
 prompt ids with HF's audio features (the audio loaded by librosa, or with --omni-audio by the server's own loader), and
 reads hidden_states[accept_hidden_layer] at the multimodal positions. Per
 request: the prompt's audio tokens against HF's feature length, the positions the talker got against the prompt's
@@ -18,6 +19,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -47,7 +49,7 @@ def relative_l2(value: torch.Tensor, truth: torch.Tensor) -> float:
     return float((value.double() - truth.double()).norm() / truth.double().norm())
 
 
-def client(port: int, out: Path) -> None:
+def client(port: int, out: Path, repeats: int) -> None:
     from benchmarks.dataset.mmsu import load_mmsu_samples
     from benchmarks.eval.benchmark_omni_mmsu import run
 
@@ -82,9 +84,20 @@ def client(port: int, out: Path) -> None:
         f"{results['speed'].get('audio_returned')} of {len(samples)} requests returned audio",
         flush=True,
     )
+    # note (ratish): the same requests again match their cached prompts, so the talker's rows
+    # come from the slots the first requests wrote.
+    if repeats:
+        args.output_dir = str(out / "repeats")
+        results = asyncio.run(run(args, samples=samples[:repeats], compute_wer=False))
+        print(
+            f"{results['speed'].get('audio_returned')} of {repeats} repeats returned audio",
+            flush=True,
+        )
+    else:
+        pass
 
 
-def serve_and_record(arm_tree: Path, out: Path) -> Path:
+def serve_and_record(arm_tree: Path, out: Path, repeats: int) -> Path:
     dump = out / "dump"
     dump.mkdir(parents=True, exist_ok=True)
     card_env = pair_check.card_env
@@ -111,6 +124,8 @@ def serve_and_record(arm_tree: Path, out: Path) -> Path:
                 str(PORT),
                 "--out",
                 str(out / "client"),
+                "--repeats",
+                str(repeats),
             ],
             cwd=arm_tree,
             env={**card_env(0, arm_tree), "PYTHONPATH": str(arm_tree)},
@@ -129,20 +144,46 @@ def main() -> None:
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--records", type=Path)
     parser.add_argument("--omni-audio", action="store_true")
+    parser.add_argument("--repeats", type=int, default=0)
     parser.add_argument("--client", action="store_true")
     parser.add_argument("--port", type=int)
     args = parser.parse_args()
     args.out.mkdir(parents=True, exist_ok=True)
     if args.client:
-        client(args.port, args.out)
+        client(args.port, args.out, args.repeats)
         return
     else:
         pass
     arm_tree = pair_check.tree(args.arm)
-    dump = args.records or serve_and_record(arm_tree, args.out)
-    # note (ratish): the server's startup warmup request reaches the talker first; the client's are the last SAMPLES.
-    records = [torch.load(path) for path in sorted(dump.glob("*.pt"))][-SAMPLES:]
+    dump = args.records or serve_and_record(arm_tree, args.out, args.repeats)
+    # note (ratish): the server's startup warmup request reaches the talker first; the client's are the last ones.
+    all_records = [torch.load(path) for path in sorted(dump.glob("*.pt"))]
+    records = all_records[-(SAMPLES + args.repeats) :][:SAMPLES]
+    repeat_records = all_records[len(all_records) - args.repeats :]
     print(f"{len(records)} talker prompt prefills recorded", flush=True)
+    repeats_equal = sum(
+        torch.equal(repeat["prompt_ids"], first["prompt_ids"])
+        and repeat["positions"] == first["positions"]
+        and torch.equal(repeat["rows"], first["rows"])
+        for repeat, first in zip(repeat_records, records)
+    )
+    server_log = args.out / "server.log"
+    # note (ratish): a repeat's thinker prefill computes only its last prompt token.
+    repeat_prefix_hits = (
+        len(
+            re.findall(
+                r"#new-seq: 1, #new-token: 1, #cached-token: [1-9]",
+                server_log.read_text(errors="replace"),
+            )
+        )
+        if server_log.exists()
+        else 0
+    )
+    print(
+        f"repeats with the first rows: {repeats_equal} of {args.repeats}, "
+        f"one-token prefills on a cached prompt: {repeat_prefix_hits}",
+        flush=True,
+    )
 
     sys.path.insert(0, str(arm_tree))
     from transformers import Qwen3OmniMoeForConditionalGeneration
@@ -264,6 +305,9 @@ def main() -> None:
         arm=args.arm,
         audio_loader="omni" if args.omni_audio else "librosa",
         recorded=len(records),
+        repeats=args.repeats,
+        repeats_equal=repeats_equal,
+        repeat_prefix_hits=repeat_prefix_hits,
         measured=len(measured),
         audio_tokens_equal=sum(result["audio_tokens_equal"] for result in results),
         positions_equal=sum(result["positions_equal"] for result in results),
