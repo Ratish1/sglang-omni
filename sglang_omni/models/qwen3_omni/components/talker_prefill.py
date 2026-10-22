@@ -208,12 +208,9 @@ class TalkerPrefillBuilder:
         # keeps zeros at the multimodal rows, the only prompt rows the hidden is read at.
         if captured_positions is not None:
             prompt_mask = multimodal_mask[: prompt_ids.shape[0]]
-            if captured_positions != prompt_mask.nonzero(as_tuple=True)[0].tolist():
-                raise ValueError(
-                    "the thinker's prompt hidden rows are not the prompt's multimodal rows"
-                )
-            else:
-                pass
+            assert (
+                captured_positions == prompt_mask.nonzero(as_tuple=True)[0].tolist()
+            ), "the thinker's prompt hidden rows are not the prompt's multimodal rows"
             prompt_hidden[captured_positions] = prompt_chunk.data.to(prompt_hidden)
         else:
             pass

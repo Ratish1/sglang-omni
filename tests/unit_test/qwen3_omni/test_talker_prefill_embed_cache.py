@@ -178,7 +178,7 @@ def test_prompt_rows_at_other_than_the_multimodal_rows_are_rejected(prompt_build
         data=torch.ones((3, HIDDEN)),
         metadata={"token_id": 20, "prompt_hidden_positions": [2, 3, 6]},
     )
-    with pytest.raises(ValueError, match="multimodal rows"):
+    with pytest.raises(AssertionError, match="multimodal rows"):
         build_streamed_prompt(prompt_builder, [1, 2, 3, 4, 5, 8, 9, 1, 6, 7], [chunk])
 
 
