@@ -18,10 +18,9 @@ import torch
 
 from benchmarks.dataset.prepare import SEEDTTS_DATASET_ID
 from benchmarks.dataset.seedtts import load_seedtts_samples
-from sglang_omni.models.qwen3_tts.compat import apply_qwen_tts_transformers_compatibility_patches
 from sglang_omni.models.qwen3_tts.prompt_frontend import load_qwen3_tts_prompt_frontend
 from sglang_omni.models.qwen3_tts.reference_encoder_cuda_graph import DEFAULT_QWEN3_TTS_REFERENCE_ENCODER_BUCKET_FRAMES
-from sglang_omni.models.qwen3_tts.stages import load_qwen3_tts_tokenizer
+from sglang_omni.models.qwen3_tts.stages import load_qwen3_tts_tokenizer, register_qwen3_tts_hf_config
 from sglang_omni.utils.checkpoint import resolve_checkpoint
 
 MODEL = "Qwen/Qwen3-TTS-12Hz-1.7B-Base"
@@ -50,7 +49,7 @@ def main() -> None:
 
     torch.cuda.set_device(args.card)
     device = torch.device("cuda", args.card)
-    apply_qwen_tts_transformers_compatibility_patches()
+    register_qwen3_tts_hf_config()
     tokenizer = load_qwen3_tts_tokenizer(MODEL, device=str(device), dtype="bfloat16", attn_implementation=None)
     frontend = load_qwen3_tts_prompt_frontend(resolve_checkpoint(MODEL), device=device, dtype=torch.bfloat16)
     runner = frontend.speaker_encoder_graph_runner
