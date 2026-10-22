@@ -13,6 +13,8 @@ c1f, every reference seeded at concurrency 1, whose tails rest on 1,088 requests
 10-21 copy under /data/c20261021, the new lease's home, on cards 0 and 1. Later on 10-21: the buffered cells b1f (every
 reference at concurrency 1, seeded) and Lb16 (the long form list at concurrency 16), for #2260's buffered route.
 Later on 10-21: PAIR_HOME names the run home (default /data/c20261021), for the 0.5.22 container's /data/c20261021b.
+10-22: a seeded cell named <cell>_s<seed> runs under that seed, and PAIR_CELLS_B gives order b its own cells, so each
+order of a pair draws its own seeded outputs (the quality draws).
 usage: python3 serve_pair_c20261021.py <first tree> <second tree> <out dir>"""
 
 import json
@@ -49,7 +51,20 @@ ALL_CELLS = {
     "r20": (["--max-concurrency", "64", "--request-rate", "20", "--arrival-seed", "2910"], True),
     "L16": (["--max-concurrency", "16", "--meta", f"{D}/longform/meta.lst"], True),
 }
-CELLS = tuple((name, *ALL_CELLS[name]) for name in os.environ.get("PAIR_CELLS", "c1,c16").split(","))
+def parse_cells(names):
+    cells = []
+    for name in names.split(","):
+        base, _, seed = name.partition("_s")
+        flags, is_stream = ALL_CELLS[base]
+        if seed:
+            at = flags.index("--seed") + 1
+            flags = [*flags[:at], seed, *flags[at + 1 :]]
+        cells.append((name, flags, is_stream))
+    return tuple(cells)
+
+
+CELLS = parse_cells(os.environ.get("PAIR_CELLS", "c1,c16"))
+CELLS_B = parse_cells(os.environ.get("PAIR_CELLS_B", os.environ.get("PAIR_CELLS", "c1,c16")))
 ROWS = (
     ("throughput_qps", "req/s"),
     ("rtf_mean", "RTF"),
@@ -90,7 +105,7 @@ def healthy(port):
         return False
 
 
-def run_order(trees, out):
+def run_order(trees, out, cells):
     out.mkdir(parents=True, exist_ok=True)
     servers = []
     for gpu, (tree, port) in enumerate(zip(trees, PORTS)):
@@ -106,7 +121,7 @@ def run_order(trees, out):
             assert all(server.poll() is None for server in servers), "a server exited before it was healthy"
             assert time.monotonic() < deadline, "servers not healthy in 30 minutes"
             time.sleep(5)
-        for cell, flags, is_stream in CELLS:
+        for cell, flags, is_stream in cells:
             clients = [
                 subprocess.Popen(
                     ["taskset", "-c", CPUS[gpu], "python3", "-u", "-m", "benchmarks.eval.benchmark_tts_seedtts",
@@ -144,8 +159,8 @@ def summary(path):
 def report(out, names):
     print(f"| order | cell | metric | {names[0]} | {names[1]} | change |")
     print("| --- | --- | --- | --- | --- | --- |")
-    for order, gpus in (("a", (0, 1)), ("b", (1, 0))):
-        for cell, _, _ in CELLS:
+    for order, gpus, cells in (("a", (0, 1), CELLS), ("b", (1, 0), CELLS_B)):
+        for cell, _, _ in cells:
             first = summary(out / order / f"gpu{gpus[0]}" / cell / "speed_results.json")
             second = summary(out / order / f"gpu{gpus[1]}" / cell / "speed_results.json")
             for key, label in ROWS:
@@ -156,6 +171,6 @@ def report(out, names):
 
 if __name__ == "__main__":
     first_tree, second_tree, out_dir = sys.argv[1], sys.argv[2], Path(sys.argv[3])
-    run_order((first_tree, second_tree), out_dir / "a")
-    run_order((second_tree, first_tree), out_dir / "b")
+    run_order((first_tree, second_tree), out_dir / "a", CELLS)
+    run_order((second_tree, first_tree), out_dir / "b", CELLS_B)
     report(out_dir, (Path(first_tree).name, Path(second_tree).name))
