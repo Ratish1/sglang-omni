@@ -34,13 +34,16 @@ PASSES = {
 }
 
 
-def run_arm(out: Path, round_index: int, card: int, arm: str) -> None:
+def run_arm(
+    out: Path, round_index: int, card: int, arm: str, label: str | None = None
+) -> None:
     from benchmarks.eval.asr_profiling import (
         start_request_profile,
         stop_request_profile,
     )
 
-    arm_dir = out / f"r{round_index}_card{card}_{arm}"
+    label = label or arm
+    arm_dir = out / f"r{round_index}_card{card}_{label}"
     arm_dir.mkdir(parents=True, exist_ok=True)
     port = SERVER_PORT + 1000 * round_index + 200 * card
     server = pair_check.serve(
@@ -54,7 +57,7 @@ def run_arm(out: Path, round_index: int, card: int, arm: str) -> None:
     base_url = f"http://127.0.0.1:{port}"
     try:
         for name, bench_args in PASSES.items():
-            run_id = f"{arm}_r{round_index}_{name}"
+            run_id = f"{label}_r{round_index}_{name}"
             start_request_profile(base_url, run_id, str(arm_dir / f"events_{name}"))
             rc = pair_check.benchmark(
                 card,
@@ -66,7 +69,7 @@ def run_arm(out: Path, round_index: int, card: int, arm: str) -> None:
                 arm_dir / f"{name}.log",
             )
             stop_request_profile(base_url, run_id)
-            pair_check.log(out, f"round {round_index} card {card} {arm} {name} rc {rc}")
+            pair_check.log(out, f"round {round_index} card {card} {label} {name} rc {rc}")
     finally:
         pair_check.stop(card, server)
 
