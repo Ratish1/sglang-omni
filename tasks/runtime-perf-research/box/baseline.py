@@ -225,11 +225,19 @@ def main() -> None:
     parser.add_argument("--pyspy-delay", type=float, default=8.0)
     parser.add_argument("--pyspy-seconds", type=float, default=15.0)
     parser.add_argument("--serve-extra", default="")
+    parser.add_argument("--probe", action="store_true",
+                        help="boot with hop_probe (queue hops, loop lag, GC) writing to <out>/probe/p.<pid>.jsonl")
     args = parser.parse_args()
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
     spec = MODELS[args.model]
     env = dict(os.environ, PYTHONPATH=str(TREE), SGLANG_OMNI_STRICT_PORT="1")
+    if args.probe:
+        (out / "probe").mkdir(exist_ok=True)
+        env.update(PYTHONPATH=f"{Path(__file__).resolve().parent / 'hop_probe'}:{TREE}",
+                   OMNI_HOP_PROBE=str(out / "probe" / "p"))
+    else:
+        pass
     identity = subprocess.run(
         "git rev-parse HEAD HEAD:sglang_omni; git diff --quiet HEAD -- sglang_omni || echo WORKING_TREE_DIRTY",
         shell=True, cwd=TREE, capture_output=True, text=True,
@@ -245,7 +253,8 @@ def main() -> None:
         *shlex.split(spec["placement"].format(card=args.card)), *shlex.split(args.serve_extra),
     ]
     (out / "identity.txt").write_text(
-        f"tree {TREE}\n{identity}imports {imported}serve {shlex.join(serve)}\nloadavg {os.getloadavg()}\n",
+        f"tree {TREE}\n{identity}imports {imported}serve {shlex.join(serve)}\npythonpath {env['PYTHONPATH']}\n"
+        f"loadavg {os.getloadavg()}\n",
         encoding="utf-8",
     )
     spawned = time.monotonic()
