@@ -7,7 +7,8 @@ talker and code2wav on its second card) and gets the CI's request shape: the fir
 and audio in, text and audio out, greedy, 256 tokens, c16. Chains on different pairs run at the same time. After the
 arms, one Qwen3-ASR server on the score card transcribes each arm's audio and scores it against the arm's text as the
 CI does. The client and the scoring run in each tree's own
-code (this file in its --client and --score modes). --model serves another checkpoint in the same shape. Writes <out>/<arm>/videoamme.json, <out>/<arm>/wer.json and
+code (this file in its --client and --score modes). --model serves another checkpoint in the same shape, and
+--concurrency sends at another concurrency. Writes <out>/<arm>/videoamme.json, <out>/<arm>/wer.json and
 <out>/summary.json.
 """
 
@@ -63,7 +64,7 @@ def log(out: Path, message: str) -> None:
         handle.write(line + "\n")
 
 
-def client(port: int, out: Path, seed: int | None) -> None:
+def client(port: int, out: Path, seed: int | None, concurrency: int) -> None:
     from benchmarks.eval.benchmark_omni_videoamme import run_videoamme_eval
     from benchmarks.eval.benchmark_omni_videomme import VideoEvalConfig
 
@@ -73,7 +74,7 @@ def client(port: int, out: Path, seed: int | None) -> None:
         port=port,
         max_samples=MAX_SAMPLES,
         max_tokens=MAX_TOKENS,
-        max_concurrency=CONCURRENCY,
+        max_concurrency=concurrency,
         output_dir=str(out),
         repo_id=REPO_ID,
         video_fps=2,
@@ -179,6 +180,7 @@ def run_arm(
     seed: int | None,
     is_code2wav_dump: bool,
     model: str,
+    concurrency: int,
 ) -> int:
     arm_out = out / arm
     arm_out.mkdir(parents=True, exist_ok=True)
@@ -204,6 +206,8 @@ def run_arm(
                 str(port),
                 "--out",
                 str(arm_out),
+                "--concurrency",
+                str(concurrency),
                 *([] if seed is None else ["--seed", str(seed)]),
             ],
             cwd=arm_tree,
@@ -240,9 +244,10 @@ def main() -> None:
         help="save every request's talker codes and served audio (code2wav_dump/sitecustomize.py)",
     )
     parser.add_argument("--model", default=MODEL, help="checkpoint every arm serves")
+    parser.add_argument("--concurrency", type=int, default=CONCURRENCY)
     args = parser.parse_args()
     if args.client:
-        client(args.port, args.out, args.seed)
+        client(args.port, args.out, args.seed, args.concurrency)
         return
     elif args.score:
         score(args.port, args.out)
@@ -258,7 +263,15 @@ def main() -> None:
 
     def run_chain(chain_arms: list[str], cards: tuple[int, int]) -> list[int]:
         return [
-            run_arm(args.out, arm, cards, args.seed, args.code2wav_dump, args.model)
+            run_arm(
+                args.out,
+                arm,
+                cards,
+                args.seed,
+                args.code2wav_dump,
+                args.model,
+                args.concurrency,
+            )
             for arm in chain_arms
         ]
 
