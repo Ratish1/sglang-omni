@@ -60,6 +60,8 @@ TREES = {
     "cim": ("cim_0d422f290", "origin", "0d422f290b416f1881ed56f006884822c293096d"),
     "fcv": ("fcv_5a6430a8e", "origin", "5a6430a8e6e2bde08c57465d275e60ae9445eb89"),
     "fcw": ("fcw_d24f347a7", "origin", "d24f347a7a1fdec35ade8984f231827decc5fce7"),
+    "upk": ("upk_272845a9c", "upstream", "272845a9cd2f6b0ed5bc2bc3c541e30f9d6e60c2"),
+    "phr": ("phr_51cfa3f6c", "origin", "51cfa3f6c1daea86bd6e74249420be990904b316"),
 }
 # note (ratish): every arm is measured by one client and scored by one ASR server, both from main; from the SGLang
 # 0.5.22 stack on (057d97629) a tree from before it no longer runs, and main's client records each chunk's length.
@@ -83,6 +85,8 @@ ARMS = {
     "cim": ("cim", [], [0.7769]),
     "fcv": ("fcv", [], [0.7769]),
     "fcw": ("fcw", [], [0.7769]),
+    "upk": ("upk", [], [0.7769]),
+    "phr": ("phr", [], [0.7769]),
 }
 # arm: benchmark args every pass of the arm adds
 ARM_BENCH_ARGS: dict[str, list[str]] = {}
