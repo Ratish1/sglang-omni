@@ -7,8 +7,9 @@ One server from this tree, placed on --card with the stage gpu flags, healthy be
 
   clean   the model's SeedTTS EN benchmark over the full corpus, nothing else attached
   events  the same with the request event recorder on (/start_request_profile into events/c<load>)
-  pyspy   the same with py-spy record (--threads --idle --nonblocking, 100 Hz) on every server process for
-          --pyspy-seconds, starting --pyspy-delay seconds into the benchmark
+  pyspy   the same with py-spy record (--threads --nonblocking, 100 Hz, running threads only) on every server
+          process for --pyspy-seconds, starting --pyspy-delay seconds into the benchmark
+  pyspygil  the same with --gil (one sample per tick, the interpreter lock holder)
 
 Every pass also stores the CPU seconds of every server thread at its start and end (thread_cpu.json) and the
 benchmark window. Identity (head, tree hash, dirty check, imported file) goes to identity.txt before the boot.
@@ -188,12 +189,18 @@ def run_pass(args, server: subprocess.Popen, load: int, kind: str, warmup: bool)
             stdout=bench_log, stderr=subprocess.STDOUT,
         )
         spies = []
-        if kind == "pyspy":
+        if kind in ("pyspy", "pyspygil"):
             time.sleep(args.pyspy_delay)
+            # note (ratish): without --idle py-spy keeps only samples of running threads, so samples over rate times
+            # duration is a thread's busy share; --gil keeps only the lock holder's sample (ownership shares)
+            mode = ["--gil"] if kind == "pyspygil" else []
+            (out / "pyspy.json").write_text(json.dumps({"rate": 100, "duration": int(args.pyspy_seconds),
+                                                        "mode": kind}), encoding="utf-8")
             for pid in group_pids(server.pid):
                 spies.append(subprocess.Popen(
                     ["py-spy", "record", "--pid", str(pid), "--rate", "100", "--duration", str(int(args.pyspy_seconds)),
-                     "--threads", "--idle", "--nonblocking", "--format", "raw", "--output", str(out / f"pyspy_{pid}.txt")],
+                     "--threads", "--nonblocking", *mode, "--format", "raw",
+                     "--output", str(out / f"pyspy_{pid}.txt")],
                     stdout=subprocess.DEVNULL, stderr=open(out / f"pyspy_{pid}.err", "w"),
                 ))
         else:

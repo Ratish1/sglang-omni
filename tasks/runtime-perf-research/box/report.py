@@ -9,7 +9,8 @@ Per cell:
            dumps; threads under 1 % are folded
   events   request event recorder: per request, the gap between consecutive request-level events (chunk events
            excluded), median and p90 over requests; per chunk, sent to received latency per edge and transport
-  pyspy    per sampled thread, the share of samples that are not idle, and the top functions of the busy samples
+  pyspy    per sampled thread, its busy share (running samples over rate x duration) or, for a --gil pass, its share
+           of lock-holder samples, and the top functions of its samples
 """
 
 import argparse
@@ -20,8 +21,6 @@ import statistics
 from pathlib import Path
 
 CHUNK_EVENTS = {"stage_stream_chunk_sent", "stage_stream_chunk_received", "coordinator_stream_received"}
-IDLE_FUNCTIONS = ("select", "epoll_wait", "poll", "wait", "_wait_for_tstate_lock", "get", "sleep", "recv",
-                  "accept", "_recv_msg", "read", "readinto", "_worker", "run_forever", "_run_once", "acquire")
 
 
 def pct(values, q):
@@ -212,38 +211,40 @@ def events_summary(cell: Path, top: int) -> None:
 
 
 def pyspy_summary(cell: Path, top: int) -> None:
+    """py-spy without --idle keeps only running threads' samples: samples over rate x duration is a thread's busy
+    share. With --gil each tick names the lock holder: a thread's samples over all samples is its ownership share.
+    Both checked on a known-answer script (one busy, one sleeping thread) on the box image."""
+    meta_path = cell / "pyspy.json"
+    if not meta_path.exists():
+        return
+    else:
+        pass
+    meta = json.loads(meta_path.read_text())
+    ticks = meta["rate"] * meta["duration"]
     for path in sorted(cell.glob("pyspy_*.txt")):
-        threads = collections.defaultdict(lambda: [0, 0, collections.Counter()])
+        threads = collections.defaultdict(lambda: [0, collections.Counter()])
         for line in path.open():
-            line = line.rstrip("\n")
-            stack, _, count = line.rpartition(" ")
+            stack, _, count = line.rstrip("\n").rpartition(" ")
             if not count.isdigit():
                 continue
             else:
                 pass
             frames = stack.split(";")
             thread, frames = frames[0], frames[1:]
-            leaf = frames[-1].split(" (")[0] if frames else ""
             stats = threads[thread]
             stats[0] += int(count)
-            if leaf not in IDLE_FUNCTIONS:
-                stats[1] += int(count)
-                seen = set()
-                for frame in frames:
-                    function = frame.split(" (")[0] + " (" + frame.split("/")[-1] if "/" in frame else frame
-                    if function not in seen:
-                        stats[2][function] += int(count)
-                        seen.add(function)
-            else:
-                pass
-        busy_threads = sorted(threads.items(), key=lambda item: -item[1][1])
-        print(f"  pyspy {path.name}")
-        for thread, (samples, busy, functions) in busy_threads[:6]:
-            if busy == 0:
-                continue
-            else:
-                pass
-            print(f"    {thread[:70]}: busy {100 * busy / samples:.0f}% of {samples} samples")
+            seen = set()
+            for frame in frames:
+                function = frame.split(" (")[0] + " (" + frame.split("/")[-1] if "/" in frame else frame
+                if function not in seen:
+                    stats[1][function] += int(count)
+                    seen.add(function)
+        total = sum(samples for samples, _ in threads.values())
+        print(f"  {meta['mode']} {path.name} ({total} samples, {ticks} ticks)")
+        for thread, (samples, functions) in sorted(threads.items(), key=lambda item: -item[1][0])[:8]:
+            share = samples / ticks if meta["mode"] == "pyspy" else samples / max(total, 1)
+            label = "busy" if meta["mode"] == "pyspy" else "holds the lock in"
+            print(f"    {thread[:70]}: {label} {100 * share:.0f}%")
             for function, count in functions.most_common(top):
                 print(f"        {100 * count / samples:5.1f}%  {function[:110]}")
 
