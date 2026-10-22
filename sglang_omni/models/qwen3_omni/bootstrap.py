@@ -90,29 +90,41 @@ def create_thinker_scheduler(
 
     output_proc = SGLangOutputProcessor()
 
+    # note (ratish): a session turn's prefill does not write its rows to the prompt hidden store,
+    # so its talker keeps zeros at multimodal prompt rows.
+    capture_prompt_hidden_states = speech_enabled and execution_mode == "request"
     if execution_mode == "session":
-        model_runner = QwenSessionThinkerModelRunner(model_worker, output_proc)
+        model_runner = QwenSessionThinkerModelRunner(
+            model_worker, output_proc, capture_prompt_hidden_states=False
+        )
     elif speech_enabled and prefill_graph_backend != CudaGraphBackend.BREAKABLE:
-        model_runner = ThinkerModelRunner(model_worker, output_proc)
+        model_runner = ThinkerModelRunner(
+            model_worker,
+            output_proc,
+            capture_prompt_hidden_states=capture_prompt_hidden_states,
+        )
     else:
-        model_runner = Qwen3OmniThinkerModelRunner(model_worker, output_proc)
+        model_runner = Qwen3OmniThinkerModelRunner(
+            model_worker,
+            output_proc,
+            capture_prompt_hidden_states=capture_prompt_hidden_states,
+        )
 
     tokenizer = get_tokenizer(
         model_config.model_path,
         trust_remote_code=True,
     )
     thinker_config = model_config.hf_config.thinker_config
-    # note (ratish): a session turn reuses its slot's committed KV, so earlier turns' prompt rows
-    # cannot be computed again; only a request computes every row the talker reads.
     request_builder, result_adapter = make_thinker_scheduler_adapters(
         tokenizer=tokenizer,
         vocab_size=model_config.vocab_size,
         thinker_config=thinker_config,
-        capture_prompt_hidden_states=speech_enabled and execution_mode == "request",
+        capture_prompt_hidden_states=capture_prompt_hidden_states,
     )
     # Note (Junnan Li): A session turn streams its tokens to the talker like any request; the session only owns the lifecycle.
     stream_output_builder = make_thinker_stream_output_builder(
-        speech_enabled=speech_enabled
+        speech_enabled=speech_enabled,
+        prompt_hidden_store=model_runner.prompt_hidden_store,
     )
     if execution_mode == "request":
         session_adapter = None

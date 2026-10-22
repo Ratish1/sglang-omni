@@ -1312,15 +1312,21 @@ def test_qwen_thinker_cuda_graph_capture_lifecycle(
     monkeypatch.setattr(
         thinker_model_runner,
         "ThinkerModelRunner",
-        lambda model_worker, output_proc: (
-            generic_runner_calls.append((model_worker, output_proc)) or object()
+        lambda model_worker, output_proc, *, capture_prompt_hidden_states: (
+            generic_runner_calls.append(
+                (model_worker, output_proc, capture_prompt_hidden_states)
+            )
+            or SimpleNamespace(prompt_hidden_store=object())
         ),
     )
     monkeypatch.setattr(
         qwen_thinker_runner,
         "Qwen3OmniThinkerModelRunner",
-        lambda model_worker, output_proc: (
-            qwen_runner_calls.append((model_worker, output_proc)) or object()
+        lambda model_worker, output_proc, *, capture_prompt_hidden_states: (
+            qwen_runner_calls.append(
+                (model_worker, output_proc, capture_prompt_hidden_states)
+            )
+            or SimpleNamespace(prompt_hidden_store=object())
         ),
     )
     monkeypatch.setattr(
@@ -1350,18 +1356,27 @@ def test_qwen_thinker_cuda_graph_capture_lifecycle(
     assert scheduler.result_adapter is ordinary_result_adapter
     assert scheduler.stream_output_builder is ordinary_stream_builder
     make_adapters.assert_called_once()
-    make_stream_builder.assert_called_once_with(speech_enabled=speech_enabled)
+    assert make_adapters.call_args.kwargs["capture_prompt_hidden_states"] is (
+        speech_enabled and execution_mode == "request"
+    )
+    make_stream_builder.assert_called_once_with(
+        speech_enabled=speech_enabled,
+        prompt_hidden_store=scheduler.model_runner.prompt_hidden_store,
+    )
     if execution_mode == "request":
         assert generic_runner_calls == (
-            [(model_worker, output_proc)] if speech_enabled else []
+            [(model_worker, output_proc, True)] if speech_enabled else []
         )
         assert qwen_runner_calls == (
-            [] if speech_enabled else [(model_worker, output_proc)]
+            [] if speech_enabled else [(model_worker, output_proc, False)]
         )
         assert getattr(scheduler, "session_adapter", None) is None
         assert scheduler.enable_async_decode is True
     else:
         assert generic_runner_calls == qwen_runner_calls == []
+        session_runner.assert_called_once_with(
+            model_worker, output_proc, capture_prompt_hidden_states=False
+        )
         assert scheduler.model_runner is session_runner.return_value
         assert scheduler.session_adapter is session_adapter.return_value
 
@@ -1444,7 +1459,7 @@ def test_qwen_thinker_enables_and_attests_breakable_prefill_graphs(
     monkeypatch.setattr(
         request_builders,
         "make_thinker_stream_output_builder",
-        lambda *, speech_enabled: object(),
+        lambda *, speech_enabled, prompt_hidden_store: object(),
     )
     monkeypatch.setattr(
         sglang_backend,
@@ -1454,8 +1469,11 @@ def test_qwen_thinker_enables_and_attests_breakable_prefill_graphs(
     monkeypatch.setattr(
         qwen_thinker_runner,
         "Qwen3OmniThinkerModelRunner",
-        lambda model_worker, output_proc: (
-            qwen_runner_calls.append((model_worker, output_proc)) or object()
+        lambda model_worker, output_proc, *, capture_prompt_hidden_states: (
+            qwen_runner_calls.append(
+                (model_worker, output_proc, capture_prompt_hidden_states)
+            )
+            or SimpleNamespace(prompt_hidden_store=None)
         ),
     )
     monkeypatch.setattr(omni_scheduler, "OmniScheduler", SimpleNamespace)
@@ -1467,7 +1485,7 @@ def test_qwen_thinker_enables_and_attests_breakable_prefill_graphs(
     assert graph_init_workers == []
     assert attest_calls == [(model_worker.model_runner, False)]
     assert output_proc_kwargs == [{}]
-    assert qwen_runner_calls == [(model_worker, output_proc)]
+    assert qwen_runner_calls == [(model_worker, output_proc, True)]
     assert scheduler.server_args is server_args
 
 

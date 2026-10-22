@@ -1,100 +1,107 @@
 # SPDX-License-Identifier: Apache-2.0
-"""A request whose next stage reads its hidden states at chosen prompt positions: prefill copies
-those rows to pinned host memory as it computes them, and the request's prefix match stops below
-the first row it still owes."""
+"""The thinker's hidden states at multimodal prompt positions, kept per KV slot in pinned host
+memory as routed experts are, so a prefix hit returns the rows its cached KV was computed with."""
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+import collections
+import logging
+from dataclasses import dataclass
 
 import torch
 from sglang.srt.managers.schedule_batch import Req
+from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
+from sglang.srt.mem_cache.pool_host.common import (
+    ALLOC_MEMORY_FUNCS,
+    HostTensorAllocator,
+)
 
+logger = logging.getLogger(__name__)
 
-@dataclass(kw_only=True)
-class PromptHiddenCapture:
-    """The hidden states a request owes at its ascending prompt positions, as pinned host rows."""
-
-    positions: torch.Tensor
-    hidden_states: torch.Tensor | None = field(default=None, init=False)
-    is_received: torch.Tensor = field(init=False)
-    is_handed_off: bool = field(default=False, init=False)
-
-    def __post_init__(self) -> None:
-        self.is_received = torch.zeros(self.positions.shape, dtype=torch.bool)
-
-    def chunk_rows(self, prefix_length: int, extend_length: int) -> slice:
-        """The rows at the positions an extend of extend_length tokens after prefix_length
-        computes."""
-        bounds = torch.tensor([prefix_length, prefix_length + extend_length])
-        start, end = torch.searchsorted(self.positions, bounds).tolist()
-        return slice(start, end)
-
-    def is_owed_in(self, prefix_length: int, extend_length: int) -> bool:
-        rows = self.chunk_rows(prefix_length, extend_length)
-        return not self.is_handed_off and not bool(self.is_received[rows].all())
-
-    def first_owed_position(self) -> int | None:
-        """The first position whose row is owed, None once all are received or handed off."""
-        if self.is_handed_off or bool(self.is_received.all()):
-            return None
-        else:
-            return int(self.positions[~self.is_received][0])
-
-    def add_chunk(self, prefix_length: int, chunk_hidden_states: torch.Tensor) -> None:
-        """Copy the chunk's rows at the captured positions into the pinned host rows without
-        blocking; the stream orders the copy before the host reads the chunk's sampled token.
-        """
-        rows = self.chunk_rows(prefix_length, chunk_hidden_states.shape[0])
-        if rows.start == rows.stop:
-            return
-        else:
-            pass
-        if self.hidden_states is None:
-            self.hidden_states = torch.empty(
-                (self.positions.numel(), chunk_hidden_states.shape[1]),
-                dtype=chunk_hidden_states.dtype,
-                pin_memory=True,
-            )
-        else:
-            pass
-        offsets = (self.positions[rows] - prefix_length).to(
-            device=chunk_hidden_states.device
-        )
-        self.hidden_states[rows].copy_(
-            chunk_hidden_states.index_select(0, offsets), non_blocking=True
-        )
-        self.is_received[rows] = True
-
-    def take(self) -> torch.Tensor:
-        """The rows once every position is received; the request owes none afterwards."""
-        if not bool(self.is_received.all()):
-            raise RuntimeError(
-                "a prompt hidden row is missing when the next stage starts"
-            )
-        else:
-            pass
-        self.is_handed_off = True
-        return self.hidden_states
+BYTES_PER_GIB = 1 << 30
 
 
 class PromptHiddenRequest(Req):
-    """A request that owes the next stage prompt hidden states: its prefix match stops below the
-    first owed row, as a logprob start keeps the positions it reports out of the match.
-    """
+    """A request whose prefill writes the thinker's hidden states at its multimodal prompt
+    positions to the prompt hidden store."""
 
-    prompt_hidden: PromptHiddenCapture | None = None
+    prompt_hidden_positions: torch.Tensor
+    is_prompt_hidden_handed_off: bool = False
 
-    def _compute_max_prefix_len(  # noqa: leading-underscore  # the Req method it overrides
-        self, input_len: int
-    ) -> int:
-        max_prefix_len = super()._compute_max_prefix_len(input_len)
-        first_owed_position = (
-            None
-            if self.prompt_hidden is None
-            else self.prompt_hidden.first_owed_position()
+    def prompt_hidden_offsets(
+        self, prefix_length: int, extend_length: int
+    ) -> torch.Tensor:
+        """Offsets into an extend of extend_length tokens after prefix_length of the positions it
+        computes."""
+        bounds = torch.tensor([prefix_length, prefix_length + extend_length])
+        start, end = torch.searchsorted(self.prompt_hidden_positions, bounds).tolist()
+        return self.prompt_hidden_positions[start:end] - prefix_length
+
+
+@dataclass(kw_only=True)
+class StagedPromptHidden:
+    """One forward's rows and their KV slot ids on their way to pinned host memory."""
+
+    slot_ids: torch.Tensor
+    hidden_states: torch.Tensor
+    copy_done: torch.cuda.Event
+
+
+class PromptHiddenStore:
+    """Hidden-state rows indexed by KV slot id, read through the slots a request's KV holds."""
+
+    def __init__(
+        self,
+        *,
+        slot_count: int,
+        hidden_size: int,
+        dtype: torch.dtype,
+        req_to_token_pool: ReqToTokenPool,
+        device: str,
+    ) -> None:
+        self.hidden_states = ALLOC_MEMORY_FUNCS[device](
+            (slot_count, hidden_size),
+            dtype=dtype,
+            device="cpu",
+            pin_memory=True,
+            allocator=HostTensorAllocator(),
         )
-        if first_owed_position is None:
-            return max_prefix_len
-        else:
-            return min(max_prefix_len, first_owed_position)
+        self.req_to_token_pool = req_to_token_pool
+        self.device_module = torch.get_device_module(device)
+        self.staged: collections.deque[StagedPromptHidden] = collections.deque()
+        logger.info(
+            f"Prompt hidden store: {slot_count} slots of {hidden_size} {dtype}, "
+            f"{self.hidden_states.nbytes / BYTES_PER_GIB:.2f} GiB pinned"
+        )
+
+    def stage(self, slot_ids: torch.Tensor, hidden_states: torch.Tensor) -> None:
+        """Copy a forward's rows and their slot ids to host behind the forward on its stream."""
+        staged = StagedPromptHidden(
+            slot_ids=torch.empty(slot_ids.shape, dtype=slot_ids.dtype, pin_memory=True),
+            hidden_states=torch.empty(
+                hidden_states.shape, dtype=hidden_states.dtype, pin_memory=True
+            ),
+            copy_done=self.device_module.Event(),
+        )
+        staged.slot_ids.copy_(slot_ids, non_blocking=True)
+        staged.hidden_states.copy_(hidden_states, non_blocking=True)
+        staged.copy_done.record()
+        self.staged.append(staged)
+        self.store_copied(wait=False)
+
+    def store_copied(self, *, wait: bool) -> None:
+        """Write staged rows into their slots in forward order, so a reused slot keeps its last
+        forward's row."""
+        while self.staged and (wait or self.staged[0].copy_done.query()):
+            staged = self.staged.popleft()
+            staged.copy_done.synchronize()
+            self.hidden_states[staged.slot_ids] = staged.hidden_states
+
+    def read(self, request_pool_index: int, positions: torch.Tensor) -> torch.Tensor:
+        """The rows at a request's prompt positions, through the slots its KV holds now."""
+        req_to_token = self.req_to_token_pool.req_to_token
+        slot_ids = req_to_token[
+            request_pool_index, positions.to(req_to_token.device)
+        ].cpu()
+        self.store_copied(wait=True)
+        return self.hidden_states[slot_ids]

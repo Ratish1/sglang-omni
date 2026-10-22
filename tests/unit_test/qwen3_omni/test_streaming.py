@@ -35,8 +35,8 @@ from sglang_omni.proto import OmniRequest, StagePayload
 from sglang_omni.scheduling.message import IncomingMessage, OutgoingMessage
 from sglang_omni.scheduling.sglang_backend import SGLangOutputProcessor
 from sglang_omni.scheduling.sglang_backend.prompt_hidden import (
-    PromptHiddenCapture,
     PromptHiddenRequest,
+    PromptHiddenStore,
 )
 from sglang_omni.scheduling.sglang_backend.request_data import SGLangARRequestData
 from sglang_omni.scheduling.types import SchedulerOutput, SchedulerRequest
@@ -148,7 +148,9 @@ def test_qwen_thinker_stream_builder_sends_the_token_id_to_each_target(
     stream: bool,
     expected_targets: list[str],
 ):
-    builder = make_thinker_stream_output_builder(speech_enabled=speech_enabled)
+    builder = make_thinker_stream_output_builder(
+        speech_enabled=speech_enabled, prompt_hidden_store=None
+    )
     req_data = SimpleNamespace(
         req=SimpleNamespace(inflight_middle_chunks=0),
         stage_payload=thinker_stage_payload(output_modalities, stream=stream),
@@ -173,7 +175,9 @@ def test_qwen_thinker_stream_builder_emits_nothing_without_an_answer_token(
     token_id: int | None,
     inflight_middle_chunks: int,
 ):
-    builder = make_thinker_stream_output_builder(speech_enabled=True)
+    builder = make_thinker_stream_output_builder(
+        speech_enabled=True, prompt_hidden_store=None
+    )
     req_data = SimpleNamespace(
         req=SimpleNamespace(inflight_middle_chunks=inflight_middle_chunks),
         stage_payload=thinker_stage_payload(["text", "audio"]),
@@ -185,13 +189,23 @@ def test_qwen_thinker_stream_builder_emits_nothing_without_an_answer_token(
 @pytest.mark.accelerator
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="pinned host rows need CUDA")
 def test_the_first_talker_chunk_carries_the_prompt_rows_once():
-    builder = make_thinker_stream_output_builder(speech_enabled=True)
+    req_to_token = torch.tensor([[0, 6, 0, 0, 7]], dtype=torch.int32, device="cuda")
+    store = PromptHiddenStore(
+        slot_count=8,
+        hidden_size=2,
+        dtype=torch.float32,
+        req_to_token_pool=SimpleNamespace(req_to_token=req_to_token),
+        device="cuda",
+    )
+    hidden_states = torch.arange(4.0, device="cuda").view(2, 2)
+    store.stage(torch.tensor([6, 7], device="cuda"), hidden_states)
+    builder = make_thinker_stream_output_builder(
+        speech_enabled=True, prompt_hidden_store=store
+    )
     req = object.__new__(PromptHiddenRequest)
     req.inflight_middle_chunks = 0
-    req.prompt_hidden = PromptHiddenCapture(positions=torch.tensor([1, 4]))
-    hidden_states = torch.arange(10.0, device="cuda").view(5, 2)
-    req.prompt_hidden.add_chunk(0, hidden_states)
-    torch.cuda.synchronize()
+    req.kv = SimpleNamespace(req_pool_idx=0)
+    req.prompt_hidden_positions = torch.tensor([1, 4])
     req_data = SimpleNamespace(
         req=req, stage_payload=thinker_stage_payload(["text", "audio"])
     )
@@ -203,7 +217,7 @@ def test_the_first_talker_chunk_carries_the_prompt_rows_once():
 
     assert decode_message.data.tolist() == [11]
     assert decode_message.metadata == {"token_id": 11}
-    assert torch.equal(talker_message.data, hidden_states[[1, 4]].cpu())
+    assert torch.equal(talker_message.data, hidden_states.cpu())
     assert talker_message.metadata == {
         "token_id": 11,
         "prompt_hidden_positions": [1, 4],
@@ -230,7 +244,9 @@ def text_projected(*token_ids: int) -> torch.Tensor:
 
 
 def test_qwen_talker_conditions_on_streamed_token_ids():
-    builder = make_thinker_stream_output_builder(speech_enabled=True)
+    builder = make_thinker_stream_output_builder(
+        speech_enabled=True, prompt_hidden_store=None
+    )
     req_data = SimpleNamespace(
         req=SimpleNamespace(inflight_middle_chunks=0),
         stage_payload=thinker_stage_payload(["audio"], stream=False),

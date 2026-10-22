@@ -73,17 +73,16 @@ def test_empty_model_inputs_are_not_replaced_by_the_flat_state(monkeypatch):
 
 
 @pytest.mark.parametrize(
-    ("capture_prompt_hidden_states", "output_modalities", "prompt_ids", "owed"),
+    ("capture_prompt_hidden_states", "output_modalities", "prompt_ids", "positions"),
     [
         (True, ["audio"], [4, 55, 77, 66, 5], [1, 2, 3]),
-        (True, None, [4, 77, 5], [1]),
-        (True, ["text"], [4, 77, 5], None),
+        (True, ["text"], [4, 77, 5], [1]),
         (False, ["audio"], [4, 77, 5], None),
         (True, ["audio"], [4, 5], None),
     ],
 )
-def test_a_multimodal_speech_request_owes_the_talker_its_prompt_rows(
-    monkeypatch, capture_prompt_hidden_states, output_modalities, prompt_ids, owed
+def test_every_request_with_media_writes_its_prompt_rows_on_a_speech_server(
+    monkeypatch, capture_prompt_hidden_states, output_modalities, prompt_ids, positions
 ):
     patch_sampling_validation(monkeypatch)
     request_builder, _ = make_thinker_scheduler_adapters(
@@ -97,16 +96,14 @@ def test_a_multimodal_speech_request_owes_the_talker_its_prompt_rows(
     payload = make_qwen_payload(
         make_qwen_state(prompt={"input_ids": torch.tensor(prompt_ids)})
     )
-    payload.request.metadata = (
-        {} if output_modalities is None else {"output_modalities": output_modalities}
-    )
+    payload.request.metadata = {"output_modalities": output_modalities}
 
     req = request_builder(payload).req
 
-    if owed is None:
+    if positions is None:
         assert not isinstance(req, PromptHiddenRequest)
     else:
-        assert req.prompt_hidden.positions.tolist() == owed
+        assert req.prompt_hidden_positions.tolist() == positions
 
 
 def test_nested_non_dict_model_inputs_fail_loudly(monkeypatch):

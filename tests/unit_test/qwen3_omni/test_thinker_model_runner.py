@@ -12,8 +12,8 @@ from sglang.srt.model_executor.forward_context import (
 from sglang_omni.model_runner.base import ModelRunner
 from sglang_omni.model_runner.thinker_model_runner import ThinkerModelRunner
 from sglang_omni.scheduling.sglang_backend.prompt_hidden import (
-    PromptHiddenCapture,
     PromptHiddenRequest,
+    PromptHiddenStore,
 )
 
 
@@ -156,9 +156,9 @@ def test_a_capturing_omni_forward_hands_the_captured_layer_to_the_logits():
     assert result.logits_output is captured
 
 
-def owing_request(positions: list[int]) -> PromptHiddenRequest:
+def multimodal_request(positions: list[int]) -> PromptHiddenRequest:
     request = object.__new__(PromptHiddenRequest)
-    request.prompt_hidden = PromptHiddenCapture(positions=torch.tensor(positions))
+    request.prompt_hidden_positions = torch.tensor(positions)
     return request
 
 
@@ -170,12 +170,12 @@ def owing_request(positions: list[int]) -> PromptHiddenRequest:
         (4, 3, CaptureHiddenMode.NULL),
     ],
 )
-def test_only_a_prefill_chunk_holding_owed_rows_captures_hidden_states(
+def test_only_a_prefill_chunk_computing_multimodal_rows_captures_hidden_states(
     prefix_length: int, extend_length: int, expected_mode: CaptureHiddenMode
 ) -> None:
     runner = ThinkerModelRunner.__new__(ThinkerModelRunner)
     schedule_batch = SimpleNamespace(
-        reqs=[SimpleNamespace(), owing_request([3])],
+        reqs=[SimpleNamespace(), multimodal_request([3])],
         prefix_lens=[0, prefix_length],
         extend_lens=[4, extend_length],
     )
@@ -188,20 +188,37 @@ def test_only_a_prefill_chunk_holding_owed_rows_captures_hidden_states(
 
 @pytest.mark.accelerator
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="pinned host rows need CUDA")
-def test_a_capturing_prefill_hands_each_request_the_rows_at_its_positions() -> None:
+def test_a_capturing_prefill_stores_each_multimodal_row_at_its_kv_slot() -> None:
+    req_to_token = torch.zeros((1, 6), dtype=torch.int32, device="cuda")
     runner = ThinkerModelRunner.__new__(ThinkerModelRunner)
-    speech = owing_request([3, 5])
+    runner.prompt_hidden_store = PromptHiddenStore(
+        slot_count=16,
+        hidden_size=2,
+        dtype=torch.float32,
+        req_to_token_pool=SimpleNamespace(req_to_token=req_to_token),
+        device="cuda",
+    )
     schedule_batch = SimpleNamespace(
-        reqs=[SimpleNamespace(), speech], prefix_lens=[0, 3], extend_lens=[2, 3]
+        reqs=[SimpleNamespace(), multimodal_request([3, 5])],
+        prefix_lens=[0, 3],
+        extend_lens=[2, 3],
     )
     hidden_states = torch.arange(10.0, device="cuda").view(5, 2)
+    out_cache_loc = torch.tensor([10, 11, 12, 13, 14], device="cuda")
 
     runner.post_prefill(
         SimpleNamespace(logits_output=SimpleNamespace(hidden_states=hidden_states)),
-        SimpleNamespace(capture_hidden_mode=CaptureHiddenMode.FULL),
+        SimpleNamespace(
+            capture_hidden_mode=CaptureHiddenMode.FULL,
+            out_cache_loc=out_cache_loc,
+            out_cache_loc_virtual=None,
+        ),
         schedule_batch,
         [],
     )
-    torch.cuda.synchronize()
+    req_to_token[0, 3:6] = out_cache_loc[2:].to(torch.int32)
 
-    assert torch.equal(speech.prompt_hidden.take(), hidden_states[[2, 4]].cpu())
+    assert torch.equal(
+        runner.prompt_hidden_store.read(0, torch.tensor([3, 5])),
+        hidden_states[[2, 4]].cpu(),
+    )
