@@ -29,6 +29,9 @@ import threading
 import time
 
 PREFIX = os.environ.get("OMNI_HOP_PROBE", "")
+# OMNI_HOP_PROBE_QUEUES=0 drops the queue records, whose tuples live up to a second and would add their own
+# promotions to a garbage collection frequency measurement
+QUEUE_RECORDS = os.environ.get("OMNI_HOP_PROBE_QUEUES", "1") == "1"
 # what-if, not a probe: OMNI_BIND_THREAD_DEVICE=1 makes every new thread bind the CUDA device its creator had current,
 # as the stage scheduler thread does (pipeline/stage/runtime.py:278), to check that unbound workers cause the context
 # a stage process placed off device 0 opens on device 0
@@ -56,6 +59,10 @@ def record(item):
 def record_queue(ns, label, op, message):
     """A queue record as a tuple, the cheapest form on the hot path: ns, queue, op, thread, request, type, target,
     chunk id, source stage."""
+    if not QUEUE_RECORDS:
+        return
+    else:
+        pass
     data = getattr(message, "data", None)
     item = (
         ns, label, op, threading.current_thread().name, getattr(message, "request_id", None),
