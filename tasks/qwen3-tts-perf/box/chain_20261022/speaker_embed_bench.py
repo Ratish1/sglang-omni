@@ -1,16 +1,18 @@
 """The Qwen3-TTS speaker embedding of SeedTTS EN references as serving computes it, on the tree on PYTHONPATH (one arm
 per process): the prompt frontend loaded and its speaker encoder graphs captured at the reference encoder's bucket
 ladder, each reference resampled to the encoder's rate as the request builder does. Per reference: the wall time of
-embed() to a synchronized embedding (median of the repeats); the embeddings are saved, so two trees compare with
---compare (cosine similarity and max |delta|).
+embed() to a synchronized embedding (its first call and the median of the repeats); the embeddings are saved, so two
+trees compare with --compare (cosine similarity and max |delta|). --meta takes the references of a long-reference
+list instead of SeedTTS EN.
 
-usage: PYTHONPATH=<tree> python3 speaker_embed_bench.py OUT.pt [--card 3] [--references 64] [--repeats 20]
+usage: PYTHONPATH=<tree> python3 speaker_embed_bench.py OUT.pt [--card 3] [--references 64] [--repeats 20] [--meta L]
        python3 speaker_embed_bench.py --compare A.pt B.pt
 """
 
 import argparse
 import statistics
 import time
+from pathlib import Path
 
 import librosa
 import soundfile
@@ -33,6 +35,7 @@ def main() -> None:
     parser.add_argument("--references", type=int, default=64)
     parser.add_argument("--repeats", type=int, default=20)
     parser.add_argument("--compare", nargs=2)
+    parser.add_argument("--meta", type=Path)
     args = parser.parse_args()
     if args.compare:
         first, second = (torch.load(path) for path in args.compare)
@@ -56,12 +59,17 @@ def main() -> None:
     runner.capture(DEFAULT_QWEN3_TTS_REFERENCE_ENCODER_BUCKET_FRAMES, tokenizer.model.encode_downsample_rate)
     print(f"speaker encoder graphs: {runner.stats()}")
     rate = frontend.speaker_encoder_sample_rate
-    samples = load_seedtts_samples(SEEDTTS_DATASET_ID, args.references, split="en")
+    if args.meta is None:
+        references = [sample.ref_audio for sample in load_seedtts_samples(SEEDTTS_DATASET_ID, args.references, split="en")]
+    else:
+        lines = [line for line in args.meta.read_text().splitlines() if line]
+        references = sorted({str(args.meta.parent / line.split("|")[2]) for line in lines})
     embeddings = []
     medians_ms = []
+    first_ms = []
     with torch.inference_mode():
-        for sample in samples:
-            audio, source_rate = soundfile.read(sample.ref_audio, dtype="float32")
+        for reference in references:
+            audio, source_rate = soundfile.read(reference, dtype="float32")
             waveform = librosa.resample(audio, orig_sr=source_rate, target_sr=rate) if source_rate != rate else audio
             times_ms = []
             for _ in range(args.repeats):
@@ -71,11 +79,17 @@ def main() -> None:
                 torch.cuda.synchronize(device)
                 times_ms.append(1000 * (time.perf_counter() - start))
             embeddings.append(embedding.float().cpu())
-            medians_ms.append(statistics.median(times_ms))
+            medians_ms.append(statistics.median(times_ms[1:]))
+            first_ms.append(times_ms[0])
+            if args.meta is not None:
+                print(f"{Path(reference).name}: {len(waveform)} samples, first {times_ms[0]:.1f} ms, then {medians_ms[-1]:.1f} ms")
+            else:
+                pass
     median_ms = statistics.median(medians_ms)
     print(
-        f"embed wall ms over {len(samples)} references: median {median_ms:.3f}, "
-        f"min {min(medians_ms):.3f}, max {max(medians_ms):.3f}; replays {runner.replays}, misses {runner.misses}"
+        f"embed wall ms over {len(references)} references: median {median_ms:.3f}, "
+        f"min {min(medians_ms):.3f}, max {max(medians_ms):.3f}; first calls median {statistics.median(first_ms):.3f}, "
+        f"max {max(first_ms):.3f}; replays {runner.replays}, misses {runner.misses}"
     )
     torch.save({"embeddings": torch.stack(embeddings), "median_ms": median_ms}, args.out)
 
