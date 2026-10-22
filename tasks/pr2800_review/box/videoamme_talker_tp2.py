@@ -64,7 +64,10 @@ def log(out: Path, message: str) -> None:
         handle.write(line + "\n")
 
 
-def client(port: int, out: Path, seed: int | None, concurrency: int) -> None:
+def client(
+    port: int, out: Path, seed: int | None, concurrency: int, sample_ids: list[str] | None
+) -> None:
+    from benchmarks.dataset.videomme import load_videoamme_samples
     from benchmarks.eval.benchmark_omni_videoamme import run_videoamme_eval
     from benchmarks.eval.benchmark_omni_videomme import VideoEvalConfig
 
@@ -86,7 +89,12 @@ def client(port: int, out: Path, seed: int | None, concurrency: int) -> None:
         timeout_s=500,
         seed=seed,
     )
-    results = asyncio.run(run_videoamme_eval(config, compute_wer=False))
+    samples = load_videoamme_samples(MAX_SAMPLES, repo_id=REPO_ID)
+    if sample_ids:
+        samples = [sample for sample in samples if sample.sample_id in sample_ids]
+    else:
+        pass
+    results = asyncio.run(run_videoamme_eval(config, samples=samples, compute_wer=False))
     (out / "videoamme.json").write_text(json.dumps(results, indent=1))
 
 
@@ -245,9 +253,16 @@ def main() -> None:
     )
     parser.add_argument("--model", default=MODEL, help="checkpoint every arm serves")
     parser.add_argument("--concurrency", type=int, default=CONCURRENCY)
+    parser.add_argument("--sample-ids", help="client mode: send only these comma-separated samples")
     args = parser.parse_args()
     if args.client:
-        client(args.port, args.out, args.seed, args.concurrency)
+        client(
+            args.port,
+            args.out,
+            args.seed,
+            args.concurrency,
+            args.sample_ids.split(",") if args.sample_ids else None,
+        )
         return
     elif args.score:
         score(args.port, args.out)
