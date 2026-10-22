@@ -217,21 +217,19 @@ def run_pass(args, server: subprocess.Popen, load: int, kind: str, warmup: bool)
         )
     else:
         pass
+    extra = shlex.split(args.bench_extra)
     if kind == "clean" and args.bench_repeats > 1 and args.model == "asr":
         command = bench_command(args.model, args.port, load, out / "bench", warmup, repeats=args.bench_repeats,
-                                bench=args.bench, meta=args.meta, asr_dataset=args.asr_dataset)
+                                bench=args.bench, meta=args.meta, asr_dataset=args.asr_dataset) + extra
     elif kind == "clean" and args.bench_repeats > 1:
         commands = [bench_command(args.model, args.port, load, out / "bench" / f"rep{index}", warmup and index == 0,
-                                  bench=args.bench, meta=args.meta, asr_dataset=args.asr_dataset)
-                    + shlex.split(args.bench_extra)
+                                  bench=args.bench, meta=args.meta, asr_dataset=args.asr_dataset) + extra
                     for index in range(args.bench_repeats)]
         command = ["bash", "-c", " && ".join(shlex.join(c) for c in commands)]
     else:
-        command = bench_command(args.model, args.port, load, out / "bench", warmup,
-                                repeats=(args.asr_pyspy_repeats
-                                         if kind in ("pyspy", "pyspygil") and args.model == "asr" else 1),
-                                bench=args.bench, meta=args.meta, asr_dataset=args.asr_dataset)
-                   + shlex.split(args.bench_extra))
+        repeats = args.asr_pyspy_repeats if kind in ("pyspy", "pyspygil") and args.model == "asr" else 1
+        command = bench_command(args.model, args.port, load, out / "bench", warmup, repeats=repeats,
+                                bench=args.bench, meta=args.meta, asr_dataset=args.asr_dataset) + extra
     (out / "bench_command.txt").write_text(shlex.join(command) + "\n", encoding="utf-8")
     cpu_start = thread_cpu(server.pid)
     window_start = time.time()
