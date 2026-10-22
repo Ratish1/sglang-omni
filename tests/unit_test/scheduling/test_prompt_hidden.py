@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from array import array
+
 import pytest
 import torch
 from sglang.srt.mem_cache.base_prefix_cache import InsertParams
@@ -42,7 +44,7 @@ def matched_prefix_length(capture: PromptHiddenCapture) -> int:
     )
     cache.insert(
         InsertParams(
-            key=RadixKey(token_ids=list(range(PROMPT_LENGTH))),
+            key=RadixKey(token_ids=array("q", range(PROMPT_LENGTH))),
             value=torch.arange(PROMPT_LENGTH),
         )
     )

@@ -386,7 +386,7 @@ def test_thinker_routes_every_unquantized_moe_layer_through_the_shared_decode_ma
     dense_mlp = torch.nn.Identity()
 
     class LayeredTextModel(torch.nn.Module):
-        def __init__(self, *, config, quant_config, prefix):
+        def __init__(self, *, config, accept_hidden_layer, quant_config, prefix):
             super().__init__()
             self.embed_tokens = torch.nn.Embedding(
                 config.vocab_size, config.hidden_size
@@ -395,7 +395,9 @@ def test_thinker_routes_every_unquantized_moe_layer_through_the_shared_decode_ma
                 [make_layer(moe_block), make_layer(dense_mlp)]
             )
 
-    monkeypatch.setattr(sglang_thinker_module, "Qwen3MoeLLMModel", LayeredTextModel)
+    monkeypatch.setattr(
+        sglang_thinker_module, "Qwen3OmniThinkerTextModel", LayeredTextModel
+    )
     monkeypatch.setattr(
         sglang_thinker_module, "LogitsProcessor", lambda config: torch.nn.Identity()
     )
