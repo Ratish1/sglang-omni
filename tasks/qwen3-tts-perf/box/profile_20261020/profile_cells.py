@@ -33,11 +33,13 @@ WINDOW_LEAD_S = {
     "W3": 10.0,
     "W4": 10.0,
     "W5": 2.0,
-    "L1_c16": 15.0,
+    # from the 10-22 formal runs' lengths (L1 c16 21 s, L2 c16 25 s in two waves of 11 s, L2 c64
+    # 22 s, L3 c16 30 s in two waves of 14 s), so each window holds the cell's steady shape, not its tail.
+    "L1_c16": 4.0,
     "L2_c1": 5.0,
-    "L2_c16": 20.0,
-    "L2_c64": 25.0,
-    "L3_c16": 25.0,
+    "L2_c16": 8.0,
+    "L2_c64": 10.0,
+    "L3_c16": 9.0,
 }
 # The long cells of profile_20261022/PLAN.md 3, their request lists written by long_cells_meta.py.
 LONG_CELL_CONCURRENCY = {"L1_c1": 1, "L1_c16": 16, "L2_c1": 1, "L2_c16": 16, "L2_c64": 64, "L3_c16": 16}
