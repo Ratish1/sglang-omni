@@ -51,7 +51,7 @@ class ThinkerModelRunner(ModelRunner):
         self.image_token_id = thinker_cfg.image_token_id
         self.video_token_id = thinker_cfg.video_token_id
         self.audio_token_id = thinker_cfg.audio_token_id
-        self.prompt_hidden_store = (
+        self.prompt_hidden_store: PromptHiddenStore | None = (
             PromptHiddenStore(
                 slot_count=sglang_model_runner.kv_index_translator.capture_token_capacity(
                     sglang_model_runner.max_token_pool_size
@@ -94,16 +94,16 @@ class ThinkerModelRunner(ModelRunner):
             pass
         return None
 
-    # note (ratish): a batch capturing hidden states runs eager above the graphs' capture mode,
-    # so only a prefill chunk computing multimodal prompt rows captures them.
+    # note (ratish): a capturing thinker's graphs are captured at FULL, so a prefill chunk asking
+    # for hidden states still replays them.
     def requested_capture_hidden_mode_prefill(
         self, schedule_batch: ScheduleBatch, requests: list[SchedulerRequest]
     ) -> CaptureHiddenMode:
         del requests
         computes_prompt_rows = any(
-            isinstance(req, PromptHiddenRequest)
-            and req.prompt_hidden_offsets(prefix_length, extend_length).numel() > 0
-            for req, prefix_length, extend_length in zip(
+            isinstance(request, PromptHiddenRequest)
+            and request.prompt_hidden_offsets(prefix_length, extend_length).numel() > 0
+            for request, prefix_length, extend_length in zip(
                 schedule_batch.reqs,
                 schedule_batch.prefix_lens,
                 schedule_batch.extend_lens,
@@ -131,14 +131,15 @@ class ThinkerModelRunner(ModelRunner):
             return
         else:
             pass
-        request_rows = []
+        request_rows: list[torch.Tensor] = []
         row_start = 0
-        for req, prefix_length, extend_length in zip(
+        for request, prefix_length, extend_length in zip(
             schedule_batch.reqs, schedule_batch.prefix_lens, schedule_batch.extend_lens
         ):
-            if isinstance(req, PromptHiddenRequest):
+            if isinstance(request, PromptHiddenRequest):
                 request_rows.append(
-                    req.prompt_hidden_offsets(prefix_length, extend_length) + row_start
+                    request.prompt_hidden_offsets(prefix_length, extend_length)
+                    + row_start
                 )
             else:
                 pass

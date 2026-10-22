@@ -72,13 +72,13 @@ def create_thinker_scheduler(
     capture_prompt_hidden_states = speech_enabled and execution_mode == "request"
     # note (ratish): a batch capturing hidden states cannot replay graphs captured at NULL, so a
     # capturing thinker captures its graphs at FULL with the talker's layer, as MiniCPM-o's does.
-    cfg = resolved_view(server_args)
-    defer_cuda_graph_capture = capture_prompt_hidden_states and not bool(
-        cfg.disable_cuda_graph
+    resolved_server_args = resolved_view(server_args)
+    defer_cuda_graph_capture = (
+        capture_prompt_hidden_states and not resolved_server_args.disable_cuda_graph
     )
     if defer_cuda_graph_capture:
-        saved_return_hidden_states = cfg.enable_return_hidden_states
-        saved_return_hidden_states_mode = cfg.return_hidden_states_mode
+        saved_return_hidden_states = resolved_server_args.enable_return_hidden_states
+        saved_return_hidden_states_mode = resolved_server_args.return_hidden_states_mode
         override_server_args(
             server_args,
             "sglang_omni.qwen3_omni.capture_prompt_hidden_states",
