@@ -202,12 +202,12 @@ def test_the_first_talker_chunk_carries_the_prompt_rows_once():
     builder = make_thinker_stream_output_builder(
         speech_enabled=True, prompt_hidden_store=store
     )
-    req = object.__new__(PromptHiddenRequest)
-    req.inflight_middle_chunks = 0
-    req.kv = SimpleNamespace(req_pool_idx=0)
-    req.prompt_hidden_positions = torch.tensor([1, 4])
+    request = object.__new__(PromptHiddenRequest)
+    request.inflight_middle_chunks = 0
+    request.kv = SimpleNamespace(req_pool_idx=0)
+    request.prompt_hidden_positions = torch.tensor([1, 4])
     req_data = SimpleNamespace(
-        req=req, stage_payload=thinker_stage_payload(["text", "audio"])
+        req=request, stage_payload=thinker_stage_payload(["text", "audio"])
     )
 
     decode_message, talker_message = builder(

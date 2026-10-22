@@ -99,12 +99,12 @@ def test_every_request_with_media_writes_its_prompt_rows_on_a_speech_server(
     )
     payload.request.metadata = {"output_modalities": output_modalities}
 
-    req = request_builder(payload).req
+    request = request_builder(payload).req
 
     if positions is None:
-        assert not isinstance(req, PromptHiddenRequest)
+        assert not isinstance(request, PromptHiddenRequest)
     else:
-        assert req.prompt_hidden_positions.tolist() == positions
+        assert request.prompt_hidden_positions.tolist() == positions
 
 
 def test_nested_non_dict_model_inputs_fail_loudly(monkeypatch):
