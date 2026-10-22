@@ -62,6 +62,7 @@ def test_empty_model_inputs_are_not_replaced_by_the_flat_state(monkeypatch):
             video_token_id=66,
             audio_token_id=77,
         ),
+        capture_prompt_hidden_states=False,
     )
 
     assert sglang_request.model_inputs == {}
@@ -129,6 +130,7 @@ def test_out_of_vocabulary_prompt_ids_are_a_bad_request(monkeypatch, token_id):
             tokenizer=FakeQwenTokenizer(),
             vocab_size=256,
             request_id="out-of-vocabulary",
+            capture_prompt_hidden_states=False,
         )
 
     assert f"token id {token_id} at position 1" in str(raised.value)
@@ -150,6 +152,7 @@ def test_chat_request_without_a_temperature_reaches_the_thinker_greedy(monkeypat
         tokenizer=FakeQwenTokenizer(),
         vocab_size=256,
         request_id="chat-without-temperature",
+        capture_prompt_hidden_states=False,
     )
 
     assert request.temperature == 0.0

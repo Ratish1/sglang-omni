@@ -697,7 +697,7 @@ def build_sglang_thinker_request(
     vocab_size: int,
     request_id: str | None = None,
     thinker_config: Qwen3OmniMoeThinkerConfig | None = None,
-    capture_prompt_hidden_states: bool = False,
+    capture_prompt_hidden_states: bool,
 ) -> "SGLangARRequestData":
     """Build SGLangARRequestData from pipeline state.
 
@@ -1150,7 +1150,7 @@ def make_thinker_scheduler_adapters(
     vocab_size: int,
     thinker_config: Qwen3OmniMoeThinkerConfig | None = None,
     stage_name: str = "thinker",
-    capture_prompt_hidden_states: bool = False,
+    capture_prompt_hidden_states: bool,
 ) -> tuple[
     Callable[[StagePayload], SGLangARRequestData],
     Callable[[SGLangARRequestData], StagePayload],
