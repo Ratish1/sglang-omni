@@ -5,11 +5,13 @@ import io
 import struct
 
 import av
+import librosa
 import numpy as np
 import pytest
 import soundfile as sf
 
 from sglang_omni.preprocessing.audio import (
+    AudioMediaIO,
     decode_audio_bytes,
     decode_audio_bytes_av,
     parse_wav_bytes,
@@ -47,6 +49,22 @@ def test_ogg_vorbis_decodes_as_the_reference_loader() -> None:
 
     assert sample_rate == SAMPLE_RATE
     np.testing.assert_array_equal(decoded, libsndfile_mono(data))
+
+
+def test_audio_at_another_rate_loads_as_the_reference_loader() -> None:
+    """Downsampling must filter frequencies above the target Nyquist limit."""
+    source_rate = 24_000
+    time = np.arange(source_rate, dtype=np.float32) / source_rate
+    audio = 0.5 * np.sin(2 * np.pi * 440 * time) + 0.25 * np.sin(
+        2 * np.pi * 10_000 * time
+    )
+    data = encode_audio(audio, "WAV", "FLOAT", source_rate)
+
+    loaded, sample_rate = AudioMediaIO(target_sr=SAMPLE_RATE).load_bytes(data)
+    reference, _ = librosa.load(io.BytesIO(data), sr=SAMPLE_RATE)
+
+    assert sample_rate == SAMPLE_RATE
+    np.testing.assert_array_equal(loaded, reference)
 
 
 @pytest.mark.parametrize(
