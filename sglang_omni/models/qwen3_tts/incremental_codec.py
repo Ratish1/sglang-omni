@@ -31,6 +31,7 @@ if current_platform.is_cuda():
         fused_bias_snake_beta,
     )
     from sglang_omni.kernels.codec_state import history_exchange, overlap_exchange
+    from sglang_omni.kernels.single_output_conv import clamped_single_output_conv
 else:
     pass
 
@@ -855,7 +856,6 @@ class Qwen3TTSIncrementalDecoder:
             self.channels_last_weights: dict[str, torch.Tensor] | None = {
                 "pre_conv": channels_last_weight(decoder.pre_conv.conv),
                 "decoder.0": channels_last_weight(decoder.decoder[0].conv),
-                "decoder.final": channels_last_weight(decoder.decoder[-1].conv),
             }
             for stage_index, blocks in enumerate(decoder.upsample):
                 self.channels_last_weights[f"upsample.{stage_index}.transconv"] = (
@@ -1475,16 +1475,15 @@ class Qwen3TTSIncrementalDecoder:
                         padded_frames,
                         residual=residual,
                     )
-        final_conv = decoder.decoder[-1]
-        waveform = slot_causal_conv(
-            final_conv,
-            weights["decoder.final"],
+        history_exchange(
             padded,
             histories["decoder.final"],
             slot_index,
-            length,
+            new_samples=length,
+            is_cold=False,
         )
-        return (waveform + final_conv.conv.bias).transpose(1, 2).clamp(min=-1, max=1)
+        # note (ratish): cuDNN has no tensor-core engine for one output channel.
+        return clamped_single_output_conv(padded, decoder.decoder[-1].conv, length)
 
     def precompile(
         self, codes: torch.Tensor, state: Qwen3TTSIncrementalCodecState
