@@ -98,8 +98,38 @@ class PrefixCudaGraphRunner:
 
     @torch.inference_mode()
     def capture(self) -> None:
-        """Largest tier first, so the smaller ones reuse its pool memory."""
+        """Largest tier first, so the smaller ones reuse its pool memory. Every tier
+        captures over views of one set of input buffers at the largest tier's size."""
         hidden_size = self.estimator.dit.input_embed.proj.out_features
+        # note (ratish): replays run one at a time on the vocoder's stream, each copying
+        # its inputs in and its outputs out, so the tiers can share their inputs; a set
+        # per tier held 1.7 GB of contexts over the prefill ladder's tiers.
+        max_frames = max(layout.half_frames for layout in self.layouts)
+        max_row_slots = max(layout.row_slots for layout in self.layouts)
+        noise_buffer = torch.zeros(
+            1, max_frames, self.mel_channels, device=self.device, dtype=self.frame_dtype
+        )
+        mu_buffer = torch.zeros_like(noise_buffer)
+        mel_conditioning_buffer = torch.zeros_like(noise_buffer)
+        time_span = torch.zeros(
+            self.euler_steps + 1, device=self.device, dtype=self.frame_dtype
+        )
+        speaker_buffer = torch.zeros(
+            max_row_slots,
+            self.speaker_channels,
+            device=self.device,
+            dtype=self.speaker_dtype,
+        )
+        context_buffer = torch.zeros(
+            self.euler_steps,
+            2 * max_row_slots,
+            2,
+            CONV_CONTEXT_FRAMES,
+            hidden_size,
+            device=self.device,
+            dtype=self.speaker_dtype,
+        )
+        next_context_buffer = torch.empty_like(context_buffer)
         with self.graphs.capture_session("prefix", self.tier_frames):
             for layout in reversed(self.layouts):
                 attention = PrefixRowAttention(
@@ -114,34 +144,12 @@ class PrefixCudaGraphRunner:
                     attention.mark_dynamic()
                 else:
                     pass
-                noise = torch.zeros(
-                    1,
-                    layout.half_frames,
-                    self.mel_channels,
-                    device=self.device,
-                    dtype=self.frame_dtype,
-                )
-                time_span = torch.zeros(
-                    self.euler_steps + 1, device=self.device, dtype=self.frame_dtype
-                )
-                mu = torch.zeros_like(noise)
-                speaker_embeddings = torch.zeros(
-                    layout.row_slots,
-                    self.speaker_channels,
-                    device=self.device,
-                    dtype=self.speaker_dtype,
-                )
-                mel_conditioning = torch.zeros_like(noise)
-                context = torch.zeros(
-                    self.euler_steps,
-                    2 * layout.row_slots,
-                    2,
-                    CONV_CONTEXT_FRAMES,
-                    hidden_size,
-                    device=self.device,
-                    dtype=self.speaker_dtype,
-                )
-                next_context = torch.empty_like(context)
+                noise = noise_buffer[:, : layout.half_frames]
+                mu = mu_buffer[:, : layout.half_frames]
+                mel_conditioning = mel_conditioning_buffer[:, : layout.half_frames]
+                speaker_embeddings = speaker_buffer[: layout.row_slots]
+                context = context_buffer[:, : 2 * layout.row_slots]
+                next_context = next_context_buffer[:, : 2 * layout.row_slots]
 
                 def solve() -> torch.Tensor:
                     return run_prefix_solve(
