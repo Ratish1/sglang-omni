@@ -2,6 +2,7 @@
 
 Runs only in the isolated reference environment, on one card (the talker alone, about 7 GB):
     PYTHONPATH=<4.57.1 env> CUDA_VISIBLE_DEVICES=<card> python3 talker_cache_check.py --trace <file> [--steps a:b]
+    or --trace-dir <dir> [--threshold kl]: for every trace, the decode steps departing from HF's cached pass
 HF's talker (bf16 Instruct weights) reads the traced request's prompt rows and decode rows twice: one token at a time
 on a DynamicCache, as talker_parity.py does, and as one forward over the whole sequence with no cache. Per step it
 prints the KL divergence (temperature 0.9, suppressed ids masked) between the two HF passes and of the served logits
@@ -55,13 +56,60 @@ def kl(value: torch.Tensor, reference: torch.Tensor) -> float:
 
 
 @torch.no_grad()
+def departures(talker: Qwen3OmniMoeTalkerForConditionalGeneration, trace: dict, threshold: float) -> list[tuple]:
+    """The decode steps where the served logits depart from HF's cached pass by more than threshold KL."""
+    vocab = talker.config.text_config.vocab_size
+    suppressed = torch.zeros(vocab, dtype=torch.bool, device="cuda")
+    suppressed[vocab - 1024:] = True
+    suppressed[talker.config.codec_eos_token_id] = False
+    prompt_rows = trace["prompt_rows"].cuda().to(torch.bfloat16)
+    length = prompt_rows.shape[0]
+    positions = trace["mrope_positions"].long().cuda()
+    next_position = int(positions.max()) + 1
+    cache = DynamicCache()
+    output = talker.model(inputs_embeds=prompt_rows[None], position_ids=positions[:, None], past_key_values=cache,
+                          use_cache=True)
+    found = []
+    for step, served_logits in enumerate(trace["logits"]):
+        hidden = output.last_hidden_state[0, -1]
+        divergence = kl(log_probs(served_logits.cuda(), suppressed), log_probs(talker.codec_head(hidden), suppressed))
+        if divergence > threshold and step > 0:
+            found.append((step, round(divergence, 3)))
+        else:
+            pass
+        if step >= len(trace["feedback_rows"]):
+            break
+        else:
+            pass
+        row = (trace["feedback_rows"][step] + trace["text_rows"][step]).cuda().to(torch.bfloat16)
+        output = talker.model(inputs_embeds=row.view(1, 1, -1),
+                              position_ids=torch.full((3, 1, 1), next_position + step, device="cuda"),
+                              past_key_values=cache, use_cache=True,
+                              cache_position=torch.tensor([length + step], device="cuda"))
+    return found
+
+
+@torch.no_grad()
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--trace", type=Path, required=True)
+    parser.add_argument("--trace", type=Path)
+    parser.add_argument("--trace-dir", type=Path, help="every trace: the steps departing from HF by over --threshold")
+    parser.add_argument("--threshold", type=float, default=0.5)
     parser.add_argument("--steps", default="118:130")
     args = parser.parse_args()
     first, last = (int(bound) for bound in args.steps.split(":"))
     talker = load_talker()
+    if args.trace_dir is not None:
+        for path in sorted(args.trace_dir.glob("*.pt")):
+            trace = torch.load(path, weights_only=False)
+            if trace.get("prompt_rows") is not None and trace.get("feedback_rows"):
+                print(f"{path.stem[:8]} frames {len(trace['logits'])}: {departures(talker, trace, args.threshold)}",
+                      flush=True)
+            else:
+                pass
+        return
+    else:
+        pass
     trace = torch.load(args.trace, weights_only=False)
     vocab = talker.config.text_config.vocab_size
     suppressed = torch.zeros(vocab, dtype=torch.bool, device="cuda")
