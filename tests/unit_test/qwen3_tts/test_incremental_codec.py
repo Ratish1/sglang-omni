@@ -19,11 +19,12 @@ from sglang_omni.models.qwen3_tts.incremental_codec import (
     FusedIncrementalTransformer,
     Qwen3TTSIncrementalCodecState,
     Qwen3TTSIncrementalDecoder,
-    channels_last_causal_conv1d,
-    channels_last_causal_transconv1d,
     incremental_causal_conv1d,
     incremental_causal_transconv1d,
     incremental_transformer,
+    padded_input,
+    slot_causal_conv,
+    slot_causal_transconv,
 )
 from sglang_omni.models.qwen3_tts.incremental_codec_cuda_graph import (
     IncrementalCodecGraphPool,
@@ -171,6 +172,18 @@ class Quantizer(nn.Module):
         return codes[:, :2].to(torch.float32) / 16.0
 
 
+class SnakeBeta(nn.Module):
+    def __init__(self, channels: int) -> None:
+        super().__init__()
+        self.alpha = nn.Parameter(torch.randn(channels) * 0.1)
+        self.beta = nn.Parameter(torch.randn(channels) * 0.1)
+        self.no_div_by_zero = 1e-9
+
+
+def activation(channels: int, snake: bool) -> nn.Module:
+    return SnakeBeta(channels) if snake else nn.Tanh()
+
+
 class ConvNeXt(nn.Module):
     def __init__(self, channels: int) -> None:
         super().__init__()
@@ -190,11 +203,11 @@ class ConvNeXt(nn.Module):
 
 
 class ResidualUnit(nn.Module):
-    def __init__(self, channels: int, dilation: int) -> None:
+    def __init__(self, channels: int, dilation: int, snake: bool) -> None:
         super().__init__()
-        self.act1 = nn.Tanh()
+        self.act1 = activation(channels, snake)
         self.conv1 = CausalConv(channels, channels, 7, dilation=dilation)
-        self.act2 = nn.Tanh()
+        self.act2 = activation(channels, snake)
         self.conv2 = CausalConv(channels, channels, 1)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -205,15 +218,15 @@ class ResidualUnit(nn.Module):
 
 
 class DecoderBlock(nn.Module):
-    def __init__(self) -> None:
+    def __init__(self, in_channels: int, out_channels: int, snake: bool) -> None:
         super().__init__()
         self.block = nn.ModuleList(
             [
-                nn.Tanh(),
-                CausalTransConv(4, 2, 4, 2),
-                ResidualUnit(2, 1),
-                ResidualUnit(2, 3),
-                ResidualUnit(2, 9),
+                activation(in_channels, snake),
+                CausalTransConv(in_channels, out_channels, 4, 2),
+                ResidualUnit(out_channels, 1, snake),
+                ResidualUnit(out_channels, 3, snake),
+                ResidualUnit(out_channels, 9, snake),
             ]
         )
 
@@ -226,8 +239,11 @@ class DecoderBlock(nn.Module):
 class Decoder(nn.Module):
     total_upsample = 4
 
-    def __init__(self) -> None:
+    def __init__(
+        self, block_channels: tuple[int, int] = (4, 2), snake: bool = False
+    ) -> None:
         super().__init__()
+        in_channels, out_channels = block_channels
         self.quantizer = Quantizer()
         self.pre_conv = CausalConv(2, 2, 3)
         self.pre_transformer = Transformer()
@@ -236,10 +252,10 @@ class Decoder(nn.Module):
         )
         self.decoder = nn.ModuleList(
             [
-                CausalConv(2, 4, 7),
-                DecoderBlock(),
-                nn.Tanh(),
-                CausalConv(2, 1, 7),
+                CausalConv(2, in_channels, 7),
+                DecoderBlock(in_channels, out_channels, snake),
+                activation(out_channels, snake),
+                CausalConv(out_channels, 1, 7),
             ]
         )
 
@@ -352,62 +368,104 @@ def test_incremental_causal_transconv_matches_whole(
     assert state.transconv_overlaps["transconv"].shape[-1] == module.right_pad
 
 
+@pytest.mark.accelerator
+@pytest.mark.skipif(
+    not current_platform.is_cuda(), reason="the slot convs run on NVIDIA CUDA only"
+)
 @pytest.mark.parametrize(("kernel_size", "dilation"), [(7, 1), (7, 3), (1, 1)])
 @pytest.mark.parametrize("partitions", [[9], [1] * 9, [1, 8], [8, 1], [3, 2, 4]])
-def test_channels_last_causal_conv_matches_whole(
+def test_slot_causal_conv_matches_whole(
     partitions: list[int], kernel_size: int, dilation: int
 ) -> None:
     torch.manual_seed(1)
-    module = CausalConv(2, 3, kernel_size, dilation=dilation)
+    module = CausalConv(2, 3, kernel_size, dilation=dilation).cuda()
     weight = channels_last_weight(module.conv)
-    inputs = torch.randn(1, sum(partitions), 2)
+    inputs = torch.randn(1, sum(partitions), 2, device="cuda")
     expected = module(inputs.transpose(1, 2)).transpose(1, 2)
-    state = Qwen3TTSIncrementalCodecState()
+    history_pool = torch.zeros(3, module.padding, 2, device="cuda")
+    slot_index = torch.tensor([2], device="cuda")
     actual = []
     offset = 0
     for length in partitions:
+        frames = inputs[:, offset : offset + length]
+        padded, padded_frames = padded_input(module, frames)
+        padded_frames.copy_(frames)
         actual.append(
-            channels_last_causal_conv1d(
-                module, weight, inputs[:, offset : offset + length], state, "conv"
-            )
+            slot_causal_conv(module, weight, padded, history_pool, slot_index, length)
+            + module.conv.bias
         )
         offset += length
 
     torch.testing.assert_close(torch.cat(actual, dim=1), expected)
-    history = state.conv_histories["conv"]
-    assert history.shape == (1, 2, module.padding)
-    assert history.untyped_storage().nbytes() == history.nbytes
+    assert torch.equal(
+        history_pool[2], F.pad(inputs[0], (0, 0, module.padding, 0))[inputs.shape[1] :]
+    )
+    assert torch.count_nonzero(history_pool[:2]).item() == 0
 
 
+@pytest.mark.accelerator
+@pytest.mark.skipif(
+    not current_platform.is_cuda(), reason="the slot convs run on NVIDIA CUDA only"
+)
 @pytest.mark.parametrize(("kernel_size", "stride"), [(8, 4), (4, 4)])
 @pytest.mark.parametrize("partitions", [[9], [1] * 9, [1, 8], [8, 1], [3, 2, 4]])
-def test_channels_last_causal_transconv_matches_whole(
+def test_slot_causal_transconv_matches_whole(
     partitions: list[int], kernel_size: int, stride: int
 ) -> None:
     torch.manual_seed(2)
-    module = CausalTransConv(2, 3, kernel_size, stride)
+    module = CausalTransConv(2, 3, kernel_size, stride).cuda()
     weight = channels_last_weight(module.conv)
-    inputs = torch.randn(1, sum(partitions), 2)
+    inputs = torch.randn(1, sum(partitions), 2, device="cuda")
     expected = module(inputs.transpose(1, 2)).transpose(1, 2)
-    state = Qwen3TTSIncrementalCodecState()
+    overlap_pool = torch.zeros(3, module.right_pad, 3, device="cuda")
+    slot_index = torch.tensor([2], device="cuda")
     actual = []
     offset = 0
     for length in partitions:
         actual.append(
-            channels_last_causal_transconv1d(
+            slot_causal_transconv(
                 module,
                 weight,
                 inputs[:, offset : offset + length],
-                state,
-                "transconv",
+                overlap_pool,
+                slot_index,
             )
+            + module.conv.bias
         )
         offset += length
 
     torch.testing.assert_close(torch.cat(actual, dim=1), expected)
-    overlap = state.transconv_overlaps["transconv"]
-    assert overlap.shape == (1, 3, module.right_pad)
-    assert overlap.untyped_storage().nbytes() == overlap.nbytes
+    assert torch.count_nonzero(overlap_pool[:2]).item() == 0
+
+
+@pytest.mark.accelerator
+@pytest.mark.skipif(
+    not current_platform.is_cuda(), reason="the slot convs run on NVIDIA CUDA only"
+)
+def test_fused_snake_beta_stack_matches_the_eager_activations() -> None:
+    torch.manual_seed(33)
+    decoder = Decoder(block_channels=(16, 8), snake=True).cuda().bfloat16().eval()
+    decoder.pre_transformer.float()
+    assert snake_beta.fuse_vocoder_decoder(decoder) == 8
+    hidden_states = torch.randn(2, 9, 2, device="cuda", dtype=torch.bfloat16)
+    fused = Qwen3TTSIncrementalDecoder(decoder)
+    eager = Qwen3TTSIncrementalDecoder(decoder)
+    eager.snake_coefficients = {}
+    states = {
+        name: fused.init_state(2, device=torch.device("cuda"), dtype=torch.bfloat16)
+        for name in ("fused", "eager")
+    }
+    with torch.inference_mode():
+        for part in hidden_states.split((4, 1, 4), dim=1):
+            assert torch.equal(
+                fused.conv_stack_tensors(part, states["fused"]),
+                eager.conv_stack_tensors(part, states["eager"]),
+            )
+
+    assert len(fused.snake_coefficients) == 8
+    for pools in ("conv_histories", "transconv_overlaps"):
+        for key, value in getattr(states["eager"], pools).items():
+            assert torch.equal(getattr(states["fused"], pools)[key], value), key
 
 
 @pytest.mark.parametrize("partitions", [[11], [1] * 11, [1, 10], [10, 1], [3, 2, 6]])
