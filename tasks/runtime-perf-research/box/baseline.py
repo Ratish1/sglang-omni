@@ -66,8 +66,10 @@ def bench_command(model: str, port: int, load: int, out: Path, warmup: bool, rep
     spec = MODELS[model]
     meta_args = ["--meta", meta] if meta else []
     if bench == "videomme":
+        # note (ratish): videomme_speed.py is the benchmark without its WER pass, which needs a second ASR server
         return [
-            sys.executable, "-m", "benchmarks.eval.benchmark_omni_videomme", "--host", "127.0.0.1", "--port", str(port),
+            sys.executable, str(Path(__file__).resolve().parent / "videomme_speed.py"), "--host", "127.0.0.1",
+            "--port", str(port),
             "--repo-id", "zhaochenyang20/Video_MME_ci", "--video-fps", "2", "--video-max-frames", "128",
             "--video-max-pixels", "401408", "--enable-audio", "--max-tokens", "256", "--timeout-s", "500",
             "--warmup", "1" if warmup else "0", "--max-concurrency", str(load), "--output-dir", str(out),
