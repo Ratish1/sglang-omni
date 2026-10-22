@@ -67,10 +67,12 @@ def departures(talker: Qwen3OmniMoeTalkerForConditionalGeneration, trace: dict, 
     suppressed[talker.config.codec_eos_token_id] = False
     prompt_rows = trace["prompt_rows"].cuda().to(torch.bfloat16)
     length = prompt_rows.shape[0]
-    positions = trace["mrope_positions"].long().cuda()
     if is_fractional:
-        next_position = float(trace["mrope_positions"].max()) + 1
+        # HF's get_rope_index keeps the prompt positions in float and its delta from the float largest one.
+        positions = trace["mrope_positions"].float().cuda()
+        next_position = float(positions.max()) + 1
     else:
+        positions = trace["mrope_positions"].long().cuda()
         next_position = int(positions.max()) + 1
     cache = DynamicCache()
     output = talker.model(inputs_embeds=prompt_rows[None], position_ids=positions[:, None], past_key_values=cache,
