@@ -8,11 +8,7 @@ from typing import TYPE_CHECKING
 from sglang.srt.arg_groups.model_override_base import resolved_view
 from sglang.srt.platforms.cuda import CudaDeviceMixin
 
-from sglang_omni.platforms.interface import (
-    Fa3SchedulerMetadata,
-    JointRopeInplaceKernel,
-    OmniPlatform,
-)
+from sglang_omni.platforms.interface import JointRopeInplaceKernel, OmniPlatform
 from sglang_omni.quantization import resolve_quant_config
 from sglang_omni.utils.misc import model_config_has_moe, normalize_quantization
 from sglang_omni.vendor.sglang.server_args import override_server_args
@@ -138,11 +134,6 @@ class CUDAOmniPlatform(CudaDeviceMixin, OmniPlatform):
         from sglang.kernels.ops.attention.rope import apply_rope_inplace
 
         return apply_rope_inplace
-
-    def get_fa3_scheduler_metadata(self) -> Fa3SchedulerMetadata:
-        from sgl_kernel.flash_attn import get_scheduler_metadata
-
-        return get_scheduler_metadata
 
     def apply_model_worker_backend_policy(
         self,

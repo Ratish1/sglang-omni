@@ -28,11 +28,6 @@ class MUSAOmniPlatform(CUDAOmniPlatform):
         # Use the native QK-norm + RoPE path on MUSA.
         return None
 
-    def get_fa3_scheduler_metadata(self) -> None:
-        # note (ratish): the precompute is validated against sgl-kernel's FA3 on NVIDIA
-        # only; MUSA keeps each FA3 call's own.
-        return None
-
     def enable_codec_decode_graph(self) -> bool:
         return False
 

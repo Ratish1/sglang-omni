@@ -48,7 +48,6 @@ def ragged_fa3(
     cu_seqlens_q: torch.Tensor,
     max_seqlen_q: int,
     num_splits: int = 0,
-    scheduler_metadata: torch.Tensor | None = None,
 ) -> torch.Tensor:
     return flash_attn_with_kvcache(
         q=q,
@@ -59,7 +58,6 @@ def ragged_fa3(
         cu_seqlens_q=cu_seqlens_q,
         max_seqlen_q=max_seqlen_q,
         causal=False,
-        scheduler_metadata=scheduler_metadata,
         num_splits=num_splits,
     )
 

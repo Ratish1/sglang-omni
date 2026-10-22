@@ -33,7 +33,6 @@ from sglang_omni.models.fun_cosyvoice3.packed_dit import (
     rotate_in_place,
     rotated,
 )
-from sglang_omni.platforms import current_platform
 
 BLOCK_FRAMES = 64
 # note(ratish): FA3's pick for these segments with a tight page table; pinned, since a
@@ -54,7 +53,6 @@ class PrefixForward(Protocol):
         block_modulations: tuple[torch.Tensor, ...],
         final_modulation: torch.Tensor,
         attention: PrefixRowAttention,
-        scheduler_metadata: torch.Tensor | None,
         rope: tuple[torch.Tensor, torch.Tensor],
         first_context: torch.Tensor,
         second_context: torch.Tensor,
@@ -373,7 +371,6 @@ class PrefixRowAttention:
         value_pool: torch.Tensor,
         head_num: int,
         head_dim: int,
-        scheduler_metadata: torch.Tensor | None,
     ) -> torch.Tensor:
         # Note (Jiaxin Deng): head_num and head_dim come from the module so the
         # dynamic graph keeps them constant and the reshapes vectorize.
@@ -393,32 +390,8 @@ class PrefixRowAttention:
             self.cu_seqlens_q,
             self.max_seqlen_q,
             PREFIX_FA3_SPLITS,
-            scheduler_metadata,
         )
         return out.reshape(1, -1, head_num * head_dim)
-
-    def fa3_scheduler_metadata(
-        self, head_num: int, head_dim: int, dtype: torch.dtype
-    ) -> torch.Tensor | None:
-        """FA3's tile schedule for the step's segments, which every layer and Euler
-        step of a solve shares; None where each call computes its own."""
-        get_scheduler_metadata = current_platform.get_fa3_scheduler_metadata()
-        if get_scheduler_metadata is None:
-            return None
-        else:
-            return get_scheduler_metadata(
-                batch_size=self.cache_seqlens.shape[0],
-                max_seqlen_q=self.max_seqlen_q,
-                max_seqlen_k=self.page_table.shape[1] * FA3_PAGE_SIZE,
-                num_heads=head_num,
-                num_heads_k=head_num,
-                headdim=head_dim,
-                cache_seqlens=self.cache_seqlens,
-                qkv_dtype=dtype,
-                cu_seqlens_q=self.cu_seqlens_q,
-                page_size=FA3_PAGE_SIZE,
-                num_splits=PREFIX_FA3_SPLITS,
-            )
 
     def mark_dynamic(self) -> None:
         # Note (Jiaxin Deng): the row count and width reach the compiled graph
@@ -482,7 +455,6 @@ def forward_prefix(
     block_modulations: tuple[torch.Tensor, ...],
     final_modulation: torch.Tensor,
     attention: PrefixRowAttention,
-    scheduler_metadata: torch.Tensor | None,
     rope: tuple[torch.Tensor, torch.Tensor],
     first_context: torch.Tensor,
     second_context: torch.Tensor,
@@ -526,7 +498,6 @@ def forward_prefix(
             values[layer],
             head_num,
             attn.inner_dim // head_num,
-            scheduler_metadata,
         ).to(query.dtype)
         hidden_states = hidden_states + gate_msa.unsqueeze(1) * attn.to_out[1](
             attn.to_out[0](out)
@@ -585,12 +556,6 @@ def run_prefix_solve(
     )[attention.speaker_index].unsqueeze(0)
     angles = angles[:, attention.positions]
     rope = (angles.cos(), angles.sin())
-    block_attention = estimator.dit.transformer_blocks[0].attn
-    scheduler_metadata = attention.fa3_scheduler_metadata(
-        block_attention.heads,
-        block_attention.inner_dim // block_attention.heads,
-        estimator.qkv_weights[0].dtype,
-    )
     x = noise
     for euler_step, (_, dt) in enumerate(euler_step_times(time_span)):
         (
@@ -608,7 +573,6 @@ def run_prefix_solve(
             estimator.block_modulations[euler_step],
             estimator.final_modulations[euler_step],
             attention,
-            scheduler_metadata,
             rope,
             context[euler_step, :, 0],
             context[euler_step, :, 1],
