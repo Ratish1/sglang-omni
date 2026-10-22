@@ -28,9 +28,9 @@ sys.path.insert(0, str(BOX))
 import pair_check  # noqa: E402
 
 MODEL = "marksverdhei/Qwen3-Omni-30B-A3B-FP8"
+CI_CONFIG = "examples/configs/qwen3_omni_colocated_h100_fp8.yaml"
 SERVE_ARGS = [
-    "--config", "examples/configs/qwen3_omni_colocated_h100_fp8.yaml", "--colocate",
-    "--preprocessing.factory.max_seq_len", "32768", "--thinker.factory.max_seq_len", "32768",
+    "--colocate", "--preprocessing.factory.max_seq_len", "32768", "--thinker.factory.max_seq_len", "32768",
 ]
 PASSES = {"c1": 1, "c8": 8, "c16": 16}
 PORT = 29000
@@ -49,13 +49,14 @@ def client(port: int, concurrency: int, out: Path) -> None:
     (out / "videoamme.json").write_text(json.dumps(results, indent=1, default=str))
 
 
-def run_pass(out: Path, pass_name: str, arm: str, card: int) -> dict[str, object]:
+def run_pass(out: Path, pass_name: str, arm: str, card: int, config: str) -> dict[str, object]:
     arm_out = out / pass_name / arm
     arm_out.mkdir(parents=True, exist_ok=True)
     arm_tree = pair_check.tree(pair_check.ARMS[arm][0])
     port = PORT + 200 * card
     pair_check.log(out, f"{pass_name} {arm} card {card} serving")
-    server = pair_check.serve(card, arm_tree, MODEL, port, SERVE_ARGS, arm_out / "server.log")
+    server = pair_check.serve(
+        card, arm_tree, MODEL, port, ["--config", config, *SERVE_ARGS], arm_out / "server.log")
     try:
         pair_check.log(out, f"{pass_name} {arm} card {card} healthy, client")
         rc = subprocess.run(
@@ -80,8 +81,8 @@ def run_pass(out: Path, pass_name: str, arm: str, card: int) -> dict[str, object
     return dict(rc=rc, accuracy=summary.get("accuracy"), failed=summary.get("failed"))
 
 
-def run_chain(out: Path, passes: list[str], arm: str, card: int) -> dict[str, object]:
-    return {pass_name: run_pass(out, pass_name, arm, card) for pass_name in passes}
+def run_chain(out: Path, passes: list[str], arm: str, card: int, config: str) -> dict[str, object]:
+    return {pass_name: run_pass(out, pass_name, arm, card, config) for pass_name in passes}
 
 
 def main() -> None:
@@ -92,6 +93,7 @@ def main() -> None:
     parser.add_argument("--client", action="store_true")
     parser.add_argument("--port", type=int)
     parser.add_argument("--concurrency", type=int)
+    parser.add_argument("--config", default=CI_CONFIG, help="the pipeline config, relative to the tree or absolute")
     args = parser.parse_args()
     if args.client:
         client(args.port, args.concurrency, args.out)
@@ -104,7 +106,9 @@ def main() -> None:
     passes = args.passes.split(",")
     placements = [(arm, int(card)) for arm, card in (entry.split("@") for entry in args.arms.split(","))]
     with ThreadPoolExecutor(max_workers=len(placements)) as pool:
-        records = list(pool.map(lambda placement: run_chain(args.out, passes, *placement), placements))
+        records = list(
+            pool.map(lambda placement: run_chain(args.out, passes, *placement, args.config), placements)
+        )
     summary = {arm: record for (arm, _), record in zip(placements, records)}
     (args.out / "summary.json").write_text(json.dumps(summary, indent=1))
     pair_check.log(args.out, "done")
