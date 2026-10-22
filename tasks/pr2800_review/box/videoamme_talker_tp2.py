@@ -38,6 +38,8 @@ MAX_TOKENS = 256
 CONCURRENCY = 16
 ASR_CONCURRENCY = 4
 PORT = 28000
+# capture directory: the variable its sitecustomize reads its output directory from
+HOOK_DIR_ENVS = {"code2wav_dump": "CODE2WAV_DUMP_DIR", "talker_trace": "TALKER_TRACE_DIR"}
 SERVE_ARGS = [
     "--model-name",
     "qwen3-omni",
@@ -119,18 +121,20 @@ def serve(
     log_path: Path,
     cards: tuple[int, int],
     port: int,
-    code2wav_dump_dir: Path | None,
+    hook: str | None,
     model: str,
 ) -> subprocess.Popen:
+    """hook names a capture directory (HOOK_DIR_ENVS) whose sitecustomize the server's processes load, writing
+    under <log dir>/<hook>."""
     env = {
         **pair_check.card_env(cards[0], arm_tree),
         "CUDA_VISIBLE_DEVICES": f"{cards[0]},{cards[1]}",
         "SGLANG_OMNI_STRICT_PORT": "1",
         "SGLANG_OMNI_STARTUP_TIMEOUT": "1800",
     }
-    if code2wav_dump_dir is not None:
-        env["PYTHONPATH"] = f"{BOX / 'code2wav_dump'}:{arm_tree}"
-        env["CODE2WAV_DUMP_DIR"] = str(code2wav_dump_dir)
+    if hook is not None:
+        env["PYTHONPATH"] = f"{BOX / hook}:{arm_tree}"
+        env[HOOK_DIR_ENVS[hook]] = str(log_path.parent / hook)
     else:
         pass
     process = subprocess.Popen(
@@ -187,7 +191,7 @@ def run_arm(
     arm: str,
     cards: tuple[int, int],
     seed: int | None,
-    is_code2wav_dump: bool,
+    hook: str | None,
     model: str,
     concurrency: int,
     passes: int,
@@ -203,7 +207,7 @@ def run_arm(
         arm_out / "server.log",
         cards,
         port,
-        arm_out / "code2wav_dump" if is_code2wav_dump else None,
+        hook,
         model,
     )
     codes = []
@@ -256,9 +260,10 @@ def main() -> None:
     parser.add_argument("--score-card", type=int, default=0)
     parser.add_argument("--seed", type=int, help="every request's sampling seed, as a seeded client sends it")
     parser.add_argument(
-        "--code2wav-dump",
-        action="store_true",
-        help="save every request's talker codes and served audio (code2wav_dump/sitecustomize.py)",
+        "--hook",
+        choices=sorted(HOOK_DIR_ENVS),
+        help="a capture the servers load: code2wav_dump saves each request's codes and served audio, talker_trace "
+        "each request's talker inputs and outputs step by step; written under <arm>/<hook>",
     )
     parser.add_argument("--model", default=MODEL, help="checkpoint every arm serves")
     parser.add_argument("--concurrency", type=int, default=CONCURRENCY)
@@ -297,7 +302,7 @@ def main() -> None:
                 arm,
                 cards,
                 args.seed,
-                args.code2wav_dump,
+                args.hook,
                 args.model,
                 args.concurrency,
                 args.passes,
