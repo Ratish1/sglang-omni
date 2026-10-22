@@ -10,8 +10,9 @@ IN=/workspace/t_marks/tasks/cosyvoice-perf/box
 MODEL=FunAudioLLM/Fun-CosyVoice3-0.5B-2512
 log() { echo "$* $(date +%T)" >> $D/queue_s2.txt; }
 cpus() { [ "$1" = 0 ] && echo 0-15,64-79 || echo 16-31,80-95; }
-# note (ratish): a scored cell keeps its result files, so a restarted queue skips it; each round's two ASR servers
-# take fresh ports, since a port the previous round's server just left can still read as in use (10-21, 10-22).
+# note (ratish): a scored cell keeps its result files, so a restarted queue skips it. A server holds its port and
+# the next two hundreds, and a port the previous round just left can still read as in use (10-21, 10-22), so every
+# server is 300 from any other, below the kernel's ephemeral range; S2_PORT_BASE moves a rerun's ports.
 score() {
   local dir=$1 card=$2 port=$3
   if [ ! -s $dir/wer_results.json ]; then
@@ -36,8 +37,8 @@ for spec in p_m1:c1f,c16,c64 p_m2:c1f,c16,c64 p_m3:c16,c64,b16; do
   for cell in $(echo ${spec#*:} | tr , ' '); do
     for order in a b; do
       round=$((round + 1))
-      score $D/$name/$order/gpu0/$cell 0 $((51000 + 400 * round)) &
-      score $D/$name/$order/gpu1/$cell 1 $((51200 + 400 * round)) &
+      score $D/$name/$order/gpu0/$cell 0 $((${S2_PORT_BASE:-26000} + 600 * round)) &
+      score $D/$name/$order/gpu1/$cell 1 $((${S2_PORT_BASE:-26000} + 300 + 600 * round)) &
       wait
     done
   done
