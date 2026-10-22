@@ -2913,6 +2913,7 @@ class FakeQwen3TTSSpeechTokenizer:
 class FakeIncrementalQwen3TTSDecoder:
     def __init__(self, decoder, *, fail_on_call: int | None = None) -> None:
         self.decoder = decoder
+        self.channels_last_weights = None
         self.fail_on_call = fail_on_call
         self.decode_inputs: list[torch.Tensor] = []
         self.decode_positions: list[list[int]] = []
