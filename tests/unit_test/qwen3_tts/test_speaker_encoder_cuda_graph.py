@@ -18,7 +18,9 @@ from sglang_omni.models.qwen3_tts.speaker_encoder_cuda_graph import (
     SPEAKER_MEL_HOP,
     Qwen3TTSSpeakerEncoderCudaGraphRunner,
     encode_bucketed,
+    log_mel,
     masked_mean,
+    mel_frames,
     reflect_index,
 )
 from tests.unit_test.fixtures.accelerator import require_device_streams
@@ -140,6 +142,32 @@ def test_mel_matches_the_checkpoint_front_end_bitwise() -> None:
         assert torch.equal(mel, expected)
 
 
+@pytest.mark.accelerator
+def test_bucketed_device_mel_tracks_the_checkpoint_front_end() -> None:
+    device = require_device_streams()
+    encoder = small_speaker_encoder(torch.float32)
+    runner = Qwen3TTSSpeakerEncoderCudaGraphRunner(encoder, sample_rate=SAMPLE_RATE)
+    window = runner.mel_window.to(device)
+    mel_basis = runner.mel_basis.to(device)
+    torch.manual_seed(10)
+    width = 48 * SPEAKER_MEL_HOP + SPEAKER_MEL_HOP - 1
+    for samples in (40 * SPEAKER_MEL_HOP, 40 * SPEAKER_MEL_HOP + 100, width):
+        waveform = torch.rand(1, samples) * 2 - 1
+        buffer = torch.rand(1, width, device=device) * 100
+        buffer[:, :samples] = waveform.to(device)
+        frames = mel_frames(samples)
+        expected = runner.mel(waveform)
+        actual = log_mel(
+            buffer, torch.tensor([samples], device=device), window, mel_basis
+        )
+
+        assert expected.shape[2] == frames
+        assert actual.shape[2] == mel_frames(width)
+        torch.testing.assert_close(
+            actual[:, :, :frames].cpu(), expected, atol=1e-4, rtol=1e-4
+        )
+
+
 def test_runner_without_graphs_runs_the_encoder_eagerly() -> None:
     encoder = small_speaker_encoder(torch.float32)
     runner = Qwen3TTSSpeakerEncoderCudaGraphRunner(encoder, sample_rate=SAMPLE_RATE)
@@ -253,6 +281,27 @@ def test_runner_replays_captured_buckets_and_encodes_the_rest() -> None:
             assert torch.allclose(embedding, eager, atol=1e-4, rtol=1e-4)
         assert torch.equal(embeddings[1], embeddings[4])
         assert torch.equal(embeddings[5], runner.embed(clips[5]))
+
+
+@pytest.mark.accelerator
+def test_replays_read_no_tensor_the_capture_let_go() -> None:
+    device = require_device_streams()
+    encoder = small_speaker_encoder(torch.float32).to(device)
+    with torch.device(device):
+        runner = Qwen3TTSSpeakerEncoderCudaGraphRunner(encoder, sample_rate=SAMPLE_RATE)
+    runner.capture((2, 4), 8 * SPEAKER_MEL_HOP)
+    clip = clip_of(20, 6)
+    with torch.inference_mode():
+        expected = runner.embed(clip)
+        fillers = [
+            torch.full((size,), float("nan"), device=device)
+            for size in (runner.mel_window.numel(), runner.mel_basis.numel())
+            for _ in range(64)
+        ]
+        actual = runner.embed(clip)
+
+    assert torch.equal(actual, expected)
+    assert all(torch.isnan(filler).all() for filler in fillers)
 
 
 def raise_out_of_memory() -> None:
