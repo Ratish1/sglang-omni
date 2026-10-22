@@ -221,14 +221,14 @@ def run_pass(args, server: subprocess.Popen, load: int, kind: str, warmup: bool)
                                 bench=args.bench, meta=args.meta)
     elif kind == "clean" and args.bench_repeats > 1:
         commands = [bench_command(args.model, args.port, load, out / "bench" / f"rep{index}", warmup and index == 0,
-                                  bench=args.bench, meta=args.meta)
+                                  bench=args.bench, meta=args.meta) + shlex.split(args.bench_extra)
                     for index in range(args.bench_repeats)]
         command = ["bash", "-c", " && ".join(shlex.join(c) for c in commands)]
     else:
         command = bench_command(args.model, args.port, load, out / "bench", warmup,
                                 repeats=(args.asr_pyspy_repeats
                                          if kind in ("pyspy", "pyspygil") and args.model == "asr" else 1),
-                                bench=args.bench, meta=args.meta)
+                                bench=args.bench, meta=args.meta) + shlex.split(args.bench_extra)
     (out / "bench_command.txt").write_text(shlex.join(command) + "\n", encoding="utf-8")
     cpu_start = thread_cpu(server.pid)
     window_start = time.time()
@@ -299,6 +299,7 @@ def main() -> None:
     parser.add_argument("--serve-env", default="", help="KEY=VALUE pairs for the server only")
     parser.add_argument("--bench", default="seedtts", choices=("seedtts", "videomme", "asr_longform"))
     parser.add_argument("--meta", default="", help="meta.lst for a seedtts bench (long-form targets)")
+    parser.add_argument("--bench-extra", default="", help="arguments appended to every benchmark command")
     parser.add_argument("--bench-repeats", type=int, default=1,
                         help="benchmark runs inside each clean pass for TTS and Omni (bench/rep<i>)")
     parser.add_argument("--asr-pyspy-repeats", type=int, default=1,
