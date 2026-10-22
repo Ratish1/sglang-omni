@@ -6,13 +6,14 @@ the talker's prefill builder and model runner are wrapped once their modules loa
 - TalkerPrefillBuilder.append_text_chunk, mark_thinker_done: each later thinker token, the thinker's end;
 - QwenTalkerModelRunner.combine_feedback_with_next_text: each decode step's feedback row and text row, apart;
 - QwenTalkerModelRunner.before_prefill, before_decode: the KV slots each prefill writes; at each decode step the rope
-  positions, sequence length and KV slot the forward uses, the batch size and row, and the feedback buffer row and
-  mask the model reads;
+  positions, sequence length and KV slot the forward uses, the batch size and row, the feedback buffer row and mask
+  the model reads, and the request's page table row (its last 8 slots, the sum and zero count up to the length);
 - QwenTalkerModelRunner.sample_next_token_ids: the prefill's logits before SGLang's sampler rewrites them in place;
 - QwenTalkerModelRunner.post_prefill, post_decode: the codec logits a step samples from, before the repetition
   penalty, the talker hidden state, the sampled code and the step's 16 codes; at prefill also the request's
   projected prompt rows, its talker input ids and positions;
 - QwenTalkerModelRunner.on_request_finished: everything for the request to <TALKER_TRACE_DIR>/<request id>.pt.
+With TALKER_TRACE_EAGER=1 the CUDA platform also declines the talker graph, so the talker runs eager.
 """
 
 import importlib.abc
@@ -22,6 +23,7 @@ import sys
 
 PREFILL_MODULE = "sglang_omni.models.qwen3_omni.components.talker_prefill"
 RUNNER_MODULE = "sglang_omni.models.qwen3_omni.talker_model_runner"
+PLATFORM_MODULE = "sglang_omni.platforms.cuda"
 TRACES = {}
 
 
@@ -99,12 +101,17 @@ def install_runner(module):
         slots = forward_batch.out_cache_loc[:batch_size].detach().to("cpu")
         buffer_rows = self.model.feedback_buffer[:batch_size].detach().to("cpu", torch.float32)
         mask = self.model.feedback_mask[:batch_size].detach().to("cpu")
+        pool_indices = forward_batch.req_pool_indices[:batch_size].detach().to("cpu")
+        req_to_token = schedule_batch.req_to_token_pool.req_to_token
         for row, sched_req in enumerate(requests):
             record = trace(sched_req.data.req.rid)
+            seq_len = int(seq_lens[row])
+            page_row = req_to_token[int(pool_indices[row]), :seq_len].to(torch.int64)
             record.setdefault("decode_steps", []).append(dict(
-                positions=positions[:, row].tolist(), seq_len=int(seq_lens[row]), slot=int(slots[row]),
+                positions=positions[:, row].tolist(), seq_len=seq_len, slot=int(slots[row]),
                 batch_size=batch_size, row=row, mask=bool(mask[row]), buffer_row=buffer_rows[row],
-                forward=forward_index["value"]))
+                forward=forward_index["value"], pool_index=int(pool_indices[row]),
+                page_tail=page_row[-8:].tolist(), page_sum=int(page_row.sum()), page_zeros=int((page_row == 0).sum())))
         return output
 
     def traced_sample_next_token_ids(self, logits_output, forward_batch, schedule_batch, requests):
@@ -185,7 +192,15 @@ def install_runner(module):
     runner.on_request_finished = traced_on_request_finished
 
 
+def install_eager_talker(module):
+    module.CUDAOmniPlatform.enable_talker_graph = lambda self: False
+
+
 INSTALLERS = {PREFILL_MODULE: install_prefill, RUNNER_MODULE: install_runner}
+if os.environ.get("TALKER_TRACE_EAGER") == "1":
+    INSTALLERS[PLATFORM_MODULE] = install_eager_talker
+else:
+    pass
 
 
 class TraceAfterLoad(importlib.abc.MetaPathFinder):
