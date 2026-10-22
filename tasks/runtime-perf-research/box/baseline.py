@@ -292,7 +292,10 @@ def run_pass(args, server: subprocess.Popen, load: int, kind: str, warmup: bool)
 
 
 def main() -> None:
+    global TREE
     parser = argparse.ArgumentParser()
+    parser.add_argument("--tree", default=str(TREE),
+                        help="source tree the server and benchmark run from (default: the kit's own tree)")
     parser.add_argument("--model", required=True, choices=sorted(MODELS))
     parser.add_argument("--card", type=int, default=0)
     parser.add_argument("--port", type=int, required=True)
@@ -316,6 +319,7 @@ def main() -> None:
     parser.add_argument("--asr-pyspy-repeats", type=int, default=1,
                         help="measured repeats inside the ASR benchmark on py-spy passes, so the load outlasts the window")
     args = parser.parse_args()
+    TREE = Path(args.tree)
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
     spec = MODELS[args.model]
