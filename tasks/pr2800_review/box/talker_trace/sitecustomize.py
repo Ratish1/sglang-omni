@@ -5,6 +5,9 @@ the talker's prefill builder and model runner are wrapped once their modules loa
 - TalkerPrefillBuilder.build_prompt_prefill: the thinker tokens the prefill holds and whether the thinker had finished;
 - TalkerPrefillBuilder.append_text_chunk, mark_thinker_done: each later thinker token, the thinker's end;
 - QwenTalkerModelRunner.combine_feedback_with_next_text: each decode step's feedback row and text row, apart;
+- QwenTalkerModelRunner.before_prefill, before_decode: the KV slots each prefill writes; at each decode step the rope
+  positions, sequence length and KV slot the forward uses, the batch size and row, and the feedback buffer row and
+  mask the model reads;
 - QwenTalkerModelRunner.sample_next_token_ids: the prefill's logits before SGLang's sampler rewrites them in place;
 - QwenTalkerModelRunner.post_prefill, post_decode: the codec logits a step samples from, before the repetition
   penalty, the talker hidden state, the sampled code and the step's 16 codes; at prefill also the request's
@@ -64,12 +67,45 @@ def install_runner(module):
 
     runner = module.QwenTalkerModelRunner
     combine = runner.combine_feedback_with_next_text
+    before_prefill = runner.before_prefill
+    before_decode = runner.before_decode
     sample_next_token_ids = runner.sample_next_token_ids
     post_prefill = runner.post_prefill
     post_decode = runner.post_decode
     on_request_finished = runner.on_request_finished
     # note (ratish): SGLang's sampler turns the prefill logits into probabilities in place, so they are kept first.
     prefill_logits = {}
+    forward_index = {"value": 0}
+
+    def traced_before_prefill(self, forward_batch, schedule_batch, requests):
+        output = before_prefill(self, forward_batch, schedule_batch, requests)
+        forward_index["value"] += 1
+        slots = forward_batch.out_cache_loc.detach().to("cpu")
+        start = 0
+        for sched_req, extend_len in zip(requests, forward_batch.extend_seq_lens_cpu):
+            record = trace(sched_req.data.req.rid)
+            record["prefill_slots"] = slots[start:start + extend_len]
+            record["prefill_forward"] = forward_index["value"]
+            start += extend_len
+        return output
+
+    def traced_before_decode(self, forward_batch, schedule_batch, requests, *, is_lookahead=False):
+        output = before_decode(self, forward_batch, schedule_batch, requests, is_lookahead=is_lookahead)
+        forward_index["value"] += 1
+        batch_size = len(requests)
+        positions = (forward_batch.mrope_positions if forward_batch.mrope_positions is not None
+                     else forward_batch.positions.view(1, -1))[:, :batch_size].detach().to("cpu")
+        seq_lens = forward_batch.seq_lens[:batch_size].detach().to("cpu")
+        slots = forward_batch.out_cache_loc[:batch_size].detach().to("cpu")
+        buffer_rows = self.model.feedback_buffer[:batch_size].detach().to("cpu", torch.float32)
+        mask = self.model.feedback_mask[:batch_size].detach().to("cpu")
+        for row, sched_req in enumerate(requests):
+            record = trace(sched_req.data.req.rid)
+            record.setdefault("decode_steps", []).append(dict(
+                positions=positions[:, row].tolist(), seq_len=int(seq_lens[row]), slot=int(slots[row]),
+                batch_size=batch_size, row=row, mask=bool(mask[row]), buffer_row=buffer_rows[row],
+                forward=forward_index["value"]))
+        return output
 
     def traced_sample_next_token_ids(self, logits_output, forward_batch, schedule_batch, requests):
         prefill_logits["value"] = logits_output.next_token_logits.detach().to("cpu", torch.float32)
@@ -142,6 +178,8 @@ def install_runner(module):
 
     runner.combine_feedback_with_next_text = staticmethod(traced_combine)
     runner.sample_next_token_ids = traced_sample_next_token_ids
+    runner.before_prefill = traced_before_prefill
+    runner.before_decode = traced_before_decode
     runner.post_prefill = traced_post_prefill
     runner.post_decode = traced_post_decode
     runner.on_request_finished = traced_on_request_finished
