@@ -297,7 +297,34 @@ class Qwen3TTSSpeakerEncoderCudaGraphRunner:
         frames = mel_frames(samples.shape[1])
         assert frames > max(self.pads)
         bucket = smallest_bucket(frames, self.graphs)
-        if bucket is None:
+        if bucket is None and self.graphs:
+            # note (ratish): past the graphs the clip runs their arithmetic eagerly at a
+            # width rounded up to the largest bucket, so cuDNN plans each width once.
+            step = max(self.graphs)
+            largest = self.graphs[step]
+            width = -(-frames // step) * step
+            param = next(self.encoder.parameters())
+            padded = torch.zeros(
+                (1, SPEAKER_MEL_HOP * (width + 1) - 1),
+                device=param.device,
+                dtype=torch.float32,
+            )
+            padded[:, : samples.shape[1]].copy_(samples)
+            mels = log_mel(
+                padded,
+                torch.full((1,), samples.shape[1], device=param.device),
+                largest.mel_window,
+                largest.mel_basis,
+            )
+            with self.lock:
+                self.misses += 1
+            return encode_bucketed(
+                self.encoder,
+                mels.to(param.dtype),
+                torch.full((1,), frames, device=param.device),
+                self.pads,
+            )
+        elif bucket is None:
             param = next(self.encoder.parameters())
             mels = self.mel(samples).to(param.device).to(param.dtype)
             # note (Haoling Pu): preprocessing threads embed concurrently, and
