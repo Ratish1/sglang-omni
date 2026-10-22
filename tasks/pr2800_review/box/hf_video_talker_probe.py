@@ -71,6 +71,9 @@ def hf_client(shard: int, shards: int, out: Path) -> None:
     processor = Qwen3OmniMoeProcessor.from_pretrained(pair_check.MODEL)
     model = Qwen3OmniMoeForConditionalGeneration.from_pretrained(
         pair_check.MODEL, dtype=torch.bfloat16, device_map="cuda:0").eval()
+    # note (ratish): transformers 5.19's talker reuses the thinker's rope index, whose audio branch reads
+    # config.audio_config.n_window, which the talker's config lacks; the thinker's audio config supplies it.
+    model.talker.config.audio_config = model.config.thinker_config.audio_config
     (out / "hf" / "audio").mkdir(parents=True, exist_ok=True)
     records = []
     for sample_id, dump in list(zip(order, dumps))[shard::shards]:
@@ -131,27 +134,14 @@ def main() -> None:
         pass
     (args.out / "omni").mkdir(parents=True, exist_ok=True)
     tree_path = pair_check.tree("ups")
-    server_env = {
-        **pair_check.card_env(0, tree_path),
-        "PYTHONPATH": f"{BOX / 'processor_dump'}:{tree_path}",
-        "PROCESSOR_DUMP_DIR": str(args.out / "omni" / "dumps"),
-    }
-    log(args.out, "ups card 0 serving")
-    server = pair_check.serve(0, tree_path, pair_check.MODEL, PORT, SERVE_ARGS, args.out / "omni" / "server.log",
-                              env=server_env)
-    try:
-        rc = subprocess.run(
-            [sys.executable, str(Path(__file__).resolve()), "--dump-client", "--port", str(PORT), "--out",
-             str(args.out)],
-            cwd=tree_path, env=pair_check.card_env(0, tree_path), stdout=open(args.out / "omni" / "client.log", "w"),
-            stderr=subprocess.STDOUT).returncode
-    finally:
-        pair_check.stop(0, server)
-    log(args.out, f"omni capture rc {rc}, captures {len(list((args.out / 'omni' / 'dumps').glob('*.pt')))}")
-    if rc != 0:
-        return
+    if (args.out / "omni" / "videoamme.json").exists():
+        log(args.out, "omni captures present, reused")
     else:
-        pass
+        rc = capture(args.out, tree_path)
+        if rc != 0:
+            return
+        else:
+            pass
 
     def run_hf(shard: int, card: int) -> int:
         code = subprocess.run(
@@ -183,6 +173,27 @@ def main() -> None:
     (args.out / "summary.json").write_text(json.dumps(dict(score_rc=rc, wer=wer), indent=1))
     log(args.out, f"score rc {rc} wer {wer}")
     log(args.out, "done")
+
+
+def capture(out: Path, tree_path: Path) -> int:
+    server_env = {
+        **pair_check.card_env(0, tree_path),
+        "PYTHONPATH": f"{BOX / 'processor_dump'}:{tree_path}",
+        "PROCESSOR_DUMP_DIR": str(out / "omni" / "dumps"),
+    }
+    log(out, "ups card 0 serving")
+    server = pair_check.serve(0, tree_path, pair_check.MODEL, PORT, SERVE_ARGS, out / "omni" / "server.log",
+                              env=server_env)
+    try:
+        rc = subprocess.run(
+            [sys.executable, str(Path(__file__).resolve()), "--dump-client", "--port", str(PORT), "--out",
+             str(out)],
+            cwd=tree_path, env=pair_check.card_env(0, tree_path), stdout=open(out / "omni" / "client.log", "w"),
+            stderr=subprocess.STDOUT).returncode
+    finally:
+        pair_check.stop(0, server)
+    log(out, f"omni capture rc {rc}, captures {len(list((out / 'omni' / 'dumps').glob('*.pt')))}")
+    return rc
 
 
 if __name__ == "__main__":
