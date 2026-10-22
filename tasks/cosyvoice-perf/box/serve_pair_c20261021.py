@@ -35,6 +35,8 @@ ALL_CELLS = {
     "c1u": (["--max-concurrency", "1", "--max-samples", "256"], True),
     "c1f": (["--max-concurrency", "1", "--seed", "1234"], True),
     "c16": (["--max-concurrency", "16"], True),
+    # note (ratish): c16 under another name, a priming pass before a measured c16 (10-22, the reference cache test)
+    "c16p": (["--max-concurrency", "16"], True),
     "c64": (["--max-concurrency", "64"], True),
     "b1": (["--max-concurrency", "1", "--max-samples", "256"], False),
     "b16": (["--max-concurrency", "16"], False),
