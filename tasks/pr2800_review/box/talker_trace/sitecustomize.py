@@ -5,9 +5,10 @@ the talker's prefill builder and model runner are wrapped once their modules loa
 - TalkerPrefillBuilder.build_prompt_prefill: the thinker tokens the prefill holds and whether the thinker had finished;
 - TalkerPrefillBuilder.append_text_chunk, mark_thinker_done: each later thinker token, the thinker's end;
 - QwenTalkerModelRunner.combine_feedback_with_next_text: each decode step's feedback row and text row, apart;
+- QwenTalkerModelRunner.sample_next_token_ids: the prefill's logits before SGLang's sampler rewrites them in place;
 - QwenTalkerModelRunner.post_prefill, post_decode: the codec logits a step samples from, before the repetition
-  penalty, the sampled code and the step's 16 codes; at prefill also the request's projected prompt rows, its talker
-  input ids and positions;
+  penalty, the talker hidden state, the sampled code and the step's 16 codes; at prefill also the request's
+  projected prompt rows, its talker input ids and positions;
 - QwenTalkerModelRunner.on_request_finished: everything for the request to <TALKER_TRACE_DIR>/<request id>.pt.
 """
 
@@ -63,9 +64,16 @@ def install_runner(module):
 
     runner = module.QwenTalkerModelRunner
     combine = runner.combine_feedback_with_next_text
+    sample_next_token_ids = runner.sample_next_token_ids
     post_prefill = runner.post_prefill
     post_decode = runner.post_decode
     on_request_finished = runner.on_request_finished
+    # note (ratish): SGLang's sampler turns the prefill logits into probabilities in place, so they are kept first.
+    prefill_logits = {}
+
+    def traced_sample_next_token_ids(self, logits_output, forward_batch, schedule_batch, requests):
+        prefill_logits["value"] = logits_output.next_token_logits.detach().to("cpu", torch.float32)
+        return sample_next_token_ids(self, logits_output, forward_batch, schedule_batch, requests)
 
     def traced_combine(*, data, device, dtype):
         inputs = runner.peek_next_decode_inputs(data)
@@ -79,16 +87,19 @@ def install_runner(module):
             pass
         return combine(data=data, device=device, dtype=dtype)
 
-    def record_step(self, result, requests):
+    def record_step(self, result, requests, logits):
         batch_size = len(requests)
-        logits = result.logits_output.next_token_logits[:batch_size].detach().to("cpu", torch.float32)
         sampled = result.next_token_ids[:batch_size].detach().to("cpu").view(-1)
         codes = self.model.output_codes[:batch_size].detach().to("cpu")
+        # a decode graph replay may return no hidden states; the talker's code predictor read them in the forward
+        hidden_states = result.logits_output.hidden_states
+        hidden = None if hidden_states is None else hidden_states[:batch_size].detach().to("cpu", torch.float32)
         for row, sched_req in enumerate(requests):
             record = trace(sched_req.data.req.rid)
             record["logits"].append(logits[row])
             record["sampled"].append(int(sampled[row]))
             record["codes"].append(codes[row])
+            record.setdefault("hidden", []).append(None if hidden is None else hidden[row].reshape(-1))
 
     def traced_post_prefill(self, result, forward_batch, schedule_batch, requests):
         output = post_prefill(self, result, forward_batch, schedule_batch, requests)
@@ -105,7 +116,7 @@ def install_runner(module):
                 else:
                     record["mrope_positions"] = None
                     record["mrope_delta"] = 0
-            record_step(self, result, requests)
+            record_step(self, result, requests, prefill_logits.pop("value"))
         else:
             pass
         return output
@@ -113,7 +124,8 @@ def install_runner(module):
     def traced_post_decode(self, result, forward_batch, schedule_batch, requests):
         output = post_decode(self, result, forward_batch, schedule_batch, requests)
         if self.feedback_enabled:
-            record_step(self, result, requests)
+            logits = result.logits_output.next_token_logits[: len(requests)].detach().to("cpu", torch.float32)
+            record_step(self, result, requests, logits)
         else:
             pass
         return output
@@ -129,6 +141,7 @@ def install_runner(module):
         return on_request_finished(self, request_id, req_data)
 
     runner.combine_feedback_with_next_text = staticmethod(traced_combine)
+    runner.sample_next_token_ids = traced_sample_next_token_ids
     runner.post_prefill = traced_post_prefill
     runner.post_decode = traced_post_decode
     runner.on_request_finished = traced_on_request_finished

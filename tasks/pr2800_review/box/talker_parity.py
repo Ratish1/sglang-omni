@@ -11,10 +11,10 @@ Reads the traces talker_trace/sitecustomize.py wrote and checks each component a
    one a step, tts_eos once the thinker finished, tts_pad after);
 3. feedback rows: HF's sum of the step's 16 code embeddings (talker codec embedding, then the code predictor's);
 4. talker logits: HF's talker teacher-forced on the served prompt rows and decode rows, at the served positions; per
-   step the KL divergence of the served distribution (temperature 0.9, suppressed ids masked) from HF's and the rank
-   of the served code under HF's;
-5. code predictor: HF's 15 residual codes by argmax from HF's talker hidden and the served first code, against the
-   served codes.
+   step the KL divergence of the served distribution (temperature 0.9, suppressed ids masked) from HF's, the rank of
+   the served code under HF's and, where the trace has it, the served talker hidden against HF's;
+5. code predictor: HF's 15 residual codes by argmax, from HF's talker hidden and, where the trace has it, from the
+   served hidden, with the served first code, against the served codes.
 Writes one JSON row a request.
 """
 
@@ -133,22 +133,38 @@ def check_request(model, trace: dict, is_zero_multimodal: bool) -> dict:
                           past_key_values=cache, use_cache=True)
     hidden = output.last_hidden_state[:, -1:]
     decode_rows = [feedback + text for feedback, text in zip(trace["feedback_rows"], trace["text_rows"])]
-    divergences, ranks, predictor_matches, top_equal = [], [], [], []
+    served_hidden = trace.get("hidden") or [None] * len(trace["logits"])
+    # note (ratish): a trace without hidden states predates the kept prefill logits; its step 0 holds SGLang's sampled
+    # probabilities.
+    is_step0_probabilities = "hidden" not in trace
+    divergences, ranks, predictor_matches, served_predictor_matches, hidden_errors, top_equal = [], [], [], [], [], []
+
+    def predictor_codes(talker_hidden: torch.Tensor, code0: int) -> torch.Tensor:
+        code0_embed = talker.get_input_embeddings()(torch.tensor([[code0]], device=device))
+        return talker.code_predictor.generate(
+            inputs_embeds=torch.cat([talker_hidden, code0_embed], 1), max_new_tokens=15, do_sample=False,
+            top_k=None, top_p=None)[0, -15:]
+
     for step, served_logits in enumerate(trace["logits"]):
-        reference_logits = talker.codec_head(hidden)[0, 0].float()
-        served = served_logits.to(device).float().masked_fill(suppressed, float("-inf"))
-        reference_logits = reference_logits.masked_fill(suppressed, float("-inf"))
-        served_log = torch.log_softmax(served / TEMPERATURE, dim=-1)
-        reference_log = torch.log_softmax(reference_logits / TEMPERATURE, dim=-1)
-        support = torch.isfinite(served_log)
-        divergences.append(float((served_log.exp() * (served_log - reference_log))[support].sum()))
-        top_equal.append(int(served.argmax()) == int(reference_logits.argmax()))
+        reference_logits = talker.codec_head(hidden)[0, 0].float().masked_fill(suppressed, float("-inf"))
         code0 = int(trace["sampled"][step])
+        if not (step == 0 and is_step0_probabilities):
+            served = served_logits.to(device).float().masked_fill(suppressed, float("-inf"))
+            served_log = torch.log_softmax(served / TEMPERATURE, dim=-1)
+            reference_log = torch.log_softmax(reference_logits / TEMPERATURE, dim=-1)
+            support = torch.isfinite(served_log)
+            divergences.append(float((served_log.exp() * (served_log - reference_log))[support].sum()))
+            top_equal.append(int(served.argmax()) == int(reference_logits.argmax()))
+        else:
+            pass
         ranks.append(int((reference_logits > reference_logits[code0]).sum()))
-        predictor = talker.code_predictor.generate(
-            inputs_embeds=torch.cat([hidden, talker.get_input_embeddings()(torch.tensor([[code0]], device=device))], 1),
-            max_new_tokens=15, do_sample=False, top_k=None, top_p=None)
-        predictor_matches.append(int((predictor[0, -15:] == codes[step, 1:]).sum()))
+        predictor_matches.append(int((predictor_codes(hidden, code0) == codes[step, 1:]).sum()))
+        if served_hidden[step] is not None:
+            step_hidden = served_hidden[step].to(device, talker.dtype).view(1, 1, -1)
+            hidden_errors.append(relative_l2(step_hidden[0, 0], hidden[0, 0]))
+            served_predictor_matches.append(int((predictor_codes(step_hidden, code0) == codes[step, 1:]).sum()))
+        else:
+            pass
         if step >= len(decode_rows):
             break
         else:
@@ -160,6 +176,7 @@ def check_request(model, trace: dict, is_zero_multimodal: bool) -> dict:
         hidden = output.last_hidden_state[:, -1:]
     steps = len(divergences)
     late = divergences[steps // 2:] or [0.0]
+    frames = len(trace["logits"])
     return dict(
         request_id=trace["request_id"], finish_reason=trace["finish_reason"], frames=len(trace["codes"]),
         thinker_tokens=len(tokens), thinker_done_at_prefill=trace["thinker_done_at_prefill"],
@@ -169,10 +186,15 @@ def check_request(model, trace: dict, is_zero_multimodal: bool) -> dict:
         feedback_max_error=max(feedback_errors, default=0.0), bad_feedback_steps=bad_feedback_steps[:20],
         kl_mean=sum(divergences) / steps, kl_max=max(divergences), kl_first_quarter=sum(divergences[:steps // 4 or 1])
         / (steps // 4 or 1), kl_second_half=sum(late) / len(late), top1_agreement=sum(top_equal) / steps,
-        served_code_rank_median=sorted(ranks)[steps // 2], served_code_rank_over_50=sum(rank >= 50 for rank in ranks),
-        predictor_codes_equal=sum(predictor_matches) / (15 * steps),
+        served_code_rank_median=sorted(ranks)[frames // 2], served_code_rank_over_50=sum(rank >= 50 for rank in ranks),
+        predictor_codes_equal=sum(predictor_matches) / (15 * frames),
+        predictor_codes_equal_on_served_hidden=(
+            sum(served_predictor_matches) / (15 * len(served_predictor_matches)) if served_predictor_matches else None),
+        hidden_error_mean=sum(hidden_errors) / len(hidden_errors) if hidden_errors else None,
+        hidden_error_max=max(hidden_errors, default=None), step0_excluded=is_step0_probabilities,
         kl_steps=[round(divergence, 4) for divergence in divergences], top1_steps=[int(equal) for equal in top_equal],
-        rank_steps=ranks, predictor_steps=predictor_matches)
+        rank_steps=ranks, predictor_steps=predictor_matches, served_predictor_steps=served_predictor_matches,
+        hidden_error_steps=[round(error, 4) for error in hidden_errors])
 
 
 def main() -> None:
