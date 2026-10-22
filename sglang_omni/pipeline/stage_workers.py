@@ -739,6 +739,14 @@ def run_process(
             for stage in stages:
                 await stage.start()
                 report_startup_progress(spec)
+            # note (ratish): the startup heap lives as long as the process, so a
+            # frozen one leaves later full collections only the serving objects.
+            gc.collect()
+            gc.freeze()
+            log.info(
+                f"Frozen process {spec.process_name} startup object graph "
+                f"({gc.get_freeze_count()} objects)"
+            )
             log.info(
                 "Process %s ready with stages=%s",
                 spec.process_name,

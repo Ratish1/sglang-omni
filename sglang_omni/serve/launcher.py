@@ -145,17 +145,11 @@ class PipelineUvicornServer(uvicorn.Server):
     The pipeline launcher owns child-process cleanup, so it restores the
     original handlers but deliberately consumes the already-handled signal.
 
-    The optional startup GC freeze is process-wide and lasts until serve exits.
+    The startup GC freeze is process-wide and lasts until serve exits.
     """
 
-    def __init__(
-        self,
-        config: uvicorn.Config,
-        *,
-        freeze_api_gc_on_startup: bool = False,
-    ) -> None:
+    def __init__(self, config: uvicorn.Config) -> None:
         super().__init__(config)
-        self.freeze_api_gc_on_startup: bool = freeze_api_gc_on_startup
         self.has_frozen_api_gc: bool = False
 
     async def serve(self, sockets: list[socket.socket] | None = None) -> None:
@@ -170,7 +164,7 @@ class PipelineUvicornServer(uvicorn.Server):
 
     async def startup(self, sockets: list[socket.socket] | None = None) -> None:
         await super().startup(sockets=sockets)
-        if self.started and self.freeze_api_gc_on_startup:
+        if self.started:
             # note (yxs): New request cycles retain normal GC outside the startup graph.
             gc.collect()
             gc.freeze()
@@ -737,10 +731,7 @@ async def run_server(
                 log_level=log_level,
                 timeout_keep_alive=KEEP_ALIVE_S,
             )
-            server = PipelineUvicornServer(
-                config,
-                freeze_api_gc_on_startup=pipeline_config.freeze_api_gc_on_startup,
-            )
+            server = PipelineUvicornServer(config)
             # note (ratish): a wildcard bind address is not a destination, so the
             # server reaches itself on loopback.
             if not host or host == "0.0.0.0":
