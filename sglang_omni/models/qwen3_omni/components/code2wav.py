@@ -28,6 +28,7 @@ from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import (
 )
 
 from sglang_omni.kernels.bias_snake_beta import SnakeBetaCoefficients
+from sglang_omni.kernels.single_output_conv import clamped_single_output_conv
 from sglang_omni.models.qwen3_omni.components.codec_state_pool import (
     CodecStatePool,
     CodecStateSpec,
@@ -378,9 +379,14 @@ class Qwen3OmniCode2Wav(Qwen3OmniMoeCode2Wav):
         for blocks in self.upsample:
             for block in blocks:
                 hidden_states = channels_last_block(block, hidden_states)
-        for block in self.decoder:
+        for block in self.decoder[:-1]:
             hidden_states = channels_last_block(block, hidden_states)
-        return hidden_states.transpose(1, 2).clamp(min=-1, max=1)
+        final_conv = self.decoder[-1]
+        return clamped_single_output_conv(
+            F.pad(hidden_states, (0, 0, final_conv.padding, 0)),
+            final_conv.conv,
+            hidden_states.shape[1],
+        )
 
 
 class Qwen3OmniIncrementalCodec:

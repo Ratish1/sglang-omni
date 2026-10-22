@@ -20,6 +20,7 @@ from sglang_omni.kernels.bias_snake_beta import (
     fused_bias_snake_beta,
 )
 from sglang_omni.kernels.codec_state import history_exchange, overlap_exchange
+from sglang_omni.kernels.single_output_conv import clamped_single_output_conv
 from sglang_omni.models.qwen3_omni.components.codec_state_pool import CodecStatePool
 from sglang_omni.utils.channels_last_conv import (
     channels_last_conv1d,
@@ -86,12 +87,10 @@ def slot_causal_conv(
     slot_decode: SlotDecode,
     state_key: str,
     length: int,
-    *,
-    add_bias: bool,
 ) -> torch.Tensor:
-    """The causal conv's (B, length, C_out) outputs for a padded_input whose frames the producer
-    wrote, its history exchanged with the slots in place; without the bias when add_bias is
-    False."""
+    """The causal conv's (B, length, C_out) outputs without its bias, which the consumer adds,
+    for a padded_input whose frames the producer wrote, its history exchanged with the slots in
+    place."""
     conv = module.conv
     histories = slot_decode.pool.histories
     if state_key in histories:
@@ -104,8 +103,7 @@ def slot_causal_conv(
         )
     else:
         pass
-    bias = conv.bias if add_bias else None
-    return channels_last_conv1d(padded, conv, conv.weight, bias, length)
+    return channels_last_conv1d(padded, conv, conv.weight, None, length)
 
 
 def slot_causal_transconv(
@@ -182,7 +180,7 @@ def slot_conv_stack(
             padded, padded_frames = padded_input(codec.decoder[0], scaled)
             torch.add(residual, scaled, out=padded_frames)
     decoder_output = slot_causal_conv(
-        codec.decoder[0], padded, slot_decode, "decoder.0", length, add_bias=False
+        codec.decoder[0], padded, slot_decode, "decoder.0", length
     )
     decoder_blocks = codec.decoder[1:-2]
     activated = decoder_output.new_empty(decoder_output.shape)
@@ -220,7 +218,6 @@ def slot_conv_stack(
                 slot_decode,
                 f"{residual_key}.conv1",
                 length,
-                add_bias=False,
             )
             padded, padded_frames = padded_input(unit.conv2, frames)
             fused_bias_snake_beta(
@@ -235,7 +232,6 @@ def slot_conv_stack(
                 slot_decode,
                 f"{residual_key}.conv2",
                 length,
-                add_bias=False,
             )
             if residual_index + 1 < len(residual_units):
                 next_unit = residual_units[residual_index + 1]
@@ -266,7 +262,11 @@ def slot_conv_stack(
                     padded_frames,
                     residual=residual,
                 )
-    waveform = slot_causal_conv(
-        codec.decoder[-1], padded, slot_decode, "decoder.final", length, add_bias=True
+    history_exchange(
+        padded,
+        slot_decode.pool.histories["decoder.final"],
+        slot_decode.slot_index,
+        new_samples=length,
+        is_cold=slot_decode.is_cold,
     )
-    return waveform.transpose(1, 2).clamp(min=-1, max=1)
+    return clamped_single_output_conv(padded, codec.decoder[-1].conv, length)
