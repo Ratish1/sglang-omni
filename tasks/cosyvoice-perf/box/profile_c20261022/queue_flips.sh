@@ -9,8 +9,8 @@ HERE=/workspace/t_marks/tasks/cosyvoice-perf/box/profile_c20261022
 log() { echo "$* $(date +%T)" >> $Q/queue_flips.txt; }
 until grep -q "queue route done" $Q/queue_route.txt 2>/dev/null; do sleep 30; done
 log "queue flips start"
-(cd /workspace/t_l3n && CUDA_VISIBLE_DEVICES=0 taskset -c 0-15,64-79 \
+(cd /workspace/t_l3n && CUDA_VISIBLE_DEVICES=0 \
   PYTHONPATH=/workspace/t_l3n:/workspace/CosyVoice:/workspace/CosyVoice/third_party/Matcha-TTS \
-  python3 -u $HERE/tokenizer_flips.py $Q/tokenizer_flips.json > $Q/tokenizer_flips.log 2>&1)
+  taskset -c 0-15,64-79 python3 -u $HERE/tokenizer_flips.py $Q/tokenizer_flips.json > $Q/tokenizer_flips.log 2>&1)
 log "flips rc $? $(tail -3 $Q/tokenizer_flips.log | tr '\n' ' ')"
 log "queue flips done"
