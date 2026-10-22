@@ -72,6 +72,7 @@ TREES = {
     "phw": ("phw_b28571d72", "origin", "b28571d72272a45015132d2d2d65d64f7f7e4cf3"),
     "ups": ("ups_ca9e8789f", "upstream", "ca9e8789fcd84ed6f7272276cb99447eec751787"),
     "phx": ("phx_ddde3a0aa", "origin", "ddde3a0aa0e9fbea257a5eb3092a98e66e6bd747"),
+    "c99": ("c99_9285030d0", "origin", "9285030d0bc1e0042c443688352860760884b2db"),
 }
 # note (ratish): every arm is measured by one client and scored by one ASR server, both from main; from the SGLang
 # 0.5.22 stack on (057d97629) a tree from before it no longer runs, and main's client records each chunk's length.
@@ -106,6 +107,7 @@ ARMS = {
     "phw": ("phw", [], [0.7769]),
     "ups": ("ups", [], [0.7769]),
     "phx": ("phx", [], [0.7769]),
+    "c99": ("c99", [], [0.7769]),
 }
 # arm: benchmark args every pass of the arm adds
 ARM_BENCH_ARGS: dict[str, list[str]] = {}
