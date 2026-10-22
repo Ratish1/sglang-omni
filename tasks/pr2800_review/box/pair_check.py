@@ -109,6 +109,13 @@ ARMS = {
     "phx": ("phx", [], [0.7769]),
     "c99": ("c99", [], [0.7769]),
     "upsb": ("ups", [], [0.7769]),
+    "upsc": ("ups", [], [0.7769]),
+    "uplb": ("upl", [], [0.7769]),
+    "uplc": ("upl", [], [0.7769]),
+    "c99b": ("c99", [], [0.7769]),
+    "c99c": ("c99", [], [0.7769]),
+    "phxb": ("phx", [], [0.7769]),
+    "phxc": ("phx", [], [0.7769]),
 }
 # arm: benchmark args every pass of the arm adds
 ARM_BENCH_ARGS: dict[str, list[str]] = {}

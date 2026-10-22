@@ -1,11 +1,12 @@
-"""Video-AMME talker in the CI's TP2 shape on the CI sample, one arm at a time on both cards.
+"""Video-AMME talker in the CI's TP2 shape on the CI sample, one arm at a time on a card pair.
 
-Run on the box: python3 /workspace/box/tasks/pr2800_review/box/videoamme_talker_tp2.py --arms upk,phs
-    --out /data/pr2800/<run>
-Each arm serves the CI's FP8 thinker TP2 speech server (examples/run_qwen3_omni_speech_server.py: thinker on cards 0
-and 1, talker and code2wav on card 1) and gets the CI's request shape: the first 10 videoamme-ci-50 samples, video and
-audio in, text and audio out, greedy, 256 tokens, c16. After the arms, one Qwen3-ASR server on card 0 transcribes each
-arm's audio and scores it against the arm's text as the CI does. The client and the scoring run in each tree's own
+Run on the box: python3 /workspace/box/tasks/pr2800_review/box/videoamme_talker_tp2.py --chains "upl,c99@0+1"
+    --score-card 0 --out /data/pr2800/<run>
+Each arm serves the CI's FP8 thinker TP2 speech server (examples/run_qwen3_omni_speech_server.py: thinker on the pair,
+talker and code2wav on its second card) and gets the CI's request shape: the first 10 videoamme-ci-50 samples, video
+and audio in, text and audio out, greedy, 256 tokens, c16. Chains on different pairs run at the same time. After the
+arms, one Qwen3-ASR server on the score card transcribes each arm's audio and scores it against the arm's text as the
+CI does. The client and the scoring run in each tree's own
 code (this file in its --client and --score modes). Writes <out>/<arm>/videoamme.json, <out>/<arm>/wer.json and
 <out>/summary.json.
 """
@@ -19,6 +20,7 @@ import os
 import subprocess
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import httpx
@@ -101,17 +103,19 @@ def score(port: int, out: Path) -> None:
     (out / "wer.json").write_text(json.dumps(wer, indent=1))
 
 
-def serve(arm_tree: Path, log_path: Path) -> subprocess.Popen:
+def serve(
+    arm_tree: Path, log_path: Path, cards: tuple[int, int], port: int
+) -> subprocess.Popen:
     env = {
-        **pair_check.card_env(0, arm_tree),
-        "CUDA_VISIBLE_DEVICES": "0,1",
+        **pair_check.card_env(cards[0], arm_tree),
+        "CUDA_VISIBLE_DEVICES": f"{cards[0]},{cards[1]}",
         "SGLANG_OMNI_STRICT_PORT": "1",
         "SGLANG_OMNI_STARTUP_TIMEOUT": "1800",
     }
     process = subprocess.Popen(
         [
             "numactl",
-            f"--physcpubind={pair_check.CARD_CPUS[0]},{pair_check.CARD_CPUS[1]}",
+            f"--physcpubind={pair_check.CARD_CPUS[cards[0]]},{pair_check.CARD_CPUS[cards[1]]}",
             f"--membind={pair_check.NODE}",
             sys.executable,
             "-u",
@@ -122,7 +126,7 @@ def serve(arm_tree: Path, log_path: Path) -> subprocess.Popen:
             "--host",
             "127.0.0.1",
             "--port",
-            str(PORT),
+            str(port),
         ],
         cwd=arm_tree,
         env=env,
@@ -139,7 +143,7 @@ def serve(arm_tree: Path, log_path: Path) -> subprocess.Popen:
             pass
         try:
             if (
-                httpx.get(f"http://127.0.0.1:{PORT}/health", timeout=5).status_code
+                httpx.get(f"http://127.0.0.1:{port}/health", timeout=5).status_code
                 == 200
             ):
                 return process
@@ -148,21 +152,22 @@ def serve(arm_tree: Path, log_path: Path) -> subprocess.Popen:
         except httpx.HTTPError:
             pass
         time.sleep(5)
-    stop(process)
+    stop(process, cards)
     raise RuntimeError(f"server not healthy in 30 min, see {log_path}")
 
 
-def stop(process: subprocess.Popen) -> None:
-    pair_check.stop(0, process)
-    pair_check.stop(1, process)
+def stop(process: subprocess.Popen, cards: tuple[int, int]) -> None:
+    pair_check.stop(cards[0], process)
+    pair_check.stop(cards[1], process)
 
 
-def run_arm(out: Path, arm: str) -> int:
+def run_arm(out: Path, arm: str, cards: tuple[int, int]) -> int:
     arm_out = out / arm
     arm_out.mkdir(parents=True, exist_ok=True)
     arm_tree = pair_check.tree(pair_check.ARMS[arm][0])
-    log(out, f"{arm} serving")
-    server = serve(arm_tree, arm_out / "server.log")
+    port = PORT + 200 * cards[0]
+    log(out, f"{arm} cards {cards} serving")
+    server = serve(arm_tree, arm_out / "server.log", cards, port)
     try:
         log(out, f"{arm} healthy, client")
         rc = subprocess.run(
@@ -171,7 +176,7 @@ def run_arm(out: Path, arm: str) -> int:
                 str(Path(__file__).resolve()),
                 "--client",
                 "--port",
-                str(PORT),
+                str(port),
                 "--out",
                 str(arm_out),
             ],
@@ -181,7 +186,7 @@ def run_arm(out: Path, arm: str) -> int:
             stderr=subprocess.STDOUT,
         ).returncode
     finally:
-        stop(server)
+        stop(server, cards)
     server_log = (arm_out / "server.log").read_text(errors="replace")
     log(
         out,
@@ -192,11 +197,16 @@ def run_arm(out: Path, arm: str) -> int:
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--arms", help="arm,arm")
+    parser.add_argument(
+        "--chains",
+        help="chains separated by ';', each 'arm,arm@a+b': its arms one after another on cards a and b, the chains "
+        "at the same time",
+    )
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--client", action="store_true")
     parser.add_argument("--score", action="store_true")
     parser.add_argument("--port", type=int)
+    parser.add_argument("--score-card", type=int, default=0)
     args = parser.parse_args()
     if args.client:
         client(args.port, args.out)
@@ -207,12 +217,23 @@ def main() -> None:
     else:
         pass
     args.out.mkdir(parents=True, exist_ok=True)
-    arms = args.arms.split(",")
-    codes = [run_arm(args.out, arm) for arm in arms]
+    chains = []
+    for chain in args.chains.split(";"):
+        chain_arms, pair = chain.split("@")
+        first_card, second_card = (int(card) for card in pair.split("+"))
+        chains.append((chain_arms.split(","), (first_card, second_card)))
+
+    def run_chain(chain_arms: list[str], cards: tuple[int, int]) -> list[int]:
+        return [run_arm(args.out, arm, cards) for arm in chain_arms]
+
+    with ThreadPoolExecutor(max_workers=len(chains)) as pool:
+        chain_codes = list(pool.map(lambda chain: run_chain(*chain), chains))
+    arms = [arm for chain_arms, _ in chains for arm in chain_arms]
+    codes = [code for codes_of_chain in chain_codes for code in codes_of_chain]
     asr_tree = pair_check.tree(pair_check.ASR_TREE)
-    asr_port = pair_check.ASR_PORT
+    asr_port = pair_check.ASR_PORT + 1000 + 200 * args.score_card
     asr = pair_check.serve(
-        0, asr_tree, pair_check.ASR_MODEL, asr_port, [], args.out / "asr_server.log"
+        args.score_card, asr_tree, pair_check.ASR_MODEL, asr_port, [], args.out / "asr_server.log"
     )
     summary = {}
     try:
@@ -232,7 +253,7 @@ def main() -> None:
                     str(args.out / arm),
                 ],
                 cwd=asr_tree,
-                env=pair_check.card_env(0, asr_tree),
+                env=pair_check.card_env(args.score_card, asr_tree),
                 stdout=open(args.out / arm / "score.log", "w"),
                 stderr=subprocess.STDOUT,
             ).returncode
@@ -249,10 +270,10 @@ def main() -> None:
             log(
                 args.out,
                 f"{arm} accuracy {videoamme['summary'].get('accuracy')} failed "
-                f"{videoamme['summary'].get('failed')} wer {wer}",
+                f"{videoamme['summary'].get('failed')} rtf {videoamme['speed'].get('rtf_mean')} wer {wer}",
             )
     finally:
-        pair_check.stop(0, asr)
+        pair_check.stop(args.score_card, asr)
     (args.out / "summary.json").write_text(json.dumps(summary, indent=1))
     log(args.out, "done")
 
