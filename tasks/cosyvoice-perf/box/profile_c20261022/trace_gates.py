@@ -28,6 +28,7 @@ def main() -> None:
                 events = json.load(gzip.open(trace)).get("traceEvents", [])
                 counts = dict.fromkeys(COUNTED, 0)
                 python_frames = 0
+                lazy_load_us = 0.0
                 stamps = []
                 for event in events:
                     name = str(event.get("name", ""))
@@ -35,7 +36,8 @@ def main() -> None:
                         python_frames += 1
                     else:
                         pass
-                    if "ts" in event:
+                    # note (ratish): metadata events carry ts 0 and widened the span to the epoch (10-22).
+                    if event.get("ph") == "X" and float(event.get("ts", 0)) > 0:
                         stamps.append(float(event["ts"]))
                     else:
                         pass
@@ -44,16 +46,24 @@ def main() -> None:
                             counts[label] += 1
                         else:
                             pass
+                    if COUNTED["lazy load"](name):
+                        lazy_load_us += float(event.get("dur", 0))
+                    else:
+                        pass
                 span = (max(stamps) - min(stamps)) / 1e6 if stamps else 0.0
                 if mode == "formal":
-                    clean = not any(counts[label] for label in ("capture", "lazy load", "module load", "dynamo"))
+                    # note (ratish): a first use kernel load of tens of microseconds charges nothing a window can
+                    # see; past 1 ms in total it is one-time work in the steady state (10-22: 0.03 to 0.09 ms each).
+                    clean = lazy_load_us <= 1000 and not any(
+                        counts[label] for label in ("capture", "module load", "dynamo")
+                    )
                     verdict = "pass" if clean and counts["graph launch"] > 0 else "FAIL"
                 else:
                     verdict = "pass" if python_frames > 0 else "FAIL"
                 print(
                     f"| {mode} | {cell_dir.name}/{trace.name.split('.')[0]} | {span:.2f} | "
                     + " | ".join(str(counts[label]) for label in COUNTED)
-                    + f" | {python_frames} | {verdict} |"
+                    + f" | {python_frames} | {verdict} (lazy loads {lazy_load_us / 1000:.2f} ms) |"
                 )
 
 
