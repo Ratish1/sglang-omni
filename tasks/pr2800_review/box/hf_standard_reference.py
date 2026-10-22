@@ -86,6 +86,9 @@ def cookbook_inputs(processor: Qwen3OmniMoeProcessor, content: list[dict[str, ob
     if is_sampled_fps:
         audios, images, videos, video_kwargs = process_mm_info(conversation, use_audio_in_video=False,
                                                                return_video_kwargs=True)
+        # note (ratish): the processor repeats one fps over every video, so a request carries one video here.
+        (sampled_fps,) = video_kwargs["fps"]
+        video_kwargs = {**video_kwargs, "fps": sampled_fps}
     else:
         audios, images, videos = process_mm_info(conversation, use_audio_in_video=False)
         video_kwargs = {}
