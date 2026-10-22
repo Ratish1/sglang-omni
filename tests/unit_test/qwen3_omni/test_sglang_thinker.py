@@ -6,7 +6,6 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from types import SimpleNamespace
-from unittest.mock import Mock
 
 import pytest
 
@@ -75,9 +74,9 @@ def test_real_qwen_config_drives_prefill_positions(
     expected_mrope: bool,
 ):
     class LightweightTextModel(torch.nn.Module):
-        def __init__(self, *, config, quant_config, prefix, accept_hidden_layer):
+        def __init__(self, *, config, accept_hidden_layer, quant_config, prefix):
             super().__init__()
-            del quant_config, prefix
+            del accept_hidden_layer, quant_config, prefix
             self.embed_tokens = torch.nn.Embedding(
                 config.vocab_size,
                 config.hidden_size,
@@ -173,7 +172,7 @@ def test_outer_thinker_forward_accepts_sidecar_request_identity():
     wrapper = object.__new__(Qwen3OmniThinkerForCausalLM)
     torch.nn.Module.__init__(wrapper)
     wrapper.model = fake_model
-    wrapper.logits_processor = lambda *args: args[0]
+    wrapper.logits_processor = lambda *args, aux_hidden_states: args[0]
     wrapper.lm_head = object()
     wrapper.fused_rope_gate = None
     wrapper.decode_live_rows = DecodeLiveRows()
@@ -181,9 +180,7 @@ def test_outer_thinker_forward_accepts_sidecar_request_identity():
     positions = torch.tensor([0, 1], dtype=torch.long)
     input_embeds = torch.ones((2, 3))
     forward_batch = SimpleNamespace(
-        mrope_positions=None,
-        forward_mode=ForwardMode.EXTEND,
-        capture_hidden_mode=CaptureHiddenMode.NULL,
+        mrope_positions=None, forward_mode=ForwardMode.EXTEND
     )
 
     result = wrapper.forward(
@@ -273,7 +270,7 @@ def make_bare_wrapper(error: RuntimeError | None = None) -> Qwen3OmniThinkerForC
     torch.nn.Module.__init__(wrapper)
     wrapper.decode_live_rows = DecodeLiveRows()
     wrapper.model = RecordingTextModel(wrapper.decode_live_rows, error)
-    wrapper.logits_processor = lambda *args: args[1]
+    wrapper.logits_processor = lambda *args, aux_hidden_states: args[1]
     wrapper.lm_head = object()
     wrapper.fused_rope_gate = None
     return wrapper
@@ -290,192 +287,52 @@ def run_forward(
         forward_batch=SimpleNamespace(
             mrope_positions=None,
             forward_mode=forward_mode,
-            capture_hidden_mode=CaptureHiddenMode.NULL,
             out_cache_loc=torch.tensor(out_cache_loc),
         ),
     )
 
 
-@pytest.fixture
-def prompt_capture_wrapper(
+@pytest.mark.parametrize(
+    ("forward_mode", "capture_hidden_mode", "accept_hidden_layer", "expected_layers"),
+    [
+        (ForwardMode.EXTEND, CaptureHiddenMode.FULL, 2, [2]),
+        (ForwardMode.EXTEND, CaptureHiddenMode.NULL, 2, []),
+        (ForwardMode.DECODE, CaptureHiddenMode.FULL, 2, []),
+        (ForwardMode.EXTEND, CaptureHiddenMode.FULL, 4, []),
+    ],
+)
+def test_the_thinker_captures_the_talkers_layer_only_on_a_full_extend(
     monkeypatch: pytest.MonkeyPatch,
-) -> Qwen3OmniThinkerForCausalLM:
-    def initialize_text_model(self, *, config, quant_config, prefix):
-        torch.nn.Module.__init__(self)
-        self.config = config
-        self.layers_to_capture = []
-
+    forward_mode: ForwardMode,
+    capture_hidden_mode: CaptureHiddenMode,
+    accept_hidden_layer: int,
+    expected_layers: list[int],
+) -> None:
+    seen: list[list[int]] = []
     monkeypatch.setattr(
         sglang_thinker_module.Qwen3MoeLLMModel,
         "__init__",
-        initialize_text_model,
+        lambda self, *, config, quant_config, prefix: torch.nn.Module.__init__(self),
     )
-    wrapper = make_bare_wrapper()
-    wrapper.config = SimpleNamespace(num_hidden_layers=4)
-    wrapper.model = Qwen3OmniThinkerTextModel(
-        config=wrapper.config, accept_hidden_layer=2
-    )
-    return wrapper
-
-
-@pytest.mark.parametrize("accepted_layer", [0, 2, 4])
-@pytest.mark.parametrize(
-    "live_capture_mode", [CaptureHiddenMode.FULL, CaptureHiddenMode.NULL]
-)
-def test_prompt_capture_returns_the_configured_layer_with_all_extend_rows(
-    monkeypatch: pytest.MonkeyPatch,
-    prompt_capture_wrapper: Qwen3OmniThinkerForCausalLM,
-    accepted_layer: int,
-    live_capture_mode: CaptureHiddenMode,
-) -> None:
-    wrapper = prompt_capture_wrapper
-    wrapper.model.accept_hidden_layer = accepted_layer
-    selected_states = torch.tensor([[10.0, 11.0], [20.0, 21.0], [30.0, 31.0]])
-    final_states = selected_states + 100
-
-    def model_forward(model, **kwargs):
-        assert model.layers_to_capture == (
-            [accepted_layer] if accepted_layer < 4 else []
-        )
-        if model.layers_to_capture:
-            return final_states, [selected_states]
-        else:
-            return final_states
-
     monkeypatch.setattr(
-        sglang_thinker_module.Qwen3MoeLLMModel, "forward", model_forward
+        sglang_thinker_module.Qwen3MoeLLMModel,
+        "forward",
+        lambda self, **kwargs: seen.append(list(self.layers_to_capture)),
     )
-    batch = SimpleNamespace(
-        mrope_positions=None,
-        forward_mode=ForwardMode.EXTEND,
-        capture_hidden_mode=CaptureHiddenMode.FULL,
+    model = Qwen3OmniThinkerTextModel(
+        config=SimpleNamespace(num_hidden_layers=4),
+        accept_hidden_layer=accept_hidden_layer,
     )
-    input_ids = torch.tensor([1, 2, 3])
-    positions = torch.arange(3)
-    captured_output = wrapper.model.forward(input_ids, positions, batch)
-    monkeypatch.setattr(wrapper.model, "forward", Mock(return_value=captured_output))
-    batch.capture_hidden_mode = live_capture_mode
 
-    def logits_processor(input_ids, hidden_states, head, batch, aux_hidden_states=None):
-        assert hidden_states is final_states
-        return hidden_states if aux_hidden_states is None else aux_hidden_states[0]
-
-    wrapper.logits_processor = logits_processor
-    result = wrapper.forward(
-        input_ids=input_ids, positions=positions, forward_batch=batch
-    )
-    expected_states = (
-        selected_states
-        if live_capture_mode == CaptureHiddenMode.FULL and accepted_layer < 4
-        else final_states
-    )
-    assert torch.equal(result, expected_states)
-    assert wrapper.model.layers_to_capture == []
-
-
-@pytest.mark.parametrize(
-    ("forward_mode", "capture_hidden_mode"),
-    [
-        (ForwardMode.EXTEND, CaptureHiddenMode.NULL),
-        (ForwardMode.DECODE, CaptureHiddenMode.FULL),
-        (ForwardMode.DECODE, CaptureHiddenMode.NULL),
-    ],
-)
-def test_text_model_does_not_collect_auxiliary_states_outside_full_prefill(
-    monkeypatch: pytest.MonkeyPatch,
-    prompt_capture_wrapper: Qwen3OmniThinkerForCausalLM,
-    forward_mode: ForwardMode,
-    capture_hidden_mode: CaptureHiddenMode,
-) -> None:
-    final_states = torch.ones(2, 3)
-
-    def model_forward(model, **kwargs):
-        if model.layers_to_capture:
-            raise AssertionError("Unexpected auxiliary capture")
-        else:
-            return final_states
-
-    monkeypatch.setattr(
-        sglang_thinker_module.Qwen3MoeLLMModel, "forward", model_forward
-    )
-    result = prompt_capture_wrapper.model.forward(
-        torch.tensor([1, 2]),
-        torch.tensor([0, 1]),
+    model.forward(
+        torch.tensor([1]),
+        torch.tensor([0]),
         SimpleNamespace(
             forward_mode=forward_mode, capture_hidden_mode=capture_hidden_mode
         ),
     )
-    assert result is final_states
 
-
-def test_prompt_capture_restores_layer_selection_after_a_failed_forward(
-    monkeypatch: pytest.MonkeyPatch,
-    prompt_capture_wrapper: Qwen3OmniThinkerForCausalLM,
-) -> None:
-    model = prompt_capture_wrapper.model
-    previous_capture_layers = [1, 3]
-    model.layers_to_capture = previous_capture_layers
-    monkeypatch.setattr(
-        sglang_thinker_module.Qwen3MoeLLMModel,
-        "forward",
-        Mock(side_effect=RuntimeError("forward failed")),
-    )
-    with pytest.raises(RuntimeError, match="forward failed"):
-        model.forward(
-            input_ids=torch.tensor([1]),
-            positions=torch.tensor([0]),
-            forward_batch=SimpleNamespace(
-                forward_mode=ForwardMode.EXTEND,
-                capture_hidden_mode=CaptureHiddenMode.FULL,
-            ),
-        )
-    assert model.layers_to_capture is previous_capture_layers
-
-
-@pytest.mark.parametrize(
-    ("model_output", "error_message"),
-    [
-        (torch.zeros(2, 1), "did not return auxiliary hidden states"),
-        (
-            (torch.zeros(2, 1), [torch.zeros(2, 1), torch.ones(2, 1)]),
-            "exactly one auxiliary layer",
-        ),
-        ((torch.zeros(2, 1), [torch.zeros(1, 1)]), "do not align"),
-    ],
-    ids=["two-row-tensor", "multiple-layers", "missing-row"],
-)
-def test_prompt_capture_rejects_malformed_model_output_before_logits(
-    monkeypatch: pytest.MonkeyPatch,
-    model_output: torch.Tensor | tuple[torch.Tensor, list[torch.Tensor]],
-    error_message: str,
-    prompt_capture_wrapper: Qwen3OmniThinkerForCausalLM,
-) -> None:
-    wrapper = prompt_capture_wrapper
-    monkeypatch.setattr(wrapper.model, "forward", Mock(return_value=model_output))
-    logits_processor = Mock()
-    wrapper.logits_processor = logits_processor
-
-    with pytest.raises(RuntimeError, match=error_message):
-        wrapper.forward(
-            input_ids=torch.tensor([1, 2]),
-            positions=torch.tensor([0, 1]),
-            forward_batch=SimpleNamespace(
-                mrope_positions=None,
-                forward_mode=ForwardMode.EXTEND,
-                capture_hidden_mode=CaptureHiddenMode.FULL,
-            ),
-        )
-
-    logits_processor.assert_not_called()
-
-
-@pytest.mark.parametrize("accepted_layer", [-1, 5])
-def test_prompt_capture_rejects_a_layer_outside_the_text_model(accepted_layer: int):
-    with pytest.raises(ValueError, match="accept_hidden_layer"):
-        Qwen3OmniThinkerTextModel(
-            config=SimpleNamespace(num_hidden_layers=4),
-            accept_hidden_layer=accepted_layer,
-        )
+    assert seen == [expected_layers]
 
 
 @pytest.mark.parametrize(
@@ -529,7 +386,7 @@ def test_thinker_routes_every_unquantized_moe_layer_through_the_shared_decode_ma
     dense_mlp = torch.nn.Identity()
 
     class LayeredTextModel(torch.nn.Module):
-        def __init__(self, *, config, quant_config, prefix, accept_hidden_layer):
+        def __init__(self, *, config, quant_config, prefix):
             super().__init__()
             self.embed_tokens = torch.nn.Embedding(
                 config.vocab_size, config.hidden_size
@@ -538,9 +395,7 @@ def test_thinker_routes_every_unquantized_moe_layer_through_the_shared_decode_ma
                 [make_layer(moe_block), make_layer(dense_mlp)]
             )
 
-    monkeypatch.setattr(
-        sglang_thinker_module, "Qwen3OmniThinkerTextModel", LayeredTextModel
-    )
+    monkeypatch.setattr(sglang_thinker_module, "Qwen3MoeLLMModel", LayeredTextModel)
     monkeypatch.setattr(
         sglang_thinker_module, "LogitsProcessor", lambda config: torch.nn.Identity()
     )

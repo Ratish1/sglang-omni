@@ -102,10 +102,13 @@ def create_thinker_scheduler(
         trust_remote_code=True,
     )
     thinker_config = model_config.hf_config.thinker_config
+    # note (ratish): a session turn reuses its slot's committed KV, so earlier turns' prompt rows
+    # cannot be computed again; only a request computes every row the talker reads.
     request_builder, result_adapter = make_thinker_scheduler_adapters(
         tokenizer=tokenizer,
         vocab_size=model_config.vocab_size,
         thinker_config=thinker_config,
+        capture_prompt_hidden_states=speech_enabled and execution_mode == "request",
     )
     # Note (Junnan Li): A session turn streams its tokens to the talker like any request; the session only owns the lifecycle.
     stream_output_builder = make_thinker_stream_output_builder(

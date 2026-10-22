@@ -1,7 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 from types import SimpleNamespace
 
+import pytest
 import torch
+from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
 from sglang.srt.model_executor.forward_context import (
     get_forward_context,
     has_forward_context,
@@ -9,6 +11,10 @@ from sglang.srt.model_executor.forward_context import (
 
 from sglang_omni.model_runner.base import ModelRunner
 from sglang_omni.model_runner.thinker_model_runner import ThinkerModelRunner
+from sglang_omni.scheduling.sglang_backend.prompt_hidden import (
+    PromptHiddenCapture,
+    PromptHiddenRequest,
+)
 
 
 def probe_runner(monkeypatch, method: str):
@@ -98,10 +104,13 @@ def test_custom_omni_forward_publishes_sglang_forward_context():
         assert kwargs["input_deepstack_embeds"] is None
         return torch.ones(1, 2)
 
-    def logits_processor(input_ids, hidden_states, lm_head, forward_batch):
+    def logits_processor(
+        input_ids, hidden_states, lm_head, forward_batch, aux_hidden_states
+    ):
         seen.append(get_forward_context().attn_backend)
         assert input_ids is forward_batch.input_ids
         assert lm_head == "lm_head"
+        assert aux_hidden_states is None
         return "logits"
 
     runner.outer_model = SimpleNamespace(
@@ -122,3 +131,77 @@ def test_custom_omni_forward_publishes_sglang_forward_context():
     )
 
     assert result.logits_output == "logits"
+
+
+def test_a_capturing_omni_forward_hands_the_captured_layer_to_the_logits():
+    runner = ThinkerModelRunner.__new__(ThinkerModelRunner)
+    attn_backend = SimpleNamespace(init_forward_metadata=lambda batch: None)
+    runner.tp_worker = SimpleNamespace(
+        model_runner=SimpleNamespace(attn_backend=attn_backend)
+    )
+    captured = [torch.full((1, 2), 7.0)]
+    runner.outer_model = SimpleNamespace(
+        model=lambda **kwargs: (torch.ones(1, 2), captured),
+        logits_processor=lambda input_ids, hidden_states, lm_head, forward_batch, aux_hidden_states: aux_hidden_states,
+        lm_head="lm_head",
+    )
+    forward_batch = SimpleNamespace(
+        positions=torch.tensor([0]),
+        mrope_positions=None,
+        input_ids=torch.tensor([1]),
+    )
+
+    result = runner.forward_with_omni_embeds(forward_batch, torch.ones(1, 2))
+
+    assert result.logits_output is captured
+
+
+def owing_request(positions: list[int]) -> PromptHiddenRequest:
+    request = object.__new__(PromptHiddenRequest)
+    request.prompt_hidden = PromptHiddenCapture(positions=torch.tensor(positions))
+    return request
+
+
+@pytest.mark.parametrize(
+    ("prefix_length", "extend_length", "expected_mode"),
+    [
+        (0, 3, CaptureHiddenMode.NULL),
+        (2, 2, CaptureHiddenMode.FULL),
+        (4, 3, CaptureHiddenMode.NULL),
+    ],
+)
+def test_only_a_prefill_chunk_holding_owed_rows_captures_hidden_states(
+    prefix_length: int, extend_length: int, expected_mode: CaptureHiddenMode
+) -> None:
+    runner = ThinkerModelRunner.__new__(ThinkerModelRunner)
+    schedule_batch = SimpleNamespace(
+        reqs=[SimpleNamespace(), owing_request([3])],
+        prefix_lens=[0, prefix_length],
+        extend_lens=[4, extend_length],
+    )
+
+    assert (
+        runner.requested_capture_hidden_mode_prefill(schedule_batch, [])
+        == expected_mode
+    )
+
+
+@pytest.mark.accelerator
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="pinned host rows need CUDA")
+def test_a_capturing_prefill_hands_each_request_the_rows_at_its_positions() -> None:
+    runner = ThinkerModelRunner.__new__(ThinkerModelRunner)
+    speech = owing_request([3, 5])
+    schedule_batch = SimpleNamespace(
+        reqs=[SimpleNamespace(), speech], prefix_lens=[0, 3], extend_lens=[2, 3]
+    )
+    hidden_states = torch.arange(10.0, device="cuda").view(5, 2)
+
+    runner.post_prefill(
+        SimpleNamespace(logits_output=SimpleNamespace(hidden_states=hidden_states)),
+        SimpleNamespace(capture_hidden_mode=CaptureHiddenMode.FULL),
+        schedule_batch,
+        [],
+    )
+    torch.cuda.synchronize()
+
+    assert torch.equal(speech.prompt_hidden.take(), hidden_states[[2, 4]].cpu())

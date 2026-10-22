@@ -20,6 +20,7 @@ from sglang_omni.model_runner.base import ModelRunner
 from sglang_omni.model_runner.model_worker import ModelWorker
 from sglang_omni.model_runner.sglang_execution import attn_forward_context
 from sglang_omni.scheduling.sglang_backend.output_processor import SGLangOutputProcessor
+from sglang_omni.scheduling.sglang_backend.prompt_hidden import PromptHiddenRequest
 from sglang_omni.scheduling.types import SchedulerRequest
 
 logger = logging.getLogger(__name__)
@@ -74,23 +75,53 @@ class ThinkerModelRunner(ModelRunner):
             pass
         return None
 
-    # note (ratish): the thinker reads no SGLang hidden states, and a request asking
-    # for them would raise the batch capture mode above the graph's and run eager
+    # note (ratish): a batch capturing hidden states runs eager above the graphs' capture mode,
+    # so only a prefill chunk holding prompt rows a request owes the talker captures them.
     def requested_capture_hidden_mode_prefill(
         self, schedule_batch: ScheduleBatch, requests: list[SchedulerRequest]
     ) -> CaptureHiddenMode:
-        del schedule_batch, requests
-        from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
-
-        return CaptureHiddenMode.NULL
+        del requests
+        is_owed = any(
+            isinstance(req, PromptHiddenRequest)
+            and req.prompt_hidden.is_owed_in(prefix_length, extend_length)
+            for req, prefix_length, extend_length in zip(
+                schedule_batch.reqs,
+                schedule_batch.prefix_lens,
+                schedule_batch.extend_lens,
+            )
+        )
+        return CaptureHiddenMode.FULL if is_owed else CaptureHiddenMode.NULL
 
     def requested_capture_hidden_mode_decode(
         self, schedule_batch: ScheduleBatch, requests: list[SchedulerRequest]
     ) -> CaptureHiddenMode:
         del schedule_batch, requests
-        from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
-
         return CaptureHiddenMode.NULL
+
+    def post_prefill(
+        self,
+        result: GenerationBatchResult,
+        forward_batch: ForwardBatch | None,
+        schedule_batch: ScheduleBatch,
+        requests: list[SchedulerRequest],
+    ) -> None:
+        del requests
+        if not forward_batch.capture_hidden_mode.is_full():
+            return
+        else:
+            pass
+        hidden_states = result.logits_output.hidden_states
+        row_start = 0
+        for req, prefix_length, extend_length in zip(
+            schedule_batch.reqs, schedule_batch.prefix_lens, schedule_batch.extend_lens
+        ):
+            if isinstance(req, PromptHiddenRequest):
+                req.prompt_hidden.add_chunk(
+                    prefix_length, hidden_states[row_start : row_start + extend_length]
+                )
+            else:
+                pass
+            row_start += extend_length
 
     # ------------------------------------------------------------------
     # Multimodal embedding injection
@@ -473,12 +504,18 @@ class ThinkerModelRunner(ModelRunner):
                 input_embeds=input_embeds,
                 input_deepstack_embeds=ds_input,
             )
+            aux_hidden_states = None
+            if isinstance(hidden_states, tuple):
+                hidden_states, aux_hidden_states = hidden_states
+            else:
+                pass
 
             logits_output = outer.logits_processor(
                 forward_batch.input_ids,
                 hidden_states,
                 outer.lm_head,
                 forward_batch,
+                aux_hidden_states=aux_hidden_states,
             )
 
         return GenerationBatchResult(

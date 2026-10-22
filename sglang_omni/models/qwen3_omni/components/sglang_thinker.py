@@ -16,6 +16,7 @@ from typing import Iterable, Optional, Tuple
 
 import torch
 import torch.nn as nn
+from sglang.srt.layers.aux_hidden_states import AuxHiddenStateList
 from sglang.srt.layers.logits_processor import LogitsProcessor, LogitsProcessorOutput
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe_triton_config import (
@@ -26,11 +27,7 @@ from sglang.srt.layers.moe.topk import StandardTopKOutput, TopK, TopKOutput
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.unquant import UnquantizedFusedMoEMethod
 from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
-from sglang.srt.model_executor.forward_batch_info import (
-    CaptureHiddenMode,
-    ForwardBatch,
-    PPProxyTensors,
-)
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.qwen3_moe import Qwen3MoeDecoderLayer, Qwen3MoeSparseMoeBlock
 from sglang.srt.models.qwen3_vl_moe import Qwen3MoeLLMModel, load_fused_expert_weights
@@ -100,6 +97,9 @@ class PaddedRowsTopK(nn.Module):
 
 
 class Qwen3OmniThinkerTextModel(Qwen3MoeLLMModel):
+    """The thinker's language model, whose FULL extend also captures the hidden state HF hands
+    the talker: the residual entering the talker's accept layer."""
+
     def __init__(
         self,
         *,
@@ -118,7 +118,13 @@ class Qwen3OmniThinkerTextModel(Qwen3MoeLLMModel):
         else:
             pass
         super().__init__(config=config, quant_config=quant_config, prefix=prefix)
-        self.accept_hidden_layer = accept_hidden_layer
+        # Note (wenyao): the final layer uses normalized output; auxiliary states hold layer inputs.
+        self.accept_layers = (
+            [accept_hidden_layer]
+            if accept_hidden_layer is not None
+            and accept_hidden_layer < config.num_hidden_layers
+            else []
+        )
 
     def forward(
         self,
@@ -128,29 +134,22 @@ class Qwen3OmniThinkerTextModel(Qwen3MoeLLMModel):
         input_embeds: torch.Tensor | None = None,
         pp_proxy_tensors: PPProxyTensors | None = None,
         input_deepstack_embeds: torch.Tensor | None = None,
-    ) -> torch.Tensor | tuple[torch.Tensor, list[torch.Tensor]] | PPProxyTensors:
-        previous_capture_layers = self.layers_to_capture
-        # Note (wenyao): the final layer uses normalized output; auxiliary states hold layer inputs.
-        if (
+    ) -> torch.Tensor | tuple[torch.Tensor, AuxHiddenStateList] | PPProxyTensors:
+        # note (ratish): graphs capture at the server's NULL mode, so a FULL extend runs eager
+        # and every forward selects its own capture.
+        is_full_extend = (
             forward_batch.forward_mode.is_extend()
-            and forward_batch.capture_hidden_mode == CaptureHiddenMode.FULL
-            and self.accept_hidden_layer is not None
-            and self.accept_hidden_layer < self.config.num_hidden_layers
-        ):
-            self.layers_to_capture = [self.accept_hidden_layer]
-        else:
-            self.layers_to_capture = []
-        try:
-            return super().forward(
-                input_ids=input_ids,
-                positions=positions,
-                forward_batch=forward_batch,
-                input_embeds=input_embeds,
-                pp_proxy_tensors=pp_proxy_tensors,
-                input_deepstack_embeds=input_deepstack_embeds,
-            )
-        finally:
-            self.layers_to_capture = previous_capture_layers
+            and forward_batch.capture_hidden_mode.is_full()
+        )
+        self.layers_to_capture = self.accept_layers if is_full_extend else []
+        return super().forward(
+            input_ids=input_ids,
+            positions=positions,
+            forward_batch=forward_batch,
+            input_embeds=input_embeds,
+            pp_proxy_tensors=pp_proxy_tensors,
+            input_deepstack_embeds=input_deepstack_embeds,
+        )
 
 
 class Qwen3OmniThinkerForCausalLM(nn.Module):
@@ -243,12 +242,8 @@ class Qwen3OmniThinkerForCausalLM(nn.Module):
             marked_live_rows.is_live_row = forward_batch.out_cache_loc != 0
         else:
             marked_live_rows = None
-        capture_prompt_states = (
-            forward_batch.forward_mode.is_extend()
-            and forward_batch.capture_hidden_mode == CaptureHiddenMode.FULL
-        )
         try:
-            model_output = self.model(
+            hidden_states = self.model(
                 input_ids=input_ids,
                 positions=positions,
                 forward_batch=forward_batch,
@@ -261,36 +256,9 @@ class Qwen3OmniThinkerForCausalLM(nn.Module):
                 marked_live_rows.is_live_row = None
             else:
                 pass
-        if isinstance(model_output, tuple):
-            hidden_states, auxiliary_hidden_states = model_output
-        else:
-            hidden_states, auxiliary_hidden_states = model_output, None
-        if (
-            capture_prompt_states
-            and self.model.accept_hidden_layer is not None
-            and self.model.accept_hidden_layer < self.config.num_hidden_layers
-        ):
-            if auxiliary_hidden_states is None:
-                raise RuntimeError(
-                    "Prompt capture did not return auxiliary hidden states"
-                )
-            elif len(auxiliary_hidden_states) != 1:
-                raise RuntimeError(
-                    "Prompt capture requires exactly one auxiliary layer"
-                )
-            elif auxiliary_hidden_states[0].shape != hidden_states.shape:
-                raise RuntimeError(
-                    "Prompt capture hidden states do not align with model rows"
-                )
-            else:
-                pass
-            return self.logits_processor(
-                input_ids,
-                hidden_states,
-                self.lm_head,
-                forward_batch,
-                aux_hidden_states=auxiliary_hidden_states,
-            )
+        aux_hidden_states = None
+        if isinstance(hidden_states, tuple):
+            hidden_states, aux_hidden_states = hidden_states
         else:
             pass
         return self.logits_processor(
@@ -298,6 +266,7 @@ class Qwen3OmniThinkerForCausalLM(nn.Module):
             hidden_states,
             self.lm_head,
             forward_batch,
+            aux_hidden_states=aux_hidden_states,
         )
 
     @torch.no_grad()
