@@ -45,7 +45,8 @@ MODELS = {
     "omni_colocated": {
         "path": "Qwen/Qwen3-Omni-30B-A3B-Instruct",
         "config": "examples/configs/qwen3_omni_colocated_h200.yaml",
-        "placement": "",
+        "placement": "--image_encoder.gpu {card} --audio_encoder.gpu {card} --thinker.gpu {card} "
+                     "--talker_ar.gpu {card} --code2wav.gpu {card}",
     },
     "omni_speech": {
         "path": "Qwen/Qwen3-Omni-30B-A3B-Instruct",
