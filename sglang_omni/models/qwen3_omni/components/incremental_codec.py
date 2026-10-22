@@ -104,7 +104,8 @@ def slot_causal_conv(
         )
     else:
         pass
-    return channels_last_conv1d(padded, conv, conv.weight, length, add_bias=add_bias)
+    bias = conv.bias if add_bias else None
+    return channels_last_conv1d(padded, conv, conv.weight, bias, length)
 
 
 def slot_causal_transconv(
