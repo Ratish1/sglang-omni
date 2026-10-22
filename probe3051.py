@@ -8,13 +8,19 @@ from pathlib import Path
 
 import torch
 
+from sglang_omni.models.qwen3_tts.codec_state_arena import Qwen3TTSCodecStateArena
 from sglang_omni.models.qwen3_tts.compat import (
     apply_qwen_tts_transformers_compatibility_patches,
 )
 from sglang_omni.models.qwen3_tts.incremental_codec import (
     FusedIncrementalTransformer,
     Qwen3TTSIncrementalCodecState,
+    Qwen3TTSIncrementalDecoder,
     incremental_transformer,
+)
+from sglang_omni.models.qwen3_tts.incremental_codec_cuda_graph import (
+    IncrementalCodecGraphPool,
+    Qwen3TTSIncrementalCodecCudaGraphRunner,
 )
 
 
@@ -138,21 +144,36 @@ def main():
             compiled = torch.compile(fused.__call__, dynamic=False, fullgraph=True)
             compiled_state = states["fused"].clone()
             eager_state = states["fused"].clone()
+            compiled_reference_state = states["reference"].clone()
+            compiled_plain_state = states["plain"].clone()
             for step in range(2):
                 inputs = torch.randn(
                     3, 8, reference.config.latent_dim, device="cuda", dtype=dtype
                 )
                 expected = fused(inputs, eager_state)
                 output = compiled(inputs, compiled_state)
+                fp32_output = incremental_transformer(
+                    reference, inputs.float(), compiled_reference_state
+                )
+                plain_output = incremental_transformer(
+                    plain, inputs, compiled_plain_state
+                )
                 assert torch.isfinite(output).all()
                 report["cases"].append(
                     dict(
                         dtype=str(dtype),
                         compiled_step=step,
                         compiled_eager_error=error(output, expected),
+                        compiled_fp32_error=error(output, fp32_output),
+                        plain_fp32_error=error(plain_output, fp32_output),
                     )
                 )
-                for state in (compiled_state, eager_state):
+                for state in (
+                    compiled_state,
+                    eager_state,
+                    compiled_reference_state,
+                    compiled_plain_state,
+                ):
                     state.advance(8)
             for batch, frames in ((1, 1), (8, 4), (16, 64)):
                 inputs = torch.randn(
@@ -196,6 +217,48 @@ def main():
                             median_ms=statistics.median(timings),
                         )
                     )
+    decoder = Qwen3TTSIncrementalDecoder(tokenizer.model.decoder.bfloat16())
+    assert decoder.fused_transformer is not None
+    arena = Qwen3TTSCodecStateArena(
+        decoder, num_slots=3, device=torch.device("cuda", 0), dtype=torch.bfloat16
+    )
+    runner = Qwen3TTSIncrementalCodecCudaGraphRunner(
+        decoder,
+        device=torch.device("cuda", 0),
+        dtype=torch.bfloat16,
+        num_quantizers=tokenizer.model.decoder.config.num_quantizers,
+        mode="warm",
+        fresh_frames=(4,),
+        batch_sizes=(2,),
+        min_free_gb=0,
+        arena=arena,
+        graph_pool=IncrementalCodecGraphPool(stream_priority=0),
+    )
+    runner.capture()
+    assert runner.enabled, runner.disable_reason
+    slots = [arena.acquire(), arena.acquire()]
+    state = arena.gather(slots)
+    waveform_errors = []
+    with torch.inference_mode():
+        for step in range(3):
+            codes = torch.randint(
+                tokenizer.model.decoder.config.codebook_size,
+                (2, tokenizer.model.decoder.config.num_quantizers, 4),
+                device="cuda",
+            )
+            expected = decoder.decode(codes, state)
+            actual = runner.decode_slots(codes, slots)
+            waveform_errors.append(error(actual, expected))
+            torch.testing.assert_close(actual, expected)
+            gathered = arena.gather(slots)
+            for actual_kv, expected_kv in (
+                (gathered.transformer_keys, state.transformer_keys),
+                (gathered.transformer_values, state.transformer_values),
+            ):
+                for index in actual_kv:
+                    assert torch.equal(actual_kv[index], expected_kv[index])
+            assert torch.equal(gathered.frame_positions, state.frame_positions)
+    report["full_trained_decoder_graph_waveform_errors"] = waveform_errors
     Path("/data/review3051/checkpoint.json").write_text(json.dumps(report, indent=2))
     print(json.dumps(report), flush=True)
 
