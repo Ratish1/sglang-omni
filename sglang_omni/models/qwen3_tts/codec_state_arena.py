@@ -84,6 +84,12 @@ class Qwen3TTSCodecStateArena:
             device=self.device,
             dtype=dtype,  # noqa: leading-underscore
         )
+        # note (ratish): every layer's keys, and values, in one tensor, so a cohort's
+        # K/V moves in one launch each way instead of one a layer.
+        self.key_cache = torch.stack(list(self.storage.transformer_keys.values()))
+        self.value_cache = torch.stack(list(self.storage.transformer_values.values()))
+        self.storage.transformer_keys = self.layer_views(self.key_cache)
+        self.storage.transformer_values = self.layer_views(self.value_cache)
         self.lock = threading.Lock()
         self.staging = threading.local()
         self.release_events: dict[int, torch.Event] = {}
@@ -270,11 +276,17 @@ class Qwen3TTSCodecStateArena:
                 state.conv_histories[key] = buffer.index_select(0, index)
             for key, buffer in storage.transconv_overlaps.items():
                 state.transconv_overlaps[key] = buffer.index_select(0, index)
-        for layer_index, buffer in storage.transformer_keys.items():
-            state.transformer_keys[layer_index] = buffer.index_select(0, index)
-        for layer_index, buffer in storage.transformer_values.items():
-            state.transformer_values[layer_index] = buffer.index_select(0, index)
+        state.transformer_keys = self.layer_views(self.key_cache.index_select(1, index))
+        state.transformer_values = self.layer_views(
+            self.value_cache.index_select(1, index)
+        )
         return state
+
+    @staticmethod
+    def layer_views(layers: torch.Tensor) -> dict[int, torch.Tensor]:
+        """Each layer of a (layers, rows, ...) tensor as its own view, writable in place
+        under autograd, which unbind's views are not."""
+        return {layer: layers[layer] for layer in range(layers.shape[0])}
 
     def scatter(
         self, slots: Sequence[int], state: Qwen3TTSIncrementalCodecState
@@ -301,16 +313,16 @@ class Qwen3TTSCodecStateArena:
                 self.copy_rows(buffer, index, state.transconv_overlaps[key], key)
         else:
             pass
-        for layer_index, buffer in storage.transformer_keys.items():
+        for cache, layers, key in (
+            (self.key_cache, state.transformer_keys, "keys"),
+            (self.value_cache, state.transformer_values, "values"),
+        ):
             self.copy_rows(
-                buffer, index, state.transformer_keys[layer_index], f"key.{layer_index}"
-            )
-        for layer_index, buffer in storage.transformer_values.items():
-            self.copy_rows(
-                buffer,
+                cache,
                 index,
-                state.transformer_values[layer_index],
-                f"value.{layer_index}",
+                torch.stack([layers[layer] for layer in range(cache.shape[0])]),
+                key,
+                dim=1,
             )
 
     @staticmethod
@@ -319,8 +331,9 @@ class Qwen3TTSCodecStateArena:
         index: torch.Tensor,
         rows: torch.Tensor,
         key: str = "frame_positions",
+        dim: int = 0,
     ) -> None:
-        expected = (int(index.shape[0]), *buffer.shape[1:])
+        expected = (*buffer.shape[:dim], int(index.shape[0]), *buffer.shape[dim + 1 :])
         if tuple(rows.shape) != expected:
             raise RuntimeError(
                 f"Qwen3-TTS codec state arena expected {expected} for {key}, got {tuple(rows.shape)}"
@@ -333,7 +346,7 @@ class Qwen3TTSCodecStateArena:
             )
         else:
             pass
-        buffer.index_copy_(0, index, rows.contiguous())
+        buffer.index_copy_(dim, index, rows.contiguous())
 
     def describe(self) -> CodecStateStats:
         return {
