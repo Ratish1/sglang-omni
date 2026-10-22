@@ -63,7 +63,7 @@ def log(out: Path, message: str) -> None:
         handle.write(line + "\n")
 
 
-def client(port: int, out: Path) -> None:
+def client(port: int, out: Path, seed: int | None) -> None:
     from benchmarks.eval.benchmark_omni_videoamme import run_videoamme_eval
     from benchmarks.eval.benchmark_omni_videomme import VideoEvalConfig
 
@@ -83,6 +83,7 @@ def client(port: int, out: Path) -> None:
         asr_concurrency=ASR_CONCURRENCY,
         disable_tqdm=True,
         timeout_s=500,
+        seed=seed,
     )
     results = asyncio.run(run_videoamme_eval(config, compute_wer=False))
     (out / "videoamme.json").write_text(json.dumps(results, indent=1))
@@ -161,7 +162,7 @@ def stop(process: subprocess.Popen, cards: tuple[int, int]) -> None:
     pair_check.stop(cards[1], process)
 
 
-def run_arm(out: Path, arm: str, cards: tuple[int, int]) -> int:
+def run_arm(out: Path, arm: str, cards: tuple[int, int], seed: int | None) -> int:
     arm_out = out / arm
     arm_out.mkdir(parents=True, exist_ok=True)
     arm_tree = pair_check.tree(pair_check.ARMS[arm][0])
@@ -179,6 +180,7 @@ def run_arm(out: Path, arm: str, cards: tuple[int, int]) -> int:
                 str(port),
                 "--out",
                 str(arm_out),
+                *([] if seed is None else ["--seed", str(seed)]),
             ],
             cwd=arm_tree,
             env={**os.environ, "PYTHONPATH": str(arm_tree)},
@@ -207,9 +209,10 @@ def main() -> None:
     parser.add_argument("--score", action="store_true")
     parser.add_argument("--port", type=int)
     parser.add_argument("--score-card", type=int, default=0)
+    parser.add_argument("--seed", type=int, help="every request's sampling seed, as a seeded client sends it")
     args = parser.parse_args()
     if args.client:
-        client(args.port, args.out)
+        client(args.port, args.out, args.seed)
         return
     elif args.score:
         score(args.port, args.out)
@@ -224,7 +227,7 @@ def main() -> None:
         chains.append((chain_arms.split(","), (first_card, second_card)))
 
     def run_chain(chain_arms: list[str], cards: tuple[int, int]) -> list[int]:
-        return [run_arm(args.out, arm, cards) for arm in chain_arms]
+        return [run_arm(args.out, arm, cards, args.seed) for arm in chain_arms]
 
     with ThreadPoolExecutor(max_workers=len(chains)) as pool:
         chain_codes = list(pool.map(lambda chain: run_chain(*chain), chains))
