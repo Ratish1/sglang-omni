@@ -1086,8 +1086,8 @@ class Qwen3TTSRefCodeBatcher:
 
     def run(self) -> None:
         if self.encode_stream is not None:
-            # note (ratish): a new thread starts on device 0, so the encode stream's
-            # entry and syncs would open a context there without this binding.
+            # note (ratish): a new thread starts on device 0, and leaving the encode
+            # stream switches it back there, which opens a context on that card.
             torch.get_device_module(self.encoder_device).set_device(self.encoder_device)
         else:
             pass
@@ -1605,6 +1605,18 @@ def prepare_qwen3_tts_request(
     )
 
 
+def bind_preprocessing_thread_device() -> None:
+    """Pin a preprocessing pool thread to the device of the preprocessing stream."""
+    with _PREPARED_REQUESTS_LOCK:
+        context = _PREPROCESSING_CONTEXT
+    if context is not None and context.stream is not None:
+        # note (ratish): a pool thread starts on device 0, and leaving the stream
+        # switches it back there, which opens a context on that card.
+        torch.get_device_module(context.stream.device).set_device(context.stream.device)
+    else:
+        pass
+
+
 def preprocess_qwen3_tts_payload(
     payload: StagePayload, *, default_stream_codec_output: bool = True
 ) -> StagePayload:
@@ -1631,9 +1643,6 @@ def preprocess_qwen3_tts_payload(
         )
     else:
         stream_device_module = torch.get_device_module(context.stream.device)
-        # note (ratish): preprocessing pool threads start on device 0, so entering
-        # the stream would open a context there without this binding.
-        stream_device_module.set_device(context.stream.device)
         with stream_device_module.stream(context.stream):
             prepared = prepare_qwen3_tts_request(
                 payload,
