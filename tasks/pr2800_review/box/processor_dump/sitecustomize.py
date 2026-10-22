@@ -37,6 +37,11 @@ def install(module):
                 {
                     "text": kwargs.get("text"),
                     "audio": [np.asarray(item, dtype=np.float32) for item in audio],
+                    "outputs": {
+                        name: value.clone()
+                        for name, value in outputs.items()
+                        if isinstance(value, torch.Tensor)
+                    },
                     "input_ids": outputs["input_ids"].clone(),
                     "input_features": outputs["input_features"].clone(),
                     "feature_attention_mask": outputs["feature_attention_mask"].clone(),
