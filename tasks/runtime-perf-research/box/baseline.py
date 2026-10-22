@@ -226,7 +226,8 @@ def run_pass(args, server: subprocess.Popen, load: int, kind: str, warmup: bool)
         command = ["bash", "-c", " && ".join(shlex.join(c) for c in commands)]
     else:
         command = bench_command(args.model, args.port, load, out / "bench", warmup,
-                                repeats=args.asr_pyspy_repeats if kind == "pyspy" and args.model == "asr" else 1,
+                                repeats=(args.asr_pyspy_repeats
+                                         if kind in ("pyspy", "pyspygil") and args.model == "asr" else 1),
                                 bench=args.bench, meta=args.meta)
     (out / "bench_command.txt").write_text(shlex.join(command) + "\n", encoding="utf-8")
     cpu_start = thread_cpu(server.pid)
