@@ -7,6 +7,8 @@
 D=/data/c20261022b
 IN=/workspace/t_marks/tasks/cosyvoice-perf/box
 export PAIR_HOME=$D
+# note (ratish): the first run of this queue lost port 24000 to another container's server on the shared host network
+export PAIR_PORTS=43000,43400
 log() { echo "$* $(date +%T)" >> $D/queue_b.txt; }
 tree() {
   local name=$1 branch=$2 sha

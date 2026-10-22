@@ -27,7 +27,8 @@ from pathlib import Path
 D = os.environ.get("PAIR_HOME", "/data/c20261021")
 MODEL = "FunAudioLLM/Fun-CosyVoice3-0.5B-2512"
 COSYVOICE = "/workspace/CosyVoice:/workspace/CosyVoice/third_party/Matcha-TTS"
-PORTS = (24000, 25000)
+# note (ratish): PAIR_PORTS moves both servers off ports another container on the same host network uses (10-22).
+PORTS = tuple(int(port) for port in os.environ.get("PAIR_PORTS", "24000,25000").split(","))
 CARDS = ("0", "1")
 CPUS = ("0-15,64-79", "16-31,80-95")
 ALL_CELLS = {
@@ -119,13 +120,21 @@ def run_order(trees, out):
             ]
             assert all(client.wait() == 0 for client in clients), f"a {cell} client failed"
     finally:
+        # note (ratish): a server whose whole group already exited raises here, and the
+        # other server must still stop (10-22: one left running on its card).
         for server in servers:
-            os.killpg(server.pid, signal.SIGTERM)
+            try:
+                os.killpg(server.pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
         for server in servers:
             try:
                 server.wait(timeout=60)
             except subprocess.TimeoutExpired:
-                os.killpg(server.pid, signal.SIGKILL)
+                try:
+                    os.killpg(server.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
 
 
 def summary(path):
