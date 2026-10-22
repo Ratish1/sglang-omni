@@ -57,6 +57,7 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--card", type=int, default=3)
     parser.add_argument("--replays", type=int, default=100)
+    parser.add_argument("--no-compile", action="store_true")
     args = parser.parse_args()
     torch.cuda.set_device(args.card)
     device = torch.device("cuda", args.card)
@@ -76,7 +77,7 @@ def main() -> None:
         fresh_frames=WARM_WIDTHS,
         batch_sizes=BATCHES,
         min_free_gb=0.0,
-        compile_fresh_frames=(8,),
+        compile_fresh_frames=() if args.no_compile else (8,),
         arena=arena,
         graph_pool=IncrementalCodecGraphPool(stream_priority=0),
     )
