@@ -68,14 +68,14 @@ def main() -> None:
         codes = encoder.encode(values, num_quantizers=num_quantizers, return_dict=True).audio_codes
         return codes[0, :, :frames].transpose(0, 1)
 
-    def wall_ms(call, samples: torch.Tensor) -> tuple[float, torch.Tensor]:
+    def wall_ms(call, samples: torch.Tensor) -> tuple[float, float, torch.Tensor]:
         times = []
         for _ in range(REPEATS):
             start = time.perf_counter()
             codes = call(samples)
             stream.synchronize()
             times.append(1000 * (time.perf_counter() - start))
-        return statistics.median(times), codes
+        return times[0], statistics.median(times[1:]), codes
 
     waveforms = [
         (path.rsplit("/", 1)[-1], torch.from_numpy(tokenizer._normalize_audio_inputs([path], sr=None)[0]))
@@ -86,7 +86,7 @@ def main() -> None:
     with torch.inference_mode(), torch.cuda.stream(stream):
         for name, samples in waveforms:
             frames = -(-samples.numel() // hop)
-            eager_ms, eager_codes = wall_ms(eager, samples)
+            eager_first_ms, eager_ms, eager_codes = wall_ms(eager, samples)
             start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
             start.record(stream)
             eager(samples)
@@ -98,16 +98,20 @@ def main() -> None:
             kernels = sum(1 for event in profiler.events() if event.device_type == torch.autograd.DeviceType.CUDA)
             bucket = extended.bucket_for(frames)
             if bucket is None:
-                print(f"{name}: {frames} frames, eager {eager_ms:.1f} ms wall, past the extended ladder")
+                print(
+                    f"{name}: {frames} frames, eager first call {eager_first_ms:.1f} ms, then {eager_ms:.1f} ms wall, "
+                    "past the extended ladder"
+                )
                 continue
             else:
                 pass
-            graph_ms, graph_codes = wall_ms(extended.encode, samples)
+            graph_first_ms, graph_ms, graph_codes = wall_ms(extended.encode, samples)
             equal = (graph_codes == eager_codes).all(dim=1)
             first_differing = int((~equal).nonzero()[0]) if not bool(equal.all()) else None
             print(
-                f"{name}: {frames} frames, bucket {bucket}: eager {eager_ms:.1f} ms wall, {start.elapsed_time(end):.1f} ms "
-                f"device, {kernels} kernels; graph {graph_ms:.1f} ms wall; codes equal on {int(equal.sum())} of {frames} "
+                f"{name}: {frames} frames, bucket {bucket}: eager first call {eager_first_ms:.1f} ms, then "
+                f"{eager_ms:.1f} ms wall, {start.elapsed_time(end):.1f} ms device, {kernels} kernels; graph first "
+                f"{graph_first_ms:.1f} ms, then {graph_ms:.1f} ms wall; codes equal on {int(equal.sum())} of {frames} "
                 f"frames, first differing {first_differing}"
             )
 
