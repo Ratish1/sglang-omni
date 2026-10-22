@@ -4,8 +4,10 @@ usage: python3 pair.py --label v3_c16_a --tree /workspace/m_bcd0d8c68 --b-tree /
        --concurrency 16 --a-card 0 --b-card 1 --port 11000 [--no-stream] [--seed 1234] [--gpu-metrics]
 
 Each arm is placed on its card with the stage gpu flags (no device env), both boot and bench at once (SeedTTS EN, full
-corpus, streaming unless --no-stream, warmup 1), then are stopped and scored at once, each on its own card: WER from
-an ASR server placed with its stage gpu flag, then speaker similarity. With --gpu-metrics each server runs under nsys with --trace=none (hardware counter sampling on its own
+corpus, streaming unless --no-stream, warmup 1), then are stopped and scored one after the other, each on its own card:
+WER from an ASR server placed with its stage gpu flag and given its rendezvous port (MASTER_PORT, the scorer port plus
+50) outside the 29500 block every container on the host claims from without seeing the others, then speaker
+similarity. With --gpu-metrics each server runs under nsys with --trace=none (hardware counter sampling on its own
 card, no CUDA injection), and the gh100 metrics' window means over the arm's own benchmark go to metrics.txt.
 Results under /data/v3_20261020/pairs/<label>/{a,b}.
 """
@@ -18,7 +20,6 @@ import signal
 import subprocess
 import sys
 import time
-from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import httpx
@@ -210,28 +211,24 @@ def main() -> None:
         print(f"byte identical {same} of {len(a_hashes)}", flush=True)
     else:
         pass
-    with ThreadPoolExecutor(len(arms)) as pool:
-        scoring = [
-            pool.submit(score, outs[arm], arms[arm][0], args.port + 400 + 400 * index, args.tree)
-            for index, arm in enumerate(arms)
-        ]
-    for scored in scoring:
-        scored.result()
+    for index, arm in enumerate(arms):
+        score(outs[arm], arms[arm][0], args.port + 400 + 400 * index, args.tree)
     print("scored", flush=True)
     print("pair done", flush=True)
 
 
 def score(out: Path, card: int, port: int, tree: str) -> None:
     """WER from an ASR server on the arm's own card, then speaker similarity on that card: the scorer's own servers
-    default to card 0, which another container may own."""
+    default to card 0, which another container may own. The ASR pipeline is one stage, so one rendezvous port."""
     env = dict(os.environ, PYTHONPATH=tree, SGLANG_OMNI_STRICT_PORT="1")
+    asr_env = dict(env, MASTER_PORT=str(port + 50))
     scorer = [sys.executable, "-m", "benchmarks.eval.benchmark_tts_seedtts", "--model", MODEL, "--lang", "en",
               "--skip-gpu-cleanup", "--output-dir", str(out / "bench")]
     with open(out / "asr_serve.log", "w", encoding="utf-8") as serve_log:
         asr = subprocess.Popen(
             [sys.executable, "-m", "sglang_omni.cli", "serve", "--model-path", ASR_MODEL, "--host", "127.0.0.1",
              "--port", str(port), "--asr.gpu", str(card)],
-            cwd=tree, env=env, stdout=serve_log, stderr=subprocess.STDOUT, start_new_session=True,
+            cwd=tree, env=asr_env, stdout=serve_log, stderr=subprocess.STDOUT, start_new_session=True,
         )
     try:
         wait_healthy(port, asr)
