@@ -103,7 +103,7 @@ def report_cell(name, start_ns, end_ns, queue_records, other):
             else:
                 pass
     for edge, parts in segments.items():
-        print(f"  same-process chain {edge}")
+        print(f"  stream chain {edge} (put, outbox get, target inbox put, target pick-up; cross-process edges include the transport in waiter to route)")
         for part in ("put to waiter", "waiter to route", "route to pickup", "put to pickup"):
             print(line(part, parts.get(part, [])))
     lags = collections.defaultdict(list)
