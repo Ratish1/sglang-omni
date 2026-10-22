@@ -107,6 +107,22 @@ def group_pids(pgid: int) -> list[int]:
     ]
 
 
+def serving_pids(pgid: int) -> list[int]:
+    """The launcher and stage processes, without Inductor compile workers and the multiprocessing resource tracker."""
+    pids = []
+    for pid in group_pids(pgid):
+        try:
+            cmdline = Path(f"/proc/{pid}/cmdline").read_bytes()
+        except FileNotFoundError:
+            continue
+        if b"compile_worker" in cmdline or b"resource_tracker" in cmdline:
+            continue
+        else:
+            pass
+        pids.append(pid)
+    return pids
+
+
 def stop_group(server: subprocess.Popen) -> None:
     try:
         os.killpg(server.pid, signal.SIGTERM)
@@ -196,7 +212,7 @@ def run_pass(args, server: subprocess.Popen, load: int, kind: str, warmup: bool)
             mode = ["--gil"] if kind == "pyspygil" else []
             (out / "pyspy.json").write_text(json.dumps({"rate": 100, "duration": int(args.pyspy_seconds),
                                                         "mode": kind}), encoding="utf-8")
-            for pid in group_pids(server.pid):
+            for pid in serving_pids(server.pid):
                 spies.append(subprocess.Popen(
                     ["py-spy", "record", "--pid", str(pid), "--rate", "100", "--duration", str(int(args.pyspy_seconds)),
                      "--threads", "--nonblocking", *mode, "--format", "raw",
@@ -211,7 +227,7 @@ def run_pass(args, server: subprocess.Popen, load: int, kind: str, warmup: bool)
     window_end = time.time()
     cpu_end = thread_cpu(server.pid)
     # note (ratish): Python threads keep the OS name python3, so a nonblocking dump maps each tid to its thread name
-    for pid in group_pids(server.pid):
+    for pid in serving_pids(server.pid):
         with open(out / f"dump_{pid}.txt", "w", encoding="utf-8") as dump:
             subprocess.run(["py-spy", "dump", "--pid", str(pid), "--nonblocking"], stdout=dump,
                            stderr=subprocess.STDOUT, timeout=60, check=False)
