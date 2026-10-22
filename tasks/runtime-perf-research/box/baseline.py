@@ -62,7 +62,7 @@ def bench_command(model: str, port: int, load: int, out: Path, warmup: bool, rep
                   bench: str = "seedtts", meta: str = "") -> list[str]:
     """The benchmark command. bench seedtts runs each model's SeedTTS EN benchmark (meta overrides the corpus with
     a meta.lst, as the long-form targets of make_longform_meta.py); videomme runs the Video-MME CI sample with audio
-    output at the CI's video settings (Omni); asr_longform runs LongLibriHeavy 30 min (ASR)."""
+    output at the CI's video settings (Omni); asr_longform runs the meanwhile long-form set (ASR)."""
     spec = MODELS[model]
     meta_args = ["--meta", meta] if meta else []
     if bench == "videomme":
@@ -74,8 +74,9 @@ def bench_command(model: str, port: int, load: int, out: Path, warmup: bool, rep
             "--disable-tqdm",
         ]
     elif bench == "asr_longform":
+        # note (ratish): meanwhile is 64 recordings of 24 to 109 s, so every request crosses the 30 s chunking
         command = [
-            sys.executable, "-m", "benchmarks.eval.benchmark_asr_longform", "--dataset", "longlibriheavy-30",
+            sys.executable, "-m", "benchmarks.eval.benchmark_asr_longform", "--dataset", "meanwhile",
             "--host", "127.0.0.1", "--port", str(port), "--concurrencies", str(load), "--repeats", str(repeats),
             "--disable-resource-monitor", "--output", str(out / "asr.json"), "--save-raw-dir", str(out / "raw"),
         ]
@@ -215,7 +216,10 @@ def run_pass(args, server: subprocess.Popen, load: int, kind: str, warmup: bool)
         )
     else:
         pass
-    if kind == "clean" and args.bench_repeats > 1 and args.model != "asr":
+    if kind == "clean" and args.bench_repeats > 1 and args.model == "asr":
+        command = bench_command(args.model, args.port, load, out / "bench", warmup, repeats=args.bench_repeats,
+                                bench=args.bench, meta=args.meta)
+    elif kind == "clean" and args.bench_repeats > 1:
         commands = [bench_command(args.model, args.port, load, out / "bench" / f"rep{index}", warmup and index == 0,
                                   bench=args.bench, meta=args.meta)
                     for index in range(args.bench_repeats)]
