@@ -173,15 +173,21 @@ def test_reference_code_batcher_replays_captured_buckets_and_encodes_the_rest() 
     batcher = qwen3_request_builders.Qwen3TTSRefCodeBatcher(
         tokenizer, max_batch_wait_ms=0, graph_bucket_frames=(4,)
     )
+    beyond_waveform = np.random.rand(5 * HOP).astype(np.float32)
     try:
         assert batcher.graph_runner is not None
         inside = batcher.encode(np.random.rand(3 * HOP + 1).astype(np.float32), 24000)
-        beyond = batcher.encode(np.random.rand(5 * HOP).astype(np.float32), 24000)
+        beyond = batcher.encode(beyond_waveform, 24000)
     finally:
         batcher.close()
+    values = torch.zeros((1, 1, 8 * HOP), device=device)
+    values[0, 0, : 5 * HOP].copy_(torch.from_numpy(beyond_waveform))
+    with torch.inference_mode():
+        expected = model.encode(values, num_quantizers=2, return_dict=True).audio_codes
 
     assert inside.shape == (4, 2) and inside.is_cuda
     assert beyond.shape == (5, 2) and beyond.is_cuda
+    assert torch.equal(beyond, expected[0, :, :5].transpose(0, 1))
     assert batcher.graph_runner.stats() == {
         "enabled": True,
         "disable_reason": None,
