@@ -18,6 +18,7 @@ Writes /data/pr2800/run221 and talker_rows.log.
 
 from __future__ import annotations
 
+import argparse
 import os
 import subprocess
 import sys
@@ -45,6 +46,7 @@ SUITES = {
 ROUNDS = "upk@0,phu@1;phu@0,upk@1;upk@0,phu@1;phu@0,upk@1"
 PASSES = "c16,c64,c16_seeded,c64_seeded,c1_seeded_full"
 SCORED = "c16,c1_seeded_full"
+STEPS = ("units", "probe", "videoamme", "mmsu", "seedtts")
 
 
 def log(message: str) -> None:
@@ -55,8 +57,16 @@ def log(message: str) -> None:
 
 
 def step(
-    name: str, command: list[str], env: dict[str, str], keep: tuple[str, ...]
+    name: str,
+    command: list[str],
+    env: dict[str, str],
+    keep: tuple[str, ...],
+    steps: list[str],
 ) -> None:
+    if name not in steps:
+        return
+    else:
+        pass
     rc = subprocess.run(
         command,
         cwd=BOX,
@@ -73,6 +83,9 @@ def step(
 
 
 def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--steps", default=",".join(STEPS))
+    steps = parser.parse_args().steps.split(",")
     OUT.mkdir(parents=True, exist_ok=True)
     cpus, node = card_pins()
     env = {**os.environ, "PR2800_CARD_CPUS": cpus, "PR2800_NODE": node}
@@ -115,6 +128,7 @@ def main() -> None:
             stderr=subprocess.STDOUT,
         )
         for card, tests in SUITES.items()
+        if "units" in steps
     }
     failed = False
     for card, process in suites.items():
@@ -143,12 +157,16 @@ def main() -> None:
         ],
         env,
         ("summary", "talker prompt prefills", "repeats with", "client rc"),
+        steps,
     )
-    probe_server_log = (OUT / "probe" / "server.log").read_text(errors="replace")
-    log(
-        f"probe prefill batches on graphs {probe_server_log.count('cuda graph: True')}, "
-        f"eager {probe_server_log.count('cuda graph: False')}"
-    )
+    if "probe" in steps:
+        probe_server_log = (OUT / "probe" / "server.log").read_text(errors="replace")
+        log(
+            f"probe prefill batches on graphs {probe_server_log.count('cuda graph: True')}, "
+            f"eager {probe_server_log.count('cuda graph: False')}"
+        )
+    else:
+        pass
     step(
         "videoamme",
         [
@@ -161,6 +179,7 @@ def main() -> None:
         ],
         env,
         ("client rc", "score rc", "accuracy"),
+        steps,
     )
     step(
         "mmsu",
@@ -174,6 +193,7 @@ def main() -> None:
         ],
         env,
         ("client rc", "score rc", "accuracy"),
+        steps,
     )
     step(
         "seedtts",
@@ -192,6 +212,7 @@ def main() -> None:
         ],
         env,
         ("failed",),
+        steps,
     )
     log("done")
 

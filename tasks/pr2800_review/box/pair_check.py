@@ -65,6 +65,7 @@ TREES = {
     "phs": ("phs_5f33ec1c8", "origin", "5f33ec1c85cc693e34799426e3a9b586091195a9"),
     "pht": ("pht_dbcfec3d3", "origin", "dbcfec3d35e2f0b6b9b3d181e1c7bdf94e016a25"),
     "phu": ("phu_85d37188c", "origin", "85d37188ca2dc8b5e9aa34a6857b2450b534d94b"),
+    "cmg": ("cmg_fc7f8e03f", "origin", "fc7f8e03f9d4205707fcaf70536f7430331d805d"),
 }
 # note (ratish): every arm is measured by one client and scored by one ASR server, both from main; from the SGLang
 # 0.5.22 stack on (057d97629) a tree from before it no longer runs, and main's client records each chunk's length.
