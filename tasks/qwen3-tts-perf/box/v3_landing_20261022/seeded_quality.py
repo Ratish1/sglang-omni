@@ -47,8 +47,13 @@ def main() -> None:
     all_sim, all_wer, all_snr = [], [], []
     for label in sys.argv[1:]:
         arms = {arm: ROOT / label / arm / "bench" for arm in ("a", "b")}
-        sims = {arm: per_sample(path / "similarity_results.json", "speaker_similarity") for arm, path in arms.items()}
+        scored = all((path / "similarity_results.json").exists() for path in arms.values())
         wers = {arm: per_sample(path / "wer_results.json", "wer") for arm, path in arms.items()}
+        sims = (
+            {arm: per_sample(path / "similarity_results.json", "speaker_similarity") for arm, path in arms.items()}
+            if scored
+            else wers
+        )
         counts = {arm: word_counts(path / "wer_results.json") for arm, path in arms.items()}
         same_length, snrs = 0, []
         common = sorted(set(sims["a"]) & set(sims["b"]))
@@ -72,14 +77,18 @@ def main() -> None:
         print(f"{label}: {len(common)} prompts scored in both, {same_length} of the same length")
         print(f"  waveform SNR b against a: median {statistics.median(finite):.1f} dB, 5th percentile "
               f"{finite[len(finite) // 20]:.1f} dB, identical {len(snrs) - len(finite)}")
-        print(f"  SIM a {statistics.fmean(sims['a'][p] for p in common):.4f}, b "
-              f"{statistics.fmean(sims['b'][p] for p in common):.4f}, paired b - a {paired(sim_diff)}")
+        if scored:
+            print(f"  SIM a {statistics.fmean(sims['a'][p] for p in common):.4f}, b "
+                  f"{statistics.fmean(sims['b'][p] for p in common):.4f}, paired b - a {paired(sim_diff)}")
+            all_sim += sim_diff
+        else:
+            print("  SIM unscored (no similarity results in an arm)")
         print(f"  WER corpus a {corpus['a']:.3f} %, b {corpus['b']:.3f} %; per prompt b - a {paired(wer_diff)}; "
               f"prompts whose WER differs {sum(d != 0 for d in wer_diff)}")
-        all_sim += sim_diff
         all_wer += wer_diff
         all_snr += finite
-    print(f"all: SIM paired b - a {paired(all_sim)}; WER per prompt b - a {paired(all_wer)}; "
+    sim_text = f"SIM paired b - a {paired(all_sim)}" if len(all_sim) > 1 else "SIM unscored"
+    print(f"all: {sim_text}; WER per prompt b - a {paired(all_wer)}; "
           f"SNR median {statistics.median(all_snr):.1f} dB over {len(all_snr)} prompts")
 
 
