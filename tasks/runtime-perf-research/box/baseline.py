@@ -10,6 +10,7 @@ One server from this tree, placed on --card with the stage gpu flags, healthy be
   pyspy   the same with py-spy record (--threads --nonblocking, 100 Hz, running threads only) on every server
           process for --pyspy-seconds, starting --pyspy-delay seconds into the benchmark
   pyspygil  the same with --gil (one sample per tick, the interpreter lock holder)
+  warm    a full benchmark pass whose numbers are not read (absorbs first-use work after the server's warmup)
 
 Every pass also stores the CPU seconds of every server thread at its start and end (thread_cpu.json) and the
 benchmark window. Identity (head, tree hash, dirty check, imported file) goes to identity.txt before the boot.
@@ -194,8 +195,13 @@ def run_pass(args, server: subprocess.Popen, load: int, kind: str, warmup: bool)
         )
     else:
         pass
-    command = bench_command(args.model, args.port, load, out / "bench", warmup,
-                            repeats=args.asr_pyspy_repeats if kind == "pyspy" and args.model == "asr" else 1)
+    if kind == "clean" and args.bench_repeats > 1 and args.model != "asr":
+        commands = [bench_command(args.model, args.port, load, out / "bench" / f"rep{index}", warmup and index == 0)
+                    for index in range(args.bench_repeats)]
+        command = ["bash", "-c", " && ".join(shlex.join(c) for c in commands)]
+    else:
+        command = bench_command(args.model, args.port, load, out / "bench", warmup,
+                                repeats=args.asr_pyspy_repeats if kind == "pyspy" and args.model == "asr" else 1)
     (out / "bench_command.txt").write_text(shlex.join(command) + "\n", encoding="utf-8")
     cpu_start = thread_cpu(server.pid)
     window_start = time.time()
@@ -264,6 +270,8 @@ def main() -> None:
     parser.add_argument("--probe", action="store_true",
                         help="boot with hop_probe (queue hops, loop lag, GC) writing to <out>/probe/p.<pid>.jsonl")
     parser.add_argument("--serve-env", default="", help="KEY=VALUE pairs for the server only")
+    parser.add_argument("--bench-repeats", type=int, default=1,
+                        help="benchmark runs inside each clean pass for TTS and Omni (bench/rep<i>)")
     parser.add_argument("--asr-pyspy-repeats", type=int, default=1,
                         help="measured repeats inside the ASR benchmark on py-spy passes, so the load outlasts the window")
     args = parser.parse_args()
