@@ -13,7 +13,7 @@ endpoint.
 Install `sglang-omni` by following [Installation](../get_started/installation.md).
 
 Qwen3-TTS Base uses the upstream `qwen-tts` package. Install it without
-dependencies so the SGLang-Omni Transformers 5.12 / SGLang 0.5.21 stack remains
+dependencies so the SGLang-Omni Transformers 5.19 / SGLang 0.5.22 stack remains
 in place:
 
 ```bash
@@ -24,7 +24,7 @@ uv pip install --no-deps qwen-tts==0.1.1
 
 `--no-deps` is required on **both** lines, for two different reasons.
 
-`qwen-tts` pins Transformers 4.57.3, which would replace the project's 5.12.1.
+`qwen-tts` pins Transformers 4.57.3, which would replace the project's 5.19.0.
 And resolving `sox` normally pulls `numpy` past the ceiling `numba==0.65.1`
 imposes (numba requires `numpy<=2.4`); the upgraded `numpy` then breaks
 `librosa`, so `import qwen_tts` fails with `Numba needs NumPy 2.4 or less`
@@ -42,7 +42,7 @@ factories (`create_causal_mask` and friends), which now spell `input_embeds` as
 `inputs_embeds` and no longer accept `cache_position`. SGLang-Omni patches these
 differences in
 `sglang_omni/models/qwen3_tts/compat.py`, which every Qwen3-TTS entry point
-applies before importing `qwen_tts`. The pinned Transformers 5.12 / SGLang 0.5.21
+applies before importing `qwen_tts`. The pinned Transformers 5.19 / SGLang 0.5.22
 stack is therefore the supported configuration, not a workaround.
 
 If you hit a `TypeError` raised from inside `qwen_tts`, do not resolve it by
@@ -81,12 +81,14 @@ sgl-omni serve \
 
 ### Ascend NPU baseline
 
-The NPU configurations use SGLang's `ascend` attention backend for the Talker
-and PyTorch SDPA for both Speech Tokenizer instances. Talker graph capture
-(`cuda_graph`), private Talker compile, and asynchronous vocoder decode stay
-disabled. The 0.6B Base
-configuration has been validated with 16 concurrent requests; the other
-configurations retain a conservative single-request baseline.
+All four NPU examples enable Talker graphs, asynchronous vocoder decoding, and
+incremental codec graphs. Custom NPU configurations use synchronous decoding
+by default.
+
+Graph capture and replay have been validated on Ascend 910 with SGLang 0.5.21,
+PyTorch 2.10.0, and torch_npu 2.10.0. The 0.6B Base configuration has been
+validated with 16 concurrent requests; the other examples keep
+`max_running_requests: 1`.
 
 ```bash
 # 0.6B Base
@@ -98,6 +100,11 @@ sgl-omni serve \
 
 Use `qwen3_tts_1_7b_npu.yaml`, `qwen3_tts_0_6b_customvoice_npu.yaml`, or
 `qwen3_tts_1_7b_voicedesign_npu.yaml` for the other supported checkpoints.
+
+To disable graph capture, pass `--tts_engine.engine.disable_cuda_graph true`
+for the Talker and `--vocoder.factory.incremental_codec_cuda_graph false` for
+the vocoder. Use `--vocoder.factory.async_decode false` for synchronous decoding.
+
 The 0.6B and 1.7B files intentionally have separate `mem_fraction_static`
 starting values. Calibrate configurations that retain the single-request
 baseline on the target NPU before increasing `max_running_requests` or any
@@ -170,47 +177,35 @@ A failed warmup stops the server. `SGLANG_OMNI_WARMUP_TIMEOUT` (seconds, default
 
 ### Prefill CUDA graphs
 
-Every Qwen3-TTS checkpoint (Base, CustomVoice, VoiceDesign) defaults to a
-prefill CUDA graph with a token ladder up to 512: the full backend on
-CustomVoice, the breakable backend elsewhere.
+Qwen3-TTS replays prefills as CUDA graphs. Base and CustomVoice use the full
+backend, VoiceDesign the breakable backend.
 
 | Knob | Meaning | Default |
 |---|---|---|
-| `--tts_engine.engine.cuda_graph_backend_prefill` | Prefill graph backend (`full`, `breakable` or `disabled`) | `full` on CustomVoice, `breakable` elsewhere |
-| `--tts_engine.engine.cuda_graph_bs_prefill` | Prefill token-count ladder to capture | shared ladder through `512`, plus a `1` bucket |
-| `--tts_engine.engine.cuda_graph_max_bs_prefill` | Cap for the ladder | top of the ladder |
+| `--tts_engine.engine.cuda_graph_backend_prefill` | Prefill graph backend (`full`, `breakable` or `disabled`) | `full` on Base and CustomVoice, `breakable` on VoiceDesign |
+| `--tts_engine.engine.cuda_graph_bs_prefill` | Prefill token counts to capture | a ladder from `1` up to the chunked prefill size |
+| `--tts_engine.engine.cuda_graph_max_bs_prefill` | Cap for the ladder | the chunked prefill size |
 
-`full` captures the prefill transformer body, attention included, as one
-graph per token bucket; the codec head and sampling still run outside it.
-`breakable` captures per-layer segments and runs attention eagerly between
-them. Each backend is accepted only on models that declare it, so a stage that
-has not adopted `full` still rejects it. `full` also needs a prefill attention
-backend that captures an ordinary prefill batch, `fa3` or `flashinfer` in
-SGLang 0.5.21: with any other backend the CustomVoice default stays
-`breakable`, and an explicit `full` fails at startup. SGLang logs the full
-prefill backend as experimental and its own compatibility rules never
-auto-disable it, so the generation batch policy's checks are what guard it
-here.
+`full` captures the whole prefill transformer, attention included, as one
+graph per token count. `breakable` captures the layers in segments and runs
+attention between them. `full` needs the `fa3`, `fa4` or `flashinfer` attention
+backend. With another attention backend, Base and CustomVoice use `breakable`,
+and an explicit `full` fails at startup.
 
-The default is the shared ladder with one bucket added. A replay falls
-back to eager when its bucket exceeds twice the real token count, and the
-shared ladder starts at 4, so a 1-token prefill lands in bucket 4 and
-misses. Measured over 3203 prefills at 10 and 20 RPS, 1301 of them (40.6%)
-are exactly one token, and they are the only shapes that fall back: 2 and
-3 already replay inside bucket 4. Adding the single `1` bucket takes the
-fallback rate to zero.
+On Hopper GPUs the full graph runs its prefill attention on `fa4` and holds every
+running request, unless you set `--tts_engine.engine.attention_backend`,
+`--tts_engine.engine.prefill_attention_backend` or an FP8
+`--tts_engine.engine.kv_cache_dtype`. Decode keeps its own attention backend.
 
-CustomVoice prompts are a few dozen tokens, where the breakable graph's
-per-layer segments are launch-bound, so CustomVoice captures the prefill
-transformer body as one graph. The full backend is selected by the
-checkpoint's `tts_model_type`; Base prefills also carry reference audio and
-keep the breakable backend until the full one is measured on them.
+The ladder reaches the chunked prefill size, which the server picks from the
+GPU's memory (8192 tokens on an 80 GB GPU), so prefills batched together under
+load still replay. It starts at `1` because a prompt that is already cached
+prefills a single token.
 
-Opt out with `--tts_engine.engine.cuda_graph_backend_prefill disabled`, or
-fall back to `breakable`. The default costs extra graph capture during
-startup. Raising `cuda_graph_max_bs_prefill` on its own regrows the default
-ladder to the new cap; declaring `cuda_graph_bs_prefill` yourself keeps your
-list as is.
+Opt out with `--tts_engine.engine.cuda_graph_backend_prefill disabled`. The
+default adds a few seconds of graph capture at startup. Setting
+`cuda_graph_max_bs_prefill` rebuilds the ladder up to the new cap, and declaring
+`cuda_graph_bs_prefill` yourself keeps your list as is.
 
 To change the ceiling, set `max_running_requests` and `max_queued_requests`
 together:
@@ -516,8 +511,18 @@ each: the default path holds 0.6% to 2.3% of streams underrun against 20.9%
 for the left-context decoder, with first playable audio at 55 to 58 ms
 against 82 to 89 ms.
 
-Intel XPU, Ascend NPU, CPU and Apple MPS decode synchronously by default. To opt
-in on Intel GPUs, follow the
+Each stream holds one of `codec_state_slots` (default 64, matching the default
+`max_running_requests`) while it decodes; streams past the slots decode eagerly
+on the left-context path. At startup the vocoder logs the decode graphs it
+captured and warns when the slots are fewer than the streams it may have to hold
+at once: the engine's `max_running_requests` when the vocoder shares its
+process, and that times the engine replicas when the vocoder runs in its own
+process, since requests bind to its replicas round-robin. Raise
+`--vocoder.factory.codec_state_slots` together with `max_running_requests`.
+
+Intel XPU, CPU and Apple MPS decode synchronously by default. For NPU defaults
+and configuration, see [Ascend NPU baseline](#ascend-npu-baseline).
+To opt in on Intel GPUs, follow the
 [Qwen3-TTS XPU recipe](../get_started/installation_xpu.md#qwen3-tts-text-to-speech-single-xpu).
 
 Each follow-up batch sorts the stateful decoder's cohorts, and the rows within

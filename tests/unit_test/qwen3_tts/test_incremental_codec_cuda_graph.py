@@ -180,7 +180,9 @@ def stub_device_runtime(
         SimpleNamespace(synchronize=synchronize, empty_cache=lambda: None),
     )
     monkeypatch.setattr(
-        incremental_codec_cuda_graph, "supports_device_streams", lambda device: True
+        incremental_codec_cuda_graph,
+        "has_device_streams",
+        lambda device: True,
     )
     monkeypatch.setattr(
         incremental_codec_cuda_graph, "device_guard", lambda device: DeviceContext()
@@ -375,7 +377,7 @@ def test_incremental_codec_capture_rollback_resets_temporary_graphs(
 def test_incremental_codec_graphs_capture_during_vocoder_warmup() -> None:
     captures: list[str] = []
 
-    def graph_holder(name: str):
+    def graph_holder(name: str) -> SimpleNamespace:
         return SimpleNamespace(capture=lambda: captures.append(name))
 
     scheduler = Qwen3TTSStreamingVocoderScheduler.__new__(
@@ -388,6 +390,7 @@ def test_incremental_codec_graphs_capture_during_vocoder_warmup() -> None:
     scheduler.initial_window_decode_graphs = graph_holder("window")
     scheduler.initial_tail_decode_graphs = graph_holder("tail")
     scheduler.followup_incremental_graph_holders = (graph_holder("warm"),)
+    scheduler.full_decode_graphs = graph_holder("full-decode")
 
     scheduler.warmup_now()
 
@@ -398,6 +401,7 @@ def test_incremental_codec_graphs_capture_during_vocoder_warmup() -> None:
         "cold",
         "window",
         "tail",
+        "full-decode",
     ]
 
 

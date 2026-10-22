@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Preprocessing resolves the caller channel, the role prompt and the voice per request."""
 
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -13,6 +14,7 @@ from sglang_omni.config.runtime import resolve_stage_factory_args
 from sglang_omni.config.sources import patches_from_stages_mapping
 from sglang_omni.models.personaplex import stages
 from sglang_omni.models.personaplex.architecture import SAMPLES_PER_FRAME
+from sglang_omni.models.personaplex.components.mimi import MimiCodec
 from sglang_omni.models.personaplex.config import PersonaPlexPipelineConfig
 from sglang_omni.models.personaplex.payload_types import PersonaPlexState
 from sglang_omni.models.personaplex.prompts import (
@@ -151,18 +153,22 @@ def test_engine_context_length_reaches_the_builder(monkeypatch):
     built = {}
 
     class Builder:
-        def __init__(self, *, max_running_requests, context_length):
+        def __init__(
+            self, *, max_running_requests, context_length, enable_async_decode
+        ):
             built["context_length"] = context_length
 
         def build(self, model_path, **kwargs):
             built["overrides"] = kwargs["server_args_overrides"]
 
     monkeypatch.setattr(stages, "PersonaPlexEngineBuilder", Builder)
-    stages.create_lm_executor("m", server_args_overrides={"context_length": 16384})
+    stages.create_lm_executor(
+        "m", enable_async_decode=False, server_args_overrides={"context_length": 16384}
+    )
     assert built["context_length"] == 16384
     assert built["overrides"] == {"context_length": 16384}
 
-    stages.create_lm_executor("m", context_length=4096)
+    stages.create_lm_executor("m", enable_async_decode=False, context_length=4096)
     assert built["context_length"] == 4096 and built["overrides"] is None
 
 
@@ -248,6 +254,49 @@ def test_mimi_encode_replaces_caller_and_voice_waveforms_with_codes(monkeypatch)
     assert no_voice.user_codes.shape == (1, 8) and no_voice.voice_codes is None
 
 
+def test_selective_codec_stages_preserve_caller_voice_and_reply(
+    random_codec: MimiCodec, mimi_checkpoint: Path
+) -> None:
+    encoder = stages.create_mimi_encode_executor(
+        str(mimi_checkpoint.parent), device="cpu"
+    )
+    decoder = stages.create_code2wav_executor(
+        str(mimi_checkpoint.parent),
+        device="cpu",
+        num_decode_slots=1,
+        max_batch_size=1,
+        max_graph_frames=0,
+        chunk_ramp_frames=[1, 4],
+    )
+    caller_waveform = torch.randn(2 * SAMPLES_PER_FRAME)
+    voice_waveform = torch.randn(3 * SAMPLES_PER_FRAME)
+    caller_codes = random_codec.encode(caller_waveform.view(1, 1, -1))
+    voice_codes = random_codec.encode(voice_waveform.view(1, 1, -1))
+    caller_samples = SAMPLES_PER_FRAME + 7
+    payload = StagePayload(
+        "selective-mimi",
+        request=OmniRequest(inputs={}, params={}),
+        data=PersonaPlexState(
+            waveform=caller_waveform,
+            voice_waveform=voice_waveform,
+            num_samples=caller_samples,
+        ).to_dict(),
+    )
+    encoded = encoder.fn(payload)
+    encoded_state = PersonaPlexState.from_dict(encoded.data)
+    torch.testing.assert_close(encoded_state.user_codes, caller_codes[0].T)
+    torch.testing.assert_close(encoded_state.voice_codes, voice_codes[0].T)
+    encoded_state.codes = encoded_state.user_codes
+    encoded.data = encoded_state.to_dict()
+    actual_waveform = np.frombuffer(
+        decoder.compute_fn(encoded).data["audio_waveform"], dtype=np.float32
+    )
+    expected_waveform = random_codec.decode(caller_codes)[0, 0, :caller_samples]
+    torch.testing.assert_close(
+        torch.from_numpy(actual_waveform.copy()), expected_waveform, atol=0, rtol=0
+    )
+
+
 @pytest.mark.parametrize(
     "prompt,budget,expected_loads",
     [
@@ -325,9 +374,10 @@ def test_code2wav_graph_limit_follows_resolved_configuration(
         {"code2wav": {"factory": overrides}}, type(config), ["code2wav"]
     )
     resolved = ConfigResolver(config).resolve(patches).config
-    codec = Mock()
+    codec = Mock(device=torch.device("cpu"))
     decode_slots = Mock(
         return_value=SimpleNamespace(
+            codec=codec,
             max_batch_size=8,
             max_chunk_frames=max(max(chunk_ramp_frames), expected_graph_frames),
         )
