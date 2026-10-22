@@ -31,6 +31,12 @@ chain=$(git -C /workspace/sglang-omni rev-parse FETCH_HEAD)
 tree t_m1b 1b726ab64
 tree t_chain $chain
 log "queue final start t_marks $(git -C /workspace/t_marks rev-parse --short HEAD) loadavg $(cut -d' ' -f1-3 /proc/loadavg)"
+(cd /workspace/t_chain && CUDA_VISIBLE_DEVICES=0 PYTHONPATH=/workspace/t_chain:/workspace/CosyVoice:/workspace/CosyVoice/third_party/Matcha-TTS \
+  timeout 3600 python3 -m pytest tests/unit_test/fun_cosyvoice3 tests/unit_test/test_platforms.py -q -p no:cacheprovider -rfEs \
+  > $F/units.log 2>&1)
+units_rc=$?
+log "units rc $units_rc $(grep -E 'passed|failed' $F/units.log | tail -n 1)"
+[ $units_rc = 0 ] || { log "units failed, stop"; exit 1; }
 bash $IN/warm_c20261021.sh t_m1b 0 $(cpus 0) 29400 $D/warm_t_m1b &
 bash $IN/warm_c20261021.sh t_chain 1 $(cpus 1) 29600 $D/warm_t_chain_final &
 wait
