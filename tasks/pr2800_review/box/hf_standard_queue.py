@@ -10,7 +10,7 @@ Run on the box: python3 /workspace/box9/tasks/pr2800_review/box/hf_standard_queu
    resampling) and #2861 (run239 phx, band limited). Writes <out>/speech_wer.json, <out>/mmsu_analysis.json and
    <out>/summary.txt.
 --speech-cards and --mmsu-card place the jobs (--mmsu-card -1 runs speech only, scored on the first speech card);
---zero-multimodal-hidden passes on to the reference's speech jobs.
+--zero-multimodal-hidden and --fp8-talker pass on to the reference's speech jobs.
 """
 
 from __future__ import annotations
@@ -122,6 +122,7 @@ def main() -> None:
     parser.add_argument("--mmsu-card", type=int, default=MMSU_CARD, help="-1 runs speech only")
     parser.add_argument("--zero-multimodal-hidden", action="store_true",
                         help="speech: zeros at the talker's multimodal prompt rows, as omni's main builds them")
+    parser.add_argument("--fp8-talker", help="speech: the talker on this FP8 checkpoint's weights and W8A8 inputs")
     args = parser.parse_args()
     if args.score_speech:
         score_speech(args.port, args.out)
@@ -130,7 +131,10 @@ def main() -> None:
         pass
     args.out.mkdir(parents=True, exist_ok=True)
     speech_cards = [int(card) for card in args.speech_cards.split(",")]
-    speech_args = ["--zero-multimodal-hidden"] if args.zero_multimodal_hidden else []
+    speech_args = [
+        *(["--zero-multimodal-hidden"] if args.zero_multimodal_hidden else []),
+        *(["--fp8-talker", args.fp8_talker] if args.fp8_talker else []),
+    ]
     is_mmsu = args.mmsu_card >= 0
     if is_mmsu:
         write_mmsu_samples(args.out / "mmsu_samples.json")

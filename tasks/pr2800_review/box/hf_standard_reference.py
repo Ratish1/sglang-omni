@@ -9,6 +9,8 @@ speech: the thinker greedy at 256 tokens, the talker with the checkpoint's sampl
 sample each under torch.manual_seed(draw); writes <out>/audio/<id>__<draw>.wav and <out>/speech_<shard>.json.
 mmsu: the talker disabled, the thinker greedy at 32 tokens; writes <out>/mmsu_<shard>.json with each raw response.
 --zero-multimodal-hidden gives HF's talker zeros at the multimodal prompt rows, as omni's main builds them.
+--fp8-talker <repo> runs every talker linear that checkpoint quantizes on its dequantized FP8 weight, its input
+quantized to e4m3 per token and 128 features as a W8A8 block-FP8 linear does; the thinker stays bf16.
 """
 
 from __future__ import annotations
@@ -25,6 +27,50 @@ from transformers import Qwen3OmniMoeForConditionalGeneration, Qwen3OmniMoeProce
 
 MODEL = "Qwen/Qwen3-Omni-30B-A3B-Instruct"
 DRAWS = 6
+FP8_BLOCK = 128
+FP8_MAX = 448.0
+
+
+def dequantize_fp8_block(weight: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+    """The checkpoint's weight_scale_inv is the quantization scale: the weight is w / s, one s a 128 x 128 block."""
+    rows, cols = weight.shape
+    expanded = scale.float().repeat_interleave(FP8_BLOCK, 0)[:rows].repeat_interleave(FP8_BLOCK, 1)[:, :cols]
+    return weight.float() / expanded
+
+
+def quantize_input_per_token_group(module: torch.nn.Module, args: tuple) -> tuple:
+    """The W8A8 block-FP8 linear's activation: e4m3 per token and group of 128 features, scale amax / 448."""
+    del module
+    x = args[0]
+    groups = x.float().reshape(*x.shape[:-1], x.shape[-1] // FP8_BLOCK, FP8_BLOCK)
+    scale = groups.abs().amax(dim=-1, keepdim=True).clamp(min=1e-10) / FP8_MAX
+    quantized = (groups / scale).clamp(-FP8_MAX, FP8_MAX).to(torch.float8_e4m3fn).float() * scale
+    return (quantized.reshape(x.shape).to(x.dtype), *args[1:])
+
+
+def use_fp8_talker(model: Qwen3OmniMoeForConditionalGeneration, fp8_model: str) -> int:
+    """Every talker linear the FP8 checkpoint quantizes runs on its dequantized FP8 weight with an FP8 input."""
+    from huggingface_hub import snapshot_download
+    from safetensors import safe_open
+
+    root = Path(snapshot_download(fp8_model, allow_patterns=["*.json"]))
+    weight_map = json.loads((root / "model.safetensors.index.json").read_text())["weight_map"]
+    replaced = 0
+    for name, module in model.talker.named_modules():
+        key = f"talker.{name}"
+        if not isinstance(module, torch.nn.Linear) or f"{key}.weight_scale_inv" not in weight_map:
+            continue
+        else:
+            pass
+        shard = Path(snapshot_download(fp8_model, allow_patterns=[weight_map[f"{key}.weight"]]))
+        with safe_open(str(shard / weight_map[f"{key}.weight"]), "pt") as handle:
+            weight = handle.get_tensor(f"{key}.weight")
+        with safe_open(str(shard / weight_map[f"{key}.weight_scale_inv"]), "pt") as handle:
+            scale = handle.get_tensor(f"{key}.weight_scale_inv")
+        module.weight.data.copy_(dequantize_fp8_block(weight, scale).to(module.weight.dtype))
+        module.register_forward_pre_hook(quantize_input_per_token_group)
+        replaced += 1
+    return replaced
 
 
 def cookbook_inputs(processor: Qwen3OmniMoeProcessor, content: list[dict[str, object]], device: torch.device,
@@ -49,10 +95,15 @@ def main() -> None:
         action="store_true",
         help="speech: the talker's multimodal prompt rows project zeros in place of the thinker's hidden states",
     )
+    parser.add_argument("--fp8-talker", help="speech: the talker on this FP8 checkpoint's weights and W8A8 inputs")
     args = parser.parse_args()
     spec = json.loads(args.samples.read_text())
     samples = spec["samples"][args.shard::args.shards]
     model = Qwen3OmniMoeForConditionalGeneration.from_pretrained(MODEL, dtype="auto", device_map="auto")
+    if args.fp8_talker:
+        print(f"FP8 talker: {use_fp8_talker(model, args.fp8_talker)} linears", flush=True)
+    else:
+        pass
     if args.zero_multimodal_hidden:
         user_parts = model._get_talker_user_parts  # noqa: leading-underscore  # HF's own method
 
