@@ -1,6 +1,7 @@
 """The Qwen3-TTS vocoder's captured decodes as serving builds them, on the tree on PYTHONPATH (one arm per process): the
-trained speech tokenizer in bf16 with SnakeBeta fused, the slot arena, warm graphs at widths 1, 4 and 8 (8 compiled,
-as served) and a tail graph at width 64, each at the served warm batch buckets. Per graph: the replay's device time
+trained speech tokenizer in bf16 with SnakeBeta fused, the slot arena, cold graphs at widths 8 and 9 (compiled, as
+served), warm graphs at widths 1, 4 and 8 (8 compiled, as served) and a tail graph at width 64, each at the served warm
+batch buckets; --no-compile captures every graph without compile. Per graph: the replay's device time
 from CUDA events between back-to-back replays (median, p10, p90) and the kernels a replay launches.
 
 usage: PYTHONPATH=<tree> python3 vocoder_decode_bench.py [--card 3] [--replays 100]
@@ -24,6 +25,7 @@ from sglang_omni.utils.snake_beta import fuse_vocoder_decoder
 
 MODEL = "Qwen/Qwen3-TTS-12Hz-1.7B-Base"
 BATCHES = (1, 4, 8)
+COLD_WIDTHS = (8, 9)
 WARM_WIDTHS = (1, 4, 8)
 TAIL_WIDTH = 64
 
@@ -68,6 +70,19 @@ def main() -> None:
     incremental = Qwen3TTSIncrementalDecoder(decoder)
     arena = Qwen3TTSCodecStateArena(incremental, num_slots=4 * max(BATCHES), device=device, dtype=dtype)
     config = decoder.config
+    cold = Qwen3TTSIncrementalCodecCudaGraphRunner(
+        incremental,
+        device=device,
+        dtype=dtype,
+        num_quantizers=config.num_quantizers,
+        mode="cold",
+        fresh_frames=COLD_WIDTHS,
+        batch_sizes=BATCHES,
+        min_free_gb=0.0,
+        compile_fresh_frames=() if args.no_compile else COLD_WIDTHS,
+        arena=arena,
+        graph_pool=IncrementalCodecGraphPool(stream_priority=0),
+    )
     warm = Qwen3TTSIncrementalCodecCudaGraphRunner(
         incremental,
         device=device,
@@ -95,10 +110,11 @@ def main() -> None:
         emit_frames=1,
     )
     with torch.inference_mode():
+        cold.capture()
         warm.capture()
         tail.capture()
         generator = torch.Generator(device="cpu").manual_seed(0)
-        for runner, widths in ((warm, WARM_WIDTHS), (tail, (TAIL_WIDTH,))):
+        for runner, widths in ((cold, COLD_WIDTHS), (warm, WARM_WIDTHS), (tail, (TAIL_WIDTH,))):
             for width in widths:
                 for batch in BATCHES:
                     slots = [arena.acquire() for _ in range(batch)]
