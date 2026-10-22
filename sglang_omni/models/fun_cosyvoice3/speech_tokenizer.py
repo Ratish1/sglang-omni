@@ -278,6 +278,11 @@ class SpeechTokenizerCudaGraphs:
         finally:
             torch.backends.cuda.matmul.allow_tf32 = allow_tf32
         torch.cuda.synchronize(device)
+        # note (ratish): a new event's first record waits while another thread is inside
+        # the CUDA runtime, so one event, first recorded here, serves every call, waited
+        # on under the lock so no later call records it first.
+        self.copy_done = torch.cuda.Event()
+        self.copy_done.record(self.stream)
 
     def tokenize(self, mel: torch.Tensor) -> list[int]:
         """Codes of a CPU mel (1, mels, frames) of at most MAX_FRAMES frames."""
@@ -291,7 +296,6 @@ class SpeechTokenizerCudaGraphs:
             captured.frames.fill_(frames)
             captured.graph.replay()
             codes = async_d2h(captured.codes[0, : conv_frames(conv_frames(frames))])
-            copy_done = torch.cuda.Event()
-            copy_done.record()
-        copy_done.synchronize()
+            self.copy_done.record()
+            self.copy_done.synchronize()
         return codes.tolist()
