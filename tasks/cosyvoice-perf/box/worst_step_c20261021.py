@@ -85,11 +85,18 @@ def main() -> None:
                     "latency_mean_s", "latency_p99_s")},
             }
     finally:
-        os.killpg(server.pid, signal.SIGTERM)
+        # note (ratish): a server whose whole group already exited raises here (10-22)
+        try:
+            os.killpg(server.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
         try:
             server.wait(timeout=60)
         except subprocess.TimeoutExpired:
-            os.killpg(server.pid, signal.SIGKILL)
+            try:
+                os.killpg(server.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
     print(identity.strip())
     print("startup:")
     for line in open(out / "serve.log", errors="replace"):

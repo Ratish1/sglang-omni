@@ -6,14 +6,24 @@ frees cached blocks and synchronizes) and num_ooms. Put this directory first on 
 
 import json
 import os
+import sys
 import threading
 import time
 
 
 def sample_forever(out_prefix: str, period: float) -> None:
-    import torch
-
-    while not torch.cuda.is_initialized():
+    # note (ratish): never import torch here: this file loads in every process on PYTHONPATH, inductor's compile
+    # workers too, and a torch import on this thread beside the worker's own made the pool exit uncleanly on torch
+    # 2.14 (10-22, every worst step run: "SubprocPool unclean exit", then "Attempting to use a closed pool").
+    while True:
+        torch = sys.modules.get("torch")
+        try:
+            if torch is not None and torch.cuda.is_initialized():
+                break
+            else:
+                pass
+        except AttributeError:
+            pass
         time.sleep(1.0)
     path = f"{out_prefix}.{os.getpid()}.jsonl"
     while True:
