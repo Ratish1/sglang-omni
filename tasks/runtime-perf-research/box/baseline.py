@@ -192,7 +192,7 @@ def run_pass(args, server: subprocess.Popen, load: int, kind: str, warmup: bool)
             time.sleep(args.pyspy_delay)
             for pid in group_pids(server.pid):
                 spies.append(subprocess.Popen(
-                    ["py-spy", "record", "--pid", str(pid), "--rate", "100", "--duration", str(args.pyspy_seconds),
+                    ["py-spy", "record", "--pid", str(pid), "--rate", "100", "--duration", str(int(args.pyspy_seconds)),
                      "--threads", "--idle", "--nonblocking", "--format", "raw", "--output", str(out / f"pyspy_{pid}.txt")],
                     stdout=subprocess.DEVNULL, stderr=open(out / f"pyspy_{pid}.err", "w"),
                 ))
