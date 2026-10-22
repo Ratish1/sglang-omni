@@ -118,6 +118,13 @@ def fused_bias_snake_beta(
     assert (
         channels % vector_elements == 0
     ), f"{channels} channels split into {vector_elements}-element vectors"
+    row_strides = (channels, 1)
+    assert (
+        conv_output.stride()[1:] == row_strides and out.stride()[1:] == row_strides
+    ), "each row of conv_output and out is one contiguous span"
+    assert all(
+        tensor is None or tensor.is_contiguous() for tensor in (residual, sum_out)
+    ), "residual and sum_out are contiguous"
     # note (ratish): each thread moves one 16-byte vector of a row's contiguous span and reads
     # its channels' parameters at the vector's offset modulo the channel count, so no lane
     # idles on a power-of-two channel tile.
