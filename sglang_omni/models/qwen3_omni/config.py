@@ -418,15 +418,19 @@ class Qwen3OmniBasePipelineConfig(PipelineConfig):
             pass
         return {}
 
-    def stage_max_running_requests(self, stage_name: str, default: int) -> int:
-        """A stage's running-request cap as its factory resolves it: an engine override, then a factory override, then default."""
+    def stage_max_running_requests(
+        self, stage_name: str, default_max_running_requests: int
+    ) -> int:
+        """A stage's running-request cap as its factory resolves it: an engine override, then a factory override, then the default."""
         stage = self.stage_named(stage_name)
         engine_overrides = stage.engine.overrides() if stage.engine is not None else {}
         factory_overrides = stage.factory.model_extra or {}
         return int(
             engine_overrides.get(
                 "max_running_requests",
-                factory_overrides.get("max_running_requests", default),
+                factory_overrides.get(
+                    "max_running_requests", default_max_running_requests
+                ),
             )
         )
 
