@@ -170,7 +170,9 @@ def check_request(model, trace: dict, is_zero_multimodal: bool) -> dict:
         kl_mean=sum(divergences) / steps, kl_max=max(divergences), kl_first_quarter=sum(divergences[:steps // 4 or 1])
         / (steps // 4 or 1), kl_second_half=sum(late) / len(late), top1_agreement=sum(top_equal) / steps,
         served_code_rank_median=sorted(ranks)[steps // 2], served_code_rank_over_50=sum(rank >= 50 for rank in ranks),
-        predictor_codes_equal=sum(predictor_matches) / (15 * steps))
+        predictor_codes_equal=sum(predictor_matches) / (15 * steps),
+        kl_steps=[round(divergence, 4) for divergence in divergences], top1_steps=[int(equal) for equal in top_equal],
+        rank_steps=ranks, predictor_steps=predictor_matches)
 
 
 def main() -> None:
