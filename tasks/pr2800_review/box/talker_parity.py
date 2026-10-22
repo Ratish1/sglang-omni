@@ -64,7 +64,7 @@ def check_request(model, trace: dict, is_zero_multimodal: bool) -> dict:
         return talker.text_projection(thinker_embed(ids))[0]
 
     tts_bos, tts_eos, tts_pad = project_text([config.tts_bos_token_id, config.tts_eos_token_id,
-                                              config.tts_pad_token_id])
+                                              config.tts_pad_token_id]).split(1)
     # 1. prompt rows: the user segment as HF's generate builds it, then the 9-row assistant tail
     input_ids = torch.tensor(trace["input_ids"], device=device)
     prompt_rows = trace["prompt_rows"].to(device)
@@ -120,12 +120,14 @@ def check_request(model, trace: dict, is_zero_multimodal: bool) -> dict:
     suppressed = torch.zeros(vocab, dtype=torch.bool, device=device)
     suppressed[vocab - 1024:] = True
     suppressed[talker_config.codec_eos_token_id] = False
-    positions = trace["mrope_positions"]
     length = prompt_rows.shape[0]
-    if positions is None:
+    if trace["mrope_positions"] is None:
         positions = torch.arange(length).view(1, -1).expand(3, -1)
     else:
-        pass
+        # note (ratish): both sides truncate the float positions, HF into its int64 position ids and the
+        # server's forward batch by casting to int64; a decode step continues from the prompt's largest.
+        positions = trace["mrope_positions"].long()
+    next_position = int(positions.max()) + 1
     cache = DynamicCache()
     output = talker.model(inputs_embeds=prompt_rows[None].to(talker.dtype), position_ids=positions[:, None].to(device),
                           past_key_values=cache, use_cache=True)
@@ -151,7 +153,7 @@ def check_request(model, trace: dict, is_zero_multimodal: bool) -> dict:
             break
         else:
             pass
-        position = torch.full((3, 1, 1), length + step + trace["mrope_delta"], device=device)
+        position = torch.full((3, 1, 1), next_position + step, device=device)
         output = talker.model(inputs_embeds=decode_rows[step].to(device, talker.dtype).view(1, 1, -1),
                               position_ids=position, past_key_values=cache, use_cache=True,
                               cache_position=torch.tensor([length + step], device=device))
