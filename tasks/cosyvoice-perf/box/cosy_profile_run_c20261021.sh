@@ -83,6 +83,7 @@ traced() {
 }
 
 # CELLS: name:concurrency:samples[:seed[:rate[:meta[:mode]]]], traced in order; PYSPY=0 skips the py-spy pass.
+# note (ratish): a cell named warm_* runs untraced, so a long shape warms before its traced cell (10-22 profile).
 CELLS=${CELLS:-c1:1:24:1234 c16:16:320}
 bench warm 16 64
 if [ -n "${PRIME:-}" ]; then
@@ -92,7 +93,10 @@ else
 fi
 for cell in $CELLS; do
   IFS=: read -r name concurrency samples seed rate meta mode <<< "$cell"
-  traced $name $concurrency $samples "$seed" "$rate" "$meta" "$mode"
+  case $name in
+    warm_*) bench $name $concurrency $samples "$seed" "$rate" "$meta" "$mode" ;;
+    *) traced $name $concurrency $samples "$seed" "$rate" "$meta" "$mode" ;;
+  esac
 done
 
 PIPE_PID=$(sed -n 's/.*StageGroup pipeline: spawned 1 process(es) (pids=\[\([0-9]*\)\]).*/\1/p' $R/serve.log | head -1)
@@ -116,6 +120,10 @@ grep -E "cosy_nvtx|loop_probe" $R/serve.log | sort | uniq -c > $R/probe_log.txt
 
 for cell in $CELLS; do
   IFS=: read -r name concurrency samples seed rate meta mode <<< "$cell"
+  case $name in
+    warm_*) continue ;;
+    *) : ;;
+  esac
   nsys export --type sqlite --force-overwrite=true --output $R/$name.sqlite $R/$name.nsys-rep \
     > $R/export_$name.log 2>&1
   python3 $IN/vocoder_selection_c20261019.py $R/$name.sqlite --skip-head-s 1 --skip-tail-s 1 \
