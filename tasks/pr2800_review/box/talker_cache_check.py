@@ -56,8 +56,10 @@ def kl(value: torch.Tensor, reference: torch.Tensor) -> float:
 
 
 @torch.no_grad()
-def departures(talker: Qwen3OmniMoeTalkerForConditionalGeneration, trace: dict, threshold: float) -> list[tuple]:
-    """The decode steps where the served logits depart from HF's cached pass by more than threshold KL."""
+def departures(talker: Qwen3OmniMoeTalkerForConditionalGeneration, trace: dict, threshold: float,
+               position_offset: int = 0) -> list[tuple]:
+    """The decode steps where the served logits depart from HF's cached pass by more than threshold KL; the decode
+    positions moved by position_offset."""
     vocab = talker.config.text_config.vocab_size
     suppressed = torch.zeros(vocab, dtype=torch.bool, device="cuda")
     suppressed[vocab - 1024:] = True
@@ -83,7 +85,7 @@ def departures(talker: Qwen3OmniMoeTalkerForConditionalGeneration, trace: dict, 
             pass
         row = (trace["feedback_rows"][step] + trace["text_rows"][step]).cuda().to(torch.bfloat16)
         output = talker.model(inputs_embeds=row.view(1, 1, -1),
-                              position_ids=torch.full((3, 1, 1), next_position + step, device="cuda"),
+                              position_ids=torch.full((3, 1, 1), next_position + position_offset + step, device="cuda"),
                               past_key_values=cache, use_cache=True,
                               cache_position=torch.tensor([length + step], device="cuda"))
     return found
@@ -96,6 +98,8 @@ def main() -> None:
     parser.add_argument("--trace-dir", type=Path, help="every trace: the steps departing from HF by over --threshold")
     parser.add_argument("--threshold", type=float, default=0.5)
     parser.add_argument("--steps", default="118:130")
+    parser.add_argument("--position-offset", type=int, default=0,
+                        help="--trace-dir: decode positions moved by this many, as the server places them")
     args = parser.parse_args()
     first, last = (int(bound) for bound in args.steps.split(":"))
     talker = load_talker()
@@ -103,8 +107,8 @@ def main() -> None:
         for path in sorted(args.trace_dir.glob("*.pt")):
             trace = torch.load(path, weights_only=False)
             if trace.get("prompt_rows") is not None and trace.get("feedback_rows"):
-                print(f"{path.stem[:8]} frames {len(trace['logits'])}: {departures(talker, trace, args.threshold)}",
-                      flush=True)
+                found = departures(talker, trace, args.threshold, args.position_offset)
+                print(f"{path.stem[:8]} frames {len(trace['logits'])}: {found}", flush=True)
             else:
                 pass
         return
