@@ -179,6 +179,8 @@ class ModelRunner(Generic[RequestDataInput]):
         self.async_query_miss: int = 0
         self.token_id_host_bufs: list[torch.Tensor] | None = None
         self.token_id_host_slot: int = 0
+        self.token_id_events: list[torch.cuda.Event] = []
+        self.token_id_event_slot: int = 0
         self.suppress_tensor_cache: dict[
             tuple[tuple[int, ...], int, str], torch.Tensor | None
         ] = {}
@@ -195,7 +197,7 @@ class ModelRunner(Generic[RequestDataInput]):
         n = ids.shape[0]
         buf = self.next_token_id_host_buf(ids, n)
         buf[:n].copy_(ids[:n], non_blocking=True)
-        event = torch.cuda.Event()
+        event = self.next_token_id_event()
         event.record()
         result._host_token_ids = buf[
             :n
@@ -212,6 +214,17 @@ class ModelRunner(Generic[RequestDataInput]):
             like.dtype,
             realloc_on_grow=True,
         )
+
+    def next_token_id_event(self) -> torch.cuda.Event:
+        # note (ratish): a new event is created at its first record, which waits while
+        # another thread of the process is inside the CUDA runtime; two, as the buffers.
+        if not self.token_id_events:
+            self.token_id_events = [torch.cuda.Event() for _ in range(2)]
+        else:
+            pass
+        event = self.token_id_events[self.token_id_event_slot]
+        self.token_id_event_slot ^= 1
+        return event
 
     def pinned_pingpong(
         self,
@@ -443,10 +456,10 @@ class ModelRunner(Generic[RequestDataInput]):
         )
 
     def execute_launch(self, scheduler_output: SchedulerOutput) -> "PendingStep | None":
-        """Enqueue a decode step's forward + on-GPU sample, call
+        """Enqueue a decode or supported whole-prompt prefill step, call
         ``post_decode_launch`` to publish a model-specific resolve payload
         (returned as launch_buf), and record a device event right after
-        publication. Does NOT wait on the GPU. Decode batches only. ``launch_buf``
+        publication. Does NOT wait on the GPU. ``launch_buf``
         is a device-side correctness snapshot (MOSS-TTS-Local) or pinned host
         staging (Higgs); only the latter overlaps a host copy with the next
         forward, and ``event.query()`` proves the launched step's GPU work is
@@ -470,7 +483,6 @@ class ModelRunner(Generic[RequestDataInput]):
             else:
                 pass
             forward_batch, schedule_batch, is_prefill = built
-            assert not is_prefill, "async lookahead launch is decode-only"
             batch_result = self.prepare_and_forward(
                 forward_batch,
                 schedule_batch,
@@ -478,6 +490,15 @@ class ModelRunner(Generic[RequestDataInput]):
                 is_prefill,
                 is_lookahead=True,
             )
+            if is_prefill:
+                self.post_prefill(
+                    batch_result,
+                    forward_batch,
+                    schedule_batch,
+                    scheduler_output.requests,
+                )
+            else:
+                pass
             launch_buf = self.post_decode_launch(
                 batch_result, forward_batch, scheduler_output.requests
             )
