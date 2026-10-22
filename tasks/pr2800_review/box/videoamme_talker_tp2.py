@@ -7,7 +7,7 @@ talker and code2wav on its second card) and gets the CI's request shape: the fir
 and audio in, text and audio out, greedy, 256 tokens, c16. Chains on different pairs run at the same time. After the
 arms, one Qwen3-ASR server on the score card transcribes each arm's audio and scores it against the arm's text as the
 CI does. The client and the scoring run in each tree's own
-code (this file in its --client and --score modes). Writes <out>/<arm>/videoamme.json, <out>/<arm>/wer.json and
+code (this file in its --client and --score modes). --model serves another checkpoint in the same shape. Writes <out>/<arm>/videoamme.json, <out>/<arm>/wer.json and
 <out>/summary.json.
 """
 
@@ -110,6 +110,7 @@ def serve(
     cards: tuple[int, int],
     port: int,
     code2wav_dump_dir: Path | None,
+    model: str,
 ) -> subprocess.Popen:
     env = {
         **pair_check.card_env(cards[0], arm_tree),
@@ -131,7 +132,7 @@ def serve(
             "-u",
             "examples/run_qwen3_omni_speech_server.py",
             "--model-path",
-            MODEL,
+            model,
             *SERVE_ARGS,
             "--host",
             "127.0.0.1",
@@ -172,7 +173,12 @@ def stop(process: subprocess.Popen, cards: tuple[int, int]) -> None:
 
 
 def run_arm(
-    out: Path, arm: str, cards: tuple[int, int], seed: int | None, is_code2wav_dump: bool
+    out: Path,
+    arm: str,
+    cards: tuple[int, int],
+    seed: int | None,
+    is_code2wav_dump: bool,
+    model: str,
 ) -> int:
     arm_out = out / arm
     arm_out.mkdir(parents=True, exist_ok=True)
@@ -185,6 +191,7 @@ def run_arm(
         cards,
         port,
         arm_out / "code2wav_dump" if is_code2wav_dump else None,
+        model,
     )
     try:
         log(out, f"{arm} healthy, client")
@@ -232,6 +239,7 @@ def main() -> None:
         action="store_true",
         help="save every request's talker codes and served audio (code2wav_dump/sitecustomize.py)",
     )
+    parser.add_argument("--model", default=MODEL, help="checkpoint every arm serves")
     args = parser.parse_args()
     if args.client:
         client(args.port, args.out, args.seed)
@@ -250,7 +258,7 @@ def main() -> None:
 
     def run_chain(chain_arms: list[str], cards: tuple[int, int]) -> list[int]:
         return [
-            run_arm(args.out, arm, cards, args.seed, args.code2wav_dump)
+            run_arm(args.out, arm, cards, args.seed, args.code2wav_dump, args.model)
             for arm in chain_arms
         ]
 
