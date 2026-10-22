@@ -144,7 +144,7 @@ def main() -> None:
     parser.add_argument("--port", type=int, default=24000)
     parser.add_argument("--events-load", type=int, default=0)
     parser.add_argument("--no-swap", action="store_true")
-    parser.add_argument("--bench", default="seedtts", choices=("seedtts", "videomme", "asr_longform"))
+    parser.add_argument("--bench", default="seedtts", choices=("seedtts", "videomme", "videomme_text", "asr_longform"))
     parser.add_argument("--warm-bench", default="", help="bench of the warm pass (default: --bench)")
     parser.add_argument("--meta", default="")
     parser.add_argument("--bench-extra", default="")

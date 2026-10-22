@@ -65,13 +65,15 @@ def bench_command(model: str, port: int, load: int, out: Path, warmup: bool, rep
     output at the CI's video settings (Omni); asr_longform runs the meanwhile long-form set (ASR)."""
     spec = MODELS[model]
     meta_args = ["--meta", meta] if meta else []
-    if bench == "videomme":
-        # note (ratish): videomme_speed.py is the benchmark without its WER pass, which needs a second ASR server
+    if bench in ("videomme", "videomme_text"):
+        # note (ratish): videomme_speed.py is the benchmark without its WER pass, which needs a second ASR server;
+        # videomme_text is the CI's text-only Video-MME test
         return [
             sys.executable, str(Path(__file__).resolve().parent / "videomme_speed.py"), "--host", "127.0.0.1",
             "--port", str(port),
             "--repo-id", "zhaochenyang20/Video_MME_ci", "--video-fps", "2", "--video-max-frames", "128",
-            "--video-max-pixels", "401408", "--enable-audio", "--max-tokens", "256", "--timeout-s", "500",
+            "--video-max-pixels", "401408", *(["--enable-audio"] if bench == "videomme" else []),
+            "--max-tokens", "256", "--timeout-s", "500",
             "--warmup", "1" if warmup else "0", "--max-concurrency", str(load), "--output-dir", str(out),
             "--disable-tqdm",
         ]
@@ -300,7 +302,7 @@ def main() -> None:
     parser.add_argument("--probe", action="store_true",
                         help="boot with hop_probe (queue hops, loop lag, GC) writing to <out>/probe/p.<pid>.jsonl")
     parser.add_argument("--serve-env", default="", help="KEY=VALUE pairs for the server only")
-    parser.add_argument("--bench", default="seedtts", choices=("seedtts", "videomme", "asr_longform"))
+    parser.add_argument("--bench", default="seedtts", choices=("seedtts", "videomme", "videomme_text", "asr_longform"))
     parser.add_argument("--meta", default="", help="meta.lst for a seedtts bench (long-form targets)")
     parser.add_argument("--bench-extra", default="", help="arguments appended to every benchmark command")
     parser.add_argument("--asr-dataset", default="meanwhile", help="dataset of an asr_longform bench")
