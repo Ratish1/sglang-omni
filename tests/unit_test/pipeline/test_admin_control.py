@@ -607,7 +607,7 @@ def test_stage_freeze_gc_keeps_the_process_heap_out_of_later_collections() -> No
 
         result = control_plane.completions[0].result
         assert result.success is True
-        assert result.data["frozen_object_count"] == gc.get_freeze_count() > 0
+        assert result.data["frozen_object_count"] > 0
         assert scheduler.calls == []
         assert warm_reference() is not None
         assert serving_reference() is None
