@@ -51,8 +51,8 @@ def main() -> None:
     torch.cuda.set_device(args.card)
     device = torch.device("cuda", args.card)
     apply_qwen_tts_transformers_compatibility_patches()
-    frontend = load_qwen3_tts_prompt_frontend(resolve_checkpoint(MODEL), device=device, dtype=torch.bfloat16)
     tokenizer = load_qwen3_tts_tokenizer(MODEL, device=str(device), dtype="bfloat16", attn_implementation=None)
+    frontend = load_qwen3_tts_prompt_frontend(resolve_checkpoint(MODEL), device=device, dtype=torch.bfloat16)
     runner = frontend.speaker_encoder_graph_runner
     runner.capture(DEFAULT_QWEN3_TTS_REFERENCE_ENCODER_BUCKET_FRAMES, tokenizer.model.encode_downsample_rate)
     print(f"speaker encoder graphs: {runner.stats()}")
