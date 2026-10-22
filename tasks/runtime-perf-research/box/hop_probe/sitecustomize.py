@@ -33,9 +33,10 @@ PREFIX = os.environ.get("OMNI_HOP_PROBE", "")
 # promotions to a garbage collection frequency measurement
 QUEUE_RECORDS = os.environ.get("OMNI_HOP_PROBE_QUEUES", "1") == "1"
 # what-if, not a probe: OMNI_BIND_THREAD_DEVICE=1 makes every new thread bind the CUDA device its creator had current,
-# as the stage scheduler thread does (pipeline/stage/runtime.py:278), to check that unbound workers cause the context
-# a stage process placed off device 0 opens on device 0
-BIND_THREAD_DEVICE = os.environ.get("OMNI_BIND_THREAD_DEVICE") == "1"
+# as the stage scheduler thread does (pipeline/stage/runtime.py:278); OMNI_BIND_THREAD_DEVICE=cuda:<n> makes every new
+# thread of a process that has imported torch bind device n before its target runs, so a server placed wholly on
+# device n shows whether unbound threads are the only source of the context it opens on device 0
+BIND_THREAD_DEVICE = os.environ.get("OMNI_BIND_THREAD_DEVICE", "")
 # what-if, not a probe: OMNI_FREEZE_STARTUP_GC=1 moves each process's heap into the permanent generation when its
 # first new request arrives, as the launcher does for the API process at startup (serve/launcher.py:173-176)
 FREEZE_STARTUP_GC = os.environ.get("OMNI_FREEZE_STARTUP_GC") == "1"
@@ -281,13 +282,16 @@ def patch_coordinator(module):
     coordinator.run_completion_loop = run_sampled
 
 
-def bind_thread_device():
-    """New threads set the CUDA device that was current in the creating thread before their target runs."""
+def bind_thread_device(fixed_device):
+    """New threads set a CUDA device before their target runs: fixed_device when given, else the device that was
+    current in the creating thread."""
     start, run = threading.Thread.start, threading.Thread.run
 
     def start_capturing(self, *args, **kwargs):
         torch = sys.modules.get("torch")
-        if torch is not None and torch.cuda.is_initialized():
+        if torch is not None and fixed_device is not None:
+            self.bound_device = fixed_device
+        elif torch is not None and torch.cuda.is_initialized():
             self.bound_device = torch.cuda.current_device()
         else:
             pass
@@ -345,9 +349,12 @@ if PREFIX:
     print(f"hop_probe on, prefix {PREFIX}", file=sys.stderr, flush=True)
 else:
     pass
-if BIND_THREAD_DEVICE:
-    bind_thread_device()
+if BIND_THREAD_DEVICE == "1":
+    bind_thread_device(None)
     print("hop_probe what-if: new threads bind their creator's CUDA device", file=sys.stderr, flush=True)
+elif BIND_THREAD_DEVICE.startswith("cuda:"):
+    bind_thread_device(int(BIND_THREAD_DEVICE.split(":")[1]))
+    print(f"hop_probe what-if: new threads bind {BIND_THREAD_DEVICE}", file=sys.stderr, flush=True)
 else:
     pass
 if FREEZE_STARTUP_GC:
