@@ -441,8 +441,8 @@ def set_cosyvoice3_preprocessing_context(
             speaker_encoder=speaker_encoder,
             reference_service=ReferenceEncodeService(
                 reference_hook,
-                max_items=256,
-                max_bytes=128 * 1024 * 1024,
+                max_items=4096,
+                max_bytes=1024 * 1024 * 1024,
                 timeout_s=130.0,
                 log_prefix="Fun-CosyVoice3",
             ),
