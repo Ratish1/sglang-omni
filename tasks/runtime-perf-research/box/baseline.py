@@ -59,7 +59,7 @@ MODELS = {
 
 
 def bench_command(model: str, port: int, load: int, out: Path, warmup: bool, repeats: int = 1,
-                  bench: str = "seedtts", meta: str = "") -> list[str]:
+                  bench: str = "seedtts", meta: str = "", asr_dataset: str = "meanwhile") -> list[str]:
     """The benchmark command. bench seedtts runs each model's SeedTTS EN benchmark (meta overrides the corpus with
     a meta.lst, as the long-form targets of make_longform_meta.py); videomme runs the Video-MME CI sample with audio
     output at the CI's video settings (Omni); asr_longform runs the meanwhile long-form set (ASR)."""
@@ -74,9 +74,10 @@ def bench_command(model: str, port: int, load: int, out: Path, warmup: bool, rep
             "--disable-tqdm",
         ]
     elif bench == "asr_longform":
-        # note (ratish): meanwhile is 64 recordings of 24 to 109 s, so every request crosses the 30 s chunking
+        # note (ratish): meanwhile is 64 recordings of 24 to 109 s, so every request crosses the 30 s chunking;
+        # longlibriheavy-30 is 1,203 unique clips of 20 to 30 s, a cache-cold short-clip corpus
         command = [
-            sys.executable, "-m", "benchmarks.eval.benchmark_asr_longform", "--dataset", "meanwhile",
+            sys.executable, "-m", "benchmarks.eval.benchmark_asr_longform", "--dataset", asr_dataset,
             "--host", "127.0.0.1", "--port", str(port), "--concurrencies", str(load), "--repeats", str(repeats),
             "--disable-resource-monitor", "--output", str(out / "asr.json"), "--save-raw-dir", str(out / "raw"),
         ]
@@ -218,17 +219,19 @@ def run_pass(args, server: subprocess.Popen, load: int, kind: str, warmup: bool)
         pass
     if kind == "clean" and args.bench_repeats > 1 and args.model == "asr":
         command = bench_command(args.model, args.port, load, out / "bench", warmup, repeats=args.bench_repeats,
-                                bench=args.bench, meta=args.meta)
+                                bench=args.bench, meta=args.meta, asr_dataset=args.asr_dataset)
     elif kind == "clean" and args.bench_repeats > 1:
         commands = [bench_command(args.model, args.port, load, out / "bench" / f"rep{index}", warmup and index == 0,
-                                  bench=args.bench, meta=args.meta) + shlex.split(args.bench_extra)
+                                  bench=args.bench, meta=args.meta, asr_dataset=args.asr_dataset)
+                    + shlex.split(args.bench_extra)
                     for index in range(args.bench_repeats)]
         command = ["bash", "-c", " && ".join(shlex.join(c) for c in commands)]
     else:
         command = bench_command(args.model, args.port, load, out / "bench", warmup,
                                 repeats=(args.asr_pyspy_repeats
                                          if kind in ("pyspy", "pyspygil") and args.model == "asr" else 1),
-                                bench=args.bench, meta=args.meta) + shlex.split(args.bench_extra)
+                                bench=args.bench, meta=args.meta, asr_dataset=args.asr_dataset)
+                   + shlex.split(args.bench_extra))
     (out / "bench_command.txt").write_text(shlex.join(command) + "\n", encoding="utf-8")
     cpu_start = thread_cpu(server.pid)
     window_start = time.time()
@@ -300,6 +303,7 @@ def main() -> None:
     parser.add_argument("--bench", default="seedtts", choices=("seedtts", "videomme", "asr_longform"))
     parser.add_argument("--meta", default="", help="meta.lst for a seedtts bench (long-form targets)")
     parser.add_argument("--bench-extra", default="", help="arguments appended to every benchmark command")
+    parser.add_argument("--asr-dataset", default="meanwhile", help="dataset of an asr_longform bench")
     parser.add_argument("--bench-repeats", type=int, default=1,
                         help="benchmark runs inside each clean pass for TTS and Omni (bench/rep<i>)")
     parser.add_argument("--asr-pyspy-repeats", type=int, default=1,
