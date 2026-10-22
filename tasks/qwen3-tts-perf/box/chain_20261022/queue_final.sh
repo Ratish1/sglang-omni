@@ -14,11 +14,11 @@ SEEDED=$T/tasks/qwen3-tts-perf/box/v3_landing_20261022
 LONG=/data/prof_20261022/formal/meta_w2/long
 M=/workspace/main_1b726ab64
 C=${C:?the chain head tree}
-D2=/workspace/c22_d9d73ccd5
-PRE_D10=/workspace/c22_8a6e0ffc8
-D10=/workspace/c22_94a7ba7dc
-PRE_D1=/workspace/c22_d124c75c8
-D1=/workspace/c22_1cb7cc3c8
+D2=${D2:?the D2 head with the capture fix}
+PRE_D10=${PRE_D10:?the chain before D10}
+D10=$C
+PRE_D1=${PRE_D1:?the chain before D1}
+D1=${D1:?the chain at D1}
 O=tests/unit_test/qwen3_omni
 SNAP=$(ls -d /root/.cache/huggingface/hub/models--Qwen--Qwen3-TTS-12Hz-1.7B-Base/snapshots/* | head -n 1)
 L=$D/queue.log
@@ -42,7 +42,15 @@ run_pair() {
   local label=$1 a=$2 b=$3
   shift 3
   python3 $IN/pair.py --label $label --tree $a --b-tree $b "$@" > $D/$label.out 2>&1
-  echo "$label rc $? $(date +%T) capture or compile failures a $(grep -ciE 'capture_failed|capture disabled|Unsupported:' $PAIR_ROOT/$label/a/serve.log) b $(grep -ciE 'capture_failed|capture disabled|Unsupported:' $PAIR_ROOT/$label/b/serve.log) $(grep 'byte identical' $D/$label.out)" >> $L
+  local rc=$?
+  local failed_a=$(grep -ciE 'capture_failed|capture disabled|Unsupported:' $PAIR_ROOT/$label/a/serve.log)
+  local failed_b=$(grep -ciE 'capture_failed|capture disabled|Unsupported:' $PAIR_ROOT/$label/b/serve.log)
+  echo "$label rc $rc $(date +%T) capture or compile failures a $failed_a b $failed_b $(grep 'byte identical' $D/$label.out)" >> $L
+  if [ "$failed_a" != 0 ] || [ "$failed_b" != 0 ]; then
+    echo "stopped: capture or compile failures in $label" >> $L
+    echo "queue_final_done $(date +%T)" >> $L
+    exit 1
+  fi
 }
 units chain $C "tests/unit_test/qwen3_tts tests/unit_test/kernels $O/test_code2wav.py $O/test_code2wav_cuda_graph.py $O/test_code2wav_batching.py $O/test_code2wav_overlap.py $O/test_code2wav_snake_beta.py"
 CHAIN_UNITS=$?
