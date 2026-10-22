@@ -8,6 +8,7 @@ from pathlib import Path
 import torch
 
 import review2999_baseline as baseline
+import sglang_omni.models.qwen3_omni.components.incremental_codec as incremental
 from sglang_omni.models.qwen3_omni.components.code2wav import Qwen3OmniIncrementalCodec
 from sglang_omni.models.qwen3_omni.components.code2wav_cuda_graph import (
     Code2WavCudaGraphRunner,
@@ -61,6 +62,23 @@ def main():
         slots = torch.tensor([1, 0], device="cuda")
         for step, frames in enumerate((1, 10, 1, 7)):
             hidden = torch.randn(2, frames, model.config.hidden_size, device="cuda")
+            captured = {}
+            old_conv = baseline.channels_last_conv1d
+            new_conv = incremental.clamped_single_output_conv
+
+            def capture_old(padded, conv, weight, bias, length):
+                if conv.out_channels == 1:
+                    captured["baseline"] = padded.clone()
+                else:
+                    pass
+                return old_conv(padded, conv, weight, bias, length)
+
+            def capture_new(padded, conv, length):
+                captured["head"] = padded.clone()
+                return new_conv(padded, conv, length)
+
+            baseline.channels_last_conv1d = capture_old
+            incremental.clamped_single_output_conv = capture_new
             truth = baseline.slot_conv_stack(
                 reference,
                 hidden,
@@ -79,6 +97,8 @@ def main():
                 SlotDecode(pool=new_pool, slot_index=slots, is_cold=step == 0),
                 codec.snake_coefficients,
             )
+            baseline.channels_last_conv1d = old_conv
+            incremental.clamped_single_output_conv = new_conv
             assert torch.isfinite(actual).all()
             assert actual.shape == truth.shape
             report["numerics"].append(
@@ -89,6 +109,17 @@ def main():
                     baseline_error=relative_error(old, truth),
                     head_error=relative_error(actual, truth),
                     head_baseline_error=relative_error(actual, old),
+                    identical_final_inputs=torch.equal(
+                        captured["head"], captured["baseline"]
+                    ),
+                    identical_histories=all(
+                        torch.equal(old_pool.histories[name], new_pool.histories[name])
+                        for name in old_pool.histories
+                    ),
+                    identical_overlaps=all(
+                        torch.equal(old_pool.overlaps[name], new_pool.overlaps[name])
+                        for name in old_pool.overlaps
+                    ),
                 )
             )
         for batch in (1, 8):
