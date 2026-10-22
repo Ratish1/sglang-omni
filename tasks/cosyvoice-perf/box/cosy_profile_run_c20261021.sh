@@ -16,7 +16,8 @@
 # cell field, a seed-tts meta.lst (the long form cell), and the vocoder selection analysis after the ledgers.
 # 10-21 copy: this lease's paths (/data/c20261021), and an optional seventh cell field, b for a buffered cell (no
 # --stream: the whole utterance path, #2260's buffered route). PAIR_HOME names another run home for the inductor
-# caches (10-22, /data/c20261022r).
+# caches (10-22, /data/c20261022r). PRIME=1 adds an untraced pass over the full EN set after the warm, so a tree whose
+# reference cache holds every reference serves the traced cells from it.
 # usage (in the container): [PEER=<other out>] [EXTRA_PATH=<dir>] [CELLS=...] [PYSPY=0] bash cosy_profile_run_c20261021.sh
 #   <tree> <card> <cpus> <port> <out>
 TREE=$1 CARD=$2 CPUS=$3 PORT=$4 R=$5
@@ -84,6 +85,11 @@ traced() {
 # CELLS: name:concurrency:samples[:seed[:rate[:meta[:mode]]]], traced in order; PYSPY=0 skips the py-spy pass.
 CELLS=${CELLS:-c1:1:24:1234 c16:16:320}
 bench warm 16 64
+if [ -n "${PRIME:-}" ]; then
+  bench prime 16 1088
+else
+  :
+fi
 for cell in $CELLS; do
   IFS=: read -r name concurrency samples seed rate meta mode <<< "$cell"
   traced $name $concurrency $samples "$seed" "$rate" "$meta" "$mode"
