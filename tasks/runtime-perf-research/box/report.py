@@ -113,6 +113,11 @@ def active_seconds(cell: Path, window: dict) -> tuple[float, str]:
             return summary["completed_requests"] / summary["throughput_qps"], "bench completed / qps"
         else:
             pass
+        results = data.get("results")
+        if isinstance(results, list) and results and isinstance(results[0], dict) and "wall_clock_s" in results[0]:
+            return sum(r["wall_clock_s"]["mean"] * r.get("repeats", 1) for r in results), "bench wall clock x repeats"
+        else:
+            pass
         flat = {}
         flatten("", data.get("results", data), flat)
         for key, value in flat.items():

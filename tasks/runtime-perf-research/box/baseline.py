@@ -55,7 +55,7 @@ MODELS = {
 }
 
 
-def bench_command(model: str, port: int, load: int, out: Path, warmup: bool) -> list[str]:
+def bench_command(model: str, port: int, load: int, out: Path, warmup: bool, repeats: int = 1) -> list[str]:
     spec = MODELS[model]
     if model == "tts":
         return [
@@ -67,7 +67,7 @@ def bench_command(model: str, port: int, load: int, out: Path, warmup: bool) -> 
     elif model == "asr":
         command = [
             sys.executable, "-m", "benchmarks.eval.benchmark_asr_seedtts", "--host", "127.0.0.1", "--port", str(port),
-            "--lang", "en", "--concurrencies", str(load), "--repeats", "1", "--disable-resource-monitor",
+            "--lang", "en", "--concurrencies", str(load), "--repeats", str(repeats), "--disable-resource-monitor",
             "--output", str(out / "asr.json"), "--save-raw-dir", str(out / "raw"),
         ]
         return command + (["--warmup"] if warmup else [])
@@ -176,7 +176,8 @@ def run_pass(args, server: subprocess.Popen, load: int, kind: str, warmup: bool)
         )
     else:
         pass
-    command = bench_command(args.model, args.port, load, out / "bench", warmup)
+    command = bench_command(args.model, args.port, load, out / "bench", warmup,
+                            repeats=args.asr_pyspy_repeats if kind == "pyspy" and args.model == "asr" else 1)
     (out / "bench_command.txt").write_text(shlex.join(command) + "\n", encoding="utf-8")
     cpu_start = thread_cpu(server.pid)
     window_start = time.time()
@@ -233,6 +234,8 @@ def main() -> None:
     parser.add_argument("--probe", action="store_true",
                         help="boot with hop_probe (queue hops, loop lag, GC) writing to <out>/probe/p.<pid>.jsonl")
     parser.add_argument("--serve-env", default="", help="KEY=VALUE pairs for the server only")
+    parser.add_argument("--asr-pyspy-repeats", type=int, default=1,
+                        help="measured repeats inside the ASR benchmark on py-spy passes, so the load outlasts the window")
     args = parser.parse_args()
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
