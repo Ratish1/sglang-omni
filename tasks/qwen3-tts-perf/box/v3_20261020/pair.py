@@ -119,6 +119,8 @@ def main() -> None:
     parser.add_argument("--gpu-metrics", action="store_true")
     parser.add_argument("--decode-digest", action="store_true")
     parser.add_argument("--decode-census", action="store_true")
+    parser.add_argument("--meta", default="")
+    parser.add_argument("--skip-score", action="store_true")
     args = parser.parse_args()
     arms = {"a": (args.a_card, "", args.port), "b": (args.b_card, args.b_args, args.port + 200)}
     outs = {arm: ROOT / args.label / arm for arm in arms}
@@ -180,6 +182,10 @@ def main() -> None:
                 command += ["--seed", str(args.seed)]
             else:
                 pass
+            if args.meta:
+                command += ["--meta", args.meta]
+            else:
+                pass
             with open(outs[arm] / "bench.log", "w", encoding="utf-8") as bench_log:
                 benches[arm] = subprocess.Popen(
                     command, cwd=args.tree, env=dict(os.environ, CUDA_VISIBLE_DEVICES="", PYTHONPATH=args.tree),
@@ -211,9 +217,12 @@ def main() -> None:
         print(f"byte identical {same} of {len(a_hashes)}", flush=True)
     else:
         pass
-    for index, arm in enumerate(arms):
-        score(outs[arm], arms[arm][0], args.port + 400 + 400 * index, args.tree)
-    print("scored", flush=True)
+    if args.skip_score:
+        pass
+    else:
+        for index, arm in enumerate(arms):
+            score(outs[arm], arms[arm][0], args.port + 400 + 400 * index, args.tree)
+        print("scored", flush=True)
     print("pair done", flush=True)
 
 
