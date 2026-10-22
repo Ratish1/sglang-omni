@@ -523,10 +523,6 @@ class Stage:
             self.schedule_receive_task(msg)
         elif isinstance(msg, FreezeGCMessage):
             gc.freeze()
-            logger.info(
-                f"Frozen stage {self.name} process object graph "
-                f"({gc.get_freeze_count()} objects)"
-            )
         elif isinstance(msg, ProfilerStartMessage):
             self.on_profiler_start(msg)
         elif isinstance(msg, ProfilerStopMessage):
