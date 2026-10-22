@@ -3,8 +3,9 @@
 Run on the box: python3 /workspace/box/tasks/pr2800_review/box/handoff_events_probe.py --arms upk,phu
     --out /data/pr2800/<run>
 Two rounds, the arms on cards 0 and 1 at the same time, then swapped. Each arm serves the cookbook's colocated bf16
-config (pair_check.serve) and records request events (POST /start_request_profile) while SeedTTS EN streamed voice
-clone runs seeded at c1 on the first SAMPLES prompts (pair_check's request shape, warmup 1), then stops them.
+config (pair_check.serve) and records request events (POST /start_request_profile), one event directory a pass,
+while SeedTTS EN streamed voice clone runs seeded at c1 on the first SAMPLES prompts and seeded at c64 on the full
+corpus (pair_check's request shape, warmup 1).
 The reader rebuilds each request's timeline (sglang_omni.profiler.views), takes every (stage, event) first time as an
 offset from the request's first event, and the thinker to talker chunk 0 (the prompt rows) and later chunk hops.
 Arms pair by request order, so a request's delta compares the same prompt; each arm's value is the mean over both
@@ -27,7 +28,10 @@ import pair_check  # noqa: E402
 
 SAMPLES = 200
 SERVER_PORT = 29000
-BENCH_ARGS = ["--max-concurrency", "1", "--seed", "1234", "--max-samples", str(SAMPLES)]
+PASSES = {
+    "c1_seeded": ["--max-concurrency", "1", "--seed", "1234", "--max-samples", str(SAMPLES)],
+    "c64_seeded": ["--max-concurrency", "64", "--seed", "1234"],
+}
 
 
 def run_arm(out: Path, round_index: int, card: int, arm: str) -> None:
@@ -49,20 +53,22 @@ def run_arm(out: Path, round_index: int, card: int, arm: str) -> None:
     )
     base_url = f"http://127.0.0.1:{port}"
     try:
-        start_request_profile(base_url, f"{arm}_r{round_index}", str(arm_dir / "events"))
-        rc = pair_check.benchmark(
-            card,
-            [
-                "--host", "127.0.0.1", "--port", str(port), "--model", "qwen3-omni", "--lang", "en",
-                "--voice-clone", "--stream", "--warmup", "1", "--generate-only", "--disable-tqdm",
-                "--output-dir", str(arm_dir / "c1_seeded"), *BENCH_ARGS,
-            ],
-            arm_dir / "c1_seeded.log",
-        )
-        stop_request_profile(base_url, f"{arm}_r{round_index}")
+        for name, bench_args in PASSES.items():
+            run_id = f"{arm}_r{round_index}_{name}"
+            start_request_profile(base_url, run_id, str(arm_dir / f"events_{name}"))
+            rc = pair_check.benchmark(
+                card,
+                [
+                    "--host", "127.0.0.1", "--port", str(port), "--model", "qwen3-omni", "--lang", "en",
+                    "--voice-clone", "--stream", "--warmup", "1", "--generate-only", "--disable-tqdm",
+                    "--output-dir", str(arm_dir / name), *bench_args,
+                ],
+                arm_dir / f"{name}.log",
+            )
+            stop_request_profile(base_url, run_id)
+            pair_check.log(out, f"round {round_index} card {card} {arm} {name} rc {rc}")
     finally:
         pair_check.stop(card, server)
-    pair_check.log(out, f"round {round_index} card {card} {arm} rc {rc}")
 
 
 def request_offsets(event_dir: Path) -> list[dict[str, float]]:
@@ -120,31 +126,37 @@ def main() -> None:
             thread.start()
         for thread in threads:
             thread.join()
-    per_arm: dict[str, list[list[dict[str, float]]]] = {main_arm: [], branch_arm: []}
-    for round_index, placements in enumerate(rounds, start=1):
-        for arm, card in placements:
-            per_arm[arm].append(request_offsets(args.out / f"r{round_index}_card{card}_{arm}" / "events"))
-    keys = sorted(
-        set.intersection(*(set(request) for runs in per_arm.values() for run in runs for request in run))
-        - {"start_ns"}
-    )
-    table = []
-    for key in keys:
-        means = {
-            arm: statistics.mean(
-                statistics.mean(request[key] for request in run) for run in runs
-            )
-            for arm, runs in per_arm.items()
-        }
-        table.append(
-            dict(event=key, main_ms=means[main_arm], branch_ms=means[branch_arm],
-                 delta_ms=means[branch_arm] - means[main_arm])
+    tables = {}
+    for name in PASSES:
+        per_arm: dict[str, list[list[dict[str, float]]]] = {main_arm: [], branch_arm: []}
+        for round_index, placements in enumerate(rounds, start=1):
+            for arm, card in placements:
+                per_arm[arm].append(
+                    request_offsets(args.out / f"r{round_index}_card{card}_{arm}" / f"events_{name}")
+                )
+        keys = sorted(
+            set.intersection(*(set(request) for runs in per_arm.values() for run in runs for request in run))
+            - {"start_ns"}
         )
-    table.sort(key=lambda row: row["main_ms"])
-    for row in table:
-        print(f"{row['event'][:70]:70s} main {row['main_ms']:9.2f}  branch {row['branch_ms']:9.2f}  "
-              f"delta {row['delta_ms']:+7.2f} ms", flush=True)
-    (args.out / "handoff.json").write_text(json.dumps(table, indent=1))
+        table = []
+        for key in keys:
+            means = {
+                arm: statistics.mean(
+                    statistics.mean(request[key] for request in run) for run in runs
+                )
+                for arm, runs in per_arm.items()
+            }
+            table.append(
+                dict(event=key, main_ms=means[main_arm], branch_ms=means[branch_arm],
+                     delta_ms=means[branch_arm] - means[main_arm])
+            )
+        table.sort(key=lambda row: row["main_ms"])
+        print(f"== {name}", flush=True)
+        for row in table:
+            print(f"{row['event'][:70]:70s} main {row['main_ms']:9.2f}  branch {row['branch_ms']:9.2f}  "
+                  f"delta {row['delta_ms']:+7.2f} ms", flush=True)
+        tables[name] = table
+    (args.out / "handoff.json").write_text(json.dumps(tables, indent=1))
     pair_check.log(args.out, "done")
 
 
