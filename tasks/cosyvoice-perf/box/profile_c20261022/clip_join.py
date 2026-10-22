@@ -67,7 +67,9 @@ def main():
                     ids = clips_of(first_errors.keys() & second_errors.keys())
                     wer_deltas.append(100 * sum(second_errors[clip][0] - first_errors[clip][0] for clip in ids) / words)
                     sim_ids = clips_of(first_sims.keys() & second_sims.keys())
-                    sim_deltas.append(statistics.mean(second_sims[clip] - first_sims[clip] for clip in sim_ids))
+                    sim_deltas.append(
+                        statistics.mean(second_sims[clip] - first_sims[clip] for clip in sim_ids) if sim_ids else 0.0
+                    )
                 parts[label].append(statistics.mean(wer_deltas))
                 sim_parts[label].append(statistics.mean(sim_deltas))
             common = set.intersection(*(run["first"][0].keys() & run["second"][0].keys() for run in runs))
