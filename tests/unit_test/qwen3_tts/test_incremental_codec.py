@@ -472,6 +472,9 @@ def test_fused_transformer_tracks_fp32_as_closely_as_the_plain_step() -> None:
         for layer in reference.layers:
             layer.self_attn_layer_scale.scale.uniform_(0.3, 0.7)
             layer.mlp_layer_scale.scale.uniform_(0.3, 0.7)
+            layer.input_layernorm.weight.uniform_(0.5, 1.5)
+            layer.post_attention_layernorm.weight.uniform_(0.5, 1.5)
+        reference.norm.weight.uniform_(0.5, 1.5)
     plain = copy.deepcopy(reference).bfloat16()
     fused = FusedIncrementalTransformer(copy.deepcopy(reference).bfloat16())
     starts = torch.tensor([0, 23, 150], device="cuda")
