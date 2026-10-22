@@ -223,7 +223,13 @@ def run_pass(args, server: subprocess.Popen, load: int, kind: str, warmup: bool)
             pass
         rc = bench.wait(timeout=BENCH_TIMEOUT_S)
         for spy in spies:
-            spy.wait(timeout=120)
+            try:
+                spy.wait(timeout=args.pyspy_seconds + 60)
+            except subprocess.TimeoutExpired:
+                # note (ratish): py-spy can hang on a process without writing anything; the pass keeps its bench numbers
+                spy.kill()
+                with open(out / "pyspy_hung.txt", "a", encoding="utf-8") as hung:
+                    hung.write(f"{shlex.join(spy.args)}\n")
     window_end = time.time()
     cpu_end = thread_cpu(server.pid)
     # note (ratish): Python threads keep the OS name python3, so a nonblocking dump maps each tid to its thread name
