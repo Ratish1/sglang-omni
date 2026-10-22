@@ -185,8 +185,15 @@ def card_env(card: int, tree_path: Path) -> dict[str, str]:
     return {**os.environ, "CUDA_VISIBLE_DEVICES": str(card), "PYTHONPATH": str(tree_path)}
 
 
-def serve(card: int, tree_path: Path, model: str, port: int, args: list[str], log_path: Path) -> subprocess.Popen:
-    env = {**card_env(card, tree_path), "SGLANG_OMNI_STRICT_PORT": "1", "SGLANG_OMNI_STARTUP_TIMEOUT": "1800"}
+def serve(
+    card: int, tree_path: Path, model: str, port: int, args: list[str], log_path: Path, *,
+    env: dict[str, str] | None = None,
+) -> subprocess.Popen:
+    env = {
+        **(card_env(card, tree_path) if env is None else env),
+        "SGLANG_OMNI_STRICT_PORT": "1",
+        "SGLANG_OMNI_STARTUP_TIMEOUT": "1800",
+    }
     handle = open(log_path, "w")
     process = subprocess.Popen(
         pinned(card, [sys.executable, "-u", "-m", "sglang_omni.cli", "serve", "--model-path", model, *args,
