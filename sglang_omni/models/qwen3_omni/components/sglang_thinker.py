@@ -16,7 +16,6 @@ from typing import Iterable, Optional, Tuple
 
 import torch
 import torch.nn as nn
-from sglang.srt.layers.aux_hidden_states import AuxHiddenStateList
 from sglang.srt.layers.logits_processor import LogitsProcessor, LogitsProcessorOutput
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe_triton_config import (
@@ -96,62 +95,6 @@ class PaddedRowsTopK(nn.Module):
         return self.topk.empty_topk_output(device, layer_id=layer_id)
 
 
-class Qwen3OmniThinkerTextModel(Qwen3MoeLLMModel):
-    """The thinker's language model, whose FULL extend also captures the hidden state HF hands
-    the talker: the residual entering the talker's accept layer."""
-
-    def __init__(
-        self,
-        *,
-        config: PretrainedConfig,
-        accept_hidden_layer: int | None,
-        quant_config: QuantizationConfig | None = None,
-        prefix: str = "",
-    ) -> None:
-        if accept_hidden_layer is not None and not (
-            0 <= accept_hidden_layer <= config.num_hidden_layers
-        ):
-            raise ValueError(
-                f"Talker accept_hidden_layer {accept_hidden_layer} is outside "
-                f"[0, {config.num_hidden_layers}]"
-            )
-        else:
-            pass
-        super().__init__(config=config, quant_config=quant_config, prefix=prefix)
-        # Note (wenyao): the final layer uses normalized output; auxiliary states hold layer inputs.
-        self.accept_layers = (
-            [accept_hidden_layer]
-            if accept_hidden_layer is not None
-            and accept_hidden_layer < config.num_hidden_layers
-            else []
-        )
-
-    def forward(
-        self,
-        input_ids: torch.Tensor,
-        positions: torch.Tensor,
-        forward_batch: ForwardBatch,
-        input_embeds: torch.Tensor | None = None,
-        pp_proxy_tensors: PPProxyTensors | None = None,
-        input_deepstack_embeds: torch.Tensor | None = None,
-    ) -> torch.Tensor | tuple[torch.Tensor, AuxHiddenStateList] | PPProxyTensors:
-        # note (ratish): graphs capture at the server's NULL mode, so a FULL extend runs eager
-        # and every forward selects its own capture.
-        is_full_extend = (
-            forward_batch.forward_mode.is_extend()
-            and forward_batch.capture_hidden_mode.is_full()
-        )
-        self.layers_to_capture = self.accept_layers if is_full_extend else []
-        return super().forward(
-            input_ids=input_ids,
-            positions=positions,
-            forward_batch=forward_batch,
-            input_embeds=input_embeds,
-            pp_proxy_tensors=pp_proxy_tensors,
-            input_deepstack_embeds=input_deepstack_embeds,
-        )
-
-
 class Qwen3OmniThinkerForCausalLM(nn.Module):
     """Qwen3-Omni thinker text model without duplicated audio/vision towers."""
 
@@ -167,12 +110,8 @@ class Qwen3OmniThinkerForCausalLM(nn.Module):
         self.config = getattr(self.thinker_config, "text_config", self.thinker_config)
         self.is_mrope_enabled = config_uses_mrope(self.config)
 
-        talker_config = getattr(config, "talker_config", None)
-        self.model = Qwen3OmniThinkerTextModel(
+        self.model = Qwen3MoeLLMModel(
             config=self.config,
-            accept_hidden_layer=(
-                talker_config.accept_hidden_layer if talker_config is not None else None
-            ),
             quant_config=quant_config,
             prefix=add_prefix("model", prefix),
         )
@@ -210,6 +149,24 @@ class Qwen3OmniThinkerForCausalLM(nn.Module):
     def thinker(self) -> "Qwen3OmniThinkerForCausalLM":
         # Existing Qwen thinker runner/hook code expects model.thinker.model.
         return self
+
+    def set_talker_layers_to_capture(self) -> None:
+        """Capture, in every forward and every graph, the hidden state HF hands the talker: the
+        residual entering its accept layer. Called before graph capture."""
+        accept_hidden_layer = self.root_config.talker_config.accept_hidden_layer
+        if not 0 <= accept_hidden_layer <= self.config.num_hidden_layers:
+            raise ValueError(
+                f"Talker accept_hidden_layer {accept_hidden_layer} is outside "
+                f"[0, {self.config.num_hidden_layers}]"
+            )
+        else:
+            pass
+        # Note (wenyao): the final layer uses normalized output; auxiliary states hold layer inputs.
+        self.model.layers_to_capture = (
+            [accept_hidden_layer]
+            if accept_hidden_layer < self.config.num_hidden_layers
+            else []
+        )
 
     def forward(
         self,

@@ -21,7 +21,7 @@ from sglang.srt.layers.moe.topk import StandardTopKOutput
 from sglang.srt.layers.moe.utils import MoeRunnerBackend
 from sglang.srt.layers.quantization.fp8 import Fp8Config
 from sglang.srt.layers.quantization.unquant import UnquantizedFusedMoEMethod
-from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardMode
+from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.model_executor.runner.prefill_cuda_graph_runner import (
     PrefillCudaGraphRunner,
 )
@@ -35,7 +35,6 @@ from sglang_omni.models.qwen3_omni.components.sglang_thinker import (
     DecodeLiveRows,
     PaddedRowsTopK,
     Qwen3OmniThinkerForCausalLM,
-    Qwen3OmniThinkerTextModel,
     config_uses_mrope,
 )
 from sglang_omni.models.qwen3_omni.hf_config import (
@@ -74,9 +73,9 @@ def test_real_qwen_config_drives_prefill_positions(
     expected_mrope: bool,
 ):
     class LightweightTextModel(torch.nn.Module):
-        def __init__(self, *, config, accept_hidden_layer, quant_config, prefix):
+        def __init__(self, *, config, quant_config, prefix):
             super().__init__()
-            del accept_hidden_layer, quant_config, prefix
+            del quant_config, prefix
             self.embed_tokens = torch.nn.Embedding(
                 config.vocab_size,
                 config.hidden_size,
@@ -90,7 +89,7 @@ def test_real_qwen_config_drives_prefill_positions(
 
     monkeypatch.setattr(
         sglang_thinker_module,
-        "Qwen3OmniThinkerTextModel",
+        "Qwen3MoeLLMModel",
         LightweightTextModel,
     )
     monkeypatch.setattr(
@@ -293,46 +292,26 @@ def run_forward(
 
 
 @pytest.mark.parametrize(
-    ("forward_mode", "capture_hidden_mode", "accept_hidden_layer", "expected_layers"),
-    [
-        (ForwardMode.EXTEND, CaptureHiddenMode.FULL, 2, [2]),
-        (ForwardMode.EXTEND, CaptureHiddenMode.NULL, 2, []),
-        (ForwardMode.DECODE, CaptureHiddenMode.FULL, 2, []),
-        (ForwardMode.EXTEND, CaptureHiddenMode.FULL, 4, []),
-    ],
+    ("accept_hidden_layer", "expected_layers"),
+    [(2, [2]), (4, []), (5, None)],
 )
-def test_the_thinker_captures_the_talkers_layer_only_on_a_full_extend(
-    monkeypatch: pytest.MonkeyPatch,
-    forward_mode: ForwardMode,
-    capture_hidden_mode: CaptureHiddenMode,
-    accept_hidden_layer: int,
-    expected_layers: list[int],
+def test_the_thinker_captures_the_talkers_accept_layer_in_every_forward(
+    accept_hidden_layer: int, expected_layers: list[int] | None
 ) -> None:
-    seen: list[list[int]] = []
-    monkeypatch.setattr(
-        sglang_thinker_module.Qwen3MoeLLMModel,
-        "__init__",
-        lambda self, *, config, quant_config, prefix: torch.nn.Module.__init__(self),
+    wrapper = object.__new__(Qwen3OmniThinkerForCausalLM)
+    torch.nn.Module.__init__(wrapper)
+    wrapper.root_config = SimpleNamespace(
+        talker_config=SimpleNamespace(accept_hidden_layer=accept_hidden_layer)
     )
-    monkeypatch.setattr(
-        sglang_thinker_module.Qwen3MoeLLMModel,
-        "forward",
-        lambda self, **kwargs: seen.append(list(self.layers_to_capture)),
-    )
-    model = Qwen3OmniThinkerTextModel(
-        config=SimpleNamespace(num_hidden_layers=4),
-        accept_hidden_layer=accept_hidden_layer,
-    )
+    wrapper.config = SimpleNamespace(num_hidden_layers=4)
+    wrapper.model = SimpleNamespace(layers_to_capture=[])
 
-    model.forward(
-        torch.tensor([1]),
-        torch.tensor([0]),
-        SimpleNamespace(
-            forward_mode=forward_mode, capture_hidden_mode=capture_hidden_mode
-        ),
-    )
-
-    assert seen == [expected_layers]
+    if expected_layers is None:
+        with pytest.raises(ValueError, match="accept_hidden_layer"):
+            wrapper.set_talker_layers_to_capture()
+    else:
+        wrapper.set_talker_layers_to_capture()
+        assert wrapper.model.layers_to_capture == expected_layers
 
 
 @pytest.mark.parametrize(
@@ -386,7 +365,7 @@ def test_thinker_routes_every_unquantized_moe_layer_through_the_shared_decode_ma
     dense_mlp = torch.nn.Identity()
 
     class LayeredTextModel(torch.nn.Module):
-        def __init__(self, *, config, accept_hidden_layer, quant_config, prefix):
+        def __init__(self, *, config, quant_config, prefix):
             super().__init__()
             self.embed_tokens = torch.nn.Embedding(
                 config.vocab_size, config.hidden_size
@@ -395,9 +374,7 @@ def test_thinker_routes_every_unquantized_moe_layer_through_the_shared_decode_ma
                 [make_layer(moe_block), make_layer(dense_mlp)]
             )
 
-    monkeypatch.setattr(
-        sglang_thinker_module, "Qwen3OmniThinkerTextModel", LayeredTextModel
-    )
+    monkeypatch.setattr(sglang_thinker_module, "Qwen3MoeLLMModel", LayeredTextModel)
     monkeypatch.setattr(
         sglang_thinker_module, "LogitsProcessor", lambda config: torch.nn.Identity()
     )
