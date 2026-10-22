@@ -8,7 +8,8 @@ and audio in, text and audio out, greedy, 256 tokens, c16. Chains on different p
 arms, one Qwen3-ASR server on the score card transcribes each arm's audio and scores it against the arm's text as the
 CI does. The client and the scoring run in each tree's own
 code (this file in its --client and --score modes). --model serves another checkpoint in the same shape, and
---concurrency sends at another concurrency. Writes <out>/<arm>/videoamme.json, <out>/<arm>/wer.json and
+--concurrency sends at another concurrency. --passes N runs N client passes per boot, each written to
+<out>/<arm>/p<index>/ and scored on its own. Writes <out>/<arm>/videoamme.json, <out>/<arm>/wer.json and
 <out>/summary.json.
 """
 
@@ -189,9 +190,11 @@ def run_arm(
     is_code2wav_dump: bool,
     model: str,
     concurrency: int,
-) -> int:
+    passes: int,
+) -> list[tuple[str, int]]:
     arm_out = out / arm
     arm_out.mkdir(parents=True, exist_ok=True)
+    pass_names = [arm] if passes == 1 else [f"{arm}/p{index}" for index in range(passes)]
     arm_tree = pair_check.tree(pair_check.ARMS[arm][0])
     port = PORT + 200 * cards[0]
     log(out, f"{arm} cards {cards} serving")
@@ -203,34 +206,40 @@ def run_arm(
         arm_out / "code2wav_dump" if is_code2wav_dump else None,
         model,
     )
+    codes = []
     try:
-        log(out, f"{arm} healthy, client")
-        rc = subprocess.run(
-            [
-                sys.executable,
-                str(Path(__file__).resolve()),
-                "--client",
-                "--port",
-                str(port),
-                "--out",
-                str(arm_out),
-                "--concurrency",
-                str(concurrency),
-                *([] if seed is None else ["--seed", str(seed)]),
-            ],
-            cwd=arm_tree,
-            env={**os.environ, "PYTHONPATH": str(arm_tree)},
-            stdout=open(arm_out / "client.log", "w"),
-            stderr=subprocess.STDOUT,
-        ).returncode
+        for pass_name in pass_names:
+            pass_out = out / pass_name
+            pass_out.mkdir(parents=True, exist_ok=True)
+            log(out, f"{pass_name} client")
+            rc = subprocess.run(
+                [
+                    sys.executable,
+                    str(Path(__file__).resolve()),
+                    "--client",
+                    "--port",
+                    str(port),
+                    "--out",
+                    str(pass_out),
+                    "--concurrency",
+                    str(concurrency),
+                    *([] if seed is None else ["--seed", str(seed)]),
+                ],
+                cwd=arm_tree,
+                env={**os.environ, "PYTHONPATH": str(arm_tree)},
+                stdout=open(pass_out / "client.log", "w"),
+                stderr=subprocess.STDOUT,
+            ).returncode
+            codes.append((pass_name, rc))
     finally:
         stop(server, cards)
     server_log = (arm_out / "server.log").read_text(errors="replace")
     log(
         out,
-        f"{arm} client rc {rc}, tp ranks {'tp_rank=0/2' in server_log and 'tp_rank=1/2' in server_log}",
+        f"{arm} client rcs {[rc for _, rc in codes]}, tp ranks "
+        f"{'tp_rank=0/2' in server_log and 'tp_rank=1/2' in server_log}",
     )
-    return rc
+    return codes
 
 
 def main() -> None:
@@ -254,6 +263,9 @@ def main() -> None:
     parser.add_argument("--model", default=MODEL, help="checkpoint every arm serves")
     parser.add_argument("--concurrency", type=int, default=CONCURRENCY)
     parser.add_argument("--sample-ids", help="client mode: send only these comma-separated samples")
+    parser.add_argument(
+        "--passes", type=int, default=1, help="client passes per server boot, each in <arm>/p<index>"
+    )
     args = parser.parse_args()
     if args.client:
         client(
@@ -276,9 +288,11 @@ def main() -> None:
         first_card, second_card = (int(card) for card in pair.split("+"))
         chains.append((chain_arms.split(","), (first_card, second_card)))
 
-    def run_chain(chain_arms: list[str], cards: tuple[int, int]) -> list[int]:
+    def run_chain(chain_arms: list[str], cards: tuple[int, int]) -> list[tuple[str, int]]:
         return [
-            run_arm(
+            pass_code
+            for arm in chain_arms
+            for pass_code in run_arm(
                 args.out,
                 arm,
                 cards,
@@ -286,14 +300,13 @@ def main() -> None:
                 args.code2wav_dump,
                 args.model,
                 args.concurrency,
+                args.passes,
             )
-            for arm in chain_arms
         ]
 
     with ThreadPoolExecutor(max_workers=len(chains)) as pool:
         chain_codes = list(pool.map(lambda chain: run_chain(*chain), chains))
-    arms = [arm for chain_arms, _ in chains for arm in chain_arms]
-    codes = [code for codes_of_chain in chain_codes for code in codes_of_chain]
+    pass_codes = [pass_code for codes_of_chain in chain_codes for pass_code in codes_of_chain]
     asr_tree = pair_check.tree(pair_check.ASR_TREE)
     asr_port = pair_check.ASR_PORT + 1000 + 200 * args.score_card
     asr = pair_check.serve(
@@ -301,11 +314,12 @@ def main() -> None:
     )
     summary = {}
     try:
-        for arm, code in zip(arms, codes):
+        for pass_name, code in pass_codes:
             if code != 0:
                 continue
             else:
                 pass
+            pass_out = args.out / pass_name
             rc = subprocess.run(
                 [
                     sys.executable,
@@ -314,27 +328,29 @@ def main() -> None:
                     "--port",
                     str(asr_port),
                     "--out",
-                    str(args.out / arm),
+                    str(pass_out),
                 ],
                 cwd=asr_tree,
                 env=pair_check.card_env(args.score_card, asr_tree),
-                stdout=open(args.out / arm / "score.log", "w"),
+                stdout=open(pass_out / "score.log", "w"),
                 stderr=subprocess.STDOUT,
             ).returncode
-            log(args.out, f"{arm} score rc {rc}")
-            videoamme = json.loads((args.out / arm / "videoamme.json").read_text())
+            log(args.out, f"{pass_name} score rc {rc}")
+            videoamme = json.loads((pass_out / "videoamme.json").read_text())
             wer = (
-                json.loads((args.out / arm / "wer.json").read_text())["summary"]
+                json.loads((pass_out / "wer.json").read_text())["summary"]
                 if rc == 0
                 else None
             )
-            summary[arm] = dict(
+            summary[pass_name] = dict(
                 summary=videoamme["summary"], speed=videoamme["speed"], wer=wer
             )
             log(
                 args.out,
-                f"{arm} accuracy {videoamme['summary'].get('accuracy')} failed "
-                f"{videoamme['summary'].get('failed')} rtf {videoamme['speed'].get('rtf_mean')} wer {wer}",
+                f"{pass_name} accuracy {videoamme['summary'].get('accuracy')} failed "
+                f"{videoamme['summary'].get('failed')} rtf {videoamme['speed'].get('rtf_mean')} wer below 50 "
+                f"{None if wer is None else wer['wer_below_50_corpus']} above 50 "
+                f"{None if wer is None else wer['n_above_50_pct_wer']}",
             )
     finally:
         pair_check.stop(args.score_card, asr)
