@@ -4,8 +4,9 @@ usage: python3 report.py /data/runtime-perf/b1_tts [--cells c16_events,c64_pyspy
 
 Per cell:
   bench    the benchmark's own summary (throughput, latency, first audio, RTF), whatever the model's benchmark wrote
-  threads  CPU seconds per server thread over the benchmark window, as a share of the window (busy share of one core),
-           grouped by process; threads under 1 % are folded
+  threads  CPU seconds per server thread over the cell, as a share of the active load window (the event span, else
+           the benchmark's wall clock) in units of one core, grouped by process and named from the cell's py-spy
+           dumps; threads under 1 % are folded
   events   request event recorder: per request, the gap between consecutive request-level events (chunk events
            excluded), median and p90 over requests; per chunk, sent to received latency per edge and transport
   pyspy    per sampled thread, the share of samples that are not idle, and the top functions of the busy samples
@@ -14,6 +15,7 @@ Per cell:
 import argparse
 import collections
 import json
+import re
 import statistics
 from pathlib import Path
 
@@ -70,16 +72,55 @@ def bench_summary(cell: Path) -> None:
             pass
 
 
+def thread_names(cell: Path) -> dict[str, str]:
+    """tid to Python thread name from the cell's py-spy dumps (Python threads keep the OS name python3)."""
+    names = {}
+    for path in cell.glob("dump_*.txt"):
+        for line in path.open(errors="replace"):
+            match = re.match(r'Thread (\d+) \((?:active|idle)[^)]*\): "(.*)"', line.strip())
+            if match:
+                names[match.group(1)] = match.group(2)
+            else:
+                pass
+    return names
+
+
+def active_seconds(cell: Path, window: dict) -> tuple[float, str]:
+    """The load window: event span when events exist, else the benchmark's wall clock, else the cell window."""
+    stamps = []
+    for path in (cell / "events").glob("*.jsonl") if (cell / "events").exists() else ():
+        for line in path.open():
+            stamps.append(json.loads(line)["timestamp_ns"])
+    if stamps:
+        return (max(stamps) - min(stamps)) / 1e9, "event span"
+    else:
+        pass
+    for path in (cell / "bench").rglob("*.json"):
+        try:
+            data = json.loads(path.read_text())
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            continue
+        flat = {}
+        flatten("", data.get("results", data), flat)
+        for key, value in flat.items():
+            if key.endswith("wall_clock_s") or key.endswith("total_duration_s") or key.endswith("duration_s"):
+                return float(value), f"bench {key}"
+            else:
+                pass
+    return window["end"] - window["start"], "cell window"
+
+
 def thread_shares(cell: Path) -> None:
     cpu = json.loads((cell / "thread_cpu.json").read_text())
     window = json.loads((cell / "window.json").read_text())
-    span = window["end"] - window["start"]
+    span, source = active_seconds(cell, window)
+    names = thread_names(cell)
     by_process = collections.defaultdict(list)
     for key, end in cpu["end"].items():
         start = cpu["start"].get(key, {"cpu_s": 0.0})["cpu_s"]
-        pid = key.split("/")[0]
-        by_process[pid].append((end["cpu_s"] - start, end["name"]))
-    print(f"  threads, window {span:.1f} s (share of one core)")
+        pid, tid = key.split("/")
+        by_process[pid].append((end["cpu_s"] - start, names.get(tid, end["name"])))
+    print(f"  threads, active {span:.2f} s ({source}), share of one core")
     for pid, rows in sorted(by_process.items(), key=lambda item: -sum(r[0] for r in item[1])):
         total = sum(r[0] for r in rows)
         if total / span < 0.01:

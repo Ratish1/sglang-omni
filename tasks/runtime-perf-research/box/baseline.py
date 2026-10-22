@@ -201,6 +201,11 @@ def run_pass(args, server: subprocess.Popen, load: int, kind: str, warmup: bool)
             spy.wait(timeout=120)
     window_end = time.time()
     cpu_end = thread_cpu(server.pid)
+    # note (ratish): Python threads keep the OS name python3, so a nonblocking dump maps each tid to its thread name
+    for pid in group_pids(server.pid):
+        with open(out / f"dump_{pid}.txt", "w", encoding="utf-8") as dump:
+            subprocess.run(["py-spy", "dump", "--pid", str(pid), "--nonblocking"], stdout=dump,
+                           stderr=subprocess.STDOUT, timeout=60, check=False)
     if kind == "events":
         (out / "events_stop.json").write_text(post(args.port, "/stop_request_profile", {"run_id": f"c{load}"}),
                                               encoding="utf-8")
