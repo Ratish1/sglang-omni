@@ -31,7 +31,12 @@ chain=$(git -C /workspace/sglang-omni rev-parse FETCH_HEAD)
 tree t_m1b 1b726ab64
 tree t_chain $chain
 log "queue final start t_marks $(git -C /workspace/t_marks rev-parse --short HEAD) loadavg $(cut -d' ' -f1-3 /proc/loadavg)"
-(cd /workspace/t_chain && CUDA_VISIBLE_DEVICES=0 PYTHONPATH=/workspace/t_chain:/workspace/CosyVoice:/workspace/CosyVoice/third_party/Matcha-TTS \
+# note (ratish): Inductor's cache keys a custom op by name, not schema, so code compiled while L7a gave
+# fun_cosyvoice3_packed_fa3 a ninth argument came back after its revert (10-22); the units and the chain's
+# server compile into fresh caches.
+rm -rf $F/inductor_units $D/inductor_t_chain
+(cd /workspace/t_chain && CUDA_VISIBLE_DEVICES=0 TORCHINDUCTOR_CACHE_DIR=$F/inductor_units \
+  PYTHONPATH=/workspace/t_chain:/workspace/CosyVoice:/workspace/CosyVoice/third_party/Matcha-TTS \
   timeout 3600 python3 -m pytest tests/unit_test/fun_cosyvoice3 tests/unit_test/test_platforms.py -q -p no:cacheprovider -rfEs \
   > $F/units.log 2>&1)
 units_rc=$?
