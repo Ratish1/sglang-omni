@@ -26,6 +26,7 @@ MODEL = "Qwen/Qwen3-TTS-12Hz-1.7B-Base"
 REFERENCE_FRAMES = 1100
 BATCHES = (1, 8)
 WINDOW_WIDTHS = (1, 2, 4, 8, 16, 32, 64)
+SAMPLES_PER_FRAME = 1920
 
 
 def timed(run, device) -> tuple[float, float]:
@@ -108,29 +109,51 @@ def main() -> None:
             ).to(device)
             slots = [arena.acquire() for _ in range(batch)]
 
-            def windows() -> None:
+            def windows() -> torch.Tensor:
                 for slot in slots:
                     arena.zero_slot(slot)
                 offset = 0
                 for width in split:
-                    assert window.decode_slots(codes[..., offset : offset + width], slots) is not None
+                    waveform = window.decode_slots(codes[..., offset : offset + width], slots)
+                    assert waveform is not None
                     offset += width
+                return waveform[..., -SAMPLES_PER_FRAME:]
 
             device_ms, host_ms = timed(windows, device)
             print(f"batch {batch} windows {split}: device {device_ms:.2f} ms, host {host_ms:.2f} ms")
             if tail is not None:
                 start = total - tail_width
 
-                def capped_tail() -> None:
+                def capped_tail() -> torch.Tensor:
                     for slot in slots:
                         arena.zero_slot(slot)
                         arena.start_slot(slot, start)
-                    assert (
-                        tail.decode_slots(codes[..., start:], slots, valid_frames=[tail_width] * batch) is not None
-                    )
+                    waveform = tail.decode_slots(codes[..., start:], slots, valid_frames=[tail_width] * batch)
+                    assert waveform is not None
+                    return waveform[..., -SAMPLES_PER_FRAME:]
 
                 device_ms, host_ms = timed(capped_tail, device)
                 print(f"batch {batch} capped tail {tail_width}: device {device_ms:.2f} ms, host {host_ms:.2f} ms")
+                index = torch.tensor(slots, device=device)
+                outputs = {}
+                for name, run in (("whole", windows), ("capped", capped_tail)):
+                    emitted = run().clone()
+                    gathered = arena.gather(slots)
+                    outputs[name] = [
+                        emitted,
+                        *(value.clone() for value in gathered.transformer_keys.values()),
+                        *(value.clone() for value in gathered.transformer_values.values()),
+                        *(pool.index_select(0, index) for pool in gathered.conv_histories.values()),
+                    ]
+                errors = [
+                    ((capped.float() - whole.float()).norm() / whole.float().norm().clamp_min(1e-30)).item()
+                    for whole, capped in zip(outputs["whole"], outputs["capped"])
+                ]
+                print(
+                    f"batch {batch} capped against whole: emitted samples relative error {errors[0]:.3e}; "
+                    f"retained state max {max(errors[1:]):.3e}, median {statistics.median(errors[1:]):.3e} "
+                    f"over {len(errors) - 1} tensors"
+                )
             else:
                 pass
             for slot in slots:
