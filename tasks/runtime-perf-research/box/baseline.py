@@ -59,7 +59,7 @@ MODELS = {
 
 
 def bench_command(model: str, port: int, load: int, out: Path, warmup: bool, repeats: int = 1,
-                  bench: str = "seedtts", meta: str = "", asr_dataset: str = "meanwhile") -> list[str]:
+                  bench: str = "seedtts", meta: str = "", asr_dataset: str = "meanwhile", stream: bool = True) -> list[str]:
     """The benchmark command. bench seedtts runs each model's SeedTTS EN benchmark (meta overrides the corpus with
     a meta.lst, as the long-form targets of make_longform_meta.py); videomme runs the Video-MME CI sample with audio
     output at the CI's video settings (Omni); asr_longform runs the meanwhile long-form set (ASR)."""
@@ -89,8 +89,8 @@ def bench_command(model: str, port: int, load: int, out: Path, warmup: bool, rep
     elif model == "tts":
         return [
             sys.executable, "-m", "benchmarks.eval.benchmark_tts_seedtts", "--model", spec["path"],
-            "--use-existing-server", "--host", "127.0.0.1", "--port", str(port), "--generate-only", "--stream",
-            "--lang", "en", "--warmup", "1" if warmup else "0", "--max-concurrency", str(load),
+            "--use-existing-server", "--host", "127.0.0.1", "--port", str(port), "--generate-only",
+            *(["--stream"] if stream else []), "--lang", "en", "--warmup", "1" if warmup else "0", "--max-concurrency", str(load),
             "--output-dir", str(out), "--disable-tqdm", *meta_args,
         ]
     elif model == "asr":
@@ -103,7 +103,7 @@ def bench_command(model: str, port: int, load: int, out: Path, warmup: bool, rep
     else:
         return [
             sys.executable, "-m", "benchmarks.eval.benchmark_omni_seedtts", "--host", "127.0.0.1", "--port", str(port),
-            "--generate-only", "--stream", "--voice-clone", "--lang", "en", "--warmup", "1" if warmup else "0",
+            "--generate-only", *(["--stream"] if stream else []), "--voice-clone", "--lang", "en", "--warmup", "1" if warmup else "0",
             "--max-concurrency", str(load), "--output-dir", str(out), "--disable-tqdm", *meta_args,
         ]
 
@@ -224,16 +224,19 @@ def run_pass(args, server: subprocess.Popen, load: int, kind: str, warmup: bool)
     extra = shlex.split(args.bench_extra)
     if kind == "clean" and args.bench_repeats > 1 and args.model == "asr":
         command = bench_command(args.model, args.port, load, out / "bench", warmup, repeats=args.bench_repeats,
-                                bench=args.bench, meta=args.meta, asr_dataset=args.asr_dataset) + extra
+                                bench=args.bench, meta=args.meta, asr_dataset=args.asr_dataset,
+                                stream=not args.no_stream) + extra
     elif kind == "clean" and args.bench_repeats > 1:
         commands = [bench_command(args.model, args.port, load, out / "bench" / f"rep{index}", warmup and index == 0,
-                                  bench=args.bench, meta=args.meta, asr_dataset=args.asr_dataset) + extra
+                                  bench=args.bench, meta=args.meta, asr_dataset=args.asr_dataset,
+                                  stream=not args.no_stream) + extra
                     for index in range(args.bench_repeats)]
         command = ["bash", "-c", " && ".join(shlex.join(c) for c in commands)]
     else:
         repeats = args.asr_pyspy_repeats if kind in ("pyspy", "pyspygil") and args.model == "asr" else 1
         command = bench_command(args.model, args.port, load, out / "bench", warmup, repeats=repeats,
-                                bench=args.bench, meta=args.meta, asr_dataset=args.asr_dataset) + extra
+                                bench=args.bench, meta=args.meta, asr_dataset=args.asr_dataset,
+                                stream=not args.no_stream) + extra
     (out / "bench_command.txt").write_text(shlex.join(command) + "\n", encoding="utf-8")
     cpu_start = thread_cpu(server.pid)
     window_start = time.time()
@@ -308,6 +311,8 @@ def main() -> None:
     parser.add_argument("--asr-dataset", default="meanwhile", help="dataset of an asr_longform bench")
     parser.add_argument("--bench-repeats", type=int, default=1,
                         help="benchmark runs inside each clean pass for TTS and Omni (bench/rep<i>)")
+    parser.add_argument("--no-stream", action="store_true",
+                        help="Qwen3-TTS and Qwen3-Omni benches without --stream (Qwen3-ASR streams via --bench-extra)")
     parser.add_argument("--asr-pyspy-repeats", type=int, default=1,
                         help="measured repeats inside the ASR benchmark on py-spy passes, so the load outlasts the window")
     args = parser.parse_args()
