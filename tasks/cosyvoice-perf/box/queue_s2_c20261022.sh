@@ -10,16 +10,23 @@ IN=/workspace/t_marks/tasks/cosyvoice-perf/box
 MODEL=FunAudioLLM/Fun-CosyVoice3-0.5B-2512
 log() { echo "$* $(date +%T)" >> $D/queue_s2.txt; }
 cpus() { [ "$1" = 0 ] && echo 0-15,64-79 || echo 16-31,80-95; }
+# note (ratish): a scored cell keeps its result files, so a restarted queue skips it; each round's two ASR servers
+# take fresh ports, since a port the previous round's server just left can still read as in use (10-21, 10-22).
 score() {
   local dir=$1 card=$2 port=$3
-  (cd /workspace/t_m && CUDA_VISIBLE_DEVICES=$card taskset -c $(cpus $card) python3 -u -m benchmarks.eval.benchmark_tts_seedtts \
-    --transcribe-only --skip-gpu-cleanup --model $MODEL --host 127.0.0.1 --port $port --lang en --output-dir $dir \
-    > $dir/score_wer.log 2>&1)
-  log "wer $dir rc $? $(grep 'WER mean' $dir/score_wer.log | tr -s ' ')"
-  (cd /workspace/t_m && CUDA_VISIBLE_DEVICES=$card taskset -c $(cpus $card) python3 -u -m benchmarks.eval.benchmark_tts_seedtts \
-    --similarity-only --model $MODEL --lang en --output-dir $dir > $dir/score_sim.log 2>&1)
-  log "sim $dir rc $? $(grep 'speaker similarity' $dir/score_sim.log | cut -c1-40)"
+  if [ ! -s $dir/wer_results.json ]; then
+    (cd /workspace/t_m && CUDA_VISIBLE_DEVICES=$card taskset -c $(cpus $card) python3 -u -m benchmarks.eval.benchmark_tts_seedtts \
+      --transcribe-only --skip-gpu-cleanup --model $MODEL --host 127.0.0.1 --port $port --lang en --output-dir $dir \
+      > $dir/score_wer.log 2>&1)
+    log "wer $dir rc $? $(grep 'WER mean' $dir/score_wer.log | tr -s ' ')"
+  fi
+  if [ ! -s $dir/similarity_results.json ]; then
+    (cd /workspace/t_m && CUDA_VISIBLE_DEVICES=$card taskset -c $(cpus $card) python3 -u -m benchmarks.eval.benchmark_tts_seedtts \
+      --similarity-only --model $MODEL --lang en --output-dir $dir > $dir/score_sim.log 2>&1)
+    log "sim $dir rc $? $(grep 'speaker similarity' $dir/score_sim.log | cut -c1-40)"
+  fi
 }
+round=0
 log "queue s2 start t_marks $(git -C /workspace/t_marks rev-parse --short HEAD) scorer t_m $(git -C /workspace/t_m rev-parse --short HEAD)"
 python3 $IN/pair_audit_c20261022.py $D /workspace/sglang-omni 07:33:00-08:43:00 09:22:00-11:33:19 11:33:20-11:51:26 \
   > $D/pair_audit.txt 2>&1
@@ -28,8 +35,9 @@ for spec in p_m1:c1f,c16,c64 p_m2:c1f,c16,c64 p_m3:c16,c64,b16; do
   name=${spec%%:*}
   for cell in $(echo ${spec#*:} | tr , ' '); do
     for order in a b; do
-      score $D/$name/$order/gpu0/$cell 0 51000 &
-      score $D/$name/$order/gpu1/$cell 1 53000 &
+      round=$((round + 1))
+      score $D/$name/$order/gpu0/$cell 0 $((51000 + 400 * round)) &
+      score $D/$name/$order/gpu1/$cell 1 $((51200 + 400 * round)) &
       wait
     done
   done
