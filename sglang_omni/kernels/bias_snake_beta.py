@@ -15,7 +15,6 @@ from triton.language.extra import libdevice
 
 VECTOR_BYTES = 16
 VECTORS_PER_PROGRAM = 256
-TRITON_DTYPES = {torch.bfloat16: tl.bfloat16, torch.float16: tl.float16}
 
 
 class SnakeBetaParameters(Protocol):
@@ -56,14 +55,14 @@ def bias_snake_beta_channels_last_kernel(
     inverse_beta_ptr,
     row_vectors,
     channel_vectors,
-    DTYPE: tl.constexpr,
     HAS_RESIDUAL: tl.constexpr,
     WRITE_SUM: tl.constexpr,
     VECTORS_PER_PROGRAM: tl.constexpr,
     VECTOR_ELEMENTS: tl.constexpr,
 ):
-    # note (ratish): every intermediate rounds to DTYPE where eager rounds it, the sums in the
-    # eager order, (conv + bias) then + residual.
+    # note (ratish): every intermediate rounds to the output dtype where eager rounds it, the sums
+    # in the eager order, (conv + bias) then + residual.
+    out_dtype = out_ptr.dtype.element_ty
     batch = tl.program_id(1).to(tl.int64)
     vector = tl.program_id(0) * VECTORS_PER_PROGRAM + tl.arange(0, VECTORS_PER_PROGRAM)
     element = tl.arange(0, VECTOR_ELEMENTS)
@@ -79,23 +78,23 @@ def bias_snake_beta_channels_last_kernel(
     conv_values = tl.load(
         conv_ptr + batch * conv_batch_stride + offsets, mask=mask, other=0
     ).to(tl.float32)
-    total = (conv_values + bias).to(DTYPE).to(tl.float32)
+    total = (conv_values + bias).to(out_dtype).to(tl.float32)
     if HAS_RESIDUAL:
         residual = tl.load(residual_ptr + contiguous_base + offsets, mask=mask, other=0)
-        total = (total + residual.to(tl.float32)).to(DTYPE).to(tl.float32)
+        total = (total + residual.to(tl.float32)).to(out_dtype).to(tl.float32)
     else:
         pass
     if WRITE_SUM:
-        tl.store(sum_ptr + contiguous_base + offsets, total.to(DTYPE), mask=mask)
+        tl.store(sum_ptr + contiguous_base + offsets, total.to(out_dtype), mask=mask)
     else:
         pass
-    phase = (total * alpha_scale).to(DTYPE).to(tl.float32)
-    sine = libdevice.sin(phase).to(DTYPE).to(tl.float32)
-    sine_squared = (sine * sine).to(DTYPE).to(tl.float32)
-    scaled = (inverse_beta * sine_squared).to(DTYPE).to(tl.float32)
+    phase = (total * alpha_scale).to(out_dtype).to(tl.float32)
+    sine = libdevice.sin(phase).to(out_dtype).to(tl.float32)
+    sine_squared = (sine * sine).to(out_dtype).to(tl.float32)
+    scaled = (inverse_beta * sine_squared).to(out_dtype).to(tl.float32)
     tl.store(
         out_ptr + batch * out_batch_stride + offsets,
-        (total + scaled).to(DTYPE),
+        (total + scaled).to(out_dtype),
         mask=mask,
     )
 
@@ -142,7 +141,6 @@ def fused_bias_snake_beta(
         coefficients.inverse_beta,
         row_vectors,
         channels // vector_elements,
-        DTYPE=TRITON_DTYPES[out.dtype],
         HAS_RESIDUAL=residual is not None,
         WRITE_SUM=sum_out is not None,
         VECTORS_PER_PROGRAM=VECTORS_PER_PROGRAM,
