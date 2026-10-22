@@ -13,6 +13,8 @@ clock of the request event recorder, so records join its events per request.
               collected objects, thread
   kind "stall" once per stall of an event loop (its sampler silent for more than 200 ms): every thread's innermost
               14 frames, taken by a watchdog thread while the stall lasts
+  kind "heap" once per process, when its first new request reaches a stage inbox: tracked objects, the 25 most
+              common types and owning packages, and the duration of one full collection over that heap
 """
 
 import atexit
@@ -31,6 +33,9 @@ PREFIX = os.environ.get("OMNI_HOP_PROBE", "")
 # as the stage scheduler thread does (pipeline/stage/runtime.py:278), to check that unbound workers cause the context
 # a stage process placed off device 0 opens on device 0
 BIND_THREAD_DEVICE = os.environ.get("OMNI_BIND_THREAD_DEVICE") == "1"
+# what-if, not a probe: OMNI_FREEZE_STARTUP_GC=1 moves each process's heap into the permanent generation when its
+# first new request arrives, as the launcher does for the API process at startup (serve/launcher.py:173-176)
+FREEZE_STARTUP_GC = os.environ.get("OMNI_FREEZE_STARTUP_GC") == "1"
 LAG_PERIOD_S = 0.005
 LAG_REPORT_S = 0.002
 STALL_S = 0.2
@@ -39,6 +44,7 @@ records = []
 records_lock = threading.Lock()
 gc_started = {}
 sampled_loops = set()
+heap_taken = []
 
 
 def record(item):
@@ -97,6 +103,34 @@ def on_gc(phase, info):
         pass
 
 
+def take_heap():
+    """Census of the tracked heap and one timed full collection over it, then the freeze of the what-if."""
+    objects = gc.get_objects()
+    by_type, by_package = {}, {}
+    for obj in objects:
+        kind = type(obj)
+        name = f"{kind.__module__}.{kind.__qualname__}"
+        by_type[name] = by_type.get(name, 0) + 1
+        try:
+            owner = getattr(obj, "__module__", None) if callable(obj) else kind.__module__
+        except Exception:
+            owner = None
+        package = (owner if isinstance(owner, str) else "?").split(".")[0]
+        by_package[package] = by_package.get(package, 0) + 1
+    tracked = len(objects)
+    del objects
+    started = time.perf_counter_ns()
+    gc.collect()
+    collect_ns = time.perf_counter_ns() - started
+    if FREEZE_STARTUP_GC:
+        gc.freeze()
+    else:
+        pass
+    record({"k": "heap", "tracked": tracked, "full_collect_ns": collect_ns, "frozen": gc.get_freeze_count(),
+            "top_types": sorted(by_type.items(), key=lambda kv: -kv[1])[:25],
+            "top_packages": sorted(by_package.items(), key=lambda kv: -kv[1])[:25]})
+
+
 def instrument_queue(q, label):
     if getattr(q, "hop_probe_label", None):
         return
@@ -107,6 +141,11 @@ def instrument_queue(q, label):
 
     def put_recorded(item, *args, **kwargs):
         record_queue(time.time_ns(), label, "put", item)
+        if not heap_taken and label.endswith(".in") and getattr(item, "type", None) == "new_request":
+            heap_taken.append(label)
+            take_heap()
+        else:
+            pass
         return put(item, *args, **kwargs)
 
     def get_recorded(*args, **kwargs):
@@ -302,5 +341,9 @@ else:
 if BIND_THREAD_DEVICE:
     bind_thread_device()
     print("hop_probe what-if: new threads bind their creator's CUDA device", file=sys.stderr, flush=True)
+else:
+    pass
+if FREEZE_STARTUP_GC:
+    print("hop_probe what-if: the heap is frozen at the first new request", file=sys.stderr, flush=True)
 else:
     pass

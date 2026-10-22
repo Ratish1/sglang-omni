@@ -156,6 +156,14 @@ def main() -> None:
     args = parser.parse_args()
     run = Path(args.run)
     queue_records, other = load(run)
+    for item in other:
+        if item.get("k") == "heap":
+            print(f"heap pid {item['pid']}: {item['tracked']} tracked objects, full collection "
+                  f"{item['full_collect_ns'] / 1e6:.1f} ms, frozen after {item['frozen']}")
+            print(f"  types {item['top_types'][:12]}")
+            print(f"  packages {item['top_packages'][:12]}")
+        else:
+            pass
     wanted = set(args.cells.split(",")) if args.cells else None
     for cell in sorted(path for path in run.iterdir() if (path / "window.json").exists()):
         if wanted and cell.name not in wanted:
