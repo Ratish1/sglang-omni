@@ -337,6 +337,8 @@ def main() -> None:
     try:
         wait_healthy(args.port, server)
         (out / "startup.txt").write_text(f"{time.monotonic() - spawned:.1f}\n", encoding="utf-8")
+        with open(out / "progress.txt", "a", encoding="utf-8") as progress:
+            progress.write(f"{time.strftime('%H:%M:%S')} healthy after {time.monotonic() - spawned:.1f}s\n")
         (out / "processes.txt").write_text(process_table(server.pid), encoding="utf-8")
         (out / "gpu_healthy.txt").write_text(gpu_snapshot(), encoding="utf-8")
         first = True
