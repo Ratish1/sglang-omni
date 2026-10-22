@@ -97,6 +97,7 @@ def main() -> None:
     parser.add_argument("--client", action="store_true")
     parser.add_argument("--score", action="store_true")
     parser.add_argument("--port", type=int)
+    parser.add_argument("--score-card", type=int, default=0, help="the card the ASR server runs on")
     args = parser.parse_args()
     if args.client:
         client(args.port, args.out)
@@ -111,8 +112,10 @@ def main() -> None:
     with ThreadPoolExecutor(max_workers=len(placements)) as pool:
         codes = list(pool.map(lambda placement: run_arm(args.out, *placement), placements))
     asr_tree = pair_check.tree(pair_check.ASR_TREE)
-    asr_port = pair_check.ASR_PORT
-    asr = pair_check.serve(0, asr_tree, pair_check.ASR_MODEL, asr_port, [], args.out / "asr_server.log")
+    asr_port = PORT + 1000 + 200 * args.score_card
+    asr = pair_check.serve(
+        args.score_card, asr_tree, pair_check.ASR_MODEL, asr_port, [], args.out / "asr_server.log"
+    )
     summary = {}
     try:
         for (arm, _), code in zip(placements, codes):
@@ -123,7 +126,8 @@ def main() -> None:
             rc = subprocess.run(
                 [sys.executable, str(Path(__file__).resolve()), "--score", "--port", str(asr_port), "--out",
                  str(args.out / arm)],
-                cwd=asr_tree, env=pair_check.card_env(0, asr_tree), stdout=open(args.out / arm / "score.log", "w"),
+                cwd=asr_tree, env=pair_check.card_env(args.score_card, asr_tree),
+                stdout=open(args.out / arm / "score.log", "w"),
                 stderr=subprocess.STDOUT).returncode
             log(args.out, f"{arm} score rc {rc}")
             mmsu = json.loads((args.out / arm / "mmsu.json").read_text())
@@ -131,7 +135,7 @@ def main() -> None:
             summary[arm] = dict(accuracy=mmsu["accuracy"], speed=mmsu["speed"], wer=wer)
             log(args.out, f"{arm} accuracy {mmsu['accuracy'].get('overall_accuracy')} wer {wer}")
     finally:
-        pair_check.stop(0, asr)
+        pair_check.stop(args.score_card, asr)
     (args.out / "summary.json").write_text(json.dumps(summary, indent=1))
     log(args.out, "done")
 
