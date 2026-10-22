@@ -701,6 +701,31 @@ def make_arena(
     return incremental, arena
 
 
+def state_rows(
+    state: Qwen3TTSIncrementalCodecState,
+) -> tuple[
+    dict[int, torch.Tensor],
+    dict[int, torch.Tensor],
+    dict[str, torch.Tensor],
+    dict[str, torch.Tensor],
+]:
+    slots = state.conv_slots(
+        int(state.frame_positions.shape[0]), state.frame_positions.device
+    )
+    return (
+        state.transformer_keys,
+        state.transformer_values,
+        {
+            key: pool.index_select(0, slots)
+            for key, pool in state.conv_histories.items()
+        },
+        {
+            key: pool.index_select(0, slots)
+            for key, pool in state.transconv_overlaps.items()
+        },
+    )
+
+
 def test_state_spec_covers_every_key_the_decode_creates() -> None:
     """The arena preallocates from the spec, so it must match what decode uses."""
     torch.manual_seed(12)
@@ -927,7 +952,7 @@ def test_incremental_codec_cuda_graph_matches_eager_state(
             torch.randint(0, 16, (1, 2, warmup_frames), device=device), warm_state
         )
         arena.scatter([slot], warm_state)
-    eager_state = arena.gather(slots)
+    eager_state = arena.gather(slots).clone()
     runner = Qwen3TTSIncrementalCodecCudaGraphRunner(
         incremental,
         device=device,
@@ -966,11 +991,8 @@ def test_incremental_codec_cuda_graph_matches_eager_state(
         torch.testing.assert_close(
             graph_state.frame_positions, eager_state.frame_positions
         )
-        for graph_mapping, eager_mapping in (
-            (graph_state.transformer_keys, eager_state.transformer_keys),
-            (graph_state.transformer_values, eager_state.transformer_values),
-            (graph_state.conv_histories, eager_state.conv_histories),
-            (graph_state.transconv_overlaps, eager_state.transconv_overlaps),
+        for graph_mapping, eager_mapping in zip(
+            state_rows(graph_state), state_rows(eager_state)
         ):
             assert graph_mapping.keys() == eager_mapping.keys()
             for key in graph_mapping:
@@ -1011,7 +1033,7 @@ def test_incremental_codec_cuda_graph_alternates_shared_pool_keys(
     assert len(runner.graphs) == 2
     slots = {1: [arena.acquire()], 4: [arena.acquire() for _ in range(4)]}
     eager_states = {
-        batch_size: arena.gather(rows) for batch_size, rows in slots.items()
+        batch_size: arena.gather(rows).clone() for batch_size, rows in slots.items()
     }
     for step, batch_size in enumerate((1, 4, 1, 4)):
         codes = (
@@ -1031,17 +1053,8 @@ def test_incremental_codec_cuda_graph_alternates_shared_pool_keys(
         torch.testing.assert_close(
             graph_state.frame_positions, eager_states[batch_size].frame_positions
         )
-        for graph_mapping, eager_mapping in (
-            (graph_state.transformer_keys, eager_states[batch_size].transformer_keys),
-            (
-                graph_state.transformer_values,
-                eager_states[batch_size].transformer_values,
-            ),
-            (graph_state.conv_histories, eager_states[batch_size].conv_histories),
-            (
-                graph_state.transconv_overlaps,
-                eager_states[batch_size].transconv_overlaps,
-            ),
+        for graph_mapping, eager_mapping in zip(
+            state_rows(graph_state), state_rows(eager_states[batch_size])
         ):
             for key in graph_mapping:
                 torch.testing.assert_close(
@@ -1088,7 +1101,7 @@ def test_incremental_codec_cuda_graph_runners_alternate_in_one_pool() -> None:
     cold.capture()
     assert window.enabled and cold.enabled
     slots = [arena.acquire() for _ in range(4)]
-    eager_state = arena.gather(slots)
+    eager_state = arena.gather(slots).clone()
     for step, (runner, frames) in enumerate(
         ((window, 2), (cold, 1), (window, 2), (cold, 1))
     ):
@@ -1104,11 +1117,8 @@ def test_incremental_codec_cuda_graph_runners_alternate_in_one_pool() -> None:
         torch.cuda.synchronize(device)
         torch.testing.assert_close(waveform, expected, rtol=2e-4, atol=2e-5)
     graph_state = arena.gather(slots)
-    for graph_mapping, eager_mapping in (
-        (graph_state.transformer_keys, eager_state.transformer_keys),
-        (graph_state.transformer_values, eager_state.transformer_values),
-        (graph_state.conv_histories, eager_state.conv_histories),
-        (graph_state.transconv_overlaps, eager_state.transconv_overlaps),
+    for graph_mapping, eager_mapping in zip(
+        state_rows(graph_state), state_rows(eager_state)
     ):
         for key in graph_mapping:
             torch.testing.assert_close(
@@ -1416,7 +1426,7 @@ def test_windowed_replays_match_one_eager_decode_and_its_arena_state(
     split = runner.split_frames(width)
     assert split == (8, 8, 4, 1)
     codes = torch.randint(0, 16, (2, 2, width), device=device)
-    eager_state = arena.gather(slots)
+    eager_state = arena.gather(slots).clone()
     eager_waveform = incremental.decode(codes, eager_state)
 
     scheduler = Qwen3TTSStreamingVocoderScheduler.__new__(
@@ -1461,11 +1471,8 @@ def test_windowed_replays_match_one_eager_decode_and_its_arena_state(
     graph_state = arena.gather(slots)
     assert graph_state.frame_positions.tolist() == [width, 3 + width]
     torch.testing.assert_close(graph_state.frame_positions, eager_state.frame_positions)
-    for graph_mapping, eager_mapping in (
-        (graph_state.transformer_keys, eager_state.transformer_keys),
-        (graph_state.transformer_values, eager_state.transformer_values),
-        (graph_state.conv_histories, eager_state.conv_histories),
-        (graph_state.transconv_overlaps, eager_state.transconv_overlaps),
+    for graph_mapping, eager_mapping in zip(
+        state_rows(graph_state), state_rows(eager_state)
     ):
         assert graph_mapping.keys() == eager_mapping.keys()
         for key in graph_mapping:
@@ -1521,12 +1528,7 @@ def test_tail_graph_replays_match_eager_tail_decodes_and_reuse_their_buffers(
         graph_state = arena.gather(slots)
         eager_state = arena.gather(reference_slots)
         assert graph_state.frame_positions.tolist() == widths
-        for actual, expected in (
-            (graph_state.conv_histories, eager_state.conv_histories),
-            (graph_state.transconv_overlaps, eager_state.transconv_overlaps),
-            (graph_state.transformer_keys, eager_state.transformer_keys),
-            (graph_state.transformer_values, eager_state.transformer_values),
-        ):
+        for actual, expected in zip(state_rows(graph_state), state_rows(eager_state)):
             for key, value in expected.items():
                 torch.testing.assert_close(actual[key], value, rtol=2e-4, atol=2e-5)
 

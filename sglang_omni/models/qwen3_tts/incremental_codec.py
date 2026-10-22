@@ -95,6 +95,16 @@ class Qwen3TTSIncrementalCodecState:
     # A cohort assembled from a state arena sets this so streams at different
     # playback positions can execute in one launch.
     frame_positions: torch.Tensor | None = None
+    # note (ratish): each row's slot when the conv histories and overlaps are an arena's
+    # pools, which the conv stack exchanges in place; None when they are the rows' own.
+    slot_index: torch.Tensor | None = None
+
+    def conv_slots(self, batch_size: int, device: torch.device) -> torch.Tensor:
+        """Each row's slot in the conv histories and overlaps."""
+        if self.slot_index is None:
+            return torch.arange(batch_size, device=device)
+        else:
+            return self.slot_index
 
     def row_frame_positions(
         self, batch_size: int, device: torch.device
@@ -129,6 +139,7 @@ class Qwen3TTSIncrementalCodecState:
             frame_positions=(
                 None if self.frame_positions is None else self.frame_positions.clone()
             ),
+            slot_index=None if self.slot_index is None else self.slot_index.clone(),
             transformer_keys={
                 key: value.clone() for key, value in self.transformer_keys.items()
             },
@@ -1235,7 +1246,7 @@ class Qwen3TTSIncrementalDecoder:
         module = self.decoder.pre_conv
         history_pool = state.conv_histories["pre_conv"]
         batch_size, _, length = quantized.shape
-        slot_index = torch.arange(batch_size, device=quantized.device)
+        slot_index = state.conv_slots(batch_size, quantized.device)
         frames = quantized.transpose(1, 2)
         padded, padded_frames = padded_input(module, frames)
         padded_frames.copy_(frames)
@@ -1315,9 +1326,7 @@ class Qwen3TTSIncrementalDecoder:
         coefficients = self.snake_coefficients
         histories = state.conv_histories
         overlaps = state.transconv_overlaps
-        slot_index = torch.arange(
-            int(hidden_states.shape[0]), device=hidden_states.device
-        )
+        slot_index = state.conv_slots(int(hidden_states.shape[0]), hidden_states.device)
         last_stage_index = len(decoder.upsample) - 1
         for stage_index, blocks in enumerate(decoder.upsample):
             transconv, convnext = blocks[0], blocks[1]
