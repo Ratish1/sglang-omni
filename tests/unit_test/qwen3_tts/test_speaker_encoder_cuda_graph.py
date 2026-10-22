@@ -283,6 +283,27 @@ def test_runner_replays_captured_buckets_and_encodes_the_rest() -> None:
         assert torch.equal(embeddings[5], runner.embed(clips[5]))
 
 
+@pytest.mark.accelerator
+def test_replays_read_no_tensor_the_capture_let_go() -> None:
+    device = require_device_streams()
+    encoder = small_speaker_encoder(torch.float32).to(device)
+    with torch.device(device):
+        runner = Qwen3TTSSpeakerEncoderCudaGraphRunner(encoder, sample_rate=SAMPLE_RATE)
+    runner.capture((2, 4), 8 * SPEAKER_MEL_HOP)
+    clip = clip_of(20, 6)
+    with torch.inference_mode():
+        expected = runner.embed(clip)
+        fillers = [
+            torch.full((size,), float("nan"), device=device)
+            for size in (runner.mel_window.numel(), runner.mel_basis.numel())
+            for _ in range(64)
+        ]
+        actual = runner.embed(clip)
+
+    assert torch.equal(actual, expected)
+    assert all(torch.isnan(filler).all() for filler in fillers)
+
+
 def raise_out_of_memory() -> None:
     raise torch.OutOfMemoryError("device out of memory")
 

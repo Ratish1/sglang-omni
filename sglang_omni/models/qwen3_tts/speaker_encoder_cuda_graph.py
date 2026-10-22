@@ -151,6 +151,9 @@ class CapturedSpeakerEncoderGraph:
     static_sample_count: torch.Tensor
     static_frames: torch.Tensor
     static_embedding: torch.Tensor
+    # note (ratish): the graph reads these two by address, so it holds them.
+    mel_window: torch.Tensor
+    mel_basis: torch.Tensor
 
 
 class Qwen3TTSSpeakerEncoderCudaGraphRunner:
@@ -264,6 +267,8 @@ class Qwen3TTSSpeakerEncoderCudaGraphRunner:
                         static_sample_count=static_sample_count,
                         static_frames=static_frames,
                         static_embedding=static_embedding,
+                        mel_window=window,
+                        mel_basis=mel_basis,
                     )
         except Exception as exc:
             self.disable_reason = f"capture_failed: {type(exc).__name__}: {exc}"
