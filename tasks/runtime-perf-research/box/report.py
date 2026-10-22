@@ -53,6 +53,10 @@ def bench_summary(cell: Path) -> None:
             data = json.loads(path.read_text())
         except (json.JSONDecodeError, UnicodeDecodeError):
             continue
+        if not isinstance(data, dict):
+            continue
+        else:
+            pass
         flat = {}
         for section in ("results", "summary", "speed", "metrics"):
             if section in data:
@@ -100,10 +104,19 @@ def active_seconds(cell: Path, window: dict) -> tuple[float, str]:
             data = json.loads(path.read_text())
         except (json.JSONDecodeError, UnicodeDecodeError):
             continue
+        if not isinstance(data, dict):
+            continue
+        else:
+            pass
+        summary = data.get("summary")
+        if isinstance(summary, dict) and summary.get("throughput_qps") and summary.get("completed_requests"):
+            return summary["completed_requests"] / summary["throughput_qps"], "bench completed / qps"
+        else:
+            pass
         flat = {}
         flatten("", data.get("results", data), flat)
         for key, value in flat.items():
-            if key.endswith("wall_clock_s") or key.endswith("total_duration_s") or key.endswith("duration_s"):
+            if key.endswith("wall_clock_s"):
                 return float(value), f"bench {key}"
             else:
                 pass
