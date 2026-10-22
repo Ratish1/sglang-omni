@@ -49,6 +49,7 @@ from sglang_omni.client.types import GenerateChunk
 from sglang_omni.config import PipelineConfig
 from sglang_omni.http import admin_auth
 from sglang_omni.models.model_capabilities import get_model_capabilities
+from sglang_omni.pipeline.coordinator import Coordinator
 from sglang_omni.pipeline.mp_runner import MultiProcessPipelineRunner
 from sglang_omni.preprocessing.resource_connector import export_media_policy
 from sglang_omni.profiler.event_recorder import get_recorder as _get_event_recorder
@@ -145,7 +146,7 @@ class PipelineUvicornServer(uvicorn.Server):
     The pipeline launcher owns child-process cleanup, so it restores the
     original handlers but deliberately consumes the already-handled signal.
 
-    The startup GC freeze is process-wide and lasts until serve exits.
+    The post-warmup GC freeze is process-wide and lasts until serve exits.
     """
 
     def __init__(self, config: uvicorn.Config) -> None:
@@ -162,18 +163,14 @@ class PipelineUvicornServer(uvicorn.Server):
             else:
                 pass
 
-    async def startup(self, sockets: list[socket.socket] | None = None) -> None:
-        await super().startup(sockets=sockets)
-        if self.started:
-            # note (yxs): New request cycles retain normal GC outside the startup graph.
-            gc.collect()
-            gc.freeze()
-            self.has_frozen_api_gc = True
-            logger.info(
-                f"Frozen API startup object graph ({gc.get_freeze_count()} objects)"
-            )
-        else:
-            pass
+    def freeze_api_gc(self) -> None:
+        # note (yxs): New request cycles retain normal GC outside the startup graph.
+        gc.collect()
+        gc.freeze()
+        self.has_frozen_api_gc = True
+        logger.info(
+            f"Frozen API startup object graph ({gc.get_freeze_count()} objects)"
+        )
 
     @contextmanager
     def capture_signals(self) -> Generator[None, None, None]:
@@ -514,9 +511,20 @@ def mount_profiler_routes(
     app.include_router(router)
 
 
+async def freeze_serving_gc(
+    server: PipelineUvicornServer, coordinator: Coordinator
+) -> None:
+    """Freeze the heap of every stage process, then of the API process."""
+    # note (ratish): warmup builds long-lived state lazily, so the freeze follows
+    # it; frozen objects drop out of every later full collection.
+    await coordinator.freeze_gc()
+    server.freeze_api_gc()
+
+
 async def warm_up_server(
-    server: uvicorn.Server,
+    server: PipelineUvicornServer,
     app: FastAPI,
+    coordinator: Coordinator,
     *,
     base_url: str,
     requests: list[
@@ -533,6 +541,7 @@ async def warm_up_server(
     while not server.started:
         await asyncio.sleep(SERVER_START_POLL_S)
     if not requests:
+        await freeze_serving_gc(server, coordinator)
         app.state.server_status = ServerStatus.UP
         return
     else:
@@ -586,6 +595,7 @@ async def warm_up_server(
         logger.error(f"Server warmup failed, stopping the server: {exc!r}")
         server.should_exit = True
         raise
+    await freeze_serving_gc(server, coordinator)
     app.state.server_status = ServerStatus.UP
     logger.info(
         f"Server warmup of {len(requests)} request(s) finished in "
@@ -745,6 +755,7 @@ async def run_server(
                 warm_up_server(
                     server,
                     app,
+                    coordinator,
                     base_url=base_url,
                     requests=warmup_requests,
                     timeout_s=float(

@@ -37,7 +37,7 @@ from sglang_omni.proto import (
     SubmitMessage,
     is_update_action,
 )
-from sglang_omni.proto.admin import AdminResponse
+from sglang_omni.proto.admin import ADMIN_FREEZE_GC, AdminResponse
 from sglang_omni.proto.session import DEFAULT_MAX_OUTPUT_LEAD_MS, SessionGraph
 
 logger = logging.getLogger(__name__)
@@ -363,6 +363,9 @@ class Coordinator(SessionGraphRunner):
             stages=stages,
             timeout_s=timeout_s,
         )
+
+    async def freeze_gc(self) -> AdminResponse:
+        return await self.admin(ADMIN_FREEZE_GC)
 
     async def pause_generation(
         self,

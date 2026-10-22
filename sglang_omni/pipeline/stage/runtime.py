@@ -10,6 +10,7 @@ Dispatches all compute to scheduler (OmniScheduler or SimpleScheduler).
 from __future__ import annotations
 
 import asyncio
+import gc
 import inspect
 import logging
 import os
@@ -59,6 +60,7 @@ from sglang_omni.proto import (
     StreamMessage,
     SubmitMessage,
 )
+from sglang_omni.proto.admin import ADMIN_FREEZE_GC
 from sglang_omni.proto.request import RoutedPayloads
 from sglang_omni.proto.session import SessionOperation, find_session_operation
 from sglang_omni.relay.base import Relay
@@ -1275,6 +1277,24 @@ class Stage:
 
     async def run_admin_operation(self, operation: AdminOperation) -> AdminResult:
         try:
+            if operation.action == ADMIN_FREEZE_GC:
+                # note (ratish): the heap belongs to the process, not the scheduler;
+                # after warmup it holds the long-lived serving state.
+                gc.collect()
+                gc.freeze()
+                frozen_object_count = gc.get_freeze_count()
+                logger.info(
+                    f"Frozen stage {self.name} process object graph "
+                    f"({frozen_object_count} objects)"
+                )
+                return self.admin_result(
+                    operation,
+                    success=True,
+                    message="ok",
+                    data={"frozen_object_count": frozen_object_count},
+                )
+            else:
+                pass
             handler = getattr(self.scheduler, "admin", None)
             if handler is None:
                 return self.admin_result(

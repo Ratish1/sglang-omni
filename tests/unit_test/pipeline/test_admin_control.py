@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import asyncio
+import gc
 import queue
 import threading
 import time
+import weakref
 from types import SimpleNamespace
 
 import pytest
@@ -20,6 +22,7 @@ from sglang_omni.proto import (
     AdminResultMessage,
     parse_message,
 )
+from sglang_omni.proto.admin import ADMIN_FREEZE_GC
 from tests.unit_test.fixtures.pipeline_fakes import (
     FakeRelay,
     FakeScheduler,
@@ -566,6 +569,50 @@ def test_stage_admin_dispatches_to_scheduler() -> None:
         assert result_msg.result.data["action"] == "pause_generation"
 
     asyncio.run(run())
+
+
+def test_stage_freeze_gc_keeps_the_process_heap_out_of_later_collections() -> None:
+    """Every full collection in a serving stage process rescanned the objects it built before serving."""
+
+    class Cycle:
+        def __init__(self) -> None:
+            self.self_reference = self
+
+    warm = Cycle()
+    warm_reference = weakref.ref(warm)
+    scheduler = AdminScheduler()
+    control_plane = RecordingStageControlPlane()
+    stage = Stage(
+        name="decode",
+        role="single",
+        get_next=lambda request_id, output: None,
+        gpu_id=None,
+        endpoints={},
+        control_plane=control_plane,
+        relay=FakeRelay(),
+        scheduler=scheduler,
+    )
+
+    try:
+        asyncio.run(
+            stage.on_admin(
+                AdminMessage(AdminOperation(op_id="op-1", action=ADMIN_FREEZE_GC))
+            )
+        )
+        del warm
+        serving = Cycle()
+        serving_reference = weakref.ref(serving)
+        del serving
+        gc.collect()
+
+        result = control_plane.completions[0].result
+        assert result.success is True
+        assert result.data["frozen_object_count"] == gc.get_freeze_count() > 0
+        assert scheduler.calls == []
+        assert warm_reference() is not None
+        assert serving_reference() is None
+    finally:
+        gc.unfreeze()
 
 
 def test_omni_scheduler_model_info_adds_the_model_runner_entries(
