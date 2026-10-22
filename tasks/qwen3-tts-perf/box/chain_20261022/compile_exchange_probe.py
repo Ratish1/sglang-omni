@@ -35,7 +35,7 @@ def step(
     coefficients: SnakeBetaCoefficients,
 ) -> torch.Tensor:
     padded = frames.new_empty(ROWS, HISTORY + LENGTH, CHANNELS)
-    torch.add(frames, 1.0, out=padded[:, HISTORY:])
+    padded[:, HISTORY:] = frames + 1.0
     history_exchange(padded, history_pool, slot_index, new_samples=LENGTH, is_cold=False)
     conv_output = F.conv1d(padded.transpose(1, 2), weight, None, dilation=3).transpose(1, 2)
     activated = conv_output.new_empty(ROWS, LENGTH, CHANNELS)
