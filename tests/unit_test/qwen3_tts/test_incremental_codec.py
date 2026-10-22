@@ -904,6 +904,51 @@ def test_tail_decode_matches_each_row_decoded_whole() -> None:
         )
 
 
+def test_first_decode_from_its_reach_matches_the_whole_reference() -> None:
+    torch.manual_seed(44)
+    decoder = Decoder().double()
+    decoder.quantizer.decode = lambda codes: codes[:, :2].double() / 16.0
+    incremental = Qwen3TTSIncrementalDecoder(decoder)
+    emit_frames = 1
+    reach = incremental.first_chunk_reference_frames(emit_frames)
+    reference_frames = reach + 9
+    codes = torch.randint(0, 16, (1, 2, reference_frames + emit_frames))
+
+    def first_decode(
+        start: int,
+    ) -> tuple[torch.Tensor, Qwen3TTSIncrementalCodecState]:
+        state = incremental.init_state(
+            1, device=torch.device("cpu"), dtype=torch.float64
+        )
+        state.frame_positions.fill_(start)
+        width = int(codes.shape[2]) - start
+        waveform = incremental.decode_tail(
+            codes[..., start:], torch.tensor([width]), state, emit_frames
+        )
+        return waveform, state
+
+    def agrees(
+        first: tuple[torch.Tensor, Qwen3TTSIncrementalCodecState],
+        second: tuple[torch.Tensor, Qwen3TTSIncrementalCodecState],
+    ) -> bool:
+        pairs = [(first[0], second[0])]
+        for mapping, other in zip(state_rows(first[1]), state_rows(second[1])):
+            pairs.extend((mapping[key], other[key]) for key in mapping)
+        return all(
+            torch.allclose(value, other, rtol=0, atol=1e-12) for value, other in pairs
+        )
+
+    whole = first_decode(0)
+
+    assert agrees(first_decode(reference_frames - reach), whole)
+    assert not agrees(
+        first_decode(
+            reference_frames - incremental.tail_frames(emit_frames) + emit_frames
+        ),
+        whole,
+    )
+
+
 @pytest.fixture(params=("cuda", "npu"))
 def codec_graph_device(request: pytest.FixtureRequest) -> torch.device:
     if request.param == "npu":
