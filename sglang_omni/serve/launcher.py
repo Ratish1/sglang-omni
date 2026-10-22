@@ -165,7 +165,6 @@ class PipelineUvicornServer(uvicorn.Server):
 
     def freeze_api_gc(self) -> None:
         # note (yxs): New request cycles retain normal GC outside the startup graph.
-        gc.collect()
         gc.freeze()
         self.has_frozen_api_gc = True
         logger.info(
@@ -516,7 +515,7 @@ async def freeze_serving_gc(
 ) -> None:
     """Freeze the heap of every stage process, then of the API process."""
     # note (ratish): warmup builds long-lived state lazily, so the freeze follows
-    # it; frozen objects drop out of every later full collection.
+    # it; a freeze moves the heap in constant time, so it can follow the up status.
     await coordinator.freeze_gc()
     server.freeze_api_gc()
 
@@ -535,14 +534,15 @@ async def warm_up_server(
     """Mark the server up once its warmup requests have crossed every stage.
 
     A fresh process builds kernels on its first request; this keeps that cost
-    off user requests. A failed warmup stops the server and raises; a shutdown
-    that starts first drops the request in flight and leaves the server down.
+    off user requests. Every process then freezes the heap warmup built. A failed
+    warmup stops the server and raises; a shutdown that starts first drops the
+    request in flight and leaves the server down.
     """
     while not server.started:
         await asyncio.sleep(SERVER_START_POLL_S)
     if not requests:
-        await freeze_serving_gc(server, coordinator)
         app.state.server_status = ServerStatus.UP
+        await freeze_serving_gc(server, coordinator)
         return
     else:
         pass
@@ -595,8 +595,8 @@ async def warm_up_server(
         logger.error(f"Server warmup failed, stopping the server: {exc!r}")
         server.should_exit = True
         raise
-    await freeze_serving_gc(server, coordinator)
     app.state.server_status = ServerStatus.UP
+    await freeze_serving_gc(server, coordinator)
     logger.info(
         f"Server warmup of {len(requests)} request(s) finished in "
         f"{time.perf_counter() - start:.1f} s; the server is ready"

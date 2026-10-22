@@ -1,16 +1,95 @@
 # SPDX-License-Identifier: Apache-2.0
-"""API post-warmup GC freeze and request-cycle collection contracts."""
+"""Post-warmup GC freeze contracts of the API and stage processes."""
 
 import asyncio
+import gc
+import queue
 import socket
 import subprocess
 import sys
+import weakref
 from textwrap import dedent
 from typing import Literal
 
 import pytest
 
 import sglang_omni.serve.launcher as launcher
+from sglang_omni.pipeline.control_plane import deserialize_message, serialize_message
+from sglang_omni.pipeline.coordinator import Coordinator
+from sglang_omni.pipeline.tp_control import TPLeaderFanout
+from sglang_omni.proto import FreezeGCMessage, ShutdownMessage
+from tests.unit_test.fixtures.pipeline_fakes import (
+    RecordingCoordinatorControlPlane,
+    RecordingStageControlPlane,
+)
+from tests.unit_test.pipeline.helpers import make_stage
+
+
+class Cycle:
+    def __init__(self) -> None:
+        self.self_reference = self
+
+
+@pytest.mark.parametrize("role", ["single", "leader"])
+def test_stage_freezes_its_process_heap_on_the_freeze_message(role: str) -> None:
+    """Every full collection in a warmed-up stage process rescanned the heap it built before serving."""
+    warm = Cycle()
+    warm_reference = weakref.ref(warm)
+    follower_queue: queue.Queue = queue.Queue()
+    control_plane = RecordingStageControlPlane()
+    stage = make_stage(
+        role=role,
+        control_plane=control_plane,
+        tp_fanout=(
+            TPLeaderFanout(
+                "stage", follower_work_queues=[follower_queue], follower_abort_queues=[]
+            )
+            if role == "leader"
+            else None
+        ),
+    )
+
+    async def run_until_shutdown() -> None:
+        run_task = asyncio.create_task(stage.run())
+        control_plane.inbox.put_nowait(
+            deserialize_message(serialize_message(FreezeGCMessage()))
+        )
+        control_plane.inbox.put_nowait(ShutdownMessage())
+        await asyncio.wait_for(run_task, timeout=5)
+
+    try:
+        asyncio.run(run_until_shutdown())
+        del warm
+        serving = Cycle()
+        serving_reference = weakref.ref(serving)
+        del serving
+        gc.collect()
+
+        assert warm_reference() is not None
+        assert serving_reference() is None
+        assert [follower_queue.get_nowait() for _ in range(follower_queue.qsize())] == (
+            [FreezeGCMessage(), ShutdownMessage()] if role == "leader" else []
+        )
+    finally:
+        gc.unfreeze()
+
+
+def test_coordinator_sends_the_freeze_to_every_stage_instance() -> None:
+    coordinator = Coordinator(
+        "inproc://complete", "inproc://abort", entry_stage="preprocessing"
+    )
+    control_plane = RecordingCoordinatorControlPlane()
+    coordinator.control_plane = control_plane
+    stage_names = ("preprocessing@r0", "preprocessing@r1", "thinker")
+    for stage_name in stage_names:
+        coordinator.register_stage(stage_name, f"inproc://{stage_name}")
+
+    asyncio.run(coordinator.freeze_gc())
+
+    assert control_plane.submitted == [
+        (stage_name, f"inproc://{stage_name}", FreezeGCMessage())
+        for stage_name in stage_names
+    ]
 
 
 @pytest.mark.asyncio
@@ -51,9 +130,7 @@ async def test_api_gc_is_unfrozen_on_exit_only_when_frozen(
         exception = RuntimeError if serve_outcome == "error" else asyncio.CancelledError
         with pytest.raises(exception):
             await server.serve()
-    assert events == (
-        ["serve", "collect", "freeze", "unfreeze"] if warmed else ["serve"]
-    )
+    assert events == (["serve", "freeze", "unfreeze"] if warmed else ["serve"])
     assert server.has_frozen_api_gc is False
 
 

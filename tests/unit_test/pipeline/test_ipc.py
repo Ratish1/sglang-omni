@@ -658,10 +658,10 @@ def make_started_server() -> SimpleNamespace:
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("request_count", [0, 2])
-async def test_server_freezes_every_process_heap_after_warmup_then_reports_up(
+async def test_server_reports_up_after_warmup_then_freezes_every_process_heap(
     monkeypatch: pytest.MonkeyPatch, request_count: int
 ) -> None:
-    """The server reported up with the heap its warmup built still scanned by every full collection."""
+    """A warmed-up server rescanned the heap its warmup built in every full collection."""
     app = FastAPI()
     app.state.server_status = ServerStatus.STARTING
     posted: list[ChatCompletionRequest] = []
@@ -697,8 +697,8 @@ async def test_server_freezes_every_process_heap_after_warmup_then_reports_up(
 
     assert posted == [request] * request_count
     assert events == [("warmup request", ServerStatus.STARTING)] * request_count + [
-        ("stage gc frozen", ServerStatus.STARTING),
-        ("api gc frozen", ServerStatus.STARTING),
+        ("stage gc frozen", ServerStatus.UP),
+        ("api gc frozen", ServerStatus.UP),
     ]
     assert app.state.server_status is ServerStatus.UP
     assert server.should_exit is False
