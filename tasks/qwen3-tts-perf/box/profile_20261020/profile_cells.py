@@ -29,7 +29,18 @@ MAPPING_ARGS = (
     "--vocoder.factory.followup_cuda_graph false --vocoder.factory.incremental_codec_cuda_graph false "
     "--vocoder.factory.incremental_codec_compile false"
 ).split()
-WINDOW_LEAD_S = {"W3": 10.0, "W4": 10.0, "W5": 2.0}
+WINDOW_LEAD_S = {
+    "W3": 10.0,
+    "W4": 10.0,
+    "W5": 2.0,
+    "L1_c16": 15.0,
+    "L2_c1": 5.0,
+    "L2_c16": 20.0,
+    "L2_c64": 25.0,
+    "L3_c16": 25.0,
+}
+# The long cells of profile_20261022/PLAN.md 3, their request lists written by long_cells_meta.py.
+LONG_CELL_CONCURRENCY = {"L1_c1": 1, "L1_c16": 16, "L2_c1": 1, "L2_c16": 16, "L2_c64": 64, "L3_c16": 16}
 # note (ratish): a mapping window only has to hold each call site once, and stacks make it large.
 WINDOW_S = {"formal": 2.0, "mapping": 1.0}
 HOST_STEPS = {"W2": 60, "W3": 60, "W4": 40}
@@ -154,7 +165,10 @@ def wait_for_trace(cell: str, cell_dir: Path) -> None:
 
 
 def cell_workload(cell: str, meta: Path, warm: bool) -> tuple[int, list[str]]:
-    if cell == "W1":
+    if cell in LONG_CELL_CONCURRENCY:
+        listing = meta / "long" / f"{cell}_{'warm' if warm else 'run'}.lst"
+        return LONG_CELL_CONCURRENCY[cell], ["--warmup", "0", "--meta", str(listing)]
+    elif cell == "W1":
         offset = "600" if warm else "0"
         return 1, ["--warmup", "0", "--max-samples", "20", "--sample-offset", offset]
     elif cell == "W2":
@@ -278,6 +292,11 @@ def main() -> None:
                 print(f"{label} benched {time.strftime('%H:%M:%S')}", flush=True)
         else:
             meta = write_long_text_meta(args.tree, out / "meta_w2")
+            if any(cell in LONG_CELL_CONCURRENCY for cell in args.cells):
+                run([sys.executable, str(Path(__file__).parent / "long_cells_meta.py"), str(meta / "long")],
+                    args.tree, out / "long_meta.log")
+            else:
+                pass
             for cell in args.cells:
                 if args.mode == "host":
                     capture_host_window(cell, args.tree, args.port, meta, out)
