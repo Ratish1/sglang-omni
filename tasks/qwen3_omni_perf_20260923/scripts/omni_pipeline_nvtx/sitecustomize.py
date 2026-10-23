@@ -18,7 +18,8 @@ Names (rid = request id; the first word is the kind the census groups by):
 
   thread name=N native=T                     mark, once per thread
   proc stage=S                               mark, once per stage, on its IO thread
-  q <stage>.<in|out>.<put|get> rid=R t=T     mark on every scheduler inbox and outbox hop
+  q <stage>.<in|out>.<put|get> rid=R t=T     mark on every scheduler inbox and outbox hop,
+                                             one put mark per message of a bulk put_messages
   io.<recv|chunk|send|stream|coord> rid=R A->B, io.result rid=R S, each with a .end
                                              marks at entry and exit of the stage IO
                                              coroutines (receive a payload, receive a
@@ -39,7 +40,12 @@ Names (rid = request id; the first word is the kind the census groups by):
   sched.build rid=R                          request build
   mark sched.admit rid=R, sched.prefill rid=R
   mark sched.rows n=N rids=R,R,...           every request of one engine step, inside its range
+  mark sched.gate n=N waiting=W              a talker decode step deferred while W of its N
+                                             rows lack their next input; sched.rollback undoes
+                                             the step's decode preparation
+  sb.prepare_decode, sb.filter, sb.merge     the engine batch's decode bookkeeping
   mr.*                                       model runner phases inside a forward
+  mark mr.decode_reuse hit=H n=N             whether the talker reused its decode buffers
   tk.build rid=R chunks=C done=D, tk.text_chunk
                                              talker prompt build from the thinker stream
   c2w.ingest rid=R, c2w.decode rid=R final=F, c2w.emit rid=R, c2w.step rows=N,
@@ -173,6 +179,24 @@ def instrument_queue(q, label):
     # note: the stdlib put_nowait and get_nowait call self.put and self.get, so the
     # instance wrappers see them too; wrapping them as well would mark twice
     q.put, q.get = put_marked, get_marked
+
+
+def patch_message(module):
+    """put_messages extends the queue under one lock instead of calling put, so mark
+    each message it adds as a put on the queue's label."""
+    put_messages = module.put_messages
+
+    @functools.wraps(put_messages)
+    def put_messages_marked(outbox, messages):
+        label = getattr(outbox, "pipe_nvtx_label", None)
+        if label:
+            for message in messages:
+                mark(
+                    f"q {label}.put rid={rid_of(message)} t={getattr(message, 'type', '-')}"
+                )
+        return put_messages(outbox, messages)
+
+    module.put_messages = put_messages_marked
 
 
 def call_sites():
@@ -560,6 +584,49 @@ def patch_talker_model(module):
     talker.code_predictor_forward = ranged(
         talker.code_predictor_forward, fixed("mr.predictor")
     )
+    talker.prepare_decode_buffers = ranged(
+        talker.prepare_decode_buffers, fixed("mr.decode_prep")
+    )
+    reuse = talker.reuse_decode_buffers
+
+    @functools.wraps(reuse)
+    def reuse_marked(self, requests):
+        reused = reuse(self, requests)
+        mark(f"mr.decode_reuse hit={int(reused)} n={len(requests)}")
+        return reused
+
+    talker.reuse_decode_buffers = reuse_marked
+
+
+def patch_talker_scheduler(module):
+    scheduler = module.QwenTalkerScheduler
+    note_chunk_wait = scheduler.note_chunk_wait
+
+    @functools.wraps(note_chunk_wait)
+    def note_chunk_wait_marked(self, batch):
+        runner = self.model_runner
+        waiting = sum(
+            1
+            for req in batch.reqs
+            if not runner.data_has_next_decode_input(getattr(req, "omni_data", None))
+        )
+        mark(f"sched.gate n={len(batch.reqs)} waiting={waiting}")
+        return note_chunk_wait(self, batch)
+
+    scheduler.note_chunk_wait = note_chunk_wait_marked
+    scheduler.rollback_decode_prep_after_skip = ranged(
+        scheduler.rollback_decode_prep_after_skip, fixed("sched.rollback")
+    )
+
+
+def patch_schedule_batch(module):
+    batch = module.ScheduleBatch
+    for name, label in (
+        ("prepare_for_decode", "sb.prepare_decode"),
+        ("filter_batch", "sb.filter"),
+        ("merge_batch", "sb.merge"),
+    ):
+        setattr(batch, name, ranged(getattr(batch, name), fixed(label)))
 
 
 def patch_talker_prefill(module):
@@ -627,6 +694,9 @@ PATCHES = {
     "torch.cuda.graphs": patch_graphs,
     "sglang_omni.pipeline.stage.runtime": patch_stage,
     "sglang_omni.comm.stage_io": patch_stage_io,
+    "sglang_omni.scheduling.message": patch_message,
+    "sglang.srt.managers.schedule_batch": patch_schedule_batch,
+    "sglang_omni.models.qwen3_omni.talker_scheduler": patch_talker_scheduler,
     "sglang_omni.pipeline.coordinator": patch_coordinator,
     "sglang_omni.scheduling.threaded_simple_scheduler": patch_threaded_simple,
     "sglang_omni.scheduling.simple_scheduler": patch_simple,

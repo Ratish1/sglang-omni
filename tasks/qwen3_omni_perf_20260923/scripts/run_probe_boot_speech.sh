@@ -7,6 +7,7 @@
 # talker readers (talker_step_classes.py, talker_gap_split.py, chunk_gap_origin.py) on the
 # same report. NSYS_ARGS=none serves the same cell clean (no probe, no profiler).
 # EXTRA_SERVE_ARGS is appended to the serve args (for example the talker's running cap).
+# PYSPY=1 samples the talker process with py-spy over the measured window (raw, per thread).
 # usage: run_probe_boot_speech.sh <tree> <out dir> <port> <concurrency> <arm>
 set -u
 TREE=$1 OUT=$2 PORT=$3 CONC=$4 ARM=$5
@@ -66,12 +67,28 @@ if [ $healthy = 1 ]; then
   PYTHONPATH=$TREE python3 "$S/run_bench.py" gen --arm "$ARM" --port "$PORT" \
     --concurrency "$CONC" --out "$OUT/warm" --max-samples "${WARM_SAMPLES:-32}" > "$OUT/warm_$ARM.log" 2>&1
   echo "warm rc $? $(date +%T)" >> "$OUT/progress.txt"
+  PYSPY_PID=""
+  if [ "${PYSPY:-0}" = 1 ]; then
+    TALKER_PID=$(grep -oE "StageGroup talker_ar: spawned 1 process\(es\) \(pids=\[[0-9]+\]" "$OUT/serve.log" | grep -oE "[0-9]+" | tail -1)
+    $(command -v py-spy || echo /opt/sglang/bin/py-spy) record -p "$TALKER_PID" -r 100 -f raw --threads --idle --nonblocking \
+      -d 3600 -o "$OUT/pyspy_talker.txt" > "$OUT/pyspy.log" 2>&1 &
+    PYSPY_PID=$!
+    echo "py-spy talker pid $TALKER_PID" >> "$OUT/progress.txt"
+  else
+    :
+  fi
   date +%s.%N > "$OUT/window.txt"
   PYTHONPATH=$TREE python3 "$S/run_bench.py" gen --arm "$ARM" --port "$PORT" \
     --concurrency "$CONC" --out "$OUT" --max-samples "${MAX_SAMPLES:-128}" \
     --skip-samples "${WARM_SAMPLES:-32}" > "$OUT/gen_$ARM.log" 2>&1
   echo "gen rc $? $(date +%T)" >> "$OUT/progress.txt"
   date +%s.%N >> "$OUT/window.txt"
+  if [ -n "$PYSPY_PID" ]; then
+    kill -INT "$PYSPY_PID"
+    wait "$PYSPY_PID"
+  else
+    :
+  fi
 else
   echo "server not healthy" > "$OUT/FAILED"
 fi
@@ -98,6 +115,7 @@ kill $LOADS $DMON $APPS 2>/dev/null
 nvidia-smi > "$OUT/gpus_after.txt"
 cat /proc/loadavg > "$OUT/loadavg_after.txt"
 grep -h "omni_pipeline_nvtx patch" "$OUT/serve.log" > "$OUT/probe_patch_errors.txt" 2>/dev/null
+grep -h "talker chunk gate" "$OUT/serve.log" > "$OUT/chunk_gate.txt" 2>/dev/null
 find "$OUT" -name '*.wav' -delete
 [ -f "$OUT/FAILED" ] && exit 1
 
@@ -107,7 +125,7 @@ if [ "$NSYS_ARGS" != none ]; then
     echo "exported $(date +%T)" >> "$OUT/progress.txt"
     cd "$S" || exit 1
     python3 omni_census.py "$OUT/serve.sqlite" --window "$OUT/window.txt" > "$OUT/census.txt" 2>&1
-    python3 talker_step_classes.py "$OUT/serve.sqlite" > "$OUT/talker_step_classes.txt" 2>&1
+    python3 talker_step_classes.py "$OUT/serve.sqlite" --window "$OUT/window.txt" > "$OUT/talker_step_classes.txt" 2>&1
     python3 talker_gap_split.py "$OUT/serve.sqlite" --window "$OUT/window.txt" > "$OUT/talker_gap_split.txt" 2>&1
     python3 chunk_gap_origin.py "$OUT/serve.sqlite" --window "$OUT/window.txt" > "$OUT/chunk_gap_origin.txt" 2>&1
     echo "census done $(date +%T)" >> "$OUT/progress.txt"
