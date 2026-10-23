@@ -251,12 +251,15 @@ def check_predictor(
         for node in parent_tree.body
         if isinstance(node, ast.ClassDef) and node.name == "Qwen3TTSTalker"
     )
+    parent_method_names = (
+        "code_predictor_forward_incremental",
+        "sample_subtalker_token",
+        "sample_subtalker_token_seeded",
+    )
     parent_methods = [
         node
         for node in parent_class.body
-        if isinstance(node, ast.FunctionDef)
-        and node.name
-        in ("code_predictor_forward_incremental", "sample_subtalker_token")
+        if isinstance(node, ast.FunctionDef) and node.name in parent_method_names
     ]
     namespace = dict(vars(model))
     namespace["sample_from_logits_with_seed_top_k_top_p"] = (
@@ -289,8 +292,14 @@ def check_predictor(
             build_talker(fixtures, has_projection=has_projection) for _ in range(2)
         ]
         parent_talker, head_talker = talkers
-        for name in ("code_predictor_forward_incremental", "sample_subtalker_token"):
+        for name in parent_method_names:
             setattr(parent_talker, name, MethodType(namespace[name], parent_talker))
+        assert (
+            parent_talker.sample_subtalker_token_seeded.__func__.__globals__[
+                "sample_from_logits_with_seed_top_k_top_p"
+            ]
+            is parent_sampling.sample_from_logits_with_seed_top_k_top_p
+        )
         requests = [
             fixtures.make_request(
                 top_k=max_top_k,
