@@ -1,7 +1,7 @@
 """Same-time pair of two trees (or one tree served two ways), then scoring, with each arm's SM Issue.
 
 usage: python3 pair.py --label v3_c16_a --tree /workspace/m_bcd0d8c68 --b-tree /workspace/v3_bb673b57a
-       --concurrency 16 --a-card 0 --b-card 1 --port 11000 [--no-stream] [--seed 1234] [--gpu-metrics]
+       --concurrency 16 --a-card 0 --b-card 1 --port 11000 [--no-stream] [--seed 1234] [--gpu-metrics] [--events]
 
 Each arm is placed on its card with the stage gpu flags (no device env), both boot and bench at once (SeedTTS EN, full
 corpus, streaming unless --no-stream, warmup 1), then are stopped and scored one after the other, each on its own card:
@@ -121,6 +121,7 @@ def main() -> None:
     parser.add_argument("--decode-census", action="store_true")
     parser.add_argument("--meta", default="")
     parser.add_argument("--skip-score", action="store_true")
+    parser.add_argument("--events", action="store_true")
     args = parser.parse_args()
     arms = {"a": (args.a_card, "", args.port), "b": (args.b_card, args.b_args, args.port + 200)}
     outs = {arm: ROOT / args.label / arm for arm in arms}
@@ -171,6 +172,13 @@ def main() -> None:
             print(f"{arm} healthy {time.strftime('%H:%M:%S')}", flush=True)
         for arm in arms:
             (outs[arm] / "gpu_healthy.txt").write_text(gpu_snapshot(), encoding="utf-8")
+        if args.events:
+            for arm, (_, _, port) in arms.items():
+                httpx.post(f"http://127.0.0.1:{port}/start_profile", timeout=60, trust_env=False, json={
+                    "run_id": f"{args.label}_{arm}", "event_dir": str(outs[arm] / "events"), "enable_torch": False,
+                }).raise_for_status()
+        else:
+            pass
         benches = {}
         stream_args = [] if args.no_stream else ["--stream"]
         for arm, (_, _, port) in arms.items():
@@ -195,6 +203,12 @@ def main() -> None:
             print(f"{arm} bench rc {bench.wait(timeout=BENCH_TIMEOUT_S)}", flush=True)
         for arm in arms:
             (outs[arm] / "gpu_after_bench.txt").write_text(gpu_snapshot(), encoding="utf-8")
+        if args.events:
+            for arm, (_, _, port) in arms.items():
+                httpx.post(f"http://127.0.0.1:{port}/stop_profile", json={"run_id": f"{args.label}_{arm}"},
+                           timeout=600, trust_env=False).raise_for_status()
+        else:
+            pass
     finally:
         for arm, server in servers.items():
             stop_group(server, arms[arm][2])
