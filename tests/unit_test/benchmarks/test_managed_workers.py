@@ -8,7 +8,6 @@ import subprocess
 import sys
 import threading
 from concurrent.futures import Future
-from pathlib import Path
 from typing import Literal
 
 import pytest
@@ -28,12 +27,10 @@ class FakeProcess:
         pid: int,
         command: list[str],
         environment: dict[str, str],
-        working_dir: Path | None,
     ) -> None:
         self.pid = pid
         self.command = command
         self.environment = environment
-        self.working_dir = working_dir
 
     def poll(self) -> None:
         return None
@@ -49,13 +46,10 @@ def created_workers(
         command: list[str],
         *,
         env: dict[str, str],
-        stdout: None,
-        stderr: None,
-        cwd: Path | None,
         start_new_session: bool,
     ) -> FakeProcess:
         assert start_new_session
-        process = FakeProcess(12345 + len(created), command, env, cwd)
+        process = FakeProcess(12345 + len(created), command, env)
         created.append(process)
         return process
 
@@ -69,10 +63,9 @@ def created_workers(
 def test_worker_command_preserves_model_arguments_and_gpu_placement(
     monkeypatch: pytest.MonkeyPatch,
     created_workers: list[FakeProcess],
-    tmp_path: Path,
     placement: Literal["explicit", "grouped", "inherited"],
 ) -> None:
-    """Worker children must receive the requested model, GPU groups, and working directory."""
+    """Worker children must receive the requested model and GPU groups."""
     monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "4,5,6,7")
     if placement == "explicit":
         worker_gpu_ids = ["8,9", "10,11"]
@@ -89,7 +82,6 @@ def test_worker_command_preserves_model_arguments_and_gpu_placement(
         worker_host="127.0.0.1",
         worker_ports=[8011, 8012],
         worker_gpu_ids=worker_gpu_ids,
-        working_dir=tmp_path,
         worker_extra_args="--mem-fraction-static 0.6 --thinker-tp-size 2 --thinker-gpus '0,1'",
     )
     command = created_workers[0].command
@@ -110,7 +102,6 @@ def test_worker_command_preserves_model_arguments_and_gpu_placement(
     assert [
         process.environment["CUDA_VISIBLE_DEVICES"] for process in created_workers
     ] == expected_visibility
-    assert all(process.working_dir == tmp_path for process in created_workers)
     assert [worker.process_group_id for worker in workers] == [
         process.pid for process in created_workers
     ]
