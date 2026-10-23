@@ -268,7 +268,7 @@ def incremental_causal_transconv1d(
 def add_into(out: torch.Tensor, first: torch.Tensor, second: torch.Tensor) -> None:
     """first + second into out, a view of a larger buffer. Autograd and Dynamo refuse out=,
     so there the sum is copied in, which inductor fuses into one in-place kernel."""
-    if torch.is_grad_enabled() or torch.compiler.is_dynamo_compiling():
+    if torch.is_grad_enabled():
         out.copy_(first + second)
     else:
         torch.add(first, second, out=out)
