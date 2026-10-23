@@ -20,7 +20,6 @@ tests/
     │   ├── test_duplex_*.py
     │   ├── test_fdb_*.py
     │   ├── test_dataset_regressions.py
-    │   ├── test_managed_workers.py
     │   └── test_runtime_metrics.py
     ├── cli/
     │   └── test_sglang_backend.py
@@ -42,7 +41,8 @@ tests/
     │   └── qwen_fakes.py
     ├── utils/
     │   ├── test_audio.py
-    │   └── test_g711.py
+    │   ├── test_g711.py
+    │   └── test_managed_workers.py
     ├── preprocessing/
     │   ├── test_cache_key.py
     │   ├── test_resample_cache.py
@@ -845,7 +845,7 @@ that happened to contain an older version of the test.
   - scheduler terminal/abort cleanup, complete row reset and reuse, mixed-batch
     ownership, and async resolve contracts.
 
-- `unit_test/benchmarks/test_managed_workers.py`: Managed worker command construction, GPU placement, parallel readiness, and process-group cleanup.
+- `unit_test/utils/test_managed_workers.py`: CI worker command construction, GPU placement, parallel readiness, and process-group cleanup for `tests/utils/managed_workers.py`.
 - `sglang_omni_router/tests/` (from the repository root): Rust router process, HTTP, media, WebSocket, and voice integration tests. Unit tests live next to the Rust implementation.
 
 - `unit_test/serve/`: In-process serving API unit tests:

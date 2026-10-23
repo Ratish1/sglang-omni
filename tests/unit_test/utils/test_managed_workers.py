@@ -12,8 +12,8 @@ from typing import Literal
 
 import pytest
 
-import benchmarks.benchmarker.workers as managed_workers
-from benchmarks.benchmarker.workers import (
+import tests.utils.managed_workers as managed_workers
+from tests.utils.managed_workers import (
     ManagedWorkerProcess,
     build_gpu_assignments,
     start_workers,

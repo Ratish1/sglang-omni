@@ -18,14 +18,6 @@ import pytest
 import requests
 import torch
 
-from benchmarks.benchmarker.workers import (
-    ManagedWorkerProcess,
-    build_gpu_assignments,
-    port_is_available,
-    start_workers,
-    stop_managed_workers,
-    wait_for_workers,
-)
 from sglang_omni.utils import find_available_port
 from tests.test_model.rust_router_config import CiRouterTopology, render_router_config
 from tests.utils import (
@@ -33,6 +25,14 @@ from tests.utils import (
     server_log_file,
     start_server_from_cmd,
     stop_server,
+)
+from tests.utils.managed_workers import (
+    ManagedWorkerProcess,
+    build_gpu_assignments,
+    port_is_available,
+    start_workers,
+    stop_managed_workers,
+    wait_for_workers,
 )
 
 RUST_ROUTER_BINARY_ENV = "SGLANG_OMNI_ROUTER_BIN"
