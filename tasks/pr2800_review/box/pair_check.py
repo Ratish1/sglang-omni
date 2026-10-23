@@ -79,6 +79,7 @@ TREES = {
     "vrp": ("vrp_2b6ae0b29", "origin", "2b6ae0b29a361dafb3f309e030af3f700642e7ba"),
     "vpp": ("vpp_36488ea9e", "origin", "36488ea9e195d7908834abf842df04c540daae19"),
     "vrf": ("vrf_a1bf0ea56", "origin", "a1bf0ea567b58c6dd0a27d8b033be3be1d626b84"),
+    "fld": ("fld_a8c993600", "origin", "a8c993600253e2610a1913b5f1e70466f4449256"),
 }
 # note (ratish): every arm is measured by one client and scored by one ASR server, both from main; from the SGLang
 # 0.5.22 stack on (057d97629) a tree from before it no longer runs, and main's client records each chunk's length.
@@ -134,6 +135,7 @@ ARMS = {
     "vrpb": ("vrp", [], [0.7769]),
     "vpp": ("vpp", [], [0.7769]),
     "vrf": ("vrf", [], [0.7769]),
+    "fld": ("fld", [], [0.7769]),
 }
 # arm: benchmark args every pass of the arm adds
 ARM_BENCH_ARGS: dict[str, list[str]] = {}
