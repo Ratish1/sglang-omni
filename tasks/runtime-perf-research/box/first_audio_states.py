@@ -16,8 +16,10 @@ from collections import defaultdict
 
 CHAIN = (
     ("coordinator", "request_admission", "admission"),
-    ("preprocessing", "preprocess_end", "preprocessing"),
-    ("audio_encoder", "encoder_start", "hop to the audio encoder"),
+    ("preprocessing", "preprocess_start", "preprocessing queue"),
+    ("preprocessing", "preprocess_end", "preprocessing work"),
+    ("audio_encoder", "stage_input_received", "hop to the audio encoder"),
+    ("audio_encoder", "encoder_start", "audio encoder queue"),
     ("audio_encoder", "encoder_end", "audio encoder"),
     ("thinker", "scheduler_request_build_start", "hop to the thinker, build wait"),
     ("thinker", "scheduler_prefill_start", "thinker build and queue"),
