@@ -681,8 +681,13 @@ def compute_mrope_positions(
         second_per_grid_ts=second_per_grid_ts,
         **kwargs,
     )
+    # note (ratish): a video timed at its sampled fps gets fractional positions, but positions are served as int64;
+    # flooring them here, after the audio-in-video merge fixed their order, with the delta from the floored largest,
+    # keeps decode positions continuing the prompt's.
     # mrope_positions: [3, 1, seq_len] -> [3, seq_len]
-    return mrope_positions.squeeze(1), mrope_position_delta
+    positions = mrope_positions.squeeze(1).floor()
+    delta = positions.max() + 1 - positions.shape[-1]
+    return positions, delta.view_as(mrope_position_delta)
 
 
 def build_sglang_thinker_request(

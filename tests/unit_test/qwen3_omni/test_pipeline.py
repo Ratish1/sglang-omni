@@ -1881,7 +1881,7 @@ def test_qwen_talker_merge_carries_mrope_metadata_without_features() -> None:
     assert talker_state.mm_inputs == {}
 
 
-def test_qwen_talker_merge_of_audio_in_video_gives_the_reference_positions() -> None:
+def test_qwen_talker_merge_of_audio_in_video_serves_the_reference_positions() -> None:
     grid, audio_feature_length, seconds_per_grid = [4, 4, 4], 300, 0.37
     input_ids = torch.tensor(
         [7, 8] + audio_in_video_span(grid, audio_feature_length) + [9], dtype=torch.long
@@ -1962,9 +1962,12 @@ def test_qwen_talker_merge_of_audio_in_video_gives_the_reference_positions() -> 
         use_audio_in_video=True,
         audio_seqlens=torch.tensor([audio_feature_length]),
     )
+    served = reference_positions.squeeze(1).float().floor()
     assert not any(key.endswith("embeds") for key in model_inputs)
-    assert torch.equal(positions.float(), reference_positions.squeeze(1).float())
-    assert torch.equal(delta.float(), reference_delta.float())
+    assert torch.equal(positions.float(), served)
+    assert torch.equal(
+        delta.float(), (served.max() + 1 - served.shape[-1]).view_as(reference_delta)
+    )
 
 
 def test_qwen_thinker_request_and_decode_contracts() -> None:
