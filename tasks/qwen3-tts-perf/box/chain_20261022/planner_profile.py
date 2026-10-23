@@ -30,14 +30,15 @@ def main() -> None:
     root = Path(os.environ["PAIR_ROOT"])
     for label in args.labels:
         for arm in ("a", "b"):
-            path = root / label / arm / "pyspy.txt"
-            if not path.exists():
+            paths = sorted((root / label / arm).glob("pyspy*.txt"))
+            if not paths:
                 print(f"{label} {arm}: no profile")
                 continue
             else:
                 pass
             counts = {name: 0 for name, _ in PARTS}
-            for line in path.read_text(errors="ignore").splitlines():
+            lines = [line for path in paths for line in path.read_text(errors="ignore").splitlines()]
+            for line in lines:
                 stack, _, count = line.rpartition(" ")
                 for name, function in PARTS:
                     if f"{function} (" in stack:

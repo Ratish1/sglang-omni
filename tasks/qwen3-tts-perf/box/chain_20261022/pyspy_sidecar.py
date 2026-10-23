@@ -1,9 +1,8 @@
 """py-spy on both arms' stage processes (preprocessing, talker and vocoder share one) while a pair.py run serves: waits
 for the arms' gpu_healthy.txt, which pair.py writes once both servers answer and before the benchmark starts; finds each
-arm's server by its --port (arm a the pair's port, arm b the port plus 200) and, in that server's session, the process
-running the vocoder's initial worker thread (its name truncated to qwen3-tts-vocod); then records it without pausing
-it (--nonblocking) at --rate Hz for --duration seconds, idle frames included, as raw collapsed stacks in
-PAIR_ROOT/<label>/<arm>/pyspy.txt. Start it alongside pair.py.
+arm's server by its --port (arm a the pair's port, arm b the port plus 200); then records the server and its spawned
+stage processes in that server's session without pausing them (--nonblocking) at --rate Hz for --duration seconds, idle frames included, as raw
+collapsed stacks in PAIR_ROOT/<label>/<arm>/pyspy_<pid>.txt. Start it alongside pair.py.
 
 usage: PAIR_ROOT=<pairs> python3 pyspy_sidecar.py LABEL --port PORT [--rate 100] [--duration 60] [--timeout 900]
 """
@@ -15,7 +14,6 @@ import time
 from pathlib import Path
 
 PROC = Path("/proc")
-THREAD_NAME = "qwen3-tts-vocod"
 
 
 def server_session(port: int) -> int | None:
@@ -35,25 +33,26 @@ def server_session(port: int) -> int | None:
     return None
 
 
-def stage_process(session: int) -> int | None:
+def session_pythons(session: int) -> list[int]:
+    """The server and its spawned stage processes in its session (not its compile workers or resource tracker): Python
+    thread names never reach /proc, so each is recorded and the stacks under the vocoder's initial worker pick out the
+    stage process."""
+    pids = []
     for entry in PROC.iterdir():
         if not entry.name.isdigit():
             continue
         else:
             pass
         try:
-            if int((entry / "stat").read_text().rsplit(")", 1)[1].split()[3]) != session:
-                continue
-            else:
-                pass
-            names = [(task / "comm").read_text().strip() for task in (entry / "task").iterdir()]
+            same_session = int((entry / "stat").read_text().rsplit(")", 1)[1].split()[3]) == session
+            command = (entry / "cmdline").read_bytes()
         except OSError:
             continue
-        if THREAD_NAME in names:
-            return int(entry.name)
+        if same_session and (b"spawn_main" in command or b"sglang_omni.cli" in command):
+            pids.append(int(entry.name))
         else:
             pass
-    return None
+    return pids
 
 
 def main() -> None:
@@ -75,21 +74,22 @@ def main() -> None:
     recorders = []
     for arm, port in (("a", args.port), ("b", args.port + 200)):
         session = server_session(port)
-        pid = None if session is None else stage_process(session)
-        if pid is None:
-            print(f"{args.label} {arm}: no stage process for port {port} (session {session})", flush=True)
+        pids = [] if session is None else session_pythons(session)
+        if not pids:
+            print(f"{args.label} {arm}: no Python process for port {port} (session {session})", flush=True)
             continue
         else:
             pass
-        recorders.append(
-            subprocess.Popen(
-                ["py-spy", "record", "--pid", str(pid), "--rate", str(args.rate), "--duration", str(args.duration),
-                 "--nonblocking", "--idle", "--threads", "--format", "raw", "--output", str(root / arm / "pyspy.txt")],
-                stdout=subprocess.DEVNULL, stderr=open(root / arm / "pyspy.log", "w"),
+        for pid in pids:
+            recorders.append(
+                subprocess.Popen(
+                    ["py-spy", "record", "--pid", str(pid), "--rate", str(args.rate), "--duration", str(args.duration),
+                     "--nonblocking", "--idle", "--threads", "--format", "raw",
+                     "--output", str(root / arm / f"pyspy_{pid}.txt")],
+                    stdout=subprocess.DEVNULL, stderr=open(root / arm / f"pyspy_{pid}.log", "w"),
+                )
             )
-        )
-        print(f"{args.label} {arm}: recording stage process {pid} (session {session}) {time.strftime('%H:%M:%S')}",
-              flush=True)
+        print(f"{args.label} {arm}: recording {pids} (session {session}) {time.strftime('%H:%M:%S')}", flush=True)
     for recorder in recorders:
         recorder.wait()
 
