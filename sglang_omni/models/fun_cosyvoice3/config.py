@@ -157,11 +157,6 @@ class FunCosyVoice3PipelineConfig(PipelineConfig):
                 token_max_hop_len=100,
                 disable_hop_growth=False,
                 flow_prefix_cache_gb=None,
-                # note (ratish): on top of the largest admitted step and the prefix
-                # graphs, both measured at startup: serving's growth outside the step
-                # (0.32 GiB at 16 rows on H100) and its fragmentation over the
-                # measured step (0.36 GiB at the 16 row worst step).
-                flow_prefix_cache_reserve_gb=0.7,
             ),
             gpu=0,
             terminal=True,

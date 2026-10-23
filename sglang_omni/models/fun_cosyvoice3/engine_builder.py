@@ -42,6 +42,14 @@ else:
 
 logger = logging.getLogger(__name__)
 
+_ENGINE_HEADROOM_BYTES: int | None = None
+
+
+def engine_headroom_bytes() -> int | None:
+    """The memory the engine keeps free beside its static pools, set when this
+    process builds the engine."""
+    return _ENGINE_HEADROOM_BYTES
+
 
 class FunCosyVoice3EngineBuilder(TtsEngineBuilder[CosyVoice3SGLangRequestData]):
     model_name = "Fun-CosyVoice3"
@@ -180,6 +188,15 @@ class FunCosyVoice3EngineBuilder(TtsEngineBuilder[CosyVoice3SGLangRequestData]):
             speaker_encoder=speaker_encoder,
             device=torch.device(device),
             model_revision=root,
+        )
+        global _ENGINE_HEADROOM_BYTES
+        model_runner = model_worker.model_runner
+        # note (ratish): the vocoder in this process sizes its Flow prefix pool after the
+        # engine, so it leaves the share of pre-load memory the engine keeps free.
+        _ENGINE_HEADROOM_BYTES = int(
+            model_runner.pre_model_load_memory
+            * (1 - model_runner.mem_fraction_static)
+            * 2**30
         )
 
     def setup_model(

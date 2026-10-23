@@ -836,7 +836,6 @@ def test_flow_admission_defers_request_after_long_singleton(monkeypatch) -> None
     scheduler = stages.create_vocoder_executor(
         "model",
         flow_prefix_cache_gb=0.0,
-        flow_prefix_cache_reserve_gb=0.0,
         enable_flow_prefix_cuda_graph=True,
         enable_flow_whole_history_cuda_graph=True,
         enable_hift_cuda_graph=False,
@@ -881,7 +880,6 @@ def test_admission_budget_below_the_first_tier_keeps_finals_eager(monkeypatch) -
         device="cuda",
         dtype="float16",
         flow_prefix_cache_gb=0.0,
-        flow_prefix_cache_reserve_gb=0.0,
         enable_flow_cuda_graph=False,
         enable_flow_prefix_cuda_graph=True,
         enable_flow_whole_history_cuda_graph=True,
@@ -927,7 +925,6 @@ def test_create_vocoder_executor_threads_batch_configuration(monkeypatch) -> Non
     scheduler = stages.create_vocoder_executor(
         "model",
         flow_prefix_cache_gb=0.0,
-        flow_prefix_cache_reserve_gb=0.0,
         enable_flow_prefix_cuda_graph=True,
         enable_flow_whole_history_cuda_graph=True,
         enable_hift_cuda_graph=False,
@@ -980,7 +977,6 @@ def test_create_vocoder_executor_threads_trt_flag(monkeypatch) -> None:
     stages.create_vocoder_executor(
         "model",
         flow_prefix_cache_gb=0.0,
-        flow_prefix_cache_reserve_gb=0.0,
         enable_flow_prefix_cuda_graph=True,
         enable_flow_whole_history_cuda_graph=True,
         enable_hift_cuda_graph=False,
@@ -1097,7 +1093,6 @@ def test_create_vocoder_executor_compiles_before_flow_graph_capture(
     _scheduler = stages.create_vocoder_executor(
         "model",
         flow_prefix_cache_gb=0.0,
-        flow_prefix_cache_reserve_gb=0.0,
         enable_flow_prefix_cuda_graph=True,
         enable_flow_whole_history_cuda_graph=True,
         enable_hift_cuda_graph=False,
@@ -1140,7 +1135,6 @@ def test_create_vocoder_executor_skips_the_padded_dit_startup_on_the_packed_rout
         device="cuda",
         dtype="bfloat16",
         flow_prefix_cache_gb=0.0,
-        flow_prefix_cache_reserve_gb=0.0,
         enable_dit_torch_compile=True,
         enable_flow_cuda_graph=True,
         flow_cuda_graph_capture_shapes=FLOW_GRAPH_CAPTURE_SHAPES,
@@ -1171,7 +1165,6 @@ def test_create_vocoder_executor_on_xpu_captures_flow_graphs_only_for_an_eager_d
     stages.create_vocoder_executor(
         "model",
         flow_prefix_cache_gb=0.0,
-        flow_prefix_cache_reserve_gb=0.0,
         enable_flow_prefix_cuda_graph=True,
         enable_flow_whole_history_cuda_graph=True,
         enable_hift_cuda_graph=False,
@@ -1218,7 +1211,6 @@ def test_create_vocoder_executor_packs_buffered_flow_only_on_ragged_attention(
         device="cuda",
         dtype=dtype,
         flow_prefix_cache_gb=0.0,
-        flow_prefix_cache_reserve_gb=0.0,
         enable_flow_cuda_graph=False,
         enable_flow_prefix_cuda_graph=False,
         enable_flow_whole_history_cuda_graph=False,
@@ -1235,7 +1227,6 @@ def test_create_vocoder_executor_rejects_trt_and_compile() -> None:
         stages.create_vocoder_executor(
             "model",
             flow_prefix_cache_gb=0.0,
-            flow_prefix_cache_reserve_gb=0.0,
             enable_flow_prefix_cuda_graph=True,
             enable_flow_whole_history_cuda_graph=True,
             enable_hift_cuda_graph=False,
@@ -1346,6 +1337,7 @@ def test_onnx_intra_op_threads_reaches_both_encoders(monkeypatch) -> None:
     monkeypatch.setattr(
         request_builders, "set_cosyvoice3_preprocessing_context", lambda **kwargs: None
     )
+    monkeypatch.setattr(engine_builder, "_ENGINE_HEADROOM_BYTES", None)
 
     builder = engine_builder.FunCosyVoice3EngineBuilder(onnx_intra_op_threads=6)
     builder.checkpoint_root = "/tmp"
@@ -1354,6 +1346,8 @@ def test_onnx_intra_op_threads_reaches_both_encoders(monkeypatch) -> None:
             model_runner=SimpleNamespace(
                 model=StubModel(),
                 model_config=SimpleNamespace(vocab_size=0),
+                pre_model_load_memory=80.0,
+                mem_fraction_static=0.85,
             )
         ),
         checkpoint_dir="/tmp",
@@ -1431,28 +1425,36 @@ def test_derived_prefix_pool_takes_the_memory_left_after_its_reserve(
         assert pool.free_frames == expected_blocks * stages.BLOCK_FRAMES
 
 
-def test_sized_prefix_pool_ignores_free_memory(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(torch.cuda, "mem_get_info", lambda device: (0, 2**36))
+@pytest.mark.parametrize(("size_blocks", "expected_blocks"), [(3, 3), (30, 10)])
+def test_sized_prefix_pool_is_capped_by_the_memory_left_after_its_reserve(
+    monkeypatch: pytest.MonkeyPatch, size_blocks: int, expected_blocks: int
+) -> None:
+    block_bytes = stages.BLOCK_FRAMES * tiny_prefix_bytes_per_frame()
+    reserve_bytes = 2**30
+    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: None)
+    monkeypatch.setattr(
+        torch.cuda,
+        "mem_get_info",
+        lambda device: (reserve_bytes + 10 * block_bytes, 2**36),
+    )
+    monkeypatch.setattr(
+        torch.cuda, "get_per_process_memory_fraction", lambda device: 1.0
+    )
+    monkeypatch.setattr(torch.cuda, "memory_reserved", lambda device: 0)
 
     pool = stages.build_prefix_pool(
         tiny_prefix_flow(),
         torch.device("cpu"),
         torch.bfloat16,
-        size_gb=2**-10,
-        reserve_bytes=2**30,
+        size_gb=size_blocks * block_bytes / 2**30,
+        reserve_bytes=reserve_bytes,
     )
 
     assert pool is not None
-    expected_frames = 2**20 // tiny_prefix_bytes_per_frame()
-    assert (
-        pool.free_frames == expected_frames // stages.BLOCK_FRAMES * stages.BLOCK_FRAMES
-    )
+    assert pool.free_frames == expected_blocks * stages.BLOCK_FRAMES
 
 
-def test_derived_prefix_pool_leaves_the_largest_admitted_step(monkeypatch) -> None:
-    """The derived pool leaves the largest step the scheduler admits, max_batch_size
-    rows at the engine's context length, measured before the pool, plus
-    flow_prefix_cache_reserve_gb."""
+def patch_ragged_vocoder(monkeypatch: pytest.MonkeyPatch) -> None:
     fake_flow = RunnableFakeFlow()
     fake_flow.packed_estimator.is_ragged = True
     flow = stages.FunCosyVoice3Flow(
@@ -1468,6 +1470,38 @@ def test_derived_prefix_pool_leaves_the_largest_admitted_step(monkeypatch) -> No
         "load_cosyvoice3_flow_hift",
         lambda checkpoint_dir, device, fp16, **kwargs: (flow, FakeHiFT()),
     )
+
+
+def create_ragged_vocoder(flow_prefix_cache_gb: float | None) -> None:
+    stages.create_vocoder_executor(
+        "model",
+        device="cuda",
+        dtype="float16",
+        max_batch_size=4,
+        flow_prefix_cache_gb=flow_prefix_cache_gb,
+        enable_flow_cuda_graph=False,
+        enable_flow_prefix_cuda_graph=False,
+        enable_flow_whole_history_cuda_graph=True,
+        enable_hift_cuda_graph=False,
+        flow_batch_admission_frames=3,
+        enable_dit_torch_compile=False,
+    )
+
+
+@pytest.mark.parametrize(
+    ("flow_prefix_cache_gb", "headroom_gib", "expected_reserve_gib"),
+    [(None, 1.5, 3.0), (None, 5.0, 5.0), (2.0, 1.5, 3.0)],
+)
+def test_prefix_pool_leaves_the_larger_of_the_engine_headroom_and_the_largest_step(
+    monkeypatch: pytest.MonkeyPatch,
+    flow_prefix_cache_gb: float | None,
+    headroom_gib: float,
+    expected_reserve_gib: float,
+) -> None:
+    """The pool leaves the larger of the engine's headroom and the largest step the
+    scheduler admits, max_batch_size rows at the engine's context length, measured
+    before the pool, also when its size is set."""
+    patch_ragged_vocoder(monkeypatch)
     events: list[tuple[str, object]] = []
 
     def measure(
@@ -1488,32 +1522,32 @@ def test_derived_prefix_pool_leaves_the_largest_admitted_step(monkeypatch) -> No
         size_gb: float | None,
         reserve_bytes: int,
     ) -> None:
-        events.append(("pool", reserve_bytes))
+        events.append(("pool", (size_gb, reserve_bytes)))
 
     monkeypatch.setattr(
         FunCosyVoice3StreamingVocoderScheduler, "measure_peak_step_bytes", measure
     )
     monkeypatch.setattr(stages, "build_prefix_pool", build)
-
-    stages.create_vocoder_executor(
-        "model",
-        device="cuda",
-        dtype="float16",
-        max_batch_size=4,
-        flow_prefix_cache_gb=None,
-        flow_prefix_cache_reserve_gb=1.5,
-        enable_flow_cuda_graph=False,
-        enable_flow_prefix_cuda_graph=False,
-        enable_flow_whole_history_cuda_graph=True,
-        enable_hift_cuda_graph=False,
-        flow_batch_admission_frames=3,
-        enable_dit_torch_compile=False,
+    monkeypatch.setattr(
+        stages, "engine_headroom_bytes", lambda: int(headroom_gib * 2**30)
     )
+
+    create_ragged_vocoder(flow_prefix_cache_gb)
 
     assert events == [
         ("measure", (4, FunCosyVoice3EngineBuilder.context_length)),
-        ("pool", int(4.5 * 2**30)),
+        ("pool", (flow_prefix_cache_gb, int(expected_reserve_gib * 2**30))),
     ]
+
+
+def test_prefix_pool_needs_the_engine_in_its_process(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    patch_ragged_vocoder(monkeypatch)
+    monkeypatch.setattr(stages, "engine_headroom_bytes", lambda: None)
+
+    with pytest.raises(ValueError, match="TTS engine in the same process"):
+        create_ragged_vocoder(None)
 
 
 def test_create_vocoder_executor_rejects_non_positive_admission_budget(
@@ -1527,7 +1561,6 @@ def test_create_vocoder_executor_rejects_non_positive_admission_budget(
         stages.create_vocoder_executor(
             "model",
             flow_prefix_cache_gb=0.0,
-            flow_prefix_cache_reserve_gb=0.0,
             enable_flow_prefix_cuda_graph=True,
             enable_flow_whole_history_cuda_graph=True,
             enable_hift_cuda_graph=False,

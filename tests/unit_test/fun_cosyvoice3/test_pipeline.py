@@ -159,7 +159,6 @@ def test_fun_cosyvoice3_config_and_registry_contract() -> None:
         "token_max_hop_len": 100,
         "disable_hop_growth": False,
         "flow_prefix_cache_gb": None,
-        "flow_prefix_cache_reserve_gb": 0.7,
     }
 
     build_compiled_process_topology(config)
