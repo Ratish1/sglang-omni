@@ -685,8 +685,11 @@ def compute_mrope_positions(
         second_per_grid_ts=second_per_grid_ts,
         **kwargs,
     )
+    # note (ratish): positions are served as int64, so floor them after the audio-in-video merge and take the delta from the floored largest.
     # mrope_positions: [3, 1, seq_len] -> [3, seq_len]
-    return mrope_positions.squeeze(1), mrope_position_delta
+    positions = mrope_positions.squeeze(1).floor()
+    delta = positions.max() + 1 - positions.shape[-1]
+    return positions, delta.view_as(mrope_position_delta)
 
 
 def build_sglang_thinker_request(
