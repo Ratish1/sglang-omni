@@ -26,6 +26,8 @@
 #   client                      client launch template; {port} {output_dir} {model} {asr_gpu} substituted.
 #                               {asr_gpu} = "cuda:N" of a GPU not given to the server
 #                               (or "cpu" if no free GPUs left); use in --asr-device / --device flags.
+#   transcribe_server_profile   optional ASR topology started after stopping the generation server
+#   transcribe_client           client command that scores saved audio against that ASR topology
 #   result_json                 path under output_dir where the client writes its JSON
 #   cells                       column header → { path, format } OR { paths: { alias: ... }, format }
 
@@ -138,6 +140,14 @@ server_profiles:
     server_boot_timeout_s: 240
     router_topology: tts
     router_policy: least_requests
+  qwen3_asr_router:
+    server_gpus: 2
+    model_path: Qwen/Qwen3-ASR-1.7B
+    model_name: Qwen/Qwen3-ASR-1.7B
+    num_workers: 2
+    num_gpus_per_worker: 1
+    router_topology: asr
+    router_policy: round_robin
 
 rows:
   # ===================== mmsu (Qwen3-Omni text-only) =====================
@@ -529,7 +539,9 @@ rows:
       section_substring: "Accuracy (accuracy.wer)"
       config_substring: "EN, stream=False"
       source_workload: "router, 2-worker, full-set, c=16"
-    client: "python -m benchmarks.eval.benchmark_tts_seedtts --model fishaudio/s2-pro --port {port} --meta zhaochenyang20/seed-tts-eval-arrow --max-concurrency 16 --lang en --output-dir {output_dir} --device {asr_gpu}"
+    client: "python -m benchmarks.eval.benchmark_tts_seedtts --model fishaudio/s2-pro --port {port} --meta zhaochenyang20/seed-tts-eval-arrow --max-concurrency 16 --lang en --output-dir {output_dir} --generate-only --use-existing-server"
+    transcribe_server_profile: qwen3_asr_router
+    transcribe_client: "python -m benchmarks.eval.benchmark_tts_seedtts --model fishaudio/s2-pro --port {port} --meta zhaochenyang20/seed-tts-eval-arrow --max-concurrency 16 --lang en --output-dir {output_dir} --transcribe-only --use-existing-server"
     result_json: "wer_results.json"
     cells:
       wer_corpus:            { path: "summary.wer_corpus",            format: "{v:.2%}" }
@@ -546,7 +558,9 @@ rows:
       section_substring: "Accuracy (accuracy.wer)"
       config_substring: "EN, stream=True"
       source_workload: "router, 2-worker, full-set, c=16"
-    client: "python -m benchmarks.eval.benchmark_tts_seedtts --stream --model fishaudio/s2-pro --port {port} --meta zhaochenyang20/seed-tts-eval-arrow --max-concurrency 16 --lang en --output-dir {output_dir} --device {asr_gpu}"
+    client: "python -m benchmarks.eval.benchmark_tts_seedtts --stream --model fishaudio/s2-pro --port {port} --meta zhaochenyang20/seed-tts-eval-arrow --max-concurrency 16 --lang en --output-dir {output_dir} --generate-only --use-existing-server"
+    transcribe_server_profile: qwen3_asr_router
+    transcribe_client: "python -m benchmarks.eval.benchmark_tts_seedtts --stream --model fishaudio/s2-pro --port {port} --meta zhaochenyang20/seed-tts-eval-arrow --max-concurrency 16 --lang en --output-dir {output_dir} --transcribe-only --use-existing-server"
     result_json: "wer_results.json"
     cells:
       wer_corpus:            { path: "summary.wer_corpus",            format: "{v:.2%}" }
@@ -563,7 +577,9 @@ rows:
       section_substring: "Accuracy (accuracy.wer)"
       config_substring: "ZH, stream=False"
       source_workload: "router, 2-worker, full-set, c=16"
-    client: "python -m benchmarks.eval.benchmark_tts_seedtts --model fishaudio/s2-pro --port {port} --meta zhaochenyang20/seed-tts-eval-arrow --max-concurrency 16 --lang zh --output-dir {output_dir} --device {asr_gpu}"
+    client: "python -m benchmarks.eval.benchmark_tts_seedtts --model fishaudio/s2-pro --port {port} --meta zhaochenyang20/seed-tts-eval-arrow --max-concurrency 16 --lang zh --output-dir {output_dir} --generate-only --use-existing-server"
+    transcribe_server_profile: qwen3_asr_router
+    transcribe_client: "python -m benchmarks.eval.benchmark_tts_seedtts --model fishaudio/s2-pro --port {port} --meta zhaochenyang20/seed-tts-eval-arrow --max-concurrency 16 --lang zh --output-dir {output_dir} --transcribe-only --use-existing-server"
     result_json: "wer_results.json"
     cells:
       wer_corpus:            { path: "summary.wer_corpus",            format: "{v:.2%}" }
@@ -580,7 +596,9 @@ rows:
       section_substring: "Accuracy (accuracy.wer)"
       config_substring: "ZH, stream=True"
       source_workload: "router, 2-worker, full-set, c=16"
-    client: "python -m benchmarks.eval.benchmark_tts_seedtts --stream --model fishaudio/s2-pro --port {port} --meta zhaochenyang20/seed-tts-eval-arrow --max-concurrency 16 --lang zh --output-dir {output_dir} --device {asr_gpu}"
+    client: "python -m benchmarks.eval.benchmark_tts_seedtts --stream --model fishaudio/s2-pro --port {port} --meta zhaochenyang20/seed-tts-eval-arrow --max-concurrency 16 --lang zh --output-dir {output_dir} --generate-only --use-existing-server"
+    transcribe_server_profile: qwen3_asr_router
+    transcribe_client: "python -m benchmarks.eval.benchmark_tts_seedtts --stream --model fishaudio/s2-pro --port {port} --meta zhaochenyang20/seed-tts-eval-arrow --max-concurrency 16 --lang zh --output-dir {output_dir} --transcribe-only --use-existing-server"
     result_json: "wer_results.json"
     cells:
       wer_corpus:            { path: "summary.wer_corpus",            format: "{v:.2%}" }
@@ -597,7 +615,9 @@ rows:
       section_substring: "Generation speed (generation.speed)"
       config_substring: "EN, stream=False"
       source_workload: "router, 2-worker, full-set, c=16"
-    client: "python -m benchmarks.eval.benchmark_tts_seedtts --model fishaudio/s2-pro --port {port} --meta zhaochenyang20/seed-tts-eval-arrow --max-concurrency 16 --lang en --output-dir {output_dir} --device {asr_gpu}"
+    client: "python -m benchmarks.eval.benchmark_tts_seedtts --model fishaudio/s2-pro --port {port} --meta zhaochenyang20/seed-tts-eval-arrow --max-concurrency 16 --lang en --output-dir {output_dir} --generate-only --use-existing-server"
+    transcribe_server_profile: qwen3_asr_router
+    transcribe_client: "python -m benchmarks.eval.benchmark_tts_seedtts --model fishaudio/s2-pro --port {port} --meta zhaochenyang20/seed-tts-eval-arrow --max-concurrency 16 --lang en --output-dir {output_dir} --transcribe-only --use-existing-server"
     result_json: "speed_results.json"
     cells:
       latency_mean_s: { path: "summary.latency_mean_s", format: "{v:.3f}" }
@@ -613,7 +633,9 @@ rows:
       section_substring: "Generation speed (generation.speed)"
       config_substring: "EN, stream=True"
       source_workload: "router, 2-worker, full-set, c=16"
-    client: "python -m benchmarks.eval.benchmark_tts_seedtts --stream --model fishaudio/s2-pro --port {port} --meta zhaochenyang20/seed-tts-eval-arrow --max-concurrency 16 --lang en --output-dir {output_dir} --device {asr_gpu}"
+    client: "python -m benchmarks.eval.benchmark_tts_seedtts --stream --model fishaudio/s2-pro --port {port} --meta zhaochenyang20/seed-tts-eval-arrow --max-concurrency 16 --lang en --output-dir {output_dir} --generate-only --use-existing-server"
+    transcribe_server_profile: qwen3_asr_router
+    transcribe_client: "python -m benchmarks.eval.benchmark_tts_seedtts --stream --model fishaudio/s2-pro --port {port} --meta zhaochenyang20/seed-tts-eval-arrow --max-concurrency 16 --lang en --output-dir {output_dir} --transcribe-only --use-existing-server"
     result_json: "speed_results.json"
     cells:
       latency_mean_s: { path: "summary.latency_mean_s", format: "{v:.3f}" }
@@ -629,7 +651,9 @@ rows:
       section_substring: "Generation speed (generation.speed)"
       config_substring: "ZH, stream=False"
       source_workload: "router, 2-worker, full-set, c=16"
-    client: "python -m benchmarks.eval.benchmark_tts_seedtts --model fishaudio/s2-pro --port {port} --meta zhaochenyang20/seed-tts-eval-arrow --max-concurrency 16 --lang zh --output-dir {output_dir} --device {asr_gpu}"
+    client: "python -m benchmarks.eval.benchmark_tts_seedtts --model fishaudio/s2-pro --port {port} --meta zhaochenyang20/seed-tts-eval-arrow --max-concurrency 16 --lang zh --output-dir {output_dir} --generate-only --use-existing-server"
+    transcribe_server_profile: qwen3_asr_router
+    transcribe_client: "python -m benchmarks.eval.benchmark_tts_seedtts --model fishaudio/s2-pro --port {port} --meta zhaochenyang20/seed-tts-eval-arrow --max-concurrency 16 --lang zh --output-dir {output_dir} --transcribe-only --use-existing-server"
     result_json: "speed_results.json"
     cells:
       latency_mean_s: { path: "summary.latency_mean_s", format: "{v:.3f}" }
@@ -645,7 +669,9 @@ rows:
       section_substring: "Generation speed (generation.speed)"
       config_substring: "ZH, stream=True"
       source_workload: "router, 2-worker, full-set, c=16"
-    client: "python -m benchmarks.eval.benchmark_tts_seedtts --stream --model fishaudio/s2-pro --port {port} --meta zhaochenyang20/seed-tts-eval-arrow --max-concurrency 16 --lang zh --output-dir {output_dir} --device {asr_gpu}"
+    client: "python -m benchmarks.eval.benchmark_tts_seedtts --stream --model fishaudio/s2-pro --port {port} --meta zhaochenyang20/seed-tts-eval-arrow --max-concurrency 16 --lang zh --output-dir {output_dir} --generate-only --use-existing-server"
+    transcribe_server_profile: qwen3_asr_router
+    transcribe_client: "python -m benchmarks.eval.benchmark_tts_seedtts --stream --model fishaudio/s2-pro --port {port} --meta zhaochenyang20/seed-tts-eval-arrow --max-concurrency 16 --lang zh --output-dir {output_dir} --transcribe-only --use-existing-server"
     result_json: "speed_results.json"
     cells:
       latency_mean_s: { path: "summary.latency_mean_s", format: "{v:.3f}" }

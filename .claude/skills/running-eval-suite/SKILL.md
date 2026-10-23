@@ -161,7 +161,8 @@ Errors halt the run with a printed reason. This matches the
      tags. The first run on a hardware target appends new router-tagged
      rows next to the older direct/V1-pipeline rows; later runs replace
      those router rows in place.
-   - Managed-router rows start complete Omni workers and the Rust router as separate processes. The shared TOML topology sets the policy. Wait for worker health and router `/ready` before running the client. At teardown, stop the router before stopping the worker parents and waiting for their pipeline children. Direct-server teardown keeps its existing process-group SIGTERM behavior.
+   - Managed-router rows start complete Omni workers and the Rust router as separate processes. Model profiles set the policy, and the suite sets admission limits. Wait for every configured worker to become routable in `/diagnostics` before running the client. At teardown, stop the router before stopping the worker parents and waiting for their pipeline children. Direct-server teardown keeps its existing process-group SIGTERM behavior.
+   - S2-Pro rows use the benchmark's existing `--generate-only --use-existing-server` mode. Stop the TTS topology, start the ASR topology on the same GPUs, then run `--transcribe-only --use-existing-server` against the saved audio. Each phase has separate server and client logs. The benchmark's combined command is unchanged.
    - Per-row state lands in `<run-dir>/run-state.json`. Stream the
      runner's stdout to the user so they can watch progress.
    - **If a row fails** (server boot timeout / client crash / locator

@@ -461,6 +461,12 @@ def cmd_precheck(args: argparse.Namespace) -> int:
     for row in cfg.get("rows", []):
         if row.get("hf_model_id"):
             hf_models.add(row["hf_model_id"])
+    for row in selected_rows:
+        if "transcribe_server_profile" in row:
+            profile = cfg["server_profiles"][row["transcribe_server_profile"]]
+            hf_models.add(profile["model_path"])
+        else:
+            pass
     hf_datasets = set(cfg.get("hf_datasets") or [])
 
     for mid in sorted(hf_models):
@@ -1101,6 +1107,37 @@ def _run_one_row(row: dict, py: str, root: Path, out_root: Path,
     }
 
 
+def run_eval_client(
+    client_template: str,
+    *,
+    port: int,
+    output_dir: Path,
+    model: str,
+    asr_device: str,
+    root: Path,
+    log_path: Path,
+    smoke: int | None,
+) -> int:
+    if smoke is not None:
+        client_template = _override_max_samples(client_template, smoke)
+    else:
+        pass
+    client_command = client_template.format(
+        port=port, output_dir=str(output_dir), model=model, asr_gpu=asr_device
+    )
+    print(f"    client: {_truncate(client_command, 110)}")
+    with open(log_path, "w") as log_handle:
+        result = subprocess.run(
+            client_command,
+            shell=True,
+            stdout=log_handle,
+            stderr=subprocess.STDOUT,
+            cwd=str(root),
+            env={**os.environ, "OUTPUT_DIR": str(output_dir)},
+        )
+    return result.returncode
+
+
 def _run_one_round(row: dict, py: str, root: Path, round_dir: Path,
                    gpus_csv: str, smoke: int | None, cfg: dict, hw: str, *,
                    asr_device: str = "cpu") -> dict:
@@ -1154,29 +1191,78 @@ def _run_one_round(row: dict, py: str, root: Path, round_dir: Path,
             }
         print(f"    server ready (<{timeout}s)")
 
-        client_tmpl = row["client"]
-        if smoke is not None:
-            client_tmpl = _override_max_samples(client_tmpl, smoke)
-        client_cmd = client_tmpl.format(
-            port=port, output_dir=str(out_dir), model=model_id,
-            asr_gpu=asr_device,
+        client_exit = run_eval_client(
+            row["client"],
+            port=port,
+            output_dir=out_dir,
+            model=model_id,
+            asr_device=asr_device,
+            root=root,
+            log_path=client_log,
+            smoke=smoke,
         )
-        print(f"    client: {_truncate(client_cmd, 110)}")
-        with open(client_log, "w") as flog:
-            r = subprocess.run(
-                client_cmd, shell=True, stdout=flog, stderr=subprocess.STDOUT,
-                cwd=str(root),
-                env={**os.environ, "OUTPUT_DIR": str(out_dir)},
-            )
-        if r.returncode != 0:
+        if client_exit != 0:
             return {
                 "status": "fail",
-                "reason": f"client exit {r.returncode}",
+                "reason": f"client exit {client_exit}",
                 "round_dir": str(round_dir),
                 "client_log": str(client_log),
                 "server_log": str(server_log),
                 "fail_excerpt": _extract_fail_excerpt(client_log, server_log),
             }
+        else:
+            pass
+
+        if "transcribe_server_profile" in row:
+            handle.stop()
+            transcribe_dir = round_dir / "transcribe"
+            transcribe_dir.mkdir(exist_ok=True)
+            server_log = transcribe_dir / "server.log"
+            client_log = transcribe_dir / "client.log"
+            profile_name = row["transcribe_server_profile"]
+            try:
+                handle = launch_row_server(
+                    {"server_profile": profile_name},
+                    cfg,
+                    py,
+                    port=port,
+                    model=cfg["server_profiles"][profile_name]["model_path"],
+                    gpus_csv=gpus_csv,
+                    log_path=server_log,
+                    round_dir=transcribe_dir,
+                    repo_root=root,
+                )
+            except (OSError, RuntimeError) as error:
+                return {
+                    "status": "fail",
+                    "reason": f"ASR server boot: {error}",
+                    "round_dir": str(round_dir),
+                    "server_log": str(server_log),
+                    "fail_excerpt": _extract_fail_excerpt(server_log),
+                }
+            client_exit = run_eval_client(
+                row["transcribe_client"],
+                port=port,
+                output_dir=out_dir,
+                model=model_id,
+                asr_device=asr_device,
+                root=root,
+                log_path=client_log,
+                smoke=smoke,
+            )
+            if client_exit != 0:
+                return {
+                    "status": "fail",
+                    "reason": f"transcribe client exit {client_exit}",
+                    "round_dir": str(round_dir),
+                    "client_log": str(client_log),
+                    "server_log": str(server_log),
+                    "fail_excerpt": _extract_fail_excerpt(client_log, server_log),
+                }
+            else:
+                pass
+        else:
+            pass
 
         rj = out_dir / row["result_json"]
         if not rj.exists():
