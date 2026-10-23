@@ -50,6 +50,17 @@ def client(benchmark: str, port: int, concurrency: int, out: Path) -> None:
             output_dir=str(out), repo_id=DATASETS["videoamme-ci-50"], video_fps=2, video_max_frames=128,
             video_max_pixels=401408, disable_tqdm=True, timeout_s=500)
         results = asyncio.run(run_videoamme_eval(config, compute_wer=False))
+    elif benchmark == "mmsu":
+        from benchmarks.eval.benchmark_omni_mmsu import run
+
+        # note (ratish): test_qwen3_omni_mmsu_ci.py's request: every mmsu-ci-2000 question, text out, greedy, 32 tokens.
+        mmsu_args = argparse.Namespace(
+            base_url=None, host="127.0.0.1", port=port, model="qwen3-omni", modalities="text", output_dir=str(out),
+            max_samples=None, task_names=None, categories=None, prompt=None, max_tokens=32, temperature=0.0,
+            warmup=0, max_concurrency=concurrency, request_rate=float("inf"), timeout_s=300, save_audio=False,
+            disable_tqdm=True, seed=None, fingerprint=False, repo_id=DATASETS["mmsu-ci-2000"], lang="en",
+            asr_device="cuda:0")
+        results = asyncio.run(run(mmsu_args))
     else:
         from benchmarks.eval.benchmark_omni_mmmu import MMMUEvalConfig, run_mmmu_eval
 
@@ -62,15 +73,17 @@ def client(benchmark: str, port: int, concurrency: int, out: Path) -> None:
 
 
 def run_pass(
-    out: Path, pass_name: str, arm: str, card: int, config: str, model: str, benchmark: str
+    out: Path, pass_name: str, arm: str, card: int, config: str, model: str, benchmark: str, extra: list[str]
 ) -> dict[str, object]:
     arm_out = out / pass_name / arm
     arm_out.mkdir(parents=True, exist_ok=True)
     arm_tree = pair_check.tree(pair_check.ARMS[arm][0])
     port = PORT + 200 * card
     pair_check.log(out, f"{pass_name} {arm} card {card} serving")
+    # note (ratish): the MMSU stage serves its thinker-only config as is; the video and MMMU stages add these.
+    base = [] if benchmark == "mmsu" else SERVE_ARGS
     server = pair_check.serve(
-        card, arm_tree, model, port, ["--config", config, *SERVE_ARGS], arm_out / "server.log")
+        card, arm_tree, model, port, ["--config", config, *base, *extra], arm_out / "server.log")
     try:
         pair_check.log(out, f"{pass_name} {arm} card {card} healthy, client")
         rc = subprocess.run(
@@ -88,17 +101,22 @@ def run_pass(
         return dict(rc=rc)
     else:
         pass
-    summary = json.loads((arm_out / f"{benchmark}.json").read_text())["summary"]
+    results = json.loads((arm_out / f"{benchmark}.json").read_text())
+    summary = results.get("summary") or results.get("accuracy") or {}
+    speed = results.get("speed") or {}
     pair_check.log(
-        out, f"{pass_name} {arm} card {card} accuracy {summary.get('accuracy')} failed {summary.get('failed')}"
+        out, f"{pass_name} {arm} card {card} accuracy {summary.get('accuracy', summary.get('overall_accuracy'))} "
+        f"failed {summary.get('failed')} throughput {speed.get('throughput_qps')} latency {speed.get('latency_mean_s')}"
     )
-    return dict(rc=rc, accuracy=summary.get("accuracy"), failed=summary.get("failed"))
+    return dict(rc=rc, accuracy=summary.get("accuracy", summary.get("overall_accuracy")), failed=summary.get("failed"))
 
 
 def run_chain(
-    out: Path, passes: list[str], arm: str, card: int, config: str, model: str, benchmark: str
+    out: Path, passes: list[str], arm: str, card: int, config: str, model: str, benchmark: str, extra: list[str]
 ) -> dict[str, object]:
-    return {pass_name: run_pass(out, pass_name, arm, card, config, model, benchmark) for pass_name in passes}
+    return {
+        pass_name: run_pass(out, pass_name, arm, card, config, model, benchmark, extra) for pass_name in passes
+    }
 
 
 def main() -> None:
@@ -111,7 +129,8 @@ def main() -> None:
     parser.add_argument("--concurrency", type=int)
     parser.add_argument("--config", default=CI_CONFIG, help="the pipeline config, relative to the tree or absolute")
     parser.add_argument("--model", default=MODEL, help="the checkpoint, served with --config's matching precision")
-    parser.add_argument("--benchmark", choices=("videoamme", "mmmu"), default="videoamme")
+    parser.add_argument("--benchmark", choices=("videoamme", "mmmu", "mmsu"), default="videoamme")
+    parser.add_argument("--serve-arg", action="append", default=[], help="one more serve argument, repeatable")
     args = parser.parse_args()
     if args.client:
         client(args.benchmark, args.port, args.concurrency, args.out)
@@ -127,7 +146,7 @@ def main() -> None:
         records = list(
             pool.map(
                 lambda placement: run_chain(
-                    args.out, passes, *placement, args.config, args.model, args.benchmark
+                    args.out, passes, *placement, args.config, args.model, args.benchmark, args.serve_arg
                 ),
                 placements,
             )

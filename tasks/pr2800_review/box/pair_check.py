@@ -148,6 +148,7 @@ ARMS = {
     "flf": ("flf", [], [0.7769]),
     "flfb": ("flf", [], [0.7769]),
     "flg": ("flg", [], [0.7769]),
+    "flgb": ("flg", [], [0.7769]),
 }
 # arm: benchmark args every pass of the arm adds
 ARM_BENCH_ARGS: dict[str, list[str]] = {}
