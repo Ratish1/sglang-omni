@@ -1,7 +1,8 @@
 """Whether the talker's departure from HF at a decode step lies in HF's incremental cache or in the served talker.
 
-Runs only in the isolated reference environment, on one card (the talker alone, about 7 GB):
-    PYTHONPATH=<4.57.1 env> CUDA_VISIBLE_DEVICES=<card> python3 talker_cache_check.py --trace <file> [--steps a:b]
+Runs on the image's transformers (or the isolated 4.57.1 environment), on one card (the whole model is loaded the
+standard way, so the loader maps the checkpoint onto the talker's own expert layout, about 70 GB):
+    CUDA_VISIBLE_DEVICES=<card> python3 talker_cache_check.py --trace <file> [--steps a:b]
     or --trace-dir <dir> [--threshold kl]: for every trace, the decode steps departing from HF's cached pass
 HF's talker (bf16 Instruct weights) reads the traced request's prompt rows and decode rows twice: one token at a time
 on a DynamicCache, as talker_parity.py does, and as one forward over the whole sequence with no cache. Per step it
@@ -12,13 +13,11 @@ from each, and the served talker hidden against each pass's.
 from __future__ import annotations
 
 import argparse
-import json
 from pathlib import Path
 
 import torch
-from huggingface_hub import snapshot_download
-from safetensors import safe_open
-from transformers import AutoConfig, DynamicCache
+import transformers
+from transformers import DynamicCache, Qwen3OmniMoeForConditionalGeneration
 from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import Qwen3OmniMoeTalkerForConditionalGeneration
 
 MODEL = "Qwen/Qwen3-Omni-30B-A3B-Instruct"
@@ -26,24 +25,11 @@ TEMPERATURE = 0.9
 
 
 def load_talker() -> Qwen3OmniMoeTalkerForConditionalGeneration:
-    config = AutoConfig.from_pretrained(MODEL).talker_config
-    with torch.device("cuda"):
-        talker = Qwen3OmniMoeTalkerForConditionalGeneration._from_config(config, torch_dtype=torch.bfloat16)  # noqa: leading-underscore  # HF's own constructor
-    root = Path(snapshot_download(MODEL, allow_patterns=["*.json"]))
-    weight_map = json.loads((root / "model.safetensors.index.json").read_text())["weight_map"]
-    shards = sorted({shard for key, shard in weight_map.items() if key.startswith("talker.")})
-    state = {}
-    for shard in shards:
-        path = Path(snapshot_download(MODEL, allow_patterns=[shard])) / shard
-        with safe_open(str(path), "pt") as handle:
-            for key in handle.keys():
-                if key.startswith("talker."):
-                    state[key[len("talker."):]] = handle.get_tensor(key)
-                else:
-                    pass
-    missing, unexpected = talker.load_state_dict(state, strict=False)
-    print(f"talker loaded: {len(state)} tensors, missing {len(missing)}, unexpected {len(unexpected)}", flush=True)
-    return talker.eval()
+    # note (ratish): from 5.x the talker's experts are packed tensors that only the standard loader maps the
+    # checkpoint's per-expert weights onto.
+    model = Qwen3OmniMoeForConditionalGeneration.from_pretrained(MODEL, dtype=torch.bfloat16, device_map={"": "cuda"})
+    print(f"talker loaded the standard way on transformers {transformers.__version__}", flush=True)
+    return model.talker.eval()
 
 
 def log_probs(logits: torch.Tensor, suppressed: torch.Tensor) -> torch.Tensor:
@@ -66,7 +52,6 @@ def departures(talker: Qwen3OmniMoeTalkerForConditionalGeneration, trace: dict, 
     suppressed[vocab - 1024:] = True
     suppressed[talker.config.codec_eos_token_id] = False
     prompt_rows = trace["prompt_rows"].cuda().to(torch.bfloat16)
-    length = prompt_rows.shape[0]
     if is_fractional:
         # HF's get_rope_index keeps the prompt positions in float and its delta from the float largest one.
         positions = trace["mrope_positions"].float().cuda()
@@ -93,8 +78,7 @@ def departures(talker: Qwen3OmniMoeTalkerForConditionalGeneration, trace: dict, 
         output = talker.model(inputs_embeds=row.view(1, 1, -1),
                               position_ids=torch.full((3, 1, 1), next_position + position_offset + step,
                                                       device="cuda", dtype=torch.float32),
-                              past_key_values=cache, use_cache=True,
-                              cache_position=torch.tensor([length + step], device="cuda"))
+                              past_key_values=cache, use_cache=True)
     return found
 
 
@@ -150,8 +134,7 @@ def main() -> None:
     for step in range(steps):
         position = torch.full((3, 1, 1), next_position + step, device="cuda")
         output = talker.model(inputs_embeds=decode_rows[step].view(1, 1, -1), position_ids=position,
-                              past_key_values=cache, use_cache=True,
-                              cache_position=torch.tensor([length + step], device="cuda"))
+                              past_key_values=cache, use_cache=True)
         cached_hidden.append(output.last_hidden_state[0, -1])
     cached_hidden = torch.stack(cached_hidden)
     for step in range(first, min(last, steps + 1)):
