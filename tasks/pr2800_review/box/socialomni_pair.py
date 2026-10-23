@@ -28,6 +28,7 @@ import pair_check  # noqa: E402
 MODEL = "Qwen/Qwen3-Omni-30B-A3B-Instruct"
 DATASET = "alexisty/SocialOmni"
 DATASET_REVISION = "3b76009b45090eaa54007454c93a831f3cc8e1e6"
+DATASET_DIR = Path("/data/pr2800/socialomni")
 SERVE_ARGS = [
     "--text-only", "--model-name", "qwen3-omni", "--preprocessing.factory.max_seq_len", "65536",
     "--thinker.factory.max_seq_len", "65536",
@@ -77,8 +78,10 @@ def main() -> None:
     parser.add_argument("--out", type=Path, required=True)
     args = parser.parse_args()
     args.out.mkdir(parents=True, exist_ok=True)
+    # note (ratish): the benchmark refuses metadata resolving outside its root, so the files are laid out in a
+    # directory of their own as benchmarks.dataset.prepare does, not read through the cache's symlinks.
     dataset_root = snapshot_download(DATASET, repo_type="dataset", revision=DATASET_REVISION,
-                                     allow_patterns=["README.md", "data/level_1/*"])
+                                     local_dir=str(DATASET_DIR), allow_patterns=["README.md", "data/level_1/**"])
     hooked = set(filter(None, args.hook_arms.split(",")))
     placements = [(arm, int(card)) for arm, card in (entry.split("@") for entry in args.arms.split(","))]
     with ThreadPoolExecutor(max_workers=len(placements)) as pool:
