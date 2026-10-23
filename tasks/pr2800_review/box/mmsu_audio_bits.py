@@ -34,6 +34,7 @@ AUDIO_PROMPT = "<|audio_start|><|audio_pad|><|audio_end|>"
 WORKERS = 12
 
 processor = None
+thinker_config = None
 
 
 def write_samples(path: Path) -> None:
@@ -44,16 +45,31 @@ def write_samples(path: Path) -> None:
 
 
 def start_worker() -> None:
-    global processor
-    from transformers import Qwen3OmniMoeProcessor
+    global processor, thinker_config
+    from transformers import AutoConfig, Qwen3OmniMoeProcessor
 
     processor = Qwen3OmniMoeProcessor.from_pretrained(MODEL)
+    thinker_config = AutoConfig.from_pretrained(MODEL).thinker_config
 
 
 def features(array):
     inputs = processor(text=AUDIO_PROMPT, audio=[array], add_special_tokens=False, return_tensors="pt")
     audio_tokens = int((inputs["input_ids"][0] == processor.tokenizer.convert_tokens_to_ids("<|audio_pad|>")).sum())
-    return inputs["input_features"], audio_tokens
+    return inputs, audio_tokens
+
+
+def positions_digest(inputs) -> str:
+    import hashlib
+
+    from sglang_omni.models.qwen3_omni.request_builders import compute_mrope_positions
+
+    positions, delta = compute_mrope_positions(
+        inputs["input_ids"][0],
+        {"audio_feature_lengths": inputs["feature_attention_mask"].sum(-1)},
+        thinker_config,
+    )
+    digest = hashlib.sha256(positions.to(dtype=positions.dtype).contiguous().numpy().tobytes()).hexdigest()[:16]
+    return f"{digest} {positions.dtype} delta {delta.flatten().tolist()}"
 
 
 def largest_difference(a, b) -> float:
@@ -80,8 +96,10 @@ def compare(sample: dict) -> dict:
     served = load_audio_path(path, target_sr=16000)
     reference = librosa.load(path, sr=16000)[0]
     sglang = load_audio(path, sr=16000)
-    served_features, served_tokens = features(served)
-    reference_features, reference_tokens = features(reference)
+    served_inputs, served_tokens = features(served)
+    reference_inputs, reference_tokens = features(reference)
+    served_features = served_inputs["input_features"]
+    reference_features = reference_inputs["input_features"]
     return dict(
         sample_id=sample["sample_id"],
         stored_rate=int(info.samplerate),
@@ -99,6 +117,7 @@ def compare(sample: dict) -> dict:
         features_difference=largest_difference(served_features.numpy(), reference_features.numpy()),
         served_audio_tokens=served_tokens,
         reference_audio_tokens=reference_tokens,
+        reference_positions=positions_digest(reference_inputs),
     )
 
 
