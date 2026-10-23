@@ -97,6 +97,8 @@ def real(name, value, codes):
 
 def main() -> None:
     count = int(sys.argv[1]) if len(sys.argv) > 1 else 6
+    # note (ratish): CUDNN_TF32=0 turns cuDNN's TF32 convs off, torch's default being on.
+    torch.backends.cudnn.allow_tf32 = os.environ.get("CUDNN_TF32", "1") == "1"
     device = torch.device("cuda", 0)
     model = load_speech_tokenizer(os.path.join(resolve_checkpoint(MODEL), "speech_tokenizer_v3.onnx"), device)
     widths = [*generate_prefill_cuda_graph_batch_sizes(MAX_FRAMES - 1), MAX_FRAMES]
