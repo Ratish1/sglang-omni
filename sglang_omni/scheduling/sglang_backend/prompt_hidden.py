@@ -16,8 +16,7 @@ from sglang.srt.mem_cache.pool_host.common import (  # noqa: leading-underscore 
     HostTensorAllocator,
     _cuda_host_unregister,
 )
-
-from sglang_omni.platforms import current_platform
+from sglang.srt.utils import is_cuda, is_hip
 
 logger = logging.getLogger(__name__)
 
@@ -106,7 +105,7 @@ class PromptHiddenStore:
             return
         else:
             pass
-        if current_platform.is_cuda_alike():
+        if is_cuda() or is_hip():
             _cuda_host_unregister(self.hidden_states)
         else:
             pass
