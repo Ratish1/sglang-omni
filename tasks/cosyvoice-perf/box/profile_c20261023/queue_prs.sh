@@ -46,6 +46,13 @@ tree t_l3e $l3e
 log "queue prs start t_marks $(git -C /workspace/t_marks rev-parse --short HEAD) loadavg $(cut -d' ' -f1-3 /proc/loadavg)"
 units() {
   local name=$1 card=$2
+  # note (ratish): a restart keeps a passed run of the same tree (10-23, the worst step's list failed after them).
+  if grep -q "units $name rc 0" $P/queue.txt; then
+    log "units $name kept"
+    return
+  else
+    :
+  fi
   rm -rf $P/inductor_units_$name
   (cd /workspace/$name && CUDA_VISIBLE_DEVICES=$card TORCHINDUCTOR_CACHE_DIR=$P/inductor_units_$name \
     PYTHONPATH=/workspace/$name:$COSYVOICE taskset -c $(cpus $card) \
@@ -58,8 +65,9 @@ units t_l3e 1 &
 wait
 grep -q 'units t_l5h rc 0' $P/queue.txt && grep -q 'units t_l3e rc 0' $P/queue.txt || { log "units failed, stop"; exit 1; }
 for rows in 16 32; do
-  [ -s $D/worst$rows/meta.lst ] || (cd /workspace/t_mh && python3 $IN/make_worst_meta_c20261011.py --out $D/worst$rows \
-    --requests $rows > $P/worst_meta_$rows.log 2>&1)
+  [ -s $D/worst$rows/meta.lst ] || (cd /workspace/t_mh && PYTHONPATH=/workspace/t_mh python3 \
+    $IN/make_worst_meta_c20261011.py --out $D/worst$rows --requests $rows > $P/worst_meta_$rows.log 2>&1)
+  [ -s $D/worst$rows/meta.lst ] || { log "worst list $rows failed, stop"; exit 1; }
 done
 rm -rf $D/inductor_t_l4h
 python3 $IN/worst_step_c20261021.py /workspace/t_l4h 0 $(cpus 0) 46000 $P/worst_l4h_16 16 $D/worst16/meta.lst > $P/worst_l4h_16.txt 2>&1 &
