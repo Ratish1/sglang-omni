@@ -22,13 +22,13 @@ from sglang_omni.kernels.bias_snake_beta import (
     ("with_residual", "with_sum"),
     [(False, False), (False, True), (True, False), (True, True)],
 )
-@pytest.mark.parametrize("round_like_eager", [True, False])
+@pytest.mark.parametrize("should_round_like_eager", [True, False])
 def test_bias_snake_matches_the_eager_rounding_or_fp32_rounded_once(
     dtype: torch.dtype,
     channels: int,
     with_residual: bool,
     with_sum: bool,
-    round_like_eager: bool,
+    should_round_like_eager: bool,
 ) -> None:
     torch.manual_seed(0)
     original = Qwen3OmniMoeSnakeBeta(channels).to(device="cuda", dtype=dtype).eval()
@@ -51,9 +51,9 @@ def test_bias_snake_matches_the_eager_rounding_or_fp32_rounded_once(
             padded_input[:, 6:43],
             residual=residual if with_residual else None,
             sum_out=sum_out if with_sum else None,
-            round_like_eager=round_like_eager,
+            should_round_like_eager=should_round_like_eager,
         )
-        if round_like_eager:
+        if should_round_like_eager:
             expected_sum = (
                 conv_output + bias + residual if with_residual else conv_output + bias
             )

@@ -370,7 +370,7 @@ def bias_activation(
             out,
             residual=residual,
             sum_out=sum_out,
-            round_like_eager=False,
+            should_round_like_eager=False,
         )
     else:
         total = conv_output + bias
