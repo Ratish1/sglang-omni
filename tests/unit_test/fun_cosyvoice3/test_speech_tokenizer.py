@@ -64,8 +64,6 @@ def test_graph_replays_match_the_tf32_model_at_their_width(
 @pytest.mark.accelerator
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_graphs_keep_the_model_their_replays_read() -> None:
-    """The graphs keep the model whose weights their replays read for as long as
-    they live, with no other reference to it."""
     device = torch.device("cuda")
     model = small_model().to(device)
     model_reference = weakref.ref(model)
