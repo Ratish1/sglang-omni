@@ -26,10 +26,16 @@ if mode == "stale":
         'if __name__ == "__main__":\n',
         'if __name__ == "__main__":\n    open(' + FOREIGN + ', "x").close()\n',
     )
-elif mode == "overlap":
+elif mode == "overlap" and "    return rebuild, arguments\n" in source:
     source = source.replace(
         "    return rebuild, arguments\n",
         "    open(" + FOREIGN + ', "x").close()\n    return rebuild, arguments\n',
+    )
+elif mode == "overlap":
+    source = source.replace(
+        "    files_before_sending = set(glob.glob(pattern))\n",
+        "    files_before_sending = set(glob.glob(pattern))\n"
+        "    open(" + FOREIGN + ', "x").close()\n',
     )
 elif mode == "missing-cleanup":
     source = source.replace(
@@ -57,6 +63,12 @@ with tempfile.TemporaryDirectory(prefix="serve-exit-probe-") as directory:
     remaining = (
         [] if report is None else [path for path in report if Path(path).exists()]
     )
+    if isinstance(report, dict):
+        test_assertions_hold = list(report.values()) == [True] and remaining == []
+    elif isinstance(report, list):
+        test_assertions_hold = bool(report) and remaining == []
+    else:
+        test_assertions_hold = False
     print(
         json.dumps(
             {
@@ -68,9 +80,7 @@ with tempfile.TemporaryDirectory(prefix="serve-exit-probe-") as directory:
                     report and foreign and set(foreign) & set(report)
                 ),
                 "remaining_after_exit": remaining,
-                "test_assertions_hold": report is not None
-                and list(report.values()) == [True]
-                and remaining == [],
+                "test_assertions_hold": test_assertions_hold,
                 "stderr_tail": sender.stderr[-300:] if sender.returncode else "",
             }
         ),
