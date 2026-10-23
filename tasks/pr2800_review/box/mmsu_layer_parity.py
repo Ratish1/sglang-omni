@@ -98,11 +98,17 @@ def hf_client(arm_out: Path, dtype_name: str, out: Path) -> None:
     )
     results_dir = out / f"hf_{dtype_name}"
     results_dir.mkdir(parents=True, exist_ok=True)
+    audio_token_id = model.config.thinker_config.audio_token_id
+    vocab_size = model.config.thinker_config.text_config.vocab_size
     pairs = requests(arm_out)
     for index, (inputs_path, _) in enumerate(pairs):
         served = torch.load(inputs_path, weights_only=False)
-        input_ids = torch.tensor([served["origin_input_ids"]])
-        input_features, feature_mask = features[tuple(served["origin_input_ids"])]
+        # note (ratish): the thinker's prompt carries the audio's cache pad value at its audio rows.
+        prompt_ids = [
+            audio_token_id if token_id >= vocab_size else token_id for token_id in served["origin_input_ids"]
+        ]
+        input_ids = torch.tensor([prompt_ids])
+        input_features, feature_mask = features[tuple(prompt_ids)]
         captured.clear()
         thinker.rope_deltas = None
         with torch.no_grad():
@@ -238,6 +244,7 @@ def main() -> None:
     parser.add_argument("--hf-client", action="store_true")
     parser.add_argument("--analyze", action="store_true")
     parser.add_argument("--dtype", choices=("fp32", "bf16"))
+    parser.add_argument("--reuse-served", action="store_true", help="skip serving; read <out>/<arm>'s dumps")
     args = parser.parse_args()
     if args.hf_client:
         hf_client(args.out / args.arm, args.dtype, args.out)
@@ -249,7 +256,7 @@ def main() -> None:
         pass
     args.out.mkdir(parents=True, exist_ok=True)
     arm_tree = pair_check.tree(pair_check.ARMS[args.arm][0])
-    if serve_and_record(args.out, args.arm) != 0:
+    if not args.reuse_served and serve_and_record(args.out, args.arm) != 0:
         pair_check.log(args.out, "stopped: the served pass failed")
         return
     else:
