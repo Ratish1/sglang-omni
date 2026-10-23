@@ -38,15 +38,14 @@ def test_codes_of_a_mel_ignore_what_fills_its_padded_width() -> None:
 
 @pytest.mark.accelerator
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-def test_graph_replays_match_the_tf32_model_at_their_width(
-    monkeypatch: pytest.MonkeyPatch,
+@pytest.mark.parametrize("allow_tf32", [False, True])
+def test_graph_replays_match_the_model_in_the_process_math_mode(
+    monkeypatch: pytest.MonkeyPatch, allow_tf32: bool
 ) -> None:
     device = torch.device("cuda")
     model = small_model().to(device)
-    monkeypatch.setattr(torch.backends.cuda.matmul, "allow_tf32", False)
+    monkeypatch.setattr(torch.backends.cuda.matmul, "allow_tf32", allow_tf32)
     graphs = SpeechTokenizerCudaGraphs(model, device)
-    assert not torch.backends.cuda.matmul.allow_tf32
-    torch.backends.cuda.matmul.allow_tf32 = True
 
     for frames in (300, 290, 37):
         mel = torch.randn(1, 128, frames)

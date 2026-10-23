@@ -250,33 +250,27 @@ class SpeechTokenizerCudaGraphs:
         self.graphs: dict[int, CapturedTokenizerGraph] = {}
         pool = torch.cuda.graph_pool_handle()
         self.stream = torch.cuda.Stream(device)
-        # note (ratish): TF32 matmuls, as ONNX Runtime ran this graph; full fp32 took
-        # 2.6 times the device time. The graphs keep the math mode they are captured
-        # with, and the process keeps its own.
-        allow_tf32 = torch.backends.cuda.matmul.allow_tf32
-        torch.backends.cuda.matmul.allow_tf32 = True
-        try:
-            with torch.inference_mode(), freeze_gc(enable_cudagraph_gc=False):
-                for width in reversed(self.widths):
-                    mel = torch.zeros(1, model.conv1.in_channels, width, device=device)
-                    frames = torch.full((1,), width, dtype=torch.int64, device=device)
-                    self.stream.wait_stream(torch.cuda.current_stream(device))
-                    with torch.cuda.stream(self.stream):
-                        for _ in range(2):
-                            model(mel, frames)
-                    graph = torch.cuda.CUDAGraph()
-                    with torch.cuda.graph(
-                        graph,
-                        pool=pool,
-                        stream=self.stream,
-                        capture_error_mode="thread_local",
-                    ):
-                        codes = model(mel, frames)
-                    self.graphs[width] = CapturedTokenizerGraph(
-                        graph=graph, mel=mel, frames=frames, codes=codes
-                    )
-        finally:
-            torch.backends.cuda.matmul.allow_tf32 = allow_tf32
+        # note (ratish): captured in the process's math mode, TF32 off unless the server
+        # enables it: in TF32, padding a mel to its graph's width moved 100 of 127,889 codes.
+        with torch.inference_mode(), freeze_gc(enable_cudagraph_gc=False):
+            for width in reversed(self.widths):
+                mel = torch.zeros(1, model.conv1.in_channels, width, device=device)
+                frames = torch.full((1,), width, dtype=torch.int64, device=device)
+                self.stream.wait_stream(torch.cuda.current_stream(device))
+                with torch.cuda.stream(self.stream):
+                    for _ in range(2):
+                        model(mel, frames)
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(
+                    graph,
+                    pool=pool,
+                    stream=self.stream,
+                    capture_error_mode="thread_local",
+                ):
+                    codes = model(mel, frames)
+                self.graphs[width] = CapturedTokenizerGraph(
+                    graph=graph, mel=mel, frames=frames, codes=codes
+                )
         torch.cuda.synchronize(device)
 
     def tokenize(self, mel: torch.Tensor) -> list[int]:
