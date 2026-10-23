@@ -933,6 +933,10 @@ class Qwen3OmniTalker(nn.Module):
             dtype=torch.bool,
             device=device,
         )
+        self.suppress_token_cache: dict[tuple[int, ...], torch.Tensor | None] = {}
+        self.suppress_token_ids_by_request: dict[
+            str, tuple[list[int] | tuple[int, ...] | None, torch.Tensor | None]
+        ] = {}
         self.sampling_temperatures = torch.ones(
             max_batch_size,
             1,
@@ -1089,8 +1093,10 @@ class Qwen3OmniTalker(nn.Module):
         sampling_seeds: list[int] = []
         rep_rows: list[int] = []
         rep_toks: list[int] = []
-        sup_rows: list[int] = []
-        sup_toks: list[int] = []
+        suppress_groups: dict[int, tuple[torch.Tensor, list[int]]] = {}
+        suppress_token_ids_by_request: dict[
+            str, tuple[list[int] | tuple[int, ...] | None, torch.Tensor | None]
+        ] = {}
 
         for row_idx, sched_req in enumerate(requests):
             data = sched_req.data
@@ -1132,19 +1138,41 @@ class Qwen3OmniTalker(nn.Module):
             suppress_tokens = (
                 data.suppress_tokens or req._codec_suppress_tokens
             )  # noqa: leading-underscore  # upstream spelling, or the public name is already taken
-            if suppress_tokens:
-                valid_sup = [
-                    t
-                    for t in (int(tok) for tok in suppress_tokens)
-                    if 0 <= t < sup_vocab
-                ]
-                if valid_sup:
-                    sup_rows.extend([row_idx] * len(valid_sup))
-                    sup_toks.extend(valid_sup)
+            # note (ratish): each request's set resolves once, so a batch change does not
+            # expand or hash every row's ids again.
+            resolved_suppress = self.suppress_token_ids_by_request.get(req.rid)
+            if (
+                resolved_suppress is not None
+                and resolved_suppress[0] is suppress_tokens
+            ):
+                suppress_token_ids = resolved_suppress[1]
+            elif suppress_tokens:
+                suppress_content = tuple(int(tok) for tok in suppress_tokens)
+                if suppress_content not in self.suppress_token_cache:
+                    valid_sup = [t for t in suppress_content if 0 <= t < sup_vocab]
+                    self.suppress_token_cache[suppress_content] = (
+                        torch.tensor(valid_sup, dtype=torch.long, device=device)
+                        if valid_sup
+                        else None
+                    )
                 else:
                     pass
+                suppress_token_ids = self.suppress_token_cache[suppress_content]
             else:
+                suppress_token_ids = None
+            suppress_token_ids_by_request[req.rid] = (
+                suppress_tokens,
+                suppress_token_ids,
+            )
+            if suppress_token_ids is None:
                 pass
+            elif id(suppress_token_ids) in suppress_groups:
+                suppress_groups[id(suppress_token_ids)][1].append(row_idx)
+            else:
+                suppress_groups[id(suppress_token_ids)] = (
+                    suppress_token_ids,
+                    [row_idx],
+                )
 
         if self.sampling_staging_event is not None:
             # Note (akazaakane): guards the prior async copy still reading
@@ -1190,15 +1218,13 @@ class Qwen3OmniTalker(nn.Module):
         else:
             pass
 
-        if sup_rows:
-            sup_pairs = torch.tensor(
-                sup_rows + sup_toks, dtype=torch.long, device=device
-            )
-            self.suppress_mask[
-                sup_pairs[: len(sup_rows)], sup_pairs[len(sup_rows) :]
-            ] = True
-        else:
-            pass
+        for suppress_token_ids, suppress_rows in suppress_groups.values():
+            if len(suppress_rows) == batch_size:
+                self.suppress_mask[:batch_size].index_fill_(1, suppress_token_ids, True)
+            else:
+                row_ids = torch.tensor(suppress_rows, dtype=torch.long, device=device)
+                self.suppress_mask[row_ids[:, None], suppress_token_ids[None, :]] = True
+        self.suppress_token_ids_by_request = suppress_token_ids_by_request
 
         self.decode_prep_rids = [sched_req.data.req.rid for sched_req in requests]
         self.decode_prep_out_lens = [

@@ -2275,6 +2275,8 @@ def talker_seed_self(
     fake = SimpleNamespace(
         repetition_mask=torch.zeros(max_bs, vocab, dtype=torch.bool, device=device),
         suppress_mask=torch.zeros(max_bs, vocab, dtype=torch.bool, device=device),
+        suppress_token_cache={},
+        suppress_token_ids_by_request={},
         repetition_penalties=torch.ones(max_bs, 1, device=device),
         sampling_temperatures=torch.ones(max_bs, 1, device=device),
         sampling_top_ps=torch.ones(max_bs, device=device),
@@ -2411,6 +2413,31 @@ def test_talker_prepare_decode_buffers_steady_state_reuse() -> None:
     Qwen3OmniTalker.prepare_decode_buffers(fresh, requests)
     assert torch.equal(fake.repetition_mask, fresh.repetition_mask)
     assert torch.equal(fake.suppress_mask, fresh.suppress_mask)
+
+
+@pytest.mark.parametrize("share_rows", [True, False])
+def test_talker_prepare_decode_buffers_masks_each_rows_own_suppress_set(
+    share_rows: bool,
+) -> None:
+    vocab = 8
+    shared = [1, 6, 7, 9, -2]
+    if share_rows:
+        batches = ([shared] * 4, [shared] * 3)
+    else:
+        batches = ([shared, [2, 3], None, shared], [[2, 3], shared, [4]])
+    fake = talker_seed_self(vocab=vocab)
+    for step, suppress_per_row in enumerate(batches):
+        requests = [
+            talker_prep_req(f"step{step}-row{row}", suppress=suppress)
+            for row, suppress in enumerate(suppress_per_row)
+        ]
+        Qwen3OmniTalker.prepare_decode_buffers(fake, requests)
+        expected = torch.zeros(len(requests), vocab, dtype=torch.bool)
+        for row, suppress in enumerate(suppress_per_row):
+            expected[row, [token for token in suppress or [] if 0 <= token < vocab]] = (
+                True
+            )
+        assert torch.equal(fake.suppress_mask[: len(requests)], expected), step
 
 
 @pytest.mark.accelerator
