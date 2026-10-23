@@ -15,6 +15,8 @@ reference at concurrency 1, seeded) and Lb16 (the long form list at concurrency 
 Later on 10-21: PAIR_HOME names the run home (default /data/c20261021), for the 0.5.22 container's /data/c20261021b.
 10-22: a seeded cell named <cell>_s<seed> runs under that seed, and PAIR_CELLS_B gives order b its own cells, so each
 order of a pair draws its own seeded outputs (the quality draws).
+10-23: no --warmup, so the benchmark warms at each cell's concurrency as its default does (#1789); --warmup 1 left
+every cell's first cohort to run cold at that concurrency (`profile_c20261022/warmup_cohort.py`).
 usage: python3 serve_pair_c20261021.py <first tree> <second tree> <out dir>"""
 
 import json
@@ -128,7 +130,7 @@ def run_order(trees, out, cells):
                 subprocess.Popen(
                     ["taskset", "-c", CPUS[gpu], "python3", "-u", "-m", "benchmarks.eval.benchmark_tts_seedtts",
                      "--model", MODEL, "--port", str(port),
-                     "--lang", "en", "--warmup", "1", "--use-existing-server", "--generate-only",
+                     "--lang", "en", "--use-existing-server", "--generate-only",
                      *(["--stream"] if is_stream else []),
                      "--output-dir", str(out / f"gpu{gpu}" / cell), *flags],
                     cwd=tree, env=environment(tree, ""),
