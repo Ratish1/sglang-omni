@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+import gc
 import signal
+import weakref
 from collections.abc import Coroutine
 from pathlib import Path
 from traceback import format_exception
@@ -677,6 +679,11 @@ async def test_server_reports_up_after_warmup_then_freezes_every_process_heap(
             events.append(("stage gc frozen", app.state.server_status))
 
     route_warmup_to(monkeypatch, httpx.MockTransport(respond))
+    monkeypatch.setattr(
+        launcher.gc,
+        "collect",
+        lambda: events.append(("api gc collected", app.state.server_status)),
+    )
     server = SimpleNamespace(
         started=True,
         should_exit=False,
@@ -696,12 +703,53 @@ async def test_server_reports_up_after_warmup_then_freezes_every_process_heap(
     )
 
     assert posted == [request] * request_count
-    assert events == [("warmup request", ServerStatus.STARTING)] * request_count + [
-        ("stage gc frozen", ServerStatus.UP),
-        ("api gc frozen", ServerStatus.UP),
-    ]
+    collected = [("api gc collected", ServerStatus.STARTING)] if request_count else []
+    assert events == (
+        [("warmup request", ServerStatus.STARTING)] * request_count
+        + collected
+        + [
+            ("stage gc frozen", ServerStatus.UP),
+            ("api gc frozen", ServerStatus.UP),
+        ]
+    )
     assert app.state.server_status is ServerStatus.UP
     assert server.should_exit is False
+
+
+@pytest.mark.asyncio
+async def test_api_heap_freeze_keeps_no_warmup_response(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The API heap freeze kept every warmup response for the server's lifetime."""
+    response_references: list[weakref.ref[httpx.Response]] = []
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        response = httpx.Response(200)
+        response_references.append(weakref.ref(response))
+        return response
+
+    route_warmup_to(monkeypatch, httpx.MockTransport(respond))
+    server = launcher.PipelineUvicornServer(uvicorn.Config("unused:app"))
+    server.started = True
+    app = FastAPI()
+    app.state.server_status = ServerStatus.STARTING
+    request = ChatCompletionRequest(messages=[ChatMessage(role="user", content="Hi")])
+
+    try:
+        await launcher.warm_up_server(
+            server,
+            app,
+            StubCoordinator(),
+            base_url="http://127.0.0.1:8000",
+            requests=[request] * 2,
+            timeout_s=5,
+        )
+        gc.collect()
+
+        assert server.has_frozen_api_gc is True
+        assert [reference() for reference in response_references] == [None, None]
+    finally:
+        gc.unfreeze()
 
 
 @pytest.mark.asyncio
