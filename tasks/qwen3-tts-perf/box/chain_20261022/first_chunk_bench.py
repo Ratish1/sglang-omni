@@ -139,11 +139,16 @@ def main() -> None:
                 for name, run in (("whole", windows), ("capped", capped_tail)):
                     emitted = run().clone()
                     gathered = arena.gather(slots)
+                    # main's gather returns the cohort's rows, the slot conv stack's the whole pools
+                    conv_rows = [
+                        pool.clone() if pool.shape[0] == batch else pool.index_select(0, index)
+                        for pool in (*gathered.conv_histories.values(), *gathered.transconv_overlaps.values())
+                    ]
                     outputs[name] = [
                         emitted,
                         *(value.clone() for value in gathered.transformer_keys.values()),
                         *(value.clone() for value in gathered.transformer_values.values()),
-                        *(pool.index_select(0, index) for pool in gathered.conv_histories.values()),
+                        *conv_rows,
                     ]
                 errors = [
                     ((capped.float() - whole.float()).norm() / whole.float().norm().clamp_min(1e-30)).item()
