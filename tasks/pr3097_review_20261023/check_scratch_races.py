@@ -29,7 +29,7 @@ def main() -> None:
         mode="warm",
         fresh_frames=(1,),
         batch_sizes=(4,),
-        arena=SimpleNamespace(scratch_slot=0),
+        arena=SimpleNamespace(scratch_slot=4),
         graph_pool=IncrementalCodecGraphPool(stream_priority=0),
         enabled=False,
     )
@@ -42,11 +42,11 @@ def main() -> None:
         flush=True,
     )
     if arguments.operation == "history":
-        history_pool = torch.zeros(4, 54, 64, device=device, dtype=torch.bfloat16)
+        history_pool = torch.zeros(5, 54, 64, device=device, dtype=torch.bfloat16)
         padded = torch.ones(4, 55, 64, device=device, dtype=torch.bfloat16)
         history_exchange(padded, history_pool, slot_index, new_samples=1, is_cold=False)
     else:
-        overlap_pool = torch.zeros(4, 4, 64, device=device, dtype=torch.bfloat16)
+        overlap_pool = torch.zeros(5, 4, 64, device=device, dtype=torch.bfloat16)
         output = torch.ones(4, 8, 64, device=device, dtype=torch.bfloat16)
         overlap_exchange(
             output, overlap_pool, slot_index, emitted_samples=4, is_cold=False
