@@ -1,10 +1,12 @@
-"""The first chunk of a stream behind an 88 s reference (1,100 reference frames and 1 generated) as the Qwen3-TTS
-vocoder decodes it, on the tree on PYTHONPATH: today's path, the whole width through window graphs of up to 64 frames
-replayed one after another on the stream's slot, against the capped path, the last first_chunk_reference_frames(1) + 1
-frames in one tail replay from a slot started there (skipped on a tree without the cap). Per batch (1 and 8 rows):
-the device time of the chunk from CUDA events and its host time (medians of 5), and the tail graphs' capture memory.
+"""The first chunk of a stream behind a long reference (default 1,100 reference frames, about 88 s, and 1 generated)
+as the Qwen3-TTS vocoder decodes it, on the tree on PYTHONPATH: today's path, the whole width through window graphs of
+up to 64 frames replayed one after another on the stream's slot, against the path the scheduler plans with the cap,
+one replay of the first_chunk_reference_frames(1) + 1 wide tail graph from the reach when the reference is longer and
+from frame 0 otherwise (skipped on a tree without the cap). Per reference length and batch (1 and 8 rows): the device
+time of the chunk from CUDA events and its host time (medians of 5), the tail graph's capture memory, and the two
+paths' emitted samples and kept state against each other.
 
-usage: PYTHONPATH=<tree> python3 first_chunk_bench.py [--card 3]
+usage: PYTHONPATH=<tree> python3 first_chunk_bench.py [--card 3] [--reference-frames 300 450 579 1100]
 """
 
 import argparse
@@ -47,6 +49,7 @@ def timed(run, device) -> tuple[float, float]:
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--card", type=int, default=3)
+    parser.add_argument("--reference-frames", type=int, nargs="+", default=[REFERENCE_FRAMES])
     args = parser.parse_args()
     torch.cuda.set_device(args.card)
     device = torch.device("cuda", args.card)
@@ -101,9 +104,10 @@ def main() -> None:
         else:
             pass
         generator = torch.Generator(device="cpu").manual_seed(0)
-        total = REFERENCE_FRAMES + 1
-        split = window.split_frames(total)
-        for batch in BATCHES:
+        for reference_frames, batch in [(frames, batch) for frames in args.reference_frames for batch in BATCHES]:
+            total = reference_frames + 1
+            split = window.split_frames(total)
+            print(f"== reference {reference_frames} frames, batch {batch}", flush=True)
             codes = torch.randint(
                 config.codebook_size, (batch, config.num_quantizers, total), generator=generator
             ).to(device)
@@ -122,18 +126,24 @@ def main() -> None:
             device_ms, host_ms = timed(windows, device)
             print(f"batch {batch} windows {split}: device {device_ms:.2f} ms, host {host_ms:.2f} ms")
             if tail is not None:
-                start = total - tail_width
+                # as the scheduler plans it: from the reach when the reference is longer, else from frame 0,
+                # padded into the reach-wide tail graph
+                start = max(0, total - tail_width)
+                valid_width = total - start
 
                 def capped_tail() -> torch.Tensor:
                     for slot in slots:
                         arena.zero_slot(slot)
                         arena.start_slot(slot, start)
-                    waveform = tail.decode_slots(codes[..., start:], slots, valid_frames=[tail_width] * batch)
+                    waveform = tail.decode_slots(codes[..., start:], slots, valid_frames=[valid_width] * batch)
                     assert waveform is not None
                     return waveform[..., -SAMPLES_PER_FRAME:]
 
                 device_ms, host_ms = timed(capped_tail, device)
-                print(f"batch {batch} capped tail {tail_width}: device {device_ms:.2f} ms, host {host_ms:.2f} ms")
+                print(
+                    f"batch {batch} tail from frame {start}, {valid_width} frames in the {tail_width}-wide graph: "
+                    f"device {device_ms:.2f} ms, host {host_ms:.2f} ms"
+                )
                 index = torch.tensor(slots, device=device)
                 outputs = {}
                 for name, run in (("whole", windows), ("capped", capped_tail)):
