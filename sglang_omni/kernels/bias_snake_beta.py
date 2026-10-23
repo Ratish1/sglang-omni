@@ -84,15 +84,14 @@ def bias_snake_beta_channels_last_kernel(
         total = total + residual.to(tl.float32)
     else:
         pass
-    total = total.to(out_dtype).to(tl.float32)
     if WRITE_SUM:
         tl.store(sum_ptr + contiguous_base + offsets, total.to(out_dtype), mask=mask)
     else:
         pass
-    phase = (total * alpha_scale).to(out_dtype).to(tl.float32)
-    sine = libdevice.sin(phase).to(out_dtype).to(tl.float32)
-    sine_squared = (sine * sine).to(out_dtype).to(tl.float32)
-    scaled = (inverse_beta * sine_squared).to(out_dtype).to(tl.float32)
+    phase = total * alpha_scale
+    sine = libdevice.sin(phase)
+    sine_squared = sine * sine
+    scaled = inverse_beta * sine_squared
     tl.store(
         out_ptr + batch * out_batch_stride + offsets,
         (total + scaled).to(out_dtype),
