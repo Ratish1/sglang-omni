@@ -243,19 +243,13 @@ class FunCosyVoice3EngineBuilder(TtsEngineBuilder[CosyVoice3SGLangRequestData]):
         global _ENGINE_HEADROOM_BYTES
         model_runner = model_worker.model_runner
         # note (ratish): the vocoder in this process sizes its Flow prefix pool after the
-        # engine, so it leaves the share of pre-load memory the engine keeps free; a
-        # declared footprint replaces that share.
-        if (
-            model_runner.total_gpu_memory_fraction is None
-            and model_runner.kv_cache_bytes is None
-        ):
-            _ENGINE_HEADROOM_BYTES = int(
-                model_runner.pre_model_load_memory
-                * (1 - model_runner.mem_fraction_static)
-                * 2**30
-            )
-        else:
-            _ENGINE_HEADROOM_BYTES = 0
+        # engine, so it leaves the share of pre-load memory the engine keeps free for its
+        # activations; a declared budget bounds only the engine's KV pool.
+        _ENGINE_HEADROOM_BYTES = int(
+            model_runner.pre_model_load_memory
+            * (1 - model_runner.mem_fraction_static)
+            * 2**30
+        )
 
     def setup_model(
         self,
