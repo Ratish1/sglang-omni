@@ -11,6 +11,7 @@ from collections.abc import Mapping
 from pathlib import Path
 
 import av
+import librosa
 import numpy as np
 import numpy.typing as npt
 import soundfile
@@ -207,22 +208,17 @@ def parse_wav_bytes(
     return audio.astype(np.float32, copy=False), int(sample_rate)
 
 
-def resample_linear(
+# note (ratish): HF's processors load audio with librosa at the model's rate, so a model expects band-limited input;
+# interpolating linearly folds the content above the new Nyquist rate back into the band the model hears.
+def resample_audio(
     audio: np.ndarray, orig_sr: int, target_sr: int
 ) -> npt.NDArray[np.float32]:
-    if orig_sr == target_sr:
+    if orig_sr == target_sr or audio.size == 0:
         return audio.astype(np.float32, copy=False)
     else:
-        pass
-    if audio.size == 0:
-        return audio.astype(np.float32, copy=False)
-    else:
-        pass
-    duration = audio.shape[0] / float(orig_sr)
-    new_len = max(int(round(duration * target_sr)), 1)
-    old_idx = np.arange(audio.shape[0], dtype=np.float64)
-    new_idx = np.linspace(0.0, audio.shape[0] - 1, num=new_len, dtype=np.float64)
-    return np.interp(new_idx, old_idx, audio).astype(np.float32)
+        return librosa.resample(
+            audio.astype(np.float32, copy=False), orig_sr=orig_sr, target_sr=target_sr
+        )
 
 
 def load_audio_path(
@@ -231,7 +227,7 @@ def load_audio_path(
     with open(path, "rb") as f:
         data = f.read()
     audio, sample_rate = decode_audio_bytes(data)
-    return resample_linear(audio, sample_rate, target_sr)
+    return resample_audio(audio, sample_rate, target_sr)
 
 
 class AudioMediaIO(MediaIO[tuple[npt.NDArray[np.float32], float]]):
@@ -251,7 +247,7 @@ class AudioMediaIO(MediaIO[tuple[npt.NDArray[np.float32], float]]):
     def load_bytes(self, data: bytes) -> tuple[npt.NDArray[np.float32], float]:
         """Load audio from raw bytes (WAV, WebM/Opus, MP3, OGG, FLAC, etc.)."""
         audio, sample_rate = decode_audio_bytes(data)
-        resampled = resample_linear(audio, sample_rate, self.target_sr)
+        resampled = resample_audio(audio, sample_rate, self.target_sr)
         return resampled, float(self.target_sr)
 
     def load_base64(
@@ -267,7 +263,7 @@ class AudioMediaIO(MediaIO[tuple[npt.NDArray[np.float32], float]]):
         with open(filepath, "rb") as f:
             data = f.read()
         audio, sample_rate = decode_audio_bytes(data)
-        resampled = resample_linear(audio, sample_rate, self.target_sr)
+        resampled = resample_audio(audio, sample_rate, self.target_sr)
         return resampled, float(self.target_sr)
 
 
