@@ -78,12 +78,13 @@ def bias_snake_beta_channels_last_kernel(
     conv_values = tl.load(
         conv_ptr + batch * conv_batch_stride + offsets, mask=mask, other=0
     ).to(tl.float32)
-    total = (conv_values + bias).to(out_dtype).to(tl.float32)
+    total = conv_values + bias
     if HAS_RESIDUAL:
         residual = tl.load(residual_ptr + contiguous_base + offsets, mask=mask, other=0)
-        total = (total + residual.to(tl.float32)).to(out_dtype).to(tl.float32)
+        total = total + residual.to(tl.float32)
     else:
         pass
+    total = total.to(out_dtype).to(tl.float32)
     if WRITE_SUM:
         tl.store(sum_ptr + contiguous_base + offsets, total.to(out_dtype), mask=mask)
     else:
