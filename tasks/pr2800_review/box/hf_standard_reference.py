@@ -11,6 +11,8 @@ mmsu: the talker disabled, the thinker greedy at 32 tokens; writes <out>/mmsu_<s
 socialomni: SocialOmni level 1 as its benchmark sends it (the video, then the prompt), with the video's own audio
 interleaved (use_audio_in_video True), the talker disabled, the thinker greedy at 256 tokens; writes
 <out>/socialomni_<shard>.json with each raw response.
+videotext: a speech sample list (video, optional spoken question, prompt) answered in text as CI stages 7 and 9 ask
+it, the talker disabled, the thinker greedy at 256 tokens; writes <out>/videotext_<shard>.json with each response.
 --zero-multimodal-hidden gives HF's talker zeros at the multimodal prompt rows, as omni's main builds them.
 --fp8-talker <repo> runs every talker linear that checkpoint quantizes on its dequantized FP8 weight, its input
 quantized to e4m3 per token and 128 features as a W8A8 block-FP8 linear does; the thinker stays bf16.
@@ -120,7 +122,7 @@ def cookbook_inputs(processor: Qwen3OmniMoeProcessor, content: list[dict[str, ob
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--task", choices=("speech", "mmsu", "socialomni"), required=True)
+    parser.add_argument("--task", choices=("speech", "mmsu", "socialomni", "videotext"), required=True)
     parser.add_argument("--samples", type=Path, required=True)
     parser.add_argument("--shard", type=int, required=True)
     parser.add_argument("--shards", type=int, required=True)
@@ -179,13 +181,23 @@ def main() -> None:
         model.disable_talker()
     records = []
     for index, sample in enumerate(samples):
-        if args.task == "speech":
-            # note (ratish): a Video-MME sample carries its own prompt and no spoken question.
-            content = [
-                {"type": "video", "video": sample["video_path"], "fps": 2, "max_frames": 128, "max_pixels": 401408},
-                *([{"type": "audio", "audio": sample["audio_path"]}] if "audio_path" in sample else []),
-                {"type": "text", "text": sample.get("prompt", spec.get("prompt"))},
-            ]
+        # note (ratish): a Video-MME sample carries its own prompt and no spoken question.
+        video_content = [
+            {"type": "video", "video": sample.get("video_path"), "fps": 2, "max_frames": 128, "max_pixels": 401408},
+            *([{"type": "audio", "audio": sample["audio_path"]}] if "audio_path" in sample else []),
+            {"type": "text", "text": sample.get("prompt", spec.get("prompt"))},
+        ]
+        if args.task == "videotext":
+            inputs = cookbook_inputs(processor, video_content, model.device, model.dtype, args.sampled_fps)
+            text_ids, _ = model.generate(**inputs, return_audio=False, thinker_return_dict_in_generate=True,
+                                         use_audio_in_video=False, thinker_do_sample=False,
+                                         thinker_max_new_tokens=256)
+            text = processor.batch_decode(text_ids.sequences[:, inputs["input_ids"].shape[1]:],
+                                          skip_special_tokens=True, clean_up_tokenization_spaces=False)[0]
+            records.append(dict(sample_id=sample["sample_id"], response=text.strip(),
+                                prompt_tokens=int(inputs["input_ids"].shape[1])))
+        elif args.task == "speech":
+            content = video_content
             inputs = cookbook_inputs(processor, content, model.device, model.dtype, args.sampled_fps)
             for draw in range(DRAWS):
                 torch.manual_seed(draw)
