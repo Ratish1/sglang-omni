@@ -93,19 +93,22 @@ def patch_model_runner(module):
                     None if logits_output is None else logits_output.next_token_logits
                 )
                 if logits is not None and row < logits.shape[0]:
+                    candidate_token_ids = (
+                        self.model.audio_decoder.main_token_candidate_ids.tolist()
+                    )
+                    eos_column = candidate_token_ids.index(eos_token_id)
                     row_logits = logits[row].float()
-                    semantic = row_logits[
-                        self.model.audio_decoder.main_token_candidate_ids[1:]
-                    ]
+                    others = module.torch.cat(
+                        (row_logits[:eos_column], row_logits[eos_column + 1 :])
+                    )
                     logits_stats = {
-                        "rows": int(logits.shape[0]),
+                        "columns": int(logits.shape[1]),
+                        "eos_column": eos_column,
                         "nan": int(row_logits.isnan().sum()),
-                        "posinf": int((row_logits == float("inf")).sum()),
                         "finite": int(row_logits.isfinite().sum()),
-                        "eos": float(row_logits[eos_token_id]),
-                        "semantic_max": float(semantic.max()),
-                        "semantic_min": float(semantic.min()),
-                        "semantic_nan": int(semantic.isnan().sum()),
+                        "eos": float(row_logits[eos_column]),
+                        "others_max": float(others.max()),
+                        "others_min": float(others.min()),
                     }
                 else:
                     logits_stats = None
