@@ -51,7 +51,16 @@ for record in records:
             json.dumps(
                 {
                     key: record.get(key)
-                    for key in ("phase", "rid", "row", "frame", "frame_counts")
+                    for key in (
+                        "phase",
+                        "rid",
+                        "row",
+                        "frame",
+                        "logits",
+                        "sampling",
+                        "state_row",
+                        "frame_counts",
+                    )
                 }
             )
         )

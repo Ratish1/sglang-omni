@@ -88,6 +88,28 @@ def patch_model_runner(module):
         request_ids = [module.request_data_of(request).req.rid for request in requests]
         for row, frame in enumerate(rows):
             if frame[0] == eos_token_id:
+                logits_output = getattr(result, "logits_output", None)
+                logits = (
+                    None if logits_output is None else logits_output.next_token_logits
+                )
+                if logits is not None and row < logits.shape[0]:
+                    row_logits = logits[row].float()
+                    semantic = row_logits[
+                        self.model.audio_decoder.main_token_candidate_ids[1:]
+                    ]
+                    logits_stats = {
+                        "rows": int(logits.shape[0]),
+                        "nan": int(row_logits.isnan().sum()),
+                        "posinf": int((row_logits == float("inf")).sum()),
+                        "finite": int(row_logits.isfinite().sum()),
+                        "eos": float(row_logits[eos_token_id]),
+                        "semantic_max": float(semantic.max()),
+                        "semantic_min": float(semantic.min()),
+                        "semantic_nan": int(semantic.isnan().sum()),
+                    }
+                else:
+                    logits_stats = None
+                buffers = self.decode_buffers
                 write(
                     {
                         "k": "eos_frame",
@@ -95,6 +117,13 @@ def patch_model_runner(module):
                         "rid": request_ids[row],
                         "row": row,
                         "frame": frame,
+                        "logits": logits_stats,
+                        "sampling": [
+                            float(buffers.temperature[row]),
+                            int(buffers.top_k[row]),
+                            float(buffers.top_p[row]),
+                        ],
+                        "state_row": int(self.state_pool.row_indices[row]),
                         "batch_rids": request_ids,
                         "frame_counts": [
                             len(module.request_data_of(request).frame_rows)
