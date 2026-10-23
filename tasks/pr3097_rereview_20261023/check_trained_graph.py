@@ -28,12 +28,14 @@ apply_qwen_tts_transformers_compatibility_patches()
 from qwen_tts import Qwen3TTSTokenizer
 
 
-def parent_module(name: str) -> ModuleType:
+def parent_module(
+    name: str, package: str = "sglang_omni/models/qwen3_tts"
+) -> ModuleType:
     source = subprocess.run(
         [
             "git",
             "show",
-            f"837251cff78b7b2c6b3f08a36fad3fc0771c014f:sglang_omni/models/qwen3_tts/{name}.py",
+            f"837251cff78b7b2c6b3f08a36fad3fc0771c014f:{package}/{name}.py",
         ],
         check=True,
         capture_output=True,
@@ -69,6 +71,11 @@ def main() -> None:
     if arguments.parent:
         parent_decoder = parent_module("incremental_codec")
         parent_arena = parent_module("codec_state_arena")
+        parent_bias = parent_module("bias_snake_beta", "sglang_omni/kernels")
+        parent_exchange = parent_module("codec_state", "sglang_omni/kernels")
+        parent_decoder.fused_bias_snake_beta = parent_bias.fused_bias_snake_beta
+        parent_decoder.history_exchange = parent_exchange.history_exchange
+        parent_decoder.overlap_exchange = parent_exchange.overlap_exchange
         incremental = parent_decoder.Qwen3TTSIncrementalDecoder(decoder)
         arena_class = parent_arena.Qwen3TTSCodecStateArena
     else:
