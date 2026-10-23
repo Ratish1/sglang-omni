@@ -30,6 +30,10 @@ from sglang_omni.scheduling.pending_text_queue import (
     coerce_pending_text_queue,
 )
 from sglang_omni.scheduling.sglang_backend import SGLangARRequestData
+from sglang_omni.scheduling.sglang_backend.prompt_hidden import (
+    PromptHiddenRequest,
+    PromptHiddenStore,
+)
 from sglang_omni.scheduling.sglang_backend.request_data import validate_prompt_token_ids
 from sglang_omni.scheduling.types import ARRequestData, RequestOutput
 
@@ -342,8 +346,8 @@ def project_encoder_to_mm_aggregate(payload: StagePayload) -> StagePayload:
     return payload_with_state(payload, projected)
 
 
-# note (ratish): the talker projects zeros at multimodal prompt rows, so of the encoder
-# outputs it reads only what its MRoPE positions need.
+# note (ratish): the talker reads multimodal prompt rows from the thinker's hidden states, so of
+# the encoder outputs it reads only what its MRoPE positions need.
 TALKER_ENCODER_OUT_KEYS = ("image_grid_thw", "video_grid_thw", "audio_feature_lengths")
 
 
@@ -698,6 +702,7 @@ def build_sglang_thinker_request(
     vocab_size: int,
     request_id: str | None = None,
     thinker_config: Qwen3OmniMoeThinkerConfig | None = None,
+    capture_prompt_hidden_states: bool,
 ) -> "SGLangARRequestData":
     """Build SGLangARRequestData from pipeline state.
 
@@ -780,9 +785,30 @@ def build_sglang_thinker_request(
     sampling_params.normalize(tokenizer)
     sampling_params.verify(vocab_size)
 
+    # note (ratish): any request's cached multimodal slots can serve a later speech request's
+    # prefix, so every request with media writes its rows, not only a speech request.
+    multimodal_positions = None
+    if capture_prompt_hidden_states and thinker_config is not None:
+        multimodal_positions = torch.isin(
+            original_input_ids,
+            original_input_ids.new_tensor(
+                [
+                    thinker_config.image_token_id,
+                    thinker_config.video_token_id,
+                    thinker_config.audio_token_id,
+                ]
+            ),
+        ).nonzero(as_tuple=True)[0]
+    else:
+        pass
+
     # Build SGLang Req
     rid = request_id or "req-0"
-    req = Req(
+    has_prompt_rows = multimodal_positions is not None and bool(
+        multimodal_positions.numel()
+    )
+    request_class = PromptHiddenRequest if has_prompt_rows else Req
+    req = request_class(
         rid=rid,
         origin_input_text="",
         origin_input_ids=input_ids_list,
@@ -790,6 +816,10 @@ def build_sglang_thinker_request(
         vocab_size=vocab_size,
     )
     req.tokenizer = tokenizer
+    if has_prompt_rows:
+        req.prompt_hidden_positions = multimodal_positions
+    else:
+        pass
 
     # Compute M-RoPE positions and attach multimodal_inputs to Req
     if thinker_config is not None and model_inputs:
@@ -1055,7 +1085,7 @@ def apply_thinker_result(
 
 
 def make_thinker_stream_output_builder(
-    *, speech_enabled: bool
+    *, speech_enabled: bool, prompt_hidden_store: PromptHiddenStore | None
 ) -> Callable[[str, SGLangARRequestData, RequestOutput], list[OutgoingMessage]]:
     def _build_stream_output(
         request_id: str, req_data: SGLangARRequestData, req_output: RequestOutput
@@ -1088,16 +1118,33 @@ def make_thinker_stream_output_builder(
         # note (ratish): a cross-process stream chunk must be a tensor, and one
         # this small is pickled inline with the control message
         token_tensor = torch.tensor([token_id], dtype=torch.long)
-        return [
-            OutgoingMessage(
+        messages = []
+        for target in stream_targets:
+            message = OutgoingMessage(
                 request_id=request_id,
                 type="stream",
                 data=token_tensor,
                 target=target,
                 metadata={"token_id": token_id},
             )
-            for target in stream_targets
-        ]
+            # note (ratish): the first talker chunk carries the prompt's hidden rows; its
+            # token id rides in the metadata the talker reads it from.
+            if (
+                target == TALKER_STAGE
+                and isinstance(req_data.req, PromptHiddenRequest)
+                and not req_data.req.is_prompt_hidden_handed_off
+            ):
+                message.data = prompt_hidden_store.read(
+                    req_data.req.kv.req_pool_idx, req_data.req.prompt_hidden_positions
+                )
+                message.metadata["prompt_hidden_positions"] = (
+                    req_data.req.prompt_hidden_positions.tolist()
+                )
+                req_data.req.is_prompt_hidden_handed_off = True
+            else:
+                pass
+            messages.append(message)
+        return messages
 
     return _build_stream_output
 
@@ -1108,6 +1155,7 @@ def make_thinker_scheduler_adapters(
     vocab_size: int,
     thinker_config: Qwen3OmniMoeThinkerConfig | None = None,
     stage_name: str = "thinker",
+    capture_prompt_hidden_states: bool,
 ) -> tuple[
     Callable[[StagePayload], SGLangARRequestData],
     Callable[[SGLangARRequestData], StagePayload],
@@ -1124,6 +1172,7 @@ def make_thinker_scheduler_adapters(
             vocab_size=vocab_size,
             request_id=payload.request_id,
             thinker_config=thinker_config,
+            capture_prompt_hidden_states=capture_prompt_hidden_states,
         )
         req_data.stage_payload = payload
         return req_data
