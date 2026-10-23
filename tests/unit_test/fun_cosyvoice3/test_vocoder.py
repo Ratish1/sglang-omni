@@ -1480,9 +1480,6 @@ def test_prefix_pool_leaves_the_engine_headroom_and_the_largest_step(
     process_fraction: float | None,
     expected_reserve_gib: float,
 ) -> None:
-    """The pool leaves the engine's headroom plus the largest step the scheduler
-    admits, max_batch_size rows at the engine's context length, measured before the
-    pool, also when its size is set, within the process's declared share."""
     fake_flow = RunnableFakeFlow()
     fake_flow.packed_estimator.is_ragged = True
     flow = stages.FunCosyVoice3Flow(
