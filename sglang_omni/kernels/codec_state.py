@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 """In-place exchanges of per-slot codec state: a causal conv's history in front of its new samples,
-and a transposed conv's overlap added into its output. Rows naming the pad slot (graph padding,
-which repeats one slot) take zero state and leave the pool unwritten."""
+and a transposed conv's overlap added into its output."""
 
 from __future__ import annotations
 
@@ -10,7 +9,6 @@ import triton
 import triton.language as tl
 
 CHANNEL_BLOCK = 64
-# note (ratish): slot ids are never negative, so with this pad slot no row is padding.
 NO_PAD_SLOT = -1
 
 
@@ -36,9 +34,8 @@ def history_exchange_kernel(
     TAIL_BLOCK: tl.constexpr,
     CHANNEL_BLOCK: tl.constexpr,
 ):
-    # note (ratish): one program owns a row's channel block over the whole history, so
-    # every read of the slot's old history precedes every write of its new one; padding
-    # rows share their slot across programs, so they neither read nor write the pool.
+    # note (ratish): a program owns a row's channel block, so it reads the old history before
+    # writing the new; padding rows share one slot across programs, so they skip the pool.
     row = tl.program_id(0).to(tl.int64)
     channel = tl.program_id(1) * CHANNEL_BLOCK + tl.arange(0, CHANNEL_BLOCK)
     channel_mask = channel < channels

@@ -330,9 +330,8 @@ class Qwen3TTSIncrementalCodecCudaGraphRunner:
             pool=pool, stream=capture_stream, keepalives=[static_codes]
         )
         graph: ReplayableGraph | None = None
-        # note (ratish): the compiled decode reads this index as the state's slots and
-        # guards on its inference flag, so the warmups use it too; another index would
-        # recompile inside capture.
+        # note (ratish): the compiled decode guards on this index's inference flag, so the
+        # warmups use it too; another index would recompile inside capture.
         static_index = self.scratch_index(key.batch_bucket)
         try:
             self.warmup_capture_shape(
