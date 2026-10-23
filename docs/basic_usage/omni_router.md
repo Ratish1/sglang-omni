@@ -452,8 +452,3 @@ loopback sockets where transport behavior is part of the contract.
 | `src/websocket/` | Speech and realtime session setup and relay |
 | `src/operations.rs` | Models, metrics, and diagnostics |
 | `tests/` | Process and protocol integration tests |
-
-## Python Router
-
-The Python router remains available as `sgl-omni-router-py`. Its guide is
-`docs/basic_usage/python_router.md`.

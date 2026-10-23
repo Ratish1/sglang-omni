@@ -20,6 +20,7 @@ tests/
     │   ├── test_duplex_*.py
     │   ├── test_fdb_*.py
     │   ├── test_dataset_regressions.py
+    │   ├── test_managed_workers.py
     │   └── test_runtime_metrics.py
     ├── cli/
     │   └── test_sglang_backend.py
@@ -216,9 +217,6 @@ tests/
     │   ├── test_s0_gate.py
     │   ├── test_state_pool.py
     │   └── test_streaming_vocoder.py
-    ├── router/
-    │   ├── test_app.py
-    │   └── test_core.py
     ├── profiler/
     │   ├── test_event_recorder.py
     │   ├── test_stop_run_id.py
@@ -847,12 +845,8 @@ that happened to contain an older version of the test.
   - scheduler terminal/abort cleanup, complete row reset and reuse, mixed-batch
     ownership, and async resolve contracts.
 
-- `unit_test/router/`: SGLang-Omni Router unit tests:
-  - router CLI/config behavior
-  - worker metadata and health-state contracts
-  - request routing, proxying, and streaming relay
-  - worker selection policy behavior
-  - managed launcher command construction and cleanup.
+- `unit_test/benchmarks/test_managed_workers.py`: Managed worker command construction, GPU placement, parallel readiness, and process-group cleanup.
+- `sglang_omni_router/rust/tests/` (from the repository root): Rust router process, HTTP, media, WebSocket, and voice integration tests. Unit tests live next to the Rust implementation.
 
 - `unit_test/serve/`: In-process serving API unit tests:
   - generation-stage SGLang server-args role mapping and CLI override capability boundaries
