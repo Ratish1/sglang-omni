@@ -71,7 +71,7 @@ def requests(arm_out: Path) -> list[tuple[Path, Path]]:
     return pairs
 
 
-def hf_client(arm_out: Path, dtype_name: str, out: Path) -> None:
+def hf_client(arm_out: Path, dtype_name: str, out: Path, reverse: bool) -> None:
     import torch
     from transformers import Qwen3OmniMoeForConditionalGeneration
 
@@ -100,8 +100,13 @@ def hf_client(arm_out: Path, dtype_name: str, out: Path) -> None:
     results_dir.mkdir(parents=True, exist_ok=True)
     audio_token_id = model.config.thinker_config.audio_token_id
     vocab_size = model.config.thinker_config.text_config.vocab_size
-    pairs = requests(arm_out)
+    # note (ratish): two processes of one dtype split the requests by walking from opposite ends.
+    pairs = requests(arm_out)[::-1] if reverse else requests(arm_out)
     for index, (inputs_path, _) in enumerate(pairs):
+        if (results_dir / inputs_path.name.replace("_inputs.pt", ".pt")).exists():
+            continue
+        else:
+            pass
         served = torch.load(inputs_path, weights_only=False)
         # note (ratish): the thinker's prompt carries the audio's cache pad value at its audio rows.
         prompt_ids = [
@@ -254,9 +259,10 @@ def main() -> None:
     parser.add_argument("--analyze", action="store_true")
     parser.add_argument("--dtype", choices=("fp32", "bf16"))
     parser.add_argument("--reuse-served", action="store_true", help="skip serving; read <out>/<arm>'s dumps")
+    parser.add_argument("--reverse", action="store_true", help="internal: walk the requests from the last")
     args = parser.parse_args()
     if args.hf_client:
-        hf_client(args.out / args.arm, args.dtype, args.out)
+        hf_client(args.out / args.arm, args.dtype, args.out, args.reverse)
         return
     elif args.analyze:
         analyze(args.out, args.arm)
