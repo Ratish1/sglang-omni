@@ -143,11 +143,11 @@ def wait_for_workers(
     else:
         deadline = time.monotonic() + timeout_seconds
         executor = ThreadPoolExecutor(max_workers=len(workers))
-        futures: set[Future[None]] = {
-            executor.submit(wait_for_worker_health, worker, deadline)
-            for worker in workers
-        }
         try:
+            futures: set[Future[None]] = {
+                executor.submit(wait_for_worker_health, worker, deadline)
+                for worker in workers
+            }
             while futures:
                 done, futures = wait(futures, return_when=FIRST_COMPLETED)
                 for future in done:

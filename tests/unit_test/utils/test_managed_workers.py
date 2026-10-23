@@ -9,6 +9,7 @@ import sys
 import threading
 from concurrent.futures import Future
 from typing import Literal
+from unittest.mock import Mock
 
 import pytest
 
@@ -107,13 +108,13 @@ def test_worker_command_preserves_model_arguments_and_gpu_placement(
     ]
 
 
-@pytest.mark.parametrize("interrupted", [False, True])
+@pytest.mark.parametrize("failure_phase", ["health", "wait", "submission"])
 def test_startup_failure_cleans_up_workers(
     monkeypatch: pytest.MonkeyPatch,
     created_workers: list[FakeProcess],
-    interrupted: bool,
+    failure_phase: Literal["health", "wait", "submission"],
 ) -> None:
-    """An interrupted or failed startup must release every started worker."""
+    """Failed or interrupted health setup must release every started worker."""
     terminated: list[ManagedWorkerProcess] = []
 
     def fail_health(worker: ManagedWorkerProcess, deadline: float) -> None:
@@ -124,8 +125,15 @@ def test_startup_failure_cleans_up_workers(
 
     monkeypatch.setattr(managed_workers, "stop_managed_workers", terminated.extend)
     monkeypatch.setattr(managed_workers, "wait_for_worker_health", fail_health)
-    if interrupted:
+    if failure_phase == "wait":
         monkeypatch.setattr(managed_workers, "wait", interrupt_wait)
+        expected_error = KeyboardInterrupt
+    elif failure_phase == "submission":
+        monkeypatch.setattr(
+            managed_workers.ThreadPoolExecutor,
+            "submit",
+            Mock(side_effect=KeyboardInterrupt),
+        )
         expected_error = KeyboardInterrupt
     else:
         expected_error = TimeoutError
