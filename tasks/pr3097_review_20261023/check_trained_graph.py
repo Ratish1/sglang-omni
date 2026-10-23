@@ -2,8 +2,14 @@
 
 from __future__ import annotations
 
+import argparse
+import copy
+import importlib.util
 import json
+import subprocess
+import sys
 from pathlib import Path
+from types import ModuleType
 
 import torch
 
@@ -22,7 +28,33 @@ apply_qwen_tts_transformers_compatibility_patches()
 from qwen_tts import Qwen3TTSTokenizer
 
 
+def parent_module(name: str) -> ModuleType:
+    source = subprocess.run(
+        [
+            "git",
+            "show",
+            f"3a4e73436d1206a675156a6d028d3a0fb2e1e753:sglang_omni/models/qwen3_tts/{name}.py",
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout
+    path = Path(f"/data/review3097/parent_{name}.py")
+    path.write_text(source)
+    specification = importlib.util.spec_from_file_location(
+        f"pr3097_parent_{name}", path
+    )
+    assert specification is not None and specification.loader is not None
+    module = importlib.util.module_from_spec(specification)
+    sys.modules[specification.name] = module
+    specification.loader.exec_module(module)
+    return module
+
+
 def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--parent", action="store_true")
+    arguments = parser.parse_args()
     torch.manual_seed(3097)
     torch.backends.cudnn.allow_tf32 = False
     tokenizer = Qwen3TTSTokenizer.from_pretrained(
@@ -32,13 +64,19 @@ def main() -> None:
         attn_implementation="sdpa",
     )
     decoder = tokenizer.model.decoder.eval()
+    reference_decoder = copy.deepcopy(decoder).float()
     replaced = fuse_vocoder_decoder(decoder)
-    incremental = Qwen3TTSIncrementalDecoder(decoder)
+    if arguments.parent:
+        parent_decoder = parent_module("incremental_codec")
+        parent_arena = parent_module("codec_state_arena")
+        incremental = parent_decoder.Qwen3TTSIncrementalDecoder(decoder)
+        arena_class = parent_arena.Qwen3TTSCodecStateArena
+    else:
+        incremental = Qwen3TTSIncrementalDecoder(decoder)
+        arena_class = Qwen3TTSCodecStateArena
     device = torch.device("cuda", 0)
     arenas = [
-        Qwen3TTSCodecStateArena(
-            incremental, num_slots=4, device=device, dtype=torch.bfloat16
-        )
+        arena_class(incremental, num_slots=4, device=device, dtype=torch.bfloat16)
         for _ in range(2)
     ]
     graph_arena, reference_arena = arenas
@@ -61,6 +99,8 @@ def main() -> None:
     assert runner.enabled, runner.stats()
     records = []
     positions = [0, 0]
+    code_history: dict[int, list[torch.Tensor]] = {0: [], 1: []}
+    pcm_snapshots: list[torch.Tensor] = []
     generator = torch.Generator(device=device).manual_seed(3097)
     for slots in ([0, 1], [1, 0], [1], [0, 1]):
         codes = torch.randint(
@@ -78,6 +118,17 @@ def main() -> None:
         signal = expected.float().square().sum()
         error = (actual.float() - expected.float()).square().sum()
         snr_db = 10 * torch.log10(signal / error.clamp_min(1e-30))
+        fp32_rows = []
+        for row, slot in enumerate(slots):
+            code_history[slot].append(codes[row : row + 1])
+            fp32_rows.append(
+                reference_decoder(torch.cat(code_history[slot], dim=-1))[
+                    ..., -8 * decoder.total_upsample :
+                ]
+            )
+        fp32_pcm = torch.cat(fp32_rows)
+        fp32_signal = fp32_pcm.square().sum()
+        fp32_error = (actual.float() - fp32_pcm).square().sum()
         for slot in slots:
             positions[slot] += 8
         assert graph_arena.storage.frame_positions[:2].tolist() == positions
@@ -90,15 +141,20 @@ def main() -> None:
             assert not pool[2].any()
         assert not graph_arena.storage.frame_positions[2]
         record = {
+            "tree": "parent" if arguments.parent else "head",
             "slots": slots,
             "positions": positions.copy(),
             "snr_to_eager_db": snr_db.item(),
+            "snr_to_fp32_db": (
+                10 * torch.log10(fp32_signal / fp32_error.clamp_min(1e-30))
+            ).item(),
             "max_absolute_pcm_error": (actual.float() - expected.float())
             .abs()
             .max()
             .item(),
         }
         records.append(record)
+        pcm_snapshots.append(actual.clone())
         print(json.dumps(record), flush=True)
     result = {
         "replaced_activations": replaced,
@@ -106,7 +162,9 @@ def main() -> None:
         "runner": runner.stats(),
         "replays": records,
     }
-    Path("/data/review3097/trained-graph.json").write_text(
+    tree = "parent" if arguments.parent else "head"
+    torch.save(pcm_snapshots, f"/data/review3097/trained-graph-{tree}-pcm.pt")
+    Path(f"/data/review3097/trained-graph-{tree}.json").write_text(
         json.dumps(result, indent=2) + "\n"
     )
     print(
