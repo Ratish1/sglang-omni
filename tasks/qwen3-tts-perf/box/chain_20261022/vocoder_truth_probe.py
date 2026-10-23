@@ -51,6 +51,10 @@ def run(args: argparse.Namespace) -> None:
     fuse_vocoder_decoder(served_decoder)
     incremental = Qwen3TTSIncrementalDecoder(served_decoder)
     arena = Qwen3TTSCodecStateArena(incremental, num_slots=4, device=device, dtype=torch.bfloat16)
+    probe_slot = arena.acquire()
+    # the slot conv stack's state carries the cohort's slot index; main's state class has no such field
+    print(f"gathered state holds the arena's pools: {getattr(arena.gather([probe_slot]), 'slot_index', None) is not None}")
+    arena.release(probe_slot)
     encoder = served_tokenizer.model.encoder
     hop = int(served_tokenizer.model.encode_downsample_rate)
     num_quantizers = int(served_tokenizer.model.encoder_valid_num_quantizers)
@@ -91,6 +95,7 @@ def run(args: argparse.Namespace) -> None:
         return torch.cat(audio).float()
 
     results = {}
+    streams = {}
     seen = set()
     with torch.inference_mode():
         for row in Path(args.list).read_text(encoding="utf-8").splitlines():
@@ -116,9 +121,11 @@ def run(args: argparse.Namespace) -> None:
                 served = stream(clip, reference_frames, first_in_windows)
                 result[f"{name} first"] = snr_db(served[:samples_per_frame], truth[:samples_per_frame])
                 result[f"{name} stream"] = snr_db(served, truth)
+                streams[f"{row_id} {name}"] = served.cpu()
             results[row_id] = result
             print(f"{row_id}: " + ", ".join(f"{key} {value:.2f}" for key, value in result.items()), flush=True)
     Path(args.out).write_text(json.dumps(results, indent=1))
+    torch.save(streams, Path(args.out).with_suffix(".pt"))
     for key in next(iter(results.values())):
         values = [result[key] for result in results.values()]
         print(f"median {key}: {statistics.median(values):.2f} dB over {len(values)} clips")
@@ -136,6 +143,14 @@ def compare(args: argparse.Namespace) -> None:
             f"{statistics.median(change[clip][key] for clip in clips):.2f} dB; change minus base mean {mean:+.3f} dB "
             f"(se {error:.3f}, 95 % {mean - 1.96 * error:+.3f} to {mean + 1.96 * error:+.3f}), lower on "
             f"{sum(delta < 0 for delta in deltas)} of {len(deltas)}"
+        )
+    base_streams = torch.load(Path(args.base).with_suffix(".pt"))
+    change_streams = torch.load(Path(args.change).with_suffix(".pt"))
+    for name in ("short", "long"):
+        apart = [snr_db(change_streams[f"{clip} {name}"], base_streams[f"{clip} {name}"]) for clip in clips]
+        print(
+            f"{name} stream, change against base: median {statistics.median(apart):.2f} dB "
+            f"(min {min(apart):.2f}, max {max(apart):.2f}), identical {sum(math.isinf(value) for value in apart)}"
         )
 
 
