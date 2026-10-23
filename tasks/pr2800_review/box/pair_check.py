@@ -126,6 +126,7 @@ ARMS = {
     "upvb": ("upv", [], [0.7769]),
     "vrtb": ("vrt", [], [0.7769]),
     "vph": ("vph", [], [0.7769]),
+    "upvq": ("upv", [], [0.7769]),
 }
 # arm: benchmark args every pass of the arm adds
 ARM_BENCH_ARGS: dict[str, list[str]] = {}
