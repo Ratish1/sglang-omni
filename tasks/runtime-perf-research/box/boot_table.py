@@ -18,18 +18,35 @@ ROWS = [
 
 
 def boot_mean(pattern, key):
-    values = [json.load(open(path))["summary"].get(key) for path in sorted(glob.glob(pattern))]
-    values = [v for v in values if v is not None]
+    values = []
+    for path in sorted(glob.glob(pattern)):
+        with open(path) as source:
+            value = json.load(source)["summary"].get(key)
+        if value is not None:
+            values.append(value)
+        else:
+            pass
     return statistics.mean(values) if values else None
 
 
 run, cell, label, main_boots, branch_boots = sys.argv[1:6]
+reps = sys.argv[6] if len(sys.argv) > 6 else "rep*"
 print(f"| {label} | main | this PR | change |")
 print("|---|---|---|---|")
 for name, key, scale, fmt in ROWS:
-    main = [boot_mean(f"{run}/{boot}/{cell}/bench/rep*/speed_results.json", key) for boot in main_boots.split(",")]
-    branch = [boot_mean(f"{run}/{boot}/{cell}/bench/rep*/speed_results.json", key) for boot in branch_boots.split(",")]
+    main = [
+        boot_mean(f"{run}/{boot}/{cell}/bench/{reps}/speed_results.json", key)
+        for boot in main_boots.split(",")
+    ]
+    branch = [
+        boot_mean(f"{run}/{boot}/{cell}/bench/{reps}/speed_results.json", key)
+        for boot in branch_boots.split(",")
+    ]
     if None in main or None in branch:
         continue
-    change = (statistics.mean(branch) - statistics.mean(main)) / statistics.mean(main) * 100
-    print(f"| {name} | {' / '.join(fmt.format(v * scale) for v in main)} | {' / '.join(fmt.format(v * scale) for v in branch)} | {change:+.1f} % |")
+    change = (
+        (statistics.mean(branch) - statistics.mean(main)) / statistics.mean(main) * 100
+    )
+    print(
+        f"| {name} | {' / '.join(fmt.format(v * scale) for v in main)} | {' / '.join(fmt.format(v * scale) for v in branch)} | {change:+.1f} % |"
+    )

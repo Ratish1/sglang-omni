@@ -15,6 +15,7 @@ clock of the request event recorder, so records join its events per request.
               14 frames, taken by a watchdog thread while the stall lasts
   kind "heap" once per process, when its first new request reaches a stage inbox: tracked objects, the 25 most
               common types and owning packages, and the duration of one full collection over that heap
+  kind "frozen" every OMNI_HOP_PROBE_FREEZE_COUNT_S seconds when set: objects in the permanent generation
 """
 
 import atexit
@@ -40,6 +41,9 @@ BIND_THREAD_DEVICE = os.environ.get("OMNI_BIND_THREAD_DEVICE", "")
 # what-if, not a probe: OMNI_FREEZE_STARTUP_GC=1 moves each process's heap into the permanent generation when its
 # first new request arrives, as the launcher does for the API process at startup (serve/launcher.py:173-176)
 FREEZE_STARTUP_GC = os.environ.get("OMNI_FREEZE_STARTUP_GC") == "1"
+# OMNI_HOP_PROBE_FREEZE_COUNT_S=<s> records gc.get_freeze_count() every s seconds, which walks the permanent
+# generation under the GIL, so it is for a check boot and not for a measured one
+FREEZE_COUNT_PERIOD_S = float(os.environ.get("OMNI_HOP_PROBE_FREEZE_COUNT_S", "0"))
 LAG_PERIOD_S = 0.005
 LAG_REPORT_S = 0.002
 STALL_S = 0.2
@@ -66,8 +70,14 @@ def record_queue(ns, label, op, message):
         pass
     data = getattr(message, "data", None)
     item = (
-        ns, label, op, threading.current_thread().name, getattr(message, "request_id", None),
-        getattr(message, "type", None), getattr(message, "target", None), getattr(data, "chunk_id", None),
+        ns,
+        label,
+        op,
+        threading.current_thread().name,
+        getattr(message, "request_id", None),
+        getattr(message, "type", None),
+        getattr(message, "target", None),
+        getattr(data, "chunk_id", None),
         getattr(data, "from_stage", None),
     )
     with records_lock:
@@ -91,6 +101,12 @@ def flush_forever():
         flush()
 
 
+def record_freeze_count_forever(period_s):
+    while True:
+        time.sleep(period_s)
+        record({"k": "frozen", "count": gc.get_freeze_count()})
+
+
 def on_gc(phase, info):
     thread = threading.get_ident()
     if phase == "start":
@@ -105,8 +121,15 @@ def on_gc(phase, info):
         pass
     duration_ns = time.perf_counter_ns() - started
     if info["generation"] >= 1 or duration_ns > 1_000_000:
-        record({"k": "gc", "gen": info["generation"], "dur_ns": duration_ns, "collected": info["collected"],
-                "th": threading.current_thread().name})
+        record(
+            {
+                "k": "gc",
+                "gen": info["generation"],
+                "dur_ns": duration_ns,
+                "collected": info["collected"],
+                "th": threading.current_thread().name,
+            }
+        )
     else:
         pass
 
@@ -120,7 +143,9 @@ def take_heap():
         name = f"{kind.__module__}.{kind.__qualname__}"
         by_type[name] = by_type.get(name, 0) + 1
         try:
-            owner = getattr(obj, "__module__", None) if callable(obj) else kind.__module__
+            owner = (
+                getattr(obj, "__module__", None) if callable(obj) else kind.__module__
+            )
         except Exception:
             owner = None
         package = (owner if isinstance(owner, str) else "?").split(".")[0]
@@ -134,9 +159,16 @@ def take_heap():
         gc.freeze()
     else:
         pass
-    record({"k": "heap", "tracked": tracked, "full_collect_ns": collect_ns, "frozen": gc.get_freeze_count(),
+    record(
+        {
+            "k": "heap",
+            "tracked": tracked,
+            "full_collect_ns": collect_ns,
+            "frozen": gc.get_freeze_count(),
             "top_types": sorted(by_type.items(), key=lambda kv: -kv[1])[:25],
-            "top_packages": sorted(by_package.items(), key=lambda kv: -kv[1])[:25]})
+            "top_packages": sorted(by_package.items(), key=lambda kv: -kv[1])[:25],
+        }
+    )
 
 
 def instrument_queue(q, label):
@@ -149,7 +181,11 @@ def instrument_queue(q, label):
 
     def put_recorded(item, *args, **kwargs):
         record_queue(time.time_ns(), label, "put", item)
-        if not heap_taken and label.endswith(".in") and getattr(item, "type", None) == "new_request":
+        if (
+            not heap_taken
+            and label.endswith(".in")
+            and getattr(item, "type", None) == "new_request"
+        ):
             heap_taken.append(label)
             take_heap()
         else:
@@ -178,11 +214,21 @@ def watch_stalls(name, ticks, loop_thread_id):
             frames = sys._current_frames()
             names = {thread.ident: thread.name for thread in threading.enumerate()}
             stacks = {
-                names.get(ident, str(ident)): [f"{f.filename}:{f.lineno} {f.name}" for f in traceback.extract_stack(frame)][-14:]
+                names.get(ident, str(ident)): [
+                    f"{f.filename}:{f.lineno} {f.name}"
+                    for f in traceback.extract_stack(frame)
+                ][-14:]
                 for ident, frame in frames.items()
             }
-            record({"k": "stall", "loop": name, "quiet_ms": quiet * 1e3,
-                    "loop_thread": names.get(loop_thread_id, str(loop_thread_id)), "stacks": stacks})
+            record(
+                {
+                    "k": "stall",
+                    "loop": name,
+                    "quiet_ms": quiet * 1e3,
+                    "loop_thread": names.get(loop_thread_id, str(loop_thread_id)),
+                    "stacks": stacks,
+                }
+            )
         elif quiet <= STALL_S:
             stalled = False
         else:
@@ -194,8 +240,12 @@ async def sample_lag(name):
 
     loop = asyncio.get_running_loop()
     ticks = [time.monotonic()]
-    threading.Thread(target=watch_stalls, args=(name, ticks, threading.get_ident()),
-                     name=f"hop-probe-stall-{name}", daemon=True).start()
+    threading.Thread(
+        target=watch_stalls,
+        args=(name, ticks, threading.get_ident()),
+        name=f"hop-probe-stall-{name}",
+        daemon=True,
+    ).start()
     window_end = loop.time() + 1.0
     count, total, worst = 0, 0.0, 0.0
     while True:
@@ -209,7 +259,15 @@ async def sample_lag(name):
         else:
             pass
         if loop.time() >= window_end:
-            record({"k": "lag", "loop": name, "n": count, "sum_ms": total * 1e3, "max_ms": worst * 1e3})
+            record(
+                {
+                    "k": "lag",
+                    "loop": name,
+                    "n": count,
+                    "sum_ms": total * 1e3,
+                    "max_ms": worst * 1e3,
+                }
+            )
             window_end = loop.time() + 1.0
             count, total, worst = 0, 0.0, 0.0
         else:
@@ -335,7 +393,11 @@ class PatchOnImport(importlib.abc.MetaPathFinder):
             try:
                 PATCHES[name](module)
             except Exception as exc:
-                print(f"hop_probe patch {name} failed: {exc!r}", file=sys.stderr, flush=True)
+                print(
+                    f"hop_probe patch {name} failed: {exc!r}",
+                    file=sys.stderr,
+                    flush=True,
+                )
 
         spec.loader.exec_module = exec_and_patch
         return spec
@@ -345,19 +407,40 @@ if PREFIX:
     sys.meta_path.insert(0, PatchOnImport())
     gc.callbacks.append(on_gc)
     threading.Thread(target=flush_forever, name="hop-probe-flush", daemon=True).start()
+    if FREEZE_COUNT_PERIOD_S > 0:
+        threading.Thread(
+            target=record_freeze_count_forever,
+            args=(FREEZE_COUNT_PERIOD_S,),
+            name="hop-probe-freeze-count",
+            daemon=True,
+        ).start()
+    else:
+        pass
     atexit.register(flush)
     print(f"hop_probe on, prefix {PREFIX}", file=sys.stderr, flush=True)
 else:
     pass
 if BIND_THREAD_DEVICE == "1":
     bind_thread_device(None)
-    print("hop_probe what-if: new threads bind their creator's CUDA device", file=sys.stderr, flush=True)
+    print(
+        "hop_probe what-if: new threads bind their creator's CUDA device",
+        file=sys.stderr,
+        flush=True,
+    )
 elif BIND_THREAD_DEVICE.startswith("cuda:"):
     bind_thread_device(int(BIND_THREAD_DEVICE.split(":")[1]))
-    print(f"hop_probe what-if: new threads bind {BIND_THREAD_DEVICE}", file=sys.stderr, flush=True)
+    print(
+        f"hop_probe what-if: new threads bind {BIND_THREAD_DEVICE}",
+        file=sys.stderr,
+        flush=True,
+    )
 else:
     pass
 if FREEZE_STARTUP_GC:
-    print("hop_probe what-if: the heap is frozen at the first new request", file=sys.stderr, flush=True)
+    print(
+        "hop_probe what-if: the heap is frozen at the first new request",
+        file=sys.stderr,
+        flush=True,
+    )
 else:
     pass
