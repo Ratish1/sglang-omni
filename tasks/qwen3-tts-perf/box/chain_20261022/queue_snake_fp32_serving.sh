@@ -13,8 +13,8 @@ HERE=$T/tasks/qwen3-tts-perf/box/chain_20261022
 M=${M:?the main tree}
 PF=${PF:?the fix tree}
 L=$D/queue.log
-until grep -q queue_snake_fp32_done $L; do sleep 20; done
-if sed -n '/queue snake fp32 start/,$p' $L | grep -q "^stopped"; then
+until tac $L | sed -n '1,/queue snake fp32 start/p' | grep -q queue_snake_fp32_done; do sleep 20; done
+if tac $L | sed -n '1,/queue snake fp32 start/p' | grep -q "^stopped"; then
   echo "queue snake fp32 serving skipped: the gate queue stopped" >> $L
   echo "queue_snake_fp32_serving_done $(date +%T)" >> $L
   exit 1
