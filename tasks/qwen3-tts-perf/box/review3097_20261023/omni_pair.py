@@ -36,6 +36,8 @@ PASSES = {
     "s_c16": ["--stream", "--max-concurrency", "16"],
     "ns_c16": ["--max-concurrency", "16"],
     "s_c64": ["--stream", "--max-concurrency", "64"],
+    "s_c16_seeded": ["--stream", "--max-concurrency", "16", "--seed", "1234"],
+    "s_c64_seeded": ["--stream", "--max-concurrency", "64", "--seed", "1234"],
 }
 STARTUP_S = 1800
 SPEED_KEYS = (
@@ -227,7 +229,7 @@ def main() -> None:
     parser.add_argument("--a-card", type=int, required=True)
     parser.add_argument("--b-card", type=int, required=True)
     parser.add_argument("--port", type=int, required=True)
-    parser.add_argument("--passes", default=",".join(PASSES))
+    parser.add_argument("--passes", default="s_c1_seeded,ns_c1_seeded,s_c16,ns_c16,s_c64")
     parser.add_argument("--score", default="s_c1_seeded,ns_c1_seeded,s_c16,ns_c16,s_c64")
     args = parser.parse_args()
     passes = args.passes.split(",")
@@ -242,13 +244,16 @@ def main() -> None:
         ]
         for job in jobs:
             job.result()
-    with ThreadPoolExecutor(max_workers=2) as pool:
-        jobs = [
-            pool.submit(score, args.label, arm, card, port + 600, args.a_tree, scored)
-            for arm, (tree, card, port) in arms.items()
-        ]
-        for job in jobs:
-            job.result()
+    if scored:
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            jobs = [
+                pool.submit(score, args.label, arm, card, port + 600, args.a_tree, scored)
+                for arm, (tree, card, port) in arms.items()
+            ]
+            for job in jobs:
+                job.result()
+    else:
+        pass
     rows = summary(args.label, passes)
     (ROOT / args.label / "summary.json").write_text(json.dumps(rows, indent=1))
     log(args.label, "pair done")
