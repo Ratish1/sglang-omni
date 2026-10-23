@@ -347,6 +347,8 @@ def bias_activation(
     out and the sum into sum_out if given: one kernel for a SnakeBeta with coefficients,
     the eager adds and module otherwise."""
     if coefficients is not None:
+        # note (ratish): in fp32 and rounded once, which keeps the decode closer to the fp32
+        # decoder than eager's per-op rounding does.
         fused_bias_snake_beta(
             conv_output,
             bias,
@@ -354,6 +356,7 @@ def bias_activation(
             out,
             residual=residual,
             sum_out=sum_out,
+            round_like_eager=False,
         )
     else:
         total = conv_output + bias

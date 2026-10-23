@@ -442,34 +442,64 @@ def test_slot_causal_transconv_matches_whole(
 @pytest.mark.skipif(
     not current_platform.is_cuda(), reason="the slot convs run on NVIDIA CUDA only"
 )
-def test_fused_snake_beta_stack_matches_the_eager_activations() -> None:
+def test_fused_snake_beta_stack_tracks_fp32_more_closely_than_eager_activations() -> (
+    None
+):
     torch.manual_seed(33)
     decoder = Decoder(block_channels=(16, 8), snake=True).cuda().bfloat16().eval()
     decoder.pre_transformer.float()
+    reference_decoder = copy.deepcopy(decoder).float()
     assert snake_beta.fuse_vocoder_decoder(decoder) == 8
-    hidden_states = torch.randn(2, 9, 2, device="cuda", dtype=torch.bfloat16)
-    fused = Qwen3TTSIncrementalDecoder(decoder)
-    eager = Qwen3TTSIncrementalDecoder(decoder)
-    eager.snake_coefficients = {}
+    assert snake_beta.fuse_vocoder_decoder(reference_decoder) == 8
+    hidden_states = torch.randn(2, 9, 2, device="cuda")
+    decoders = {
+        "reference": Qwen3TTSIncrementalDecoder(reference_decoder),
+        "fused": Qwen3TTSIncrementalDecoder(decoder),
+        "eager": Qwen3TTSIncrementalDecoder(decoder),
+    }
+    decoders["reference"].snake_coefficients = {}
+    decoders["eager"].snake_coefficients = {}
+    dtypes = {
+        "reference": torch.float32,
+        "fused": torch.bfloat16,
+        "eager": torch.bfloat16,
+    }
     states = {
-        name: fused.init_state(2, device=torch.device("cuda"), dtype=torch.bfloat16)
-        for name in ("fused", "eager")
+        name: incremental.init_state(2, device=torch.device("cuda"), dtype=dtypes[name])
+        for name, incremental in decoders.items()
     }
     with torch.inference_mode():
         for part in hidden_states.split((4, 1, 4), dim=1):
-            assert torch.equal(
-                fused.conv_stack_tensors(part, states["fused"]),
-                eager.conv_stack_tensors(part, states["eager"]),
-            )
+            outputs = {
+                name: incremental.conv_stack_tensors(
+                    part.to(dtypes[name]), states[name]
+                )
+                for name, incremental in decoders.items()
+            }
+            assert relative_error(
+                outputs["fused"], outputs["reference"]
+            ) < relative_error(outputs["eager"], outputs["reference"])
 
-    assert len(fused.snake_coefficients) == 8
-    fused_state, eager_state = states["fused"], states["eager"]
-    for fused_pools, eager_pools in (
-        (fused_state.conv_histories, eager_state.conv_histories),
-        (fused_state.transconv_overlaps, eager_state.transconv_overlaps),
+    assert len(decoders["fused"].snake_coefficients) == 8
+    for truths, fuseds, eagers in (
+        (
+            states["reference"].conv_histories,
+            states["fused"].conv_histories,
+            states["eager"].conv_histories,
+        ),
+        (
+            states["reference"].transconv_overlaps,
+            states["fused"].transconv_overlaps,
+            states["eager"].transconv_overlaps,
+        ),
     ):
-        for key, value in eager_pools.items():
-            assert torch.equal(fused_pools[key], value), key
+        for key, truth in truths.items():
+            if truth.any():
+                assert relative_error(fuseds[key], truth) <= relative_error(
+                    eagers[key], truth
+                ), key
+            else:
+                assert not fuseds[key].any() and not eagers[key].any(), key
 
 
 @pytest.mark.parametrize("partitions", [[11], [1] * 11, [1, 10], [10, 1], [3, 2, 6]])
@@ -1590,7 +1620,7 @@ def test_tail_graph_runner_keeps_only_widths_that_hold_a_tail() -> None:
 @pytest.mark.benchmark
 @pytest.mark.accelerator
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-def test_real_tts_decoder_and_incremental_pcm_equal() -> None:
+def test_real_tts_fused_decoder_pcm_equal_and_streaming_pcm_tracks_fp32() -> None:
     checkpoint = os.environ.get("QWEN3_TTS_TOKENIZER_PATH")
     if checkpoint is None:
         pytest.skip("Set QWEN3_TTS_TOKENIZER_PATH to run the real checkpoint gate")
@@ -1624,17 +1654,23 @@ def test_real_tts_decoder_and_incremental_pcm_equal() -> None:
     ]
     with torch.inference_mode():
         expected = [decoder(value).clone() for value in codes]
+        reference_pcm = copy.deepcopy(decoder).float()(codes[1])
         incremental = Qwen3TTSIncrementalDecoder(decoder)
         state = Qwen3TTSIncrementalCodecState()
         parts = codes[1].split((2, 6, 8, 8), dim=-1)
-        incremental_expected = [
-            incremental.decode(part, state).clone() for part in parts
-        ]
+        eager_pcm = torch.cat(
+            [incremental.decode(part, state) for part in parts], dim=-1
+        )
 
         assert snake_beta.fuse_vocoder_decoder(decoder) == 29
         for value, pcm in zip(codes, expected):
             assert torch.equal(decoder(value), pcm), tuple(value.shape)
         incremental = Qwen3TTSIncrementalDecoder(decoder)
         state = Qwen3TTSIncrementalCodecState()
-        for part, pcm in zip(parts, incremental_expected):
-            assert torch.equal(incremental.decode(part, state), pcm)
+        fused_pcm = torch.cat(
+            [incremental.decode(part, state) for part in parts], dim=-1
+        )
+
+    assert relative_error(fused_pcm, reference_pcm) < relative_error(
+        eager_pcm, reference_pcm
+    )
