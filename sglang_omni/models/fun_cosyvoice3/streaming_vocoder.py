@@ -266,16 +266,16 @@ class FunCosyVoice3StreamingVocoderScheduler(
         )
 
     def measure_peak_step_bytes(
-        self, device: torch.device, *, rows: int, tokens: int
+        self, device: torch.device, *, row_count: int, tokens_per_row: int
     ) -> int:
         """Device memory the largest step this scheduler admits maps beyond what stays
-        resident: rows streams of tokens tokens each, prompt included, as uncached hops
-        and as finals over their whole history, each followed by HiFT."""
+        resident: row_count streams of tokens_per_row tokens each, prompt included, as
+        uncached hops and as finals over their whole history, each followed by HiFT."""
         hop_frames = self.token_max_hop_len * self.vocoder.flow.token_mel_ratio
         samples_per_frame = self.vocoder.hift_samples_per_mel_frame
         items = [
-            self.make_warmup_flow_input(tokens - self.token_hop_len)
-            for _ in range(rows)
+            self.make_warmup_flow_input(tokens_per_row - self.token_hop_len)
+            for _ in range(row_count)
         ]
         torch.cuda.synchronize(device)
         torch.cuda.empty_cache()
@@ -302,7 +302,8 @@ class FunCosyVoice3StreamingVocoderScheduler(
         torch.cuda.synchronize(device)
         peak_bytes = torch.cuda.max_memory_reserved(device) - resident_bytes
         logger.info(
-            f"Fun-CosyVoice3 largest admitted step, {rows} rows of {tokens} tokens: "
+            f"Fun-CosyVoice3 largest admitted step, {row_count} rows of {tokens_per_row} "
+            f"tokens: "
             f"{peak_bytes / 2**30:.2f} GB mapped ({time.monotonic() - started:.1f} s)"
         )
         return peak_bytes
