@@ -76,10 +76,7 @@ def hf_client(arm_out: Path, dtype_name: str, out: Path, reverse: bool) -> None:
     from transformers import Qwen3OmniMoeForConditionalGeneration
 
     dtype = torch.float32 if dtype_name == "fp32" else torch.bfloat16
-    features = {}
-    for path in (arm_out / "dumps").glob("*.pt"):
-        dump = torch.load(path, weights_only=False)
-        features[tuple(dump["input_ids"][0].tolist())] = (dump["input_features"], dump["feature_attention_mask"])
+    features = processor_calls_by_pad_value(arm_out)
     # note (ratish): the truth runs eager experts in fp32; the floor is HF's default bf16 path.
     precision_kwargs = {"experts_implementation": "eager"} if dtype_name == "fp32" else {}
     model = Qwen3OmniMoeForConditionalGeneration.from_pretrained(
@@ -112,13 +109,14 @@ def hf_client(arm_out: Path, dtype_name: str, out: Path, reverse: bool) -> None:
         prompt_ids = [
             audio_token_id if token_id >= vocab_size else token_id for token_id in served["origin_input_ids"]
         ]
-        if tuple(prompt_ids) not in features:
-            print(f"no processor call for {inputs_path.name} (the server's warmup), skipped", flush=True)
+        pad_values = {token_id for token_id in served["origin_input_ids"] if token_id >= vocab_size}
+        if len(pad_values) != 1 or next(iter(pad_values)) not in features:
+            print(f"no single audio processor call for {inputs_path.name} (the server's warmup), skipped", flush=True)
             continue
         else:
             pass
         input_ids = torch.tensor([prompt_ids])
-        input_features, feature_mask = features[tuple(prompt_ids)]
+        input_features, feature_mask = features[next(iter(pad_values))]
         captured.clear()
         thinker.rope_deltas = None
         with torch.no_grad():
@@ -143,6 +141,36 @@ def hf_client(arm_out: Path, dtype_name: str, out: Path, reverse: bool) -> None:
             print(f"{time.strftime('%H:%M:%S')} hf {dtype_name} {index}/{len(pairs)}", flush=True)
         else:
             pass
+
+
+def audio_pad_value(audio, vocab_size: int) -> int:
+    """The thinker's pad value for one request audio, as the served pipeline derives it."""
+    import xxhash
+
+    from sglang_omni.models.qwen3_omni.components.preprocessor import contextualize_cache_key
+    from sglang_omni.preprocessing.audio import compute_audio_cache_key
+
+    encoder_key = contextualize_cache_key(compute_audio_cache_key([audio]), target_sr=16000)
+    return vocab_size + xxhash.xxh3_64(f"audio:{encoder_key}".encode()).intdigest() % (1 << 62)
+
+
+def processor_calls_by_pad_value(arm_out: Path) -> dict[int, tuple[object, object]]:
+    """Each audio processor call's features, keyed by its audio's pad value: prompt ids are shared by items with
+    the same question and audio length, the pad value is not."""
+    import torch
+    from transformers import AutoConfig
+
+    vocab_size = AutoConfig.from_pretrained(MODEL).thinker_config.text_config.vocab_size
+    calls = {}
+    for path in (arm_out / "dumps").glob("*.pt"):
+        dump = torch.load(path, weights_only=False)
+        if len(dump["audio"]) == 1:
+            calls[audio_pad_value(dump["audio"][0], vocab_size)] = (
+                dump["input_features"], dump["feature_attention_mask"]
+            )
+        else:
+            pass
+    return calls
 
 
 def run_hf(out: Path, arm: str, dtype_name: str, card: int, tree_path: Path) -> int:
