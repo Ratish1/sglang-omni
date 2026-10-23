@@ -140,7 +140,10 @@ def run(args: argparse.Namespace) -> None:
                 clip = codes[..., :total]
                 truth = truth_decoder(clip).reshape(-1)[reference_frames * samples_per_frame :]
                 served = stream(clip, reference_frames, first_in_windows)
+                ramp_end = sum(RAMP) * samples_per_frame
                 result[f"{name} first"] = snr_db(served[:samples_per_frame], truth[:samples_per_frame])
+                result[f"{name} ramp"] = snr_db(served[samples_per_frame:ramp_end], truth[samples_per_frame:ramp_end])
+                result[f"{name} steady"] = snr_db(served[ramp_end:], truth[ramp_end:])
                 result[f"{name} stream"] = snr_db(served, truth)
                 streams[f"{row_id} {name}"] = served.cpu()
             results[row_id] = result
@@ -156,6 +159,10 @@ def compare(args: argparse.Namespace) -> None:
     base, change = json.loads(Path(args.base).read_text()), json.loads(Path(args.change).read_text())
     clips = sorted(set(base) & set(change))
     for key in base[clips[0]]:
+        if key not in change[clips[0]]:
+            continue
+        else:
+            pass
         deltas = [change[clip][key] - base[clip][key] for clip in clips]
         mean = statistics.fmean(deltas)
         error = statistics.stdev(deltas) / math.sqrt(len(deltas))
