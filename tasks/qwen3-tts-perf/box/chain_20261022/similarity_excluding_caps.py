@@ -4,6 +4,7 @@ the scorer skips it in both, then the scorer's similarity-only pass on that copy
 placed in the arm's bench/ beside similarity_excluded.txt, which names the clips left out.
 
 usage: PAIR_ROOT=<pairs> python3 similarity_excluding_caps.py <label> --tree <tree> --card 2 [--max-seconds 60]
+       [--meta <list the pair ran, or its short_reference_meta.py list>]
 """
 
 import argparse
@@ -23,6 +24,7 @@ def main() -> None:
     parser.add_argument("--tree", required=True)
     parser.add_argument("--card", type=int, required=True)
     parser.add_argument("--max-seconds", type=float, default=60.0)
+    parser.add_argument("--meta", default="")
     args = parser.parse_args()
     root = Path(os.environ["PAIR_ROOT"]) / args.label
     generated = {arm: json.loads((root / arm / "bench" / "generated.json").read_text()) for arm in ("a", "b")}
@@ -44,7 +46,7 @@ def main() -> None:
             subprocess.run(
                 [sys.executable, "-m", "benchmarks.eval.benchmark_tts_seedtts", "--model", MODEL, "--lang", "en",
                  "--skip-gpu-cleanup", "--output-dir", str(sim_dir), "--similarity-only", "--device",
-                 f"cuda:{args.card}"],
+                 f"cuda:{args.card}", *(["--meta", args.meta] if args.meta else [])],
                 cwd=args.tree, env=dict(os.environ, PYTHONPATH=args.tree), stdout=log, stderr=subprocess.STDOUT,
                 check=True,
             )
