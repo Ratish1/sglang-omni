@@ -1399,14 +1399,23 @@ def test_derived_prefix_pool_takes_the_memory_left_after_its_reserve(
     expected_blocks: int | None,
 ) -> None:
     block_bytes = stages.BLOCK_FRAMES * tiny_prefix_bytes_per_frame()
-    reserve_bytes = 2**30
+    stage_reserve_bytes = 2**30
+    headroom_bytes = 2**29
     total_bytes = 2**36
-    reserved_bytes = int(total_bytes / 2 - reserve_bytes - capped_blocks * block_bytes)
+    reserved_bytes = int(
+        total_bytes / 2
+        - stage_reserve_bytes
+        - headroom_bytes
+        - capped_blocks * block_bytes
+    )
     monkeypatch.setattr(torch.cuda, "empty_cache", lambda: None)
     monkeypatch.setattr(
         torch.cuda,
         "mem_get_info",
-        lambda device: (int(reserve_bytes + free_blocks * block_bytes), total_bytes),
+        lambda device: (
+            int(stage_reserve_bytes + headroom_bytes + free_blocks * block_bytes),
+            total_bytes,
+        ),
     )
     monkeypatch.setattr(
         torch.cuda, "get_per_process_memory_fraction", lambda device: 0.5
@@ -1418,12 +1427,13 @@ def test_derived_prefix_pool_takes_the_memory_left_after_its_reserve(
         torch.device("cpu"),
         torch.bfloat16,
         size_gb=None,
-        reserve_bytes=reserve_bytes,
-        memory_fraction=(
+        max_blocks=None,
+        stage_reserve_bytes=stage_reserve_bytes,
+        headroom_bytes=headroom_bytes,
+        share_ceiling_bytes=(
             None
             if share_blocks is None
-            else (reserved_bytes + reserve_bytes + share_blocks * block_bytes)
-            / total_bytes
+            else reserved_bytes + stage_reserve_bytes + share_blocks * block_bytes
         ),
     )
 
@@ -1434,17 +1444,23 @@ def test_derived_prefix_pool_takes_the_memory_left_after_its_reserve(
         assert pool.free_frames == expected_blocks * stages.BLOCK_FRAMES
 
 
-@pytest.mark.parametrize(("size_blocks", "expected_blocks"), [(3, 3), (30, 10)])
-def test_sized_prefix_pool_is_capped_by_the_memory_left_after_its_reserve(
-    monkeypatch: pytest.MonkeyPatch, size_blocks: int, expected_blocks: int
+@pytest.mark.parametrize(
+    ("size_blocks", "max_blocks", "expected_blocks"),
+    [(3, None, 3), (30, None, 10), (None, 4, 4)],
+)
+def test_prefix_pool_caps_take_the_smaller_of_their_size_and_the_memory_left(
+    monkeypatch: pytest.MonkeyPatch,
+    size_blocks: int | None,
+    max_blocks: int | None,
+    expected_blocks: int,
 ) -> None:
     block_bytes = stages.BLOCK_FRAMES * tiny_prefix_bytes_per_frame()
-    reserve_bytes = 2**30
+    stage_reserve_bytes = 2**30
     monkeypatch.setattr(torch.cuda, "empty_cache", lambda: None)
     monkeypatch.setattr(
         torch.cuda,
         "mem_get_info",
-        lambda device: (reserve_bytes + 10 * block_bytes, 2**36),
+        lambda device: (stage_reserve_bytes + 10 * block_bytes, 2**36),
     )
     monkeypatch.setattr(
         torch.cuda, "get_per_process_memory_fraction", lambda device: 1.0
@@ -1455,9 +1471,11 @@ def test_sized_prefix_pool_is_capped_by_the_memory_left_after_its_reserve(
         tiny_prefix_flow(),
         torch.device("cpu"),
         torch.bfloat16,
-        size_gb=size_blocks * block_bytes / 2**30,
-        reserve_bytes=reserve_bytes,
-        memory_fraction=None,
+        size_gb=None if size_blocks is None else size_blocks * block_bytes / 2**30,
+        max_blocks=max_blocks,
+        stage_reserve_bytes=stage_reserve_bytes,
+        headroom_bytes=0,
+        share_ceiling_bytes=None,
     )
 
     assert pool is not None
@@ -1465,20 +1483,14 @@ def test_sized_prefix_pool_is_capped_by_the_memory_left_after_its_reserve(
 
 
 @pytest.mark.parametrize(
-    (
-        "flow_prefix_cache_gb",
-        "headroom_gib",
-        "process_fraction",
-        "expected_reserve_gib",
-    ),
-    [(None, 1.5, None, 4.5), (2.0, 1.5, None, 4.5), (None, 0.0, 0.6, 3.0)],
+    ("flow_prefix_cache_gb", "vocoder_fraction", "expected_share_ceiling_bytes"),
+    [(None, None, None), (2.0, None, None), (None, 0.5, 2**30 + 2**33)],
 )
 def test_prefix_pool_leaves_the_engine_headroom_and_the_largest_step(
     monkeypatch: pytest.MonkeyPatch,
     flow_prefix_cache_gb: float | None,
-    headroom_gib: float,
-    process_fraction: float | None,
-    expected_reserve_gib: float,
+    vocoder_fraction: float | None,
+    expected_share_ceiling_bytes: int | None,
 ) -> None:
     fake_flow = RunnableFakeFlow()
     fake_flow.packed_estimator.is_ragged = True
@@ -1495,16 +1507,22 @@ def test_prefix_pool_leaves_the_engine_headroom_and_the_largest_step(
         "load_cosyvoice3_flow_hift",
         lambda checkpoint_dir, device, fp16, **kwargs: (flow, FakeHiFT()),
     )
+    monkeypatch.setattr(torch.cuda, "memory_reserved", lambda device: 2**30)
+    monkeypatch.setattr(
+        torch.cuda,
+        "get_device_properties",
+        lambda device: SimpleNamespace(total_memory=2**34),
+    )
     events: list[tuple[str, object]] = []
 
     def measure(
         scheduler: FunCosyVoice3StreamingVocoderScheduler,
         device: torch.device,
         *,
-        rows: int,
-        tokens: int,
+        row_count: int,
+        tokens_per_row: int,
     ) -> int:
-        events.append(("measure", (rows, tokens)))
+        events.append(("measure", (row_count, tokens_per_row)))
         return 3 * 2**30
 
     def build(
@@ -1513,18 +1531,29 @@ def test_prefix_pool_leaves_the_engine_headroom_and_the_largest_step(
         dtype: torch.dtype,
         *,
         size_gb: float | None,
-        reserve_bytes: int,
-        memory_fraction: float | None,
+        max_blocks: int | None,
+        stage_reserve_bytes: int,
+        headroom_bytes: int,
+        share_ceiling_bytes: int | None,
     ) -> None:
-        events.append(("pool", (size_gb, reserve_bytes, memory_fraction)))
+        events.append(
+            (
+                "pool",
+                (
+                    size_gb,
+                    max_blocks,
+                    stage_reserve_bytes,
+                    headroom_bytes,
+                    share_ceiling_bytes,
+                ),
+            )
+        )
 
     monkeypatch.setattr(
         FunCosyVoice3StreamingVocoderScheduler, "measure_peak_step_bytes", measure
     )
     monkeypatch.setattr(stages, "build_prefix_pool", build)
-    monkeypatch.setattr(
-        stages, "engine_headroom_bytes", lambda: int(headroom_gib * 2**30)
-    )
+    monkeypatch.setattr(stages, "engine_headroom_bytes", lambda: 3 * 2**29)
 
     stages.create_vocoder_executor(
         "model",
@@ -1538,8 +1567,7 @@ def test_prefix_pool_leaves_the_engine_headroom_and_the_largest_step(
         enable_hift_cuda_graph=False,
         flow_batch_admission_frames=3,
         enable_dit_torch_compile=False,
-        total_gpu_memory_fraction=None if process_fraction is None else 0.2,
-        process_total_gpu_memory_fraction=process_fraction,
+        total_gpu_memory_fraction=vocoder_fraction,
     )
 
     assert events == [
@@ -1548,8 +1576,10 @@ def test_prefix_pool_leaves_the_engine_headroom_and_the_largest_step(
             "pool",
             (
                 flow_prefix_cache_gb,
-                int(expected_reserve_gib * 2**30),
-                process_fraction,
+                None,
+                3 * 2**30,
+                3 * 2**29,
+                expected_share_ceiling_bytes,
             ),
         ),
     ]

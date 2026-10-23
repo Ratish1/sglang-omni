@@ -1560,47 +1560,52 @@ def compile_dit_backbone(
     )
 
 
-def prefix_pool_bytes_per_frame(flow: FunCosyVoice3Flow, dtype: torch.dtype) -> int:
-    estimator = flow.decoder.estimator
-    attention = estimator.transformer_blocks[0].attn
-    head_num = int(attention.heads)
-    return PrefixKVPool.bytes_per_frame(
-        layer_num=len(estimator.transformer_blocks),
-        euler_steps=FLOW_EULER_STEPS,
-        head_num=head_num,
-        head_dim=int(attention.inner_dim) // head_num,
-        dtype=dtype,
-    )
-
-
 def build_prefix_pool(
     flow: FunCosyVoice3Flow,
     device: torch.device,
     dtype: torch.dtype,
     *,
     size_gb: float | None,
-    reserve_bytes: int,
-    memory_fraction: float | None,
+    max_blocks: int | None,
+    stage_reserve_bytes: int,
+    headroom_bytes: int,
+    share_ceiling_bytes: int | None,
 ) -> PrefixKVPool | None:
-    """The pool at the memory this process can still take minus reserve_bytes, at
-    most size_gb when set; None when that holds no block."""
+    """The pool at the memory this process can still take less the stage's reserve
+    and the engine's headroom, at most size_gb or max_blocks when set; None when
+    that holds no block."""
     estimator = flow.decoder.estimator
     attention = estimator.transformer_blocks[0].attn
     layer_num = len(estimator.transformer_blocks)
     head_num = int(attention.heads)
     head_dim = int(attention.inner_dim) // head_num
-    bytes_per_frame = prefix_pool_bytes_per_frame(flow, dtype)
-    # note (ratish): a declared footprint caps this process below the device's free
-    # memory: total_reserve_bytes as the allocator's cap, gpu_memory_fraction as a share.
+    bytes_per_frame = PrefixKVPool.bytes_per_frame(
+        layer_num=layer_num,
+        euler_steps=FLOW_EULER_STEPS,
+        head_num=head_num,
+        head_dim=head_dim,
+        dtype=dtype,
+    )
+    # note (ratish): the engine's headroom stays free on the device and under the
+    # process's allocator cap (total_reserve_bytes); a declared vocoder share
+    # (gpu_memory_fraction) bounds this stage's own allocations.
     torch.cuda.empty_cache()
     free_bytes, total_bytes = torch.cuda.mem_get_info(device)
-    cap_fraction = torch.cuda.get_per_process_memory_fraction(device)
-    if memory_fraction is not None:
-        cap_fraction = min(cap_fraction, memory_fraction)
+    reserved_bytes = torch.cuda.memory_reserved(device)
+    allocator_cap_bytes = (
+        torch.cuda.get_per_process_memory_fraction(device) * total_bytes
+    )
+    budget_bytes = (
+        min(free_bytes, allocator_cap_bytes - reserved_bytes)
+        - headroom_bytes
+        - stage_reserve_bytes
+    )
+    if share_ceiling_bytes is not None:
+        budget_bytes = min(
+            budget_bytes, share_ceiling_bytes - reserved_bytes - stage_reserve_bytes
+        )
     else:
         pass
-    under_cap_bytes = cap_fraction * total_bytes - torch.cuda.memory_reserved(device)
-    budget_bytes = min(free_bytes, under_cap_bytes) - reserve_bytes
     if size_gb is None:
         pass
     elif size_gb * 2**30 > budget_bytes:
@@ -1611,10 +1616,15 @@ def build_prefix_pool(
     else:
         budget_bytes = size_gb * 2**30
     capacity_frames = int(budget_bytes // bytes_per_frame)
+    if max_blocks is not None:
+        capacity_frames = min(capacity_frames, max_blocks * BLOCK_FRAMES)
+    else:
+        pass
+    reserve_gb = (stage_reserve_bytes + headroom_bytes) / 2**30
     if capacity_frames < BLOCK_FRAMES:
         logger.warning(
             f"Fun-CosyVoice3 Flow prefix cache off: {budget_bytes / 2**30:.2f} GB "
-            f"left after the {reserve_bytes / 2**30:.2f} GB reserve"
+            f"left after the {reserve_gb:.2f} GB reserve"
         )
         return None
     else:
@@ -1632,7 +1642,7 @@ def build_prefix_pool(
         f"Fun-CosyVoice3 Flow prefix cache: {pool.free_frames} frames "
         f"({pool.free_frames * bytes_per_frame / 2**30:.1f} GB, "
         f"{bytes_per_frame} bytes per frame, size_gb={size_gb}, "
-        f"reserve {reserve_bytes / 2**30:.2f} GB)"
+        f"reserve {reserve_gb:.2f} GB)"
     )
     return pool
 
@@ -2437,7 +2447,6 @@ def create_vocoder_executor(
     disable_hop_growth: bool = False,
     flow_prefix_cache_gb: float | None,
     total_gpu_memory_fraction: float | None = None,
-    process_total_gpu_memory_fraction: float | None = None,
 ) -> FunCosyVoice3StreamingVocoderScheduler:
     from sglang_omni.models.fun_cosyvoice3.streaming_vocoder import (
         FunCosyVoice3StreamingVocoderScheduler,
@@ -2478,6 +2487,16 @@ def create_vocoder_executor(
         autocast_dtype = None
     else:
         pass
+    device_obj = torch.device(device)
+    # note (ratish): a declared vocoder share bounds this stage's own allocations,
+    # which start here; only CUDA has the Flow prefix pool it sizes.
+    if total_gpu_memory_fraction is None or device_obj.type != "cuda":
+        share_ceiling_bytes: int | None = None
+    else:
+        share_ceiling_bytes = torch.cuda.memory_reserved(device_obj) + int(
+            total_gpu_memory_fraction
+            * torch.cuda.get_device_properties(device_obj).total_memory
+        )
     flow, hift = load_cosyvoice3_flow_hift(
         checkpoint_dir,
         device=device,
@@ -2486,7 +2505,6 @@ def create_vocoder_executor(
         enable_flow_estimator_trt=enable_flow_estimator_trt,
     )
 
-    device_obj = torch.device(device)
     has_ragged_attention = (
         flow.packed_estimator is not None
         and flow.packed_estimator.is_ragged
@@ -2525,11 +2543,6 @@ def create_vocoder_executor(
     has_prefix_pool = (
         flow_prefix_cache_gb is None or flow_prefix_cache_gb > 0
     ) and has_ragged_attention
-    memory_fraction = (
-        process_total_gpu_memory_fraction
-        if process_total_gpu_memory_fraction is not None
-        else total_gpu_memory_fraction
-    )
 
     if enable_flow_cuda_graph and not flow.is_buffered_packed:
         capture_shapes = verify_flow_cuda_graph_capture_shapes(
@@ -2701,24 +2714,21 @@ def create_vocoder_executor(
         # the scheduler admits: max_batch_size rows, each at most the AR's context.
         step_bytes = scheduler.measure_peak_step_bytes(
             device_obj,
-            rows=max_batch_size,
-            tokens=FunCosyVoice3EngineBuilder.context_length,
+            row_count=max_batch_size,
+            tokens_per_row=FunCosyVoice3EngineBuilder.context_length,
         )
         if has_prefix_graphs:
             # note (ratish): the prefix graphs capture after the pool they read, so
             # their memory is measured first on a throwaway pool and graph pool.
-            dry_pool_bytes = (
-                DRY_PREFIX_POOL_BLOCKS
-                * BLOCK_FRAMES
-                * prefix_pool_bytes_per_frame(flow, autocast_dtype)
-            )
             flow.prefix_pool = build_prefix_pool(
                 flow,
                 device_obj,
                 autocast_dtype,
-                size_gb=dry_pool_bytes / 2**30,
-                reserve_bytes=0,
-                memory_fraction=memory_fraction,
+                size_gb=None,
+                max_blocks=DRY_PREFIX_POOL_BLOCKS,
+                stage_reserve_bytes=0,
+                headroom_bytes=0,
+                share_ceiling_bytes=share_ceiling_bytes,
             )
             assert flow.prefix_pool is not None
             flow.prefix_pool.forward = prefix_forward
@@ -2745,7 +2755,6 @@ def create_vocoder_executor(
         # its own, and the allocator never shares a block across streams, so the
         # engine's headroom and the step add up.
         headroom_bytes = engine_headroom_bytes()
-        reserve_bytes = prefix_graph_bytes + headroom_bytes + step_bytes
         logger.info(
             f"Fun-CosyVoice3 Flow prefix cache reserve: prefix graphs "
             f"{prefix_graph_bytes / 2**30:.2f} GB, engine headroom "
@@ -2756,8 +2765,10 @@ def create_vocoder_executor(
             device_obj,
             autocast_dtype,
             size_gb=flow_prefix_cache_gb,
-            reserve_bytes=reserve_bytes,
-            memory_fraction=memory_fraction,
+            max_blocks=None,
+            stage_reserve_bytes=prefix_graph_bytes + step_bytes,
+            headroom_bytes=headroom_bytes,
+            share_ceiling_bytes=share_ceiling_bytes,
         )
         if flow.prefix_pool is not None:
             flow.prefix_pool.forward = prefix_forward
