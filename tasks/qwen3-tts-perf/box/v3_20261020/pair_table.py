@@ -62,7 +62,10 @@ def row(label: str, arm: str) -> str:
         pass
     similarity = "-"
     similarity_log = directory / "score--similarity-only.log"
-    if similarity_log.exists():
+    similarity_path = directory / "bench" / "similarity_results.json"
+    if similarity_path.exists():
+        similarity = f"{json.load(open(similarity_path))['summary']['speaker_similarity_mean']:.4f}"
+    elif similarity_log.exists():
         value = last_float(r"speaker similarity: ([0-9.]+)", similarity_log.read_text(errors="ignore"))
         similarity = f"{value:.4f}" if value is not None else "-"
     else:
