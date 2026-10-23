@@ -11,10 +11,8 @@ from sglang.srt.model_executor.forward_context import (
 
 from sglang_omni.model_runner.base import ModelRunner
 from sglang_omni.model_runner.thinker_model_runner import ThinkerModelRunner
-from sglang_omni.scheduling.sglang_backend.prompt_hidden import (
-    PromptHiddenRequest,
-    PromptHiddenStore,
-)
+from sglang_omni.scheduling.sglang_backend.prompt_hidden import PromptHiddenRequest
+from tests.unit_test.fixtures.prompt_hidden import cuda_prompt_hidden_store
 
 
 def probe_runner(monkeypatch, method: str):
@@ -191,13 +189,6 @@ def test_only_a_prefill_chunk_computing_multimodal_rows_captures_hidden_states(
 def test_a_capturing_prefill_stores_each_multimodal_row_at_its_kv_slot() -> None:
     req_to_token = torch.zeros((1, 6), dtype=torch.int32, device="cuda")
     runner = ThinkerModelRunner.__new__(ThinkerModelRunner)
-    runner.prompt_hidden_store = PromptHiddenStore(
-        slot_count=16,
-        hidden_size=2,
-        dtype=torch.float32,
-        req_to_token_pool=SimpleNamespace(req_to_token=req_to_token),
-        device="cuda",
-    )
     schedule_batch = SimpleNamespace(
         reqs=[SimpleNamespace(), multimodal_request([3, 5])],
         prefix_lens=[0, 3],
@@ -206,19 +197,20 @@ def test_a_capturing_prefill_stores_each_multimodal_row_at_its_kv_slot() -> None
     hidden_states = torch.arange(10.0, device="cuda").view(5, 2)
     out_cache_loc = torch.tensor([10, 11, 12, 13, 14], device="cuda")
 
-    runner.post_prefill(
-        SimpleNamespace(logits_output=SimpleNamespace(hidden_states=hidden_states)),
-        SimpleNamespace(
-            capture_hidden_mode=CaptureHiddenMode.FULL,
-            out_cache_loc=out_cache_loc,
-            out_cache_loc_virtual=None,
-        ),
-        schedule_batch,
-        [],
-    )
-    req_to_token[0, 3:6] = out_cache_loc[2:].to(torch.int32)
+    with cuda_prompt_hidden_store(slot_count=16, req_to_token=req_to_token) as store:
+        runner.prompt_hidden_store = store
+        runner.post_prefill(
+            SimpleNamespace(logits_output=SimpleNamespace(hidden_states=hidden_states)),
+            SimpleNamespace(
+                capture_hidden_mode=CaptureHiddenMode.FULL,
+                out_cache_loc=out_cache_loc,
+                out_cache_loc_virtual=None,
+            ),
+            schedule_batch,
+            [],
+        )
+        req_to_token[0, 3:6] = out_cache_loc[2:].to(torch.int32)
 
-    assert torch.equal(
-        runner.prompt_hidden_store.read(0, torch.tensor([3, 5])),
-        hidden_states[[2, 4]].cpu(),
-    )
+        assert torch.equal(
+            store.read(0, torch.tensor([3, 5])), hidden_states[[2, 4]].cpu()
+        )

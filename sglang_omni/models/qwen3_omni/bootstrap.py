@@ -193,6 +193,11 @@ def create_thinker_scheduler(
         prefill_coalesce_requests=prefill_coalesce_requests,
         prefill_coalesce_wait_ms=prefill_coalesce_wait_ms,
         prefill_coalesce_when_idle=prefill_coalesce_when_idle,
+        shutdown_callback=(
+            model_runner.prompt_hidden_store.destroy
+            if model_runner.prompt_hidden_store is not None
+            else None
+        ),
     )
 
 

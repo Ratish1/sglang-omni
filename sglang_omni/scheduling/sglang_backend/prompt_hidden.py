@@ -11,10 +11,13 @@ from dataclasses import dataclass
 import torch
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
-from sglang.srt.mem_cache.pool_host.common import (
+from sglang.srt.mem_cache.pool_host.common import (  # noqa: leading-underscore  # the allocator's own unregister
     ALLOC_MEMORY_FUNCS,
     HostTensorAllocator,
+    _cuda_host_unregister,
 )
+
+from sglang_omni.platforms import current_platform
 
 logger = logging.getLogger(__name__)
 
@@ -96,6 +99,18 @@ class PromptHiddenStore:
             staged = self.staged.popleft()
             staged.copy_done.synchronize()
             self.hidden_states[staged.slot_ids] = staged.hidden_states
+
+    def destroy(self) -> None:
+        """Release the rows' host registration, so a buffer mapped later at the same address can register."""
+        if self.hidden_states is None:
+            return
+        else:
+            pass
+        if current_platform.is_cuda_alike():
+            _cuda_host_unregister(self.hidden_states)
+        else:
+            pass
+        self.hidden_states = None
 
     def read(self, request_pool_index: int, positions: torch.Tensor) -> torch.Tensor:
         """The rows at a request's prompt positions, through the slots its KV holds now."""

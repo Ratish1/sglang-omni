@@ -1240,6 +1240,7 @@ def test_qwen_thinker_cuda_graph_capture_lifecycle(
     generic_runner_calls: list[tuple[object, object]] = []
     qwen_runner_calls: list[tuple[object, object]] = []
     output_proc = object()
+    prompt_hidden_store = SimpleNamespace(destroy=lambda: None)
     events: list[str] = []
 
     class FakeThinker:
@@ -1339,7 +1340,7 @@ def test_qwen_thinker_cuda_graph_capture_lifecycle(
             generic_runner_calls.append(
                 (model_worker, output_proc, capture_prompt_hidden_states)
             )
-            or SimpleNamespace(prompt_hidden_store=object())
+            or SimpleNamespace(prompt_hidden_store=prompt_hidden_store)
         ),
     )
     monkeypatch.setattr(
@@ -1349,7 +1350,7 @@ def test_qwen_thinker_cuda_graph_capture_lifecycle(
             qwen_runner_calls.append(
                 (model_worker, output_proc, capture_prompt_hidden_states)
             )
-            or SimpleNamespace(prompt_hidden_store=object())
+            or SimpleNamespace(prompt_hidden_store=prompt_hidden_store)
         ),
     )
     monkeypatch.setattr(
@@ -1390,6 +1391,10 @@ def test_qwen_thinker_cuda_graph_capture_lifecycle(
     make_stream_builder.assert_called_once_with(
         speech_enabled=speech_enabled,
         prompt_hidden_store=scheduler.model_runner.prompt_hidden_store,
+    )
+    assert (
+        scheduler.shutdown_callback
+        is scheduler.model_runner.prompt_hidden_store.destroy
     )
     if execution_mode == "request":
         assert generic_runner_calls == (
