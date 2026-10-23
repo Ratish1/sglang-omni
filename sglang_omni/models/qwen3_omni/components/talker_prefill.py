@@ -207,9 +207,22 @@ class TalkerPrefillBuilder:
         # note (ratish): a session turn reuses its slot's KV and sends no prompt rows, so it
         # keeps zeros at the multimodal rows, the only prompt rows the hidden is read at.
         if captured_positions is not None:
-            prompt_mask = multimodal_mask[: prompt_ids.shape[0]]
+            # note (ratish): checked on the CPU prompt ids, so the device mask is never read back.
+            multimodal_token_ids = prompt_ids.new_tensor(
+                [
+                    int(token_id)
+                    for token_id in (
+                        self.audio_token_id,
+                        self.image_token_id,
+                        self.video_token_id,
+                    )
+                    if token_id is not None
+                ]
+            )
+            prompt_positions = torch.isin(prompt_ids, multimodal_token_ids)
             assert (
-                captured_positions == prompt_mask.nonzero(as_tuple=True)[0].tolist()
+                captured_positions
+                == prompt_positions.nonzero(as_tuple=True)[0].tolist()
             ), "the thinker's prompt hidden rows are not the prompt's multimodal rows"
             prompt_hidden[captured_positions] = prompt_chunk.data.to(prompt_hidden)
         else:
