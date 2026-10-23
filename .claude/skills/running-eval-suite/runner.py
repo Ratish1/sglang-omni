@@ -20,7 +20,6 @@ import fcntl
 import json
 import os
 import re
-import shutil
 import signal
 import socket
 import subprocess
@@ -31,17 +30,6 @@ import urllib.request
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
-
-from benchmarks.benchmarker.router_config import RouterTopology, render_router_config
-from benchmarks.benchmarker.workers import (
-    ManagedWorkerProcess,
-    build_gpu_assignments,
-    port_is_available,
-    start_workers,
-    stop_managed_workers,
-    wait_for_all_router_workers,
-    wait_for_workers,
-)
 
 __version__ = "0.2.0"
 
@@ -77,9 +65,16 @@ try:
         with open(path) as fh:
             return yaml.safe_load(fh)
 
+    def dump_yaml(data: Any) -> str:
+        return yaml.safe_dump(data, sort_keys=False)
 except ImportError:  # pragma: no cover
 
     def load_yaml(path: Path) -> Any:
+        raise SystemExit(
+            "PyYAML missing — `pip install pyyaml` in your venv first"
+        )
+
+    def dump_yaml(data: Any) -> str:
         raise SystemExit(
             "PyYAML missing — `pip install pyyaml` in your venv first"
         )
@@ -228,12 +223,14 @@ def free_port() -> int:
     return port
 
 
-def rust_router_binary() -> str:
-    binary = shutil.which(os.environ.get("SGLANG_OMNI_ROUTER_BIN", "sgl-omni-router"))
-    if binary is None:
-        raise RuntimeError("install sgl-omni-router or set SGLANG_OMNI_ROUTER_BIN")
-    else:
-        return binary
+def port_is_available(port: int, host: str = "127.0.0.1") -> bool:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            sock.bind((host, port))
+        except OSError:
+            return False
+    return True
 
 
 def free_port_range(count: int, excluded: set[int] | None = None) -> int:
@@ -418,19 +415,6 @@ def cmd_precheck(args: argparse.Namespace) -> int:
     versions: dict[str, str] = {}
     gpus: list[dict] = []
 
-    selected_rows = _select_rows(cfg.get("rows", []), args.benchmarks, args.exclude_ids)
-    if any(
-        _resolve_server_profile(row, cfg, row.get("hf_model_id", cfg.get("hf_model_id", "")))
-        is not None
-        for row in selected_rows
-    ):
-        try:
-            print(f"  Rust router: {rust_router_binary()}")
-        except RuntimeError as error:
-            errs.append(str(error))
-    else:
-        pass
-
     if not Path(py).exists():
         errs.append(f"venv python missing: {py}")
         if src == "default" and len(cands) > 1:
@@ -461,12 +445,6 @@ def cmd_precheck(args: argparse.Namespace) -> int:
     for row in cfg.get("rows", []):
         if row.get("hf_model_id"):
             hf_models.add(row["hf_model_id"])
-    for row in selected_rows:
-        if "transcribe_server_profile" in row:
-            profile = cfg["server_profiles"][row["transcribe_server_profile"]]
-            hf_models.add(profile["model_path"])
-        else:
-            pass
     hf_datasets = set(cfg.get("hf_datasets") or [])
 
     for mid in sorted(hf_models):
@@ -681,14 +659,12 @@ class ServerHandle:
         popen: subprocess.Popen,
         port: int,
         log_path: Path,
-        workers: list[ManagedWorkerProcess] | None = None,
-        health_path: str = "/health",
-    ) -> None:
+        cleanup_manifest: Path | None = None,
+    ):
         self.popen = popen
         self.port = port
         self.log_path = log_path
-        self.workers = workers if workers is not None else []
-        self.health_path = health_path
+        self.cleanup_manifest = cleanup_manifest
 
     def stop(self) -> None:
         try:
@@ -710,8 +686,8 @@ class ServerHandle:
             except subprocess.TimeoutExpired:
                 pass
         finally:
-            stop_managed_workers(self.workers)
-            self.workers.clear()
+            if self.cleanup_manifest is not None:
+                _cleanup_process_groups_from_manifest(self.cleanup_manifest)
 
 
 def launch_server(cmd_template: str, *, port: int, model: str,
@@ -762,7 +738,6 @@ def launch_row_server(
     return launch_managed_router_server(
         profile,
         py,
-        max_inflight=cfg["router_max_inflight"],
         port=port,
         model=model,
         gpus_csv=gpus_csv,
@@ -777,7 +752,6 @@ def launch_managed_router_server(
     profile: dict,
     py: str,
     *,
-    max_inflight: int,
     port: int,
     model: str,
     gpus_csv: str,
@@ -786,72 +760,81 @@ def launch_managed_router_server(
     repo_root: Path,
     server_extra: str = "",
 ) -> ServerHandle:
-    binary = rust_router_binary()
     num_workers = int(profile.get("num_workers", 2))
     worker_base_port = free_port_range(num_workers, excluded={port})
-    worker_ports = [worker_base_port + index for index in range(num_workers)]
-    worker_host = profile.get("worker_host", "127.0.0.1")
-    model_name = str(profile["model_name"]).format(model=model, repo_root=str(repo_root))
-    router_config = round_dir / "router.toml"
-    router_config.write_text(
-        render_router_config(
-            topology=RouterTopology(profile["router_topology"]),
-            router_port=port,
-            worker_urls=[f"http://{worker_host}:{worker_port}" for worker_port in worker_ports],
-            model_name=model_name,
-            max_inflight=max_inflight,
-            strategy=profile["router_policy"],
-        ),
-        encoding="utf-8",
-    )
+    cleanup_manifest = round_dir / "router_pgids.txt"
+    launcher_config = round_dir / "launcher.yaml"
     worker_extra_args = str(profile.get("worker_extra_args", "")).format(
         model=model,
         repo_root=str(repo_root),
     )
     if server_extra:
         worker_extra_args = f"{worker_extra_args} {server_extra}".strip()
-    else:
-        pass
-    num_gpus_per_worker = int(profile.get("num_gpus_per_worker", 1))
-    devices = gpus_csv.split(",")
-    worker_gpu_ids = build_gpu_assignments(devices, num_workers, num_gpus_per_worker)
-    workers: list[ManagedWorkerProcess] = []
+    launcher_config.write_text(
+        dump_yaml(
+            {
+                "launcher": {
+                    "backend": "local",
+                    "model_path": str(profile.get("model_path", model)).format(
+                        model=model,
+                        repo_root=str(repo_root),
+                    ),
+                    "model_name": str(profile["model_name"]).format(
+                        model=model,
+                        repo_root=str(repo_root),
+                    ),
+                    "num_workers": num_workers,
+                    "num_gpus_per_worker": int(profile.get("num_gpus_per_worker", 1)),
+                    "worker_host": profile.get("worker_host", "127.0.0.1"),
+                    "worker_base_port": worker_base_port,
+                    "worker_extra_args": worker_extra_args,
+                    "wait_timeout": int(profile.get("wait_timeout", 900)),
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    env = dict(os.environ)
+    if gpus_csv:
+        env["CUDA_VISIBLE_DEVICES"] = gpus_csv
+    env["SGLANG_OMNI_ROUTER_CLEANUP_MANIFEST"] = str(cleanup_manifest)
+    cmd = [
+        py,
+        "-m",
+        "sglang_omni_router.python.serve",
+        "--host",
+        "0.0.0.0",
+        "--port",
+        str(port),
+        "--launcher-config",
+        str(launcher_config),
+        "--policy",
+        profile.get("router_policy", "least_request"),
+        "--health-success-threshold",
+        "1",
+        "--health-failure-threshold",
+        "2",
+        "--health-check-interval-secs",
+        "2",
+        "--log-level",
+        "info",
+    ]
     log_path.parent.mkdir(parents=True, exist_ok=True)
-    try:
-        with open(log_path, "w") as log_fh:
-            workers = start_workers(
-                model_path=str(profile.get("model_path", model)).format(
-                    model=model, repo_root=str(repo_root)
-                ),
-                model_name=model_name,
-                worker_host=worker_host,
-                worker_ports=worker_ports,
-                worker_extra_args=worker_extra_args,
-                worker_gpu_ids=worker_gpu_ids,
-                output=log_fh,
-                working_dir=repo_root,
-                command=str(Path(py).with_name("sgl-omni")),
-            )
-            popen = subprocess.Popen(
-                [binary, "--config", str(router_config)],
-                stdout=log_fh,
-                stderr=subprocess.STDOUT,
-                cwd=str(repo_root),
-                start_new_session=True,
-            )
-    except BaseException:
-        stop_managed_workers(workers)
-        raise
-    handle = ServerHandle(popen, port, log_path, workers=workers, health_path="/ready")
-    try:
-        wait_for_workers(workers, int(profile.get("wait_timeout", 900)))
-        wait_for_all_router_workers(
-            port, expected_workers=num_workers, timeout=int(profile.get("server_boot_timeout_s", 300))
+    with open(log_path, "w") as log_fh:
+        popen = subprocess.Popen(
+            cmd,
+            stdout=log_fh,
+            stderr=subprocess.STDOUT,
+            env=env,
+            cwd=str(repo_root),
+            start_new_session=True,
         )
-    except BaseException:
-        handle.stop()
+    try:
+        _record_process_group(cleanup_manifest, os.getpgid(popen.pid))
+    except Exception:
+        ServerHandle(popen, port, log_path, cleanup_manifest=cleanup_manifest).stop()
         raise
-    return handle
+    return ServerHandle(popen, port, log_path, cleanup_manifest=cleanup_manifest)
 
 
 def _resolve_server_profile(row: dict, cfg: dict, model_id: str) -> dict | None:
@@ -887,6 +870,46 @@ def _row_server_boot_timeout(row: dict, cfg: dict) -> int:
             profile.get("server_boot_timeout_s", row.get("server_boot_timeout_s", 300))
         )
     return int(row.get("server_boot_timeout_s", 300))
+
+
+def _record_process_group(manifest: Path, process_group_id: int) -> None:
+    with manifest.open("a", encoding="utf-8") as handle:
+        handle.write(f"{process_group_id}\n")
+
+
+def _cleanup_process_groups_from_manifest(manifest: Path) -> None:
+    if not manifest.exists():
+        return
+    process_group_ids: set[int] = set()
+    for line in manifest.read_text().splitlines():
+        try:
+            process_group_ids.add(int(line.strip()))
+        except ValueError:
+            continue
+    for sig, delay in ((signal.SIGTERM, 5), (signal.SIGKILL, 1)):
+        remaining: set[int] = set()
+        for process_group_id in process_group_ids:
+            try:
+                os.killpg(process_group_id, sig)
+                remaining.add(process_group_id)
+            except ProcessLookupError:
+                continue
+        if not remaining:
+            return
+        time.sleep(delay)
+        process_group_ids = {
+            process_group_id
+            for process_group_id in remaining
+            if _process_group_exists(process_group_id)
+        }
+
+
+def _process_group_exists(process_group_id: int) -> bool:
+    try:
+        os.killpg(process_group_id, 0)
+        return True
+    except ProcessLookupError:
+        return False
 
 
 def wait_health(url: str, timeout_s: int) -> tuple[bool, str]:
@@ -1107,37 +1130,6 @@ def _run_one_row(row: dict, py: str, root: Path, out_root: Path,
     }
 
 
-def run_eval_client(
-    client_template: str,
-    *,
-    port: int,
-    output_dir: Path,
-    model: str,
-    asr_device: str,
-    root: Path,
-    log_path: Path,
-    smoke: int | None,
-) -> int:
-    if smoke is not None:
-        client_template = _override_max_samples(client_template, smoke)
-    else:
-        pass
-    client_command = client_template.format(
-        port=port, output_dir=str(output_dir), model=model, asr_gpu=asr_device
-    )
-    print(f"    client: {_truncate(client_command, 110)}")
-    with open(log_path, "w") as log_handle:
-        result = subprocess.run(
-            client_command,
-            shell=True,
-            stdout=log_handle,
-            stderr=subprocess.STDOUT,
-            cwd=str(root),
-            env={**os.environ, "OUTPUT_DIR": str(output_dir)},
-        )
-    return result.returncode
-
-
 def _run_one_round(row: dict, py: str, root: Path, round_dir: Path,
                    gpus_csv: str, smoke: int | None, cfg: dict, hw: str, *,
                    asr_device: str = "cpu") -> dict:
@@ -1151,36 +1143,22 @@ def _run_one_round(row: dict, py: str, root: Path, round_dir: Path,
     model_id = row.get("hf_model_id") or cfg.get("hf_model_id", "")
 
     print(f"  [{round_dir.name}] launching server (port={port}) ...", flush=True)
+    handle = launch_row_server(
+        row,
+        cfg,
+        py,
+        port=port,
+        model=model_id,
+        gpus_csv=gpus_csv,
+        log_path=server_log,
+        round_dir=round_dir,
+        repo_root=root,
+        server_extra=server_extra,
+    )
     try:
-        handle = launch_row_server(
-            row,
-            cfg,
-            py,
-            port=port,
-            model=model_id,
-            gpus_csv=gpus_csv,
-            log_path=server_log,
-            round_dir=round_dir,
-            repo_root=root,
-            server_extra=server_extra,
-        )
-    except (OSError, RuntimeError) as error:
-        return {
-            "status": "fail",
-            "reason": f"server boot: {error}",
-            "round_dir": str(round_dir),
-            "server_log": str(server_log),
-            "fail_excerpt": _extract_fail_excerpt(server_log),
-        }
-    try:
+        health = row.get("server_health", "http://localhost:{port}/health").format(port=port)
         timeout = _row_server_boot_timeout(row, cfg)
-        if handle.workers and "server_health" not in row:
-            ok, msg = True, "ok"
-        else:
-            health = row.get(
-                "server_health", f"http://localhost:{{port}}{handle.health_path}"
-            ).format(port=port)
-            ok, msg = wait_health(health, timeout)
+        ok, msg = wait_health(health, timeout)
         if not ok:
             return {
                 "status": "fail",
@@ -1191,78 +1169,29 @@ def _run_one_round(row: dict, py: str, root: Path, round_dir: Path,
             }
         print(f"    server ready (<{timeout}s)")
 
-        client_exit = run_eval_client(
-            row["client"],
-            port=port,
-            output_dir=out_dir,
-            model=model_id,
-            asr_device=asr_device,
-            root=root,
-            log_path=client_log,
-            smoke=smoke,
+        client_tmpl = row["client"]
+        if smoke is not None:
+            client_tmpl = _override_max_samples(client_tmpl, smoke)
+        client_cmd = client_tmpl.format(
+            port=port, output_dir=str(out_dir), model=model_id,
+            asr_gpu=asr_device,
         )
-        if client_exit != 0:
+        print(f"    client: {_truncate(client_cmd, 110)}")
+        with open(client_log, "w") as flog:
+            r = subprocess.run(
+                client_cmd, shell=True, stdout=flog, stderr=subprocess.STDOUT,
+                cwd=str(root),
+                env={**os.environ, "OUTPUT_DIR": str(out_dir)},
+            )
+        if r.returncode != 0:
             return {
                 "status": "fail",
-                "reason": f"client exit {client_exit}",
+                "reason": f"client exit {r.returncode}",
                 "round_dir": str(round_dir),
                 "client_log": str(client_log),
                 "server_log": str(server_log),
                 "fail_excerpt": _extract_fail_excerpt(client_log, server_log),
             }
-        else:
-            pass
-
-        if "transcribe_server_profile" in row:
-            handle.stop()
-            transcribe_dir = round_dir / "transcribe"
-            transcribe_dir.mkdir(exist_ok=True)
-            server_log = transcribe_dir / "server.log"
-            client_log = transcribe_dir / "client.log"
-            profile_name = row["transcribe_server_profile"]
-            try:
-                handle = launch_row_server(
-                    {"server_profile": profile_name},
-                    cfg,
-                    py,
-                    port=port,
-                    model=cfg["server_profiles"][profile_name]["model_path"],
-                    gpus_csv=gpus_csv,
-                    log_path=server_log,
-                    round_dir=transcribe_dir,
-                    repo_root=root,
-                )
-            except (OSError, RuntimeError) as error:
-                return {
-                    "status": "fail",
-                    "reason": f"ASR server boot: {error}",
-                    "round_dir": str(round_dir),
-                    "server_log": str(server_log),
-                    "fail_excerpt": _extract_fail_excerpt(server_log),
-                }
-            client_exit = run_eval_client(
-                row["transcribe_client"],
-                port=port,
-                output_dir=out_dir,
-                model=model_id,
-                asr_device=asr_device,
-                root=root,
-                log_path=client_log,
-                smoke=smoke,
-            )
-            if client_exit != 0:
-                return {
-                    "status": "fail",
-                    "reason": f"transcribe client exit {client_exit}",
-                    "round_dir": str(round_dir),
-                    "client_log": str(client_log),
-                    "server_log": str(server_log),
-                    "fail_excerpt": _extract_fail_excerpt(client_log, server_log),
-                }
-            else:
-                pass
-        else:
-            pass
 
         rj = out_dir / row["result_json"]
         if not rj.exists():
