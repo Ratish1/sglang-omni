@@ -350,12 +350,35 @@ def test_failed_scheduler_construction_releases_registered_rows(
     model_config = SimpleNamespace(
         model_path="dummy",
         vocab_size=32,
-        hf_config=SimpleNamespace(thinker_config=SimpleNamespace()),
+        dtype=torch.bfloat16,
+        hf_config=SimpleNamespace(
+            thinker_config=SimpleNamespace(
+                image_token_id=4,
+                video_token_id=5,
+                audio_token_id=3,
+                text_config=SimpleNamespace(hidden_size=8),
+            )
+        ),
+    )
+    thinker = SimpleNamespace(
+        model=SimpleNamespace(embed_tokens=torch.nn.Embedding(32, 8))
     )
     worker = SimpleNamespace(
+        gpu_id=0,
         model_runner=SimpleNamespace(
-            model=SimpleNamespace(set_talker_layers_to_capture=lambda: None)
-        )
+            model=SimpleNamespace(
+                thinker=thinker, set_talker_layers_to_capture=lambda: None
+            ),
+            model_config=model_config,
+            device="cuda",
+            max_token_pool_size=64,
+            kv_index_translator=SimpleNamespace(
+                capture_token_capacity=lambda capacity: capacity
+            ),
+            req_to_token_pool=SimpleNamespace(
+                req_to_token=torch.zeros((2, 16), dtype=torch.int32, device="cuda")
+            ),
+        ),
     )
     monkeypatch.setattr(model_override_base, "resolved_view", lambda args: args)
     monkeypatch.setattr(
@@ -363,12 +386,15 @@ def test_failed_scheduler_construction_releases_registered_rows(
         "create_sglang_infrastructure",
         lambda *args, **kwargs: (worker, None, None, None, model_config),
     )
-    with small_store() as (store, request_to_token):
-        monkeypatch.setattr(
-            thinker_model_runner,
-            "ThinkerModelRunner",
-            lambda *args, **kwargs: SimpleNamespace(prompt_hidden_store=store),
-        )
+    allocated_stores: list[PromptHiddenStore] = []
+
+    def record_store(**options) -> PromptHiddenStore:
+        store = PromptHiddenStore(**options)
+        allocated_stores.append(store)
+        return store
+
+    monkeypatch.setattr(thinker_model_runner, "PromptHiddenStore", record_store)
+    try:
 
         def fail_tokenizer(*args, **kwargs):
             raise OSError("review tokenizer setup failure")
@@ -376,6 +402,10 @@ def test_failed_scheduler_construction_releases_registered_rows(
         monkeypatch.setattr(hf_transformers_utils, "get_tokenizer", fail_tokenizer)
         with pytest.raises(OSError, match="review tokenizer setup failure"):
             bootstrap.create_thinker_scheduler(arguments, speech_enabled=True)
-        assert store.hidden_states is None, (
+        assert len(allocated_stores) == 1
+        assert allocated_stores[0].hidden_states is None, (
             "scheduler construction left the store registered without a shutdown owner"
         )
+    finally:
+        for store in allocated_stores:
+            store.destroy()
