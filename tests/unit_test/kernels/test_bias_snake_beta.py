@@ -16,19 +16,17 @@ from sglang_omni.kernels.bias_snake_beta import (
 
 @pytest.mark.accelerator
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
 @pytest.mark.parametrize("channels", [96, 1536])
 @pytest.mark.parametrize(
     ("with_residual", "with_sum"),
     [(False, False), (False, True), (True, False), (True, True)],
 )
-@pytest.mark.parametrize("should_round_like_eager", [True, False])
-def test_bias_snake_matches_the_eager_rounding_or_fp32_rounded_once(
+def test_bias_snake_matches_fp32_math_rounded_once(
     dtype: torch.dtype,
     channels: int,
     with_residual: bool,
     with_sum: bool,
-    should_round_like_eager: bool,
 ) -> None:
     torch.manual_seed(0)
     original = Qwen3OmniMoeSnakeBeta(channels).to(device="cuda", dtype=dtype).eval()
@@ -51,24 +49,15 @@ def test_bias_snake_matches_the_eager_rounding_or_fp32_rounded_once(
             padded_input[:, 6:43],
             residual=residual if with_residual else None,
             sum_out=sum_out if with_sum else None,
-            should_round_like_eager=should_round_like_eager,
         )
-        if should_round_like_eager:
-            expected_sum = (
-                conv_output + bias + residual if with_residual else conv_output + bias
-            )
-            expected = original(expected_sum.transpose(1, 2)).transpose(1, 2)
+        total = conv_output.float() + bias.float()
+        if with_residual:
+            total = total + residual.float()
         else:
-            total = conv_output.float() + bias.float()
-            if with_residual:
-                total = total + residual.float()
-            else:
-                pass
-            sine = torch.sin(total * coefficients.alpha_scale.float())
-            expected_sum = total.to(dtype)
-            expected = (total + coefficients.inverse_beta.float() * (sine * sine)).to(
-                dtype
-            )
+            pass
+        sine = torch.sin(total * coefficients.alpha_scale.float())
+        expected_sum = total.to(dtype)
+        expected = (total + coefficients.inverse_beta.float() * (sine * sine)).to(dtype)
 
     assert torch.equal(padded_input[:, 6:43], expected)
     assert not padded_input[:, :6].any() and not padded_input[:, 43:].any()

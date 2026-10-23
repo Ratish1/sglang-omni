@@ -179,9 +179,12 @@ class SnakeBeta(nn.Module):
         self.beta = nn.Parameter(torch.randn(channels) * 0.1)
         self.no_div_by_zero = 1e-9
 
-
-def activation(channels: int, snake: bool) -> nn.Module:
-    return SnakeBeta(channels) if snake else nn.Tanh()
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        alpha = torch.exp(self.alpha).view(1, -1, 1)
+        beta = torch.exp(self.beta).view(1, -1, 1)
+        return hidden_states + torch.sin(hidden_states * alpha).pow(2) / (
+            beta + self.no_div_by_zero
+        )
 
 
 class ConvNeXt(nn.Module):
@@ -203,11 +206,11 @@ class ConvNeXt(nn.Module):
 
 
 class ResidualUnit(nn.Module):
-    def __init__(self, channels: int, dilation: int, snake: bool) -> None:
+    def __init__(self, channels: int, dilation: int) -> None:
         super().__init__()
-        self.act1 = activation(channels, snake)
+        self.act1 = SnakeBeta(channels)
         self.conv1 = CausalConv(channels, channels, 7, dilation=dilation)
-        self.act2 = activation(channels, snake)
+        self.act2 = SnakeBeta(channels)
         self.conv2 = CausalConv(channels, channels, 1)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -218,15 +221,15 @@ class ResidualUnit(nn.Module):
 
 
 class DecoderBlock(nn.Module):
-    def __init__(self, in_channels: int, out_channels: int, snake: bool) -> None:
+    def __init__(self, in_channels: int, out_channels: int) -> None:
         super().__init__()
         self.block = nn.ModuleList(
             [
-                activation(in_channels, snake),
+                SnakeBeta(in_channels),
                 CausalTransConv(in_channels, out_channels, 4, 2),
-                ResidualUnit(out_channels, 1, snake),
-                ResidualUnit(out_channels, 3, snake),
-                ResidualUnit(out_channels, 9, snake),
+                ResidualUnit(out_channels, 1),
+                ResidualUnit(out_channels, 3),
+                ResidualUnit(out_channels, 9),
             ]
         )
 
@@ -239,9 +242,7 @@ class DecoderBlock(nn.Module):
 class Decoder(nn.Module):
     total_upsample = 4
 
-    def __init__(
-        self, block_channels: tuple[int, int] = (4, 2), snake: bool = False
-    ) -> None:
+    def __init__(self, block_channels: tuple[int, int] = (8, 4)) -> None:
         super().__init__()
         in_channels, out_channels = block_channels
         self.quantizer = Quantizer()
@@ -253,8 +254,8 @@ class Decoder(nn.Module):
         self.decoder = nn.ModuleList(
             [
                 CausalConv(2, in_channels, 7),
-                DecoderBlock(in_channels, out_channels, snake),
-                activation(out_channels, snake),
+                DecoderBlock(in_channels, out_channels),
+                SnakeBeta(out_channels),
                 CausalConv(out_channels, 1, 7),
             ]
         )
@@ -265,13 +266,15 @@ class Decoder(nn.Module):
         hidden_states = full_transformer(self.pre_transformer, hidden_states).permute(
             0, 2, 1
         )
+        return self.conv_stack(hidden_states)
+
+    def conv_stack(self, hidden_states: torch.Tensor) -> torch.Tensor:
         for modules in self.upsample:
             for module in modules:
                 hidden_states = module(hidden_states)
-        waveform = hidden_states
         for module in self.decoder:
-            waveform = module(waveform)
-        return waveform.clamp(min=-1, max=1)
+            hidden_states = module(hidden_states)
+        return hidden_states.clamp(min=-1, max=1)
 
 
 def full_transformer(
@@ -445,64 +448,27 @@ def test_slot_causal_transconv_matches_whole(
 @pytest.mark.skipif(
     not current_platform.is_cuda(), reason="the slot convs run on NVIDIA CUDA only"
 )
-def test_fused_snake_beta_stack_tracks_fp32_more_closely_than_eager_activations() -> (
-    None
-):
+def test_slot_conv_stack_error_to_fp32_is_below_the_bf16_forward_error() -> None:
     torch.manual_seed(33)
-    decoder = Decoder(block_channels=(16, 8), snake=True).cuda().bfloat16().eval()
+    decoder = Decoder(block_channels=(16, 8)).cuda().bfloat16().eval()
     decoder.pre_transformer.float()
     reference_decoder = copy.deepcopy(decoder).float()
-    assert snake_beta.fuse_vocoder_decoder(decoder) == 8
-    assert snake_beta.fuse_vocoder_decoder(reference_decoder) == 8
+    incremental = Qwen3TTSIncrementalDecoder(decoder)
+    state = incremental.init_state(2, device=torch.device("cuda"), dtype=torch.bfloat16)
     hidden_states = torch.randn(2, 9, 2, device="cuda")
-    decoders = {
-        "reference": Qwen3TTSIncrementalDecoder(reference_decoder),
-        "fused": Qwen3TTSIncrementalDecoder(decoder),
-        "eager": Qwen3TTSIncrementalDecoder(decoder),
-    }
-    decoders["reference"].snake_coefficients = {}
-    decoders["eager"].snake_coefficients = {}
-    dtypes = {
-        "reference": torch.float32,
-        "fused": torch.bfloat16,
-        "eager": torch.bfloat16,
-    }
-    states = {
-        name: incremental.init_state(2, device=torch.device("cuda"), dtype=dtypes[name])
-        for name, incremental in decoders.items()
-    }
-    with torch.inference_mode():
-        for part in hidden_states.split((4, 1, 4), dim=1):
-            outputs = {
-                name: incremental.conv_stack_tensors(
-                    part.to(dtypes[name]), states[name]
-                )
-                for name, incremental in decoders.items()
-            }
-            assert relative_error(
-                outputs["fused"], outputs["reference"]
-            ) < relative_error(outputs["eager"], outputs["reference"])
 
-    assert len(decoders["fused"].snake_coefficients) == 8
-    for truths, fuseds, eagers in (
-        (
-            states["reference"].conv_histories,
-            states["fused"].conv_histories,
-            states["eager"].conv_histories,
-        ),
-        (
-            states["reference"].transconv_overlaps,
-            states["fused"].transconv_overlaps,
-            states["eager"].transconv_overlaps,
-        ),
-    ):
-        for key, truth in truths.items():
-            if truth.any():
-                assert relative_error(fuseds[key], truth) <= relative_error(
-                    eagers[key], truth
-                ), key
-            else:
-                assert not fuseds[key].any() and not eagers[key].any(), key
+    with torch.inference_mode():
+        reference = reference_decoder.conv_stack(hidden_states.transpose(1, 2))
+        whole = decoder.conv_stack(hidden_states.bfloat16().transpose(1, 2))
+        streamed = torch.cat(
+            [
+                incremental.conv_stack_tensors(part.bfloat16(), state)
+                for part in hidden_states.split((4, 1, 4), dim=1)
+            ],
+            dim=-1,
+        )
+
+    assert relative_error(streamed, reference) < relative_error(whole, reference)
 
 
 @pytest.mark.parametrize("partitions", [[11], [1] * 11, [1, 10], [10, 1], [3, 2, 6]])
