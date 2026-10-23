@@ -12,6 +12,12 @@ from pathlib import Path
 from types import MethodType, ModuleType, SimpleNamespace
 
 import torch
+from sglang.srt.model_executor.cuda_graph_config import (
+    Backend,
+    CudaGraphConfig,
+    PhaseConfig,
+)
+from sglang.srt.runtime_context import get_context
 from torch import nn
 
 import sglang_omni.models.qwen3_tts.sampling_kernels as sampling
@@ -379,7 +385,14 @@ def main() -> None:
         "pr3096_predictor_fixtures",
         REPOSITORY / "tests/unit_test/qwen3_tts/test_predictor_cuda_graph.py",
     )
-    with torch.inference_mode():
+    with (
+        get_context().override_server_args(
+            cuda_graph_config=CudaGraphConfig(
+                prefill=PhaseConfig(backend=Backend.DISABLED)
+            )
+        ),
+        torch.inference_mode(),
+    ):
         leaf_replays = check_leaf(parent_sampling)
         print(f"leaf_replays={leaf_replays}", flush=True)
         predictor_results = check_predictor(fixtures, parent_sampling, parent_gather)
