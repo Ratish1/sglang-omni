@@ -24,11 +24,33 @@ class Coordinator:
 async def main():
     mode = sys.argv[1] if len(sys.argv) > 1 else "current"
     gc.collect()
-    gc.disable()
+    automatic_gc = len(sys.argv) > 2 and sys.argv[2] == "automatic"
+    if automatic_gc:
+        gc.enable()
+    else:
+        gc.disable()
     references = []
 
     def respond(request):
-        response = httpx.Response(200, content=b"x" * (4 * 1024 * 1024))
+        response = httpx.Response(
+            200,
+            json={
+                "id": "warmup",
+                "object": "chat.completion",
+                "created": 0,
+                "model": "warmup",
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {
+                            "role": "assistant",
+                            "content": "x" * (4 * 1024 * 1024),
+                        },
+                        "finish_reason": "stop",
+                    }
+                ],
+            },
+        )
         references.append(weakref.ref(response))
         return response
 
@@ -77,6 +99,7 @@ async def main():
             json.dumps(
                 dict(
                     mode=mode,
+                    automatic_gc=automatic_gc,
                     response_count=len(references),
                     retained_after_warmup=retained,
                     retained_body_bytes=sum(
