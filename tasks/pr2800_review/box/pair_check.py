@@ -83,6 +83,7 @@ TREES = {
     "upw": ("upw_0ee9d47df", "upstream", "0ee9d47dffe16a5b1cc8d1dcbfbb04769884107f"),
     "fle": ("fld_9abafb923", "origin", "9abafb923a6ff33310fa422286205897e9e2796a"),
     "flf": ("fld_b427c1edd", "origin", "b427c1edd3eae8985e0bf76af5f48356b79d3a09"),
+    "flg": ("fld_6b9d2a067", "origin", "6b9d2a06748b728f70e92d7146816ef9e0a59e24"),
 }
 # note (ratish): every arm is measured by one client and scored by one ASR server, both from main; from the SGLang
 # 0.5.22 stack on (057d97629) a tree from before it no longer runs, and main's client records each chunk's length.
@@ -146,6 +147,7 @@ ARMS = {
     "fleb": ("fle", [], [0.7769]),
     "flf": ("flf", [], [0.7769]),
     "flfb": ("flf", [], [0.7769]),
+    "flg": ("flg", [], [0.7769]),
 }
 # arm: benchmark args every pass of the arm adds
 ARM_BENCH_ARGS: dict[str, list[str]] = {}
