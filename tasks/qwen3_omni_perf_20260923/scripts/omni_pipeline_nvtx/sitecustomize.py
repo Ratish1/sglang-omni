@@ -319,10 +319,12 @@ def patch_stage(module):
             f"io.recv rid={request_id} {from_stage}->{self.name}"
         ),
     )
-    stage.receive_local_stream_chunk = bracketed_async(
-        stage.receive_local_stream_chunk,
-        lambda self, request_id, from_stage, *args, **kwargs: (
-            f"io.chunk rid={request_id} {from_stage}->{self.name}"
+    # note: a same-process stream run arrives as one call with every chunk of the run
+    stage.receive_local_stream_chunks = bracketed_async(
+        stage.receive_local_stream_chunks,
+        lambda self, from_stage, chunks, *args, **kwargs: (
+            f"io.chunk rid={chunks[0].request_id if chunks else None} "
+            f"{from_stage}->{self.name} n={len(chunks)}"
         ),
     )
     stage.send_to_stage = bracketed_async(
