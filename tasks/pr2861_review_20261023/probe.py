@@ -10,6 +10,7 @@ import torch
 from safetensors.torch import save_file
 from sglang.srt.managers.schedule_batch import MultimodalInputs
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardBatch
+from sglang.srt.runtime_context import get_context
 from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import (
     Qwen3OmniMoeForConditionalGeneration,
 )
@@ -160,6 +161,19 @@ def test_fractional_audio_in_video_decode_uses_the_served_prompt_floor(
     ).to(torch.int64)
     assert torch.equal(
         first_decode, torch.full((3, 1), int(positions.max()) + 1, dtype=torch.int64)
+    )
+    decoded_batch = SimpleNamespace(
+        seq_lens_cpu=torch.tensor([len(tokens) + 1]),
+        seq_lens=torch.tensor([len(tokens) + 1], device="cuda"),
+    )
+    with get_context().override_server_args():
+        ForwardBatch._compute_mrope_positions_decode(
+            decoded_batch,
+            SimpleNamespace(device="cuda"),
+            SimpleNamespace(multimodal_inputs=[multimodal_inputs]),
+        )
+    torch.testing.assert_close(
+        decoded_batch.mrope_positions.cpu(), first_decode, rtol=0, atol=0
     )
 
 

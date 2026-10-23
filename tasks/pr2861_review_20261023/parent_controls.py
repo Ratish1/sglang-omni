@@ -4,12 +4,21 @@ import importlib.util
 import subprocess
 import sys
 from pathlib import Path
-from types import ModuleType
+from types import ModuleType, SimpleNamespace
 
 import pytest
+import torch
+from sglang.srt.managers.schedule_batch import MultimodalInputs
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.runtime_context import get_context
 
 import sglang_omni.models.qwen3_omni.components.talker_prefill as talker_prefill
 import sglang_omni.preprocessing.audio as audio
+from sglang_omni.models.qwen3_omni.request_builders import compute_mrope_positions
+from tests.unit_test.qwen3_omni.test_mrope_positions import (
+    video_span,
+    thinker_config_ns,
+)
 
 PARENT = "0ee9d47dffe16a5b1cc8d1dcbfbb04769884107f"
 OUTPUT_DIRECTORY = Path("/data/review2861")
@@ -63,3 +72,37 @@ assert status == 1
 assert len(recorder.failures) == 2
 assert all("AssertionError" in failure for failure in recorder.failures.values())
 print("EXPECTED_PARENT_ASSERTION_FAILURES_CONFIRMED", sorted(recorder.failures))
+
+parent_builder = parent_module(
+    "sglang_omni/models/qwen3_omni/request_builders.py",
+    "sglang_omni.models.qwen3_omni.review2861_parent_builders",
+)
+tokens = [10] + video_span([8, 16, 16]) + [11, 12]
+model_inputs = {
+    "video_grid_thw": torch.tensor([[8, 16, 16]]),
+    "video_second_per_grid": torch.tensor([1.1611]),
+}
+decode_positions = {}
+for label, builder in (
+    ("parent", parent_builder.compute_mrope_positions),
+    ("head", compute_mrope_positions),
+):
+    positions, delta = builder(torch.tensor(tokens), model_inputs, thinker_config_ns())
+    multimodal = MultimodalInputs(mm_items=[])
+    multimodal.mrope_positions = positions
+    multimodal.mrope_position_delta = delta
+    forward_batch = SimpleNamespace(
+        seq_lens_cpu=torch.tensor([len(tokens) + 1]),
+        seq_lens=torch.tensor([len(tokens) + 1], device="cuda"),
+    )
+    with get_context().override_server_args():
+        ForwardBatch._compute_mrope_positions_decode(
+            forward_batch,
+            SimpleNamespace(device="cuda"),
+            SimpleNamespace(multimodal_inputs=[multimodal]),
+        )
+    decode_positions[label] = int(forward_batch.mrope_positions[0, 0])
+expected_position = int(positions.max()) + 1
+assert decode_positions["parent"] == expected_position + 1
+assert decode_positions["head"] == expected_position
+print("FAST_CUDA_DECODE_GAP_CONFIRMED", decode_positions, "expected", expected_position)
