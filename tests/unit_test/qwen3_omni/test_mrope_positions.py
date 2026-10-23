@@ -612,3 +612,28 @@ def test_build_talker_request_attaches_no_mrope_without_mm_markers(
         talker_model_inputs=model_inputs,
     )
     assert data.req.multimodal_inputs is None
+
+
+def test_compute_mrope_positions_floors_fractional_video_timing() -> None:
+    """A video timed at its sampled fps gets fractional positions; served positions are their floor, and decode continues from the floored largest."""
+    from sglang_omni.models.qwen3_omni.request_builders import compute_mrope_positions
+
+    grid = [4, 4, 4]
+    tokens = [10] + video_span(grid) + [11, 12]
+    seconds = torch.tensor([1.1611], dtype=torch.float)
+    video_grid = torch.tensor([grid], dtype=torch.long)
+    (oracle_pos, _), _ = oracle_and_fast(
+        torch.tensor([tokens], dtype=torch.long),
+        video_grid_thw=video_grid,
+        second_per_grid_ts=seconds,
+    )
+    expected = oracle_pos.squeeze(1).float().floor()
+    assert not torch.equal(expected, oracle_pos.squeeze(1).float())
+
+    positions, delta = compute_mrope_positions(
+        torch.tensor(tokens, dtype=torch.long),
+        {"video_grid_thw": video_grid, "video_second_per_grid": seconds},
+        thinker_config_ns(),
+    )
+    assert torch.equal(positions.float(), expected)
+    assert decode_pos_from_delta(delta, len(tokens) + 1) == expected.max().item() + 1
