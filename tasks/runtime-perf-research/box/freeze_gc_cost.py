@@ -12,7 +12,7 @@ from sglang.srt.utils.common import freeze_gc
 
 extra_objects = int(sys.argv[1])
 mode = sys.argv[2]
-heap = [{"index": index} for index in range(extra_objects)]
+heap = [[index] for index in range(extra_objects)]
 gc.collect()
 started = time.perf_counter()
 if mode == "helper":
