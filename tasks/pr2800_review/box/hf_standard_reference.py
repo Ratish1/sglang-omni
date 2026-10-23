@@ -8,6 +8,9 @@ chat template, qwen_omni_utils.process_mm_info with use_audio_in_video False, th
 speech: the thinker greedy at 256 tokens, the talker with the checkpoint's sampling, speaker Ethan, DRAWS draws a
 sample each under torch.manual_seed(draw); writes <out>/audio/<id>__<draw>.wav and <out>/speech_<shard>.json.
 mmsu: the talker disabled, the thinker greedy at 32 tokens; writes <out>/mmsu_<shard>.json with each raw response.
+socialomni: SocialOmni level 1 as its benchmark sends it (the video, then the prompt), with the video's own audio
+interleaved (use_audio_in_video True), the talker disabled, the thinker greedy at 256 tokens; writes
+<out>/socialomni_<shard>.json with each raw response.
 --zero-multimodal-hidden gives HF's talker zeros at the multimodal prompt rows, as omni's main builds them.
 --fp8-talker <repo> runs every talker linear that checkpoint quantizes on its dequantized FP8 weight, its input
 quantized to e4m3 per token and 128 features as a W8A8 block-FP8 linear does; the thinker stays bf16.
@@ -95,28 +98,29 @@ def use_served_positions() -> None:
 
 
 def cookbook_inputs(processor: Qwen3OmniMoeProcessor, content: list[dict[str, object]], device: torch.device,
-                    dtype: torch.dtype, is_sampled_fps: bool = False) -> dict[str, torch.Tensor]:
+                    dtype: torch.dtype, is_sampled_fps: bool = False,
+                    is_audio_in_video: bool = False) -> dict[str, torch.Tensor]:
     """is_sampled_fps hands the processor each video's sampled fps (qwen_omni_utils' return_video_kwargs), as omni
     does; the cookbook passes none and the processor times every video at its default 1 fps."""
     conversation = [{"role": "user", "content": content}]
     text = processor.apply_chat_template(conversation, add_generation_prompt=True, tokenize=False)
     if is_sampled_fps:
-        audios, images, videos, video_kwargs = process_mm_info(conversation, use_audio_in_video=False,
+        audios, images, videos, video_kwargs = process_mm_info(conversation, use_audio_in_video=is_audio_in_video,
                                                                return_video_kwargs=True)
         # note (ratish): the processor repeats one fps over every video, so a request carries one video here.
         (sampled_fps,) = video_kwargs["fps"]
         video_kwargs = {**video_kwargs, "fps": sampled_fps}
     else:
-        audios, images, videos = process_mm_info(conversation, use_audio_in_video=False)
+        audios, images, videos = process_mm_info(conversation, use_audio_in_video=is_audio_in_video)
         video_kwargs = {}
     inputs = processor(text=text, audio=audios, images=images, videos=videos, return_tensors="pt", padding=True,
-                       use_audio_in_video=False, **video_kwargs)
+                       use_audio_in_video=is_audio_in_video, **video_kwargs)
     return inputs.to(device).to(dtype)
 
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--task", choices=("speech", "mmsu"), required=True)
+    parser.add_argument("--task", choices=("speech", "mmsu", "socialomni"), required=True)
     parser.add_argument("--samples", type=Path, required=True)
     parser.add_argument("--shard", type=int, required=True)
     parser.add_argument("--shards", type=int, required=True)
@@ -169,10 +173,10 @@ def main() -> None:
     else:
         pass
     processor = Qwen3OmniMoeProcessor.from_pretrained(MODEL)
-    if args.task == "mmsu":
-        model.disable_talker()
-    else:
+    if args.task == "speech":
         (args.out / "audio").mkdir(parents=True, exist_ok=True)
+    else:
+        model.disable_talker()
     records = []
     for index, sample in enumerate(samples):
         if args.task == "speech":
@@ -201,6 +205,21 @@ def main() -> None:
                                     latency_s=round(seconds, 2), audio_duration_s=round(len(wav) / 24000, 2)))
                 print(f"{time.strftime('%H:%M:%S')} {sample['sample_id']} draw {draw}: {len(wav) / 24000:.1f} s audio, "
                       f"{seconds:.0f} s, text {text[:100]!r}", flush=True)
+        elif args.task == "socialomni":
+            content = [{"type": "video", "video": sample["video_path"]}, {"type": "text", "text": sample["prompt"]}]
+            inputs = cookbook_inputs(processor, content, model.device, model.dtype, args.sampled_fps,
+                                     is_audio_in_video=True)
+            text_ids, _ = model.generate(**inputs, return_audio=False, thinker_return_dict_in_generate=True,
+                                         use_audio_in_video=True, thinker_do_sample=False,
+                                         thinker_max_new_tokens=256)
+            text = processor.batch_decode(text_ids.sequences[:, inputs["input_ids"].shape[1]:],
+                                          skip_special_tokens=True, clean_up_tokenization_spaces=False)[0]
+            records.append(dict(sample_id=sample["sample_id"], response=text.strip(),
+                                prompt_tokens=int(inputs["input_ids"].shape[1])))
+            if index % 50 == 0:
+                print(f"{time.strftime('%H:%M:%S')} socialomni shard {args.shard} {index}/{len(samples)}", flush=True)
+            else:
+                pass
         else:
             content = [{"type": "audio", "audio": sample["audio_path"]}, {"type": "text", "text": sample["question"]}]
             inputs = cookbook_inputs(processor, content, model.device, model.dtype)
