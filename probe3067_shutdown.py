@@ -8,6 +8,8 @@ import uvicorn
 from fastapi import FastAPI
 
 import sglang_omni.serve.launcher as launcher
+from sglang_omni.pipeline.coordinator import Coordinator
+from sglang_omni.proto.messages import FreezeGCMessage
 
 
 async def main():
@@ -19,10 +21,17 @@ async def main():
         self.started = True
         await end_serving.wait()
 
-    class Coordinator:
-        async def freeze_gc(self):
+    class ControlPlane:
+        async def submit_to_stage(self, stage_name, stage_endpoint, message):
+            assert isinstance(message, FreezeGCMessage)
             sending.set()
             await send_accepted.wait()
+
+    coordinator = Coordinator(
+        "inproc://complete", "inproc://abort", entry_stage="stage"
+    )
+    coordinator.register_stage("stage", "inproc://stage")
+    coordinator.control_plane = ControlPlane()
 
     original = uvicorn.Server.serve
     uvicorn.Server.serve = serve
@@ -33,7 +42,7 @@ async def main():
         launcher.warm_up_server(
             server,
             app,
-            Coordinator(),
+            coordinator,
             base_url="http://127.0.0.1:8000",
             requests=[],
             timeout_s=5,
