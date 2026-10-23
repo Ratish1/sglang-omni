@@ -1276,11 +1276,13 @@ class Qwen3TTSIncrementalDecoder:
         )
         decoder_blocks = decoder.decoder[1:-2]
         activated = decoder_output.new_empty(decoder_output.shape)
+        # note (ratish): eager rounding would land further from fp32 than main's compiled adds.
         fused_bias_snake_beta(
             decoder_output,
             decoder.decoder[0].conv.bias,
             coefficients[decoder_blocks[0].block[0]],
             activated,
+            should_round_like_eager=False,
         )
         for block_index, decoder_block in enumerate(decoder_blocks, start=1):
             conv_output, residual = self.slot_decoder_block(
@@ -1295,6 +1297,7 @@ class Qwen3TTSIncrementalDecoder:
                     coefficients[decoder_blocks[block_index].block[0]],
                     activated,
                     residual=residual,
+                    should_round_like_eager=False,
                 )
             else:
                 padded, padded_frames = padded_input(decoder.decoder[-1], conv_output)
@@ -1304,6 +1307,7 @@ class Qwen3TTSIncrementalDecoder:
                     coefficients[decoder.decoder[-2]],
                     padded_frames,
                     residual=residual,
+                    should_round_like_eager=False,
                 )
         length = int(conv_output.shape[1])
         history_exchange(
@@ -1397,6 +1401,7 @@ class Qwen3TTSIncrementalDecoder:
             coefficients[residual_units[0].act1],
             padded_frames,
             sum_out=residual,
+            should_round_like_eager=False,
         )
         for residual_index, unit in enumerate(residual_units):
             unit_key = f"{key}.residual.{residual_index}"
@@ -1415,6 +1420,7 @@ class Qwen3TTSIncrementalDecoder:
                 unit.conv1.conv.bias,
                 coefficients[unit.act2],
                 padded_frames,
+                should_round_like_eager=False,
             )
             conv2_output = slot_causal_conv(
                 unit.conv2,
@@ -1435,6 +1441,7 @@ class Qwen3TTSIncrementalDecoder:
                     padded_frames,
                     residual=residual,
                     sum_out=residual,
+                    should_round_like_eager=False,
                 )
             else:
                 pass
