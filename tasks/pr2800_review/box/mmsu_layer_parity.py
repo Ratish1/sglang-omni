@@ -162,7 +162,9 @@ def relative_l2(value, truth) -> float:
 
 def analyze(out: Path, arm: str) -> None:
     import torch
+    from transformers import AutoConfig
 
+    vocab_size = AutoConfig.from_pretrained(MODEL).thinker_config.text_config.vocab_size
     rows = []
     for inputs_path, logits_path in requests(out / arm):
         served = torch.load(inputs_path, weights_only=False)
@@ -179,10 +181,18 @@ def analyze(out: Path, arm: str) -> None:
         served_top = int(served_logits["logits"].argmax())
         truth_top = int(truth["logits"].argmax())
         floor_top = int(floor["logits"].argmax())
+        # note (ratish): a request computes its rows from its cached prefix on, and the runner releases the
+        # audio embeddings once placed, so the served audio is read at its rows of the composed input.
+        prefix = served["prefix"]
+        audio_rows = torch.tensor(
+            [index for index, token_id in enumerate(served["origin_input_ids"]) if token_id >= vocab_size]
+        )
+        served_audio = served["input_embeds"][audio_rows - prefix]
         row = dict(
             rid=served["rid"],
             prompt_tokens=len(served["origin_input_ids"]),
-            single_chunk=served["prefix"] == 0 and served["input_embeds"].shape[0] == len(served["origin_input_ids"]),
+            prefix=prefix,
+            single_chunk=prefix + served["input_embeds"].shape[0] == len(served["origin_input_ids"]),
             positions_equal=bool(
                 served_positions is not None
                 and served_positions.shape == hf_positions.shape
@@ -193,12 +203,11 @@ def analyze(out: Path, arm: str) -> None:
                 and int(served["mrope_position_delta"].flatten()[0]) == int(truth["rope_deltas"].flatten()[0])
             ),
             audio_rows=int(truth["audio"].shape[0]),
-            audio_shape_equal=served["audio_embeds"] is not None
-            and tuple(served["audio_embeds"].shape) == tuple(truth["audio"].shape),
-            audio_served=relative_l2(served["audio_embeds"], truth["audio"]),
+            audio_shape_equal=tuple(served_audio.shape) == tuple(truth["audio"].shape),
+            audio_served=relative_l2(served_audio, truth["audio"]),
             audio_floor=relative_l2(floor["audio"], truth["audio"]),
-            embeds_served=relative_l2(served["input_embeds"], truth["inputs_embeds"]),
-            embeds_floor=relative_l2(floor["inputs_embeds"], truth["inputs_embeds"]),
+            embeds_served=relative_l2(served["input_embeds"], truth["inputs_embeds"][prefix:]),
+            embeds_floor=relative_l2(floor["inputs_embeds"][prefix:], truth["inputs_embeds"][prefix:]),
             logits_served=relative_l2(served_logits["logits"], truth["logits"]),
             logits_floor=relative_l2(floor["logits"], truth["logits"]),
             served_top=served_top,
