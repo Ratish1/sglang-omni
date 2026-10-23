@@ -16,6 +16,13 @@ from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import (
 )
 
 from sglang_omni.model_runner.thinker_model_runner import ThinkerModelRunner
+from sglang_omni.comm.data_ref import TransportKind
+from sglang_omni.comm.stage_io import (
+    read_stream_chunk,
+    serialize_inline_stream_chunk,
+    write_stream_chunk,
+)
+from sglang_omni.relay.shm import ShmRelay
 from sglang_omni.models.qwen3_omni.components.talker_prefill import TalkerPrefillBuilder
 from sglang_omni.models.qwen3_omni.thinker_session_runner import (
     QwenSessionThinkerModelRunner,
@@ -35,11 +42,11 @@ from tests.unit_test.qwen3_omni.test_mrope_positions import (
 
 
 @contextmanager
-def small_store():
+def small_store(*, hidden_size: int = 8):
     request_to_token = torch.zeros((2, 16), dtype=torch.int32, device="cuda")
     store = PromptHiddenStore(
         slot_count=64,
-        hidden_size=8,
+        hidden_size=hidden_size,
         dtype=torch.bfloat16,
         req_to_token_pool=SimpleNamespace(req_to_token=request_to_token),
         device="cuda",
@@ -48,6 +55,44 @@ def small_store():
         yield store, request_to_token
     finally:
         store.destroy()
+
+
+@pytest.mark.asyncio
+async def test_real_width_bf16_prompt_rows_cross_the_shm_stream_path() -> None:
+    """Media prompt rows exceed the inline limit and must retain bytes and metadata over SHM."""
+    with small_store(hidden_size=4096) as (store, request_to_token):
+        rows = torch.arange(3 * 4096, device="cuda", dtype=torch.bfloat16).reshape(
+            3, 4096
+        )
+        store.stage(torch.tensor([10, 20, 30], device="cuda"), rows)
+        request_to_token[0, :3] = torch.tensor(
+            [10, 20, 30], device="cuda", dtype=torch.int32
+        )
+        host_rows = store.read(0, torch.arange(3))
+    metadata = {"token_id": 20, "prompt_hidden_positions": [1, 4, 9]}
+    assert serialize_inline_stream_chunk(host_rows, metadata) is None
+    relay = ShmRelay(engine_id="review2861")
+    try:
+        data_reference, operations = await write_stream_chunk(
+            relay,
+            request_id="review2861",
+            data=host_rows,
+            target_stage="talker_ar",
+            from_stage="thinker",
+            chunk_id=0,
+            metadata=metadata,
+            transport=TransportKind.SHM,
+        )
+        received_rows, received_metadata = await read_stream_chunk(
+            relay, data_reference
+        )
+        for operation in operations:
+            operation.mark_receiver_done()
+            await operation.wait_for_completion()
+        torch.testing.assert_close(received_rows, host_rows, rtol=0, atol=0)
+        assert received_metadata == metadata
+    finally:
+        relay.close()
 
 
 def prompt_request(positions: list[int]) -> PromptHiddenRequest:
