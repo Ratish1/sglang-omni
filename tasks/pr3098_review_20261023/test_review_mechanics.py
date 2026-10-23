@@ -13,6 +13,7 @@ from pathlib import Path
 import httpx
 import pytest
 
+from benchmarks.eval.benchmark_asr_seedtts import _fetch_worker_snapshot
 from tests.test_model.omni_router_utils import (
     find_available_port_range,
     launch_managed_router,
@@ -28,9 +29,11 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 import json
 import os
 from pathlib import Path
+import signal
 import subprocess
 import sys
 
+signal.signal(signal.SIGINT, signal.default_int_handler)
 parser = argparse.ArgumentParser()
 parser.add_argument("command")
 parser.add_argument("--model-path")
@@ -144,6 +147,14 @@ def test_complete_router_topology_and_cleanup(
                 for worker in snapshot["workers"]
             ]
             assert sum(counts) == 6 and all(count > 0 for count in counts)
+            benchmark_snapshot = _fetch_worker_snapshot("127.0.0.1", handle.port)
+            assert (
+                sum(
+                    worker["routed_requests"]
+                    for worker in benchmark_snapshot["workers"]
+                )
+                == 6
+            )
             if not external:
                 records = [
                     json.loads(path.read_text())
