@@ -245,9 +245,8 @@ class Qwen3TTSCodecStateArena:
         return self.gather_by_index(self.stage_index(slots))
 
     def gather_by_index(self, index: torch.Tensor) -> Qwen3TTSIncrementalCodecState:
-        """Select the rows named by a device index tensor; a channels-last decoder
-        exchanges its conv histories and overlaps in place, so its state holds the
-        arena's pools, the index as its slots and the scratch slot as its pad slot.
+        """Select the rows named by a device index tensor; a channels-last decoder's
+        state borrows the arena's conv pools, with the scratch slot as its pad slot.
 
         Capturable: with a static index this is the gather half of a graph
         that reads the arena directly.
