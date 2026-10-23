@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
-# 10-23, cards 0 and 1, after queue flips: L5 alone at the seeded c1 cells, where every quality draw of the chain
-# against main read the chain's WER higher (c1f and b1f, seeds 1234, 11, 12). Two pairs of t_l4b (L2, L3, L4) against
-# t_l5b (L4 with L5's prefill graphs), each order its own seed, every arm scored, then the draws reader over them.
+# 10-23, cards 0 and 1: L5 alone at the seeded c1 cells, where the chain against main read b1f +0.066 WER points (5
+# draws, se 0.024) and c1f +0.051 (4 draws, se 0.027). Two pairs of t_l4b (L2, L3, L4) against t_l5b (L4 with L5's
+# prefill graphs), each order its own seed, every arm scored, then the draws reader and the clips the arms miss in most
+# seeds. Started directly on the 10-23 lease (the tokenizer flips are in tokenizer_flips_early.json).
 # usage (in the container): setsid bash -c 'echo $$ > /data/c20261022b/queue_l5q.pgid; exec bash /workspace/t_marks/tasks/cosyvoice-perf/box/profile_c20261022/queue_l5q.sh'
 D=/data/c20261022b
 Q=$D/quality
@@ -12,7 +13,7 @@ export PAIR_HOME=$D
 export PAIR_PORTS=43000,43400
 log() { echo "$* $(date +%T)" >> $Q/queue_l5q.txt; }
 cpus() { [ "$1" = 0 ] && echo 0-15,64-79 || echo 16-31,80-95; }
-until grep -q "queue flips done" $Q/queue_flips.txt 2>/dev/null; do sleep 30; done
+mkdir -p $Q
 log "queue l5q start t_l4b $(git -C /workspace/t_l4b rev-parse --short HEAD) t_l5b $(git -C /workspace/t_l5b rev-parse --short HEAD) loadavg $(cut -d' ' -f1-3 /proc/loadavg)"
 score() {
   local dir=$1 card=$2 port=$3
@@ -50,4 +51,6 @@ for name in p_l5q1 p_l5q2; do
   python3 $HERE/quality_draws.py $D $pairs > $Q/draws_l5q.txt 2>&1
   log "draws rc $? after $name: $(grep -E '^\| (c1f|b1f) \|' $Q/draws_l5q.txt | awk -F'|' '{printf "%s n%s WER%s (se%s) SIM%s (se%s); ", $2, $3, $6, $8, $13, $15}')"
 done
+python3 $HERE/clip_join.py $D $Q/flips_none.json $pairs > $Q/clip_join_l5q.txt 2>&1
+log "clips rc $?"
 log "queue l5q done"

@@ -2,15 +2,14 @@
 both arms' corpus WER and SIM and the second arm minus the first; per family the arms' means, the mean delta, its
 standard deviation, standard error and t, and the draws worse and better. Then the vocoder route effect of each arm:
 for every order that ran a streaming and a buffered seeded cell under one seed, the per clip WER and SIM of the
-buffered audio minus the streaming audio over the clips whose two audios share a length (the same tokens), and the
-second arm's route effect minus the first's. A seeded cell that ran under one seed in both orders is one draw, the
+buffered audio minus the streaming audio over the clips whose two requests generated as many tokens (the same
+tokens; read from speed_results.json, so no audio is needed), and the second arm's route effect minus the first's. A seeded cell that ran under one seed in both orders is one draw, the
 two orders averaged: the chain repeats its seeded audio exactly across boots.
 usage: python3 quality_draws.py <run home> <pair> [<pair> ...]"""
 
 import json
 import statistics
 import sys
-import wave
 from pathlib import Path
 
 SEEDED = ("c1", "c1f", "b1f")
@@ -30,12 +29,9 @@ def wer_rows(data):
     return {row["id"]: row["wer"] for row in data["per_sample"] if row.get("wer") is not None}
 
 
-def frames(cell):
-    lengths = {}
-    for path in cell.rglob("*.wav"):
-        with wave.open(str(path)) as audio:
-            lengths[path.stem] = audio.getnframes()
-    return lengths
+def token_counts(cell):
+    with open(cell / "speed_results.json") as handle:
+        return {row["id"]: row["completion_tokens"] for row in json.load(handle)["per_request"] if row["is_success"]}
 
 
 def stats(values):
@@ -84,12 +80,12 @@ def main():
                 for arm in ("first", "second"):
                     stream_dir, stream_wer, stream_sim = scored[cell][arm]
                     buffer_dir, buffer_wer, buffer_sim = scored[buffered][arm]
-                    stream_frames, buffer_frames = frames(stream_dir), frames(buffer_dir)
+                    stream_tokens, buffer_tokens = token_counts(stream_dir), token_counts(buffer_dir)
                     wer_s, wer_b = wer_rows(stream_wer), wer_rows(buffer_wer)
                     sim_s, sim_b = sim_rows(stream_sim), sim_rows(buffer_sim)
                     ids = [
                         clip for clip in wer_s.keys() & wer_b.keys() & sim_s.keys() & sim_b.keys()
-                        if stream_frames.get(clip) == buffer_frames.get(clip)
+                        if stream_tokens.get(clip) == buffer_tokens.get(clip)
                     ]
                     effect[arm] = (
                         len(ids),
