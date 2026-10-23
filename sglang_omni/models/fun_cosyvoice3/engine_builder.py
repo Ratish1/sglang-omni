@@ -11,7 +11,10 @@ from typing import TYPE_CHECKING
 
 import numpy as np
 import torch
-from sglang.srt.arg_groups.model_override_base import resolved_view
+from sglang.srt.arg_groups.model_override_base import (
+    attention_backends_of,
+    resolved_view,
+)
 from sglang.srt.model_executor.cuda_graph_config import Phase, with_phase
 from sglang.srt.server_args import ServerArgs
 
@@ -34,8 +37,10 @@ from sglang_omni.scheduling.engine_factory import (
     TtsEngineBuilder,
 )
 from sglang_omni.scheduling.generation_batch_policy import (
+    FULL_PREFILL_ATTENTION_BACKENDS,
     CudaGraphBackend,
     nested_prefill_overrides,
+    operator_selected_prefill_backend,
 )
 from sglang_omni.scheduling.sglang_backend.output_processor import SGLangOutputProcessor
 from sglang_omni.utils.checkpoint import resolve_checkpoint as _resolve_checkpoint
@@ -148,18 +153,34 @@ class FunCosyVoice3EngineBuilder(TtsEngineBuilder[CosyVoice3SGLangRequestData]):
         }
 
     def customize_server_args(self, server_args: ServerArgs) -> None:
-        graph_config = resolved_view(server_args).cuda_graph_config
+        resolved = resolved_view(server_args)
+        graph_config = resolved.cuda_graph_config
         prefill = graph_config.prefill
-        # note (ratish): a prompt the radix cache holds re-prefills only its last token,
-        # which the ladder's first bucket of 4 pads past twice its size and runs eagerly;
-        # every eager prefill measured at c16 and c64 was such a one-token batch.
         if (
+            prefill.backend == CudaGraphBackend.FULL
+            and attention_backends_of(resolved)[0]
+            not in FULL_PREFILL_ATTENTION_BACKENDS
+            and not operator_selected_prefill_backend(self.server_args_overrides)
+        ):
+            # note (ratish): the full prefill graph is this model's default only where
+            # the attention backend captures it; elsewhere the prefill stays eager.
+            override_server_args(
+                server_args,
+                "fun_cosyvoice3.prefill_cuda_graph_backend",
+                cuda_graph_config=with_phase(
+                    graph_config, Phase.PREFILL, backend=CudaGraphBackend.DISABLED
+                ),
+            )
+        elif (
             prefill.backend == CudaGraphBackend.FULL
             and prefill.bs
             and prefill.bs[0] != 1
             and self.server_args_overrides.get("cuda_graph_bs_prefill") is None
             and "bs" not in nested_prefill_overrides(self.server_args_overrides)
         ):
+            # note (ratish): a prompt the radix cache holds re-prefills only its last
+            # token, which the ladder's first bucket of 4 pads past twice its size and
+            # runs eagerly; every eager prefill measured at c16 and c64 was one.
             override_server_args(
                 server_args,
                 "fun_cosyvoice3.prefill_cuda_graph_shape",
