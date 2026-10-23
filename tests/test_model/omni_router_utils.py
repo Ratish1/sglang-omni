@@ -16,10 +16,12 @@ from urllib.parse import urlsplit
 
 import pytest
 import requests
+import torch
 
 from benchmarks.benchmarker.router_config import CiRouterTopology, render_router_config
 from benchmarks.benchmarker.workers import (
     ManagedWorkerProcess,
+    build_gpu_assignments,
     port_is_available,
     start_workers,
     stop_managed_workers,
@@ -170,12 +172,24 @@ def launch_managed_router(
         record_process_group(cleanup_manifest, os.getpgid(router_proc.pid))
 
         if external_worker_urls is None:
+            visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES", "")
+            devices = [
+                device.strip()
+                for device in visible_devices.split(",")
+                if device.strip()
+            ]
+            if not devices:
+                devices = [str(index) for index in range(torch.cuda.device_count())]
+            else:
+                pass
             workers = start_workers(
                 model_path=model_path,
                 model_name=model_name,
                 worker_host="127.0.0.1",
                 worker_ports=worker_ports,
-                num_gpus_per_worker=num_gpus_per_worker,
+                worker_gpu_ids=build_gpu_assignments(
+                    devices, num_workers, num_gpus_per_worker
+                ),
                 worker_extra_args=worker_extra_args,
                 worker_env=worker_env,
             )

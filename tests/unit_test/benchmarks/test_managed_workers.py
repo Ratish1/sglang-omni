@@ -8,6 +8,8 @@ import subprocess
 import sys
 import threading
 from concurrent.futures import Future
+from pathlib import Path
+from typing import Literal
 
 import pytest
 
@@ -20,25 +22,18 @@ from benchmarks.benchmarker.workers import (
 )
 
 
-def test_gpu_assignment_uses_explicit_worker_gpu_ids() -> None:
-    assert build_gpu_assignments(2, 2, worker_gpu_ids=["0,1", "2,3"]) == ["0,1", "2,3"]
-
-
-def test_gpu_assignment_groups_visible_devices(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "4,5,6,7")
-    assert build_gpu_assignments(2, 2) == ["4,5", "6,7"]
-
-
-def test_gpu_assignment_allows_default_process_visibility(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setattr(managed_workers, "infer_available_cuda_devices", lambda: [])
-    assert build_gpu_assignments(1, 1) is None
-
-
 class FakeProcess:
-    def __init__(self, pid: int) -> None:
+    def __init__(
+        self,
+        pid: int,
+        command: list[str],
+        environment: dict[str, str],
+        working_dir: Path | None,
+    ) -> None:
         self.pid = pid
+        self.command = command
+        self.environment = environment
+        self.working_dir = working_dir
 
     def poll(self) -> None:
         return None
@@ -47,8 +42,8 @@ class FakeProcess:
 @pytest.fixture
 def created_workers(
     monkeypatch: pytest.MonkeyPatch,
-) -> list[tuple[FakeProcess, list[str], dict[str, str]]]:
-    created: list[tuple[FakeProcess, list[str], dict[str, str]]] = []
+) -> list[FakeProcess]:
+    created: list[FakeProcess] = []
 
     def fake_popen(
         command: list[str],
@@ -56,12 +51,12 @@ def created_workers(
         env: dict[str, str],
         stdout: None,
         stderr: None,
-        cwd: None,
+        cwd: Path | None,
         start_new_session: bool,
     ) -> FakeProcess:
         assert start_new_session
-        process = FakeProcess(12345 + len(created))
-        created.append((process, command, env))
+        process = FakeProcess(12345 + len(created), command, env, cwd)
+        created.append(process)
         return process
 
     monkeypatch.setattr(managed_workers.shutil, "which", lambda command: command)
@@ -70,19 +65,34 @@ def created_workers(
     return created
 
 
-def test_worker_command_preserves_model_arguments(
-    created_workers: list[tuple[FakeProcess, list[str], dict[str, str]]],
+@pytest.mark.parametrize("placement", ["explicit", "grouped", "inherited"])
+def test_worker_command_preserves_model_arguments_and_gpu_placement(
+    monkeypatch: pytest.MonkeyPatch,
+    created_workers: list[FakeProcess],
+    tmp_path: Path,
+    placement: Literal["explicit", "grouped", "inherited"],
 ) -> None:
+    """Worker children must receive the requested model, GPU groups, and working directory."""
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "4,5,6,7")
+    if placement == "explicit":
+        worker_gpu_ids = ["8,9", "10,11"]
+        expected_visibility = worker_gpu_ids
+    elif placement == "grouped":
+        worker_gpu_ids = build_gpu_assignments(["4", "5", "6", "7"], 2, 2)
+        expected_visibility = ["4,5", "6,7"]
+    else:
+        worker_gpu_ids = build_gpu_assignments([], 2, 2)
+        expected_visibility = ["4,5,6,7", "4,5,6,7"]
     workers = start_workers(
         model_path="Qwen/Qwen3-Omni-30B-A3B-Instruct",
         model_name="qwen3-omni",
         worker_host="127.0.0.1",
-        worker_ports=[8011],
-        num_gpus_per_worker=2,
-        worker_gpu_ids=["0,1"],
+        worker_ports=[8011, 8012],
+        worker_gpu_ids=worker_gpu_ids,
+        working_dir=tmp_path,
         worker_extra_args="--mem-fraction-static 0.6 --thinker-tp-size 2 --thinker-gpus '0,1'",
     )
-    process, command, environment = created_workers[0]
+    command = created_workers[0].command
     assert command[:8] == [
         "sgl-omni",
         "serve",
@@ -97,16 +107,22 @@ def test_worker_command_preserves_model_arguments(
     assert command[command.index("--mem-fraction-static") + 1] == "0.6"
     assert command[command.index("--thinker-tp-size") + 1] == "2"
     assert command[command.index("--thinker-gpus") + 1] == "0,1"
-    assert environment["CUDA_VISIBLE_DEVICES"] == "0,1"
-    assert workers[0].process_group_id == process.pid
+    assert [
+        process.environment["CUDA_VISIBLE_DEVICES"] for process in created_workers
+    ] == expected_visibility
+    assert all(process.working_dir == tmp_path for process in created_workers)
+    assert [worker.process_group_id for worker in workers] == [
+        process.pid for process in created_workers
+    ]
 
 
 @pytest.mark.parametrize("interrupted", [False, True])
 def test_startup_failure_cleans_up_workers(
     monkeypatch: pytest.MonkeyPatch,
-    created_workers: list[tuple[FakeProcess, list[str], dict[str, str]]],
+    created_workers: list[FakeProcess],
     interrupted: bool,
 ) -> None:
+    """An interrupted or failed startup must release every started worker."""
     terminated: list[ManagedWorkerProcess] = []
 
     def fail_health(worker: ManagedWorkerProcess, deadline: float) -> None:
@@ -127,19 +143,19 @@ def test_startup_failure_cleans_up_workers(
         model_name="model",
         worker_host="127.0.0.1",
         worker_ports=[8011],
-        num_gpus_per_worker=1,
         worker_gpu_ids=["7"],
     )
     with pytest.raises(expected_error):
         wait_for_workers(workers, 1)
-    assert [worker.process for worker in terminated] == [created_workers[0][0]]
+    assert [worker.process for worker in terminated] == created_workers
     assert workers == []
 
 
 def test_workers_wait_in_parallel(
     monkeypatch: pytest.MonkeyPatch,
-    created_workers: list[tuple[FakeProcess, list[str], dict[str, str]]],
+    created_workers: list[FakeProcess],
 ) -> None:
+    """A worker's health wait must not prevent other workers from starting theirs."""
     terminated: list[ManagedWorkerProcess] = []
     waiting_urls: list[str] = []
     waiting_lock = threading.Lock()
@@ -165,21 +181,19 @@ def test_workers_wait_in_parallel(
         model_name="model",
         worker_host="127.0.0.1",
         worker_ports=[8011, 8012],
-        num_gpus_per_worker=1,
         worker_gpu_ids=["0", "1"],
     )
     with pytest.raises(RuntimeError, match="worker 2 failed"):
         wait_for_workers(workers, 10)
     assert set(waiting_urls) == {"http://127.0.0.1:8011", "http://127.0.0.1:8012"}
-    assert [worker.process for worker in terminated] == [
-        created[0] for created in created_workers
-    ]
+    assert [worker.process for worker in terminated] == created_workers
     assert workers == []
 
 
 def test_managed_shutdown_signals_only_worker_parents(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """Worker parents must retain control of graceful stage shutdown."""
     events: list[tuple[str, int, int]] = []
 
     class FakeProcess:
@@ -226,6 +240,7 @@ def test_managed_shutdown_signals_only_worker_parents(
 def test_managed_shutdown_kills_remaining_group(
     monkeypatch: pytest.MonkeyPatch, parent_timed_out: bool
 ) -> None:
+    """Children that survive graceful shutdown must be killed and reaped."""
     group_signals: list[int] = []
 
     class FakeProcess:
@@ -271,6 +286,7 @@ def test_managed_shutdown_kills_remaining_group(
 
 
 def test_managed_shutdown_waits_for_orphaned_worker_child() -> None:
+    """Shutdown must not return while an exited worker's child is still alive."""
     parent = subprocess.Popen(
         [
             sys.executable,

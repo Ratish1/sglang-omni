@@ -17,7 +17,6 @@ from io import TextIOWrapper
 from pathlib import Path
 
 import httpx
-import torch
 
 logger = logging.getLogger(__name__)
 GROUP_EXIT_POLL_INTERVAL_S = 0.05
@@ -44,40 +43,25 @@ def port_is_available(port: int, host: str = "127.0.0.1") -> bool:
     return True
 
 
-def infer_available_cuda_devices() -> list[str]:
-    visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES")
-    if visible_devices:
-        return [
-            device.strip() for device in visible_devices.split(",") if device.strip()
-        ]
-    else:
-        return [str(index) for index in range(torch.cuda.device_count())]
-
-
 def build_gpu_assignments(
+    devices: list[str],
     num_workers: int,
     num_gpus_per_worker: int,
-    *,
-    worker_gpu_ids: list[str] | None = None,
 ) -> list[str] | None:
-    if worker_gpu_ids is not None:
-        return worker_gpu_ids
+    if not devices:
+        return None
     else:
-        devices = infer_available_cuda_devices()
-        if not devices:
-            return None
+        required = num_workers * num_gpus_per_worker
+        if len(devices) < required:
+            raise RuntimeError(
+                "not enough CUDA devices for managed workers: "
+                f"required={required}, available={len(devices)}"
+            )
         else:
-            required = num_workers * num_gpus_per_worker
-            if len(devices) < required:
-                raise RuntimeError(
-                    "not enough CUDA devices for managed workers: "
-                    f"required={required}, available={len(devices)}"
-                )
-            else:
-                return [
-                    ",".join(devices[start : start + num_gpus_per_worker])
-                    for start in range(0, required, num_gpus_per_worker)
-                ]
+            return [
+                ",".join(devices[start : start + num_gpus_per_worker])
+                for start in range(0, required, num_gpus_per_worker)
+            ]
 
 
 def start_workers(
@@ -86,12 +70,11 @@ def start_workers(
     model_name: str,
     worker_host: str,
     worker_ports: list[int],
-    num_gpus_per_worker: int,
+    worker_gpu_ids: list[str] | None,
     worker_extra_args: str = "",
-    worker_gpu_ids: list[str] | None = None,
     worker_env: dict[str, str] | None = None,
     output: TextIOWrapper | None = None,
-    working_directory: Path | None = None,
+    working_dir: Path | None = None,
     command: str = "sgl-omni",
 ) -> list[ManagedWorkerProcess]:
     if shutil.which(command) is None:
@@ -108,15 +91,12 @@ def start_workers(
             )
         else:
             pass
-        gpu_assignments = build_gpu_assignments(
-            len(worker_ports), num_gpus_per_worker, worker_gpu_ids=worker_gpu_ids
-        )
 
     workers: list[ManagedWorkerProcess] = []
     try:
         for worker_index, port in enumerate(worker_ports):
             cuda_visible_devices = (
-                gpu_assignments[worker_index] if gpu_assignments is not None else None
+                worker_gpu_ids[worker_index] if worker_gpu_ids is not None else None
             )
             worker_url = f"http://{worker_host}:{port}"
             worker_command = [
@@ -149,7 +129,7 @@ def start_workers(
                 env=environment,
                 stdout=output,
                 stderr=subprocess.STDOUT if output is not None else None,
-                cwd=working_directory,
+                cwd=working_dir,
                 start_new_session=True,
             )
             workers.append(

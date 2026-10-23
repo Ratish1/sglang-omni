@@ -35,6 +35,7 @@ from typing import Any
 from benchmarks.benchmarker.router_config import CiRouterTopology, render_router_config
 from benchmarks.benchmarker.workers import (
     ManagedWorkerProcess,
+    build_gpu_assignments,
     port_is_available,
     start_workers,
     stop_managed_workers,
@@ -802,10 +803,7 @@ def launch_managed_router_server(
         pass
     num_gpus_per_worker = int(profile.get("num_gpus_per_worker", 1))
     devices = gpus_csv.split(",")
-    worker_gpu_ids = [
-        ",".join(devices[start : start + num_gpus_per_worker])
-        for start in range(0, num_workers * num_gpus_per_worker, num_gpus_per_worker)
-    ]
+    worker_gpu_ids = build_gpu_assignments(devices, num_workers, num_gpus_per_worker)
     workers: list[ManagedWorkerProcess] = []
     log_path.parent.mkdir(parents=True, exist_ok=True)
     try:
@@ -817,11 +815,10 @@ def launch_managed_router_server(
                 model_name=model_name,
                 worker_host=worker_host,
                 worker_ports=worker_ports,
-                num_gpus_per_worker=num_gpus_per_worker,
                 worker_extra_args=worker_extra_args,
                 worker_gpu_ids=worker_gpu_ids,
                 output=log_fh,
-                working_directory=repo_root,
+                working_dir=repo_root,
                 command=str(Path(py).with_name("sgl-omni")),
             )
             popen = subprocess.Popen(
