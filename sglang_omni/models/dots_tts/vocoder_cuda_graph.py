@@ -8,6 +8,7 @@ from collections.abc import Callable, Iterable
 from typing import NamedTuple
 
 import torch
+from sglang.srt.model_executor.runner.base_cuda_graph_runner import freeze_gc
 
 logger = logging.getLogger(__name__)
 HIT_RATE_LOG_EVERY = 1024
@@ -68,7 +69,9 @@ class DotsVocoderGraphRunner:
         ordered = sorted(
             {(int(b), int(t)) for b, t in keys} - set(self.graphs), reverse=True
         )
-        with torch.cuda.device(self.device):
+        # note (ratish): a collection during capture can free a graph that a dead
+        # reference cycle holds, and destroying a graph invalidates the capture.
+        with freeze_gc(enable_cudagraph_gc=False), torch.cuda.device(self.device):
             current_stream = torch.cuda.current_stream(self.device)
             capture_stream = torch.cuda.Stream(device=self.device)
             capture_stream.wait_stream(current_stream)
