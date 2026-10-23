@@ -93,6 +93,27 @@ def run_stage(out: Path, arm: str, cards: tuple[int, int], stage: int, passes: i
     return codes
 
 
+def score_speech_passes(out: Path, card: int, speech_passes: list[Path]) -> None:
+    """One Qwen3-ASR server on the card scores every stage 8 pass as the CI does."""
+    asr_tree = pair_check.tree(pair_check.ASR_TREE)
+    asr_port = pair_check.ASR_PORT + 1000 + 200 * card
+    asr = pair_check.serve(card, asr_tree, pair_check.ASR_MODEL, asr_port, [], out / "asr_server.log")
+    try:
+        for pass_out in speech_passes:
+            rc = subprocess.run(
+                [sys.executable, str(BOX / "videoamme_talker_tp2.py"), "--score", "--port", str(asr_port), "--out",
+                 str(pass_out), "--results-name", RESULTS_NAME],
+                cwd=asr_tree, env=pair_check.card_env(card, asr_tree),
+                stdout=open(pass_out / "score.log", "w"), stderr=subprocess.STDOUT).returncode
+            wer = json.loads((pass_out / "wer.json").read_text())["summary"] if rc == 0 else None
+            videoamme_talker_tp2.log(
+                out, f"{pass_out.relative_to(out)} score rc {rc} wer below 50 "
+                f"{None if wer is None else wer['wer_below_50_corpus']} above 50 "
+                f"{None if wer is None else wer['n_above_50_pct_wer']}")
+    finally:
+        pair_check.stop(card, asr)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--arms", help="arms in order, each on the card pair in turn")
@@ -121,23 +142,10 @@ def main() -> None:
                 speech_passes += [pass_out for pass_out, rc in codes if rc == 0]
             else:
                 pass
-    asr_tree = pair_check.tree(pair_check.ASR_TREE)
-    asr_port = pair_check.ASR_PORT + 1000 + 200 * first_card
-    asr = pair_check.serve(first_card, asr_tree, pair_check.ASR_MODEL, asr_port, [], args.out / "asr_server.log")
-    try:
-        for pass_out in speech_passes:
-            rc = subprocess.run(
-                [sys.executable, str(BOX / "videoamme_talker_tp2.py"), "--score", "--port", str(asr_port), "--out",
-                 str(pass_out), "--results-name", RESULTS_NAME],
-                cwd=asr_tree, env=pair_check.card_env(first_card, asr_tree),
-                stdout=open(pass_out / "score.log", "w"), stderr=subprocess.STDOUT).returncode
-            wer = json.loads((pass_out / "wer.json").read_text())["summary"] if rc == 0 else None
-            videoamme_talker_tp2.log(
-                args.out, f"{pass_out.relative_to(args.out)} score rc {rc} wer below 50 "
-                f"{None if wer is None else wer['wer_below_50_corpus']} above 50 "
-                f"{None if wer is None else wer['n_above_50_pct_wer']}")
-    finally:
-        pair_check.stop(first_card, asr)
+    if speech_passes:
+        score_speech_passes(args.out, first_card, speech_passes)
+    else:
+        pass
     summary = {}
     for path in sorted(args.out.glob(f"*/s*/p*/{RESULTS_NAME}")):
         record = json.loads(path.read_text())
