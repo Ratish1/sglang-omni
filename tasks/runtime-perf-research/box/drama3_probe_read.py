@@ -45,6 +45,19 @@ for record in short:
             }
         )
     )
+for record in records:
+    if record["k"] == "eos_frame":
+        print(
+            json.dumps(
+                {
+                    key: record.get(key)
+                    for key in ("phase", "rid", "row", "frame", "frame_counts")
+                }
+            )
+        )
+        print("  batch", [rid[:14] for rid in record["batch_rids"]])
+    else:
+        pass
 streams = [
     record
     for record in records

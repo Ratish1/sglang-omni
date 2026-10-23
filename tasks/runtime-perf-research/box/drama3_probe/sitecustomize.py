@@ -43,6 +43,7 @@ def patch_request_builders(module):
                 "inputs": str(request_data.stage_payload.request.inputs)[:24],
                 "sampled": len(sampled),
                 "last_main": sampled[-1][0] if sampled else None,
+                "last_frames": sampled[-2:],
                 "max_new_tokens": request_data.max_new_tokens,
                 "output_ids": None if req is None else len(req.output_ids),
                 "finished_reason": finished_reason_of(req),
@@ -74,7 +75,66 @@ def patch_scheduler(module):
     module.OmniScheduler.abort = probe_abort
 
 
+def patch_model_runner(module):
+    runner_class = module.Drama3ModelRunner
+    collect_frames = runner_class.collect_frames
+    post_prefill = runner_class.post_prefill
+    post_decode = runner_class.post_decode
+    phase = threading.local()
+
+    def probe_collect_frames(self, result, requests, frames):
+        eos_token_id = self.model.config.eos_token_id
+        rows = frames.tolist()
+        request_ids = [module.request_data_of(request).req.rid for request in requests]
+        for row, frame in enumerate(rows):
+            if frame[0] == eos_token_id:
+                write(
+                    {
+                        "k": "eos_frame",
+                        "phase": getattr(phase, "name", None),
+                        "rid": request_ids[row],
+                        "row": row,
+                        "frame": frame,
+                        "batch_rids": request_ids,
+                        "frame_counts": [
+                            len(module.request_data_of(request).frame_rows)
+                            for request in requests
+                        ],
+                    }
+                )
+            else:
+                pass
+        return collect_frames(self, result, requests, frames)
+
+    def probe_post_prefill(self, result, forward_batch, schedule_batch, requests):
+        phase.name = "prefill"
+        write(
+            {
+                "k": "prefill",
+                "rids": [
+                    module.request_data_of(request).req.rid for request in requests
+                ],
+            }
+        )
+        try:
+            return post_prefill(self, result, forward_batch, schedule_batch, requests)
+        finally:
+            phase.name = None
+
+    def probe_post_decode(self, result, forward_batch, schedule_batch, requests):
+        phase.name = "decode"
+        try:
+            return post_decode(self, result, forward_batch, schedule_batch, requests)
+        finally:
+            phase.name = None
+
+    runner_class.collect_frames = probe_collect_frames
+    runner_class.post_prefill = probe_post_prefill
+    runner_class.post_decode = probe_post_decode
+
+
 PATCHES = {
+    "sglang_omni.models.fishaudio_drama3.model_runner": patch_model_runner,
     "sglang_omni.models.fishaudio_drama3.request_builders": patch_request_builders,
     "sglang_omni.scheduling.omni_scheduler": patch_scheduler,
 }
