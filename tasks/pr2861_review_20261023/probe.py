@@ -16,6 +16,9 @@ from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import (
 
 from sglang_omni.model_runner.thinker_model_runner import ThinkerModelRunner
 from sglang_omni.models.qwen3_omni.components.talker_prefill import TalkerPrefillBuilder
+from sglang_omni.models.qwen3_omni.thinker_session_runner import (
+    QwenSessionThinkerModelRunner,
+)
 from sglang_omni.models.qwen3_omni.request_builders import compute_mrope_positions
 from sglang_omni.pipeline.stage.stream_queue import StreamItem
 from sglang_omni.proto import OmniRequest, StagePayload
