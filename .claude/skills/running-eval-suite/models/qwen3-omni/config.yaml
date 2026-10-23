@@ -103,7 +103,7 @@ server_profiles:
     model_name: qwen3-omni
     num_workers: 2
     num_gpus_per_worker: 1
-    worker_extra_args: "--config {repo_root}/examples/configs/qwen3_omni_colocated.yaml --colocate"
+    worker_extra_args: "--config {repo_root}/examples/configs/qwen3_omni_colocated_h100_bf16.yaml --colocate"
     wait_timeout: 600
     server_boot_timeout_s: 660
     router_topology: omni_audio
@@ -113,7 +113,7 @@ server_profiles:
     model_name: qwen3-omni
     num_workers: 2
     num_gpus_per_worker: 1
-    worker_extra_args: "--config {repo_root}/examples/configs/qwen3_omni_colocated.yaml --colocate --stages.0.factory-args.thinker-max-seq-len 32768 --stages.thinker.factory-args.thinker-max-seq-len 32768"
+    worker_extra_args: "--config {repo_root}/examples/configs/qwen3_omni_colocated_h100_bf16.yaml --colocate --preprocessing.factory.max_seq_len 32768 --thinker.factory.max_seq_len 32768"
     wait_timeout: 600
     server_boot_timeout_s: 660
     router_topology: omni_audio
@@ -161,7 +161,7 @@ rows:
     locate:
       section_substring: "Accuracy (accuracy)"
       config_substring: "modalities=text+audio"
-      source_workload: "router, 2-worker, full-set, c=8"
+      source_workload: "router, 2-worker, full-set, c=8, audio-output server"
     client: "python benchmarks/eval/benchmark_omni_mmsu.py --model qwen3-omni --port {port} --modalities text+audio --max-concurrency 8 --output-dir {output_dir} --asr-device {asr_gpu}"
     result_json: "mmsu_results.json"
     cells:
@@ -190,7 +190,7 @@ rows:
     locate:
       section_substring: "Speed (speed)"
       config_substring: "modalities=text+audio"
-      source_workload: "router, 2-worker, full-set, c=8"
+      source_workload: "router, 2-worker, full-set, c=8, audio-output server"
     client: "python benchmarks/eval/benchmark_omni_mmsu.py --model qwen3-omni --port {port} --modalities text+audio --max-concurrency 8 --output-dir {output_dir} --asr-device {asr_gpu}"
     result_json: "mmsu_results.json"
     cells:
