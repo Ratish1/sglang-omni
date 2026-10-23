@@ -1,11 +1,11 @@
 """How close a tree's served bf16 streaming vocoder stays to the fp32 decode of the same codes, per clip, so two trees
 are compared on one truth. Real codes: each distinct long reference of a list encoded by the speech tokenizer as
 serving encodes. Two streams per clip: a SeedTTS-like one (--short-reference frames of reference, its first chunk from
-frame 0 in one decode_tail, as the tail graphs decode it) and a long one (all but --generated frames of reference, its
-first chunk from frame 0 in windows of up to 64 frames, as the window runner decodes it); either way --generated frames
-follow in the served ramp (1, 2, 4, then 8 a chunk). Every decode goes through the codec state arena (gather, decode,
-scatter) on a bf16 decoder fused as served, so a channels-last tree runs its slot conv stack; with --compiled-width 8
-the follow-ups of that width run the torch.compile'd decode, as the served warm graphs do. Truth: the decoder's own
+frame 0 in one tail graph replay) and a long one (all but --generated frames of reference, its first chunk from frame 0
+in window graph replays of up to 64 frames); either way --generated frames follow in the served ramp (1, 2, 4, then 8 a
+chunk) through warm graph replays. The runners are the served ones (Qwen3TTSIncrementalCodecCudaGraphRunner, batch 1,
+on a codec state arena), on a bf16 decoder fused as served, so a channels-last tree runs its slot conv stack; with
+--compiled the window and warm runners compile width 8, as the served ones do. Truth: the decoder's own
 forward in fp32 over the same codes. Writes per clip the SNR in dB of each stream's emitted audio against the truth,
 over the first frame and over the stream.
 
@@ -25,8 +25,13 @@ import torch
 
 from sglang_omni.models.qwen3_tts.codec_state_arena import Qwen3TTSCodecStateArena
 from sglang_omni.models.qwen3_tts.incremental_codec import Qwen3TTSIncrementalDecoder
-from sglang_omni.models.qwen3_tts.incremental_codec_cuda_graph import split_frames_by_width
+from sglang_omni.models.qwen3_tts.incremental_codec_cuda_graph import (
+    IncrementalCodecGraphPool,
+    Qwen3TTSIncrementalCodecCudaGraphRunner,
+    split_frames_by_width,
+)
 from sglang_omni.models.qwen3_tts.stages import load_qwen3_tts_tokenizer
+from sglang_omni.models.qwen3_tts.streaming_vocoder import QWEN3_TTS_TAIL_GRAPH_FRAMES
 from sglang_omni.utils.snake_beta import fuse_vocoder_decoder
 
 MODEL = "Qwen/Qwen3-TTS-12Hz-1.7B-Base"
@@ -55,50 +60,57 @@ def run(args: argparse.Namespace) -> None:
     probe_slot = arena.acquire()
     # the slot conv stack's state carries the cohort's slot index; main's state class has no such field
     print(f"gathered state holds the arena's pools: {getattr(arena.gather([probe_slot]), 'slot_index', None) is not None}")
-    if args.compiled_width:
-        with torch.inference_mode():
-            warm_codes = torch.zeros((1, 16, args.compiled_width), dtype=torch.long, device=device)
-            incremental.precompile(warm_codes, arena.gather([probe_slot]))
-        print(f"compiled decode at width {args.compiled_width}", flush=True)
-    else:
-        pass
     arena.release(probe_slot)
+    num_quantizers = int(served_tokenizer.model.encoder_valid_num_quantizers)
+
+    def runner(mode: str, fresh_frames: tuple[int, ...], compiled: tuple[int, ...], emit_frames: int = 0):
+        built = Qwen3TTSIncrementalCodecCudaGraphRunner(
+            incremental,
+            device=device,
+            dtype=torch.bfloat16,
+            num_quantizers=num_quantizers,
+            mode=mode,
+            fresh_frames=fresh_frames,
+            batch_sizes=(1,),
+            min_free_gb=0.0,
+            compile_fresh_frames=compiled,
+            arena=arena,
+            graph_pool=IncrementalCodecGraphPool(stream_priority=0),
+            emit_frames=emit_frames,
+        )
+        built.capture()
+        print(f"{mode} graphs: {built.stats()['build']}", flush=True)
+        return built
+
+    with torch.inference_mode():
+        tail = runner("tail", QWEN3_TTS_TAIL_GRAPH_FRAMES, (), emit_frames=1)
+        window = runner("window", WINDOW_WIDTHS, (STEADY_STRIDE,) if args.compiled else ())
+        warm = runner("warm", tuple(range(1, STEADY_STRIDE + 1)), (STEADY_STRIDE,) if args.compiled else ())
     encoder = served_tokenizer.model.encoder
     hop = int(served_tokenizer.model.encode_downsample_rate)
-    num_quantizers = int(served_tokenizer.model.encoder_valid_num_quantizers)
     samples_per_frame = int(incremental.total_upsample)
     list_dir = Path(args.list).parent
 
-    def stream(codes, reference_frames: int, first_in_windows: bool) -> torch.Tensor:
+    def replay(graphs, codes: torch.Tensor, slot: int, valid_frames: list[int] | None = None) -> torch.Tensor:
+        waveform = graphs.decode_slots(codes, [slot], valid_frames=valid_frames)
+        assert waveform is not None, f"{graphs.mode} graph missed width {int(codes.shape[-1])}"
+        return waveform.reshape(-1).clone()
+
+    def stream(codes: torch.Tensor, reference_frames: int, first_in_windows: bool) -> torch.Tensor:
         slot = arena.acquire()
-        audio = []
         if first_in_windows:
             offset = 0
             for width in split_frames_by_width(reference_frames + 1, WINDOW_WIDTHS):
-                state = arena.gather([slot])
-                waveform = incremental.decode(codes[..., offset : offset + width], state)
-                arena.scatter([slot], state)
+                waveform = replay(window, codes[..., offset : offset + width], slot)
                 offset += width
-            audio.append(waveform.reshape(-1)[-samples_per_frame:])
+            audio = [waveform[-samples_per_frame:]]
         else:
-            state = arena.gather([slot])
-            waveform = incremental.decode_tail(
-                codes[..., : reference_frames + 1],
-                torch.tensor([reference_frames + 1], device=device),
-                state,
-                1,
-            )
-            arena.scatter([slot], state)
-            audio.append(waveform.reshape(-1))
+            audio = [replay(tail, codes[..., : reference_frames + 1], slot, [reference_frames + 1])]
         position = reference_frames + 1
         widths = iter(RAMP[1:])
         while position < int(codes.shape[-1]):
-            width = next(widths, STEADY_STRIDE)
-            end = min(position + width, int(codes.shape[-1]))
-            state = arena.gather([slot])
-            compiled = end - position == args.compiled_width
-            audio.append(incremental.decode(codes[..., position:end], state, compiled=compiled).reshape(-1))
-            arena.scatter([slot], state)
+            end = min(position + next(widths, STEADY_STRIDE), int(codes.shape[-1]))
+            audio.append(replay(warm, codes[..., position:end], slot))
             position = end
         arena.release(slot)
         return torch.cat(audio).float()
@@ -173,7 +185,7 @@ def main() -> None:
     run_parser.add_argument("--clips", type=int, default=62)
     run_parser.add_argument("--short-reference", type=int, default=100)
     run_parser.add_argument("--generated", type=int, default=96)
-    run_parser.add_argument("--compiled-width", type=int, default=0)
+    run_parser.add_argument("--compiled", action="store_true")
     compare_parser = commands.add_parser("compare")
     compare_parser.add_argument("base")
     compare_parser.add_argument("change")
