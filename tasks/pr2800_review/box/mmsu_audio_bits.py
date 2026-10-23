@@ -84,6 +84,8 @@ def largest_difference(a, b) -> float:
 
 
 def compare(sample: dict) -> dict:
+    import hashlib
+
     import librosa
     import numpy as np
     import soundfile
@@ -118,6 +120,9 @@ def compare(sample: dict) -> dict:
         served_audio_tokens=served_tokens,
         reference_audio_tokens=reference_tokens,
         reference_positions=positions_digest(reference_inputs),
+        served_digest=hashlib.sha256(served.tobytes()).hexdigest()[:16],
+        features_digest=hashlib.sha256(served_features.numpy().tobytes()).hexdigest()[:16],
+        served_positions=positions_digest(served_inputs),
     )
 
 
@@ -209,6 +214,24 @@ def main() -> None:
             pass
         rows = [json.loads(line) for line in (args.out / f"{arm}.jsonl").read_text().splitlines()]
         lines += [f"{arm} ({trees[arm].name}):", *summarize(rows)]
+    tree_rows = {
+        arm: {row["sample_id"]: row for row in map(json.loads, (args.out / f"{arm}.jsonl").read_text().splitlines())}
+        for arm in arms
+        if (args.out / f"{arm}.jsonl").exists()
+    }
+    for arm_a, arm_b in zip(arms, arms[1:]):
+        if arm_a not in tree_rows or arm_b not in tree_rows:
+            continue
+        else:
+            pass
+        items = sorted(set(tree_rows[arm_a]) & set(tree_rows[arm_b]))
+        lines.append(
+            f"{arm_a} against {arm_b}, {len(items)} clips: served arrays equal "
+            + ", ".join(
+                f"{field} {sum(tree_rows[arm_a][item][field] == tree_rows[arm_b][item][field] for item in items)}"
+                for field in ("served_digest", "features_digest", "served_positions")
+            )
+        )
     (args.out / "summary.txt").write_text("\n".join(lines) + "\n")
     for line in lines:
         pair_check.log(args.out, line)
