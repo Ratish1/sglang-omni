@@ -187,7 +187,10 @@ def analyze(out: Path, arm: str) -> None:
         audio_rows = torch.tensor(
             [index for index, token_id in enumerate(served["origin_input_ids"]) if token_id >= vocab_size]
         )
-        served_audio = served["input_embeds"][audio_rows - prefix]
+        computed = audio_rows >= prefix
+        served_audio = served["input_embeds"][audio_rows[computed] - prefix]
+        truth_audio = truth["audio"][computed]
+        floor_audio = floor["audio"][computed]
         row = dict(
             rid=served["rid"],
             prompt_tokens=len(served["origin_input_ids"]),
@@ -203,9 +206,10 @@ def analyze(out: Path, arm: str) -> None:
                 and int(served["mrope_position_delta"].flatten()[0]) == int(truth["rope_deltas"].flatten()[0])
             ),
             audio_rows=int(truth["audio"].shape[0]),
-            audio_shape_equal=tuple(served_audio.shape) == tuple(truth["audio"].shape),
-            audio_served=relative_l2(served_audio, truth["audio"]),
-            audio_floor=relative_l2(floor["audio"], truth["audio"]),
+            audio_rows_computed=int(computed.sum()),
+            audio_shape_equal=audio_rows.numel() == truth["audio"].shape[0],
+            audio_served=relative_l2(served_audio, truth_audio) if computed.any() else None,
+            audio_floor=relative_l2(floor_audio, truth_audio) if computed.any() else None,
             embeds_served=relative_l2(served["input_embeds"], truth["inputs_embeds"][prefix:]),
             embeds_floor=relative_l2(floor["inputs_embeds"][prefix:], truth["inputs_embeds"][prefix:]),
             logits_served=relative_l2(served_logits["logits"], truth["logits"]),
@@ -231,9 +235,14 @@ def analyze(out: Path, arm: str) -> None:
         f"argmax {sum(row['sampled'] == row['served_top'] for row in rows)}",
         "relative L2 to HF fp32, median / p90 / p99 / max (served, then HF bf16):",
     ]
+    lines.append(
+        f"requests computing their own audio rows {sum(row['audio_rows_computed'] > 0 for row in rows)} "
+        f"(the rest reused a cached prefix holding the same clip's audio)"
+    )
     for boundary in ("audio", "embeds", "logits"):
-        served = [row[f"{boundary}_served"] for row in rows]
-        floor = [row[f"{boundary}_floor"] for row in rows]
+        measured = [row for row in rows if row[f"{boundary}_served"] is not None]
+        served = [row[f"{boundary}_served"] for row in measured]
+        floor = [row[f"{boundary}_floor"] for row in measured]
         ratios = [s / f for s, f in zip(served, floor) if f > 0]
         lines.append(
             f"  {boundary}: served {quantiles(served)}; HF bf16 {quantiles(floor)}; served over bf16 "
