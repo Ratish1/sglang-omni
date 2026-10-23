@@ -10,9 +10,9 @@ Benchmarks:
 - socialomni: SocialOmni level 1 (2000 items, the video's own audio interleaved), parsed by parse_choice on the last
   line; an omni result is a socialomni-*.json.
 1. Samples from the benchmark's own loader, in main's tree.
-2. The reference (hf_standard_reference.py, task videotext or socialomni), sharded over the cards, in the isolated
-   environment; --sampled-fps hands the processor each video's sampled fps (float positions) where the cookbook passes
-   none.
+2. The reference (hf_standard_reference.py, task videotext or socialomni), sharded over the cards, on the image's own
+   transformers (5.19, the version omni serves with; --transformers 4.57.1 takes the isolated environment instead);
+   --sampled-fps hands the processor each video's sampled fps (float positions) where the cookbook passes none.
 3. Accuracy, and against each --omni arm: the items whose parsed answers agree, the items only one side gets right and
    the exact McNemar p. Writes <out>/samples.json, <out>/scored.json and <out>/summary.txt.
 """
@@ -35,6 +35,8 @@ import pair_check  # noqa: E402
 from hf_standard_queue import REFERENCE_PATH  # noqa: E402
 
 MAIN_TREE = "upv"
+# qwen_omni_utils alone, so the reference runs on the image's own transformers
+QWEN_OMNI_UTILS_PATH = "/data/pr2800/pylib/qou"
 SOCIALOMNI_ROOT = "/data/pr2800/socialomni"
 VIDEOAMME_SAMPLES = 50
 REFERENCE_TASKS = {"videoamme": "videotext", "socialomni": "socialomni"}
@@ -133,14 +135,14 @@ def main() -> None:
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--sampled-fps", action="store_true")
     parser.add_argument("--omni", nargs="*", default=[], help="arm=<omni result json> to pair with")
-    parser.add_argument("--samples-only", action="store_true")
+    parser.add_argument("--transformers", choices=("image", "4.57.1"), default="image",
+                        help="the reference's transformers: the image's own (5.19), or the isolated 4.57.1")
     parser.add_argument("--score-only", action="store_true")
     args = parser.parse_args()
     args.out.mkdir(parents=True, exist_ok=True)
-    if args.samples_only:
-        write_samples(args.benchmark, args.out / "samples.json")
-        return
-    elif args.score_only:
+    # note (ratish): the benchmark's loaders and parsers come from main's tree, as its own client reads them.
+    sys.path.insert(0, str(pair_check.tree(MAIN_TREE)))
+    if args.score_only:
         lines = score(args.benchmark, args.out, args.omni)
         (args.out / "summary.txt").write_text("\n".join(lines) + "\n")
         for line in lines:
@@ -148,11 +150,9 @@ def main() -> None:
         return
     else:
         pass
-    tree = pair_check.tree(MAIN_TREE)
-    env = {**os.environ, "PYTHONPATH": str(tree)}
-    this = [sys.executable, str(Path(__file__).resolve()), "--benchmark", args.benchmark, "--out", str(args.out)]
-    subprocess.run([*this, "--samples-only"], cwd=tree, env=env, check=True)
+    write_samples(args.benchmark, args.out / "samples.json")
     log(args.out, "samples written")
+    reference_path = QWEN_OMNI_UTILS_PATH if args.transformers == "image" else REFERENCE_PATH
     cards = [int(card) for card in args.cards.split(",")]
 
     def run_shard(shard: int) -> int:
@@ -162,7 +162,7 @@ def main() -> None:
             [sys.executable, str(BOX / "hf_standard_reference.py"), "--task", REFERENCE_TASKS[args.benchmark],
              "--samples", str(args.out / "samples.json"), "--shard", str(shard), "--shards", str(len(cards)),
              "--out", str(args.out), *(["--sampled-fps"] if args.sampled_fps else [])],
-            cwd="/tmp", env={**os.environ, "PYTHONPATH": REFERENCE_PATH, "CUDA_VISIBLE_DEVICES": str(card)},
+            cwd="/tmp", env={**os.environ, "PYTHONPATH": reference_path, "CUDA_VISIBLE_DEVICES": str(card)},
             stdout=open(args.out / f"reference_{shard}.log", "w"), stderr=subprocess.STDOUT).returncode
         log(args.out, f"shard {shard} card {card} rc {rc}")
         return rc
@@ -174,7 +174,10 @@ def main() -> None:
         return
     else:
         pass
-    subprocess.run([*this, "--score-only", "--omni", *args.omni], cwd=tree, env=env, check=True)
+    lines = score(args.benchmark, args.out, args.omni)
+    (args.out / "summary.txt").write_text("\n".join(lines) + "\n")
+    for line in lines:
+        log(args.out, line)
     log(args.out, "done")
 
 
