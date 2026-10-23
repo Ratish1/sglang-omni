@@ -92,6 +92,7 @@ auto_env:
   SEEDTTS_SIM_CACHE_DIR: "/github/home/seedtts-wavlm-sim"
 
 default_server_profile: qwen3_omni_colocated_router
+router_max_inflight: 256
 
 server_profile_by_hf_model_id:
   fishaudio/s2-pro: s2pro_router
@@ -106,6 +107,7 @@ server_profiles:
     wait_timeout: 600
     server_boot_timeout_s: 660
     router_topology: omni_audio
+    router_policy: least_requests
   qwen3_omni_video_router:
     server_gpus: 2
     model_name: qwen3-omni
@@ -115,6 +117,7 @@ server_profiles:
     wait_timeout: 600
     server_boot_timeout_s: 660
     router_topology: omni_audio
+    router_policy: least_requests
   qwen3_omni_mmsu_router:
     server_gpus: 2
     model_name: qwen3-omni
@@ -124,6 +127,7 @@ server_profiles:
     wait_timeout: 600
     server_boot_timeout_s: 660
     router_topology: omni_text
+    router_policy: least_requests
   s2pro_router:
     server_gpus: 2
     model_name: fishaudio/s2-pro
@@ -133,6 +137,7 @@ server_profiles:
     wait_timeout: 180
     server_boot_timeout_s: 240
     router_topology: tts
+    router_policy: least_requests
 
 rows:
   # ===================== mmsu (Qwen3-Omni text-only) =====================

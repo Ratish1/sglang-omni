@@ -1,17 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Rust router topologies for model CI."""
+"""Render Rust router configurations for homogeneous worker pools."""
 
 from __future__ import annotations
 
 import json
 from enum import StrEnum
-
-CI_ROUTER_MAX_INFLIGHT = 256
-TTS_SERVING_WORKER_BATCH_LIMIT = 32
-TTS_SERVING_BATCH_ADMISSION = CI_ROUTER_MAX_INFLIGHT * TTS_SERVING_WORKER_BATCH_LIMIT
+from typing import Literal
 
 
-class CiRouterTopology(StrEnum):
+class RouterTopology(StrEnum):
     ASR = "asr"
     TTS = "tts"
     TTS_SERVING = "tts_serving"
@@ -21,20 +18,20 @@ class CiRouterTopology(StrEnum):
 
 def render_router_config(
     *,
-    topology: CiRouterTopology,
+    topology: RouterTopology,
     router_port: int,
     worker_urls: list[str],
     model_name: str,
+    max_inflight: int,
+    strategy: Literal["round_robin", "least_requests"],
+    batch_limit: int | None = None,
     generation_streaming: bool = True,
     named_voice: bool = False,
 ) -> str:
-    """Render one current-schema router config for a homogeneous CI worker pool.
-
-    ``named_voice`` describes a TTS pool whose checkpoint serves preset voices
-    from the text alone; the speech profiles then advertise ``text_to_speech``
-    without a reference instead of ``voice_clone``.
-    """
-    preamble = router_preamble(topology, router_port)
+    """Render a worker pool with caller-owned admission limits and policy."""
+    preamble = router_preamble(
+        topology, router_port, max_inflight, strategy, batch_limit
+    )
     worker_blocks = [
         worker_block(
             topology=topology,
@@ -43,38 +40,37 @@ def render_router_config(
             model_name=model_name,
             generation_streaming=generation_streaming,
             named_voice=named_voice,
+            max_inflight=max_inflight,
+            batch_limit=batch_limit,
         )
         for ordinal, worker_url in enumerate(worker_urls, start=1)
     ]
     return f"{preamble.rstrip()}\n\n" + "\n\n".join(worker_blocks) + "\n"
 
 
-def router_preamble(topology: CiRouterTopology, router_port: int) -> str:
-    strategy = "round_robin" if topology is CiRouterTopology.ASR else "least_requests"
-    admission = {
-        CiRouterTopology.ASR: (
-            f"global = {CI_ROUTER_MAX_INFLIGHT}",
-            f"transcription_http = {CI_ROUTER_MAX_INFLIGHT}",
-        ),
-        CiRouterTopology.TTS: (
-            f"global = {CI_ROUTER_MAX_INFLIGHT}",
-            f"speech_http = {CI_ROUTER_MAX_INFLIGHT}",
-        ),
-        CiRouterTopology.TTS_SERVING: (
-            f"global = {CI_ROUTER_MAX_INFLIGHT}",
-            f"speech_http = {CI_ROUTER_MAX_INFLIGHT}",
-            f"speech_batch = {TTS_SERVING_BATCH_ADMISSION}",
-            f"speech_websocket = {CI_ROUTER_MAX_INFLIGHT}",
-        ),
-        CiRouterTopology.OMNI_TEXT: (
-            f"global = {CI_ROUTER_MAX_INFLIGHT}",
-            f"generation_http = {CI_ROUTER_MAX_INFLIGHT}",
-        ),
-        CiRouterTopology.OMNI_AUDIO: (
-            f"global = {CI_ROUTER_MAX_INFLIGHT}",
-            f"generation_http = {CI_ROUTER_MAX_INFLIGHT}",
-        ),
-    }[topology]
+def router_preamble(
+    topology: RouterTopology,
+    router_port: int,
+    max_inflight: int,
+    strategy: Literal["round_robin", "least_requests"],
+    batch_limit: int | None,
+) -> str:
+    if topology is RouterTopology.TTS_SERVING:
+        assert batch_limit is not None
+        admission = (
+            f"global = {max_inflight}",
+            f"speech_http = {max_inflight}",
+            f"speech_batch = {max_inflight * batch_limit}",
+            f"speech_websocket = {max_inflight}",
+        )
+    else:
+        admission_class = {
+            RouterTopology.ASR: "transcription_http",
+            RouterTopology.TTS: "speech_http",
+            RouterTopology.OMNI_TEXT: "generation_http",
+            RouterTopology.OMNI_AUDIO: "generation_http",
+        }[topology]
+        admission = (f"global = {max_inflight}", f"{admission_class} = {max_inflight}")
     lines = [
         "schema_version = 1",
         "",
@@ -91,8 +87,10 @@ def router_preamble(topology: CiRouterTopology, router_port: int) -> str:
         "[router]",
         f"strategy = {toml_string(strategy)}",
     ]
-    if topology is CiRouterTopology.TTS_SERVING:
+    if topology is RouterTopology.TTS_SERVING:
         lines.append('voice_owner_worker_id = "tts-serving-1"')
+    else:
+        pass
     lines.extend(
         [
             "",
@@ -103,7 +101,7 @@ def router_preamble(topology: CiRouterTopology, router_port: int) -> str:
             "",
         ]
     )
-    if topology in {CiRouterTopology.OMNI_TEXT, CiRouterTopology.OMNI_AUDIO}:
+    if topology in {RouterTopology.OMNI_TEXT, RouterTopology.OMNI_AUDIO}:
         lines.extend(
             [
                 "[http_generation]",
@@ -111,11 +109,13 @@ def router_preamble(topology: CiRouterTopology, router_port: int) -> str:
             ]
         )
         return "\n".join(lines)
+    else:
+        pass
 
     routes = {
-        CiRouterTopology.ASR: ["transcription"],
-        CiRouterTopology.TTS: ["speech"],
-        CiRouterTopology.TTS_SERVING: ["speech", "speech_batch"],
+        RouterTopology.ASR: ["transcription"],
+        RouterTopology.TTS: ["speech"],
+        RouterTopology.TTS_SERVING: ["speech", "speech_batch"],
     }[topology]
     lines.extend(
         [
@@ -124,26 +124,30 @@ def router_preamble(topology: CiRouterTopology, router_port: int) -> str:
             'trust_domain = "local"',
         ]
     )
-    if topology is CiRouterTopology.TTS_SERVING:
+    if topology is RouterTopology.TTS_SERVING:
         lines.extend(["", "[websocket.speech]", 'trust_domain = "local"'])
+    else:
+        pass
     return "\n".join(lines)
 
 
 def worker_block(
     *,
-    topology: CiRouterTopology,
+    topology: RouterTopology,
     ordinal: int,
     worker_url: str,
     model_name: str,
     generation_streaming: bool,
     named_voice: bool,
+    max_inflight: int,
+    batch_limit: int | None,
 ) -> str:
     prefix = {
-        CiRouterTopology.ASR: "asr",
-        CiRouterTopology.TTS: "tts",
-        CiRouterTopology.TTS_SERVING: "tts-serving",
-        CiRouterTopology.OMNI_TEXT: "omni",
-        CiRouterTopology.OMNI_AUDIO: "omni",
+        RouterTopology.ASR: "asr",
+        RouterTopology.TTS: "tts",
+        RouterTopology.TTS_SERVING: "tts-serving",
+        RouterTopology.OMNI_TEXT: "omni",
+        RouterTopology.OMNI_AUDIO: "omni",
     }[topology]
     worker_id = f"{prefix}-{ordinal}"
     lines = [
@@ -153,14 +157,16 @@ def worker_block(
         'trust_domain = "local"',
         f"default_model_id = {toml_string(model_name)}",
     ]
-    if topology is CiRouterTopology.TTS_SERVING:
+    if topology is RouterTopology.TTS_SERVING:
         lines.extend(
             [
                 "",
                 "[workers.capacity]",
-                f"speech_websocket = {CI_ROUTER_MAX_INFLIGHT}",
+                f"speech_websocket = {max_inflight}",
             ]
         )
+    else:
+        pass
     lines.extend(
         [
             "",
@@ -169,6 +175,7 @@ def worker_block(
                 model_name,
                 named_voice,
                 generation_streaming=generation_streaming,
+                batch_limit=batch_limit,
             ),
         ]
     )
@@ -176,20 +183,21 @@ def worker_block(
 
 
 def service_profiles(
-    topology: CiRouterTopology,
+    topology: RouterTopology,
     model_name: str,
     named_voice: bool,
     *,
     generation_streaming: bool,
+    batch_limit: int | None,
 ) -> str:
     model_ids = toml_array([model_name])
-    if topology is CiRouterTopology.ASR:
+    if topology is RouterTopology.ASR:
         return transcription_profile(
             model_ids,
             task="transcribe",
             formats=["json", "verbose_json", "sse"],
         )
-    if topology is CiRouterTopology.TTS:
+    elif topology is RouterTopology.TTS:
         if named_voice:
             tasks = ["text_to_speech"]
             reference_forms = ["none"]
@@ -220,7 +228,8 @@ def service_profiles(
                 ),
             ]
         )
-    if topology is CiRouterTopology.TTS_SERVING:
+    elif topology is RouterTopology.TTS_SERVING:
+        assert batch_limit is not None
         profiles = [
             speech_profile(
                 service="speech_http",
@@ -240,7 +249,7 @@ def service_profiles(
                 reference_forms=["none", "direct", "list"],
                 voice_name_policy="uploaded",
             ),
-            speech_batch_profile(model_ids),
+            speech_batch_profile(model_ids, batch_limit),
             speech_profile(
                 service="speech_websocket",
                 model_ids=model_ids,
@@ -252,11 +261,12 @@ def service_profiles(
             ),
         ]
         return "\n\n".join(profiles)
-    return generation_profile(
-        model_ids=model_ids,
-        audio_output=topology is CiRouterTopology.OMNI_AUDIO,
-        streaming=generation_streaming,
-    )
+    else:
+        return generation_profile(
+            model_ids=model_ids,
+            audio_output=topology is RouterTopology.OMNI_AUDIO,
+            streaming=generation_streaming,
+        )
 
 
 def transcription_profile(
@@ -301,7 +311,7 @@ def speech_profile(
     )
 
 
-def speech_batch_profile(model_ids: str) -> str:
+def speech_batch_profile(model_ids: str, batch_limit: int) -> str:
     return "\n".join(
         [
             "[[workers.service_profiles]]",
@@ -311,7 +321,7 @@ def speech_batch_profile(model_ids: str) -> str:
             'tasks = ["text_to_speech", "voice_clone", "voice_design"]',
             'reference_forms = ["none", "direct", "list"]',
             'voice_name_policy = "uploaded"',
-            f"max_batch_size = {TTS_SERVING_WORKER_BATCH_LIMIT}",
+            f"max_batch_size = {batch_limit}",
         ]
     )
 

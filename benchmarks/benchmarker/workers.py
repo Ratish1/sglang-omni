@@ -197,6 +197,35 @@ def wait_for_worker_health(worker: ManagedWorkerProcess, deadline: float) -> Non
     raise TimeoutError(f"managed worker {worker.url} did not become healthy{detail}")
 
 
+def wait_for_all_router_workers(
+    port: int, *, expected_workers: int, timeout: int = 120
+) -> None:
+    """Wait until the router can dispatch to every configured replica."""
+    deadline = time.monotonic() + timeout
+    last_response = ""
+    with httpx.Client(trust_env=False, timeout=20) as client:
+        while time.monotonic() < deadline:
+            try:
+                response = client.get(f"http://127.0.0.1:{port}/diagnostics")
+                last_response = response.text
+                response.raise_for_status()
+                diagnostics = response.json()
+                workers = diagnostics["workers"]
+                if (
+                    diagnostics["lifecycle"] == "serving"
+                    and diagnostics["ready"] is True
+                    and len(workers) == expected_workers
+                    and all(worker["routable"] is True for worker in workers)
+                ):
+                    return
+                else:
+                    pass
+            except (httpx.HTTPError, ValueError):
+                pass
+            time.sleep(1)
+    raise TimeoutError(f"router workers did not become fully routable: {last_response}")
+
+
 def stop_managed_workers(workers: list[ManagedWorkerProcess]) -> None:
     for worker in workers:
         worker.process.send_signal(signal.SIGINT)

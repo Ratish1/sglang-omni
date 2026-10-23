@@ -18,13 +18,15 @@ import pytest
 import requests
 import torch
 
-from benchmarks.benchmarker.router_config import CiRouterTopology, render_router_config
+from benchmarks.benchmarker.router_config import RouterTopology as CiRouterTopology
+from benchmarks.benchmarker.router_config import render_router_config
 from benchmarks.benchmarker.workers import (
     ManagedWorkerProcess,
     build_gpu_assignments,
     port_is_available,
     start_workers,
     stop_managed_workers,
+    wait_for_all_router_workers,
     wait_for_workers,
 )
 from sglang_omni.utils import find_available_port
@@ -38,6 +40,8 @@ from tests.utils import (
 RUST_ROUTER_BINARY_ENV = "SGLANG_OMNI_ROUTER_BIN"
 REQUEST_TIMEOUT = 20
 LOG_TAIL_LINES = 120
+CI_ROUTER_MAX_INFLIGHT = 256
+TTS_SERVING_WORKER_BATCH_LIMIT = 32
 
 
 @dataclass
@@ -265,32 +269,6 @@ def router_get_json(port: int, path: str) -> dict:
     return payload
 
 
-def wait_for_all_router_workers(
-    port: int,
-    *,
-    expected_workers: int,
-    timeout: int = 120,
-) -> None:
-    deadline = time.monotonic() + timeout
-    last_payload: dict | None = None
-    while time.monotonic() < deadline:
-        try:
-            last_payload = router_get_json(port, "/diagnostics")
-        except (requests.RequestException, ValueError, TypeError):
-            time.sleep(1)
-            continue
-        workers = last_payload.get("workers", [])
-        if (
-            last_payload.get("lifecycle") == "serving"
-            and last_payload.get("ready") is True
-            and len(workers) == expected_workers
-            and all(worker.get("routable") is True for worker in workers)
-        ):
-            return
-        time.sleep(1)
-    raise TimeoutError(f"router workers did not become fully routable: {last_payload}")
-
-
 def assert_router_healthy(handle: ManagedRouterHandle) -> dict:
     return wait_for_router_quiescence(
         handle.port,
@@ -485,6 +463,11 @@ def write_router_config(
             router_port=router_port,
             worker_urls=worker_urls,
             model_name=model_name,
+            max_inflight=CI_ROUTER_MAX_INFLIGHT,
+            strategy=(
+                "round_robin" if topology is CiRouterTopology.ASR else "least_requests"
+            ),
+            batch_limit=TTS_SERVING_WORKER_BATCH_LIMIT,
             generation_streaming=generation_streaming,
             named_voice=named_voice,
         ),

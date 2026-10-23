@@ -32,13 +32,14 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
-from benchmarks.benchmarker.router_config import CiRouterTopology, render_router_config
+from benchmarks.benchmarker.router_config import RouterTopology, render_router_config
 from benchmarks.benchmarker.workers import (
     ManagedWorkerProcess,
     build_gpu_assignments,
     port_is_available,
     start_workers,
     stop_managed_workers,
+    wait_for_all_router_workers,
     wait_for_workers,
 )
 
@@ -755,6 +756,7 @@ def launch_row_server(
     return launch_managed_router_server(
         profile,
         py,
+        max_inflight=cfg["router_max_inflight"],
         port=port,
         model=model,
         gpus_csv=gpus_csv,
@@ -769,6 +771,7 @@ def launch_managed_router_server(
     profile: dict,
     py: str,
     *,
+    max_inflight: int,
     port: int,
     model: str,
     gpus_csv: str,
@@ -786,10 +789,12 @@ def launch_managed_router_server(
     router_config = round_dir / "router.toml"
     router_config.write_text(
         render_router_config(
-            topology=CiRouterTopology(profile["router_topology"]),
+            topology=RouterTopology(profile["router_topology"]),
             router_port=port,
             worker_urls=[f"http://{worker_host}:{worker_port}" for worker_port in worker_ports],
             model_name=model_name,
+            max_inflight=max_inflight,
+            strategy=profile["router_policy"],
         ),
         encoding="utf-8",
     )
@@ -834,6 +839,9 @@ def launch_managed_router_server(
     handle = ServerHandle(popen, port, log_path, workers=workers, health_path="/ready")
     try:
         wait_for_workers(workers, int(profile.get("wait_timeout", 900)))
+        wait_for_all_router_workers(
+            port, expected_workers=num_workers, timeout=int(profile.get("server_boot_timeout_s", 300))
+        )
     except BaseException:
         handle.stop()
         raise
@@ -1128,11 +1136,14 @@ def _run_one_round(row: dict, py: str, root: Path, round_dir: Path,
             "fail_excerpt": _extract_fail_excerpt(server_log),
         }
     try:
-        health = row.get(
-            "server_health", f"http://localhost:{{port}}{handle.health_path}"
-        ).format(port=port)
         timeout = _row_server_boot_timeout(row, cfg)
-        ok, msg = wait_health(health, timeout)
+        if handle.workers and "server_health" not in row:
+            ok, msg = True, "ok"
+        else:
+            health = row.get(
+                "server_health", f"http://localhost:{{port}}{handle.health_path}"
+            ).format(port=port)
+            ok, msg = wait_health(health, timeout)
         if not ok:
             return {
                 "status": "fail",
