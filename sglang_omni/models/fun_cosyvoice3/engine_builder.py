@@ -66,9 +66,6 @@ class FunCosyVoice3EngineBuilder(TtsEngineBuilder[CosyVoice3SGLangRequestData]):
     model_name = "Fun-CosyVoice3"
     context_length = 4096
     model_arch_override = "FunCosyVoice3SGLangModel"
-    supports_breakable_prefill_cuda_graph = (
-        CAPABILITIES.supports_breakable_prefill_cuda_graph
-    )
     supports_full_prefill_cuda_graph = CAPABILITIES.supports_full_prefill_cuda_graph
 
     def __init__(
@@ -157,7 +154,7 @@ class FunCosyVoice3EngineBuilder(TtsEngineBuilder[CosyVoice3SGLangRequestData]):
         # which the ladder's first bucket of 4 pads past twice its size and runs eagerly;
         # every eager prefill measured at c16 and c64 was such a one-token batch.
         if (
-            prefill.backend in (CudaGraphBackend.BREAKABLE, CudaGraphBackend.FULL)
+            prefill.backend == CudaGraphBackend.FULL
             and prefill.bs
             and prefill.bs[0] != 1
             and self.server_args_overrides.get("cuda_graph_bs_prefill") is None
