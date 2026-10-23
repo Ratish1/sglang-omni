@@ -23,8 +23,6 @@ GROUP_EXIT_POLL_INTERVAL_S = 0.05
 @dataclass(kw_only=True)
 class ManagedWorkerProcess:
     url: str
-    port: int
-    cuda_visible_devices: str | None
     process: subprocess.Popen[bytes]
     process_group_id: int
 
@@ -127,8 +125,6 @@ def start_workers(
             workers.append(
                 ManagedWorkerProcess(
                     url=worker_url,
-                    port=port,
-                    cuda_visible_devices=cuda_visible_devices,
                     process=process,
                     process_group_id=process.pid,
                 )

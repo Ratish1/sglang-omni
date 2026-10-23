@@ -160,7 +160,7 @@ def test_workers_wait_in_parallel(
             else:
                 pass
         assert both_waiting.wait(timeout=2)
-        if worker.port == 8012:
+        if worker.url == "http://127.0.0.1:8012":
             raise RuntimeError("worker 2 failed")
         else:
             pass
@@ -207,8 +207,6 @@ def test_managed_shutdown_signals_only_worker_parents(
     workers = [
         managed_workers.ManagedWorkerProcess(
             url=f"http://127.0.0.1:{port}",
-            port=port,
-            cuda_visible_devices=None,
             process=FakeProcess(port),
             process_group_id=port,
         )
@@ -261,8 +259,6 @@ def test_managed_shutdown_kills_remaining_group(
     process = FakeProcess()
     worker = managed_workers.ManagedWorkerProcess(
         url="http://127.0.0.1:8011",
-        port=8011,
-        cuda_visible_devices=None,
         process=process,
         process_group_id=8011,
     )
@@ -298,8 +294,6 @@ def test_managed_shutdown_waits_for_orphaned_worker_child() -> None:
 
         worker = managed_workers.ManagedWorkerProcess(
             url="http://127.0.0.1:8011",
-            port=8011,
-            cuda_visible_devices=None,
             process=parent,
             process_group_id=parent.pid,
         )
