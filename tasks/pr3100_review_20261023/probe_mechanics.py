@@ -131,7 +131,10 @@ raise SystemExit(pytest.main(["-q", "--tb=short", "tests/unit_test/dots_tts/test
             "stream capture status" in completed.stdout
             or "previous error during capture" in completed.stdout
         )
-        assert "operation not permitted when stream is capturing" in completed.stderr
+        assert (
+            "operation not permitted when stream is capturing"
+            in completed.stdout + completed.stderr
+        )
     else:
         ipc_probe(options.mode)
 
