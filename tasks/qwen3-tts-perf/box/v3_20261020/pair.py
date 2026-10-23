@@ -235,18 +235,19 @@ def main() -> None:
         pass
     else:
         for index, arm in enumerate(arms):
-            score(outs[arm], arms[arm][0], args.port + 400 + 400 * index, args.tree)
+            score(outs[arm], arms[arm][0], args.port + 400 + 400 * index, args.tree, args.meta)
         print("scored", flush=True)
     print("pair done", flush=True)
 
 
-def score(out: Path, card: int, port: int, tree: str) -> None:
+def score(out: Path, card: int, port: int, tree: str, meta: str) -> None:
     """WER from an ASR server on the arm's own card, then speaker similarity on that card: the scorer's own servers
-    default to card 0, which another container may own. The ASR pipeline is one stage, so one rendezvous port."""
+    default to card 0, which another container may own. The ASR pipeline is one stage, so one rendezvous port. A
+    --meta list goes to the scorer too, whose similarity pass reads each sample's reference from it."""
     env = dict(os.environ, PYTHONPATH=tree, SGLANG_OMNI_STRICT_PORT="1")
     asr_env = dict(env, MASTER_PORT=str(port + 50))
     scorer = [sys.executable, "-m", "benchmarks.eval.benchmark_tts_seedtts", "--model", MODEL, "--lang", "en",
-              "--skip-gpu-cleanup", "--output-dir", str(out / "bench")]
+              "--skip-gpu-cleanup", "--output-dir", str(out / "bench"), *(["--meta", meta] if meta else [])]
     with open(out / "asr_serve.log", "w", encoding="utf-8") as serve_log:
         asr = subprocess.Popen(
             [sys.executable, "-m", "sglang_omni.cli", "serve", "--model-path", ASR_MODEL, "--host", "127.0.0.1",
