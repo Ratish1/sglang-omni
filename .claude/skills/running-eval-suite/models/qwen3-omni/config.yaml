@@ -21,8 +21,8 @@
 #   server                      legacy direct server launch template fallback
 #   server_extra_by_hardware    optional hardware tag -> extra server args appended to server or profiled worker args
 #   server_gpus                 legacy direct server GPU count fallback
-#   server_health               optional health URL ({port} substituted), defaults to /health
-#   server_boot_timeout_s       optional seconds to wait for /health 2xx; profiles own this by default
+#   server_health               optional health URL ({port} substituted), defaults to /ready for routers and /health for direct workers
+#   server_boot_timeout_s       optional seconds to wait for readiness 2xx; profiles own this by default
 #   client                      client launch template; {port} {output_dir} {model} {asr_gpu} substituted.
 #                               {asr_gpu} = "cuda:N" of a GPU not given to the server
 #                               (or "cpu" if no free GPUs left); use in --asr-device / --device flags.
@@ -105,7 +105,7 @@ server_profiles:
     worker_extra_args: "--config {repo_root}/examples/configs/qwen3_omni_colocated.yaml --colocate"
     wait_timeout: 600
     server_boot_timeout_s: 660
-    router_policy: least_request
+    router_topology: omni_audio
   qwen3_omni_video_router:
     server_gpus: 2
     model_name: qwen3-omni
@@ -114,7 +114,7 @@ server_profiles:
     worker_extra_args: "--config {repo_root}/examples/configs/qwen3_omni_colocated.yaml --colocate --stages.0.factory-args.thinker-max-seq-len 32768 --stages.thinker.factory-args.thinker-max-seq-len 32768"
     wait_timeout: 600
     server_boot_timeout_s: 660
-    router_policy: least_request
+    router_topology: omni_audio
   qwen3_omni_mmsu_router:
     server_gpus: 2
     model_name: qwen3-omni
@@ -123,7 +123,7 @@ server_profiles:
     worker_extra_args: "--config {repo_root}/examples/configs/qwen3_omni_mmsu.yaml --text-only"
     wait_timeout: 600
     server_boot_timeout_s: 660
-    router_policy: least_request
+    router_topology: omni_text
   s2pro_router:
     server_gpus: 2
     model_name: fishaudio/s2-pro
@@ -132,7 +132,7 @@ server_profiles:
     worker_extra_args: "--config {repo_root}/examples/configs/s2pro_tts.yaml"
     wait_timeout: 180
     server_boot_timeout_s: 240
-    router_policy: least_request
+    router_topology: tts
 
 rows:
   # ===================== mmsu (Qwen3-Omni text-only) =====================
@@ -152,7 +152,7 @@ rows:
 
   - id: mmsu-text-audio-c8-accuracy
     file: "benchmarks/eval/benchmark_omni_mmsu.py"
-    server_profile: qwen3_omni_mmsu_router
+    server_profile: qwen3_omni_colocated_router
     locate:
       section_substring: "Accuracy (accuracy)"
       config_substring: "modalities=text+audio"
@@ -181,7 +181,7 @@ rows:
 
   - id: mmsu-text-audio-c8-speed
     file: "benchmarks/eval/benchmark_omni_mmsu.py"
-    server_profile: qwen3_omni_mmsu_router
+    server_profile: qwen3_omni_colocated_router
     locate:
       section_substring: "Speed (speed)"
       config_substring: "modalities=text+audio"

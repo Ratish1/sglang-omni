@@ -1,6 +1,6 @@
 ---
 name: running-eval-suite
-description: Run all reference benchmarks under benchmarks/eval/ and refresh the reference-table cells in benchmark_*.py. Auto-detects host hardware (H200/H100/H800/...). For each row's matching hw entry: replace cells in place. For new hardware or a new workload tag: append a new row to the section's table. Local-Pipeline-Result tables are skipped. One slash command runs everything end-to-end and auto-commits.
+description: "Run all reference benchmarks under benchmarks/eval/ and refresh the reference-table cells in benchmark_*.py. Auto-detects host hardware (H200/H100/H800/...). For each row's matching hw entry: replace cells in place. For new hardware or a new workload tag: append a new row to the section's table. Local-Pipeline-Result tables are skipped. One slash command runs everything end-to-end and auto-commits."
 ---
 
 # running-eval-suite
@@ -43,6 +43,8 @@ limited to its maintainers.
 ## Prerequisites (the skill verifies, it does not create)
 
 - A sglang-omni clone (`benchmarks/eval/` reachable from the working dir).
+- The `sgl-omni-router` executable, built with the [router installation instructions](../../../docs/basic_usage/omni_router.md#installation). Put it on `PATH` or set `SGLANG_OMNI_ROUTER_BIN` to its executable path. Precheck requires it for managed-router rows.
+- Run the runner from the repository root with `export PYTHONPATH="$PWD${PYTHONPATH:+:$PYTHONPATH}"` so it can import the shared benchmark utilities.
 - A venv with `sglang` + `torch` importable. Default candidates (first existing wins):
   `/sgl-workspace/sglang-omni/omni/bin/python`,
   `/github/home/calibration/omni/bin/python`,
@@ -151,8 +153,7 @@ Errors halt the run with a printed reason. This matches the
      [--exclude-ids <substr>] [--gpu-pool <ids>] \
      --output-dir <run-dir>
    ```
-   - For each row: launch server (process-group SIGTERM at end, never
-     `pkill -f`), run client, capture `result.json`, then immediately
+   - For each row: launch server, run client, capture `result.json`, then immediately
      edit the matching row in `benchmarks/eval/benchmark_*.py`
      (replace existing hw row OR append new hw row at end of the
      section's table; Local sections never touched).
@@ -160,6 +161,7 @@ Errors halt the run with a printed reason. This matches the
      tags. The first run on a hardware target appends new router-tagged
      rows next to the older direct/V1-pipeline rows; later runs replace
      those router rows in place.
+   - Managed-router rows start complete Omni workers and the Rust router as separate processes. The shared TOML topology sets the policy. Wait for worker health and router `/ready` before running the client. At teardown, stop the router before stopping the worker parents and waiting for their pipeline children. Direct-server teardown keeps its existing process-group SIGTERM behavior.
    - Per-row state lands in `<run-dir>/run-state.json`. Stream the
      runner's stdout to the user so they can watch progress.
    - **If a row fails** (server boot timeout / client crash / locator
