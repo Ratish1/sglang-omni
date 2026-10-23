@@ -21,7 +21,7 @@ def requests(directory: Path) -> dict[tuple[int, ...], tuple[dict, dict]]:
     for inputs_path in sorted(directory.glob("*_inputs.pt")):
         logits_path = inputs_path.with_name(inputs_path.name.replace("_inputs.pt", "_logits.pt"))
         inputs = torch.load(inputs_path, weights_only=False)
-        if not logits_path.exists() or inputs["prefix"] != 0:
+        if not logits_path.exists():
             continue
         else:
             pass
@@ -38,12 +38,15 @@ def main() -> None:
 
     vocab_size = AutoConfig.from_pretrained(MODEL).thinker_config.text_config.vocab_size
     first, second = requests(Path(sys.argv[1])), requests(Path(sys.argv[2]))
-    prompts = sorted(set(first) & set(second))
+    prompts = sorted(
+        prompt for prompt in set(first) & set(second) if first[prompt][0]["prefix"] == second[prompt][0]["prefix"]
+    )
     counts = {"embeds": 0, "media_rows": 0, "deepstack": 0, "positions": 0, "logits": 0, "argmax": 0}
     rows = []
     for prompt in prompts:
         (inputs_a, logits_a), (inputs_b, logits_b) = first[prompt], second[prompt]
-        media = torch.tensor([token_id >= vocab_size for token_id in prompt])
+        prefix = inputs_a["prefix"]
+        media = torch.tensor([token_id >= vocab_size for token_id in prompt[prefix:]])
         embeds_equal = torch.equal(inputs_a["input_embeds"], inputs_b["input_embeds"])
         media_equal = torch.equal(inputs_a["input_embeds"][media], inputs_b["input_embeds"][media])
         deepstack_equal = (inputs_a["deepstack_embeds"] is None and inputs_b["deepstack_embeds"] is None) or (
@@ -65,7 +68,7 @@ def main() -> None:
             largest_difference(logits_a["logits"], logits_b["logits"]),
             int(media.sum()), len(prompt),
         ))
-    print(f"{len(prompts)} requests in both boots (whole prompts computed in one chunk)")
+    print(f"{len(prompts)} requests in both boots with the same cached prefix")
     print("equal byte for byte: " + ", ".join(f"{name} {count}" for name, count in counts.items()))
     embeds_same_logits_differ = sum(1 for row in rows if row[0] and not row[1])
     embeds_differ = sum(1 for row in rows if not row[0])
