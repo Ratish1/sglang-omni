@@ -1337,7 +1337,7 @@ def test_onnx_intra_op_threads_reaches_both_encoders(monkeypatch) -> None:
     monkeypatch.setattr(
         request_builders, "set_cosyvoice3_preprocessing_context", lambda **kwargs: None
     )
-    monkeypatch.setattr(engine_builder, "_ENGINE_HEADROOM_BYTES", None)
+    monkeypatch.setattr(engine_builder, "_ENGINE_HEADROOM_BYTES", 0)
 
     builder = engine_builder.FunCosyVoice3EngineBuilder(onnx_intra_op_threads=6)
     builder.checkpoint_root = "/tmp"
@@ -1348,6 +1348,8 @@ def test_onnx_intra_op_threads_reaches_both_encoders(monkeypatch) -> None:
                 model_config=SimpleNamespace(vocab_size=0),
                 pre_model_load_memory=80.0,
                 mem_fraction_static=0.85,
+                total_gpu_memory_fraction=None,
+                kv_cache_bytes=None,
             )
         ),
         checkpoint_dir="/tmp",
@@ -1381,18 +1383,25 @@ def tiny_prefix_bytes_per_frame() -> int:
 
 
 @pytest.mark.parametrize(
-    ("free_blocks", "capped_blocks", "expected_blocks"),
-    [(10.0, 100.0, 10), (10.0, 4.5, 4), (0.5, 100.0, None)],
+    ("free_blocks", "capped_blocks", "share_blocks", "expected_blocks"),
+    [
+        (10.0, 100.0, None, 10),
+        (10.0, 4.5, None, 4),
+        (0.5, 100.0, None, None),
+        (10.0, 100.0, 3, 3),
+    ],
 )
 def test_derived_prefix_pool_takes_the_memory_left_after_its_reserve(
     monkeypatch: pytest.MonkeyPatch,
     free_blocks: float,
     capped_blocks: float,
+    share_blocks: int | None,
     expected_blocks: int | None,
 ) -> None:
     block_bytes = stages.BLOCK_FRAMES * tiny_prefix_bytes_per_frame()
     reserve_bytes = 2**30
     total_bytes = 2**36
+    reserved_bytes = int(total_bytes / 2 - reserve_bytes - capped_blocks * block_bytes)
     monkeypatch.setattr(torch.cuda, "empty_cache", lambda: None)
     monkeypatch.setattr(
         torch.cuda,
@@ -1402,13 +1411,7 @@ def test_derived_prefix_pool_takes_the_memory_left_after_its_reserve(
     monkeypatch.setattr(
         torch.cuda, "get_per_process_memory_fraction", lambda device: 0.5
     )
-    monkeypatch.setattr(
-        torch.cuda,
-        "memory_reserved",
-        lambda device: int(
-            total_bytes / 2 - reserve_bytes - capped_blocks * block_bytes
-        ),
-    )
+    monkeypatch.setattr(torch.cuda, "memory_reserved", lambda device: reserved_bytes)
 
     pool = stages.build_prefix_pool(
         tiny_prefix_flow(),
@@ -1416,6 +1419,12 @@ def test_derived_prefix_pool_takes_the_memory_left_after_its_reserve(
         torch.bfloat16,
         size_gb=None,
         reserve_bytes=reserve_bytes,
+        memory_fraction=(
+            None
+            if share_blocks is None
+            else (reserved_bytes + reserve_bytes + share_blocks * block_bytes)
+            / total_bytes
+        ),
     )
 
     if expected_blocks is None:
@@ -1448,13 +1457,32 @@ def test_sized_prefix_pool_is_capped_by_the_memory_left_after_its_reserve(
         torch.bfloat16,
         size_gb=size_blocks * block_bytes / 2**30,
         reserve_bytes=reserve_bytes,
+        memory_fraction=None,
     )
 
     assert pool is not None
     assert pool.free_frames == expected_blocks * stages.BLOCK_FRAMES
 
 
-def patch_ragged_vocoder(monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize(
+    (
+        "flow_prefix_cache_gb",
+        "headroom_gib",
+        "process_fraction",
+        "expected_reserve_gib",
+    ),
+    [(None, 1.5, None, 4.5), (2.0, 1.5, None, 4.5), (None, 0.0, 0.6, 3.0)],
+)
+def test_prefix_pool_leaves_the_engine_headroom_and_the_largest_step(
+    monkeypatch: pytest.MonkeyPatch,
+    flow_prefix_cache_gb: float | None,
+    headroom_gib: float,
+    process_fraction: float | None,
+    expected_reserve_gib: float,
+) -> None:
+    """The pool leaves the engine's headroom plus the largest step the scheduler
+    admits, max_batch_size rows at the engine's context length, measured before the
+    pool, also when its size is set, within the process's declared share."""
     fake_flow = RunnableFakeFlow()
     fake_flow.packed_estimator.is_ragged = True
     flow = stages.FunCosyVoice3Flow(
@@ -1470,38 +1498,6 @@ def patch_ragged_vocoder(monkeypatch: pytest.MonkeyPatch) -> None:
         "load_cosyvoice3_flow_hift",
         lambda checkpoint_dir, device, fp16, **kwargs: (flow, FakeHiFT()),
     )
-
-
-def create_ragged_vocoder(flow_prefix_cache_gb: float | None) -> None:
-    stages.create_vocoder_executor(
-        "model",
-        device="cuda",
-        dtype="float16",
-        max_batch_size=4,
-        flow_prefix_cache_gb=flow_prefix_cache_gb,
-        enable_flow_cuda_graph=False,
-        enable_flow_prefix_cuda_graph=False,
-        enable_flow_whole_history_cuda_graph=True,
-        enable_hift_cuda_graph=False,
-        flow_batch_admission_frames=3,
-        enable_dit_torch_compile=False,
-    )
-
-
-@pytest.mark.parametrize(
-    ("flow_prefix_cache_gb", "headroom_gib", "expected_reserve_gib"),
-    [(None, 1.5, 3.0), (None, 5.0, 5.0), (2.0, 1.5, 3.0)],
-)
-def test_prefix_pool_leaves_the_larger_of_the_engine_headroom_and_the_largest_step(
-    monkeypatch: pytest.MonkeyPatch,
-    flow_prefix_cache_gb: float | None,
-    headroom_gib: float,
-    expected_reserve_gib: float,
-) -> None:
-    """The pool leaves the larger of the engine's headroom and the largest step the
-    scheduler admits, max_batch_size rows at the engine's context length, measured
-    before the pool, also when its size is set."""
-    patch_ragged_vocoder(monkeypatch)
     events: list[tuple[str, object]] = []
 
     def measure(
@@ -1521,8 +1517,9 @@ def test_prefix_pool_leaves_the_larger_of_the_engine_headroom_and_the_largest_st
         *,
         size_gb: float | None,
         reserve_bytes: int,
+        memory_fraction: float | None,
     ) -> None:
-        events.append(("pool", (size_gb, reserve_bytes)))
+        events.append(("pool", (size_gb, reserve_bytes, memory_fraction)))
 
     monkeypatch.setattr(
         FunCosyVoice3StreamingVocoderScheduler, "measure_peak_step_bytes", measure
@@ -1532,22 +1529,33 @@ def test_prefix_pool_leaves_the_larger_of_the_engine_headroom_and_the_largest_st
         stages, "engine_headroom_bytes", lambda: int(headroom_gib * 2**30)
     )
 
-    create_ragged_vocoder(flow_prefix_cache_gb)
+    stages.create_vocoder_executor(
+        "model",
+        device="cuda",
+        dtype="float16",
+        max_batch_size=4,
+        flow_prefix_cache_gb=flow_prefix_cache_gb,
+        enable_flow_cuda_graph=False,
+        enable_flow_prefix_cuda_graph=False,
+        enable_flow_whole_history_cuda_graph=True,
+        enable_hift_cuda_graph=False,
+        flow_batch_admission_frames=3,
+        enable_dit_torch_compile=False,
+        total_gpu_memory_fraction=None if process_fraction is None else 0.2,
+        process_total_gpu_memory_fraction=process_fraction,
+    )
 
     assert events == [
         ("measure", (4, FunCosyVoice3EngineBuilder.context_length)),
-        ("pool", (flow_prefix_cache_gb, int(expected_reserve_gib * 2**30))),
+        (
+            "pool",
+            (
+                flow_prefix_cache_gb,
+                int(expected_reserve_gib * 2**30),
+                process_fraction,
+            ),
+        ),
     ]
-
-
-def test_prefix_pool_needs_the_engine_in_its_process(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    patch_ragged_vocoder(monkeypatch)
-    monkeypatch.setattr(stages, "engine_headroom_bytes", lambda: None)
-
-    with pytest.raises(ValueError, match="TTS engine in the same process"):
-        create_ragged_vocoder(None)
 
 
 def test_create_vocoder_executor_rejects_non_positive_admission_budget(
