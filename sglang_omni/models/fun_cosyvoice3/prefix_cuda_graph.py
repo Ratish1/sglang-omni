@@ -104,10 +104,14 @@ class PrefixCudaGraphRunner:
         # note (ratish): replays run one at a time on the vocoder's stream, each copying
         # its inputs in and its outputs out, so the tiers can share their inputs; a set
         # per tier held 1.7 GB of contexts over the prefill ladder's tiers.
-        max_frames = max(layout.half_frames for layout in self.layouts)
+        top_tier_frames = max(layout.half_frames for layout in self.layouts)
         max_row_slots = max(layout.row_slots for layout in self.layouts)
         noise_buffer = torch.zeros(
-            1, max_frames, self.mel_channels, device=self.device, dtype=self.frame_dtype
+            1,
+            top_tier_frames,
+            self.mel_channels,
+            device=self.device,
+            dtype=self.frame_dtype,
         )
         mu_buffer = torch.zeros_like(noise_buffer)
         mel_conditioning_buffer = torch.zeros_like(noise_buffer)
