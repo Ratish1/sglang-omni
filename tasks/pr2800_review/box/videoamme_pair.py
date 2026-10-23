@@ -73,7 +73,8 @@ def client(benchmark: str, port: int, concurrency: int, out: Path) -> None:
 
 
 def run_pass(
-    out: Path, pass_name: str, arm: str, card: int, config: str, model: str, benchmark: str, extra: list[str]
+    out: Path, pass_name: str, arm: str, card: int, config: str, model: str, benchmark: str, extra: list[str],
+    layer_dump: bool,
 ) -> dict[str, object]:
     arm_out = out / pass_name / arm
     arm_out.mkdir(parents=True, exist_ok=True)
@@ -82,8 +83,17 @@ def run_pass(
     pair_check.log(out, f"{pass_name} {arm} card {card} serving")
     # note (ratish): the MMSU stage serves its thinker-only config as is; the video and MMMU stages add these.
     base = [] if benchmark == "mmsu" else SERVE_ARGS
+    server_env = None
+    if layer_dump:
+        server_env = {
+            **pair_check.card_env(card, arm_tree),
+            "PYTHONPATH": f"{BOX / 'layer_dump'}:{arm_tree}",
+            "LAYER_DUMP_DIR": str(arm_out / "layers"),
+        }
+    else:
+        pass
     server = pair_check.serve(
-        card, arm_tree, model, port, ["--config", config, *base, *extra], arm_out / "server.log")
+        card, arm_tree, model, port, ["--config", config, *base, *extra], arm_out / "server.log", env=server_env)
     try:
         pair_check.log(out, f"{pass_name} {arm} card {card} healthy, client")
         rc = subprocess.run(
@@ -112,10 +122,12 @@ def run_pass(
 
 
 def run_chain(
-    out: Path, passes: list[str], arm: str, card: int, config: str, model: str, benchmark: str, extra: list[str]
+    out: Path, passes: list[str], arm: str, card: int, config: str, model: str, benchmark: str, extra: list[str],
+    layer_dump: bool,
 ) -> dict[str, object]:
     return {
-        pass_name: run_pass(out, pass_name, arm, card, config, model, benchmark, extra) for pass_name in passes
+        pass_name: run_pass(out, pass_name, arm, card, config, model, benchmark, extra, layer_dump)
+        for pass_name in passes
     }
 
 
@@ -131,6 +143,7 @@ def main() -> None:
     parser.add_argument("--model", default=MODEL, help="the checkpoint, served with --config's matching precision")
     parser.add_argument("--benchmark", choices=("videoamme", "mmmu", "mmsu"), default="videoamme")
     parser.add_argument("--serve-arg", action="append", default=[], help="one more serve argument, repeatable")
+    parser.add_argument("--layer-dump", action="store_true", help="serve with layer_dump/sitecustomize.py's hooks")
     args = parser.parse_args()
     if args.client:
         client(args.benchmark, args.port, args.concurrency, args.out)
@@ -146,7 +159,8 @@ def main() -> None:
         records = list(
             pool.map(
                 lambda placement: run_chain(
-                    args.out, passes, *placement, args.config, args.model, args.benchmark, args.serve_arg
+                    args.out, passes, *placement, args.config, args.model, args.benchmark, args.serve_arg,
+                    args.layer_dump,
                 ),
                 placements,
             )

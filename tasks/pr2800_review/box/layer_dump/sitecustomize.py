@@ -34,6 +34,7 @@ def install(module):
         else:
             pass
         input_embeds = result[0]
+        deepstack_embeds = result[1]
         extend_lens = [int(length) for length in forward_batch.extend_seq_lens_cpu]
         prefix_lens = [int(prefix) for prefix in forward_batch.extend_prefix_lens_cpu]
         start = 0
@@ -48,6 +49,11 @@ def install(module):
                     origin_input_ids=list(req.origin_input_ids),
                     audio_embeds=None if audio_embeds is None else audio_embeds.detach().cpu().clone(),
                     input_embeds=input_embeds[start : start + length].detach().cpu().clone(),
+                    deepstack_embeds=(
+                        None
+                        if deepstack_embeds is None or len(schedule_batch.reqs) != 1
+                        else [embeds.detach().cpu().clone() for embeds in deepstack_embeds]
+                    ),
                     mrope_positions=(
                         None if multimodal_inputs is None else multimodal_inputs.mrope_positions.detach().cpu().clone()
                     ),
