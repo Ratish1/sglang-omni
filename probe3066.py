@@ -121,11 +121,77 @@ def reference():
         assert not batcher.thread.is_alive()
 
 
+def trained_reference():
+    torch.cuda.set_device(1)
+    from sglang_omni.models.qwen3_tts.compat import (
+        apply_qwen_tts_transformers_compatibility_patches,
+    )
+    from sglang_omni.models.qwen3_tts.reference_encoder_cuda_graph import (
+        move_conv_padding_to_host,
+    )
+
+    apply_qwen_tts_transformers_compatibility_patches()
+    from qwen_tts import Qwen3TTSTokenizer
+
+    tokenizer = Qwen3TTSTokenizer.from_pretrained(
+        "Qwen/Qwen3-TTS-Tokenizer-12Hz",
+        device_map="cuda:1",
+        dtype=torch.float32,
+        attn_implementation="sdpa",
+    )
+    move_conv_padding_to_host(tokenizer.model.encoder)
+    initial = primary_context_active(0)
+    batcher = request_builders.Qwen3TTSRefCodeBatcher(tokenizer, max_batch_wait_ms=0)
+    equal = []
+    try:
+        for frames in (1, 3, 8):
+            samples = frames * batcher.hop - 17
+            waveform = (
+                np.sin(np.arange(samples, dtype=np.float32) * 0.05) * 0.1
+            ).astype(np.float32)
+            actual = batcher.encode(waveform, 24000)
+            values = torch.zeros(
+                1,
+                1,
+                frames * batcher.hop,
+                dtype=batcher.encoder_dtype,
+                device=batcher.encoder_device,
+            )
+            values[0, 0, :samples].copy_(torch.from_numpy(waveform))
+            with torch.inference_mode():
+                expected = (
+                    batcher.encoder.encode(
+                        values, num_quantizers=batcher.num_quantizers, return_dict=True
+                    )
+                    .audio_codes[0, :, :frames]
+                    .T
+                )
+            equal.append(torch.equal(actual, expected))
+        assert all(equal)
+        print(
+            json.dumps(
+                dict(
+                    path="trained_reference",
+                    identical_codes=equal,
+                    other_context_before=initial,
+                    other_context_after=primary_context_active(0),
+                )
+            ),
+            flush=True,
+        )
+    finally:
+        batcher.close()
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("path", choices=("preprocessing", "reference"))
+    parser.add_argument(
+        "path", choices=("preprocessing", "reference", "trained_reference")
+    )
     args = parser.parse_args()
     if args.path == "preprocessing":
         preprocessing()
-    else:
+    elif args.path == "reference":
         reference()
+    else:
+        trained_reference()
