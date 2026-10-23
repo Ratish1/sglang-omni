@@ -132,7 +132,10 @@ def main() -> None:
             scale = float(a.abs().max()) or 1.0
             tf32_diff = float((a - b).abs().max()) / scale
             fp32_diff = float((fa - fb).abs().max()) / scale
-            print(f"   {name:22s} tf32 {tf32_diff:.2e}  fp32 {fp32_diff:.2e}  equal {torch.equal(a, b)}")
+            print(
+                f"   {name:22s} tf32 {tf32_diff:.2e}  fp32 {fp32_diff:.2e}  equal {torch.equal(a, b)}  "
+                f"tf32 is fp32: true width {torch.equal(a, fa)}, padded {torch.equal(b, fb)}"
+            )
         if moved >= count:
             break
         else:
