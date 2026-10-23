@@ -85,7 +85,9 @@ ROWS = (
 
 
 def environment(tree, card):
-    return {**os.environ, "CUDA_VISIBLE_DEVICES": card, "PYTHONPATH": f"{tree}:{COSYVOICE}",
+    # note (ratish): PAIR_PROBE_PATH puts a sitecustomize probe first on every process's path (10-23).
+    path = ":".join(entry for entry in (os.environ.get("PAIR_PROBE_PATH"), tree, COSYVOICE) if entry)
+    return {**os.environ, "CUDA_VISIBLE_DEVICES": card, "PYTHONPATH": path,
             "SGLANG_OMNI_STRICT_PORT": "1", "TORCHINDUCTOR_CACHE_DIR": f"{D}/inductor_{Path(tree).name}"}
 
 

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# 10-23, cards 0 and 1, after queue l5q: the last two quality pairs of the chain against main that queue_quality.sh
+# 10-23, cards 0 and 1, after queue probe: the last two quality pairs of the chain against main that queue_quality.sh
 # did not reach on 10-22, p_w3 (seeds 15, 16) and p_w4 (17, 18), each order c1f and b1f under its seed then c16 and
 # b16, every arm scored; then the draws reader and the flip split over every scored pair (the 10-22 results, back in
 # this home from the Mac). p_w2 order b c1f_s14 stays unscored: its audio went with the 10-22 lease.
@@ -13,7 +13,7 @@ export PAIR_HOME=$D
 export PAIR_PORTS=43000,43400
 log() { echo "$* $(date +%T)" >> $Q/queue_w34.txt; }
 cpus() { [ "$1" = 0 ] && echo 0-15,64-79 || echo 16-31,80-95; }
-until grep -q "queue l5q done" $Q/queue_l5q.txt 2>/dev/null; do sleep 30; done
+until grep -q "queue probe done" $Q/queue_probe.txt 2>/dev/null; do sleep 30; done
 log "queue w34 start t_m1b $(git -C /workspace/t_m1b rev-parse --short HEAD) t_chain $(git -C /workspace/t_chain rev-parse --short HEAD) loadavg $(cut -d' ' -f1-3 /proc/loadavg)"
 score() {
   local dir=$1 card=$2 port=$3
