@@ -115,7 +115,7 @@ class FunCosyVoice3PipelineConfig(PipelineConfig):
             factory=FactoryArgs(max_concurrency=8),
             next="tts_engine",
         ),
-        # note(ratish): stages in one process are built in list order. The engine's KV
+        # note (ratish): stages in one process are built in list order. The engine's KV
         # pool is max_running_requests x context_length tokens, not free memory, so it
         # comes first and the vocoder sizes its Flow prefix pool from what is left.
         EngineStageConfig(
