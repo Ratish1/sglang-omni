@@ -209,6 +209,14 @@ def test_real_prefill_plan_reaches_both_draft_id_consumers(
                 assert not torch.equal(dflash_ids, virtual_ids)
             else:
                 assert dflash_ids is batch.out_cache_loc
+            draft_worker = make_worker(draft_reader)
+            draft_batch = ForwardBatch.init_new(
+                batch, draft_worker.model_runner, kv_loc_plan=output.kv_loc_plan,
+                capture_hidden_mode=CaptureHiddenMode.LAST,
+                return_hidden_states_before_norm=False,
+            )
+            assert draft_batch.kv_loc_plan is output.kv_loc_plan
+            assert draft_batch.out_cache_loc is dflash_ids
     else:
         pass
 
@@ -218,7 +226,10 @@ def test_verify_returns_the_post_forward_plan_without_sampling(allocated_readers
     readers, request_to_token, allocator = allocated_readers
     worker = make_worker(readers[0])
     batch = make_batch(request_to_token, False)
-    forward_batch = ForwardBatch.init_new(batch, worker.model_runner)
+    forward_batch = ForwardBatch.init_new(
+        batch, worker.model_runner, return_hidden_states_before_norm=False,
+    )
+    forward_batch.forward_mode = ForwardMode.TARGET_VERIFY
     old_plan = forward_batch.kv_loc_plan
     replacement = readers[0].own_plan(batch)
     output = SimpleNamespace(
