@@ -4,7 +4,8 @@ serving encodes. Two streams per clip: a SeedTTS-like one (--short-reference fra
 frame 0 in one decode_tail, as the tail graphs decode it) and a long one (all but --generated frames of reference, its
 first chunk from frame 0 in windows of up to 64 frames, as the window runner decodes it); either way --generated frames
 follow in the served ramp (1, 2, 4, then 8 a chunk). Every decode goes through the codec state arena (gather, decode,
-scatter) on a bf16 decoder fused as served, so a channels-last tree runs its slot conv stack. Truth: the decoder's own
+scatter) on a bf16 decoder fused as served, so a channels-last tree runs its slot conv stack; with --compiled-width 8
+the follow-ups of that width run the torch.compile'd decode, as the served warm graphs do. Truth: the decoder's own
 forward in fp32 over the same codes. Writes per clip the SNR in dB of each stream's emitted audio against the truth,
 over the first frame and over the stream.
 
@@ -54,6 +55,13 @@ def run(args: argparse.Namespace) -> None:
     probe_slot = arena.acquire()
     # the slot conv stack's state carries the cohort's slot index; main's state class has no such field
     print(f"gathered state holds the arena's pools: {getattr(arena.gather([probe_slot]), 'slot_index', None) is not None}")
+    if args.compiled_width:
+        with torch.inference_mode():
+            warm_codes = torch.zeros((1, 16, args.compiled_width), dtype=torch.long, device=device)
+            incremental.precompile(warm_codes, arena.gather([probe_slot]))
+        print(f"compiled decode at width {args.compiled_width}", flush=True)
+    else:
+        pass
     arena.release(probe_slot)
     encoder = served_tokenizer.model.encoder
     hop = int(served_tokenizer.model.encode_downsample_rate)
@@ -88,7 +96,8 @@ def run(args: argparse.Namespace) -> None:
             width = next(widths, STEADY_STRIDE)
             end = min(position + width, int(codes.shape[-1]))
             state = arena.gather([slot])
-            audio.append(incremental.decode(codes[..., position:end], state).reshape(-1))
+            compiled = end - position == args.compiled_width
+            audio.append(incremental.decode(codes[..., position:end], state, compiled=compiled).reshape(-1))
             arena.scatter([slot], state)
             position = end
         arena.release(slot)
@@ -164,6 +173,7 @@ def main() -> None:
     run_parser.add_argument("--clips", type=int, default=62)
     run_parser.add_argument("--short-reference", type=int, default=100)
     run_parser.add_argument("--generated", type=int, default=96)
+    run_parser.add_argument("--compiled-width", type=int, default=0)
     compare_parser = commands.add_parser("compare")
     compare_parser.add_argument("base")
     compare_parser.add_argument("change")
