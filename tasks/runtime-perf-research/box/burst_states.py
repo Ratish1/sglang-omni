@@ -1,20 +1,27 @@
-"""Request states of a c64 events cell: first time of each event after admission, over the opening burst and the rest.
+"""Request states of an events cell: first time of each event after admission, over the opening burst and the rest.
 
-usage: python3 burst_states.py <run dir> [<run dir> ...]
+usage: python3 burst_states.py [--cell c64_events] [--burst 64] <run dir> [<run dir> ...]
 """
 
+import argparse
 import glob
 import json
 import statistics
-import sys
 from collections import defaultdict
 
-BURST = 64
+parser = argparse.ArgumentParser()
+parser.add_argument("runs", nargs="+")
+parser.add_argument("--cell", default="c64_events")
+parser.add_argument(
+    "--burst", type=int, default=64, help="the opening requests, the cell's concurrency"
+)
+arguments = parser.parse_args()
+BURST = arguments.burst
 
 
 def load(run):
     first = defaultdict(dict)
-    for path in glob.glob(f"{run}/c64_events/events/*.jsonl"):
+    for path in glob.glob(f"{run}/{arguments.cell}/events/*.jsonl"):
         with open(path) as source:
             for line in source:
                 record = json.loads(line)
@@ -50,7 +57,7 @@ def split(first, burst):
     return offsets
 
 
-runs = sys.argv[1:]
+runs = arguments.runs
 data = {run: load(run) for run in runs}
 for burst in (True, False):
     print(
