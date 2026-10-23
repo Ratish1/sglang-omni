@@ -120,6 +120,17 @@ def cookbook_inputs(processor: Qwen3OmniMoeProcessor, content: list[dict[str, ob
     return inputs.to(device).to(dtype)
 
 
+def generate_text(model: Qwen3OmniMoeForConditionalGeneration, processor: Qwen3OmniMoeProcessor,
+                  inputs: dict[str, torch.Tensor], *, is_audio_in_video: bool, max_new_tokens: int) -> str:
+    """The thinker's greedy answer alone; without audio 4.57.1's generate returns (text, None), 5.19's the text."""
+    result = model.generate(**inputs, return_audio=False, thinker_return_dict_in_generate=True,
+                            use_audio_in_video=is_audio_in_video, thinker_do_sample=False,
+                            thinker_max_new_tokens=max_new_tokens)
+    thinker_result = result[0] if isinstance(result, tuple) else result
+    return processor.batch_decode(thinker_result.sequences[:, inputs["input_ids"].shape[1]:],
+                                  skip_special_tokens=True, clean_up_tokenization_spaces=False)[0]
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--task", choices=("speech", "mmsu", "socialomni", "videotext"), required=True)
@@ -189,11 +200,7 @@ def main() -> None:
         ]
         if args.task == "videotext":
             inputs = cookbook_inputs(processor, video_content, model.device, model.dtype, args.sampled_fps)
-            text_ids, _ = model.generate(**inputs, return_audio=False, thinker_return_dict_in_generate=True,
-                                         use_audio_in_video=False, thinker_do_sample=False,
-                                         thinker_max_new_tokens=256)
-            text = processor.batch_decode(text_ids.sequences[:, inputs["input_ids"].shape[1]:],
-                                          skip_special_tokens=True, clean_up_tokenization_spaces=False)[0]
+            text = generate_text(model, processor, inputs, is_audio_in_video=False, max_new_tokens=256)
             records.append(dict(sample_id=sample["sample_id"], response=text.strip(),
                                 prompt_tokens=int(inputs["input_ids"].shape[1])))
         elif args.task == "speech":
@@ -221,11 +228,7 @@ def main() -> None:
             content = [{"type": "video", "video": sample["video_path"]}, {"type": "text", "text": sample["prompt"]}]
             inputs = cookbook_inputs(processor, content, model.device, model.dtype, args.sampled_fps,
                                      is_audio_in_video=True)
-            text_ids, _ = model.generate(**inputs, return_audio=False, thinker_return_dict_in_generate=True,
-                                         use_audio_in_video=True, thinker_do_sample=False,
-                                         thinker_max_new_tokens=256)
-            text = processor.batch_decode(text_ids.sequences[:, inputs["input_ids"].shape[1]:],
-                                          skip_special_tokens=True, clean_up_tokenization_spaces=False)[0]
+            text = generate_text(model, processor, inputs, is_audio_in_video=True, max_new_tokens=256)
             records.append(dict(sample_id=sample["sample_id"], response=text.strip(),
                                 prompt_tokens=int(inputs["input_ids"].shape[1])))
             if index % 50 == 0:
@@ -235,11 +238,7 @@ def main() -> None:
         else:
             content = [{"type": "audio", "audio": sample["audio_path"]}, {"type": "text", "text": sample["question"]}]
             inputs = cookbook_inputs(processor, content, model.device, model.dtype)
-            text_ids, _ = model.generate(**inputs, return_audio=False, thinker_return_dict_in_generate=True,
-                                         use_audio_in_video=False, thinker_do_sample=False, thinker_max_new_tokens=32)
-            sequences = text_ids.sequences
-            text = processor.batch_decode(sequences[:, inputs["input_ids"].shape[1]:], skip_special_tokens=True,
-                                          clean_up_tokenization_spaces=False)[0]
+            text = generate_text(model, processor, inputs, is_audio_in_video=False, max_new_tokens=32)
             records.append(dict(sample_id=sample["sample_id"], response=text.strip(),
                                 prompt_tokens=int(inputs["input_ids"].shape[1])))
             if index % 100 == 0:
