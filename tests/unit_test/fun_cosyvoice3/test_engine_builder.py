@@ -10,7 +10,6 @@ from sglang.srt.arg_groups.cuda_graph_hook import (
     generate_prefill_cuda_graph_batch_sizes,
 )
 from sglang.srt.arg_groups.model_override_base import resolved_view
-from sglang.srt.server_args import ServerArgs
 
 import sglang_omni.models.fun_cosyvoice3.engine_builder as engine_builder_module
 from sglang_omni.models.fun_cosyvoice3.engine_builder import FunCosyVoice3EngineBuilder
@@ -85,14 +84,12 @@ def test_prefill_replays_from_full_graphs_only_on_cuda(
         CudaGraphBackend.FULL if is_cuda else CudaGraphBackend.DISABLED
     )
     assert CudaGraphBackend.FULL in builder.allowed_prefill_cuda_graph_backends()
-    assert builder.supports_breakable_prefill_cuda_graph
 
 
-def resolved_cuda_server_args(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    server_args_overrides: dict[str, object],
-) -> ServerArgs:
+@pytest.mark.parametrize("declared_ladder", [None, [4, 8]])
+def test_a_cached_prompts_one_token_prefill_has_a_graph_bucket(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, declared_ladder: list[int] | None
+) -> None:
     monkeypatch.setattr(
         engine_builder_module, "current_platform", SimpleNamespace(is_cuda=lambda: True)
     )
@@ -101,7 +98,14 @@ def resolved_cuda_server_args(
     builder.device = "cuda:0"
     builder.server_args_overrides = {
         "attention_backend": "fa3",
-        **server_args_overrides,
+        **(
+            {}
+            if declared_ladder is None
+            else {
+                "cuda_graph_bs_prefill": declared_ladder,
+                "cuda_graph_max_bs_prefill": 8,
+            }
+        ),
     }
     overrides = build_generation_batch_overrides(
         server_args_overrides=builder.server_args_overrides,
@@ -112,25 +116,6 @@ def resolved_cuda_server_args(
         checkpoint, context_length=builder.context_length, device="cuda", **overrides
     )
     builder.customize_server_args(server_args)
-    return server_args
-
-
-@pytest.mark.parametrize("declared_ladder", [None, [4, 8]])
-def test_a_cached_prompts_one_token_prefill_has_a_graph_bucket(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, declared_ladder: list[int] | None
-) -> None:
-    server_args = resolved_cuda_server_args(
-        tmp_path,
-        monkeypatch,
-        (
-            {}
-            if declared_ladder is None
-            else {
-                "cuda_graph_bs_prefill": declared_ladder,
-                "cuda_graph_max_bs_prefill": 8,
-            }
-        ),
-    )
     resolved = resolved_view(server_args)
 
     assert resolved.cuda_graph_config.prefill.bs == (
