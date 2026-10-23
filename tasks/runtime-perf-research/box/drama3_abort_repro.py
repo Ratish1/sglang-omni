@@ -74,18 +74,28 @@ def held_round(base_url, delay_s):
         next(line for line in response.iter_lines() if line.startswith("data: "))
         streams.append(stream)
 
+    close_times_ns = []
+
     def close_streams():
         time.sleep(delay_s)
         for stream, client in zip(streams, clients):
+            close_times_ns.append(time.monotonic_ns())
             stream.__exit__(None, None, None)
             client.close()
 
     closer = threading.Thread(target=close_streams)
+    round_start_ns = time.monotonic_ns()
     with ThreadPoolExecutor(max_workers=1) as pool:
         counts = pool.submit(full_round, base_url)
         closer.start()
         result = counts.result()
     closer.join()
+    print(
+        json.dumps(
+            {"k": "held", "round_start_ns": round_start_ns, "close_ns": close_times_ns}
+        ),
+        flush=True,
+    )
     return result
 
 
