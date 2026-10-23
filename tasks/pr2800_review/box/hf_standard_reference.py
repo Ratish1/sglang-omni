@@ -15,6 +15,9 @@ quantized to e4m3 per token and 128 features as a W8A8 block-FP8 linear does; th
 (top_k 50, top_p 0.8, `prepare_inputs_for_generation`).
 --sampled-fps times each video at its sampled fps (qwen_omni_utils' return_video_kwargs), as omni does; the cookbook
 passes no fps and the processor's default of 1 fps gives every video 2 s per temporal grid.
+--served-positions, with --sampled-fps, gives the thinker and the talker the rope positions omni's server uses: the
+prompt's float positions truncated as the forward batch casts them to int64, and the decode delta truncated toward
+zero as the decode path reads it with .item() into int64 (HF's decode positions are the cache position plus it).
 """
 
 from __future__ import annotations
@@ -28,6 +31,9 @@ import soundfile
 import torch
 from qwen_omni_utils import process_mm_info
 from transformers import Qwen3OmniMoeForConditionalGeneration, Qwen3OmniMoeProcessor
+from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import (
+    Qwen3OmniMoePreTrainedModelForConditionalGeneration,
+)
 
 MODEL = "Qwen/Qwen3-Omni-30B-A3B-Instruct"
 DRAWS = 6
@@ -77,6 +83,17 @@ def use_fp8_talker(model: Qwen3OmniMoeForConditionalGeneration, fp8_model: str) 
     return replaced
 
 
+def use_served_positions() -> None:
+    """The thinker and the talker (whose get_rope_index calls this class's) on omni's truncated positions."""
+    rope_index = Qwen3OmniMoePreTrainedModelForConditionalGeneration.get_rope_index
+
+    def truncated_rope_index(self, *args, **kwargs):
+        position_ids, deltas = rope_index(self, *args, **kwargs)
+        return position_ids.trunc(), deltas.trunc()
+
+    Qwen3OmniMoePreTrainedModelForConditionalGeneration.get_rope_index = truncated_rope_index
+
+
 def cookbook_inputs(processor: Qwen3OmniMoeProcessor, content: list[dict[str, object]], device: torch.device,
                     dtype: torch.dtype, is_sampled_fps: bool = False) -> dict[str, torch.Tensor]:
     """is_sampled_fps hands the processor each video's sampled fps (qwen_omni_utils' return_video_kwargs), as omni
@@ -114,7 +131,15 @@ def main() -> None:
                         help="speech: the 15 residual codes by argmax, as omni takes them, in place of HF's sampling")
     parser.add_argument("--sampled-fps", action="store_true",
                         help="speech: each video timed at its sampled fps, as omni times it")
+    parser.add_argument("--served-positions", action="store_true",
+                        help="speech, with --sampled-fps: the rope positions and decode delta truncated as omni's "
+                        "server uses them")
     args = parser.parse_args()
+    assert args.sampled_fps or not args.served_positions, "--served-positions truncates the sampled-fps timing"
+    if args.served_positions:
+        use_served_positions()
+    else:
+        pass
     spec = json.loads(args.samples.read_text())
     samples = spec["samples"][args.shard::args.shards]
     model = Qwen3OmniMoeForConditionalGeneration.from_pretrained(MODEL, dtype="auto", device_map="auto")
