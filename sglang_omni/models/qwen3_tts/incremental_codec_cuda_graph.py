@@ -560,8 +560,9 @@ class Qwen3TTSIncrementalCodecCudaGraphRunner:
         """Replay the bucket that fits this cohort directly against the arena.
 
         Returns the borrowed waveform rows, or None on a graph miss. Rows past
-        the cohort read and write the arena's scratch row. A tail runner takes each
-        row's valid width and replays the smallest captured width that holds the codes.
+        the cohort name the arena's scratch slot, whose conv state the exchanges
+        skip. A tail runner takes each row's valid width and replays the smallest
+        captured width that holds the codes.
         """
         if os.getpid() != self.owner_pid:
             raise RuntimeError(

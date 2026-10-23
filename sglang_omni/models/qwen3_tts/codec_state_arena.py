@@ -247,7 +247,7 @@ class Qwen3TTSCodecStateArena:
     def gather_by_index(self, index: torch.Tensor) -> Qwen3TTSIncrementalCodecState:
         """Select the rows named by a device index tensor; a channels-last decoder
         exchanges its conv histories and overlaps in place, so its state holds the
-        arena's pools and the index as its slots.
+        arena's pools, the index as its slots and the scratch slot as its pad slot.
 
         Capturable: with a static index this is the gather half of a graph
         that reads the arena directly.
@@ -259,6 +259,7 @@ class Qwen3TTSCodecStateArena:
         )
         if self.decoder.channels_last_weights is not None:
             state.slot_index = index
+            state.pad_slot = self.scratch_slot
             state.conv_histories = dict(storage.conv_histories)
             state.transconv_overlaps = dict(storage.transconv_overlaps)
         else:

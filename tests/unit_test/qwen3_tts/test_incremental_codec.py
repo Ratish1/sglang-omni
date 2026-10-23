@@ -1349,6 +1349,11 @@ def test_arena_bound_graph_replays_match_eager_and_advance_the_arena() -> None:
     assert single is not None and single.shape[0] == 1
     torch.cuda.synchronize()
     assert arena.gather(slots).frame_positions.tolist() == [8, 6]
+    scratch_pools = (
+        *arena.storage.conv_histories.values(),
+        *arena.storage.transconv_overlaps.values(),
+    )
+    assert not any(pool[arena.scratch_slot].any() for pool in scratch_pools)
 
 
 @pytest.mark.accelerator
