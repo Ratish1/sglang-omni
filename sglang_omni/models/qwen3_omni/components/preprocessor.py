@@ -60,7 +60,6 @@ logger = logging.getLogger(__name__)
 
 
 class VideoProcessorKwargs(TypedDict, total=False):
-    fps: float | list[float]
     max_frames: int
     min_pixels: int
     max_pixels: int
@@ -896,20 +895,9 @@ class Qwen3OmniPreprocessor:
         image_cache_key = compute_image_cache_key(images)
         video_cache_key = compute_video_cache_key(videos)
 
+        # note (ratish): no fps, so the processor times every video at 2 s a temporal grid as the
+        # checkpoint's reference does; a sampled fps gives fractional rope positions, truncated in int64.
         videos_kwargs: VideoProcessorKwargs = {}
-        if sampled_video_fps:
-            # note (Teery): The HF processor uses one scalar FPS for video token timestamps.
-            if any(fps != sampled_video_fps[0] for fps in sampled_video_fps):
-                raise ValueError(
-                    "Qwen3-Omni requires all videos in a request to have the same sampled FPS"
-                )
-            else:
-                pass
-            videos_kwargs["fps"] = sampled_video_fps[0]
-        elif resolved_video_fps is not None:
-            videos_kwargs["fps"] = resolved_video_fps
-        else:
-            pass
         if resolved_video_max_frames is not None:
             videos_kwargs["max_frames"] = resolved_video_max_frames
         else:

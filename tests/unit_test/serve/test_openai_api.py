@@ -3369,10 +3369,6 @@ def test_transcription_endpoint_returns_text_json() -> None:
             400,
         ),
         ("Invalid media data while decoding video path=/tmp/corrupt.mp4", 400),
-        (
-            "Qwen3-Omni requires all videos in a request to have the same sampled FPS",
-            400,
-        ),
         ("video_fps must be positive and finite", 400),
         ("video_max_frames must be positive", 400),
         ("Video pixel budgets must be positive", 400),

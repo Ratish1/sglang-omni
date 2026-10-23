@@ -386,7 +386,7 @@ def test_merge_extracted_video_audio_rejects_mixed_audio_presence(missing) -> No
 def test_qwen_preprocessor_two_videos_and_audio_with_real_processor(
     monkeypatch, sampled_fps, total_pixels
 ) -> None:
-    """Keep audio features and tokens aligned through the real processor call."""
+    """Keep audio features and tokens aligned through the real processor call, and time every video at 2 s a temporal grid whatever its sampled fps."""
     from transformers import (
         Qwen2Tokenizer,
         Qwen2VLImageProcessor,
@@ -453,13 +453,8 @@ def test_qwen_preprocessor_two_videos_and_audio_with_real_processor(
         ),
         data={},
     )
-    if sampled_fps[0] != sampled_fps[1]:
-        with pytest.raises(ValueError, match="same sampled FPS"):
-            asyncio.run(pre.call_impl(payload))
-        return
-
     state = Qwen3OmniPipelineState.from_dict(asyncio.run(pre.call_impl(payload)).data)
-    assert state.mm_inputs["video"]["video_second_per_grid"].tolist() == [1.0, 1.0]
+    assert state.mm_inputs["video"]["video_second_per_grid"].tolist() == [2.0, 2.0]
     assert state.mm_inputs["video"]["video_grid_thw"].shape[0] == 2
     mask = state.encoder_inputs["audio_encoder"]["feature_attention_mask"]
     assert mask.sum(-1).tolist() == [20, 40, 60]
