@@ -846,7 +846,7 @@ that happened to contain an older version of the test.
     ownership, and async resolve contracts.
 
 - `unit_test/benchmarks/test_managed_workers.py`: Managed worker command construction, GPU placement, parallel readiness, and process-group cleanup.
-- `sglang_omni_router/rust/tests/` (from the repository root): Rust router process, HTTP, media, WebSocket, and voice integration tests. Unit tests live next to the Rust implementation.
+- `sglang_omni_router/tests/` (from the repository root): Rust router process, HTTP, media, WebSocket, and voice integration tests. Unit tests live next to the Rust implementation.
 
 - `unit_test/serve/`: In-process serving API unit tests:
   - generation-stage SGLang server-args role mapping and CLI override capability boundaries
