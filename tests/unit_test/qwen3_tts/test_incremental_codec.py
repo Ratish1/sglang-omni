@@ -391,7 +391,9 @@ def test_slot_causal_conv_matches_whole(
         padded, padded_frames = padded_input(module, frames)
         padded_frames.copy_(frames)
         actual.append(
-            slot_causal_conv(module, weight, padded, history_pool, slot_index, length)
+            slot_causal_conv(
+                module, weight, padded, history_pool, slot_index, 0, length
+            )
             + module.conv.bias
         )
         offset += length
@@ -429,6 +431,7 @@ def test_slot_causal_transconv_matches_whole(
                 inputs[:, offset : offset + length],
                 overlap_pool,
                 slot_index,
+                0,
             )
             + module.conv.bias
         )
@@ -1349,6 +1352,11 @@ def test_arena_bound_graph_replays_match_eager_and_advance_the_arena() -> None:
     assert single is not None and single.shape[0] == 1
     torch.cuda.synchronize()
     assert arena.gather(slots).frame_positions.tolist() == [8, 6]
+    scratch_pools = (
+        *arena.storage.conv_histories.values(),
+        *arena.storage.transconv_overlaps.values(),
+    )
+    assert not any(pool[arena.scratch_slot].any() for pool in scratch_pools)
 
 
 @pytest.mark.accelerator

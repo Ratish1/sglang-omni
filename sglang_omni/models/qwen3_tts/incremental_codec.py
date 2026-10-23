@@ -99,6 +99,9 @@ class Qwen3TTSIncrementalCodecState:
     # note (ratish): each row's slot when the conv histories and overlaps are an arena's
     # pools, which the conv stack exchanges in place; None when they are the rows' own.
     slot_index: torch.Tensor | None = None
+    # note (ratish): the slot graph padding rows name, which the conv exchanges neither read
+    # nor write, as several rows share it; -1, the default, names no slot.
+    pad_slot: int = -1
 
     def conv_slots(self, batch_size: int, device: torch.device) -> torch.Tensor:
         """Each row's slot in the conv histories and overlaps."""
@@ -141,6 +144,7 @@ class Qwen3TTSIncrementalCodecState:
                 None if self.frame_positions is None else self.frame_positions.clone()
             ),
             slot_index=None if self.slot_index is None else self.slot_index.clone(),
+            pad_slot=self.pad_slot,
             transformer_keys={
                 key: value.clone() for key, value in self.transformer_keys.items()
             },
@@ -291,15 +295,22 @@ def slot_causal_conv(
     padded: torch.Tensor,
     history_pool: torch.Tensor,
     slot_index: torch.Tensor,
+    pad_slot: int,
     length: int,
 ) -> torch.Tensor:
     """The causal conv's (B, length, C_out) outputs without its bias, which the consumer
     adds, for a padded_input whose frames the producer wrote; the rows' histories in the
-    (slots, history, C) history_pool at slot_index are exchanged with its front in place.
+    (slots, history, C) history_pool at slot_index are exchanged with its front in place,
+    rows at pad_slot taking zeros.
     """
     if history_pool.shape[1] > 0:
         history_exchange(
-            padded, history_pool, slot_index, new_samples=length, is_cold=False
+            padded,
+            history_pool,
+            slot_index,
+            new_samples=length,
+            is_cold=False,
+            pad_slot=pad_slot,
         )
     else:
         pass
@@ -312,11 +323,13 @@ def slot_causal_transconv(
     frames: torch.Tensor,
     overlap_pool: torch.Tensor,
     slot_index: torch.Tensor,
+    pad_slot: int,
 ) -> torch.Tensor:
     """The transposed conv's (B, L * stride, C_out) emitted samples of (B, L, C) frames
     without its bias, which the consumer adds after the overlap so overlapping samples
     carry it once: the rows' overlaps in the (slots, overlap, C_out) overlap_pool at
-    slot_index added in front and the samples the next frames add to kept there."""
+    slot_index added in front and the samples the next frames add to kept there, rows
+    at pad_slot adding none."""
     conv = module.conv
     output = channels_last_conv_transpose1d(frames, conv, weight, None)
     emitted_samples = int(frames.shape[1]) * int(conv.stride[0])
@@ -327,6 +340,7 @@ def slot_causal_transconv(
             slot_index,
             emitted_samples=emitted_samples,
             is_cold=False,
+            pad_slot=pad_slot,
         )
     else:
         pass
@@ -1254,7 +1268,12 @@ class Qwen3TTSIncrementalDecoder:
         padded_frames.copy_(frames)
         if valid_frames is None:
             history_exchange(
-                padded, history_pool, slot_index, new_samples=length, is_cold=False
+                padded,
+                history_pool,
+                slot_index,
+                new_samples=length,
+                is_cold=False,
+                pad_slot=state.pad_slot,
             )
         else:
             history_samples = int(module.padding)
@@ -1329,6 +1348,7 @@ class Qwen3TTSIncrementalDecoder:
         histories = state.conv_histories
         overlaps = state.transconv_overlaps
         slot_index = state.conv_slots(int(hidden_states.shape[0]), hidden_states.device)
+        pad_slot = state.pad_slot
         last_stage_index = len(decoder.upsample) - 1
         for stage_index, blocks in enumerate(decoder.upsample):
             transconv, convnext = blocks[0], blocks[1]
@@ -1339,6 +1359,7 @@ class Qwen3TTSIncrementalDecoder:
                 hidden_states,
                 overlaps[f"{key}.transconv"],
                 slot_index,
+                pad_slot,
             )
             # note (ratish): the depthwise conv stays on PyTorch's own (B, C, L) kernel,
             # faster than cuDNN's channels-last depthwise and free of its per-shape setup.
@@ -1355,6 +1376,7 @@ class Qwen3TTSIncrementalDecoder:
                 slot_index,
                 new_samples=length,
                 is_cold=False,
+                pad_slot=pad_slot,
             )
             normed = convnext.norm(
                 convnext.dwconv.conv(depthwise_input).transpose(1, 2)
@@ -1373,6 +1395,7 @@ class Qwen3TTSIncrementalDecoder:
             padded,
             histories["decoder.0"],
             slot_index,
+            pad_slot,
             length,
         )
         decoder_blocks = decoder.decoder[1:-2]
@@ -1393,6 +1416,7 @@ class Qwen3TTSIncrementalDecoder:
                 activated,
                 overlaps[f"{key}.transconv"],
                 slot_index,
+                pad_slot,
             )
             residual_units = decoder_block.block[2:]
             length = int(frames.shape[1])
@@ -1414,6 +1438,7 @@ class Qwen3TTSIncrementalDecoder:
                     padded,
                     histories[f"{unit_key}.conv1"],
                     slot_index,
+                    pad_slot,
                     length,
                 )
                 padded, padded_frames = padded_input(unit.conv2, frames)
@@ -1430,6 +1455,7 @@ class Qwen3TTSIncrementalDecoder:
                     padded,
                     histories[f"{unit_key}.conv2"],
                     slot_index,
+                    pad_slot,
                     length,
                 )
                 if residual_index + 1 < len(residual_units):
@@ -1470,6 +1496,7 @@ class Qwen3TTSIncrementalDecoder:
             slot_index,
             new_samples=length,
             is_cold=False,
+            pad_slot=pad_slot,
         )
         # note (ratish): cuDNN has no tensor-core engine for one output channel.
         return clamped_single_output_conv(padded, decoder.decoder[-1].conv, length)
