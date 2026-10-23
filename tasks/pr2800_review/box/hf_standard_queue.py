@@ -129,6 +129,8 @@ def main() -> None:
     parser.add_argument("--sampled-fps", action="store_true", help="speech: each video timed at its sampled fps")
     parser.add_argument("--served-positions", action="store_true",
                         help="speech, with --sampled-fps: the positions truncated as omni's server uses them")
+    parser.add_argument("--speech-samples", type=Path, default=SPEECH_SAMPLES,
+                        help="speech: the sample list (stage 10's by default; a sample may carry its own prompt)")
     args = parser.parse_args()
     if args.score_speech:
         score_speech(args.port, args.out)
@@ -151,7 +153,7 @@ def main() -> None:
     else:
         pass
     with ThreadPoolExecutor(max_workers=len(speech_cards) + 1) as pool:
-        jobs = [pool.submit(run_reference, args.out, "speech", SPEECH_SAMPLES, shard, len(speech_cards), card,
+        jobs = [pool.submit(run_reference, args.out, "speech", args.speech_samples, shard, len(speech_cards), card,
                             speech_args)
                 for shard, card in enumerate(speech_cards)]
         if is_mmsu:

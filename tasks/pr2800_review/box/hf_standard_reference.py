@@ -176,10 +176,11 @@ def main() -> None:
     records = []
     for index, sample in enumerate(samples):
         if args.task == "speech":
+            # note (ratish): a Video-MME sample carries its own prompt and no spoken question.
             content = [
                 {"type": "video", "video": sample["video_path"], "fps": 2, "max_frames": 128, "max_pixels": 401408},
-                {"type": "audio", "audio": sample["audio_path"]},
-                {"type": "text", "text": spec["prompt"]},
+                *([{"type": "audio", "audio": sample["audio_path"]}] if "audio_path" in sample else []),
+                {"type": "text", "text": sample.get("prompt", spec.get("prompt"))},
             ]
             inputs = cookbook_inputs(processor, content, model.device, model.dtype, args.sampled_fps)
             for draw in range(DRAWS):
