@@ -101,10 +101,10 @@ def client(
     (out / "videoamme.json").write_text(json.dumps(results, indent=1))
 
 
-def score(port: int, out: Path) -> None:
+def score(port: int, out: Path, results_name: str = "videoamme.json") -> None:
     from benchmarks.tasks.asr import compute_text_audio_consistency_from_records
 
-    per_sample = json.loads((out / "videoamme.json").read_text())["per_sample"]
+    per_sample = json.loads((out / results_name).read_text())["per_sample"]
     wer = compute_text_audio_consistency_from_records(
         per_sample,
         "en",
@@ -123,9 +123,10 @@ def serve(
     port: int,
     hook: str | None,
     model: str,
+    serve_args: list[str] = SERVE_ARGS,
 ) -> subprocess.Popen:
     """hook names a capture directory (HOOK_DIR_ENVS) whose sitecustomize the server's processes load, writing
-    under <log dir>/<hook>."""
+    under <log dir>/<hook>; serve_args place the stages (the CI's TP2 shape by default)."""
     env = {
         **pair_check.card_env(cards[0], arm_tree),
         "CUDA_VISIBLE_DEVICES": f"{cards[0]},{cards[1]}",
@@ -147,7 +148,7 @@ def serve(
             "examples/run_qwen3_omni_speech_server.py",
             "--model-path",
             model,
-            *SERVE_ARGS,
+            *serve_args,
             "--host",
             "127.0.0.1",
             "--port",
@@ -268,6 +269,7 @@ def main() -> None:
     parser.add_argument("--model", default=MODEL, help="checkpoint every arm serves")
     parser.add_argument("--concurrency", type=int, default=CONCURRENCY)
     parser.add_argument("--sample-ids", help="client mode: send only these comma-separated samples")
+    parser.add_argument("--results-name", default="videoamme.json", help="score mode: the client's results file")
     parser.add_argument(
         "--passes", type=int, default=1, help="client passes per server boot, each in <arm>/p<index>"
     )
@@ -282,7 +284,7 @@ def main() -> None:
         )
         return
     elif args.score:
-        score(args.port, args.out)
+        score(args.port, args.out, args.results_name)
         return
     else:
         pass
