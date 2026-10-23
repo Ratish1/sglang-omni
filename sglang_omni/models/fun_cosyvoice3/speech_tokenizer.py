@@ -66,17 +66,6 @@ def conv_frames(frames: int | torch.Tensor) -> int | torch.Tensor:
     return (frames - 1) // 2 + 1
 
 
-def rotary_tables(head_dim: int) -> tuple[torch.Tensor, torch.Tensor]:
-    """The cosine and sine (positions, head_dim) the checkpoint was exported with."""
-    frequencies = 1.0 / (
-        ROTARY_THETA ** (torch.arange(0, head_dim, 2).float() / head_dim)
-    )
-    angles = torch.outer(torch.arange(ROTARY_POSITIONS), frequencies).float()
-    rotations = torch.polar(torch.ones_like(angles), angles)
-    rotations = torch.view_as_real(torch.cat((rotations, rotations), dim=-1))
-    return rotations[..., 0].contiguous(), rotations[..., 1].contiguous()
-
-
 def rotate(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
     first, second = x.chunk(2, dim=-1)
     return x * cos + torch.cat((-second, first), dim=-1) * sin
@@ -110,22 +99,25 @@ class SpeechTokenizerBlock(torch.nn.Module):
         cos: torch.Tensor,
         sin: torch.Tensor,
     ) -> torch.Tensor:
-        heads = (1, x.shape[1], self.head_count, -1)
-        hidden = self.attn_ln(x)
-        query = rotate(self.query(hidden).view(heads), cos, sin)
-        key = rotate(self.key(hidden).view(heads), cos, sin)
-        value = self.value(hidden)
+        head_shape = (1, x.shape[1], self.head_count, -1)
+        normed_states = self.attn_ln(x)
+        query = rotate(self.query(normed_states).view(head_shape), cos, sin)
+        key = rotate(self.key(normed_states).view(head_shape), cos, sin)
+        value = self.value(normed_states)
         memory_input = value * position_mask
-        left = (self.fsmn.kernel_size[0] - 1) // 2
-        right = self.fsmn.kernel_size[0] - 1 - left
+        left_padding_frames = (self.fsmn.kernel_size[0] - 1) // 2
+        right_padding_frames = self.fsmn.kernel_size[0] - 1 - left_padding_frames
         memory = self.fsmn(
-            F.pad(memory_input.transpose(1, 2), (left, right))
+            F.pad(
+                memory_input.transpose(1, 2),
+                (left_padding_frames, right_padding_frames),
+            )
         ).transpose(1, 2)
         memory = (memory + memory_input) * position_mask
         scale = query.shape[-1] ** -0.25
         scores = (query.permute(0, 2, 1, 3) * scale) @ (key.permute(0, 2, 3, 1) * scale)
         weights = torch.softmax(scores + attention_bias, dim=-1)
-        attended = weights @ value.view(heads).transpose(1, 2)
+        attended = weights @ value.view(head_shape).transpose(1, 2)
         x = x + (self.out(attended.transpose(1, 2).reshape_as(x)) + memory)
         return x + self.mlp_out(F.gelu(self.mlp_in(self.mlp_ln(x))))
 
@@ -155,9 +147,20 @@ class SpeechTokenizerV3Model(torch.nn.Module):
             for _ in range(layer_count)
         )
         self.project_down = torch.nn.Linear(state_channels, FSQ_DIMS)
-        cos, sin = rotary_tables(state_channels // head_count)
-        self.register_buffer("rotary_cos", cos, persistent=False)
-        self.register_buffer("rotary_sin", sin, persistent=False)
+        # note (ratish): the rotary cosine and sine the checkpoint was exported with.
+        head_dim = state_channels // head_count
+        frequencies = 1.0 / (
+            ROTARY_THETA ** (torch.arange(0, head_dim, 2).float() / head_dim)
+        )
+        angles = torch.outer(torch.arange(ROTARY_POSITIONS), frequencies).float()
+        rotations = torch.polar(torch.ones_like(angles), angles)
+        rotations = torch.view_as_real(torch.cat((rotations, rotations), dim=-1))
+        self.register_buffer(
+            "rotary_cos", rotations[..., 0].contiguous(), persistent=False
+        )
+        self.register_buffer(
+            "rotary_sin", rotations[..., 1].contiguous(), persistent=False
+        )
         self.register_buffer(
             "fsq_powers",
             FSQ_LEVELS ** torch.arange(FSQ_DIMS, dtype=torch.float32),
@@ -198,22 +201,26 @@ def load_speech_tokenizer(
     layer_count = 0
     for node in graph.node:
         if node.name.startswith("/blocks."):
-            block, suffix = node.name[len("/blocks.") :].split("/", 1)
-            names = (
-                (f"blocks.{block}.{BLOCK_NODE_PARAMETERS[suffix]}",)
+            block_index, suffix = node.name[len("/blocks.") :].split("/", 1)
+            parameter_names = (
+                (f"blocks.{block_index}.{BLOCK_NODE_PARAMETERS[suffix]}",)
                 if suffix in BLOCK_NODE_PARAMETERS
                 else ()
             )
-            layer_count = max(layer_count, int(block) + 1)
+            layer_count = max(layer_count, int(block_index) + 1)
         else:
-            names = NODE_PARAMETERS.get(node.name, ())
-        parameters = [name for name in node.input if name in initializers]
-        for name, parameter in zip(names, parameters, strict=True):
+            parameter_names = NODE_PARAMETERS.get(node.name, ())
+        initializer_names = [name for name in node.input if name in initializers]
+        for parameter_name, initializer_name in zip(
+            parameter_names, initializer_names, strict=True
+        ):
             tensor = torch.from_numpy(
-                numpy_helper.to_array(initializers[parameter]).copy()
+                numpy_helper.to_array(initializers[initializer_name]).copy()
             )
             # note (ratish): an ONNX MatMul's weight is (in, out), a Linear's (out, in).
-            state_dict[name] = tensor.t() if node.op_type == "MatMul" else tensor
+            state_dict[parameter_name] = (
+                tensor.t() if node.op_type == "MatMul" else tensor
+            )
     state_channels, mel_channels, _ = state_dict["conv1.weight"].shape
     model = SpeechTokenizerV3Model(
         layer_count=layer_count,
@@ -253,7 +260,7 @@ class SpeechTokenizerCudaGraphs:
         # note (ratish): TF32 matmuls, as ONNX Runtime ran this graph; full fp32 took
         # 2.6 times the device time. The graphs keep the math mode they are captured
         # with, and the process keeps its own.
-        allow_tf32 = torch.backends.cuda.matmul.allow_tf32
+        process_allow_tf32 = torch.backends.cuda.matmul.allow_tf32
         torch.backends.cuda.matmul.allow_tf32 = True
         try:
             with torch.inference_mode(), freeze_gc(enable_cudagraph_gc=False):
@@ -276,7 +283,7 @@ class SpeechTokenizerCudaGraphs:
                         graph=graph, mel=mel, frames=frames, codes=codes
                     )
         finally:
-            torch.backends.cuda.matmul.allow_tf32 = allow_tf32
+            torch.backends.cuda.matmul.allow_tf32 = process_allow_tf32
         torch.cuda.synchronize(device)
         # note (ratish): a new event's first record waits while another thread is inside
         # the CUDA runtime, so one event, first recorded here, serves every call, waited
