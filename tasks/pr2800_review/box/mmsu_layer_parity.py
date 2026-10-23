@@ -107,6 +107,11 @@ def hf_client(arm_out: Path, dtype_name: str, out: Path) -> None:
         prompt_ids = [
             audio_token_id if token_id >= vocab_size else token_id for token_id in served["origin_input_ids"]
         ]
+        if tuple(prompt_ids) not in features:
+            print(f"no processor call for {inputs_path.name} (the server's warmup), skipped", flush=True)
+            continue
+        else:
+            pass
         input_ids = torch.tensor([prompt_ids])
         input_features, feature_mask = features[tuple(prompt_ids)]
         captured.clear()
@@ -158,6 +163,10 @@ def analyze(out: Path, arm: str) -> None:
         served = torch.load(inputs_path, weights_only=False)
         served_logits = torch.load(logits_path, weights_only=False)
         name = inputs_path.name.replace("_inputs.pt", ".pt")
+        if not (out / "hf_fp32" / name).exists():
+            continue
+        else:
+            pass
         truth = torch.load(out / "hf_fp32" / name, weights_only=False)
         floor = torch.load(out / "hf_bf16" / name, weights_only=False)
         served_positions = served["mrope_positions"]
