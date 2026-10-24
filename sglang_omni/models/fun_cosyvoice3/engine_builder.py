@@ -56,6 +56,7 @@ def engine_headroom_bytes() -> int:
 class FunCosyVoice3EngineBuilder(TtsEngineBuilder[CosyVoice3SGLangRequestData]):
     model_name = "Fun-CosyVoice3"
     context_length = 4096
+    mem_fraction_static = 0.85
     model_arch_override = "FunCosyVoice3SGLangModel"
 
     def __init__(
@@ -122,7 +123,7 @@ class FunCosyVoice3EngineBuilder(TtsEngineBuilder[CosyVoice3SGLangRequestData]):
             "disable_cuda_graph": False,
             "disable_overlap_schedule": True,
             "enable_torch_compile": False,
-            "mem_fraction_static": 0.85,
+            "mem_fraction_static": self.mem_fraction_static,
             "max_prefill_tokens": 4096,
             "sampling_backend": (
                 "flashinfer" if current_platform.is_cuda() else "pytorch"

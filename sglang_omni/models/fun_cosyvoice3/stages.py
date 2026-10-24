@@ -2513,14 +2513,32 @@ def create_vocoder_executor(
     else:
         pass
     device_obj = torch.device(device)
-    # note (ratish): a declared vocoder share bounds this stage's own allocations,
-    # which start here.
-    if total_gpu_memory_fraction is None:
-        share_ceiling_bytes: int | None = None
+    is_prefix_cache_requested = flow_prefix_cache_gb is None or flow_prefix_cache_gb > 0
+    if is_prefix_cache_requested:
+        # note (ratish): this stage's allocations start here, read once the allocator
+        # has returned what earlier stages freed.
+        gc.collect()
+        torch.accelerator.empty_cache()
+        pre_load_free_bytes, total_bytes = torch.accelerator.get_memory_info(device_obj)
+        if total_gpu_memory_fraction is None:
+            share_ceiling_bytes: int | None = None
+        else:
+            share_ceiling_bytes = torch.accelerator.memory_reserved(device_obj) + int(
+                total_gpu_memory_fraction * total_bytes
+            )
+        # note (ratish): the engine keeps 1 - mem_fraction_static of its pre-load memory
+        # free for the process's runtime. Without the engine the vocoder keeps the same
+        # share of its own, for what no step bounds: each stream's prompt and history.
+        if engine_headroom_bytes() > 0:
+            headroom_bytes = engine_headroom_bytes()
+        else:
+            headroom_bytes = int(
+                pre_load_free_bytes
+                * (1 - FunCosyVoice3EngineBuilder.mem_fraction_static)
+            )
     else:
-        share_ceiling_bytes = torch.accelerator.memory_reserved(device_obj) + int(
-            total_gpu_memory_fraction * torch.accelerator.get_memory_info(device_obj)[1]
-        )
+        share_ceiling_bytes = None
+        headroom_bytes = 0
     flow, hift = load_cosyvoice3_flow_hift(
         checkpoint_dir,
         device=device,
@@ -2564,9 +2582,7 @@ def create_vocoder_executor(
     else:
         pass
 
-    has_prefix_pool = (
-        flow_prefix_cache_gb is None or flow_prefix_cache_gb > 0
-    ) and has_ragged_attention
+    has_prefix_pool = is_prefix_cache_requested and has_ragged_attention
 
     if enable_flow_cuda_graph and not flow.is_buffered_packed:
         capture_shapes = verify_flow_cuda_graph_capture_shapes(
@@ -2780,11 +2796,10 @@ def create_vocoder_executor(
             prefix_graph_bytes = 0
         # note (ratish): the step runs on the vocoder's stream while the engine runs on
         # its own, and the allocator never shares a block across streams, so the
-        # engine's headroom and the step add up.
-        headroom_bytes = engine_headroom_bytes()
+        # runtime headroom and the step add up.
         logger.info(
             f"Fun-CosyVoice3 Flow prefix cache reserve: prefix graphs "
-            f"{prefix_graph_bytes / 2**30:.2f} GB, engine headroom "
+            f"{prefix_graph_bytes / 2**30:.2f} GB, runtime headroom "
             f"{headroom_bytes / 2**30:.2f} GB, step {step_bytes / 2**30:.2f} GB"
         )
         flow.prefix_pool = build_prefix_pool(

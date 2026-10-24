@@ -1559,15 +1559,36 @@ def test_a_pool_of_the_prefix_warmup_blocks_runs_both_warmup_hops(
 
 
 @pytest.mark.parametrize(
-    ("flow_prefix_cache_gb", "vocoder_fraction", "expected_share_ceiling_bytes"),
-    [(None, None, None), (2.0, None, None), (None, 0.5, 2**30 + 2**33)],
+    (
+        "flow_prefix_cache_gb",
+        "vocoder_fraction",
+        "engine_headroom_bytes",
+        "expected_share_ceiling_bytes",
+        "expected_headroom_bytes",
+    ),
+    [
+        (None, None, 3 * 2**29, None, 3 * 2**29),
+        (2.0, None, 3 * 2**29, None, 3 * 2**29),
+        (None, 0.5, 3 * 2**29, 2**30 + 2**33, 3 * 2**29),
+        (
+            None,
+            None,
+            0,
+            None,
+            int(2**33 * (1 - FunCosyVoice3EngineBuilder.mem_fraction_static)),
+        ),
+    ],
 )
-def test_prefix_pool_leaves_the_engine_headroom_and_the_largest_step(
+def test_prefix_pool_leaves_the_runtime_headroom_and_the_largest_step(
     monkeypatch: pytest.MonkeyPatch,
     flow_prefix_cache_gb: float | None,
     vocoder_fraction: float | None,
+    engine_headroom_bytes: int,
     expected_share_ceiling_bytes: int | None,
+    expected_headroom_bytes: int,
 ) -> None:
+    """A declared share's baseline counted memory an earlier stage had freed but the
+    allocator still cached, so the pool took that memory beyond the share."""
     fake_flow = RunnableFakeFlow()
     fake_flow.packed_estimator.is_ragged = True
     flow = stages.FunCosyVoice3Flow(
@@ -1583,7 +1604,11 @@ def test_prefix_pool_leaves_the_engine_headroom_and_the_largest_step(
         "load_cosyvoice3_flow_hift",
         lambda checkpoint_dir, device, fp16, **kwargs: (flow, FakeHiFT()),
     )
-    monkeypatch.setattr(torch.accelerator, "memory_reserved", lambda device: 2**30)
+    cached_bytes = [2**28]
+    monkeypatch.setattr(torch.accelerator, "empty_cache", lambda: cached_bytes.clear())
+    monkeypatch.setattr(
+        torch.accelerator, "memory_reserved", lambda device: 2**30 + sum(cached_bytes)
+    )
     monkeypatch.setattr(
         torch.accelerator, "get_memory_info", lambda device: (2**33, 2**34)
     )
@@ -1627,7 +1652,7 @@ def test_prefix_pool_leaves_the_engine_headroom_and_the_largest_step(
         FunCosyVoice3StreamingVocoderScheduler, "measure_peak_step_bytes", measure
     )
     monkeypatch.setattr(stages, "build_prefix_pool", build)
-    monkeypatch.setattr(stages, "engine_headroom_bytes", lambda: 3 * 2**29)
+    monkeypatch.setattr(stages, "engine_headroom_bytes", lambda: engine_headroom_bytes)
 
     stages.create_vocoder_executor(
         "model",
@@ -1652,7 +1677,7 @@ def test_prefix_pool_leaves_the_engine_headroom_and_the_largest_step(
                 flow_prefix_cache_gb,
                 None,
                 3 * 2**30,
-                3 * 2**29,
+                expected_headroom_bytes,
                 expected_share_ceiling_bytes,
             ),
         ),
