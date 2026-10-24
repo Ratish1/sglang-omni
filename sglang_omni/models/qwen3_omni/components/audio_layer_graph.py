@@ -199,15 +199,21 @@ class AudioLayerGraphRunner:
         return Captured(graph, hidden_states, cu_seqlens, output, slots)
 
     def capture_all(self) -> None:
-        for bucket in self.token_buckets:
-            captured = self.capture(bucket)
-            if captured is None:
-                self.disabled_reason = f"capture failed at bucket {bucket}"
-                self.graphs.clear()
-                return
-            else:
-                pass
-            self.graphs[bucket] = captured
+        # Local import: only a process that captures these graphs loads the graph runner's imports.
+        from sglang.srt.model_executor.runner.base_cuda_graph_runner import freeze_gc
+
+        # note (ratish): a collection during capture can free what a reference cycle holds,
+        # a dead runner's graphs among them, and invalidate the capture.
+        with freeze_gc(enable_cudagraph_gc=False):
+            for bucket in self.token_buckets:
+                captured = self.capture(bucket)
+                if captured is None:
+                    self.disabled_reason = f"capture failed at bucket {bucket}"
+                    self.graphs.clear()
+                    return
+                else:
+                    pass
+                self.graphs[bucket] = captured
         logger.info(
             f"audio layer CUDA graphs captured for buckets {list(self.graphs)} "
             f"with {type(self.packed_attention).__name__}"
