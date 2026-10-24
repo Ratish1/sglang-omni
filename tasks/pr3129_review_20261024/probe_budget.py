@@ -9,12 +9,12 @@ import torch
 from sglang_omni.models.fun_cosyvoice3 import stages
 
 
-def build_pool(**overrides):
-    attention = SimpleNamespace(heads=2, inner_dim=8)
+def build_pool(*, layers=2, heads=2, hidden=8, **overrides):
+    attention = SimpleNamespace(heads=heads, inner_dim=hidden)
     flow = SimpleNamespace(
         decoder=SimpleNamespace(
             estimator=SimpleNamespace(
-                transformer_blocks=[SimpleNamespace(attn=attention)] * 2
+                transformer_blocks=[SimpleNamespace(attn=attention)] * layers
             )
         )
     )
@@ -86,6 +86,26 @@ def main():
         del pool
     finally:
         torch.cuda.set_per_process_memory_fraction(1.0, device)
+    gc.collect()
+    torch.cuda.empty_cache()
+    cap_bytes = 8 * 2**30
+    step_reserve = 6 * 2**30
+    torch.cuda.set_per_process_memory_fraction(cap_bytes / total, device)
+    pool = build_pool(layers=22, heads=16, hidden=1024, stage_reserve_bytes=step_reserve)
+    pool_reserved = torch.cuda.memory_reserved(device)
+    pool_allocated = sum(t.numel() * t.element_size() for rows in (pool.keys, pool.values) for row in rows for t in row)
+    try:
+        step = torch.empty(step_reserve, dtype=torch.uint8, device=device)
+    except torch.OutOfMemoryError as error:
+        print(json.dumps(dict(case="production_layout_reserve", cap_bytes=cap_bytes,
+                             step_reserve=step_reserve, pool_tensor_bytes=pool_allocated,
+                             pool_reserved=pool_reserved, outcome=type(error).__name__)), flush=True)
+    else:
+        print(json.dumps(dict(case="production_layout_reserve", outcome="step_fits")), flush=True)
+        del step
+    finally:
+        torch.cuda.set_per_process_memory_fraction(1.0, device)
+    del pool
     gc.collect()
     torch.cuda.empty_cache()
     previous_stage_temporary = torch.empty(
