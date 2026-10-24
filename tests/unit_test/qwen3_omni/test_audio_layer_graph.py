@@ -264,7 +264,7 @@ def make_cu_seqlens(segments: list[int], device: torch.device) -> torch.Tensor:
 def test_packed_attention_matches_fp32_sdpa_per_segment_and_head() -> None:
     torch.manual_seed(0)
     device = torch.device("cuda", 0)
-    packed_attention = resolve_packed_attention(device)
+    packed_attention = resolve_packed_attention(device, torch.bfloat16)
     segments = [104, 104, 49, 37, 90]
     q, k, v = (
         torch.randn(sum(segments), HEADS, HEAD_DIM, device=device).to(torch.bfloat16)
@@ -300,7 +300,7 @@ def test_packed_layer_stack_matches_segmented_sdpa() -> None:
         tower,
         device=device,
         window=WINDOW,
-        packed_attention=resolve_packed_attention(device),
+        packed_attention=resolve_packed_attention(device, torch.bfloat16),
     )
     segments = [104, 104, 49, 37, 90]
     hidden = torch.randn(sum(segments), tower.config.d_model, device=device).to(
@@ -323,7 +323,7 @@ def test_capture_all_records_a_graph_for_every_bucket() -> None:
         tower,
         device=device,
         window=WINDOW,
-        packed_attention=resolve_packed_attention(device),
+        packed_attention=resolve_packed_attention(device, torch.bfloat16),
     )
     runner.capture_all()
     assert runner.has_graphs, runner.disabled_reason
@@ -340,7 +340,7 @@ def test_replay_matches_the_uncaptured_packed_stack_across_bucket_boundaries() -
         tower,
         device=device,
         window=WINDOW,
-        packed_attention=resolve_packed_attention(device),
+        packed_attention=resolve_packed_attention(device, torch.bfloat16),
     )
     runner.capture_all()
     assert runner.has_graphs, runner.disabled_reason

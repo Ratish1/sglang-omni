@@ -214,10 +214,8 @@ class Qwen3OmniAudioEncoder(nn.Module):
         )  # noqa: leading-underscore  # upstream spelling, or the public name is already taken
         self.segment_splits = SegmentSplits()
         # note (ratish): one attention kernel for a clip whether or not its batch fits a layer graph.
-        self.packed_attention: nn.Module | None = (
-            resolve_packed_attention(self.device)
-            if self.device.type == "cuda"
-            else None
+        self.packed_attention: nn.Module | None = resolve_packed_attention(
+            self.device, torch_dtype
         )
         if self.packed_attention is not None:
             for layer in self.audio_tower.layers:
@@ -228,7 +226,7 @@ class Qwen3OmniAudioEncoder(nn.Module):
             self.audio_tower, self.segment_splits, self.packed_attention
         )
         self.layer_graph_runner = None
-        if enable_layer_cuda_graph and self.device.type == "cuda":
+        if enable_layer_cuda_graph and self.packed_attention is not None:
             self.enable_layer_cuda_graph()
         else:
             pass

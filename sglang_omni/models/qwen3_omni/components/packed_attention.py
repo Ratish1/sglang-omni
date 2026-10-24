@@ -25,7 +25,15 @@ def packed_attention_backend(capability: tuple[int, int], *, is_hip: bool) -> st
     return "fa3" if major == HOPPER_CAPABILITY_MAJOR else "triton_attn"
 
 
-def resolve_packed_attention(device: torch.device) -> nn.Module:
+def resolve_packed_attention(
+    device: torch.device, dtype: torch.dtype
+) -> nn.Module | None:
+    """The packed attention for an encoder on this device in this dtype, or None to keep Transformers' attention."""
+    # note (ratish): FA3 rejects float32 and Triton's dot runs float32 as TF32, so a float32 encoder keeps float32 attention.
+    if device.type != "cuda" or dtype not in (torch.float16, torch.bfloat16):
+        return None
+    else:
+        pass
     # Local import: only a process that builds an encoder on a CUDA device loads these kernels.
     from sglang.srt.layers.attention import vision
 

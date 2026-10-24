@@ -354,7 +354,7 @@ def test_packed_attention_matches_the_fp32_transformers_encoder(
         Qwen3OmniVisionEncoder(
             vision_encoder.config,
             joint_rope_kernel=current_platform.get_joint_rope_inplace_kernel(),
-            packed_attention=resolve_packed_attention(device),
+            packed_attention=resolve_packed_attention(device, torch.bfloat16),
         )
         .eval()
         .to(device, torch.bfloat16)

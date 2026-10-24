@@ -83,17 +83,14 @@ def instantiate_visual(
     vision_config: Qwen3OmniMoeVisionEncoderConfig,
     *,
     device: str,
+    dtype: torch.dtype,
     native_visual_class: type[Qwen3OmniMoeVisionEncoderCompat],
 ) -> Qwen3OmniMoeVisionEncoderCompat:
     if torch.device(device).type != current_platform.device_type:
         return instantiate_module(native_visual_class, vision_config)
     else:
         # note (ratish): per-image Transformers attention reaches cuDNN on Hopper, whose output changes between processes.
-        packed_attention = (
-            resolve_packed_attention(torch.device(device))
-            if torch.device(device).type == "cuda"
-            else None
-        )
+        packed_attention = resolve_packed_attention(torch.device(device), dtype)
         with no_init_weights():
             return Qwen3OmniVisionEncoder._from_config(  # noqa: leading-underscore  # Transformers construction API
                 vision_config,
