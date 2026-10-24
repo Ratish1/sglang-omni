@@ -16,8 +16,8 @@ import soundfile
 from benchmarks.dataset.prepare import SEEDTTS_DATASET_ID
 from benchmarks.dataset.seedtts import load_seedtts_samples
 
-SHORT_ROWS = 400
-LONG_EVERY = 70
+SHORT_ROWS = 1000
+LONG_EVERY = 200
 LONG_SECONDS = (25.0, 46.0, 66.0, 87.0, 107.0)
 GAP_SECONDS = 0.25
 
