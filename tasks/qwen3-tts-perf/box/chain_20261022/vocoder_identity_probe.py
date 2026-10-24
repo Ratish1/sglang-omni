@@ -13,6 +13,7 @@ import argparse
 
 import torch
 
+from sglang_omni.models.qwen3_tts.codec_state_arena import Qwen3TTSCodecStateArena
 from sglang_omni.models.qwen3_tts.incremental_codec import Qwen3TTSIncrementalDecoder
 from sglang_omni.models.qwen3_tts.stages import load_qwen3_tts_tokenizer
 from sglang_omni.utils.snake_beta import fuse_vocoder_decoder
@@ -20,6 +21,12 @@ from sglang_omni.utils.snake_beta import fuse_vocoder_decoder
 MODEL = "Qwen/Qwen3-TTS-12Hz-1.7B-Base"
 STREAM_PARTS = (16, 1, 2, 4, 8, 8, 8, 3)
 TAIL_WIDTHS = (40, 25, 30)
+# (rows of the stream codes, frames): cohorts whose slot order differs from the rows' and whose membership changes,
+# so a K/V row gathered from or scattered to the wrong slot changes a later waveform.
+ARENA_COHORTS = (
+    ((2, 0), 16), ((1, 3), 16), ((3, 2, 0, 1), 1), ((0, 2), 4), ((1, 3, 2), 2), ((3, 0, 1, 2), 8), ((2, 1), 8),
+    ((0, 3), 8), ((1, 0, 3, 2), 3),
+)
 
 
 def canonical_state(incremental: Qwen3TTSIncrementalDecoder, state, prefix: str) -> dict[str, torch.Tensor]:
@@ -49,6 +56,33 @@ def stream(incremental, codes, device, dtype, prefix: str, compiled: bool) -> di
         outputs[f"{prefix}.wave.{index}"] = incremental.decode(part, state, compiled=compiled and width == 8).cpu()
         offset += width
     outputs.update(canonical_state(incremental, state, prefix))
+    return outputs
+
+
+def arena_streams(incremental, codes, device, dtype) -> dict[str, torch.Tensor]:
+    """Streams decoded as the vocoder's eager paths decode them: cohorts gathered from the slot arena in shuffled slot
+    orders, decoded, scattered back; every waveform and the arena's whole storage afterwards."""
+    arena = Qwen3TTSCodecStateArena(incremental, num_slots=8, device=device, dtype=dtype)
+    slots = [arena.acquire() for _ in range(codes.shape[0])]
+    offsets = [0] * codes.shape[0]
+    outputs = {}
+    for step, (rows, width) in enumerate(ARENA_COHORTS):
+        cohort = [slots[row] for row in rows]
+        part = torch.stack([codes[row, :, offsets[row] : offsets[row] + width] for row in rows]).contiguous()
+        state = arena.gather(cohort)
+        outputs[f"arena.wave.{step}"] = incremental.decode(part, state).cpu()
+        arena.scatter(cohort, state)
+        for row in rows:
+            offsets[row] += width
+    storage = arena.storage
+    for name, pools in (("history", storage.conv_histories), ("overlap", storage.transconv_overlaps)):
+        for key, value in pools.items():
+            outputs[f"arena.{name}.{key}"] = value.cpu()
+    for layer, value in storage.transformer_keys.items():
+        outputs[f"arena.key.{layer}"] = value.cpu()
+    for layer, value in storage.transformer_values.items():
+        outputs[f"arena.value.{layer}"] = value.cpu()
+    outputs["arena.positions"] = storage.frame_positions.cpu()
     return outputs
 
 
@@ -102,6 +136,8 @@ def main() -> None:
         outputs["tail.wave"] = incremental.decode_tail(tail_codes, valid, state, 1).cpu()
         outputs["tail.follow"] = incremental.decode(follow_codes, state).cpu()
         outputs.update(canonical_state(incremental, state, "tail"))
+
+        outputs.update(arena_streams(incremental, stream_codes, device, dtype))
 
         trace_state = incremental.init_state(4, device=device, dtype=dtype)
         incremental.precompile(stream_codes[..., :8].contiguous(), trace_state)
