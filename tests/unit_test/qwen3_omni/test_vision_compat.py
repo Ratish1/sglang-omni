@@ -15,13 +15,9 @@ from transformers.models.qwen3_omni_moe import modeling_qwen3_omni_moe as hf_mod
 
 import sglang_omni.models.qwen3_omni.components.vision_encoder as vision_runtime
 from sglang_omni.models.qwen3_omni.components import image_encoder, vision_compat
-from sglang_omni.models.qwen3_omni.components.packed_attention import (
-    resolve_packed_attention,
-)
 from sglang_omni.models.qwen3_omni.components.vision_encoder import (
     Qwen3OmniVisionEncoder,
 )
-from sglang_omni.platforms import current_platform
 
 
 def make_encoder() -> vision_compat.Qwen3OmniMoeVisionEncoderCompat:
@@ -336,41 +332,58 @@ def test_packed_attention_receives_every_sequence_and_the_host_max_length(
         encoder(pixels, grid_thw=grid)
 
     assert packed_attention.call_count == vision_encoder.config.depth
+    metadata = packed_attention.call_args.kwargs["forward_metadata"]
+    assert metadata.cu_seqlens.tolist() == [0, 16, 40, 64]
+    assert isinstance(metadata.max_seqlen, int)
+    assert metadata.max_seqlen == 24
     for attention_call in packed_attention.call_args_list:
-        assert attention_call.args[3].tolist() == [0, 16, 40, 64]
-        assert isinstance(attention_call.kwargs["max_seqlen"], int)
-        assert attention_call.kwargs["max_seqlen"] == 24
+        assert attention_call.kwargs["forward_metadata"] is metadata
+        assert attention_call.args[3] is metadata.cu_seqlens
         assert attention_call.kwargs["seq_len"] == 64
 
 
 @pytest.mark.accelerator
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-def test_packed_attention_matches_the_fp32_transformers_encoder(
+@pytest.mark.parametrize(
+    ("dtype", "tolerance"), [("bf16", 2e-2), ("fp32", 0.0)], ids=["bf16", "fp32"]
+)
+def test_cuda_image_encoder_matches_the_fp32_transformers_encoder(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
     vision_encoder: vision_compat.Qwen3OmniMoeVisionEncoderCompat,
+    dtype: Literal["bf16", "fp32"],
+    tolerance: float,
 ) -> None:
-    device = torch.device("cuda", 0)
-    reference = copy.deepcopy(vision_encoder).to(device, torch.float32)
-    encoder = (
-        Qwen3OmniVisionEncoder(
-            vision_encoder.config,
-            joint_rope_kernel=current_platform.get_joint_rope_inplace_kernel(),
-            packed_attention=resolve_packed_attention(device),
-        )
-        .eval()
-        .to(device, torch.bfloat16)
+    monkeypatch.setenv("SGLANG_VIT_ENABLE_CUDA_GRAPH", "1")
+    save_file(
+        {
+            f"thinker.visual.{name}": tensor
+            for name, tensor in vision_encoder.state_dict().items()
+        },
+        tmp_path / "model.safetensors",
     )
-    encoder.load_state_dict(vision_encoder.state_dict(), strict=True)
-    grid = torch.tensor([[1, 4, 4], [2, 4, 6]], dtype=torch.long, device=device)
+    monkeypatch.setattr(
+        image_encoder,
+        "load_thinker_config",
+        Mock(return_value=SimpleNamespace(vision_config=vision_encoder.config)),
+    )
+    model = image_encoder.Qwen3OmniImageEncoder(
+        str(tmp_path), device="cuda", dtype=dtype
+    )
+    reference = copy.deepcopy(vision_encoder).to("cuda", torch.float32)
+    grid = torch.tensor([[1, 4, 4], [2, 4, 6]], dtype=torch.long)
     torch.manual_seed(0)
-    pixels = torch.randn(64, 24, device=device)
+    pixels = torch.randn(64, 24)
 
     with torch.no_grad():
         with sdpa_kernel(SDPBackend.MATH):
-            expected = reference(pixels, grid_thw=grid, return_dict=True)
-        actual = encoder(pixels.to(torch.bfloat16), grid_thw=grid, return_dict=True)
+            expected = reference(
+                pixels.to("cuda"), grid_thw=grid.to("cuda"), return_dict=True
+            )
+        actual = model(pixel_values=pixels, image_grid_thw=grid)
 
     for got, want in zip(
-        (actual.pooler_output, *actual.deepstack_features),
+        (actual["image_embeds"], *actual["deepstack_visual_embeds_image"]),
         (expected.pooler_output, *expected.deepstack_features),
     ):
-        torch.testing.assert_close(got.float(), want, rtol=2e-2, atol=2e-2)
+        torch.testing.assert_close(got.float(), want, rtol=tolerance, atol=tolerance)

@@ -11,6 +11,7 @@ from transformers.models.qwen3_omni_moe.configuration_qwen3_omni_moe import (
 )
 
 from sglang_omni.models.qwen3_omni.components.packed_attention import (
+    prepare_packed_attention_metadata,
     resolve_packed_attention,
 )
 from sglang_omni.models.qwen3_omni.components.vision_attention import (
@@ -36,6 +37,7 @@ class Qwen3OmniVisionEncoder(Qwen3OmniMoeVisionEncoderCompat):
     ) -> None:
         super().__init__(config)
         self.joint_rope_kernel: JointRopeInplaceKernel | None = joint_rope_kernel
+        self.packed_attention: nn.Module | None = packed_attention
         # note (yzxiao): Keep attention and its RoPE input format paired at construction.
         for block in self.blocks:
             block.attn = Qwen3OmniVisionAttention(
@@ -70,11 +72,19 @@ class Qwen3OmniVisionEncoder(Qwen3OmniMoeVisionEncoderCompat):
     def prepare_attention_metadata(
         self,
         sequence_patch_counts: tuple[int, ...],
+        cu_seqlens: torch.Tensor,
     ) -> dict[str, VisionSequenceMetadata]:
         # note (yzxiao): Reuse host lengths to avoid per-layer device synchronization.
         return {
             "sequence_metadata": VisionSequenceMetadata(
-                sequence_patch_counts=sequence_patch_counts
+                sequence_patch_counts=sequence_patch_counts,
+                packed_attention_metadata=(
+                    prepare_packed_attention_metadata(
+                        cu_seqlens, max(sequence_patch_counts)
+                    )
+                    if self.packed_attention is not None
+                    else None
+                ),
             )
         }
 
@@ -83,17 +93,14 @@ def instantiate_visual(
     vision_config: Qwen3OmniMoeVisionEncoderConfig,
     *,
     device: str,
+    dtype: torch.dtype,
     native_visual_class: type[Qwen3OmniMoeVisionEncoderCompat],
 ) -> Qwen3OmniMoeVisionEncoderCompat:
     if torch.device(device).type != current_platform.device_type:
         return instantiate_module(native_visual_class, vision_config)
     else:
         # note (ratish): per-image Transformers attention reaches cuDNN on Hopper, whose output changes between processes.
-        packed_attention = (
-            resolve_packed_attention(torch.device(device))
-            if torch.device(device).type == "cuda"
-            else None
-        )
+        packed_attention = resolve_packed_attention(torch.device(device), dtype)
         with no_init_weights():
             return Qwen3OmniVisionEncoder._from_config(  # noqa: leading-underscore  # Transformers construction API
                 vision_config,

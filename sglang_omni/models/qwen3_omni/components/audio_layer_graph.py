@@ -10,6 +10,11 @@ from dataclasses import dataclass
 import torch
 import torch.nn as nn
 
+from sglang_omni.models.qwen3_omni.components.packed_attention import (
+    PackedAttentionMetadata,
+    prepare_packed_attention_metadata,
+)
+
 logger = logging.getLogger(__name__)
 
 DEFAULT_TOKEN_BUCKETS: tuple[int, ...] = (128, 256, 512, 1024, 2048, 4096)
@@ -47,8 +52,7 @@ def packed_attention_forward(
     attention: nn.Module,
     packed_attention: nn.Module,
     hidden_states: torch.Tensor,
-    cu_seqlens: torch.Tensor,
-    max_seqlen: int,
+    attention_metadata: PackedAttentionMetadata,
 ) -> torch.Tensor:
     seq_length, _ = hidden_states.size()
     # note (ratish): the packed attention reads strided q, k and v, so one GEMM projects all three without copies.
@@ -57,16 +61,15 @@ def packed_attention_forward(
         .reshape(seq_length, 3, attention.num_heads, -1)
         .unbind(1)
     )
-    # An int max_seqlen avoids the device-to-host max() that would break capture.
     attn_output = packed_attention(
         query_states,
         key_states,
         value_states,
-        cu_seqlens,
+        attention_metadata.cu_seqlens,
         bsz=1,
         seq_len=seq_length,
         softmax_scale=attention.scaling,
-        max_seqlen=max_seqlen,
+        forward_metadata=attention_metadata,
     )
     return attention.out_proj(attn_output.reshape(seq_length, -1).contiguous())
 
@@ -138,6 +141,8 @@ class AudioLayerGraphRunner:
         return segments
 
     def run_layers(self, hidden_states, cu_seqlens, max_seqlen: int):
+        # An int max_seqlen avoids the device-to-host max() that would break capture.
+        attention_metadata = prepare_packed_attention_metadata(cu_seqlens, max_seqlen)
         for layer in self.tower.layers:
             residual = hidden_states
             hidden_states = layer.self_attn_layer_norm(hidden_states)
@@ -145,8 +150,7 @@ class AudioLayerGraphRunner:
                 layer.self_attn,
                 self.packed_attention,
                 hidden_states,
-                cu_seqlens,
-                max_seqlen,
+                attention_metadata,
             )
             hidden_states = residual + hidden_states
             residual = hidden_states

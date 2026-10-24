@@ -78,7 +78,7 @@ class Qwen3OmniVisionAttention(nn.Module):
                 bsz=1,
                 seq_len=sequence_patch_count,
                 softmax_scale=self.scaling,
-                max_seqlen=max_seqlen,
+                forward_metadata=sequence_metadata.packed_attention_metadata,
             )
             return self.proj(
                 attention_output.reshape(sequence_patch_count, -1).contiguous()

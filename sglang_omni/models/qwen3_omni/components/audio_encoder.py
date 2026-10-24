@@ -20,6 +20,8 @@ from sglang_omni.models.qwen3_omni.components.audio_layer_graph import (
 )
 from sglang_omni.models.qwen3_omni.components.common import load_thinker_config
 from sglang_omni.models.qwen3_omni.components.packed_attention import (
+    PackedAttentionMetadata,
+    prepare_packed_attention_metadata,
     resolve_packed_attention,
 )
 from sglang_omni.models.weight_loader import load_module, resolve_dtype
@@ -79,12 +81,13 @@ def pack_padded_audio_features(
 
 
 class SegmentSplits:
-    """Per-request attention segment sizes, shared by every encoder layer."""
+    """Per-request attention segment sizes and packed attention metadata, shared by every encoder layer."""
 
-    __slots__ = ("value",)
+    __slots__ = ("value", "attention_metadata")
 
     def __init__(self) -> None:
         self.value: list[int] | None = None
+        self.attention_metadata: PackedAttentionMetadata | None = None
 
 
 def forward_with_shared_segments(
@@ -103,7 +106,10 @@ def forward_with_shared_segments(
         pass
     if self.packed_attention is not None:
         return packed_attention_forward(
-            self, self.packed_attention, hidden_states, cu_seqlens, max(splits)
+            self,
+            self.packed_attention,
+            hidden_states,
+            self._omni_segment_splits.attention_metadata,  # noqa: leading-underscore  # upstream spelling, or the public name is already taken
         )
     else:
         pass
@@ -214,10 +220,8 @@ class Qwen3OmniAudioEncoder(nn.Module):
         )  # noqa: leading-underscore  # upstream spelling, or the public name is already taken
         self.segment_splits = SegmentSplits()
         # note (ratish): one attention kernel for a clip whether or not its batch fits a layer graph.
-        self.packed_attention: nn.Module | None = (
-            resolve_packed_attention(self.device)
-            if self.device.type == "cuda"
-            else None
+        self.packed_attention: nn.Module | None = resolve_packed_attention(
+            self.device, torch_dtype
         )
         if self.packed_attention is not None:
             for layer in self.audio_tower.layers:
@@ -228,7 +232,7 @@ class Qwen3OmniAudioEncoder(nn.Module):
             self.audio_tower, self.segment_splits, self.packed_attention
         )
         self.layer_graph_runner = None
-        if enable_layer_cuda_graph and self.device.type == "cuda":
+        if enable_layer_cuda_graph and self.packed_attention is not None:
             self.enable_layer_cuda_graph()
         else:
             pass
@@ -298,6 +302,13 @@ class Qwen3OmniAudioEncoder(nn.Module):
         self.segment_splits.value = (cu_seqlens[1:] - cu_seqlens[:-1]).tolist()
         valid_indices = valid_indices.to(self.device, non_blocking=True)
         cu_seqlens = cu_seqlens.to(self.device, non_blocking=True)
+        self.segment_splits.attention_metadata = (
+            prepare_packed_attention_metadata(
+                cu_seqlens, max(self.segment_splits.value)
+            )
+            if self.packed_attention is not None
+            else None
+        )
         try:
             outputs = tower(
                 input_features,
@@ -310,6 +321,7 @@ class Qwen3OmniAudioEncoder(nn.Module):
             )
         finally:
             self.segment_splits.value = None
+            self.segment_splits.attention_metadata = None
         audio_embeds = outputs.last_hidden_state
         audio_output_lengths = self.downsample_lengths(
             audio_feature_lengths, tower.n_window

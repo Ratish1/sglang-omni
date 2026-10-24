@@ -3,12 +3,20 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+from types import SimpleNamespace
+from typing import Literal
+from unittest.mock import Mock
+
 import pytest
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from safetensors.torch import save_file
 from torch.nn.attention import SDPBackend, sdpa_kernel
+from transformers.models.qwen3_omni_moe import modeling_qwen3_omni_moe as hf_modeling
 
+from sglang_omni.models.qwen3_omni.components import audio_encoder
 from sglang_omni.models.qwen3_omni.components.audio_layer_graph import (
     DEFAULT_TOKEN_BUCKETS,
     AudioLayerGraphRunner,
@@ -16,6 +24,7 @@ from sglang_omni.models.qwen3_omni.components.audio_layer_graph import (
 )
 from sglang_omni.models.qwen3_omni.components.packed_attention import (
     packed_attention_backend,
+    prepare_packed_attention_metadata,
     resolve_packed_attention,
 )
 
@@ -264,7 +273,7 @@ def make_cu_seqlens(segments: list[int], device: torch.device) -> torch.Tensor:
 def test_packed_attention_matches_fp32_sdpa_per_segment_and_head() -> None:
     torch.manual_seed(0)
     device = torch.device("cuda", 0)
-    packed_attention = resolve_packed_attention(device)
+    packed_attention = resolve_packed_attention(device, torch.bfloat16)
     segments = [104, 104, 49, 37, 90]
     q, k, v = (
         torch.randn(sum(segments), HEADS, HEAD_DIM, device=device).to(torch.bfloat16)
@@ -280,7 +289,7 @@ def test_packed_attention_matches_fp32_sdpa_per_segment_and_head() -> None:
             bsz=1,
             seq_len=q.shape[0],
             softmax_scale=HEAD_DIM**-0.5,
-            max_seqlen=WINDOW,
+            forward_metadata=prepare_packed_attention_metadata(cu_seqlens, WINDOW),
         )
         with sdpa_kernel(SDPBackend.MATH):
             reference = segmented_sdpa(
@@ -300,7 +309,7 @@ def test_packed_layer_stack_matches_segmented_sdpa() -> None:
         tower,
         device=device,
         window=WINDOW,
-        packed_attention=resolve_packed_attention(device),
+        packed_attention=resolve_packed_attention(device, torch.bfloat16),
     )
     segments = [104, 104, 49, 37, 90]
     hidden = torch.randn(sum(segments), tower.config.d_model, device=device).to(
@@ -323,7 +332,7 @@ def test_capture_all_records_a_graph_for_every_bucket() -> None:
         tower,
         device=device,
         window=WINDOW,
-        packed_attention=resolve_packed_attention(device),
+        packed_attention=resolve_packed_attention(device, torch.bfloat16),
     )
     runner.capture_all()
     assert runner.has_graphs, runner.disabled_reason
@@ -340,7 +349,7 @@ def test_replay_matches_the_uncaptured_packed_stack_across_bucket_boundaries() -
         tower,
         device=device,
         window=WINDOW,
-        packed_attention=resolve_packed_attention(device),
+        packed_attention=resolve_packed_attention(device, torch.bfloat16),
     )
     runner.capture_all()
     assert runner.has_graphs, runner.disabled_reason
@@ -365,3 +374,67 @@ def test_replay_matches_the_uncaptured_packed_stack_across_bucket_boundaries() -
             replayed = runner.maybe_replay(hidden, cu_seqlens, segments)
             assert replayed is not None
             torch.testing.assert_close(replayed, uncaptured)
+
+
+@pytest.mark.accelerator
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize(
+    ("dtype", "enable_layer_cuda_graph", "tolerance"),
+    [("bf16", True, 0.0), ("bf16", False, 0.0), ("fp32", False, 0.0)],
+    ids=["bf16-graphs", "bf16-eager", "fp32"],
+)
+def test_cuda_audio_encoder_matches_the_fp32_transformers_tower(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    dtype: Literal["bf16", "fp32"],
+    enable_layer_cuda_graph: bool,
+    tolerance: float,
+) -> None:
+    monkeypatch.setenv("SGLANG_VIT_ENABLE_CUDA_GRAPH", "1")
+    config = hf_modeling.Qwen3OmniMoeAudioEncoderConfig(
+        d_model=256,
+        encoder_layers=2,
+        encoder_attention_heads=4,
+        encoder_ffn_dim=512,
+        downsample_hidden_size=16,
+        output_dim=64,
+    )
+    torch.manual_seed(0)
+    reference = hf_modeling.Qwen3OmniMoeAudioEncoder(config).eval()
+    save_file(
+        {
+            f"thinker.audio_tower.{name}": tensor.contiguous()
+            for name, tensor in reference.state_dict().items()
+        },
+        tmp_path / "model.safetensors",
+    )
+    monkeypatch.setattr(
+        audio_encoder,
+        "load_thinker_config",
+        Mock(return_value=SimpleNamespace(audio_config=config)),
+    )
+    model = audio_encoder.Qwen3OmniAudioEncoder(
+        str(tmp_path),
+        device="cuda",
+        dtype=dtype,
+        enable_layer_cuda_graph=enable_layer_cuda_graph,
+    )
+    assert (model.layer_graph_runner is not None) == enable_layer_cuda_graph
+    reference = reference.to("cuda", torch.float32)
+    lengths = torch.tensor([400, 850, 99])
+    features = torch.randn(3, config.num_mel_bins, 850)
+
+    with torch.no_grad():
+        actual = model(
+            input_features=features,
+            feature_attention_mask=torch.arange(850) < lengths.unsqueeze(1),
+        )["audio_embeds"]
+        with sdpa_kernel(SDPBackend.MATH):
+            expected = reference(
+                torch.cat(
+                    [row[:, :length] for row, length in zip(features, lengths)], dim=-1
+                ).to("cuda"),
+                feature_lens=lengths.to("cuda"),
+            ).last_hidden_state
+
+    torch.testing.assert_close(actual.float(), expected, rtol=tolerance, atol=tolerance)
