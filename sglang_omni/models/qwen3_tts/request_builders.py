@@ -1079,8 +1079,8 @@ class Qwen3TTSRefCodeBatcher:
             and self.graph_runner is not None
             and frames > self.graph_runner.bucket_frames[-1]
         ):
-            step = self.graph_runner.bucket_frames[-1]
-            padded_frames = -(-frames // step) * step
+            largest_frames = self.graph_runner.bucket_frames[-1]
+            padded_frames = -(-frames // largest_frames) * largest_frames
         else:
             padded_frames = frames
         values = torch.zeros(

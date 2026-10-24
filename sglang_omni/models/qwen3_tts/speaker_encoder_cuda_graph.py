@@ -312,11 +312,11 @@ class Qwen3TTSSpeakerEncoderCudaGraphRunner:
         if bucket is None and self.graphs and self.mel_on_device:
             # note (ratish): past the graphs the clip runs their arithmetic eagerly at a
             # width rounded up to the largest bucket, so cuDNN plans each width once.
-            step = max(self.graphs)
-            largest = self.graphs[step]
-            width = -(-frames // step) * step
+            largest_frames = max(self.graphs)
+            largest = self.graphs[largest_frames]
+            padded_frames = -(-frames // largest_frames) * largest_frames
             padded = torch.zeros(
-                (1, SPEAKER_MEL_HOP * (width + 1) - 1),
+                (1, SPEAKER_MEL_HOP * (padded_frames + 1) - 1),
                 device=param.device,
                 dtype=torch.float32,
             )

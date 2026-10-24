@@ -186,10 +186,10 @@ def test_reference_code_batcher_replays_captured_buckets_and_encodes_the_rest(
     encoded_samples = []
 
     def recording_encode(
-        values: torch.Tensor, **kwargs: int | bool
+        values: torch.Tensor, *, num_quantizers: int, return_dict: bool
     ) -> MimiEncoderOutput:
         encoded_samples.append(int(values.shape[-1]))
-        return encode(values, **kwargs)
+        return encode(values, num_quantizers=num_quantizers, return_dict=return_dict)
 
     monkeypatch.setattr(model, "encode", recording_encode)
     try:
