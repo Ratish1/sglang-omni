@@ -2,7 +2,8 @@
 # Is the Qwen3-TTS talker's runaway (a repetition loop that never samples codec EOS, to the 2,048-frame cap) the
 # model's or ours? The three SeedTTS EN prompts that ran away on 10-24, default serving: main against #3102,
 # non-streaming, c16, unseeded, 200 of each prompt a run, both card orders, no scoring; then the official qwen_tts
-# implementation at the checkpoint's own sampling defaults, 100 of each prompt on each card; rates per prompt.
+# implementation (qwen-tts 0.1.1 in its own environment, REFPY) at the checkpoint's own sampling defaults, 200 of each
+# prompt on each card; rates per prompt. Served pairs already scored are skipped.
 set -u
 D=/data/runaway
 export PAIR_ROOT=$D/pairs
@@ -36,7 +37,7 @@ else
 fi
 PROMPTS="common_voice_en_19916471-common_voice_en_19916474 common_voice_en_20660224-common_voice_en_20660228 common_voice_en_21319256-common_voice_en_21319257"
 (cd $M && PYTHONPATH=$M python3 $REPEAT $D/served $(for p in $PROMPTS; do printf '%s:200 ' $p; done) >> $L 2>&1)
-(cd $M && PYTHONPATH=$M python3 $REPEAT $D/reference $(for p in $PROMPTS; do printf '%s:100 ' $p; done) >> $L 2>&1)
+(cd $M && PYTHONPATH=$M python3 $REPEAT $D/reference $(for p in $PROMPTS; do printf '%s:200 ' $p; done) >> $L 2>&1)
 run_pair() {
   if [ -f $PAIR_ROOT/$1/a/bench/speed_results.json ] && [ -f $PAIR_ROOT/$1/b/bench/speed_results.json ]; then
     return
