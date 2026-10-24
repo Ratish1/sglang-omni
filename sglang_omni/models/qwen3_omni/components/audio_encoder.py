@@ -101,12 +101,9 @@ def forward_with_shared_segments(
         )  # noqa: leading-underscore  # upstream spelling, or the public name is already taken
     else:
         pass
-    packed_attention = (
-        self._omni_packed_attention
-    )  # noqa: leading-underscore  # upstream spelling, or the public name is already taken
-    if packed_attention is not None:
+    if self.packed_attention is not None:
         return packed_attention_forward(
-            self, packed_attention, hidden_states, cu_seqlens, max(splits)
+            self, self.packed_attention, hidden_states, cu_seqlens, max(splits)
         )
     else:
         pass
@@ -154,7 +151,7 @@ def share_segment_splits(
     for layer in tower.layers:
         attention = layer.self_attn
         attention._omni_segment_splits = splits  # noqa: leading-underscore  # upstream spelling, or the public name is already taken
-        attention._omni_packed_attention = packed_attention  # noqa: leading-underscore  # upstream spelling, or the public name is already taken
+        attention.packed_attention = packed_attention
         attention._omni_unshared_forward = (
             attention.forward
         )  # noqa: leading-underscore  # upstream spelling, or the public name is already taken
@@ -216,10 +213,9 @@ class Qwen3OmniAudioEncoder(nn.Module):
             hf_modeling._get_feat_extract_output_lengths
         )  # noqa: leading-underscore  # upstream spelling, or the public name is already taken
         self.segment_splits = SegmentSplits()
-        # note (ratish): on a CUDA device the eager layers attend as the layer graphs do, one varlen call per
-        # layer over every window; other devices keep the Transformers attention.
+        # note (ratish): one attention kernel for a clip whether or not its batch fits a layer graph.
         self.packed_attention: nn.Module | None = (
-            resolve_packed_attention(self.device)[0]
+            resolve_packed_attention(self.device)
             if self.device.type == "cuda"
             else None
         )

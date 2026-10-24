@@ -88,10 +88,9 @@ def instantiate_visual(
     if torch.device(device).type != current_platform.device_type:
         return instantiate_module(native_visual_class, vision_config)
     else:
-        # note (ratish): on a CUDA device attention runs as the audio encoder's graphs run it,
-        # one varlen call over every image's patches; other devices keep the Transformers attention.
+        # note (ratish): per-image Transformers attention reaches cuDNN on Hopper, whose output changes between processes.
         packed_attention = (
-            resolve_packed_attention(torch.device(device))[0]
+            resolve_packed_attention(torch.device(device))
             if torch.device(device).type == "cuda"
             else None
         )

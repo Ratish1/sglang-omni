@@ -51,7 +51,7 @@ def packed_attention_forward(
     max_seqlen: int,
 ) -> torch.Tensor:
     seq_length, _ = hidden_states.size()
-    # note (ratish): one projection GEMM, and the packed attention reads q, k and v as strided views of its output.
+    # note (ratish): the packed attention reads strided q, k and v, so one GEMM projects all three without copies.
     query_states, key_states, value_states = (
         attention.qkv_proj(hidden_states)
         .reshape(seq_length, 3, attention.num_heads, -1)

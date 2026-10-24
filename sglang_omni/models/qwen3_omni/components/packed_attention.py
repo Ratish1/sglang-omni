@@ -25,7 +25,7 @@ def packed_attention_backend(capability: tuple[int, int], *, is_hip: bool) -> st
     return "fa3" if major == HOPPER_CAPABILITY_MAJOR else "triton_attn"
 
 
-def resolve_packed_attention(device: torch.device) -> tuple[nn.Module, str]:
+def resolve_packed_attention(device: torch.device) -> nn.Module:
     # Local import: only a process that builds an encoder on a CUDA device loads these kernels.
     from sglang.srt.layers.attention import vision
 
@@ -38,4 +38,4 @@ def resolve_packed_attention(device: torch.device) -> tuple[nn.Module, str]:
     else:
         impl_class = vision.VisionTritonAttention
     # The encoder process holds no sglang parallel state to read.
-    return impl_class(use_data_parallel=True), backend
+    return impl_class(use_data_parallel=True)
