@@ -1,6 +1,7 @@
 """The TTS CI's quality metrics read from same-time pairs: per arm the corpus WER, the corpus WER without samples past
 50 %, requests at the token cap, and the speaker similarity mean over all samples and over the first 50 in dataset order
-(the CI's similarity check scores --max-samples 50); then b minus a per sample over those 50 and over all.
+(the CI's similarity check scores --max-samples 50); then b minus a per sample over those 50 and over all, per pair
+and pooled over the pairs given (leave byte-identical seeded pairs out of the pool).
 
 usage: PAIR_ROOT=<pairs> PYTHONPATH=<omni tree> python3 ci_metrics.py LABEL [LABEL ...]
 """
@@ -20,7 +21,10 @@ CI_SIMILARITY_SAMPLES = 50
 
 
 def paired(a: dict[str, float], b: dict[str, float], ids: list[str]) -> str:
-    deltas = [b[sample_id] - a[sample_id] for sample_id in ids if sample_id in a and sample_id in b]
+    return interval([b[sample_id] - a[sample_id] for sample_id in ids if sample_id in a and sample_id in b])
+
+
+def interval(deltas: list[float]) -> str:
     mean = statistics.fmean(deltas)
     error = statistics.stdev(deltas) / math.sqrt(len(deltas))
     return f"{mean:+.3f} (95 % {mean - 1.96 * error:+.3f} to {mean + 1.96 * error:+.3f}, n {len(deltas)})"
@@ -28,6 +32,7 @@ def paired(a: dict[str, float], b: dict[str, float], ids: list[str]) -> str:
 
 def main() -> None:
     first = [sample.sample_id for sample in load_seedtts_samples(SEEDTTS_DATASET_ID, CI_SIMILARITY_SAMPLES, split="en")]
+    pooled = {"first 50": [], "all": []}
     for label in sys.argv[1:]:
         similarity = {}
         for arm in ("a", "b"):
@@ -54,6 +59,17 @@ def main() -> None:
                 f"{label} b minus a: SIM first 50 {paired(similarity['a'], similarity['b'], first)}, "
                 f"all {paired(similarity['a'], similarity['b'], sorted(similarity['a']))}"
             )
+            for name, ids in (("first 50", first), ("all", sorted(similarity["a"]))):
+                pooled[name] += [
+                    similarity["b"][sample_id] - similarity["a"][sample_id]
+                    for sample_id in ids
+                    if sample_id in similarity["a"] and sample_id in similarity["b"]
+                ]
+        else:
+            pass
+    for name, deltas in pooled.items():
+        if len(deltas) > 1:
+            print(f"pooled b minus a, SIM {name}: {interval(deltas)}")
         else:
             pass
 
