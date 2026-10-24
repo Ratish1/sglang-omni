@@ -12,8 +12,7 @@ from transformers.utils.generic import TransformersKwargs, merge_with_config_def
 from transformers.utils.output_capturing import capture_outputs
 from transformers.vision_utils import get_vision_cu_seqlens, get_vision_position_ids
 
-# note (ratish): below this many grid rows the per-row loop is faster (crossover measured on H20);
-# both forms give the same bits.
+# note (ratish): below this many grid rows the per-row loop is faster (crossover measured on H20).
 VECTORIZED_POS_EMBED_MIN_IMAGES = 6
 
 
@@ -223,8 +222,8 @@ class Qwen3OmniMoeVisionEncoderCompat(hf_modeling.Qwen3OmniMoeVisionEncoder):
         # kwargs. This compatibility path always recomputes them from the grid.
         kwargs.pop("interp_indices", None)
         kwargs.pop("interp_weights", None)
-        # note (ratish): every length is derived on the host from the grid; the
-        # device receives one copy of each and is never read back.
+        # note (ratish): the rotary positions and attention lengths are derived on the host
+        # from the grid; the device receives one copy of each and is never read back.
         host_grid_thw = grid_thw.cpu()
         position_ids = get_vision_position_ids(
             host_grid_thw, self.spatial_merge_size, kwargs=kwargs
