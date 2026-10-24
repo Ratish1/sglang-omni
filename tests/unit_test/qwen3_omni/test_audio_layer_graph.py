@@ -13,6 +13,8 @@ from sglang_omni.models.qwen3_omni.components import audio_layer_graph
 from sglang_omni.models.qwen3_omni.components.audio_layer_graph import (
     DEFAULT_TOKEN_BUCKETS,
     AudioLayerGraphRunner,
+)
+from sglang_omni.models.qwen3_omni.components.packed_attention import (
     packed_attention_backend,
     resolve_packed_attention,
 )
