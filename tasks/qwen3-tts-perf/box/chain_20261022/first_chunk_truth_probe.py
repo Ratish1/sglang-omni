@@ -6,7 +6,8 @@ reference. Each bf16 path emits the first frame, then both continue with the sam
 frames; the fp32 truth is the decoder's own whole forward over the same codes (in fp32, as served for non-streaming).
 Two crossed variants separate D1's two changes: one pass from frame 0, and windows from the reach. Per distinct
 reference clip (rows sharing a clip are read once): SNR in dB of each path's emitted audio against the truth, over the
-first frame and over the whole stream, and of D1 against main; then each stream's SNR minus main's, paired by clip.
+first frame and over the whole stream, and of D1 against main; then each path's first-frame and stream SNR minus
+main's, paired by clip.
 
 usage: PYTHONPATH=<D1 tree> python3 first_chunk_truth_probe.py LIST [--card 3] [--references 96] [--generated 96]
 """
@@ -121,18 +122,19 @@ def main() -> None:
     for key in results[0]:
         values = [result[key] for result in results]
         print(f"median {key}: {statistics.median(values):.2f} dB (min {min(values):.2f}, max {max(values):.2f})")
-    baseline = "main: windows from 0 stream"
-    for key in results[0]:
-        if key.endswith("stream") and key != baseline:
-            deltas = [result[key] - result[baseline] for result in results]
-            mean = statistics.fmean(deltas)
-            error = statistics.stdev(deltas) / math.sqrt(len(deltas))
-            print(
-                f"{key} minus {baseline}: mean {mean:+.3f} dB (se {error:.3f}, 95 % {mean - 1.96 * error:+.3f} to "
-                f"{mean + 1.96 * error:+.3f}), worse on {sum(delta < 0 for delta in deltas)} of {len(deltas)}"
-            )
-        else:
-            pass
+    for segment in ("first", "stream"):
+        baseline = f"main: windows from 0 {segment}"
+        for key in results[0]:
+            if key.endswith(segment) and key != baseline:
+                deltas = [result[key] - result[baseline] for result in results]
+                mean = statistics.fmean(deltas)
+                error = statistics.stdev(deltas) / math.sqrt(len(deltas))
+                print(
+                    f"{key} minus {baseline}: mean {mean:+.3f} dB (se {error:.3f}, 95 % {mean - 1.96 * error:+.3f} "
+                    f"to {mean + 1.96 * error:+.3f}), worse on {sum(delta < 0 for delta in deltas)} of {len(deltas)}"
+                )
+            else:
+                pass
 
 
 if __name__ == "__main__":
