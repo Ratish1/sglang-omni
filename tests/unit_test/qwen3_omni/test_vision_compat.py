@@ -336,10 +336,13 @@ def test_packed_attention_receives_every_sequence_and_the_host_max_length(
         encoder(pixels, grid_thw=grid)
 
     assert packed_attention.call_count == vision_encoder.config.depth
+    metadata = packed_attention.call_args.kwargs["forward_metadata"]
+    assert metadata.cu_seqlens.tolist() == [0, 16, 40, 64]
+    assert isinstance(metadata.max_seqlen, int)
+    assert metadata.max_seqlen == 24
     for attention_call in packed_attention.call_args_list:
-        assert attention_call.args[3].tolist() == [0, 16, 40, 64]
-        assert isinstance(attention_call.kwargs["max_seqlen"], int)
-        assert attention_call.kwargs["max_seqlen"] == 24
+        assert attention_call.kwargs["forward_metadata"] is metadata
+        assert attention_call.args[3] is metadata.cu_seqlens
         assert attention_call.kwargs["seq_len"] == 64
 
 

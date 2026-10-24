@@ -16,6 +16,9 @@ from sglang_omni.models.qwen3_omni.components.audio_encoder import (
 from sglang_omni.models.qwen3_omni.components.audio_layer_graph import (
     stack_qkv_projection,
 )
+from sglang_omni.models.qwen3_omni.components.packed_attention import (
+    prepare_packed_attention_metadata,
+)
 
 HEADS, HEAD_DIM = 4, 16
 DIM = HEADS * HEAD_DIM
@@ -103,7 +106,7 @@ def test_shared_splits_match_the_per_layer_split_bitwise() -> None:
         assert torch.equal(got, want)
 
 
-def test_packed_attention_receives_every_window_and_the_host_max_length() -> None:
+def test_packed_attention_receives_the_call_metadata_in_every_layer() -> None:
     torch.manual_seed(0)
     packed_attention = Mock(
         side_effect=lambda query, key, value, cu_seqlens, **kwargs: value
@@ -115,6 +118,7 @@ def test_packed_attention_receives_every_window_and_the_host_max_length() -> Non
     segments = [104, 104, 52]
     hs, cu = inputs(segments)
     splits.value = segments
+    splits.attention_metadata = prepare_packed_attention_metadata(cu, max(segments))
     with torch.no_grad():
         for layer in tower.layers:
             attention = layer.self_attn
@@ -130,8 +134,9 @@ def test_packed_attention_receives_every_window_and_the_host_max_length() -> Non
                     received, projection(hs).reshape(sum(segments), HEADS, HEAD_DIM)
                 )
             assert attention_call.args[3] is cu
-            assert isinstance(attention_call.kwargs["max_seqlen"], int)
-            assert attention_call.kwargs["max_seqlen"] == 104
+            assert (
+                attention_call.kwargs["forward_metadata"] is splits.attention_metadata
+            )
             assert attention_call.kwargs["seq_len"] == 260
     assert packed_attention.call_count == len(tower.layers)
 

@@ -16,6 +16,7 @@ from sglang_omni.models.qwen3_omni.components.audio_layer_graph import (
 )
 from sglang_omni.models.qwen3_omni.components.packed_attention import (
     packed_attention_backend,
+    prepare_packed_attention_metadata,
     resolve_packed_attention,
 )
 
@@ -280,7 +281,7 @@ def test_packed_attention_matches_fp32_sdpa_per_segment_and_head() -> None:
             bsz=1,
             seq_len=q.shape[0],
             softmax_scale=HEAD_DIM**-0.5,
-            max_seqlen=WINDOW,
+            forward_metadata=prepare_packed_attention_metadata(cu_seqlens, WINDOW),
         )
         with sdpa_kernel(SDPBackend.MATH):
             reference = segmented_sdpa(
