@@ -272,6 +272,7 @@ def test_flash_backend_receives_host_max_sequence_lengths(
         Qwen3OmniVisionEncoder(
             vision_encoder.config,
             joint_rope_kernel=kernel if has_joint_kernel else None,
+            packed_attention=None,
         )
         .eval()
         .to(torch.bfloat16)
@@ -304,3 +305,33 @@ def test_flash_backend_receives_host_max_sequence_lengths(
         assert isinstance(backend_call.kwargs["max_length_k"], int)
         assert backend_call.kwargs["max_length_q"] == 24
         assert backend_call.kwargs["max_length_k"] == 24
+
+
+def test_packed_attention_receives_every_sequence_and_the_host_max_length(
+    vision_encoder: vision_compat.Qwen3OmniMoeVisionEncoderCompat,
+) -> None:
+    packed_attention = Mock(
+        side_effect=lambda query, key, value, cu_seqlens, **kwargs: value
+    )
+    encoder = (
+        Qwen3OmniVisionEncoder(
+            vision_encoder.config,
+            joint_rope_kernel=None,
+            packed_attention=packed_attention,
+        )
+        .eval()
+        .to(torch.bfloat16)
+    )
+    encoder.load_state_dict(vision_encoder.state_dict(), strict=True)
+    grid = torch.tensor([[1, 4, 4], [2, 4, 6]], dtype=torch.long, device="cpu")
+    pixels = torch.randn(64, 24, dtype=torch.bfloat16, device="cpu")
+
+    with torch.no_grad():
+        encoder(pixels, grid_thw=grid)
+
+    assert packed_attention.call_count == vision_encoder.config.depth
+    for attention_call in packed_attention.call_args_list:
+        assert attention_call.args[3].tolist() == [0, 16, 40, 64]
+        assert isinstance(attention_call.kwargs["max_seqlen"], int)
+        assert attention_call.kwargs["max_seqlen"] == 24
+        assert attention_call.kwargs["seq_len"] == 64
