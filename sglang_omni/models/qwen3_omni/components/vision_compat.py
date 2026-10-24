@@ -53,14 +53,17 @@ class Qwen3OmniMoeVisionEncoderCompat(hf_modeling.Qwen3OmniMoeVisionEncoder):
         num_grid_per_side = self.num_grid_per_side
         m_size = self.spatial_merge_size
         hidden_dim = self.pos_embed.embedding_dim
+        # note (ratish): the model's device and dtype properties iterate its parameters on every read.
+        dtype = self.pos_embed.weight.dtype
+        device = self.pos_embed.weight.device
 
         outputs = []
         for t, h, w in grid_thw:
             h_idxs = torch.linspace(
-                0, num_grid_per_side - 1, h, dtype=torch.float32, device=self.device
+                0, num_grid_per_side - 1, h, dtype=torch.float32, device=device
             )
             w_idxs = torch.linspace(
-                0, num_grid_per_side - 1, w, dtype=torch.float32, device=self.device
+                0, num_grid_per_side - 1, w, dtype=torch.float32, device=device
             )
 
             h_floor = h_idxs.to(torch.long)
@@ -86,7 +89,7 @@ class Qwen3OmniMoeVisionEncoderCompat(hf_modeling.Qwen3OmniMoeVisionEncoder):
 
             indices = (h_grid_idx + w_grid).reshape(4, -1)
             weights = torch.stack([w00, w01, w10, w11], dim=0).reshape(4, -1, 1)
-            weights = weights.to(dtype=self.dtype)
+            weights = weights.to(dtype=dtype)
 
             embeds = self.pos_embed(indices)
             embeds *= weights
@@ -108,8 +111,8 @@ class Qwen3OmniMoeVisionEncoderCompat(hf_modeling.Qwen3OmniMoeVisionEncoder):
         """fast_pos_embed_interpolate_from_list over all grid rows at once, equal bit for bit."""
         num_grid_per_side = self.num_grid_per_side
         m = self.spatial_merge_size
-        dtype = self.dtype
-        device = self.device
+        dtype = self.pos_embed.weight.dtype
+        device = self.pos_embed.weight.device
 
         ts = [g[0] for g in grid_thw]
         hs = [g[1] for g in grid_thw]
