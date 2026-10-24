@@ -33,7 +33,7 @@ for name in t_l6r t_l5r; do
 done
 wait
 rm -rf $D/inductor_t_l5r
-cp -a $D/inductor_t_l5q $D/inductor_t_l5r
+cp -a $D/inductor_t_l5p $D/inductor_t_l5r
 bash $IN/warm_c20261021.sh t_l5r 1 $(cpus 1) 29700 $P/warm_t_l5r
 log "warm t_l5r $(grep 'bench rc' $P/warm_t_l5r/progress.txt) $(grep -E 'Completed requests|Failed requests' $P/warm_t_l5r/bench.log | tr -s ' ' | tr '\n' ' ') tracebacks $(grep -c Traceback $P/warm_t_l5r/serve.log)"
 grep -E 'Flow prefix cache|largest admitted step|prefix compile warmup|prefill graph' $P/warm_t_l5r/serve.log | sed 's/^.*\] //' | sed 's/^/    /' >> $P/queue65.txt
