@@ -1,6 +1,7 @@
 """Remote review diagnostics through real component constructors and checkpoints."""
 
 import argparse
+import contextlib
 import hashlib
 import json
 from pathlib import Path
@@ -62,7 +63,7 @@ def run(root, label, output, dtype):
                 arguments = dict(input_features=features, feature_attention_mask=mask)
             else:
                 arguments = dict(pixel_values=torch.randn(64,24), image_grid_thw=torch.tensor([[1,4,4],[2,4,6]]))
-            with torch.no_grad(), sdpa_kernel(SDPBackend.MATH):
+            with torch.no_grad(), (sdpa_kernel(SDPBackend.MATH) if dtype == 'float32' else contextlib.nullcontext()):
                 result = model(**arguments)
             main_key = 'audio_embeds' if kind == 'audio' else 'image_embeds'
             first = result[main_key]
@@ -75,7 +76,7 @@ def run(root, label, output, dtype):
             else:
                 arguments['pixel_values'][16:] += 20
                 count = 4
-            with torch.no_grad(), sdpa_kernel(SDPBackend.MATH):
+            with torch.no_grad(), (sdpa_kernel(SDPBackend.MATH) if dtype == 'float32' else contextlib.nullcontext()):
                 second = model(**arguments)[main_key]
             record['first_segment_unchanged'] = bool(torch.equal(first[:count], second[:count]))
             records.append(record)
