@@ -63,6 +63,7 @@ def prepare_packed_attention_metadata(
     cu_seqlens: torch.Tensor, max_seqlen: int
 ) -> PackedAttentionMetadata:
     """The packed attention's metadata for one encoder call, with the longest sequence from the host."""
+    # Local import, for the same reason as in resolve_packed_attention.
     from sglang.srt.layers.attention import vision
 
     # note (ratish): given metadata, the kernels ignore SGLANG_VIT_ENABLE_CUDA_GRAPH, which changes how they read cu_seqlens.
