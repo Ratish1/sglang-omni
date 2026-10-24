@@ -46,7 +46,11 @@ def main() -> None:
     for prompt in prompts:
         (inputs_a, logits_a), (inputs_b, logits_b) = first[prompt], second[prompt]
         prefix = inputs_a["prefix"]
-        media = torch.tensor([token_id >= vocab_size for token_id in prompt[prefix:]])
+        # note (ratish): a chunk re-prefilled after a decode retraction extends past the prompt; its rows there are text.
+        chunk_rows = inputs_a["input_embeds"].shape[0]
+        prompt_media = torch.tensor(prompt[prefix : prefix + chunk_rows], dtype=torch.long) >= vocab_size
+        media = torch.zeros(chunk_rows, dtype=torch.bool)
+        media[: prompt_media.numel()] = prompt_media
         embeds_equal = torch.equal(inputs_a["input_embeds"], inputs_b["input_embeds"])
         media_equal = torch.equal(inputs_a["input_embeds"][media], inputs_b["input_embeds"][media])
         deepstack_equal = (inputs_a["deepstack_embeds"] is None and inputs_b["deepstack_embeds"] is None) or (
