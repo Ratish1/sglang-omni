@@ -52,7 +52,7 @@ run_pair runaway_ns_c16_b 3 2 11200
 python3 $HERE/runaway_rates.py --pairs runaway_ns_c16_a runaway_ns_c16_b > $D/runaway_rates_served.txt 2>&1
 echo "served rates done $(date +%T)" >> $L
 for card in 2 3; do
-  (cd $D && PYTHONPATH=$M python3 $HERE/reference_runaway.py $D/reference/meta.lst $D/reference_card$card.json --card $card \
+  (cd $D && ${REFPY:?the reference venv python} $HERE/reference_runaway.py $D/reference/meta.lst $D/reference_card$card.json --card $card \
     > $D/reference_card$card.txt 2>&1; echo "reference card $card rc $? $(date +%T)" >> $L) &
 done
 wait

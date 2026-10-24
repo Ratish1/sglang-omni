@@ -4,10 +4,10 @@ voice clone with the reference transcript, language Auto, as the served requests
 with max_new_tokens 600: a row that reaches 600 frames (48 s) emitted no codec EOS. Writes each request's generated
 frames to OUT_JSON.
 
-usage: PYTHONPATH=<omni tree> python3 reference_runaway.py META_LST OUT_JSON --card 2 [--batch 50] [--max-new-tokens 600]
+usage: <venv>/bin/python reference_runaway.py META_LST OUT_JSON --card 2 [--batch 50] [--max-new-tokens 600]
 
-qwen-tts 0.1.1 needs the omni tree's Transformers call-shape shims (the image ships Transformers 5.19), applied before
-it is imported, as the serving path does; they change no arithmetic.
+Run in a venv holding qwen-tts 0.1.1's pins (transformers 4.57.3, accelerate 1.12.0) over the image's torch: its talker
+does not load under the image's Transformers 5.19.
 """
 
 import argparse
@@ -17,12 +17,7 @@ from collections import defaultdict
 from pathlib import Path
 
 import torch
-
-from sglang_omni.models.qwen3_tts.compat import apply_qwen_tts_transformers_compatibility_patches
-
-apply_qwen_tts_transformers_compatibility_patches()
-
-from qwen_tts import Qwen3TTSModel  # noqa: E402
+from qwen_tts import Qwen3TTSModel
 
 MODEL = "Qwen/Qwen3-TTS-12Hz-1.7B-Base"
 SAMPLES_PER_FRAME = 1920
