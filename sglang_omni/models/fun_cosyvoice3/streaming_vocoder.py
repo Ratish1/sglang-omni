@@ -271,11 +271,9 @@ class FunCosyVoice3StreamingVocoderScheduler(
         self, device: torch.device, *, row_count: int, generated_tokens_per_row: int
     ) -> int:
         """Device memory the largest step this scheduler admits maps beyond what stays
-        resident: row_count streams of generated_tokens_per_row tokens after the longest
-        reference prompt, as uncached hops and as finals over their whole history, each
-        followed by HiFT."""
-        hop_frames = self.token_max_hop_len * self.vocoder.flow.token_mel_ratio
-        samples_per_frame = self.vocoder.hift_samples_per_mel_frame
+        resident, over rows of generated_tokens_per_row tokens after the longest
+        reference prompt: the larger of row_count streams as uncached hops and finals,
+        and the largest non-streaming batch."""
         # note (ratish): without ref_text the engine's prompt omits the reference tokens,
         # so Flow gets the whole reference on top of a context of generated tokens.
         prompt_token_count = MAX_REFERENCE_SECONDS * self.vocoder.flow.input_frame_rate
@@ -288,37 +286,84 @@ class FunCosyVoice3StreamingVocoderScheduler(
             )
             for _ in range(row_count)
         ]
+        started = time.monotonic()
+        streaming_bytes = self.measure_peak_bytes(device, items, is_streaming=True)
+        non_streaming_bytes = self.measure_peak_bytes(device, items, is_streaming=False)
+        logger.info(
+            f"Fun-CosyVoice3 largest admitted step, {row_count} rows of "
+            f"{generated_tokens_per_row} tokens after a {prompt_token_count} token "
+            f"prompt: streaming {streaming_bytes / 2**30:.2f} GB, non-streaming "
+            f"{non_streaming_bytes / 2**30:.2f} GB mapped "
+            f"({time.monotonic() - started:.1f} s)"
+        )
+        return max(streaming_bytes, non_streaming_bytes)
+
+    def measure_peak_bytes(
+        self, device: torch.device, items: list[FlowBatchInput], *, is_streaming: bool
+    ) -> int:
+        """Device memory one pass maps beyond what stays resident: the items as uncached
+        hops and as finals, each followed by a HiFT step, or the non-streaming decode
+        of one item alone and of the largest batch the admission budget lets through."""
+        token_mel_ratio = self.vocoder.flow.token_mel_ratio
+        hop_frames = self.token_max_hop_len * token_mel_ratio
+        samples_per_frame = self.vocoder.hift_samples_per_mel_frame
         torch.accelerator.synchronize(device)
         torch.accelerator.empty_cache()
         resident_bytes = torch.accelerator.memory_reserved(device)
         torch.accelerator.reset_peak_memory_stats(device)
-        started = time.monotonic()
         with self.vocoder.stream_context:
-            for decode, is_final in (
-                (self.vocoder.hop_batch, False),
-                (self.vocoder.leftover_batch, True),
-            ):
-                mels = decode(items)
-                self.vocoder.hift_step(
-                    [
-                        HiftStepRow(
-                            history=mel,
-                            emitted_samples=max(int(mel.shape[2]) - hop_frames, 0)
-                            * samples_per_frame,
-                            is_final=is_final,
+            if is_streaming:
+                for decode, is_final in (
+                    (self.vocoder.hop_batch, False),
+                    (self.vocoder.leftover_batch, True),
+                ):
+                    mels = decode(items)
+                    self.vocoder.hift_step(
+                        [
+                            HiftStepRow(
+                                history=mel,
+                                emitted_samples=max(int(mel.shape[2]) - hop_frames, 0)
+                                * samples_per_frame,
+                                is_final=is_final,
+                            )
+                            for mel in mels
+                        ]
+                    ).wait()
+            else:
+                # note (ratish): a non-streaming request runs the final's Flow, then HiFT
+                # over its whole mel. Batched requests fit the admission budget, and a
+                # HiFT group pads to its longest row within the Flow merge budget and
+                # HiFT's padding cap.
+                mels = self.vocoder.leftover_batch(items[:1])
+                self.vocoder.mel2wav_batch(mels)
+                if self.max_batch_size > 1:
+                    row_frames = (
+                        int(items[0].prompt_token.shape[1])
+                        + int(items[0].token.shape[1])
+                    ) * token_mel_ratio
+                    if self.max_batch_cost is None:
+                        batch_frames = self.max_batch_size * row_frames
+                    else:
+                        batch_frames = min(
+                            self.max_batch_cost, self.max_batch_size * row_frames
                         )
-                        for mel in mels
-                    ]
-                ).wait()
+                    padding_ratio = min(
+                        self.vocoder.hift_max_padding_waste,
+                        1 + self.vocoder.flow_merge_pad_budget_percent / 100,
+                    )
+                    padded_frames = (
+                        int(batch_frames * padding_ratio) // self.max_batch_size
+                    )
+                    self.vocoder.mel2wav_batch(
+                        [
+                            mels[0].new_zeros(1, int(mels[0].shape[1]), padded_frames)
+                            for _ in range(self.max_batch_size)
+                        ]
+                    )
+                else:
+                    pass
         torch.accelerator.synchronize(device)
-        peak_bytes = torch.accelerator.max_memory_reserved(device) - resident_bytes
-        logger.info(
-            f"Fun-CosyVoice3 largest admitted step, {row_count} rows of "
-            f"{generated_tokens_per_row} tokens after a {prompt_token_count} token "
-            f"prompt: {peak_bytes / 2**30:.2f} GB mapped "
-            f"({time.monotonic() - started:.1f} s)"
-        )
-        return peak_bytes
+        return torch.accelerator.max_memory_reserved(device) - resident_bytes
 
     def warmup_prefix_compile(self) -> None:
         """The pool's compiled prefix forward through its hops, so its graphs capture
