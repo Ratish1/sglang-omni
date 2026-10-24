@@ -4,7 +4,8 @@
 # step (every layer's codec K and V in one arena tensor). Gate before the profile and the pairs, cards 2 and 3, one
 # job at a time so no timing shares the host: units and the real-checkpoint tests on both branches; D8's speaker and
 # reference encode benches (main, D8, D8, main); D8's distance to the model's fp32 preprocessing (embedding cosine and
-# codes, main and D8 paired); whether a fresh FFT or conv plan waits for other streams' work; D3's arena identity
+# codes, main and D8 paired); whether a fresh FFT or conv plan waits for other streams' work, and in serving the other
+# streams' longest chunk silence while long references of new widths are preprocessed; D3's arena identity
 # against main (cohorts through gather, decode, scatter) and its decode bench (main, D3, D3, main). A branch whose
 # units, gates or identity fail is flagged in $D/failed_<branch> and the later queues skip it.
 set -u
@@ -71,6 +72,19 @@ done
 echo "truth compare rc $? $(date +%T)" >> $L
 python3 $HERE/plan_wait_probe.py --card 3 > $D/plan_wait.txt 2>&1
 echo "plan wait rc $? $(date +%T)" >> $L
+# note (ratish): a new FFT size waits for the whole device (plan_wait.txt), and D8's mel past the graphs makes one
+# per new rounded width, so the served cost of each width's first clip is read here, both card orders.
+FW=$D/fresh_width
+(cd $M && PYTHONPATH=$M python3 $T/tasks/qwen3-tts-perf/box/next_20261024/fresh_width_meta.py $FW > $D/fresh_width_meta.log 2>&1)
+echo "fresh width list rc $? $(tail -n 1 $D/fresh_width_meta.log) $(date +%T)" >> $L
+export PAIR_ROOT=$D/pairs
+for spec in "fw_a 2 3 2400" "fw_b 3 2 3600"; do
+  set -- $spec
+  python3 $T/tasks/qwen3-tts-perf/box/v3_20261020/pair.py --label $1 --tree $M --b-tree $P8 --concurrency 16 \
+    --a-card $2 --b-card $3 --port $4 --meta $FW/fresh_width.lst --events --skip-score > $D/$1.out 2>&1
+  echo "$1 rc $? $(date +%T)" >> $L
+  python3 $T/tasks/qwen3-tts-perf/box/next_20261024/arrival_stalls.py $1 > $D/stalls_$1.txt 2>&1
+done
 for arm in "main $M" "d3 $P3"; do
   set -- $arm
   (cd $2 && PYTHONPATH=$2 python3 $HERE/vocoder_identity_probe.py $D/identity_$1.pt --card 3 > $D/identity_$1.log 2>&1)
