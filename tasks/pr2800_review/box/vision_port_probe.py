@@ -7,9 +7,9 @@ Run on the box from the branch's tree (cwd and PYTHONPATH the tree):
    align_corners=True) in float64, and whether the vectorized form equals the loop.
 2. The served encoder (build_visual, the checkpoint's dtype, card 0) on every recorded interpolation of each --calls
    set (videoamme_pair.py --encoder-grids): the branch's loop, vectorized and dispatched forms (the forward's choice at
-   VECTORIZED_POS_EMBED_MIN_IMAGES rows) against SGLang's Qwen3VLMoeVisionModel.fast_pos_embed_interpolate_from_list on
-   a stub holding the same table, counted bit-equal; then each form's summed time, one warmup and three timed sweeps,
-   each interpolation synchronized before and after.
+   VECTORIZED_POS_EMBED_MIN_IMAGES rows) and SGLang's vectorized form against SGLang's
+   Qwen3VLMoeVisionModel.fast_pos_embed_interpolate_from_list on a stub holding the same table, counted bit-equal; then
+   each form's summed time, one warmup and three timed sweeps, each interpolation synchronized before and after.
 """
 
 from __future__ import annotations
@@ -69,7 +69,8 @@ def main() -> None:
           f"{visual.device} dtype {visual.dtype}; threshold {threshold} (SGLang {sglang_threshold})", flush=True)
     forms = {
         "sglang_loop": lambda grid: qwen3_vl.Qwen3VLMoeVisionModel.fast_pos_embed_interpolate_from_list(stub, grid),
-        "loop": visual.fast_pos_embed_interpolate_from_list,
+        "sglang_vec": lambda grid: qwen3_vl.Qwen3VLMoeVisionModel.fast_pos_embed_interpolate_vectorized(stub, grid),
+        "loop":visual.fast_pos_embed_interpolate_from_list,
         "vectorized": visual.fast_pos_embed_interpolate_vectorized,
         "dispatch": lambda grid: (
             visual.fast_pos_embed_interpolate_vectorized(grid)
