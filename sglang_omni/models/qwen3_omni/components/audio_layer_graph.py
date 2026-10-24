@@ -10,10 +10,6 @@ from dataclasses import dataclass
 import torch
 import torch.nn as nn
 
-from sglang_omni.models.qwen3_omni.components.packed_attention import (
-    resolve_packed_attention,
-)
-
 logger = logging.getLogger(__name__)
 
 DEFAULT_TOKEN_BUCKETS: tuple[int, ...] = (128, 256, 512, 1024, 2048, 4096)
@@ -58,10 +54,8 @@ def packed_attention_forward(
 class AudioLayerGraphRunner:
     """Replays the audio encoder's layer stack from a captured CUDA graph.
 
-    One instance owns one tower on one CUDA device. Replay is opt-in because
-    it runs the packed attention kernel sglang picks for the device where
-    serving otherwise runs sdpa: outputs agree to bf16 kernel noise, not
-    bitwise, so it needs the content gate rather than an equality check.
+    One instance owns one tower on one CUDA device and attends through the
+    encoder's packed attention.
     """
 
     def __init__(
@@ -70,6 +64,7 @@ class AudioLayerGraphRunner:
         *,
         device: torch.device,
         window: int,
+        packed_attention: nn.Module,
         token_buckets: tuple[int, ...] = DEFAULT_TOKEN_BUCKETS,
         max_batch_rows: int = 32,
     ) -> None:
@@ -93,8 +88,7 @@ class AudioLayerGraphRunner:
         self.owner_pid = os.getpid()
         self.dtype = next(tower.parameters()).dtype
         self.hidden = tower.config.d_model
-        self.packed_attention: nn.Module | None = None
-        self.backend: str | None = None
+        self.packed_attention: nn.Module = packed_attention
 
     @property
     def has_graphs(self) -> bool:
@@ -122,22 +116,6 @@ class AudioLayerGraphRunner:
         segments = self.window_segments(bucket)
         segments.extend([0] * (self.segment_slots(bucket) - len(segments)))
         return segments
-
-    def resolve_attention(self) -> None:
-        if self.packed_attention is not None or self.disabled_reason is not None:
-            return
-        else:
-            pass
-        try:
-            self.packed_attention, self.backend = resolve_packed_attention(self.device)
-        except Exception as exc:
-            # Like a failed capture: the encoder stays eager, the stage lives.
-            self.disabled_reason = f"packed attention unavailable: {exc}"
-            logger.warning(
-                "audio layer CUDA graphs unavailable: %s",
-                self.disabled_reason,
-                exc_info=True,
-            )
 
     def run_layers(self, hidden_states, cu_seqlens, max_seqlen: int):
         for layer in self.tower.layers:
@@ -197,11 +175,6 @@ class AudioLayerGraphRunner:
         return Captured(graph, hidden_states, cu_seqlens, output, slots)
 
     def capture_all(self) -> None:
-        self.resolve_attention()
-        if self.disabled_reason is not None:
-            return
-        else:
-            pass
         for bucket in self.token_buckets:
             captured = self.capture(bucket)
             if captured is None:
@@ -212,9 +185,8 @@ class AudioLayerGraphRunner:
                 pass
             self.graphs[bucket] = captured
         logger.info(
-            "audio layer CUDA graphs captured for buckets %s with %s attention",
-            list(self.graphs),
-            self.backend,
+            f"audio layer CUDA graphs captured for buckets {list(self.graphs)} "
+            f"with {type(self.packed_attention).__name__}"
         )
 
     def select(self, tokens: int, segments: list[int]) -> int | None:

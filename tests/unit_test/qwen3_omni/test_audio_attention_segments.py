@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+from unittest.mock import Mock
+
 import torch
 import torch.nn as nn
 from transformers.models.qwen3_omni_moe import modeling_qwen3_omni_moe as hf_modeling
@@ -90,12 +92,36 @@ def test_shared_splits_match_the_per_layer_split_bitwise() -> None:
     hs, cu = inputs(segments)
     with torch.no_grad():
         reference = [layer.self_attn(hs, cu) for layer in tower.layers]
-    share_segment_splits(tower, splits)
+    share_segment_splits(tower, splits, None)
     splits.value = segments
     with torch.no_grad():
         shared = [layer.self_attn(hs, cu) for layer in tower.layers]
     for got, want in zip(shared, reference):
         assert torch.equal(got, want)
+
+
+def test_packed_attention_receives_every_window_and_the_host_max_length() -> None:
+    torch.manual_seed(0)
+    packed_attention = Mock(
+        side_effect=lambda query, key, value, cu_seqlens, **kwargs: value
+    )
+    tower, splits = Tower(), SegmentSplits()
+    share_segment_splits(tower, splits, packed_attention)
+    segments = [104, 104, 52]
+    hs, cu = inputs(segments)
+    splits.value = segments
+    with torch.no_grad():
+        for layer in tower.layers:
+            attention = layer.self_attn
+            assert torch.equal(
+                attention(hs, cu), attention.out_proj(attention.v_proj(hs))
+            )
+    assert packed_attention.call_count == len(tower.layers)
+    for attention_call in packed_attention.call_args_list:
+        assert attention_call.args[3] is cu
+        assert isinstance(attention_call.kwargs["max_seqlen"], int)
+        assert attention_call.kwargs["max_seqlen"] == 104
+        assert attention_call.kwargs["seq_len"] == 260
 
 
 def test_missing_splits_fall_back_to_the_stock_path() -> None:
@@ -104,7 +130,7 @@ def test_missing_splits_fall_back_to_the_stock_path() -> None:
     hs, cu = inputs([104, 26])
     with torch.no_grad():
         reference = tower.layers[0].self_attn(hs, cu)
-    share_segment_splits(tower, splits)
+    share_segment_splits(tower, splits, None)
     splits.value = None
     with torch.no_grad():
         assert torch.equal(tower.layers[0].self_attn(hs, cu), reference)
@@ -116,7 +142,7 @@ def test_mismatched_splits_fall_back_instead_of_corrupting() -> None:
     hs, cu = inputs([104, 26])
     with torch.no_grad():
         reference = tower.layers[0].self_attn(hs, cu)
-    share_segment_splits(tower, splits)
+    share_segment_splits(tower, splits, None)
     splits.value = [64, 64]
     with torch.no_grad():
         assert torch.equal(tower.layers[0].self_attn(hs, cu), reference)
@@ -125,7 +151,7 @@ def test_mismatched_splits_fall_back_instead_of_corrupting() -> None:
 def test_shared_splits_do_not_copy_from_device_per_layer() -> None:
     """The whole point is one host round-trip per request, not one per layer."""
     tower, splits = Tower(), SegmentSplits()
-    share_segment_splits(tower, splits)
+    share_segment_splits(tower, splits, None)
     segments = [104, 26]
     hs, cu = inputs(segments)
     splits.value = segments

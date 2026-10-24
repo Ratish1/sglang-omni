@@ -9,7 +9,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn.attention import SDPBackend, sdpa_kernel
 
-from sglang_omni.models.qwen3_omni.components import audio_layer_graph
 from sglang_omni.models.qwen3_omni.components.audio_layer_graph import (
     DEFAULT_TOKEN_BUCKETS,
     AudioLayerGraphRunner,
@@ -51,13 +50,22 @@ class Tower(nn.Module):
 def make_runner(**kwargs) -> AudioLayerGraphRunner:
     tower = Tower()
     return AudioLayerGraphRunner(
-        tower, device=torch.device("cuda", 0), window=WINDOW, **kwargs
+        tower,
+        device=torch.device("cuda", 0),
+        window=WINDOW,
+        packed_attention=SegmentedSdpa(),
+        **kwargs,
     )
 
 
 def test_cpu_device_is_rejected() -> None:
     with pytest.raises(ValueError):
-        AudioLayerGraphRunner(Tower(), device=torch.device("cpu"), window=WINDOW)
+        AudioLayerGraphRunner(
+            Tower(),
+            device=torch.device("cpu"),
+            window=WINDOW,
+            packed_attention=SegmentedSdpa(),
+        )
 
 
 def test_runner_without_captured_graphs_declines() -> None:
@@ -151,20 +159,6 @@ def test_packed_attention_backend_keeps_hip_off_fa3() -> None:
     """PyTorch HIP reports gfx950 as (9, 5); that is not NVIDIA Hopper."""
     assert packed_attention_backend((9, 5), is_hip=True) == "triton_attn"
     assert packed_attention_backend((9, 0), is_hip=True) == "triton_attn"
-
-
-def test_an_unresolvable_kernel_stack_stays_eager_with_a_reason(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    def resolve(device: torch.device) -> tuple[nn.Module, str]:
-        raise ImportError("no flash attention build for this torch")
-
-    monkeypatch.setattr(audio_layer_graph, "resolve_packed_attention", resolve)
-    runner = make_runner()
-    runner.capture_all()
-    assert runner.has_graphs is False
-    assert runner.graphs == {}
-    assert "no flash attention build" in runner.disabled_reason
 
 
 def test_capture_segments_fit_the_declared_window() -> None:
@@ -270,9 +264,12 @@ def test_packed_layer_stack_matches_segmented_sdpa() -> None:
     torch.manual_seed(0)
     device = torch.device("cuda", 0)
     tower = RealTower().to(device, torch.bfloat16)
-    runner = AudioLayerGraphRunner(tower, device=device, window=WINDOW)
-    runner.resolve_attention()
-    assert runner.disabled_reason is None, runner.disabled_reason
+    runner = AudioLayerGraphRunner(
+        tower,
+        device=device,
+        window=WINDOW,
+        packed_attention=resolve_packed_attention(device)[0],
+    )
     segments = [104, 104, 49, 37, 90]
     hidden = torch.randn(sum(segments), tower.config.d_model, device=device).to(
         torch.bfloat16
@@ -288,8 +285,14 @@ def test_packed_layer_stack_matches_segmented_sdpa() -> None:
 @pytest.mark.accelerator
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_capture_all_records_a_graph_for_every_bucket() -> None:
-    tower = RealTower().to(torch.device("cuda", 0), torch.bfloat16)
-    runner = AudioLayerGraphRunner(tower, device=torch.device("cuda", 0), window=WINDOW)
+    device = torch.device("cuda", 0)
+    tower = RealTower().to(device, torch.bfloat16)
+    runner = AudioLayerGraphRunner(
+        tower,
+        device=device,
+        window=WINDOW,
+        packed_attention=resolve_packed_attention(device)[0],
+    )
     runner.capture_all()
     assert runner.has_graphs, runner.disabled_reason
     assert sorted(runner.graphs) == sorted(DEFAULT_TOKEN_BUCKETS)
@@ -301,7 +304,12 @@ def test_replay_matches_the_uncaptured_packed_stack_across_bucket_boundaries() -
     torch.manual_seed(0)
     device = torch.device("cuda", 0)
     tower = RealTower().to(device, torch.bfloat16)
-    runner = AudioLayerGraphRunner(tower, device=device, window=WINDOW)
+    runner = AudioLayerGraphRunner(
+        tower,
+        device=device,
+        window=WINDOW,
+        packed_attention=resolve_packed_attention(device)[0],
+    )
     runner.capture_all()
     assert runner.has_graphs, runner.disabled_reason
 

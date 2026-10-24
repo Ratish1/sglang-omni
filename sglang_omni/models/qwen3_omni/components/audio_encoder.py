@@ -15,8 +15,12 @@ from transformers.models.qwen3_omni_moe.configuration_qwen3_omni_moe import (
 
 from sglang_omni.models.qwen3_omni.components.audio_layer_graph import (
     AudioLayerGraphRunner,
+    packed_attention_forward,
 )
 from sglang_omni.models.qwen3_omni.components.common import load_thinker_config
+from sglang_omni.models.qwen3_omni.components.packed_attention import (
+    resolve_packed_attention,
+)
 from sglang_omni.models.weight_loader import load_module, resolve_dtype
 from sglang_omni.utils import instantiate_module
 
@@ -96,6 +100,15 @@ def forward_with_shared_segments(
         )  # noqa: leading-underscore  # upstream spelling, or the public name is already taken
     else:
         pass
+    packed_attention = (
+        self._omni_packed_attention
+    )  # noqa: leading-underscore  # upstream spelling, or the public name is already taken
+    if packed_attention is not None:
+        return packed_attention_forward(
+            self, packed_attention, hidden_states, cu_seqlens, max(splits)
+        )
+    else:
+        pass
 
     seq_length, _ = hidden_states.size()
     query_states = self.q_proj(hidden_states).reshape(seq_length, self.num_heads, -1)
@@ -131,13 +144,16 @@ def forward_with_shared_segments(
     return self.out_proj(attn_output)
 
 
-def share_segment_splits(tower: nn.Module, splits: SegmentSplits) -> None:
+def share_segment_splits(
+    tower: nn.Module, splits: SegmentSplits, packed_attention: nn.Module | None
+) -> None:
     # Note (wenyao): the stock attention derives its split sizes with a
     # device-to-host copy, so every one of the 32 layers stalls on the same
     # value; that sync is also what makes the stack uncapturable.
     for layer in tower.layers:
         attention = layer.self_attn
         attention._omni_segment_splits = splits  # noqa: leading-underscore  # upstream spelling, or the public name is already taken
+        attention._omni_packed_attention = packed_attention  # noqa: leading-underscore  # upstream spelling, or the public name is already taken
         attention._omni_unshared_forward = (
             attention.forward
         )  # noqa: leading-underscore  # upstream spelling, or the public name is already taken
@@ -199,7 +215,16 @@ class Qwen3OmniAudioEncoder(nn.Module):
             hf_modeling._get_feat_extract_output_lengths
         )  # noqa: leading-underscore  # upstream spelling, or the public name is already taken
         self.segment_splits = SegmentSplits()
-        share_segment_splits(self.audio_tower, self.segment_splits)
+        # note (ratish): on a CUDA device the eager layers attend as the layer graphs do, one varlen call per
+        # layer over every window; other devices keep the Transformers attention.
+        self.packed_attention: nn.Module | None = (
+            resolve_packed_attention(self.device)[0]
+            if self.device.type == "cuda"
+            else None
+        )
+        share_segment_splits(
+            self.audio_tower, self.segment_splits, self.packed_attention
+        )
         self.layer_graph_runner = None
         if enable_layer_cuda_graph and self.device.type == "cuda":
             self.enable_layer_cuda_graph()
@@ -214,7 +239,12 @@ class Qwen3OmniAudioEncoder(nn.Module):
             ).item()
         )
         window = chunk_tokens * (tower.n_window_infer // (tower.n_window * 2))
-        runner = AudioLayerGraphRunner(tower, device=self.device, window=window)
+        runner = AudioLayerGraphRunner(
+            tower,
+            device=self.device,
+            window=window,
+            packed_attention=self.packed_attention,
+        )
         runner.capture_all()
         if not runner.has_graphs:
             logger.warning("audio layer CUDA graphs unavailable; staying eager")
