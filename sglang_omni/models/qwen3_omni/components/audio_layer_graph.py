@@ -140,9 +140,13 @@ class AudioLayerGraphRunner:
         segments.extend([0] * (self.segment_slots(bucket) - len(segments)))
         return segments
 
-    def run_layers(self, hidden_states, cu_seqlens, max_seqlen: int):
+    def run_layers(self, hidden_states, cu_seqlens, max_seqlen: int, frozen=None):
         # An int max_seqlen avoids the device-to-host max() that would break capture.
-        attention_metadata = prepare_packed_attention_metadata(cu_seqlens, max_seqlen)
+        attention_metadata = (
+            prepare_packed_attention_metadata(cu_seqlens, max_seqlen)
+            if frozen is None
+            else frozen
+        )
         for layer in self.tower.layers:
             residual = hidden_states
             hidden_states = layer.self_attn_layer_norm(hidden_states)
@@ -175,19 +179,24 @@ class AudioLayerGraphRunner:
             .to(torch.int32)
             .to(self.device)
         )
+        frozen = prepare_packed_attention_metadata(cu_seqlens, self.window)
         try:
             with torch.no_grad():
                 for _ in range(WARMUP_ITERATIONS):
-                    self.run_layers(hidden_states, cu_seqlens, self.window)
+                    self.run_layers(hidden_states, cu_seqlens, self.window, frozen)
                 torch.cuda.synchronize()
                 graph = torch.cuda.CUDAGraph()
                 if self.pool is None:
                     with torch.cuda.graph(graph):
-                        output = self.run_layers(hidden_states, cu_seqlens, self.window)
+                        output = self.run_layers(
+                            hidden_states, cu_seqlens, self.window, frozen
+                        )
                     self.pool = graph.pool()
                 else:
                     with torch.cuda.graph(graph, pool=self.pool):
-                        output = self.run_layers(hidden_states, cu_seqlens, self.window)
+                        output = self.run_layers(
+                            hidden_states, cu_seqlens, self.window, frozen
+                        )
             torch.cuda.synchronize()
         except Exception:
             logger.warning(
