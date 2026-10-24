@@ -25,6 +25,7 @@ from sglang_omni.models.fun_cosyvoice3.request_builders import (
 )
 from sglang_omni.models.fun_cosyvoice3.streaming import TOKEN_HOP_LEN
 from sglang_omni.models.fun_cosyvoice3.utils import (
+    MAX_REFERENCE_SAMPLES,
     CosyVoice3Tokenizer,
     SpeakerEncoder,
     SpeechTokenizerV3,
@@ -54,9 +55,6 @@ else:
     pass
 
 logger = logging.getLogger(__name__)
-
-# note (ratish): the longest reference extract_speech_token takes, 30 s at 16 kHz.
-MAX_REFERENCE_SAMPLES = 30 * 16000
 
 _ENGINE_HEADROOM_BYTES = 0
 
@@ -238,15 +236,12 @@ class FunCosyVoice3EngineBuilder(TtsEngineBuilder[CosyVoice3SGLangRequestData]):
             device=device,
             intra_op_threads=self.onnx_intra_op_threads,
         )
-        if torch.device(device).type == "cuda":
-            # note (ratish): ONNX Runtime keeps its arena outside torch at the peak it
-            # reached, so one reference at the cap makes it resident before either pool
-            # is sized from free memory.
-            speech_tokenizer.extract_speech_token(
-                np.zeros((1, MAX_REFERENCE_SAMPLES), dtype=np.float32)
-            )
-        else:
-            pass
+        # note (ratish): ONNX Runtime keeps its arena outside torch at the peak it
+        # reached, so one reference at the cap makes it resident before either pool
+        # is sized from free memory.
+        speech_tokenizer.extract_speech_token(
+            np.zeros((1, MAX_REFERENCE_SAMPLES), dtype=np.float32)
+        )
         speaker_encoder = SpeakerEncoder(
             campplus_path,
             device=device,
