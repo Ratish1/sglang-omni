@@ -38,6 +38,24 @@ def main():
     else:
         print(json.dumps(dict(case="post_pool_worst_step", outcome="passed", peak_bytes=reserve,
                              free_bytes=torch.cuda.mem_get_info()[0])), flush=True)
+    caches = []
+    with torch.inference_mode(), scheduler.vocoder.stream_context:
+        for group in range(4):
+            items = [scheduler.make_warmup_flow_input(28) for _ in range(16)]
+            pairs = [scheduler.vocoder.prefix_cache_rows(100) for _ in items]
+            assert all(pair is not None for pair in pairs)
+            scheduler.vocoder.hop_batch_prefix(items, pairs)
+            caches.extend(pairs)
+    torch.cuda.synchronize()
+    context_bytes = sum(row.conv_context.numel()*row.conv_context.element_size()
+                        for pair in caches for row in pair)
+    print(json.dumps(dict(case="retained_stream_state", streams=len(caches), context_bytes=context_bytes)), flush=True)
+    try:
+        reserve = scheduler.measure_peak_step_bytes(torch.device("cuda:0"), row_count=16, tokens_per_row=4096)
+    except torch.OutOfMemoryError as error:
+        print(json.dumps(dict(case="worst_step_with_live_streams", outcome=type(error).__name__, error=str(error))), flush=True)
+    else:
+        print(json.dumps(dict(case="worst_step_with_live_streams", outcome="passed", peak_bytes=reserve)), flush=True)
 
 
 if __name__ == "__main__":
