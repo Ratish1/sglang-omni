@@ -1,6 +1,7 @@
 """Exercise the real factory's no-cache branch at a declared share boundary."""
 
 import json
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import torch
@@ -14,18 +15,20 @@ def main():
     fake = RunnableFakeFlow()
     fake.packed_estimator.is_ragged = True
     flow = stages.FunCosyVoice3Flow(fake, packed_estimator=fake.packed_estimator)
+    flow.decoder.estimator.transformer_blocks = [
+        SimpleNamespace(attn=SimpleNamespace(heads=2, inner_dim=8))
+    ] * 2
     load_bytes = 2**20
     memory_readings = iter((0, load_bytes))
     recorded = []
+    original_build = stages.build_prefix_pool
 
     def reserve(device):
         return next(memory_readings)
 
     def build(*args, **kwargs):
         recorded.append(kwargs)
-        # The sizing helper's documented result when a declared stage share has
-        # no room for a cache block. Do not mask the caller's failure boundary.
-        return None
+        return original_build(*args, **kwargs)
 
     with (
         patch.object(stages, "resolve_concrete_device", return_value=torch.device("cuda:0")),
