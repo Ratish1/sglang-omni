@@ -10,7 +10,8 @@ import numpy as np
 import torch
 
 # note (ratish): the longest reference the speech tokenizer takes, 30 s at its 16 kHz.
-MAX_REFERENCE_SAMPLES = 30 * 16000
+MAX_REFERENCE_SECONDS = 30
+MAX_REFERENCE_SAMPLES = MAX_REFERENCE_SECONDS * 16000
 
 
 class CosyVoice3Tokenizer:

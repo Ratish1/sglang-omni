@@ -38,7 +38,9 @@ from sglang_omni.models.fun_cosyvoice3.streaming import (
     as_flow_prompt_token,
     next_stream_hop_len,
     pad_flow_prompt_to_hop,
+    prompt_token_pad,
 )
+from sglang_omni.models.fun_cosyvoice3.utils import MAX_REFERENCE_SECONDS
 from sglang_omni.proto import StagePayload
 from sglang_omni.scheduling.message import OutgoingMessage
 from sglang_omni.scheduling.pipeline_state import build_usage
@@ -266,15 +268,24 @@ class FunCosyVoice3StreamingVocoderScheduler(
         )
 
     def measure_peak_step_bytes(
-        self, device: torch.device, *, row_count: int, tokens_per_row: int
+        self, device: torch.device, *, row_count: int, generated_tokens_per_row: int
     ) -> int:
         """Device memory the largest step this scheduler admits maps beyond what stays
-        resident: row_count streams of tokens_per_row tokens each, prompt included, as
-        uncached hops and as finals over their whole history, each followed by HiFT."""
+        resident: row_count streams of generated_tokens_per_row tokens after the longest
+        reference prompt, as uncached hops and as finals over their whole history, each
+        followed by HiFT."""
         hop_frames = self.token_max_hop_len * self.vocoder.flow.token_mel_ratio
         samples_per_frame = self.vocoder.hift_samples_per_mel_frame
+        # note (ratish): without ref_text the engine's prompt omits the reference tokens,
+        # so Flow gets the whole reference on top of a context of generated tokens.
+        prompt_token_count = MAX_REFERENCE_SECONDS * self.vocoder.flow.input_frame_rate
+        prompt_token_count += prompt_token_pad(
+            prompt_token_count, hop_len=self.token_hop_len
+        )
         items = [
-            self.make_warmup_flow_input(tokens_per_row - self.token_hop_len)
+            self.make_warmup_flow_input(
+                generated_tokens_per_row, prompt_token_count=prompt_token_count
+            )
             for _ in range(row_count)
         ]
         torch.accelerator.synchronize(device)
@@ -302,9 +313,10 @@ class FunCosyVoice3StreamingVocoderScheduler(
         torch.accelerator.synchronize(device)
         peak_bytes = torch.accelerator.max_memory_reserved(device) - resident_bytes
         logger.info(
-            f"Fun-CosyVoice3 largest admitted step, {row_count} rows of {tokens_per_row} "
-            f"tokens: "
-            f"{peak_bytes / 2**30:.2f} GB mapped ({time.monotonic() - started:.1f} s)"
+            f"Fun-CosyVoice3 largest admitted step, {row_count} rows of "
+            f"{generated_tokens_per_row} tokens after a {prompt_token_count} token "
+            f"prompt: {peak_bytes / 2**30:.2f} GB mapped "
+            f"({time.monotonic() - started:.1f} s)"
         )
         return peak_bytes
 
@@ -361,13 +373,19 @@ class FunCosyVoice3StreamingVocoderScheduler(
         finally:
             self.vocoder.release_prefix_cache(cache)
 
-    def make_warmup_flow_input(self, token_count: int) -> FlowBatchInput:
+    def make_warmup_flow_input(
+        self, token_count: int, *, prompt_token_count: int | None = None
+    ) -> FlowBatchInput:
         flow = self.vocoder.flow
+        if prompt_token_count is None:
+            prompt_token_count = self.token_hop_len
+        else:
+            pass
         return FlowBatchInput(
             token=torch.zeros(1, token_count, dtype=torch.int32),
-            prompt_token=torch.zeros(1, self.token_hop_len, dtype=torch.int32),
+            prompt_token=torch.zeros(1, prompt_token_count, dtype=torch.int32),
             prompt_feat=torch.zeros(
-                1, self.token_hop_len * flow.token_mel_ratio, flow.output_size
+                1, prompt_token_count * flow.token_mel_ratio, flow.output_size
             ),
             embedding=torch.zeros(1, flow.spk_embed_affine_layer.in_features),
         )

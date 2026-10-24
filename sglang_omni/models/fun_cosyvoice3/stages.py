@@ -928,6 +928,7 @@ class FunCosyVoice3Flow:
     pre_lookahead_layer: PreLookaheadLayer
     pre_lookahead_len: int
     token_mel_ratio: int
+    input_frame_rate: int
     output_size: int
     decoder: CausalConditionalCFM
 
@@ -2708,11 +2709,11 @@ def create_vocoder_executor(
         else:
             prefix_forward = forward_prefix
         # note (ratish): the pool takes what is free, so it leaves the largest step
-        # the scheduler admits: max_batch_size rows, each at most the AR's context.
+        # the scheduler admits: max_batch_size rows of at most the AR's context each.
         step_bytes = scheduler.measure_peak_step_bytes(
             device_obj,
             row_count=max_batch_size,
-            tokens_per_row=FunCosyVoice3EngineBuilder.context_length,
+            generated_tokens_per_row=FunCosyVoice3EngineBuilder.context_length,
         )
         if has_prefix_graphs:
             # note (ratish): the prefix graphs capture after the pool they read, so

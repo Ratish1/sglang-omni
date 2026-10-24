@@ -1571,9 +1571,9 @@ def test_prefix_pool_leaves_the_engine_headroom_and_the_largest_step(
         device: torch.device,
         *,
         row_count: int,
-        tokens_per_row: int,
+        generated_tokens_per_row: int,
     ) -> int:
-        events.append(("measure", (row_count, tokens_per_row)))
+        events.append(("measure", (row_count, generated_tokens_per_row)))
         return 3 * 2**30
 
     def build(
@@ -1634,6 +1634,49 @@ def test_prefix_pool_leaves_the_engine_headroom_and_the_largest_step(
             ),
         ),
     ]
+
+
+def test_largest_step_rows_hold_the_longest_reference_prompt(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The largest step was measured with a hop of prompt, so a request without
+    ref_text, whose whole reference reaches Flow and not the engine, outgrew it."""
+    flow_rows: list[tuple[int, int]] = []
+
+    def decode(items: list[stages.FlowBatchInput]) -> list[torch.Tensor]:
+        flow_rows.extend(
+            (int(item.prompt_token.shape[1]), int(item.token.shape[1]))
+            for item in items
+        )
+        return [torch.zeros(1, 80, 4) for _ in items]
+
+    vocoder = SimpleNamespace(
+        flow=SimpleNamespace(
+            token_mel_ratio=2,
+            output_size=80,
+            input_frame_rate=25,
+            spk_embed_affine_layer=SimpleNamespace(in_features=192),
+        ),
+        hift_samples_per_mel_frame=480,
+        stream_context=contextlib.nullcontext(),
+        hop_batch=decode,
+        leftover_batch=decode,
+        hift_step=lambda rows: SimpleNamespace(wait=lambda: None),
+    )
+    scheduler = FunCosyVoice3StreamingVocoderScheduler(vocoder, token_hop_len=40)
+    monkeypatch.setattr(torch.accelerator, "synchronize", lambda device: None)
+    monkeypatch.setattr(torch.accelerator, "empty_cache", lambda: None)
+    monkeypatch.setattr(torch.accelerator, "memory_reserved", lambda device: 0)
+    monkeypatch.setattr(
+        torch.accelerator, "reset_peak_memory_stats", lambda device: None
+    )
+    monkeypatch.setattr(torch.accelerator, "max_memory_reserved", lambda device: 0)
+
+    scheduler.measure_peak_step_bytes(
+        torch.device("cpu"), row_count=2, generated_tokens_per_row=4096
+    )
+
+    assert flow_rows == [(760, 4096)] * 4
 
 
 def test_create_vocoder_executor_rejects_non_positive_admission_budget(
