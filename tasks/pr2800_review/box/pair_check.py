@@ -166,6 +166,7 @@ ARMS = {
     "vdi": ("vdi", [], [0.7769]),
     "vdib": ("vdi", [], [0.7769]),
     "vdk": ("vdk", [], [0.7769]),
+    "vdm": ("vdm", [], [0.7769]),
 }
 # arm: benchmark args every pass of the arm adds
 ARM_BENCH_ARGS: dict[str, list[str]] = {}
