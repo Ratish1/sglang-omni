@@ -2760,17 +2760,23 @@ def create_vocoder_executor(
         if has_prefix_graphs:
             # note (ratish): the prefix graphs capture after the pool they read, so
             # their memory is measured first on a throwaway pool and graph pool, the
-            # pool holding the prefix warmup's hops.
+            # pool holding the prefix warmup's hops under the real pool's reserve.
             flow.prefix_pool = build_prefix_pool(
                 flow,
                 device_obj,
                 autocast_dtype,
                 size_gb=None,
                 max_blocks=scheduler.prefix_warmup_block_count(),
-                stage_reserve_bytes=0,
-                headroom_bytes=0,
+                stage_reserve_bytes=step_bytes,
+                headroom_bytes=headroom_bytes,
                 share_ceiling_bytes=share_ceiling_bytes,
             )
+            # note (ratish): the real pool is sized from no more, so it holds no block
+            # either and serving keeps the whole-history hops.
+            has_prefix_graphs = flow.prefix_pool is not None
+        else:
+            pass
+        if has_prefix_graphs:
             assert flow.prefix_pool is not None
             flow.prefix_pool.forward = prefix_forward
             if is_prefix_compiled:
