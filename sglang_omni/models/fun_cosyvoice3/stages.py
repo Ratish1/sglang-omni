@@ -131,9 +131,6 @@ CAUSAL_CONV_CACHE_PATCHED = False
 FLOW_CUDA_GRAPH_FRAME_BUCKET = 16
 # note(ratish): the Flow's Euler steps per solve, CosyVoice's n_timesteps.
 FLOW_EULER_STEPS = 10
-# note (ratish): the throwaway prefix pool the prefix graphs are measured on: a first
-# warmup hop for both CFG twins at the default hop.
-DRY_PREFIX_POOL_BLOCKS = 4
 # Note (chenyang):
 # Mel-frame step size for buffered flow CUDA Graph keys. Capture shapes
 # must use a T that is a multiple of this step size. For example, 489
@@ -2719,13 +2716,14 @@ def create_vocoder_executor(
         )
         if has_prefix_graphs:
             # note (ratish): the prefix graphs capture after the pool they read, so
-            # their memory is measured first on a throwaway pool and graph pool.
+            # their memory is measured first on a throwaway pool and graph pool, the
+            # pool holding the prefix warmup's hops.
             flow.prefix_pool = build_prefix_pool(
                 flow,
                 device_obj,
                 autocast_dtype,
                 size_gb=None,
-                max_blocks=DRY_PREFIX_POOL_BLOCKS,
+                max_blocks=scheduler.prefix_warmup_block_count(),
                 stage_reserve_bytes=0,
                 headroom_bytes=0,
                 share_ceiling_bytes=share_ceiling_bytes,

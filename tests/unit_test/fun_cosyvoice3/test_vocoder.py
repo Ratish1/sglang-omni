@@ -1482,6 +1482,49 @@ def test_prefix_pool_caps_take_the_smaller_of_their_size_and_the_memory_left(
     assert pool.free_frames == expected_blocks * stages.BLOCK_FRAMES
 
 
+@pytest.mark.parametrize("token_hop_len", [25, 50])
+def test_a_pool_of_the_prefix_warmup_blocks_runs_both_warmup_hops(
+    token_hop_len: int,
+) -> None:
+    prefix_hop_row_counts: list[int] = []
+    vocoder = SimpleNamespace(
+        flow=SimpleNamespace(
+            token_mel_ratio=2,
+            output_size=80,
+            spk_embed_affine_layer=SimpleNamespace(in_features=192),
+            prefix_pool=None,
+        ),
+        hop_batch_prefix=lambda items, caches: prefix_hop_row_counts.append(len(items)),
+    )
+    vocoder.prefix_cache_rows = lambda frames: (
+        stages.CosyVoice3Vocoder.prefix_cache_rows(vocoder, frames)
+    )
+    vocoder.grow_prefix_cache = lambda pair, frames: (
+        stages.CosyVoice3Vocoder.grow_prefix_cache(vocoder, pair, frames)
+    )
+    vocoder.release_prefix_cache = lambda pair: (
+        stages.CosyVoice3Vocoder.release_prefix_cache(vocoder, pair)
+    )
+    scheduler = FunCosyVoice3StreamingVocoderScheduler(
+        vocoder, token_hop_len=token_hop_len
+    )
+    capacity_frames = scheduler.prefix_warmup_block_count() * stages.BLOCK_FRAMES
+    vocoder.flow.prefix_pool = stages.PrefixKVPool(
+        layer_num=1,
+        euler_steps=1,
+        head_num=1,
+        head_dim=4,
+        capacity_frames=capacity_frames,
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+    )
+
+    scheduler.warmup_prefix_hops()
+
+    assert prefix_hop_row_counts == [1, 1]
+    assert vocoder.flow.prefix_pool.free_frames == capacity_frames
+
+
 @pytest.mark.parametrize(
     ("flow_prefix_cache_gb", "vocoder_fraction", "expected_share_ceiling_bytes"),
     [(None, None, None), (2.0, None, None), (None, 0.5, 2**30 + 2**33)],
