@@ -12,7 +12,7 @@ from transformers.utils.generic import TransformersKwargs, merge_with_config_def
 from transformers.utils.output_capturing import capture_outputs
 from transformers.vision_utils import get_vision_cu_seqlens, get_vision_position_ids
 
-# note (ratish): below this many grid rows the per-row loop is faster (crossover measured on H20).
+# note (ratish): below this many grid rows the per-row loop is faster (crossover measured on H20 and H200).
 VECTORIZED_POS_EMBED_MIN_IMAGES = 6
 
 
