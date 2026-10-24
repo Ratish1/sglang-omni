@@ -2,7 +2,8 @@
 # #3102 merged with main after #3097 (11c131654) against main 6e75cba89, every number of its body again on the new
 # base, cards 2 and 3. First the non-streaming SeedTTS EN checks behind #3102's failed non-streaming CI WER (3.60 %
 # against 1.46 %): seeded c1 (byte identity expected on all 1,088: non-streaming decodes through the decoder's own
-# forward) and c16 in both card orders. Then the long lists and the first decode's distance to the fp32 decode
+# forward) and c16 five times with the card orders alternating, read as the CI reads them (ci_metrics.py: corpus WER,
+# cap hits, SIM over the first 50 samples). Pairs whose arms are both scored are skipped. Then the long lists and the first decode's distance to the fp32 decode
 # (first_chunk_truth_probe.py, crossed, skipped when its output exists); SeedTTS EN seeded c1, c16 and c64 in both
 # orders; L1 c16 and L3 c16 in both orders with request events and each pair's first-audio chain; seeded c1 on the L1
 # c1 list and on the 96-prompt L1 list at four seeds, each scored for SIM against its sample's own clip, then the
@@ -22,7 +23,7 @@ SHORT=$D/short_reference_meta
 M=${M:?the main tree}
 P1=${P1:?the 3102 tree}
 L=$D/queue.log
-BASES="10000 11200 12400 13600 14800 17000 18200 19400 20600 21800 23000 24200 25400 26600 27800 30000 31200"
+BASES="4400 7000 8200 10000 11200 12400 13600 14800 17000 18200 19400 20600 21800 23000 24200 25400 26600 27800 30000 31200"
 BUSY=$(python3 - $BASES <<'EOF'
 import sys
 listening = set()
@@ -45,6 +46,11 @@ fi
 run_pair() {
   local label=$1
   shift
+  if [ -f $PAIR_ROOT/$label/a/bench/wer_results.json ] && [ -f $PAIR_ROOT/$label/b/bench/wer_results.json ]; then
+    return
+  else
+    :
+  fi
   python3 $IN/pair.py --label $label --tree $M --b-tree $P1 "$@" > $D/$label.out 2>&1
   local rc=$?
   local failed_a=$(grep -ciE 'capture_failed|capture disabled|Unsupported:' $PAIR_ROOT/$label/a/serve.log)
@@ -70,9 +76,13 @@ short_similarity() {
 run_pair rp_ns_c1 --concurrency 1 --a-card 2 --b-card 3 --port 10000 --seed 1234 --no-stream
 run_pair rp_ns_c16_a --concurrency 16 --a-card 2 --b-card 3 --port 11200 --no-stream
 run_pair rp_ns_c16_b --concurrency 16 --a-card 3 --b-card 2 --port 12400 --no-stream
-NONSTREAM_LABELS="rp_ns_c1 rp_ns_c16_a rp_ns_c16_b"
+run_pair rp_ns_c16_c --concurrency 16 --a-card 2 --b-card 3 --port 4400 --no-stream
+run_pair rp_ns_c16_d --concurrency 16 --a-card 3 --b-card 2 --port 7000 --no-stream
+run_pair rp_ns_c16_e --concurrency 16 --a-card 2 --b-card 3 --port 8200 --no-stream
+NONSTREAM_LABELS="rp_ns_c1 rp_ns_c16_a rp_ns_c16_b rp_ns_c16_c rp_ns_c16_d rp_ns_c16_e"
 seedtts_similarity $NONSTREAM_LABELS
 python3 $IN/pair_table.py $NONSTREAM_LABELS > $D/table_nonstream.txt 2>&1
+(cd $M && PYTHONPATH=$M python3 $T/tasks/qwen3-tts-perf/box/d1merge_20261024/ci_metrics.py $NONSTREAM_LABELS > $D/ci_metrics_nonstream.txt 2>&1)
 echo "non-streaming done $(date +%T)" >> $L
 if [ -f $LONG/L1_c16_run.lst ] && [ -f $SHORT/L1_c16_run.lst ]; then
   :
