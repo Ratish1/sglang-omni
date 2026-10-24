@@ -15,7 +15,8 @@ def main():
     torch.manual_seed(1337)
     scheduler = stages.create_vocoder_executor(
         "FunAudioLLM/Fun-CosyVoice3-0.5B-2512",
-        device="cuda:0",
+        device="cuda",
+        gpu_id=0,
         dtype="bfloat16",
         max_batch_size=16,
         flow_prefix_cache_gb=0,
