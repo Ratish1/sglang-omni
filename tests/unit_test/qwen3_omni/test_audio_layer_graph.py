@@ -13,6 +13,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from safetensors.torch import save_file
+from sglang.srt.layers.attention.vision import VisionTritonAttention
 from torch.nn.attention import SDPBackend, sdpa_kernel
 from transformers.models.qwen3_omni_moe import modeling_qwen3_omni_moe as hf_modeling
 
@@ -341,7 +342,10 @@ def test_capture_all_records_a_graph_for_every_bucket() -> None:
 
 @pytest.mark.accelerator
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-def test_replay_matches_the_uncaptured_packed_stack_across_bucket_boundaries() -> None:
+@pytest.mark.parametrize("backend", ["platform", "triton"])
+def test_replay_matches_the_uncaptured_packed_stack_across_bucket_boundaries(
+    backend: Literal["platform", "triton"],
+) -> None:
     torch.manual_seed(0)
     device = torch.device("cuda", 0)
     tower = real_tower(device)
@@ -349,7 +353,11 @@ def test_replay_matches_the_uncaptured_packed_stack_across_bucket_boundaries() -
         tower,
         device=device,
         window=WINDOW,
-        packed_attention=resolve_packed_attention(device, torch.bfloat16),
+        packed_attention=(
+            resolve_packed_attention(device, torch.bfloat16)
+            if backend == "platform"
+            else VisionTritonAttention()
+        ),
     )
     runner.capture_all()
     assert runner.has_graphs, runner.disabled_reason
