@@ -92,6 +92,7 @@ TREES = {
     "vdi": ("vdi_2754ffaa4", "origin", "2754ffaa45e75250766e9665a3fdad1fc271d837"),
     "vdk": ("vdk_2e6ed1c36", "origin", "2e6ed1c36528d64f179349caa3f594f7ddea968f"),
     "vdm": ("vdm_47315b507", "origin", "47315b5075bab157eaee5051cab33e2d3a34a31d"),
+    "pam": ("pam_352c20afc", "origin", "352c20afc1dc361aac93bb5ff3c550650f6209a1"),
 }
 # note (ratish): every arm is measured by one client and scored by one ASR server, both from main; from the SGLang
 # 0.5.22 stack on (057d97629) a tree from before it no longer runs, and main's client records each chunk's length.
