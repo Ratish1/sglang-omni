@@ -6,8 +6,9 @@ Long prefill rows repeat a sample's own reference clip (0.25 s of silence betwee
 to about LONG_PREFILL_POSITIONS prompt positions, one speaker, and keep the sample's own target. Long decode rows keep a
 sample's own reference and join corpus targets, taken in order and wrapping, up to about LONG_DECODE_WORDS words,
 about 1,900 codec frames of speech. Every row takes its own sample's reference, and the reference opens the prompt, so
-no prompt is already in the prefix cache when its run is captured. Writes OUT_DIR/<cell>_{warm,run}.lst, the long
-reference wavs and lengths.tsv.
+no prompt is already in the prefix cache when its run is captured. Writes OUT_DIR/<cell>_{warm,run}.lst, then
+OUT_DIR/<cell>_timing.lst (the run's shape and count from later samples, whose timeline places the run's profiler
+window), the long reference wavs and lengths.tsv.
 """
 
 import math
@@ -60,34 +61,40 @@ def main() -> None:
     cursor = 0
     text_cursor = 0
     lengths = ["cell\trow\tsample\treference_s\tprompt_positions\ttarget_words"]
-    for cell, (long_prefill, long_decode, warm_count, run_count) in CELLS.items():
-        for part, count in (("warm", warm_count), ("run", run_count)):
-            rows = []
-            for _ in range(count):
-                sample = samples[cursor]
-                cursor += 1
-                if long_prefill:
-                    wav_name, ref_text, reference_s = long_reference(sample, out_dir)
-                else:
-                    wav_name = f"wavs/{sample.sample_id}.wav"
-                    (out_dir / wav_name).write_bytes(Path(sample.ref_audio).read_bytes())
-                    ref_text = sample.ref_text
-                    reference_s = soundfile.info(sample.ref_audio).duration
-                if long_decode:
-                    words = []
-                    while len(words) < LONG_DECODE_WORDS:
-                        words += samples[text_cursor % len(samples)].target_text.split()
-                        text_cursor += 1
-                    target_text = " ".join(words)
-                else:
-                    target_text = sample.target_text
-                row_id = f"{cell}_{part}_{len(rows)}"
-                rows.append(f"{row_id}|{ref_text}|{wav_name}|{target_text}")
-                lengths.append(
-                    f"{cell}\t{row_id}\t{sample.sample_id}\t{reference_s:.1f}\t"
-                    f"{round(reference_s * FRAMES_PER_SECOND) + SPECIAL_POSITIONS}\t{len(target_text.split())}"
-                )
-            (out_dir / f"{cell}_{part}.lst").write_text("\n".join(rows) + "\n", encoding="utf-8")
+    # note (ratish): the timing lists come after every warm and run list, so those stay as 10-22 wrote them.
+    parts = [
+        (cell, part, count)
+        for cell, (_, _, warm_count, run_count) in CELLS.items()
+        for part, count in (("warm", warm_count), ("run", run_count))
+    ] + [(cell, "timing", run_count) for cell, (_, _, _, run_count) in CELLS.items()]
+    for cell, part, count in parts:
+        long_prefill, long_decode = CELLS[cell][:2]
+        rows = []
+        for _ in range(count):
+            sample = samples[cursor]
+            cursor += 1
+            if long_prefill:
+                wav_name, ref_text, reference_s = long_reference(sample, out_dir)
+            else:
+                wav_name = f"wavs/{sample.sample_id}.wav"
+                (out_dir / wav_name).write_bytes(Path(sample.ref_audio).read_bytes())
+                ref_text = sample.ref_text
+                reference_s = soundfile.info(sample.ref_audio).duration
+            if long_decode:
+                words = []
+                while len(words) < LONG_DECODE_WORDS:
+                    words += samples[text_cursor % len(samples)].target_text.split()
+                    text_cursor += 1
+                target_text = " ".join(words)
+            else:
+                target_text = sample.target_text
+            row_id = f"{cell}_{part}_{len(rows)}"
+            rows.append(f"{row_id}|{ref_text}|{wav_name}|{target_text}")
+            lengths.append(
+                f"{cell}\t{row_id}\t{sample.sample_id}\t{reference_s:.1f}\t"
+                f"{round(reference_s * FRAMES_PER_SECOND) + SPECIAL_POSITIONS}\t{len(target_text.split())}"
+            )
+        (out_dir / f"{cell}_{part}.lst").write_text("\n".join(rows) + "\n", encoding="utf-8")
     (out_dir / "lengths.tsv").write_text("\n".join(lengths) + "\n", encoding="utf-8")
     print(f"wrote {len(CELLS)} cells over {cursor} corpus samples to {out_dir}")
 

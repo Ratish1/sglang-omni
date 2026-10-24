@@ -12,6 +12,7 @@ when its .trace.json sibling is gone (the server gzips in the background).
 """
 
 import argparse
+import heapq
 import json
 import os
 import signal
@@ -29,18 +30,10 @@ MAPPING_ARGS = (
     "--vocoder.factory.followup_cuda_graph false --vocoder.factory.incremental_codec_cuda_graph false "
     "--vocoder.factory.incremental_codec_compile false"
 ).split()
-WINDOW_LEAD_S = {
-    "W3": 10.0,
-    "W4": 10.0,
-    "W5": 2.0,
-    # from the 10-22 formal runs' lengths (L1 c16 21 s, L2 c16 25 s in two waves of 11 s, L2 c64
-    # 22 s, L3 c16 30 s in two waves of 14 s), so each window holds the cell's steady shape, not its tail.
-    "L1_c16": 4.0,
-    "L2_c1": 5.0,
-    "L2_c16": 8.0,
-    "L2_c64": 10.0,
-    "L3_c16": 9.0,
-}
+WINDOW_LEAD_S = {"W3": 10.0, "W4": 10.0, "W5": 2.0}
+# note (ratish): these windows are placed from the cell's timing list run unprofiled on the same boot, since fixed
+# leads only fit the tree they were measured on.
+TIMED_WINDOW_CELLS = ("L1_c16", "L2_c1", "L2_c16", "L2_c64", "L3_c16")
 # The long cells of profile_20261022/PLAN.md 3, their request lists written by long_cells_meta.py.
 LONG_CELL_CONCURRENCY = {"L1_c1": 1, "L1_c16": 16, "L2_c1": 1, "L2_c16": 16, "L2_c64": 64, "L3_c16": 16}
 # note (ratish): a mapping window only has to hold each call site once, and stacks make it large.
@@ -166,9 +159,36 @@ def wait_for_trace(cell: str, cell_dir: Path) -> None:
     raise TimeoutError(f"trace of {cell} not complete")
 
 
-def cell_workload(cell: str, meta: Path, warm: bool) -> tuple[int, list[str]]:
+def steady_window(speed_results: Path, concurrency: int, window_s: float) -> dict[str, float]:
+    """A window's lead centred in a run's steady span, from a same-shape run's per-request latencies replayed through
+    the client's concurrency slots in list order: from the first wave's last first audio to its first completion when
+    that span holds two windows (streams decoding in waves), else to the last request's start (streams turning over)."""
+    per_request = json.loads(speed_results.read_text(encoding="utf-8"))["per_request"]
+    rows = sorted(per_request, key=lambda row: int(row["id"].rsplit("_", 1)[1]))
+    free_at_s = [0.0] * concurrency
+    starts_s, ends_s = [], []
+    for row in rows:
+        start_s = heapq.heappop(free_at_s)
+        heapq.heappush(free_at_s, start_s + row["latency_s"])
+        starts_s.append(start_s)
+        ends_s.append(start_s + row["latency_s"])
+    first_wave = range(min(concurrency, len(rows)))
+    opening_end_s = max(starts_s[i] + (rows[i]["audio_ttfp_s"] or rows[i]["latency_s"]) for i in first_wave)
+    full_batch_end_s = min(ends_s[i] for i in first_wave)
+    if full_batch_end_s - opening_end_s >= 2 * window_s:
+        span_end_s = full_batch_end_s
+    else:
+        span_end_s = starts_s[-1]
+    return {
+        "opening_end_s": opening_end_s, "full_batch_end_s": full_batch_end_s, "span_end_s": span_end_s,
+        "makespan_s": max(ends_s), "lead_s": max((opening_end_s + span_end_s - window_s) / 2, 1.0),
+    }
+
+
+def cell_workload(cell: str, meta: Path, part: str) -> tuple[int, list[str]]:
+    warm = part == "warm"
     if cell in LONG_CELL_CONCURRENCY:
-        listing = meta / "long" / f"{cell}_{'warm' if warm else 'run'}.lst"
+        listing = meta / "long" / f"{cell}_{part}.lst"
         return LONG_CELL_CONCURRENCY[cell], ["--warmup", "0", "--meta", str(listing)]
     elif cell == "W1":
         offset = "600" if warm else "0"
@@ -191,20 +211,28 @@ def cell_workload(cell: str, meta: Path, warm: bool) -> tuple[int, list[str]]:
 def capture_cell(cell: str, tree: str, port: int, meta: Path, out: Path, window_s: float) -> None:
     cell_dir = out / cell
     cell_dir.mkdir(parents=True, exist_ok=True)
-    concurrency, extra = cell_workload(cell, meta, warm=True)
-    if cell in WINDOW_LEAD_S:
+    concurrency, extra = cell_workload(cell, meta, "warm")
+    if cell in WINDOW_LEAD_S or cell in TIMED_WINDOW_CELLS:
         warm_extra = [*extra, "--max-samples", "128"]
     else:
         warm_extra = extra
     run(bench_command(port, concurrency, cell_dir / "warm", warm_extra), tree, cell_dir / "warm.log")
-    concurrency, extra = cell_workload(cell, meta, warm=False)
-    if cell in WINDOW_LEAD_S:
+    if cell in TIMED_WINDOW_CELLS:
+        concurrency, extra = cell_workload(cell, meta, "timing")
+        run(bench_command(port, concurrency, cell_dir / "timing", extra), tree, cell_dir / "timing.log")
+        window = steady_window(cell_dir / "timing" / "speed_results.json", concurrency, window_s)
+        (cell_dir / "window.json").write_text(json.dumps(window, indent=1), encoding="utf-8")
+        lead_s = window["lead_s"]
+    else:
+        lead_s = WINDOW_LEAD_S.get(cell)
+    concurrency, extra = cell_workload(cell, meta, "run")
+    if lead_s is not None:
         with open(cell_dir / "bench.log", "w", encoding="utf-8") as log:
             bench = subprocess.Popen(
                 bench_command(port, concurrency, cell_dir / "bench", extra), cwd=tree,
                 env=dict(os.environ, PYTHONPATH=tree), stdout=log, stderr=subprocess.STDOUT,
             )
-            time.sleep(WINDOW_LEAD_S[cell])
+            time.sleep(lead_s)
             start_profile(port, cell, cell_dir)
             time.sleep(window_s)
             stop_profile(port, cell, cell_dir)
@@ -220,13 +248,13 @@ def capture_host_window(cell: str, tree: str, port: int, meta: Path, out: Path) 
     """One step window of the engine's forwards with stacks, armed once the cell's load is steady."""
     cell_dir = out / cell
     cell_dir.mkdir(parents=True, exist_ok=True)
-    concurrency, extra = cell_workload(cell, meta, warm=True)
+    concurrency, extra = cell_workload(cell, meta, "warm")
     if cell in WINDOW_LEAD_S:
         warm_extra = [*extra, "--max-samples", "128"]
     else:
         warm_extra = extra
     run(bench_command(port, concurrency, cell_dir / "warm", warm_extra), tree, cell_dir / "warm.log")
-    concurrency, extra = cell_workload(cell, meta, warm=False)
+    concurrency, extra = cell_workload(cell, meta, "run")
     body = {
         "run_id": cell, "trace_path_template": str(cell_dir / "trace"), "num_steps": HOST_STEPS[cell],
         "step_stage": "tts_engine", "with_stack": True,
