@@ -114,7 +114,9 @@ def interval(values: list[float]) -> str:
 
 def compare(truth_path: str, first_path: str, second_path: str) -> None:
     reference, first, second = (torch.load(path) for path in (truth_path, first_path, second_path))
-    assert reference["rows"] == first["rows"] == second["rows"]
+    # note (ratish): each arm runs from its own tree, whose dataset cache path differs, so rows match by file name.
+    names = [[(group, Path(path).name) for group, path in result["rows"]] for result in (reference, first, second)]
+    assert names[0] == names[1] == names[2]
     for group in ("seedtts", "long"):
         picked = [i for i, (row_group, _) in enumerate(reference["rows"]) if row_group == group]
         cosines = {}
