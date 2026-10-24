@@ -1,7 +1,7 @@
-"""MMMU results from videoamme_pair.py --benchmark mmmu, paired item by item.
+"""MMMU or Video-AMME results from videoamme_pair.py, paired item by item.
 
 Run: python3 mmmu_pair_read.py <out> <pass>/<arm> <pass>/<arm> [<pass>/<arm> ...]
-Each argument names one result, <out>/<pass>/<arm>/mmmu.json. Prints each result's correct count, and for every pair
+Each argument names one result, <out>/<pass>/<arm>/mmmu.json (or videoamme.json). Prints each result's correct count, and for every pair
 of results the items whose raw responses are identical, the items only one side gets right with the exact McNemar p,
 and each item whose parsed answers differ.
 """
@@ -16,7 +16,8 @@ from pathlib import Path
 
 
 def records(out: Path, result: str) -> dict[str, dict]:
-    rows = json.loads((out / result / "mmmu.json").read_text())["per_sample"]
+    name = "mmmu.json" if (out / result / "mmmu.json").exists() else "videoamme.json"
+    rows = json.loads((out / result / name).read_text())["per_sample"]
     return {row["sample_id"]: row for row in rows}
 
 
