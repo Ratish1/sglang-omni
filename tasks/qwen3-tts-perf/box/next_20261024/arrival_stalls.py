@@ -57,10 +57,13 @@ def arm_report(folder: Path) -> tuple[list[tuple[float, float]], list[float]]:
             chunks.append((seconds, row["request_id"]))
         else:
             pass
+    # note (ratish): a long reference whose window reaches the last admission shares it with the run's tail, where the
+    # other streams finish rather than stall, so it is read only while requests are still arriving.
     spans = sorted(
         (preprocessing[key]["stage_input_received"], preprocessing[key]["stage_complete"])
         for key in wide
         if preprocessing[key]["stage_complete"] - preprocessing[key]["stage_input_received"] > CACHE_HIT_S
+        and preprocessing[key]["stage_complete"] + WINDOW_TAIL_S < max(admitted)
     )
     others = sorted(seconds for seconds, request in chunks if request not in wide)
     windows = [(1000 * (end_s - start_s), 1000 * longest_silence(others, start_s, end_s + WINDOW_TAIL_S)) for start_s, end_s in spans]
