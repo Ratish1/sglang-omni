@@ -53,7 +53,7 @@ def main():
     ) for _ in range(16)]
     try:
         with torch.inference_mode(), scheduler.vocoder.stream_context:
-            for decode, final in ((scheduler.vocoder.hop_batch, False), (scheduler.vocoder.leftover_batch, True)):
+            for decode, final in ((scheduler.vocoder.leftover_batch, True),):
                 mels = decode(long_items)
                 scheduler.vocoder.hift_step([HiftStepRow(
                     history=mel, emitted_samples=max(mel.shape[2]-200, 0)*480,
