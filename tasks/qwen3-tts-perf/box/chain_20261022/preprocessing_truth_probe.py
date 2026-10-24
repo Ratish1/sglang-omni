@@ -37,13 +37,14 @@ MODEL = "Qwen/Qwen3-TTS-12Hz-1.7B-Base"
 RATE = 24000
 
 
-def references(metas: list[Path]) -> list[tuple[str, str]]:
-    """(group, wav path) for every SeedTTS EN reference, then every distinct reference of the long lists."""
+def references(metas: list[Path], limit: int | None) -> list[tuple[str, str]]:
+    """(group, wav path) for every SeedTTS EN reference, then every distinct reference of the long lists; limit keeps
+    the first of each group (a smoke run)."""
     rows = [("seedtts", sample.ref_audio) for sample in load_seedtts_samples(SEEDTTS_DATASET_ID, split="en")]
     long_paths = sorted(
         {str(meta.parent / line.split("|")[2]) for meta in metas for line in meta.read_text().splitlines() if line}
     )
-    return rows + [("long", path) for path in long_paths]
+    return rows[:limit] + [("long", path) for path in long_paths[:limit]]
 
 
 def waveform_at_rate(path: str) -> np.ndarray:
@@ -153,6 +154,7 @@ def main() -> None:
     parser.add_argument("--card", type=int, default=3)
     parser.add_argument("--meta", type=Path, nargs="*", default=[])
     parser.add_argument("--compare", nargs=3)
+    parser.add_argument("--limit", type=int, default=None)
     args = parser.parse_args()
     if args.compare:
         compare(*args.compare)
@@ -161,7 +163,7 @@ def main() -> None:
         pass
     torch.cuda.set_device(args.card)
     device = torch.device("cuda", args.card)
-    rows = references(args.meta)
+    rows = references(args.meta, args.limit)
     result = truth(rows, device) if args.truth else served(rows, device)
     torch.save({"rows": rows, **result}, args.out)
     print(f"wrote {len(rows)} references to {args.out}")
