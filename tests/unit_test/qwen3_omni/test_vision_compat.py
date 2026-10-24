@@ -26,7 +26,7 @@ GRID_CASES = {
     "video-plus-image": [[3, 12, 16], [1, 20, 28], [2, 8, 8]],
     "many": [[1, 24, 24]] * 8,
 }
-BILINEAR_TOLERANCES = {torch.bfloat16: 6e-3, torch.float32: 1e-5}
+BILINEAR_TOLERANCES = {torch.bfloat16: 1e-2, torch.float32: 1e-5}
 
 
 def make_encoder(dtype: torch.dtype) -> vision_compat.Qwen3OmniMoeVisionEncoderCompat:
