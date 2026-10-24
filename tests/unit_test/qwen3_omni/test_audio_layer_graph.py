@@ -379,8 +379,12 @@ def test_replay_matches_the_uncaptured_packed_stack_across_bucket_boundaries() -
 @pytest.mark.accelerator
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize(
-    ("dtype", "enable_layer_cuda_graph", "tolerance"),
-    [("bf16", True, 5e-3), ("bf16", False, 5e-3), ("fp32", False, 1e-5)],
+    ("dtype", "enable_layer_cuda_graph", "replays", "tolerance"),
+    [
+        ("bf16", True, [True], 5e-3),
+        ("bf16", False, [], 5e-3),
+        ("fp32", True, [], 1e-5),
+    ],
     ids=["bf16-graphs", "bf16-eager", "fp32"],
 )
 def test_cuda_audio_encoder_matches_the_fp32_transformers_tower(
@@ -388,8 +392,10 @@ def test_cuda_audio_encoder_matches_the_fp32_transformers_tower(
     tmp_path: Path,
     dtype: Literal["bf16", "fp32"],
     enable_layer_cuda_graph: bool,
+    replays: list[bool],
     tolerance: float,
 ) -> None:
+    """A CUDA audio encoder encodes in fp32, and in bf16 with SGLANG_VIT_ENABLE_CUDA_GRAPH set."""
     monkeypatch.setenv("SGLANG_VIT_ENABLE_CUDA_GRAPH", "1")
     config = hf_modeling.Qwen3OmniMoeAudioEncoderConfig(
         d_model=256,
@@ -419,7 +425,22 @@ def test_cuda_audio_encoder_matches_the_fp32_transformers_tower(
         dtype=dtype,
         enable_layer_cuda_graph=enable_layer_cuda_graph,
     )
-    assert (model.layer_graph_runner is not None) == enable_layer_cuda_graph
+    runner = model.layer_graph_runner
+    assert (runner is not None) == bool(replays)
+    recorded_replays: list[bool] = []
+    if runner is not None:
+        replay = runner.maybe_replay
+
+        def recorded_replay(
+            hidden_states: torch.Tensor, cu_seqlens: torch.Tensor, segments: list[int]
+        ) -> torch.Tensor | None:
+            replayed = replay(hidden_states, cu_seqlens, segments)
+            recorded_replays.append(replayed is not None)
+            return replayed
+
+        monkeypatch.setattr(runner, "maybe_replay", recorded_replay)
+    else:
+        pass
     reference = reference.to("cuda", torch.float32)
     lengths = torch.tensor([400, 850, 99])
     features = torch.randn(3, config.num_mel_bins, 850)
@@ -437,4 +458,5 @@ def test_cuda_audio_encoder_matches_the_fp32_transformers_tower(
                 feature_lens=lengths.to("cuda"),
             ).last_hidden_state
 
+    assert recorded_replays == replays
     torch.testing.assert_close(actual.float(), expected, rtol=tolerance, atol=tolerance)

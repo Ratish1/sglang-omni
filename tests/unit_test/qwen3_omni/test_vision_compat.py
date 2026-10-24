@@ -354,6 +354,7 @@ def test_cuda_image_encoder_matches_the_fp32_transformers_encoder(
     dtype: Literal["bf16", "fp32"],
     tolerance: float,
 ) -> None:
+    """A CUDA image encoder encodes in fp32, and in bf16 with SGLANG_VIT_ENABLE_CUDA_GRAPH set."""
     monkeypatch.setenv("SGLANG_VIT_ENABLE_CUDA_GRAPH", "1")
     save_file(
         {
