@@ -38,7 +38,24 @@ PASSES = {"c1": 1, "c8": 8, "c16": 16}
 PORT = 29000
 
 
-def client(benchmark: str, port: int, concurrency: int, out: Path) -> None:
+def client(benchmark: str, port: int, concurrency: int, out: Path, events: Path | None) -> None:
+    from benchmarks.eval.asr_profiling import start_request_profile, stop_request_profile
+
+    base_url = f"http://127.0.0.1:{port}"
+    if events is not None:
+        start_request_profile(base_url, f"{out.parent.name}_{out.name}", str(events))
+    else:
+        pass
+    try:
+        run_client(benchmark, port, concurrency, out)
+    finally:
+        if events is not None:
+            stop_request_profile(base_url)
+        else:
+            pass
+
+
+def run_client(benchmark: str, port: int, concurrency: int, out: Path) -> None:
     from benchmarks.dataset.prepare import DATASETS
 
     if benchmark == "videoamme":
@@ -74,7 +91,7 @@ def client(benchmark: str, port: int, concurrency: int, out: Path) -> None:
 
 def run_pass(
     out: Path, pass_name: str, arm: str, card: int, config: str, model: str, benchmark: str, extra: list[str],
-    layer_dump: bool,
+    layer_dump: bool, request_events: bool,
 ) -> dict[str, object]:
     arm_out = out / pass_name / arm
     arm_out.mkdir(parents=True, exist_ok=True)
@@ -98,7 +115,8 @@ def run_pass(
         pair_check.log(out, f"{pass_name} {arm} card {card} healthy, client")
         rc = subprocess.run(
             [sys.executable, str(Path(__file__).resolve()), "--client", "--benchmark", benchmark, "--port",
-             str(port), "--concurrency", str(PASSES[pass_name]), "--out", str(arm_out)],
+             str(port), "--concurrency", str(PASSES[pass_name]), "--out", str(arm_out),
+             *(["--events", str(arm_out / "events")] if request_events else [])],
             cwd=arm_tree, env=pair_check.card_env(card, arm_tree), stdout=open(arm_out / "client.log", "w"),
             stderr=subprocess.STDOUT).returncode
     finally:
@@ -123,10 +141,10 @@ def run_pass(
 
 def run_chain(
     out: Path, passes: list[str], arm: str, card: int, config: str, model: str, benchmark: str, extra: list[str],
-    layer_dump: bool,
+    layer_dump: bool, request_events: bool,
 ) -> dict[str, object]:
     return {
-        pass_name: run_pass(out, pass_name, arm, card, config, model, benchmark, extra, layer_dump)
+        pass_name: run_pass(out, pass_name, arm, card, config, model, benchmark, extra, layer_dump, request_events)
         for pass_name in passes
     }
 
@@ -144,9 +162,11 @@ def main() -> None:
     parser.add_argument("--benchmark", choices=("videoamme", "mmmu", "mmsu"), default="videoamme")
     parser.add_argument("--serve-arg", action="append", default=[], help="one more serve argument, repeatable")
     parser.add_argument("--layer-dump", action="store_true", help="serve with layer_dump/sitecustomize.py's hooks")
+    parser.add_argument("--request-events", action="store_true", help="record request events, <pass>/<arm>/events")
+    parser.add_argument("--events", type=Path, help="client mode: the request events directory")
     args = parser.parse_args()
     if args.client:
-        client(args.benchmark, args.port, args.concurrency, args.out)
+        client(args.benchmark, args.port, args.concurrency, args.out, args.events)
         return
     else:
         pass
@@ -160,7 +180,7 @@ def main() -> None:
             pool.map(
                 lambda placement: run_chain(
                     args.out, passes, *placement, args.config, args.model, args.benchmark, args.serve_arg,
-                    args.layer_dump,
+                    args.layer_dump, args.request_events,
                 ),
                 placements,
             )
