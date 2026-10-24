@@ -189,6 +189,13 @@ def compare(out: Path, tags: list[str]) -> None:
               f"clips, largest difference {max(differences):.4g}")
 
 
+def reference_equal(out: Path, other: Path) -> None:
+    rows, other_rows = torch.load(out / "reference.pt"), torch.load(other / "reference.pt")
+    equal = sum(torch.equal(row, other_row) for row, other_row in zip(rows, other_rows))
+    largest = max(float((row - other_row).abs().max()) for row, other_row in zip(rows, other_rows))
+    print(f"fp32 reference {out} vs {other}: {len(rows)} clips, equal {equal}, largest difference {largest:.4g}")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--out", type=Path, required=True)
@@ -196,6 +203,7 @@ def main() -> None:
     parser.add_argument("--reference", action="store_true")
     parser.add_argument("--encode")
     parser.add_argument("--compare", nargs=2)
+    parser.add_argument("--reference-equal", type=Path, help="another --out whose reference.pt to compare row by row")
     args = parser.parse_args()
     if args.prepare:
         prepare(args.out)
@@ -203,6 +211,8 @@ def main() -> None:
         reference(args.out)
     elif args.encode:
         encode(args.out, args.encode)
+    elif args.reference_equal:
+        reference_equal(args.out, args.reference_equal)
     else:
         compare(args.out, args.compare)
 

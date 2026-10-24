@@ -7,7 +7,8 @@ Run on the box from the arm's tree:
     python3 vision_boot_probe.py --distance <reference tag> <tag> [<tag> ...] --out <dir>
 --encode honours VISION_PROBE_SDPA=math|flash|efficient|cudnn (forces PyTorch's attention backend),
 VISION_PROBE_DETERMINISTIC=1 (torch.use_deterministic_algorithms) and VISION_PROBE_NATIVE=fp32|bf16 (the tree's
-Transformers-attention encoder, the one it builds off its platform, in that dtype, in place of the served one);
+Transformers-attention encoder, the one it builds off its platform, in that dtype, in place of the served one) and
+VISION_PROBE_DTYPE=fp32|bf16 (the served encoder through its public constructor in that dtype);
 CUBLAS_WORKSPACE_CONFIG passes through the environment. Each encode writes <dir>/<tag>.pt with every image's pooled
 embeddings and deepstack features, then times three more passes over every image (device time, events on card 0).
 --distance prints each tag's relative L2 to the reference tag, per image, as median and largest.
@@ -71,7 +72,7 @@ def encode(out: Path, tag: str) -> None:
         )
     else:
         pass
-    dtype = {"fp32": torch.float32, "bf16": torch.bfloat16, None: None}[native]
+    dtype = {"fp32": torch.float32, "bf16": torch.bfloat16, None: None}[native or os.environ.get("VISION_PROBE_DTYPE")]
     encoder = Qwen3OmniImageEncoder(snapshot_download(MODEL), device="cuda:0", dtype=dtype)
     attention = encoder.visual.blocks[0].attn
     print(
