@@ -40,7 +40,7 @@ def main():
                              free_bytes=torch.cuda.mem_get_info()[0])), flush=True)
     caches = []
     with torch.inference_mode(), scheduler.vocoder.stream_context:
-        for group in range(4):
+        for group in range(3):
             items = [scheduler.make_warmup_flow_input(28) for _ in range(16)]
             pairs = [scheduler.vocoder.prefix_cache_rows(100) for _ in items]
             assert all(pair is not None for pair in pairs)
