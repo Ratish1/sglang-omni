@@ -234,6 +234,10 @@ class Qwen3OmniAudioEncoder(nn.Module):
         self.layer_graph_runner = None
         if enable_layer_cuda_graph and self.packed_attention is not None:
             self.enable_layer_cuda_graph()
+        elif enable_layer_cuda_graph and self.device.type == "cuda":
+            logger.warning(
+                "audio layer CUDA graphs need an fp16 or bf16 encoder; staying eager"
+            )
         else:
             pass
 
