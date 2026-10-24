@@ -1320,7 +1320,7 @@ def test_onnx_intra_op_threads_reaches_both_encoders(monkeypatch) -> None:
 
     def fake_tokenizer(model_path, device="cpu", intra_op_threads=1):
         seen["speech_tokenizer"] = intra_op_threads
-        return object()
+        return SimpleNamespace(extract_speech_token=lambda audio: None)
 
     def fake_encoder(model_path, device="cpu", intra_op_threads=1):
         seen["speaker_encoder"] = intra_op_threads
