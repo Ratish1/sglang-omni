@@ -147,21 +147,15 @@ def encode_bucketed(
 @dataclass
 class CapturedSpeakerEncoderGraph:
     graph: ReplayableGraph
-    # note (ratish): the clip as the graph reads it, its samples where the graph computes
-    # the mel too, else its mel.
-    static_clip: torch.Tensor
-    static_sample_count: torch.Tensor
+    static_mels: torch.Tensor
     static_frames: torch.Tensor
     static_embedding: torch.Tensor
-    # note (ratish): the graph reads these two by address, so it holds them.
-    mel_window: torch.Tensor
-    mel_basis: torch.Tensor
 
 
 class Qwen3TTSSpeakerEncoderCudaGraphRunner:
-    """The speaker embedding of a waveform: one captured encode per bucket length, on CUDA
-    with the mel front end in the graph and past the largest bucket the same arithmetic
-    eager; elsewhere the checkpoint's mel on the CPU and an eager encode past it."""
+    """The speaker embedding of a waveform: the checkpoint's mel front end on the CPU,
+    then one captured encode per bucket length; past the largest bucket, on CUDA the
+    same mel on the device and the encode at a rounded width, elsewhere both eager."""
 
     def __init__(self, encoder: torch.nn.Module, *, sample_rate: int) -> None:
         self.encoder = encoder
@@ -182,7 +176,8 @@ class Qwen3TTSSpeakerEncoderCudaGraphRunner:
             for conv in encoder.modules()
             if isinstance(conv, torch.nn.Conv1d)
         ) - {0}
-        self.mel_on_device = current_platform.is_cuda()
+        self.device_mel_window: torch.Tensor | None = None
+        self.device_mel_basis: torch.Tensor | None = None
         self.lock = threading.Lock()
         self.graphs: dict[int, CapturedSpeakerEncoderGraph] = {}
         self.bucket_frames: list[int] = []
@@ -216,18 +211,6 @@ class Qwen3TTSSpeakerEncoderCudaGraphRunner:
         else:
             pass
         device_module = torch.get_device_module(param.device)
-        window = self.mel_window.to(param.device)
-        mel_basis = self.mel_basis.to(param.device)
-
-        def bucket_embedding(
-            clip: torch.Tensor, sample_count: torch.Tensor, frames: torch.Tensor
-        ) -> torch.Tensor:
-            if self.mel_on_device:
-                mels = log_mel(clip, sample_count, window, mel_basis).to(param.dtype)
-            else:
-                mels = clip
-            return encode_bucketed(self.encoder, mels, frames, self.pads)
-
         graphs: dict[int, CapturedSpeakerEncoderGraph] = {}
         try:
             with device_guard(param.device):
@@ -235,21 +218,10 @@ class Qwen3TTSSpeakerEncoderCudaGraphRunner:
                 stream = device_module.Stream(device=param.device)
                 # note(ratish): largest first so the shared pool is sized once.
                 for frames in reversed(buckets):
-                    # note (ratish): the widest clip whose mel has frames frames; the
-                    # warmups make the FFT plans, whose creation waits for the device.
-                    sample_count = SPEAKER_MEL_HOP * (frames + 1) - 1
-                    if self.mel_on_device:
-                        static_clip = torch.zeros(
-                            (1, sample_count), device=param.device, dtype=torch.float32
-                        )
-                    else:
-                        static_clip = torch.zeros(
-                            (1, self.mel_basis.shape[0], frames),
-                            device=param.device,
-                            dtype=param.dtype,
-                        )
-                    static_sample_count = torch.full(
-                        (1,), sample_count, device=param.device, dtype=torch.long
+                    static_mels = torch.zeros(
+                        (1, self.mel_basis.shape[0], frames),
+                        device=param.device,
+                        dtype=param.dtype,
                     )
                     static_frames = torch.full(
                         (1,), frames, device=param.device, dtype=torch.long
@@ -257,8 +229,8 @@ class Qwen3TTSSpeakerEncoderCudaGraphRunner:
                     stream.wait_stream(device_module.current_stream(param.device))
                     with torch.inference_mode(), device_module.stream(stream):
                         for _ in range(2):
-                            bucket_embedding(
-                                static_clip, static_sample_count, static_frames
+                            encode_bucketed(
+                                self.encoder, static_mels, static_frames, self.pads
                             )
                     with (
                         torch.inference_mode(),
@@ -268,18 +240,15 @@ class Qwen3TTSSpeakerEncoderCudaGraphRunner:
                             thread_local_errors=True,
                         ) as graph,
                     ):
-                        static_embedding = bucket_embedding(
-                            static_clip, static_sample_count, static_frames
+                        static_embedding = encode_bucketed(
+                            self.encoder, static_mels, static_frames, self.pads
                         )
                     stream.synchronize()
                     graphs[frames] = CapturedSpeakerEncoderGraph(
                         graph=graph,
-                        static_clip=static_clip,
-                        static_sample_count=static_sample_count,
+                        static_mels=static_mels,
                         static_frames=static_frames,
                         static_embedding=static_embedding,
-                        mel_window=window,
-                        mel_basis=mel_basis,
                     )
         except Exception as exc:
             self.disable_reason = f"capture_failed: {type(exc).__name__}: {exc}"
@@ -290,6 +259,11 @@ class Qwen3TTSSpeakerEncoderCudaGraphRunner:
             )
             return
         self.graphs = graphs
+        if current_platform.is_cuda():
+            self.device_mel_window = self.mel_window.to(param.device)
+            self.device_mel_basis = self.mel_basis.to(param.device)
+        else:
+            pass
         logger.info(f"Qwen3-TTS speaker encoder graphs captured for {buckets} frames")
 
     def stats(self) -> ReferenceEncoderGraphStats:
@@ -309,11 +283,11 @@ class Qwen3TTSSpeakerEncoderCudaGraphRunner:
         assert frames > max(self.pads)
         param = next(self.encoder.parameters())
         bucket = smallest_bucket(frames, self.graphs)
-        if bucket is None and self.graphs and self.mel_on_device:
-            # note (ratish): past the graphs the clip runs their arithmetic eagerly at a
-            # width rounded up to the largest bucket, so cuDNN plans each width once.
+        if bucket is None and self.device_mel_basis is not None:
+            # note (ratish): past the graphs the CPU mel sets a long clip's preprocessing, so
+            # the mel runs on the device, at a width rounded up to the largest bucket so cuDNN
+            # and cuFFT plan each width once.
             largest_frames = max(self.graphs)
-            largest = self.graphs[largest_frames]
             padded_frames = -(-frames // largest_frames) * largest_frames
             padded = torch.zeros(
                 (1, SPEAKER_MEL_HOP * (padded_frames + 1) - 1),
@@ -324,8 +298,8 @@ class Qwen3TTSSpeakerEncoderCudaGraphRunner:
             mels = log_mel(
                 padded,
                 torch.full((1,), samples.shape[1], device=param.device),
-                largest.mel_window,
-                largest.mel_basis,
+                self.device_mel_window,
+                self.device_mel_basis,
             )
             with self.lock:
                 self.misses += 1
@@ -335,8 +309,10 @@ class Qwen3TTSSpeakerEncoderCudaGraphRunner:
                 torch.full((1,), frames, device=param.device),
                 self.pads,
             )
-        elif bucket is None:
-            mels = self.mel(samples).to(param.device).to(param.dtype)
+        else:
+            pass
+        mels = self.mel(samples).to(param.device).to(param.dtype)
+        if bucket is None:
             # note (Haoling Pu): preprocessing threads embed concurrently, and
             # model_info reports this count.
             with self.lock:
@@ -344,16 +320,11 @@ class Qwen3TTSSpeakerEncoderCudaGraphRunner:
             return self.encoder(mels.transpose(1, 2))[0]
         else:
             pass
-        if self.mel_on_device:
-            clip = samples.to(param.device)
-        else:
-            clip = self.mel(samples).to(param.device).to(param.dtype)
         captured = self.graphs[bucket]
         # note(ratish): every worker enqueues on one shared stream, so the lock only
         # orders the enqueue and the clone lands before the next replay.
         with self.lock:
-            captured.static_clip[..., : clip.shape[-1]].copy_(clip)
-            captured.static_sample_count.fill_(samples.shape[1])
+            captured.static_mels[:, :, :frames].copy_(mels)
             captured.static_frames.fill_(frames)
             captured.graph.replay()
             self.replays += 1
