@@ -12,6 +12,7 @@ from torch.nn.attention import SDPBackend, sdpa_kernel
 from sglang_omni.models.qwen3_omni.components.audio_layer_graph import (
     DEFAULT_TOKEN_BUCKETS,
     AudioLayerGraphRunner,
+    stack_qkv_projection,
 )
 from sglang_omni.models.qwen3_omni.components.packed_attention import (
     packed_attention_backend,
@@ -175,10 +176,10 @@ class RealAttention(nn.Module):
         super().__init__()
         self.num_heads = HEADS
         self.scaling = HEAD_DIM**-0.5
-        self.q_proj = nn.Linear(dim, dim, bias=False)
-        self.k_proj = nn.Linear(dim, dim, bias=False)
-        self.v_proj = nn.Linear(dim, dim, bias=False)
-        self.out_proj = nn.Linear(dim, dim, bias=False)
+        self.q_proj = nn.Linear(dim, dim)
+        self.k_proj = nn.Linear(dim, dim)
+        self.v_proj = nn.Linear(dim, dim)
+        self.out_proj = nn.Linear(dim, dim)
 
 
 class RealLayer(nn.Module):
@@ -197,6 +198,37 @@ class RealTower(nn.Module):
         super().__init__()
         self.config = Config(dim)
         self.layers = nn.ModuleList(RealLayer(dim) for _ in range(n))
+
+
+def real_tower(device: torch.device) -> RealTower:
+    tower = RealTower().to(device, torch.bfloat16)
+    for layer in tower.layers:
+        stack_qkv_projection(layer.self_attn)
+    return tower
+
+
+def test_stacked_projection_holds_q_k_and_v_once() -> None:
+    torch.manual_seed(0)
+    attention = RealAttention(HEADS * HEAD_DIM)
+    projections = (attention.q_proj, attention.k_proj, attention.v_proj)
+    hidden = torch.randn(7, HEADS * HEAD_DIM)
+    with torch.no_grad():
+        before = [projection(hidden) for projection in projections]
+        stack_qkv_projection(attention)
+        after = [projection(hidden) for projection in projections]
+        stacked = attention.qkv_proj(hidden)
+    for got, want in zip(after, before):
+        assert torch.equal(got, want)
+    torch.testing.assert_close(stacked, torch.cat(before, dim=-1))
+    for projection in projections:
+        assert (
+            projection.weight.untyped_storage().data_ptr()
+            == attention.qkv_proj.weight.untyped_storage().data_ptr()
+        )
+        assert (
+            projection.bias.untyped_storage().data_ptr()
+            == attention.qkv_proj.bias.untyped_storage().data_ptr()
+        )
 
 
 def segmented_sdpa(q, k, v, cu_seqlens, softmax_scale):
@@ -263,7 +295,7 @@ def test_packed_attention_matches_fp32_sdpa_per_segment_and_head() -> None:
 def test_packed_layer_stack_matches_segmented_sdpa() -> None:
     torch.manual_seed(0)
     device = torch.device("cuda", 0)
-    tower = RealTower().to(device, torch.bfloat16)
+    tower = real_tower(device)
     runner = AudioLayerGraphRunner(
         tower,
         device=device,
@@ -286,7 +318,7 @@ def test_packed_layer_stack_matches_segmented_sdpa() -> None:
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_capture_all_records_a_graph_for_every_bucket() -> None:
     device = torch.device("cuda", 0)
-    tower = RealTower().to(device, torch.bfloat16)
+    tower = real_tower(device)
     runner = AudioLayerGraphRunner(
         tower,
         device=device,
@@ -303,7 +335,7 @@ def test_capture_all_records_a_graph_for_every_bucket() -> None:
 def test_replay_matches_the_uncaptured_packed_stack_across_bucket_boundaries() -> None:
     torch.manual_seed(0)
     device = torch.device("cuda", 0)
-    tower = RealTower().to(device, torch.bfloat16)
+    tower = real_tower(device)
     runner = AudioLayerGraphRunner(
         tower,
         device=device,

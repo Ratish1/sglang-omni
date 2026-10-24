@@ -13,6 +13,9 @@ from sglang_omni.models.qwen3_omni.components.audio_encoder import (
     SegmentSplits,
     share_segment_splits,
 )
+from sglang_omni.models.qwen3_omni.components.audio_layer_graph import (
+    stack_qkv_projection,
+)
 
 HEADS, HEAD_DIM = 4, 16
 DIM = HEADS * HEAD_DIM
@@ -22,7 +25,7 @@ class Attention(nn.Module):
     def __init__(self) -> None:
         super().__init__()
         for name in ("q_proj", "k_proj", "v_proj", "out_proj"):
-            setattr(self, name, nn.Linear(DIM, DIM, bias=False))
+            setattr(self, name, nn.Linear(DIM, DIM))
         self.num_heads = HEADS
         self.scaling = HEAD_DIM**-0.5
         self.attention_dropout = 0.0
@@ -106,6 +109,8 @@ def test_packed_attention_receives_every_window_and_the_host_max_length() -> Non
         side_effect=lambda query, key, value, cu_seqlens, **kwargs: value
     )
     tower, splits = Tower(), SegmentSplits()
+    for layer in tower.layers:
+        stack_qkv_projection(layer.self_attn)
     share_segment_splits(tower, splits, packed_attention)
     segments = [104, 104, 52]
     hs, cu = inputs(segments)
@@ -113,15 +118,22 @@ def test_packed_attention_receives_every_window_and_the_host_max_length() -> Non
     with torch.no_grad():
         for layer in tower.layers:
             attention = layer.self_attn
-            assert torch.equal(
+            torch.testing.assert_close(
                 attention(hs, cu), attention.out_proj(attention.v_proj(hs))
             )
+            attention_call = packed_attention.call_args
+            for received, projection in zip(
+                attention_call.args[:3],
+                (attention.q_proj, attention.k_proj, attention.v_proj),
+            ):
+                torch.testing.assert_close(
+                    received, projection(hs).reshape(sum(segments), HEADS, HEAD_DIM)
+                )
+            assert attention_call.args[3] is cu
+            assert isinstance(attention_call.kwargs["max_seqlen"], int)
+            assert attention_call.kwargs["max_seqlen"] == 104
+            assert attention_call.kwargs["seq_len"] == 260
     assert packed_attention.call_count == len(tower.layers)
-    for attention_call in packed_attention.call_args_list:
-        assert attention_call.args[3] is cu
-        assert isinstance(attention_call.kwargs["max_seqlen"], int)
-        assert attention_call.kwargs["max_seqlen"] == 104
-        assert attention_call.kwargs["seq_len"] == 260
 
 
 def test_missing_splits_fall_back_to_the_stock_path() -> None:

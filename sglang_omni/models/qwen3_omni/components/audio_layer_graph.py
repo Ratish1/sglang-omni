@@ -25,6 +25,24 @@ class Captured:
     segment_slots: int
 
 
+def stack_qkv_projection(attention: nn.Module) -> None:
+    """Give the attention one q, k and v projection; q_proj, k_proj and v_proj become views of it."""
+    projections = (attention.q_proj, attention.k_proj, attention.v_proj)
+    with torch.no_grad():
+        weight = torch.cat([projection.weight for projection in projections])
+        bias = torch.cat([projection.bias for projection in projections])
+    qkv_proj = nn.Linear(weight.shape[1], weight.shape[0], device="meta")
+    qkv_proj.weight = nn.Parameter(weight)
+    qkv_proj.bias = nn.Parameter(bias)
+    attention.qkv_proj = qkv_proj
+    start = 0
+    for projection in projections:
+        end = start + projection.out_features
+        projection.weight = nn.Parameter(weight[start:end])
+        projection.bias = nn.Parameter(bias[start:end])
+        start = end
+
+
 def packed_attention_forward(
     attention: nn.Module,
     packed_attention: nn.Module,
@@ -33,10 +51,12 @@ def packed_attention_forward(
     max_seqlen: int,
 ) -> torch.Tensor:
     seq_length, _ = hidden_states.size()
-    heads = attention.num_heads
-    query_states = attention.q_proj(hidden_states).reshape(seq_length, heads, -1)
-    key_states = attention.k_proj(hidden_states).reshape(seq_length, heads, -1)
-    value_states = attention.v_proj(hidden_states).reshape(seq_length, heads, -1)
+    # note (ratish): one projection GEMM, and the packed attention reads q, k and v as strided views of its output.
+    query_states, key_states, value_states = (
+        attention.qkv_proj(hidden_states)
+        .reshape(seq_length, 3, attention.num_heads, -1)
+        .unbind(1)
+    )
     # An int max_seqlen avoids the device-to-host max() that would break capture.
     attn_output = packed_attention(
         query_states,

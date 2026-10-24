@@ -16,6 +16,7 @@ from transformers.models.qwen3_omni_moe.configuration_qwen3_omni_moe import (
 from sglang_omni.models.qwen3_omni.components.audio_layer_graph import (
     AudioLayerGraphRunner,
     packed_attention_forward,
+    stack_qkv_projection,
 )
 from sglang_omni.models.qwen3_omni.components.common import load_thinker_config
 from sglang_omni.models.qwen3_omni.components.packed_attention import (
@@ -222,6 +223,11 @@ class Qwen3OmniAudioEncoder(nn.Module):
             if self.device.type == "cuda"
             else None
         )
+        if self.packed_attention is not None:
+            for layer in self.audio_tower.layers:
+                stack_qkv_projection(layer.self_attn)
+        else:
+            pass
         share_segment_splits(
             self.audio_tower, self.segment_splits, self.packed_attention
         )
