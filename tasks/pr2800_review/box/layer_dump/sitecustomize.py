@@ -2,9 +2,10 @@
 
 Every stage process imports sitecustomize at start while this directory is on PYTHONPATH. With LAYER_DUMP_DIR set,
 once the shared thinker runner's module loads, inject_multimodal_embeds and post_prefill are wrapped: each prefill
-chunk writes <rid>_inputs.pt (the prompt ids, the chunk's prefix, the audio embeddings the encoder stage handed the
-thinker, the composed input embeddings of the chunk, and the request's M-RoPE positions and delta), and each prefill
-writes <rid>_logits.pt (the next-token logits in fp32 and the token sampled). With PROCESSOR_DUMP_DIR set,
+chunk inside the prompt writes <rid>_inputs.pt (the prompt ids, the chunk's prefix, the audio embeddings the encoder
+stage handed the thinker, the composed input embeddings of the chunk, and the request's M-RoPE positions and delta),
+and the chunk that ends the prompt writes <rid>_logits.pt (the first token's logits in fp32 and the token sampled).
+Extends past the prompt (mixed-chunk decode tokens, a retraction's re-prefill) write nothing. With PROCESSOR_DUMP_DIR set,
 processor_dump/sitecustomize.py's processor hook is installed too.
 """
 
@@ -39,6 +40,13 @@ def install(module):
         prefix_lens = [int(prefix) for prefix in forward_batch.extend_prefix_lens_cpu]
         start = 0
         for req, length, prefix in zip(schedule_batch.reqs, extend_lens, prefix_lens):
+            # note (ratish): a mixed-chunk decode token or a retraction's re-prefill extends past the prompt; it would
+            # overwrite the prompt's record.
+            if prefix >= len(req.origin_input_ids):
+                start += length
+                continue
+            else:
+                pass
             model_inputs = req.omni_model_inputs or {}
             audio_embeds = model_inputs.get("audio_embeds")
             multimodal_inputs = req.multimodal_inputs
@@ -72,7 +80,14 @@ def install(module):
         logits = result.logits_output.next_token_logits
         next_token_ids = getattr(result, "next_token_ids", None)
         if logits is not None:
-            for index, req in enumerate(schedule_batch.reqs):
+            for index, (req, prefix, length) in enumerate(
+                zip(schedule_batch.reqs, schedule_batch.prefix_lens, schedule_batch.extend_lens)
+            ):
+                # note (ratish): only the chunk that ends the prompt computes the first token's logits.
+                if prefix + length != len(req.origin_input_ids):
+                    continue
+                else:
+                    pass
                 torch.save(
                     dict(
                         rid=req.rid,
