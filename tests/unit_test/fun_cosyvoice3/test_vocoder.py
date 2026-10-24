@@ -1763,21 +1763,21 @@ def test_a_share_that_holds_no_block_serves_without_the_prefix_cache(
     assert scheduler.vocoder.flow.prefix_cuda_graph_runner is None
 
 
-def test_largest_step_rows_hold_the_longest_reference_prompt(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """The largest step was measured with a hop of prompt, so a request without
-    ref_text, whose whole reference reaches Flow and not the engine, outgrew it."""
-    flow_rows: list[tuple[int, int]] = []
-
+def step_measurement_vocoder(
+    flow_rows: list[tuple[int, int]], hift_shapes: list[tuple[int, int]]
+) -> SimpleNamespace:
     def decode(items: list[stages.FlowBatchInput]) -> list[torch.Tensor]:
         flow_rows.extend(
             (int(item.prompt_token.shape[1]), int(item.token.shape[1]))
             for item in items
         )
-        return [torch.zeros(1, 80, 4) for _ in items]
+        return [torch.zeros(1, 80, 2 * int(item.token.shape[1])) for item in items]
 
-    vocoder = SimpleNamespace(
+    def mel2wav_batch(mels: list[torch.Tensor]) -> list[torch.Tensor]:
+        hift_shapes.append((len(mels), max(int(mel.shape[2]) for mel in mels)))
+        return []
+
+    return SimpleNamespace(
         flow=SimpleNamespace(
             token_mel_ratio=2,
             output_size=80,
@@ -1785,25 +1785,68 @@ def test_largest_step_rows_hold_the_longest_reference_prompt(
             spk_embed_affine_layer=SimpleNamespace(in_features=192),
         ),
         hift_samples_per_mel_frame=480,
+        hift_max_padding_waste=1.5,
+        flow_merge_pad_budget_percent=25.0,
         stream_context=contextlib.nullcontext(),
         hop_batch=decode,
         leftover_batch=decode,
         hift_step=lambda rows: SimpleNamespace(wait=lambda: None),
+        mel2wav_batch=mel2wav_batch,
     )
-    scheduler = FunCosyVoice3StreamingVocoderScheduler(vocoder, token_hop_len=40)
+
+
+def patch_step_memory(monkeypatch: pytest.MonkeyPatch, window_peaks: list[int]) -> None:
+    peaks = iter(window_peaks)
     monkeypatch.setattr(torch.accelerator, "synchronize", lambda device: None)
     monkeypatch.setattr(torch.accelerator, "empty_cache", lambda: None)
     monkeypatch.setattr(torch.accelerator, "memory_reserved", lambda device: 0)
     monkeypatch.setattr(
         torch.accelerator, "reset_peak_memory_stats", lambda device: None
     )
-    monkeypatch.setattr(torch.accelerator, "max_memory_reserved", lambda device: 0)
+    monkeypatch.setattr(
+        torch.accelerator, "max_memory_reserved", lambda device: next(peaks)
+    )
+
+
+def test_largest_step_rows_hold_the_longest_reference_prompt(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The largest step was measured with a hop of prompt, so a request without
+    ref_text, whose whole reference reaches Flow and not the engine, outgrew it."""
+    flow_rows: list[tuple[int, int]] = []
+    vocoder = step_measurement_vocoder(flow_rows, [])
+    scheduler = FunCosyVoice3StreamingVocoderScheduler(vocoder, token_hop_len=40)
+    patch_step_memory(monkeypatch, [0, 0])
 
     scheduler.measure_peak_step_bytes(
         torch.device("cpu"), row_count=2, generated_tokens_per_row=4096
     )
 
-    assert flow_rows == [(760, 4096)] * 4
+    assert set(flow_rows) == {(760, 4096)}
+
+
+@pytest.mark.parametrize(("window_peaks", "expected_bytes"), [([7, 5], 7), ([3, 5], 5)])
+def test_largest_step_reserves_the_larger_of_streaming_and_non_streaming(
+    monkeypatch: pytest.MonkeyPatch,
+    window_peaks: list[int],
+    expected_bytes: int,
+) -> None:
+    """The reserve held only the largest streaming step, so with fewer rows a step a
+    non-streaming batch at the admission budget, decoded by HiFT in one pass, could
+    outgrow it."""
+    hift_shapes: list[tuple[int, int]] = []
+    vocoder = step_measurement_vocoder([], hift_shapes)
+    scheduler = FunCosyVoice3StreamingVocoderScheduler(
+        vocoder, max_batch_size=16, max_batch_cost=8000
+    )
+    patch_step_memory(monkeypatch, window_peaks)
+
+    reserve_bytes = scheduler.measure_peak_step_bytes(
+        torch.device("cpu"), row_count=16, generated_tokens_per_row=4096
+    )
+
+    assert reserve_bytes == expected_bytes
+    assert hift_shapes == [(1, 8192), (16, 625)]
 
 
 def test_create_vocoder_executor_rejects_non_positive_admission_budget(
