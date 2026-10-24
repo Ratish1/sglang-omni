@@ -1,29 +1,36 @@
-"""How long the Qwen3-Omni vision encoder's position interpolation takes on MMMU-50's 51 images, against the device
-form SGLang runs, and how far apart their outputs are.
+"""The Qwen3-Omni vision position interpolation in every candidate form, on the vision encoder calls a served run made.
 
 Run on the box from main's tree (cwd and PYTHONPATH the tree):
-    python3 vision_interp_probe.py --inputs /data/pr2800/run309/probe/inputs.pt
-Builds the served vision encoder (build_visual, the checkpoint's dtype, card 0). Per image grid it times the encoder's
-legacy_pos_embed_interpolate (index and weight lists built on the host) and SGLang 0.5.22's
-Qwen3VLMoeVisionModel.fast_pos_embed_interpolate_from_list on the same pos_embed table (on the device), each
-synchronized per call, one warmup sweep then three timed sweeps; the whole encoder forward over the same images is
-timed the same way for scale. Prints the sweep times and the largest difference and relative L2 between the two
-interpolations' outputs. --reference instead runs both forms with the table in fp32 as well, takes the legacy form in
-fp32 as the reference, and prints each bf16 form's relative L2 to it (median and largest over the images), the two
-fp32 forms against each other (the weight formulas alone), and whether host and device linspace give equal
-coordinates for every grid side.
+    python3 vision_interp_probe.py --calls <name>=<dir with grids_*.jsonl> [<name>=<dir> ...]
+The directories come from videoamme_pair.py --encoder-grids (encoder_grids/sitecustomize.py): one line per vision
+encoder call with its image and video grid rows. Each call's image grids and video grids are one interpolation each,
+as the encoder runs them. The served encoder is built (build_visual, the checkpoint's dtype, card 0) for its pos_embed
+table, and every interpolation runs in each form:
+  legacy      the encoder's legacy_pos_embed_interpolate (Transformers 5.6 arithmetic, lists built on the host)
+  loop        SGLang 0.5.22 Qwen3VLMoeVisionModel.fast_pos_embed_interpolate_from_list
+  vectorized  SGLang 0.5.22 Qwen3VLMoeVisionModel.fast_pos_embed_interpolate_vectorized
+  dispatch    SGLang's choice between the two (vectorized at _VECTORIZED_VL_POS_EMBED_MIN_IMAGES grids or more)
+  hf519       Transformers 5.19: get_vision_interpolation_indices_and_weights, the weighted embedding sum in fp32,
+              one cast to the table dtype
+Truth is the legacy arithmetic on the table upcast to float64. Per run: the calls, grids per call, the calls at or
+over SGLang's threshold, then per form the relative L2 to truth (median and largest over interpolations), the
+interpolations bit-equal to the loop form, and the summed time of one warmup and three timed sweeps, each
+interpolation synchronized before and after.
 """
 
 from __future__ import annotations
 
 import argparse
+import json
+import statistics
 import time
 from pathlib import Path
 from types import SimpleNamespace
 
 import torch
 from huggingface_hub import snapshot_download
-from sglang.srt.models.qwen3_vl import Qwen3VLMoeVisionModel
+from sglang.srt.models import qwen3_vl
+from transformers.vision_utils import get_vision_interpolation_indices_and_weights
 
 from sglang_omni.models.qwen3_omni.components.common import load_thinker_config
 from sglang_omni.models.qwen3_omni.components.image_encoder import build_visual
@@ -32,104 +39,96 @@ MODEL = "Qwen/Qwen3-Omni-30B-A3B-Instruct"
 TIMED_SWEEPS = 3
 
 
-def sweep_ms(call, arguments: list) -> float:
-    total = 0.0
-    for argument in arguments:
-        torch.cuda.synchronize()
-        start = time.perf_counter()
-        call(argument)
-        torch.cuda.synchronize()
-        total += time.perf_counter() - start
-    return total * 1000
-
-
-def relative_l2(value: torch.Tensor, truth: torch.Tensor) -> float:
-    return float((value.float() - truth).norm() / truth.norm())
-
-
-def reference(visual: torch.nn.Module, grids: list[torch.Tensor]) -> None:
-    device = visual.pos_embed.weight.device
-    table = torch.nn.Embedding.from_pretrained(visual.pos_embed.weight.detach().float())
-    forms = {}
-    for name, embedding in (("bf16", visual.pos_embed), ("fp32", table)):
-        forms[name] = (
-            SimpleNamespace(pos_embed=embedding, num_grid_per_side=visual.num_grid_per_side, config=visual.config),
-            SimpleNamespace(pos_embed=embedding, num_grid_per_side=visual.num_grid_per_side,
-                            spatial_merge_size=visual.spatial_merge_size, device=device,
-                            dtype=embedding.weight.dtype),
-        )
-    distances: dict[str, list[float]] = {"legacy bf16": [], "device bf16": [], "device fp32": []}
-    for grid in grids:
-        truth = type(visual).legacy_pos_embed_interpolate(forms["fp32"][0], grid).float()
-        distances["legacy bf16"].append(
-            relative_l2(type(visual).legacy_pos_embed_interpolate(forms["bf16"][0], grid), truth)
-        )
-        for dtype_name in ("bf16", "fp32"):
-            distances[f"device {dtype_name}"].append(relative_l2(
-                Qwen3VLMoeVisionModel.fast_pos_embed_interpolate_from_list(forms[dtype_name][1], grid.tolist()),
-                truth,
-            ))
-    for name, values in distances.items():
-        print(f"{name} against legacy fp32: relative L2 median {sorted(values)[len(values) // 2]:.3g} "
-              f"largest {max(values):.3g}")
-    sides = sorted({int(side) for grid in grids for side in grid[0, 1:].tolist()})
-    side_count = visual.num_grid_per_side
-    equal = sum(
-        torch.equal(torch.linspace(0, side_count - 1, side), torch.linspace(0, side_count - 1, side, device=device).cpu())
-        for side in sides
-    )
-    print(f"linspace host against device: equal on {equal} of {len(sides)} grid sides")
+def load_interpolations(directory: Path) -> tuple[int, list[list[list[int]]]]:
+    calls = 0
+    interpolations = []
+    for path in sorted(directory.glob("grids_*.jsonl")):
+        for line in path.read_text().splitlines():
+            call = json.loads(line)
+            calls += 1
+            interpolations.extend(call[key] for key in ("image", "video") if call[key])
+    return calls, interpolations
 
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--inputs", type=Path, required=True)
-    parser.add_argument("--reference", action="store_true")
+    parser.add_argument("--calls", nargs="+", required=True, help="name=directory")
     args = parser.parse_args()
     path = snapshot_download(MODEL)
     visual = build_visual(path, thinker_cfg=load_thinker_config(path), torch_dtype=None, device="cuda:0").eval()
     device = visual.pos_embed.weight.device
-    device_form = SimpleNamespace(
+    dtype = visual.pos_embed.weight.dtype
+    stub = SimpleNamespace(
         num_grid_per_side=visual.num_grid_per_side,
         spatial_merge_size=visual.spatial_merge_size,
         pos_embed=visual.pos_embed,
         device=device,
-        dtype=visual.pos_embed.weight.dtype,
+        dtype=dtype,
     )
-    inputs = torch.load(args.inputs)
-    grids = [grid_thw.cpu() for _, grid_thw in inputs]
-    if args.reference:
-        with torch.no_grad():
-            reference(visual, grids)
-        return
-    else:
-        pass
-    images = [(pixel_values.to(device), grid_thw.to(device)) for pixel_values, grid_thw in inputs]
-    print(f"{len(grids)} images, patches per image {[int(grid.prod()) for grid in grids]}")
+    truth_stub = SimpleNamespace(
+        num_grid_per_side=visual.num_grid_per_side,
+        config=visual.config,
+        pos_embed=torch.nn.Embedding.from_pretrained(visual.pos_embed.weight.detach().double()),
+    )
+    threshold = qwen3_vl._VECTORIZED_VL_POS_EMBED_MIN_IMAGES  # noqa: leading-underscore  # SGLang's constant
+    model = qwen3_vl.Qwen3VLMoeVisionModel
+    print(f"table {tuple(visual.pos_embed.weight.shape)} {dtype}, side {visual.num_grid_per_side}, merge "
+          f"{visual.spatial_merge_size}, SGLang threshold {threshold}")
 
-    def host(grid: torch.Tensor) -> torch.Tensor:
-        return visual.legacy_pos_embed_interpolate(grid)
+    def hf519(grid: list[list[int]]) -> torch.Tensor:
+        indices, weights = get_vision_interpolation_indices_and_weights(
+            torch.tensor(grid, device=device), num_grid_per_side=visual.num_grid_per_side, mode="bilinear",
+            align_corners=True, spatial_merge_size=visual.spatial_merge_size,
+        )
+        return (visual.pos_embed(indices) * weights[:, :, None]).sum(1).to(dtype)
 
-    def on_device(grid: torch.Tensor) -> torch.Tensor:
-        return Qwen3VLMoeVisionModel.fast_pos_embed_interpolate_from_list(device_form, grid.tolist())
-
-    def encoder(image: tuple[torch.Tensor, torch.Tensor]) -> None:
-        visual(image[0], grid_thw=image[1])
-
+    forms = {
+        "legacy": lambda grid: visual.legacy_pos_embed_interpolate(torch.tensor(grid)),
+        "loop": lambda grid: model.fast_pos_embed_interpolate_from_list(stub, grid),
+        "vectorized": lambda grid: model.fast_pos_embed_interpolate_vectorized(stub, grid),
+        "dispatch": lambda grid: (
+            model.fast_pos_embed_interpolate_vectorized(stub, grid)
+            if len(grid) >= threshold
+            else model.fast_pos_embed_interpolate_from_list(stub, grid)
+        ),
+        "hf519": hf519,
+    }
     with torch.no_grad():
-        largest = 0.0
-        relative = []
-        for grid in grids:
-            first, second = host(grid).float(), on_device(grid).float()
-            largest = max(largest, float((first - second).abs().max()))
-            relative.append(float((first - second).norm() / first.norm()))
-        print(f"host against device: largest difference {largest:.4g}, relative L2 largest {max(relative):.4g}, "
-              f"outputs equal on {sum(value == 0 for value in relative)} of {len(relative)}")
-        for name, call, arguments in (("host interpolation", host, grids), ("device interpolation", on_device, grids),
-                                      ("encoder forward", encoder, images)):
-            sweep_ms(call, arguments)
-            times = [sweep_ms(call, arguments) for _ in range(TIMED_SWEEPS)]
-            print(f"{name}: {', '.join(f'{value:.1f}' for value in times)} ms over {len(arguments)} images")
+        for entry in args.calls:
+            name, directory = entry.split("=", 1)
+            calls, interpolations = load_interpolations(Path(directory))
+            sizes = [len(grid) for grid in interpolations]
+            patches = [sum(t * h * w for t, h, w in grid) for grid in interpolations]
+            print(f"== {name}: {calls} calls, {len(interpolations)} interpolations, grids per interpolation "
+                  f"median {statistics.median(sizes)} largest {max(sizes)}, at or over {threshold}: "
+                  f"{sum(size >= threshold for size in sizes)}; patches median {statistics.median(patches)} "
+                  f"largest {max(patches)}", flush=True)
+            distances: dict[str, list[float]] = {form: [] for form in forms}
+            equal = dict.fromkeys(forms, 0)
+            for grid in interpolations:
+                truth = type(visual).legacy_pos_embed_interpolate(truth_stub, torch.tensor(grid))
+                loop = forms["loop"](grid)
+                for form, call in forms.items():
+                    output = call(grid)
+                    distances[form].append(float((output.double() - truth).norm() / truth.norm()))
+                    equal[form] += int(torch.equal(output, loop))
+            for form, call in forms.items():
+                times = []
+                for sweep in range(TIMED_SWEEPS + 1):
+                    total = 0.0
+                    for grid in interpolations:
+                        torch.cuda.synchronize()
+                        start = time.perf_counter()
+                        call(grid)
+                        torch.cuda.synchronize()
+                        total += time.perf_counter() - start
+                    if sweep > 0:
+                        times.append(total * 1000)
+                    else:
+                        pass
+                print(f"{form:10s} relative L2 to truth median {statistics.median(distances[form]):.3e} largest "
+                      f"{max(distances[form]):.3e}; equal to loop {equal[form]} of {len(interpolations)}; time "
+                      f"{', '.join(f'{value:.1f}' for value in times)} ms", flush=True)
 
 
 if __name__ == "__main__":

@@ -91,7 +91,7 @@ def run_client(benchmark: str, port: int, concurrency: int, out: Path) -> None:
 
 def run_pass(
     out: Path, pass_name: str, arm: str, card: int, config: str, model: str, benchmark: str, extra: list[str],
-    layer_dump: bool, request_events: bool,
+    layer_dump: bool, request_events: bool, encoder_grids: bool,
 ) -> dict[str, object]:
     arm_out = out / pass_name / arm
     arm_out.mkdir(parents=True, exist_ok=True)
@@ -106,6 +106,12 @@ def run_pass(
             **pair_check.card_env(card, arm_tree),
             "PYTHONPATH": f"{BOX / 'layer_dump'}:{arm_tree}",
             "LAYER_DUMP_DIR": str(arm_out / "layers"),
+        }
+    elif encoder_grids:
+        server_env = {
+            **pair_check.card_env(card, arm_tree),
+            "PYTHONPATH": f"{BOX / 'encoder_grids'}:{arm_tree}",
+            "ENCODER_GRIDS_DIR": str(arm_out / "grids"),
         }
     else:
         pass
@@ -141,10 +147,12 @@ def run_pass(
 
 def run_chain(
     out: Path, passes: list[str], arm: str, card: int, config: str, model: str, benchmark: str, extra: list[str],
-    layer_dump: bool, request_events: bool,
+    layer_dump: bool, request_events: bool, encoder_grids: bool,
 ) -> dict[str, object]:
     return {
-        pass_name: run_pass(out, pass_name, arm, card, config, model, benchmark, extra, layer_dump, request_events)
+        pass_name: run_pass(
+            out, pass_name, arm, card, config, model, benchmark, extra, layer_dump, request_events, encoder_grids
+        )
         for pass_name in passes
     }
 
@@ -163,6 +171,7 @@ def main() -> None:
     parser.add_argument("--serve-arg", action="append", default=[], help="one more serve argument, repeatable")
     parser.add_argument("--layer-dump", action="store_true", help="serve with layer_dump/sitecustomize.py's hooks")
     parser.add_argument("--request-events", action="store_true", help="record request events, <pass>/<arm>/events")
+    parser.add_argument("--encoder-grids", action="store_true", help="record each vision call's grids, <pass>/<arm>/grids")
     parser.add_argument("--events", type=Path, help="client mode: the request events directory")
     args = parser.parse_args()
     if args.client:
@@ -180,7 +189,7 @@ def main() -> None:
             pool.map(
                 lambda placement: run_chain(
                     args.out, passes, *placement, args.config, args.model, args.benchmark, args.serve_arg,
-                    args.layer_dump, args.request_events,
+                    args.layer_dump, args.request_events, args.encoder_grids,
                 ),
                 placements,
             )
