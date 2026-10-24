@@ -131,9 +131,6 @@ CAUSAL_CONV_CACHE_PATCHED = False
 FLOW_CUDA_GRAPH_FRAME_BUCKET = 16
 # note(ratish): the Flow's Euler steps per solve, CosyVoice's n_timesteps.
 FLOW_EULER_STEPS = 10
-# note (ratish): the throwaway prefix pool the prefix graphs are measured on: a first
-# warmup hop for both CFG twins at the default hop.
-DRY_PREFIX_POOL_BLOCKS = 4
 # Note (chenyang):
 # Mel-frame step size for buffered flow CUDA Graph keys. Capture shapes
 # must use a T that is a multiple of this step size. For example, 489
@@ -1589,11 +1586,12 @@ def build_prefix_pool(
     # note (ratish): the engine's headroom stays free on the device and under the
     # process's allocator cap (total_reserve_bytes); a declared vocoder share
     # (gpu_memory_fraction) bounds this stage's own allocations.
-    torch.cuda.empty_cache()
-    free_bytes, total_bytes = torch.cuda.mem_get_info(device)
-    reserved_bytes = torch.cuda.memory_reserved(device)
+    torch.accelerator.empty_cache()
+    free_bytes, total_bytes = torch.accelerator.get_memory_info(device)
+    reserved_bytes = torch.accelerator.memory_reserved(device)
     allocator_cap_bytes = (
-        torch.cuda.get_per_process_memory_fraction(device) * total_bytes
+        torch.get_device_module(device).get_per_process_memory_fraction(device)
+        * total_bytes
     )
     budget_bytes = (
         min(free_bytes, allocator_cap_bytes - reserved_bytes)
@@ -2489,13 +2487,12 @@ def create_vocoder_executor(
         pass
     device_obj = torch.device(device)
     # note (ratish): a declared vocoder share bounds this stage's own allocations,
-    # which start here; only CUDA has the Flow prefix pool it sizes.
-    if total_gpu_memory_fraction is None or device_obj.type != "cuda":
+    # which start here.
+    if total_gpu_memory_fraction is None:
         share_ceiling_bytes: int | None = None
     else:
-        share_ceiling_bytes = torch.cuda.memory_reserved(device_obj) + int(
-            total_gpu_memory_fraction
-            * torch.cuda.get_device_properties(device_obj).total_memory
+        share_ceiling_bytes = torch.accelerator.memory_reserved(device_obj) + int(
+            total_gpu_memory_fraction * torch.accelerator.get_memory_info(device_obj)[1]
         )
     flow, hift = load_cosyvoice3_flow_hift(
         checkpoint_dir,
@@ -2719,13 +2716,14 @@ def create_vocoder_executor(
         )
         if has_prefix_graphs:
             # note (ratish): the prefix graphs capture after the pool they read, so
-            # their memory is measured first on a throwaway pool and graph pool.
+            # their memory is measured first on a throwaway pool and graph pool, the
+            # pool holding the prefix warmup's hops.
             flow.prefix_pool = build_prefix_pool(
                 flow,
                 device_obj,
                 autocast_dtype,
                 size_gb=None,
-                max_blocks=DRY_PREFIX_POOL_BLOCKS,
+                max_blocks=scheduler.prefix_warmup_block_count(),
                 stage_reserve_bytes=0,
                 headroom_bytes=0,
                 share_ceiling_bytes=share_ceiling_bytes,
@@ -2736,8 +2734,8 @@ def create_vocoder_executor(
                 scheduler.warmup_prefix_compile()
             else:
                 pass
-            torch.cuda.empty_cache()
-            free_bytes = torch.cuda.mem_get_info(device_obj)[0]
+            torch.accelerator.empty_cache()
+            free_bytes = torch.accelerator.get_memory_info(device_obj)[0]
             dry_prefix_runner = make_prefix_runner(
                 flow.prefix_pool,
                 SolveGraphCapture(
@@ -2745,8 +2743,10 @@ def create_vocoder_executor(
                 ),
             )
             dry_prefix_runner.capture()
-            torch.cuda.empty_cache()
-            prefix_graph_bytes = free_bytes - torch.cuda.mem_get_info(device_obj)[0]
+            torch.accelerator.empty_cache()
+            prefix_graph_bytes = (
+                free_bytes - torch.accelerator.get_memory_info(device_obj)[0]
+            )
             del dry_prefix_runner
             flow.prefix_pool = None
         else:

@@ -1320,7 +1320,7 @@ def test_onnx_intra_op_threads_reaches_both_encoders(monkeypatch) -> None:
 
     def fake_tokenizer(model_path, device="cpu", intra_op_threads=1):
         seen["speech_tokenizer"] = intra_op_threads
-        return object()
+        return SimpleNamespace(extract_speech_token=lambda audio: None)
 
     def fake_encoder(model_path, device="cpu", intra_op_threads=1):
         seen["speaker_encoder"] = intra_op_threads
@@ -1408,19 +1408,25 @@ def test_derived_prefix_pool_takes_the_memory_left_after_its_reserve(
         - headroom_bytes
         - capped_blocks * block_bytes
     )
-    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: None)
+    monkeypatch.setattr(torch.accelerator, "empty_cache", lambda: None)
     monkeypatch.setattr(
-        torch.cuda,
-        "mem_get_info",
+        torch.accelerator,
+        "get_memory_info",
         lambda device: (
             int(stage_reserve_bytes + headroom_bytes + free_blocks * block_bytes),
             total_bytes,
         ),
     )
     monkeypatch.setattr(
-        torch.cuda, "get_per_process_memory_fraction", lambda device: 0.5
+        torch,
+        "get_device_module",
+        lambda device: SimpleNamespace(
+            get_per_process_memory_fraction=lambda device: 0.5
+        ),
     )
-    monkeypatch.setattr(torch.cuda, "memory_reserved", lambda device: reserved_bytes)
+    monkeypatch.setattr(
+        torch.accelerator, "memory_reserved", lambda device: reserved_bytes
+    )
 
     pool = stages.build_prefix_pool(
         tiny_prefix_flow(),
@@ -1456,16 +1462,20 @@ def test_prefix_pool_caps_take_the_smaller_of_their_size_and_the_memory_left(
 ) -> None:
     block_bytes = stages.BLOCK_FRAMES * tiny_prefix_bytes_per_frame()
     stage_reserve_bytes = 2**30
-    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: None)
+    monkeypatch.setattr(torch.accelerator, "empty_cache", lambda: None)
     monkeypatch.setattr(
-        torch.cuda,
-        "mem_get_info",
+        torch.accelerator,
+        "get_memory_info",
         lambda device: (stage_reserve_bytes + 10 * block_bytes, 2**36),
     )
     monkeypatch.setattr(
-        torch.cuda, "get_per_process_memory_fraction", lambda device: 1.0
+        torch,
+        "get_device_module",
+        lambda device: SimpleNamespace(
+            get_per_process_memory_fraction=lambda device: 1.0
+        ),
     )
-    monkeypatch.setattr(torch.cuda, "memory_reserved", lambda device: 0)
+    monkeypatch.setattr(torch.accelerator, "memory_reserved", lambda device: 0)
 
     pool = stages.build_prefix_pool(
         tiny_prefix_flow(),
@@ -1480,6 +1490,49 @@ def test_prefix_pool_caps_take_the_smaller_of_their_size_and_the_memory_left(
 
     assert pool is not None
     assert pool.free_frames == expected_blocks * stages.BLOCK_FRAMES
+
+
+@pytest.mark.parametrize("token_hop_len", [25, 50])
+def test_a_pool_of_the_prefix_warmup_blocks_runs_both_warmup_hops(
+    token_hop_len: int,
+) -> None:
+    prefix_hop_row_counts: list[int] = []
+    vocoder = SimpleNamespace(
+        flow=SimpleNamespace(
+            token_mel_ratio=2,
+            output_size=80,
+            spk_embed_affine_layer=SimpleNamespace(in_features=192),
+            prefix_pool=None,
+        ),
+        hop_batch_prefix=lambda items, caches: prefix_hop_row_counts.append(len(items)),
+    )
+    vocoder.prefix_cache_rows = lambda frames: (
+        stages.CosyVoice3Vocoder.prefix_cache_rows(vocoder, frames)
+    )
+    vocoder.grow_prefix_cache = lambda pair, frames: (
+        stages.CosyVoice3Vocoder.grow_prefix_cache(vocoder, pair, frames)
+    )
+    vocoder.release_prefix_cache = lambda pair: (
+        stages.CosyVoice3Vocoder.release_prefix_cache(vocoder, pair)
+    )
+    scheduler = FunCosyVoice3StreamingVocoderScheduler(
+        vocoder, token_hop_len=token_hop_len
+    )
+    capacity_frames = scheduler.prefix_warmup_block_count() * stages.BLOCK_FRAMES
+    vocoder.flow.prefix_pool = stages.PrefixKVPool(
+        layer_num=1,
+        euler_steps=1,
+        head_num=1,
+        head_dim=4,
+        capacity_frames=capacity_frames,
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+    )
+
+    scheduler.warmup_prefix_hops()
+
+    assert prefix_hop_row_counts == [1, 1]
+    assert vocoder.flow.prefix_pool.free_frames == capacity_frames
 
 
 @pytest.mark.parametrize(
@@ -1507,11 +1560,9 @@ def test_prefix_pool_leaves_the_engine_headroom_and_the_largest_step(
         "load_cosyvoice3_flow_hift",
         lambda checkpoint_dir, device, fp16, **kwargs: (flow, FakeHiFT()),
     )
-    monkeypatch.setattr(torch.cuda, "memory_reserved", lambda device: 2**30)
+    monkeypatch.setattr(torch.accelerator, "memory_reserved", lambda device: 2**30)
     monkeypatch.setattr(
-        torch.cuda,
-        "get_device_properties",
-        lambda device: SimpleNamespace(total_memory=2**34),
+        torch.accelerator, "get_memory_info", lambda device: (2**33, 2**34)
     )
     events: list[tuple[str, object]] = []
 
