@@ -54,9 +54,10 @@ for arm in "main $M" "d8 $P8" "d8b $P8" "mainb $M"; do
 done
 for pair in "main d8" "main mainb" "d8 d8b"; do
   set -- $pair
-  python3 $HERE/speaker_embed_bench.py --compare $D/speaker_seedtts_$1.pt $D/speaker_seedtts_$2.pt \
-    > $D/speaker_compare_seedtts_$1_$2.txt 2>&1
-  python3 $HERE/speaker_embed_bench.py --compare $D/speaker_L3_$1.pt $D/speaker_L3_$2.pt > $D/speaker_compare_L3_$1_$2.txt 2>&1
+  (cd $M && PYTHONPATH=$M python3 $HERE/speaker_embed_bench.py --compare $D/speaker_seedtts_$1.pt \
+    $D/speaker_seedtts_$2.pt > $D/speaker_compare_seedtts_$1_$2.txt 2>&1)
+  (cd $M && PYTHONPATH=$M python3 $HERE/speaker_embed_bench.py --compare $D/speaker_L3_$1.pt $D/speaker_L3_$2.pt \
+    > $D/speaker_compare_L3_$1_$2.txt 2>&1)
 done
 (cd $M && PYTHONPATH=$M timeout 3600 python3 $HERE/preprocessing_truth_probe.py $D/truth_fp32.pt --truth --card 3 \
   --meta $LONG/L1_c16_run.lst $LONG/L3_c16_run.lst > $D/truth_fp32.log 2>&1)
