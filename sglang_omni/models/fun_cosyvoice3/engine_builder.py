@@ -20,6 +20,7 @@ from sglang_omni.models.fun_cosyvoice3.request_builders import (
 )
 from sglang_omni.models.fun_cosyvoice3.streaming import TOKEN_HOP_LEN
 from sglang_omni.models.fun_cosyvoice3.utils import (
+    MAX_REFERENCE_SAMPLES,
     CosyVoice3Tokenizer,
     SpeakerEncoder,
     SpeechTokenizerV3,
@@ -42,9 +43,6 @@ else:
     pass
 
 logger = logging.getLogger(__name__)
-
-# note (ratish): the longest reference extract_speech_token takes, 30 s at 16 kHz.
-MAX_REFERENCE_SAMPLES = 30 * 16000
 
 _ENGINE_HEADROOM_BYTES = 0
 
