@@ -1366,20 +1366,28 @@ def tiny_prefix_flow() -> SimpleNamespace:
     return SimpleNamespace(
         decoder=SimpleNamespace(
             estimator=SimpleNamespace(
-                transformer_blocks=[SimpleNamespace(attn=attention)] * 2
+                transformer_blocks=[SimpleNamespace(attn=attention)] * 2,
+                input_embed=SimpleNamespace(proj=SimpleNamespace(out_features=8)),
             )
         )
     )
 
 
-def tiny_prefix_bytes_per_frame() -> int:
-    return stages.PrefixKVPool.bytes_per_frame(
+def tiny_prefix_padding_bytes() -> int:
+    return stages.BLOCK_FRAMES * stages.PrefixKVPool.bytes_per_frame(
         layer_num=2,
         euler_steps=stages.FLOW_EULER_STEPS,
         head_num=2,
         head_dim=4,
         dtype=torch.bfloat16,
     )
+
+
+def tiny_prefix_block_bytes() -> int:
+    conv_context_bytes = (
+        stages.FLOW_EULER_STEPS * 2 * stages.CONV_CONTEXT_FRAMES * 8 * 2
+    )
+    return tiny_prefix_padding_bytes() + conv_context_bytes
 
 
 @pytest.mark.parametrize(
@@ -1398,7 +1406,8 @@ def test_derived_prefix_pool_takes_the_memory_left_after_its_reserve(
     share_blocks: int | None,
     expected_blocks: int | None,
 ) -> None:
-    block_bytes = stages.BLOCK_FRAMES * tiny_prefix_bytes_per_frame()
+    padding_bytes = tiny_prefix_padding_bytes()
+    block_bytes = tiny_prefix_block_bytes()
     stage_reserve_bytes = 2**30
     headroom_bytes = 2**29
     total_bytes = 2**36
@@ -1406,6 +1415,7 @@ def test_derived_prefix_pool_takes_the_memory_left_after_its_reserve(
         total_bytes / 2
         - stage_reserve_bytes
         - headroom_bytes
+        - padding_bytes
         - capped_blocks * block_bytes
     )
     monkeypatch.setattr(torch.accelerator, "empty_cache", lambda: None)
@@ -1413,7 +1423,12 @@ def test_derived_prefix_pool_takes_the_memory_left_after_its_reserve(
         torch.accelerator,
         "get_memory_info",
         lambda device: (
-            int(stage_reserve_bytes + headroom_bytes + free_blocks * block_bytes),
+            int(
+                stage_reserve_bytes
+                + headroom_bytes
+                + padding_bytes
+                + free_blocks * block_bytes
+            ),
             total_bytes,
         ),
     )
@@ -1439,7 +1454,10 @@ def test_derived_prefix_pool_takes_the_memory_left_after_its_reserve(
         share_ceiling_bytes=(
             None
             if share_blocks is None
-            else reserved_bytes + stage_reserve_bytes + share_blocks * block_bytes
+            else reserved_bytes
+            + stage_reserve_bytes
+            + padding_bytes
+            + share_blocks * block_bytes
         ),
     )
 
@@ -1460,13 +1478,14 @@ def test_prefix_pool_caps_take_the_smaller_of_their_size_and_the_memory_left(
     max_blocks: int | None,
     expected_blocks: int,
 ) -> None:
-    block_bytes = stages.BLOCK_FRAMES * tiny_prefix_bytes_per_frame()
+    padding_bytes = tiny_prefix_padding_bytes()
+    block_bytes = tiny_prefix_block_bytes()
     stage_reserve_bytes = 2**30
     monkeypatch.setattr(torch.accelerator, "empty_cache", lambda: None)
     monkeypatch.setattr(
         torch.accelerator,
         "get_memory_info",
-        lambda device: (stage_reserve_bytes + 10 * block_bytes, 2**36),
+        lambda device: (stage_reserve_bytes + padding_bytes + 10 * block_bytes, 2**36),
     )
     monkeypatch.setattr(
         torch,
@@ -1481,7 +1500,11 @@ def test_prefix_pool_caps_take_the_smaller_of_their_size_and_the_memory_left(
         tiny_prefix_flow(),
         torch.device("cpu"),
         torch.bfloat16,
-        size_gb=None if size_blocks is None else size_blocks * block_bytes / 2**30,
+        size_gb=(
+            None
+            if size_blocks is None
+            else (padding_bytes + size_blocks * block_bytes) / 2**30
+        ),
         max_blocks=max_blocks,
         stage_reserve_bytes=stage_reserve_bytes,
         headroom_bytes=0,
