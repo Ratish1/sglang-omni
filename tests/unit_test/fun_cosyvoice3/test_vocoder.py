@@ -1408,19 +1408,25 @@ def test_derived_prefix_pool_takes_the_memory_left_after_its_reserve(
         - headroom_bytes
         - capped_blocks * block_bytes
     )
-    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: None)
+    monkeypatch.setattr(torch.accelerator, "empty_cache", lambda: None)
     monkeypatch.setattr(
-        torch.cuda,
-        "mem_get_info",
+        torch.accelerator,
+        "get_memory_info",
         lambda device: (
             int(stage_reserve_bytes + headroom_bytes + free_blocks * block_bytes),
             total_bytes,
         ),
     )
     monkeypatch.setattr(
-        torch.cuda, "get_per_process_memory_fraction", lambda device: 0.5
+        torch,
+        "get_device_module",
+        lambda device: SimpleNamespace(
+            get_per_process_memory_fraction=lambda device: 0.5
+        ),
     )
-    monkeypatch.setattr(torch.cuda, "memory_reserved", lambda device: reserved_bytes)
+    monkeypatch.setattr(
+        torch.accelerator, "memory_reserved", lambda device: reserved_bytes
+    )
 
     pool = stages.build_prefix_pool(
         tiny_prefix_flow(),
@@ -1456,16 +1462,20 @@ def test_prefix_pool_caps_take_the_smaller_of_their_size_and_the_memory_left(
 ) -> None:
     block_bytes = stages.BLOCK_FRAMES * tiny_prefix_bytes_per_frame()
     stage_reserve_bytes = 2**30
-    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: None)
+    monkeypatch.setattr(torch.accelerator, "empty_cache", lambda: None)
     monkeypatch.setattr(
-        torch.cuda,
-        "mem_get_info",
+        torch.accelerator,
+        "get_memory_info",
         lambda device: (stage_reserve_bytes + 10 * block_bytes, 2**36),
     )
     monkeypatch.setattr(
-        torch.cuda, "get_per_process_memory_fraction", lambda device: 1.0
+        torch,
+        "get_device_module",
+        lambda device: SimpleNamespace(
+            get_per_process_memory_fraction=lambda device: 1.0
+        ),
     )
-    monkeypatch.setattr(torch.cuda, "memory_reserved", lambda device: 0)
+    monkeypatch.setattr(torch.accelerator, "memory_reserved", lambda device: 0)
 
     pool = stages.build_prefix_pool(
         tiny_prefix_flow(),
@@ -1550,11 +1560,9 @@ def test_prefix_pool_leaves_the_engine_headroom_and_the_largest_step(
         "load_cosyvoice3_flow_hift",
         lambda checkpoint_dir, device, fp16, **kwargs: (flow, FakeHiFT()),
     )
-    monkeypatch.setattr(torch.cuda, "memory_reserved", lambda device: 2**30)
+    monkeypatch.setattr(torch.accelerator, "memory_reserved", lambda device: 2**30)
     monkeypatch.setattr(
-        torch.cuda,
-        "get_device_properties",
-        lambda device: SimpleNamespace(total_memory=2**34),
+        torch.accelerator, "get_memory_info", lambda device: (2**33, 2**34)
     )
     events: list[tuple[str, object]] = []
 

@@ -277,10 +277,10 @@ class FunCosyVoice3StreamingVocoderScheduler(
             self.make_warmup_flow_input(tokens_per_row - self.token_hop_len)
             for _ in range(row_count)
         ]
-        torch.cuda.synchronize(device)
-        torch.cuda.empty_cache()
-        resident_bytes = torch.cuda.memory_reserved(device)
-        torch.cuda.reset_peak_memory_stats(device)
+        torch.accelerator.synchronize(device)
+        torch.accelerator.empty_cache()
+        resident_bytes = torch.accelerator.memory_reserved(device)
+        torch.accelerator.reset_peak_memory_stats(device)
         started = time.monotonic()
         with self.vocoder.stream_context:
             for decode, is_final in (
@@ -299,8 +299,8 @@ class FunCosyVoice3StreamingVocoderScheduler(
                         for mel in mels
                     ]
                 ).wait()
-        torch.cuda.synchronize(device)
-        peak_bytes = torch.cuda.max_memory_reserved(device) - resident_bytes
+        torch.accelerator.synchronize(device)
+        peak_bytes = torch.accelerator.max_memory_reserved(device) - resident_bytes
         logger.info(
             f"Fun-CosyVoice3 largest admitted step, {row_count} rows of {tokens_per_row} "
             f"tokens: "
