@@ -49,7 +49,7 @@ def summary(tensor):
                 sha256=hashlib.sha256(tensor.detach().cpu().contiguous().view(torch.uint8).numpy().tobytes()).hexdigest())
 
 
-def run(root, label, output, dtype):
+def run(root, label, output, dtype, trained):
     records = []
     root = str(root)
     for kind, constructor in (('audio', Qwen3OmniAudioEncoder), ('vision', Qwen3OmniImageEncoder)):
@@ -62,7 +62,10 @@ def run(root, label, output, dtype):
                 mask = torch.arange(850).unsqueeze(0) < lengths.unsqueeze(1)
                 arguments = dict(input_features=features, feature_attention_mask=mask)
             else:
-                arguments = dict(pixel_values=torch.randn(64,24), image_grid_thw=torch.tensor([[1,4,4],[2,4,6]]))
+                config = model.visual.config
+                patch_width = config.in_channels * config.temporal_patch_size * config.patch_size**2
+                grid = torch.tensor([[1,16,16],[2,12,16]] if trained else [[1,4,4],[2,4,6]])
+                arguments = dict(pixel_values=torch.randn(int(grid.prod(-1).sum()),patch_width), image_grid_thw=grid)
             with torch.no_grad(), (sdpa_kernel(SDPBackend.MATH) if dtype == 'float32' else contextlib.nullcontext()):
                 result = model(**arguments)
             main_key = 'audio_embeds' if kind == 'audio' else 'image_embeds'
@@ -74,8 +77,9 @@ def run(root, label, output, dtype):
                 arguments['input_features'][1] += 20
                 count = int(result['audio_output_lengths'][0])
             else:
-                arguments['pixel_values'][16:] += 20
-                count = 4
+                first_patches = int(arguments['image_grid_thw'][0].prod())
+                arguments['pixel_values'][first_patches:] += 20
+                count = first_patches // model.spatial_merge_size**2
             with torch.no_grad(), (sdpa_kernel(SDPBackend.MATH) if dtype == 'float32' else contextlib.nullcontext()):
                 second = model(**arguments)[main_key]
             record['first_segment_unchanged'] = bool(torch.equal(first[:count], second[:count]))
@@ -127,6 +131,7 @@ def main():
     parser.add_argument('--label', default='head')
     parser.add_argument('--dtype', default='bfloat16')
     parser.add_argument('--graphs', action='store_true')
+    parser.add_argument('--trained', action='store_true')
     options = parser.parse_args()
     options.output.mkdir(parents=True,exist_ok=True)
     if options.make:
@@ -136,7 +141,7 @@ def main():
     if options.graphs:
         graph_transitions(options.checkpoint,options.output)
     else:
-        run(options.checkpoint,options.label,options.output,options.dtype)
+        run(options.checkpoint,options.label,options.output,options.dtype,options.trained)
 
 
 if __name__ == '__main__':
