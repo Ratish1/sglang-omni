@@ -7,6 +7,8 @@ import time
 import torch
 
 from sglang_omni.models.fun_cosyvoice3 import stages
+from sglang_omni.models.fun_cosyvoice3.utils import CosyVoice3Tokenizer
+from sglang_omni.models.fun_cosyvoice3.streaming_vocoder import HiftStepRow
 
 
 def main():
@@ -38,6 +40,30 @@ def main():
     else:
         print(json.dumps(dict(case="post_pool_worst_step", outcome="passed", peak_bytes=reserve,
                              free_bytes=torch.cuda.mem_get_info()[0])), flush=True)
+    tokenizer = CosyVoice3Tokenizer(stages.resolve_checkpoint("FunAudioLLM/Fun-CosyVoice3-0.5B-2512") + "/CosyVoice-BlankEN")
+    ar_prompt = len(tokenizer.encode("You are a helpful assistant.<|endofprompt|>")) + len(tokenizer.encode("Hi")) + 2
+    print(json.dumps(dict(case="crosslingual_lengths", ar_prompt_tokens=ar_prompt,
+                         generated_tokens=4050, ar_total_tokens=ar_prompt+4050,
+                         flow_reference_tokens=750, flow_total_tokens=4800)), flush=True)
+    long_items = [stages.FlowBatchInput(
+        token=torch.zeros(1, 4050, dtype=torch.int32),
+        prompt_token=torch.zeros(1, 750, dtype=torch.int32),
+        prompt_feat=torch.zeros(1, 1500, 80),
+        embedding=torch.zeros(1, 192),
+    ) for _ in range(16)]
+    try:
+        with torch.inference_mode(), scheduler.vocoder.stream_context:
+            for decode, final in ((scheduler.vocoder.hop_batch, False), (scheduler.vocoder.leftover_batch, True)):
+                mels = decode(long_items)
+                scheduler.vocoder.hift_step([HiftStepRow(
+                    history=mel, emitted_samples=max(mel.shape[2]-200, 0)*480,
+                    is_final=final) for mel in mels]).wait()
+        torch.cuda.synchronize()
+    except torch.OutOfMemoryError as error:
+        print(json.dumps(dict(case="admitted_long_reference", outcome=type(error).__name__, error=str(error))), flush=True)
+    else:
+        print(json.dumps(dict(case="admitted_long_reference", outcome="passed")), flush=True)
+        del mels
     caches = []
     with torch.inference_mode(), scheduler.vocoder.stream_context:
         for group in range(3):
