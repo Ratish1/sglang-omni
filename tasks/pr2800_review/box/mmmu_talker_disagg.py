@@ -9,8 +9,9 @@ first card, the talker and code2wav on the second) once and sends test_qwen3_omn
 --passes times: its MAX_SAMPLES mmmu-ci-50 samples with its prompt, MAX_TOKENS and CONCURRENCY, text and audio out,
 greedy. The client runs in the arm's tree and imports those constants from the arm's own test (this file in its
 --client mode). Writes <out>/<arm>/p<index>/mmmu.json. --read pools every round under the directory: per arm the pass
-scores (correct of the stage's samples), the passes under the stage's 0.75, and per sample the correct passes of each
-arm, listing the samples whose rates differ.
+scores (correct of the stage's samples), the passes under the stage's 0.75, the honest scores (drawn letters counted
+wrong) and the answers cut at the token limit, and per sample each arm's honest correct and cut passes, listing the
+samples whose rates differ.
 """
 
 from __future__ import annotations
@@ -33,7 +34,7 @@ RESULTS_NAME = "mmmu.json"
 STAGE_ACCURACY = 0.75
 
 
-def client(port: int, out: Path) -> None:
+def client(port: int, out: Path, max_tokens: int | None) -> None:
     from benchmarks.dataset.prepare import DATASETS
     from benchmarks.eval.benchmark_omni_mmmu import MMMUEvalConfig, run_mmmu_eval
     from tests.test_model import test_qwen3_omni_mmmu_talker_ci as stage
@@ -43,7 +44,7 @@ def client(port: int, out: Path) -> None:
         host="127.0.0.1",
         port=port,
         max_samples=stage.MAX_SAMPLES,
-        max_tokens=stage.MAX_TOKENS,
+        max_tokens=stage.MAX_TOKENS if max_tokens is None else max_tokens,
         max_concurrency=stage.CONCURRENCY,
         output_dir=str(out),
         enable_audio=True,
@@ -56,7 +57,9 @@ def client(port: int, out: Path) -> None:
     (out / RESULTS_NAME).write_text(json.dumps(results, indent=1, default=str))
 
 
-def run_arm(out: Path, arm: str, cards: tuple[int, int], passes: int) -> None:
+def run_arm(
+    out: Path, arm: str, cards: tuple[int, int], passes: int, max_tokens: int | None
+) -> None:
     arm_out = out / arm
     arm_out.mkdir(parents=True, exist_ok=True)
     arm_tree = pair_check.tree(pair_check.ARMS[arm][0])
@@ -85,6 +88,11 @@ def run_arm(out: Path, arm: str, cards: tuple[int, int], passes: int) -> None:
                         str(port),
                         "--out",
                         str(pass_out),
+                        *(
+                            ["--max-tokens", str(max_tokens)]
+                            if max_tokens is not None
+                            else []
+                        ),
                     ],
                     cwd=arm_tree,
                     env={**os.environ, "PYTHONPATH": str(arm_tree)},
@@ -107,41 +115,65 @@ def run_arm(out: Path, arm: str, cards: tuple[int, int], passes: int) -> None:
 
 def read(root: Path, arms: list[str]) -> None:
     scores: dict[str, list[float]] = {arm: [] for arm in arms}
+    honest_scores: dict[str, list[int]] = {arm: [] for arm in arms}
+    cut_counts: dict[str, list[int]] = {arm: [] for arm in arms}
     correct: dict[str, dict[str, int]] = {arm: {} for arm in arms}
+    cut: dict[str, dict[str, int]] = {arm: {} for arm in arms}
     letters: dict[str, dict[str, dict[str, int]]] = {arm: {} for arm in arms}
     for arm in arms:
         for path in sorted(root.glob(f"r*/{arm}/p*/{RESULTS_NAME}")):
             record = json.loads(path.read_text())
+            max_tokens = record["config"]["max_tokens"]
             scores[arm].append(record["summary"]["accuracy"])
+            honest_scores[arm].append(0)
+            cut_counts[arm].append(0)
             for sample in record["per_sample"]:
                 key = str(sample["sample_id"])
-                correct[arm][key] = correct[arm].get(key, 0) + int(
-                    bool(sample["is_correct"])
-                )
+                is_honest = bool(sample["is_correct"]) and not sample["is_mc_fallback"]
+                is_cut = sample["completion_tokens"] >= max_tokens
+                honest_scores[arm][-1] += int(is_honest)
+                cut_counts[arm][-1] += int(is_cut)
+                correct[arm][key] = correct[arm].get(key, 0) + int(is_honest)
+                cut[arm][key] = cut[arm].get(key, 0) + int(is_cut)
                 predicted = letters[arm].setdefault(key, {})
-                predicted[sample["predicted"]] = (
-                    predicted.get(sample["predicted"], 0) + 1
+                letter = (
+                    sample["predicted"].lower() + "*"
+                    if sample["is_mc_fallback"]
+                    else sample["predicted"]
                 )
+                predicted[letter] = predicted.get(letter, 0) + 1
         values = scores[arm]
         print(
             f"{arm}: {len(values)} passes, scores {sorted(values)}, mean {sum(values) / max(len(values), 1):.4f}, "
-            f"under {STAGE_ACCURACY}: {sum(value < STAGE_ACCURACY for value in values)}"
+            f"under {STAGE_ACCURACY}: {sum(value < STAGE_ACCURACY for value in values)}; "
+            f"honest {sorted(honest_scores[arm])}, mean {sum(honest_scores[arm]) / max(len(values), 1):.3f}; "
+            f"cut at the token limit {sorted(cut_counts[arm])}, mean {sum(cut_counts[arm]) / max(len(values), 1):.3f}"
         )
     samples = sorted(set().union(*(correct[arm] for arm in arms)))
     differing = [
         key
         for key in samples
-        if len({correct[arm].get(key, 0) / max(len(scores[arm]), 1) for arm in arms})
+        if len(
+            {
+                (
+                    correct[arm].get(key, 0) / max(len(scores[arm]), 1),
+                    cut[arm].get(key, 0) / max(len(scores[arm]), 1),
+                )
+                for arm in arms
+            }
+        )
         > 1
     ]
     print(
-        f"samples {len(samples)}, with different correct rates across arms {len(differing)}"
+        f"samples {len(samples)}, with different honest correct or cut rates across arms {len(differing)} "
+        f"(letters: lower case with * is a drawn letter)"
     )
     for key in differing:
         print(
             f"  {key}: "
             + ", ".join(
-                f"{arm} {correct[arm].get(key, 0)}/{len(scores[arm])} {letters[arm].get(key, {})}"
+                f"{arm} correct {correct[arm].get(key, 0)}/{len(scores[arm])} cut {cut[arm].get(key, 0)} "
+                f"{letters[arm].get(key, {})}"
                 for arm in arms
             )
         )
@@ -161,15 +193,22 @@ def main() -> None:
     parser.add_argument("--port", type=int)
     parser.add_argument("--read", type=Path)
     parser.add_argument("--arms")
+    parser.add_argument(
+        "--max-tokens",
+        type=int,
+        help="the stage's token budget in place of its MAX_TOKENS",
+    )
     args = parser.parse_args()
     if args.client:
-        client(args.port, args.out)
+        client(args.port, args.out, args.max_tokens)
     elif args.read is not None:
         read(args.read, args.arms.split(","))
     else:
         args.out.mkdir(parents=True, exist_ok=True)
         first_card, second_card = (int(card) for card in args.cards.split("+"))
-        run_arm(args.out, args.arm, (first_card, second_card), args.passes)
+        run_arm(
+            args.out, args.arm, (first_card, second_card), args.passes, args.max_tokens
+        )
 
 
 if __name__ == "__main__":
