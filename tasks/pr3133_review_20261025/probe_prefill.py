@@ -48,8 +48,9 @@ def main() -> None:
         sidecar = get_omni_prefill_inputs(forward_batch)
         assert sidecar is not None
         assert forward_batch.input_embeds is None
+        reference_embeds = sidecar.input_embeds.clone()
         reference = runner.forward_with_input_embeds(
-            forward_batch, sidecar.input_embeds
+            forward_batch, reference_embeds
         ).logits_output.next_token_logits.clone()
         result = original_forward(forward_batch, **kwargs)
         actual = result.logits_output.next_token_logits.clone()
@@ -58,7 +59,6 @@ def main() -> None:
         log_reference = torch.log_softmax(reference.float(), dim=-1)
         log_actual = torch.log_softmax(actual.float(), dim=-1)
         divergence = (log_reference.exp() * (log_reference - log_actual)).sum(-1)
-        assert divergence.max().item() < 0.001
         records.append({
             "rids": forward_batch.rids,
             "tokens": len(forward_batch.input_ids),
@@ -68,8 +68,10 @@ def main() -> None:
             "max_logit_error": (actual-reference).abs().max().item(),
             "max_kl": divergence.max().item(),
             "top1_equal": bool(torch.equal(actual.argmax(-1), reference.argmax(-1))),
+            "eager_mutates_input": not bool(torch.equal(reference_embeds, sidecar.input_embeds)),
         })
         print(json.dumps(records[-1]), flush=True)
+        assert divergence.max().item() < 0.001
         return result
 
     worker.forward_batch_generation = checked_forward
