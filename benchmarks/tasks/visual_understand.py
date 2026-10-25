@@ -42,7 +42,7 @@ class MMMURecord(TypedDict):
     raw_response: str
     is_correct: bool
     is_success: bool
-    is_unparsed: bool
+    is_unparseable: bool
     error: str
 
 
@@ -174,12 +174,8 @@ def parse_multi_choice_response(
 ) -> tuple[str, bool]:
     """Extract a single answer letter from the model response.
 
-    Priority: ``Answer: X`` → ``(A)`` bracket → ``·A·`` space-padded →
-    option-text match → last-occurrence tie-break.
-
-    Returns ``(choice, is_unparsed)``. When the response names no option,
-    ``choice`` is empty and ``is_unparsed`` is ``True``, so the answer
-    scores as wrong.
+    Priority: Answer: X, then (A), then a space-padded letter, then the option text, with the last occurrence breaking ties.
+    Returns (choice, is_unparseable); a response that names no option returns an empty choice, which scores as wrong.
     """
     answer_matches = re.findall(r"[Aa]nswer\s*:\s*\*?\*?\s*\(?([A-Z])\)?", response)
     if answer_matches:
@@ -342,25 +338,27 @@ def build_mmmu_result_records(
             "raw_response": result.error,
             "is_correct": False,
             "is_success": False,
-            "is_unparsed": False,
+            "is_unparseable": False,
             "error": result.error,
         }
 
         if result.is_success:
             gold = sample.answer
-            is_unparsed = False
+            is_unparseable = False
             if (
                 sample.question_type == "multiple-choice"
                 and sample.all_choices
                 and sample.index2ans
             ):
-                predicted, is_unparsed = parse_multi_choice_response(
+                predicted, is_unparseable = parse_multi_choice_response(
                     result.text,
                     sample.all_choices,
                     sample.index2ans,
                 )
-                if is_unparsed:
-                    logger.debug(f"MMMU answer unparsed for sample {sample.sample_id}")
+                if is_unparseable:
+                    logger.debug(
+                        f"MMMU answer unparseable for sample {sample.sample_id}"
+                    )
                 else:
                     pass
                 is_correct = gold is not None and predicted == gold
@@ -374,7 +372,7 @@ def build_mmmu_result_records(
                 raw_response=result.text,
                 is_correct=is_correct,
                 is_success=True,
-                is_unparsed=is_unparsed,
+                is_unparseable=is_unparseable,
                 error="",
             )
 

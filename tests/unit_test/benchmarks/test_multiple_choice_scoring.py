@@ -18,7 +18,7 @@ from benchmarks.tasks.visual_understand import (
 
 CHOICES = ["A", "B", "C", "D"]
 OPTIONS = {"A": "pine", "B": "oak", "C": "maple", "D": "birch"}
-UNPARSED_TEXT = "the reasoning stops before it names"
+UNPARSEABLE_TEXT = "the reasoning stops before it names"
 
 
 def mmmu_sample(sample_id: str, answer: str) -> MMMUSample:
@@ -51,8 +51,8 @@ def answered(text: str) -> RequestResult:
     return RequestResult(text=text, is_success=True)
 
 
-def test_unparsed_answer_names_no_option() -> None:
-    assert parse_multi_choice_response(UNPARSED_TEXT, CHOICES, OPTIONS) == ("", True)
+def test_unparseable_answer_names_no_option() -> None:
+    assert parse_multi_choice_response(UNPARSEABLE_TEXT, CHOICES, OPTIONS) == ("", True)
 
 
 def test_explicit_answer_line_parses() -> None:
@@ -62,36 +62,38 @@ def test_explicit_answer_line_parses() -> None:
     )
 
 
-@pytest.mark.parametrize("earlier_text", ["Answer: A", UNPARSED_TEXT])
-def test_unparsed_mmmu_answer_is_wrong_whatever_came_before(earlier_text: str) -> None:
+@pytest.mark.parametrize("earlier_text", ["Answer: A", UNPARSEABLE_TEXT])
+def test_unparseable_mmmu_answer_is_wrong_whatever_came_before(
+    earlier_text: str,
+) -> None:
     records = build_mmmu_result_records(
         [mmmu_sample("first", "A"), mmmu_sample("second", "C")],
-        [answered(earlier_text), answered(UNPARSED_TEXT)],
+        [answered(earlier_text), answered(UNPARSEABLE_TEXT)],
     )
 
     second = records[1]
-    assert (second["predicted"], second["is_correct"], second["is_unparsed"]) == (
+    assert (second["predicted"], second["is_correct"], second["is_unparseable"]) == (
         "",
         False,
         True,
     )
 
 
-def test_mmmu_summary_counts_unparsed() -> None:
+def test_mmmu_summary_counts_unparseable() -> None:
     records = build_mmmu_result_records(
         [mmmu_sample("first", "A"), mmmu_sample("second", "C")],
-        [answered("Answer: A"), answered(UNPARSED_TEXT)],
+        [answered("Answer: A"), answered(UNPARSEABLE_TEXT)],
     )
 
     summary = compute_mmmu_metrics(records)
-    assert (summary["correct"], summary["unparsed"]) == (1, 1)
+    assert (summary["correct"], summary["unparseable"]) == (1, 1)
 
 
-def test_unparsed_video_answer_is_wrong() -> None:
+def test_unparseable_video_answer_is_wrong() -> None:
     records = build_videomme_result_records(
         [video_sample("first", "A"), video_sample("second", "C")],
-        [answered(UNPARSED_TEXT), answered("Answer: C")],
+        [answered(UNPARSEABLE_TEXT), answered("Answer: C")],
     )
 
     assert [record["is_correct"] for record in records] == [False, True]
-    assert compute_videomme_metrics(records)["unparsed"] == 1
+    assert compute_videomme_metrics(records)["unparseable"] == 1

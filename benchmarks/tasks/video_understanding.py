@@ -51,7 +51,7 @@ class VideoMMERecord(TypedDict):
     raw_response: str
     is_correct: bool
     is_success: bool
-    is_unparsed: bool
+    is_unparseable: bool
     error: str
 
 
@@ -227,7 +227,7 @@ def build_videomme_result_records(
             "raw_response": result.error,
             "is_correct": False,
             "is_success": False,
-            "is_unparsed": False,
+            "is_unparseable": False,
             "error": result.error,
         }
 
@@ -235,14 +235,14 @@ def build_videomme_result_records(
             per_sample.append(record)
             continue
 
-        predicted, is_unparsed = parse_multi_choice_response(
+        predicted, is_unparseable = parse_multi_choice_response(
             result.text,
             sample.all_choices,
             sample.index2ans,
         )
         is_correct = predicted == sample.answer
-        if is_unparsed:
-            logger.debug("Video-MME answer unparsed for sample %s", sample.sample_id)
+        if is_unparseable:
+            logger.debug(f"Video-MME answer unparseable for sample {sample.sample_id}")
         else:
             pass
 
@@ -251,7 +251,7 @@ def build_videomme_result_records(
             raw_response=result.text,
             is_correct=is_correct,
             is_success=True,
-            is_unparsed=is_unparsed,
+            is_unparseable=is_unparseable,
             error="",
         )
         per_sample.append(record)
