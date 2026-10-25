@@ -1034,6 +1034,10 @@ class Qwen3TTSStreamingVocoderScheduler(
             num_slots=num_slots,
             device=self.device,
             dtype=dtype,
+            # note (ratish): the widest follow-up decode, so every warm replay attends in place.
+            in_place_frames=max(
+                (self.stream_followup_stride, *self.followup_stride_ramp)
+            ),
         )
         logger.info(
             "Qwen3-TTS incremental Codec state: %d slots, %.2f MiB per stream, %.1f MiB total (%s, %s)",
