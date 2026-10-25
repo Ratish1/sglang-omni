@@ -32,6 +32,7 @@ def main() -> None:
             "chunked_prefill_size": 64,
             "cuda_graph_max_bs_prefill": 64,
             "attention_backend": "fa3",
+            "cuda_graph_config": {"prefill": {"full_prefill_max_req": 2}},
         },
     )
     runner = scheduler.model_runner
@@ -127,6 +128,10 @@ def main() -> None:
             assert message.type != "error", message.data
 
     try:
+        enqueue("fallback31", 31)
+        enqueue("fallback17", 17)
+        enqueue("fallback5", 5)
+        drain()
         enqueue("cold31", 31)
         enqueue("cold17", 17)
         drain()
@@ -141,7 +146,8 @@ def main() -> None:
         assert any(record["graph"] and record["tokens"] == 1 for record in records)
         assert any(record["graph"] and len(record["rids"]) > 1 for record in records)
         assert any(record["graph"] and max(record["prefix_lengths"]) >= 64 for record in records)
-        assert all(record["graph"] for record in records)
+        assert any(not record["graph"] and len(record["rids"]) == 3 for record in records)
+        assert all(record["graph"] for record in records if len(record["rids"]) <= 2)
         Path("/data/review3133oct25/prefill.json").write_text(json.dumps(records, indent=2))
     finally:
         scheduler.shutdown_request_build_executor()
