@@ -51,6 +51,13 @@ def log_mel(
     lie within the length read only those samples."""
     padding = (SPEAKER_MEL_N_FFT - SPEAKER_MEL_HOP) // 2
     padded = samples.index_select(1, reflect_index(length, samples.shape[1], padding))
+    return padded_log_mel(padded, window, mel_basis)
+
+
+def padded_log_mel(
+    padded: torch.Tensor, window: torch.Tensor, mel_basis: torch.Tensor
+) -> torch.Tensor:
+    """Log mel (1, mels, frames) of a clip already carrying the front end's reflect pad."""
     spectrum = torch.stft(
         padded,
         SPEAKER_MEL_N_FFT,
@@ -187,9 +194,9 @@ class Qwen3TTSSpeakerEncoderCudaGraphRunner:
 
     def mel(self, waveform: torch.Tensor) -> torch.Tensor:
         """Log mel (1, mels, frames) of a CPU waveform (1, samples)."""
-        return log_mel(
-            waveform,
-            torch.tensor([waveform.shape[1]]),
+        padding = (SPEAKER_MEL_N_FFT - SPEAKER_MEL_HOP) // 2
+        return padded_log_mel(
+            F.pad(waveform, (padding, padding), mode="reflect"),
             self.mel_window,
             self.mel_basis,
         )
@@ -262,6 +269,16 @@ class Qwen3TTSSpeakerEncoderCudaGraphRunner:
         if current_platform.is_cuda():
             self.device_mel_window = self.mel_window.to(param.device)
             self.device_mel_basis = self.mel_basis.to(param.device)
+            # note (ratish): the first device FFT initializes cuFFT, which waits for the
+            # whole device, so it runs here, at the first width past the graphs.
+            first_samples = SPEAKER_MEL_HOP * (2 * buckets[-1] + 1) - 1
+            with torch.inference_mode(), device_guard(param.device):
+                log_mel(
+                    torch.zeros((1, first_samples), device=param.device),
+                    torch.full((1,), first_samples, device=param.device),
+                    self.device_mel_window,
+                    self.device_mel_basis,
+                )
         else:
             pass
         logger.info(f"Qwen3-TTS speaker encoder graphs captured for {buckets} frames")
