@@ -163,6 +163,13 @@ def load_code2wav_model(
         device=device,
         strict=False,
     )
+    # note (ratish): load_module casts every floating buffer to the weight dtype, and the
+    # rotary's inverse frequencies rounded to bf16 move the angles by up to 0.3 % per position;
+    # transformers keeps that table in float32, so it is rebuilt from the config after the cast.
+    rotary = model.pre_transformer.rotary_emb
+    model.pre_transformer.rotary_emb = type(rotary)(config=rotary.config).to(
+        rotary.inv_freq.device
+    )
     if current_platform.is_cuda() and torch.device(device).type == "cuda":
         model.use_channels_last()
         if model.dtype in (torch.bfloat16, torch.float16):
