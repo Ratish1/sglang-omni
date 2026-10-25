@@ -35,7 +35,7 @@ CI_CONFIG = "examples/configs/qwen3_omni_colocated_h100_fp8.yaml"
 SERVE_ARGS = [
     "--colocate", "--preprocessing.factory.max_seq_len", "32768", "--thinker.factory.max_seq_len", "32768",
 ]
-PASSES = {"c1": 1, "c8": 8, "c16": 16}
+PASSES = {"c1": 1, "c8": 8, "c16": 16, "c32": 32, "c64": 64}
 PORT = 29000
 
 

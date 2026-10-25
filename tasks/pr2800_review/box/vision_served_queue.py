@@ -37,12 +37,12 @@ def log(message: str) -> None:
         handle.write(line + "\n")
 
 
-def run_pair(out: Path, benchmark: str, arms: str, config: str, model: str) -> None:
+def run_pair(out: Path, benchmark: str, arms: str, config: str, model: str, passes: str) -> None:
     out.mkdir(parents=True, exist_ok=True)
     log(f"{out.name} {arms}")
     rc = subprocess.run(
         [sys.executable, str(BOX / "videoamme_pair.py"), "--benchmark", benchmark, "--arms", arms, "--passes",
-         "c1,c16", "--config", config, "--model", model, "--out", str(out)],
+         passes, "--config", config, "--model", model, "--out", str(out)],
         cwd=BOX, env=os.environ.copy(), stdout=open(out / "pair.log", "w"), stderr=subprocess.STDOUT,
     ).returncode
     for line in (out / "driver.log").read_text().splitlines():
@@ -66,6 +66,7 @@ def main() -> None:
     parser.add_argument(
         "--phases", default="pair,aa", help="pair runs every tree twice at once already; aa adds a second band"
     )
+    parser.add_argument("--passes", default="c1,c16", help="videoamme_pair.py passes, each on a fresh server")
     args = parser.parse_args()
     out, LOG = DATA / args.run, DATA / f"{args.run}.log"
     out.mkdir(parents=True, exist_ok=True)
@@ -97,7 +98,7 @@ def main() -> None:
             threads = [
                 threading.Thread(
                     target=run_pair,
-                    args=(out / f"{benchmark}_{phase}_{name}", benchmark, arms, args.config, args.model),
+                    args=(out / f"{benchmark}_{phase}_{name}", benchmark, arms, args.config, args.model, args.passes),
                 )
                 for name, arms in pairs
             ]
