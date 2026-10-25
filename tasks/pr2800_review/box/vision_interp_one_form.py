@@ -7,7 +7,8 @@ The served vision encoder is built (Qwen3-Omni Instruct, bf16, card 0); each for
 list. "dispatch" names the tree's own choice: the vectorized method at VECTORIZED_POS_EMBED_MIN_IMAGES grids or more.
 Inputs: "same" N copies of the median recorded image grid and "mixed" the first N distinct recorded image grids, for N
 in SWEEP_COUNTS; then every interpolation of each served call set (grids_*.jsonl from encoder_grids/sitecustomize.py).
-Per input and form: the sha256 of the bf16 output and of the fp32 output (the encoder cast to fp32), and two times,
+Per input and form: the sha256 of the bf16 output and of the fp32 output (the encoder cast to fp32), the bf16 output's
+relative L2 to the table's bilinear resampling in float64 (median and largest over interpolations), and two times,
 each the median of TIMED_CALLS after WARMUP_CALLS: alone (synchronized before and after the call) and in forward (the
 patch embedding of that many random patches, the interpolation, the add, synchronized after, as the encoder's forward
 runs them). compare prints, per input, whether every form's hashes agree across both files, then the time tables.
@@ -23,6 +24,7 @@ import time
 from pathlib import Path
 
 import torch
+import torch.nn.functional as F
 from huggingface_hub import snapshot_download
 
 from sglang_omni.models.qwen3_omni.components import vision_compat
@@ -48,6 +50,31 @@ def sha256(tensor: torch.Tensor) -> str:
     return hashlib.sha256(
         tensor.contiguous().view(torch.uint8).cpu().numpy().tobytes()
     ).hexdigest()[:16]
+
+
+def float64_truth(
+    table: torch.Tensor, grid: list[list[int]], merge_size: int
+) -> torch.Tensor:
+    hidden_size = table.shape[1]
+    pieces = []
+    for frames, height, width in grid:
+        resampled = F.interpolate(
+            table, size=(height, width), mode="bilinear", align_corners=True
+        )[0]
+        merged = (
+            resampled.permute(1, 2, 0)
+            .reshape(
+                height // merge_size,
+                merge_size,
+                width // merge_size,
+                merge_size,
+                hidden_size,
+            )
+            .permute(0, 2, 1, 3, 4)
+            .reshape(-1, hidden_size)
+        )
+        pieces.append(merged.repeat(frames, 1))
+    return torch.cat(pieces)
 
 
 def median_ms(run, warmup: int = WARMUP_CALLS, timed: int = TIMED_CALLS) -> float:
@@ -114,6 +141,8 @@ def run(args: argparse.Namespace) -> None:
         flush=True,
     )
     results: dict[str, dict[str, dict[str, object]]] = {}
+    side = visual.num_grid_per_side
+    table = visual.pos_embed.weight.detach().double().T.reshape(1, -1, side, side)
     with torch.no_grad():
         for name, interpolations in inputs.items():
             results[name] = {}
@@ -140,14 +169,23 @@ def run(args: argparse.Namespace) -> None:
                         )
 
                 single = len(interpolations) == 1
+                distances = []
+                for grid in interpolations:
+                    truth = float64_truth(table, grid, visual.spatial_merge_size)
+                    distances.append(
+                        float((call(grid).double() - truth).norm() / truth.norm())
+                    )
+                    del truth
                 results[name][form] = {
                     "bf16": [sha256(call(grid)) for grid in interpolations],
+                    "distance": distances,
                     "alone_ms": median_ms(alone, *(() if single else (1, 3))),
                     "in_forward_ms": median_ms(in_forward, *(() if single else (1, 3))),
                 }
                 print(
                     f"{name:14s} {form:10s} alone {results[name][form]['alone_ms']:8.3f} ms, in forward "
-                    f"{results[name][form]['in_forward_ms']:8.3f} ms",
+                    f"{results[name][form]['in_forward_ms']:8.3f} ms, relative L2 to float64 median "
+                    f"{statistics.median(distances):.3e} largest {max(distances):.3e}",
                     flush=True,
                 )
                 del patches
@@ -187,6 +225,15 @@ def compare(args: argparse.Namespace) -> None:
                 for form, entry in results[name].items()
             ]
             print(f"{name:14s} " + ", ".join(cells))
+    print("== relative L2 to float64, median / largest")
+    for name in first:
+        cells = [
+            f"{form} {statistics.median(entry['distance']):.3e} / {max(entry['distance']):.3e}"
+            for results in (first, second)
+            for form, entry in results[name].items()
+            if "distance" in entry
+        ]
+        print(f"{name:14s} " + ", ".join(cells))
 
 
 def main() -> None:
