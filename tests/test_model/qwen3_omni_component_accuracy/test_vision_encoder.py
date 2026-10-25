@@ -3,7 +3,8 @@
 
 Omni runs the HF module with the Transformers 5.6 positional interpolation, a Linear patch embedding and the
 platform's joint rotary kernel. The check covers the merged embeddings and the three deepstack features for images
-of several grids and for a video, and separately measures what the 5.6 interpolation alone changes in FP32.
+of several grids, for a video and for the MMMU talker stage's requests, each alone and all packed into one forward as
+the image encoder stage batches them, and separately measures what the 5.6 interpolation alone changes in FP32.
 """
 
 from __future__ import annotations
@@ -30,6 +31,10 @@ from tests.test_model.qwen3_omni_component_accuracy.comparison import (
     geometric_mean_ratio,
     parameter_mismatches,
     reference_copy,
+)
+from tests.test_model.qwen3_omni_component_accuracy.mmmu_requests import (
+    load_image_questions,
+    reference_inputs,
 )
 
 pytestmark = [pytest.mark.benchmark, pytest.mark.accelerator]
@@ -90,6 +95,25 @@ def test_vision_encoder_follows_reference(
             "video",
             processed["pixel_values_videos"],
             processed["video_grid_thw"],
+        )
+    )
+    image_questions = load_image_questions()
+    request_inputs = [reference_inputs(processor, sample) for sample in image_questions]
+    for sample, inputs in zip(image_questions, request_inputs):
+        cases.append(
+            (
+                f"mmmu/{sample.sample_id}",
+                "image",
+                inputs["pixel_values"],
+                inputs["image_grid_thw"],
+            )
+        )
+    cases.append(
+        (
+            f"mmmu_packed_{len(request_inputs)}",
+            "image",
+            torch.cat([inputs["pixel_values"] for inputs in request_inputs]),
+            torch.cat([inputs["image_grid_thw"] for inputs in request_inputs]),
         )
     )
 
