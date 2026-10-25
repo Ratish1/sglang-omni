@@ -47,8 +47,10 @@ def interval(values: list[float]) -> str:
 def main() -> None:
     pooled_all: list[float] = []
     pooled_clean: list[float] = []
+    pooled_both_leaked: list[float] = []
     lower = 0
     scored_pairs = 0
+    totals = {"a": [0, 0], "b": [0, 0]}
     for pair in (Path(argument) for argument in sys.argv[1:]):
         wer = {arm: per_sample(pair / arm / "bench" / "wer_results.json") for arm in ("a", "b")}
         similarity = {arm: per_sample(pair / arm / "bench" / "similarity_results.json") for arm in ("a", "b")}
@@ -56,10 +58,21 @@ def main() -> None:
         for arm in ("a", "b"):
             rows = list(wer[arm].values())
             kept = [row for row in rows if row["wer"] <= 0.5]
+            leaked = [row["id"] for row in rows if row["insertions"] >= LEAK_INSERTIONS]
+            leaked_sim = [similarity[arm][sample]["speaker_similarity"] for sample in leaked if sample in similarity[arm]]
+            clean_sim = [
+                similarity[arm][sample]["speaker_similarity"]
+                for sample in similarity[arm]
+                if sample in wer[arm] and wer[arm][sample]["insertions"] < LEAK_INSERTIONS
+            ]
             line.append(
                 f"{'main' if arm == 'a' else 'PR'}: WER all {corpus_wer(rows):.2f} %, without >50 % "
-                f"{corpus_wer(kept):.2f} %, >50 % {len(rows) - len(kept)}, target spoken {target_spoken(rows):.4f}"
+                f"{corpus_wer(kept):.2f} %, >50 % {len(rows) - len(kept)}, target spoken {target_spoken(rows):.4f}, "
+                f"leaked {len(leaked)} (SIM {statistics.fmean(leaked_sim) if leaked_sim else float('nan'):.2f}, "
+                f"clean {statistics.fmean(clean_sim) if clean_sim else float('nan'):.2f})"
             )
+            totals[arm][0] += len(leaked)
+            totals[arm][1] += len(rows)
         both = sorted(set(similarity["a"]) & set(similarity["b"]))
         if both:
             scored_pairs += 1
@@ -78,17 +91,33 @@ def main() -> None:
                 and wer["a"][sample]["insertions"] < LEAK_INSERTIONS
                 and wer["b"][sample]["insertions"] < LEAK_INSERTIONS
             ]
+            both_leaked = [
+                delta
+                for sample, delta in zip(both, deltas)
+                if sample in wer["a"]
+                and sample in wer["b"]
+                and wer["a"][sample]["insertions"] >= LEAK_INSERTIONS
+                and wer["b"][sample]["insertions"] >= LEAK_INSERTIONS
+            ]
             pooled_all.extend(deltas)
             pooled_clean.extend(clean)
+            pooled_both_leaked.extend(both_leaked)
             line.append(
                 f"SIM main {main_sim:.2f} / PR {pr_sim:.2f} (PR minus main {pr_sim - main_sim:+.2f} over {len(both)}; "
-                f"clean prompts {interval(clean)})"
+                f"clean prompts {interval(clean)}; prompts both arms leaked {interval(both_leaked)})"
             )
         else:
             line.append("SIM not scored")
         print(" | ".join(line))
-    print(f"pooled SIM, PR minus main per prompt: all {interval(pooled_all)}; clean {interval(pooled_clean)}")
+    print(
+        f"pooled SIM, PR minus main per prompt: all {interval(pooled_all)}; clean {interval(pooled_clean)}; "
+        f"both arms leaked {interval(pooled_both_leaked)}"
+    )
     print(f"pairs where the PR's SIM is lower: {lower} of {scored_pairs}")
+    print(
+        f"outputs that first speak the reference transcript ({LEAK_INSERTIONS}+ inserted words): main "
+        f"{totals['a'][0]} of {totals['a'][1]}, PR {totals['b'][0]} of {totals['b'][1]}"
+    )
 
 
 if __name__ == "__main__":
