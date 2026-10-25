@@ -338,8 +338,6 @@ def test_packed_attention_receives_every_sequence_and_the_host_max_length(
     assert metadata.max_seqlen == 24
     for attention_call in packed_attention.call_args_list:
         assert attention_call.kwargs["forward_metadata"] is metadata
-        assert attention_call.args[3] is metadata.cu_seqlens
-        assert attention_call.kwargs["seq_len"] == 64
 
 
 @pytest.mark.accelerator

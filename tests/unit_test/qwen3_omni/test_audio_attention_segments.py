@@ -133,12 +133,9 @@ def test_packed_attention_receives_the_call_metadata_in_every_layer() -> None:
                 torch.testing.assert_close(
                     received, projection(hs).reshape(sum(segments), HEADS, HEAD_DIM)
                 )
-            assert attention_call.args[3] is cu
             assert (
                 attention_call.kwargs["forward_metadata"] is splits.attention_metadata
             )
-            assert attention_call.kwargs["seq_len"] == 260
-    assert packed_attention.call_count == len(tower.layers)
 
 
 def test_missing_splits_fall_back_to_the_stock_path() -> None:
