@@ -9,22 +9,26 @@ QWEN3_OMNI_ACCURACY_FLOOR_DEVICE, the floor a correct BF16 implementation sets, 
 QWEN3_OMNI_ACCURACY_REFERENCE_DEVICE, which teacher-forces every recording. A departure is a step whose recorded token
 is not the FP32 argmax. Omni passes when its logprob deviation from FP32 per request stays within the floor's by
 comparison.py's bounds and it departs nowhere the FP32 top-two margin is wider than the widest margin at which HF's
-own BF16 copy departs.
+own BF16 copy departs. QWEN3_OMNI_ACCURACY_REFERENCE_CACHE, when set, names a JSON file that keeps the HF recordings
+and their teacher-forced numbers, which do not depend on the server; a later run whose model, Transformers version,
+token budget and inputs match reuses them and loads only the FP32 thinker.
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import os
 import statistics
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from pathlib import Path
 
 import httpx
 import pytest
 import torch
+import transformers
 from transformers import Qwen3OmniMoeForConditionalGeneration
 from transformers.feature_extraction_utils import BatchFeature
 from transformers.models.qwen3_omni_moe.processing_qwen3_omni_moe import (
@@ -55,6 +59,14 @@ REQUEST_TIMEOUT_S = 600
 class Recording:
     tokens: list[int]
     logprobs: list[float]
+
+
+@dataclass(frozen=True, kw_only=True)
+class Reference:
+    """The HF thinker's greedy recordings in BF16 ("floor") and FP32 ("truth"), each teacher-forced through FP32."""
+
+    recordings: dict[str, list[Recording]]
+    follows: dict[str, list[dict[str, object]]]
 
 
 def media(inputs: BatchFeature) -> dict[str, torch.Tensor]:
@@ -171,6 +183,71 @@ def follow(truth_logits: torch.Tensor, recording: Recording) -> dict[str, object
     }
 
 
+def reference_key(
+    model_path: str, request_inputs: list[BatchFeature]
+) -> dict[str, object]:
+    return {
+        "model_path": model_path,
+        "transformers": transformers.__version__,
+        "max_tokens": MAX_TOKENS,
+        "input_ids": [inputs["input_ids"][0].tolist() for inputs in request_inputs],
+        "media_sha256": [
+            {
+                name: hashlib.sha256(
+                    tensor.detach().cpu().contiguous().numpy().tobytes()
+                ).hexdigest()
+                for name, tensor in media(inputs).items()
+            }
+            for inputs in request_inputs
+        ],
+    }
+
+
+def load_reference(path: Path | None, key: dict[str, object]) -> Reference | None:
+    if path is None or not path.exists():
+        return None
+    else:
+        stored = json.loads(path.read_text())
+        if stored["key"] != key:
+            return None
+        else:
+            return Reference(
+                recordings={
+                    name: [Recording(**recording) for recording in recordings]
+                    for name, recordings in stored["recordings"].items()
+                },
+                follows=stored["follows"],
+            )
+
+
+def compute_reference(
+    model_path: str,
+    truth_thinker: torch.nn.Module,
+    request_inputs: list[BatchFeature],
+    eos_token_id: int,
+) -> Reference:
+    floor_thinker = load_thinker(
+        model_path,
+        torch.bfloat16,
+        os.environ.get("QWEN3_OMNI_ACCURACY_FLOOR_DEVICE", "cuda:1"),
+    )
+    recordings: dict[str, list[Recording]] = {"floor": [], "truth": []}
+    follows: dict[str, list[dict[str, object]]] = {"floor": [], "truth": []}
+    for inputs in request_inputs:
+        recordings["floor"].append(
+            reference_greedy(floor_thinker, inputs, eos_token_id)
+        )
+        recordings["truth"].append(
+            reference_greedy(truth_thinker, inputs, eos_token_id)
+        )
+        for name in recordings:
+            truth_logits = teacher_forced_logits(
+                truth_thinker, inputs, recordings[name][-1].tokens
+            )
+            follows[name].append(follow(truth_logits, recordings[name][-1]))
+    return Reference(recordings=recordings, follows=follows)
+
+
 def test_thinker_images_follow_reference(
     model_path: str, report_dir: Path | None
 ) -> None:
@@ -193,25 +270,42 @@ def test_thinker_images_follow_reference(
         torch.float32,
         os.environ.get("QWEN3_OMNI_ACCURACY_REFERENCE_DEVICE", "cuda:0"),
     )
-    floor_thinker = load_thinker(
-        model_path,
-        torch.bfloat16,
-        os.environ.get("QWEN3_OMNI_ACCURACY_FLOOR_DEVICE", "cuda:1"),
-    )
-    recordings: dict[str, list[Recording]] = {"omni": served, "floor": [], "truth": []}
-    follows: dict[str, list[dict[str, object]]] = {name: [] for name in recordings}
-    for index, inputs in enumerate(request_inputs):
-        recordings["floor"].append(
-            reference_greedy(floor_thinker, inputs, eos_token_id)
+    cache = os.environ.get("QWEN3_OMNI_ACCURACY_REFERENCE_CACHE")
+    cache_path = Path(cache) if cache is not None else None
+    key = reference_key(model_path, request_inputs)
+    reference = load_reference(cache_path, key)
+    if reference is None:
+        reference = compute_reference(
+            model_path, truth_thinker, request_inputs, eos_token_id
         )
-        recordings["truth"].append(
-            reference_greedy(truth_thinker, inputs, eos_token_id)
-        )
-        for name in recordings:
-            truth_logits = teacher_forced_logits(
-                truth_thinker, inputs, recordings[name][index].tokens
+        if cache_path is not None:
+            cache_path.write_text(
+                json.dumps(
+                    {
+                        "key": key,
+                        "recordings": {
+                            name: [asdict(recording) for recording in recordings]
+                            for name, recordings in reference.recordings.items()
+                        },
+                        "follows": reference.follows,
+                    }
+                )
             )
-            follows[name].append(follow(truth_logits, recordings[name][index]))
+        else:
+            pass
+    else:
+        pass
+    recordings = {"omni": served, **reference.recordings}
+    follows = {
+        "omni": [
+            follow(
+                teacher_forced_logits(truth_thinker, inputs, recording.tokens),
+                recording,
+            )
+            for inputs, recording in zip(request_inputs, served)
+        ],
+        **reference.follows,
+    }
 
     report: dict[str, object] = {}
     for name, recording_list in recordings.items():
