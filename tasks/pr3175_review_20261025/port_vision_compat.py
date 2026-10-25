@@ -3,7 +3,6 @@
 
 from __future__ import annotations
 
-import itertools
 from dataclasses import dataclass
 
 import torch
@@ -12,6 +11,9 @@ from transformers.processing_utils import Unpack
 from transformers.utils.generic import TransformersKwargs, merge_with_config_defaults
 from transformers.utils.output_capturing import capture_outputs
 from transformers.vision_utils import get_vision_cu_seqlens, get_vision_position_ids
+
+# note (ratish): below this many grid rows the per-row loop is faster (crossover measured on H20 and H200).
+VECTORIZED_POS_EMBED_MIN_IMAGES = 6
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -42,116 +44,170 @@ class Qwen3OmniMoeVisionEncoderCompat(hf_modeling.Qwen3OmniMoeVisionEncoder):
         """The extra attention keywords every block receives."""
         return {}
 
-    def interpolate_position_embeddings(
+    def fast_pos_embed_interpolate_from_list(
         self,
         grid_thw: list[list[int]],
     ) -> torch.Tensor:
-        """Bilinear position embeddings of every grid, in merge-block order, repeated per frame."""
-        grid_side = self.num_grid_per_side
-        merge_size = self.spatial_merge_size
+        """Bilinear position embeddings per grid row, in merge-block order, repeated per frame."""
+        num_grid_per_side = self.num_grid_per_side
+        m_size = self.spatial_merge_size
+        hidden_dim = self.pos_embed.embedding_dim
         # note (ratish): the model's device and dtype properties iterate its parameters on every read.
-        table = self.pos_embed.weight
-        device = table.device
+        dtype = self.pos_embed.weight.dtype
+        device = self.pos_embed.weight.device
 
-        heights = sorted({height for _, height, _ in grid_thw})
-        widths = sorted({width for _, _, width in grid_thw})
-        height_offsets = dict(zip(heights, itertools.accumulate(heights, initial=0)))
-        width_offsets = dict(zip(widths, itertools.accumulate(widths, initial=0)))
-        grid_metadata = []
-        total_frame_patches = 0
-        total_output_patches = 0
-        for frames, height, width in grid_thw:
-            grid_metadata.append(
-                [
-                    height * width,
-                    frames * height * width,
-                    total_frame_patches,
-                    total_output_patches,
-                    width,
-                    height_offsets[height],
-                    width_offsets[width],
-                ]
+        outputs = []
+        for t, h, w in grid_thw:
+            h_idxs = torch.linspace(
+                0, num_grid_per_side - 1, h, dtype=torch.float32, device=device
             )
-            total_frame_patches += height * width
-            total_output_patches += frames * height * width
-        # note (ratish): every grid-derived value is built on the host and copied once; nothing is read back.
-        (
-            grid_frame_patches,
-            grid_output_patches,
-            grid_frame_offsets,
-            grid_output_offsets,
-            grid_widths,
-            grid_height_offsets,
-            grid_width_offsets,
-        ) = (
-            torch.tensor(grid_metadata, dtype=torch.long)
-            .to(device, non_blocking=True)
-            .unbind(1)
-        )
+            w_idxs = torch.linspace(
+                0, num_grid_per_side - 1, w, dtype=torch.float32, device=device
+            )
 
-        patch_grids = torch.repeat_interleave(
-            grid_frame_patches, output_size=total_frame_patches
-        )
-        merged_indices = (
-            torch.arange(total_frame_patches, device=device)
-            - grid_frame_offsets[patch_grids]
-        )
-        blocks_per_row = grid_widths[patch_grids] // merge_size
-        block_indices = merged_indices // (merge_size * merge_size)
-        patch_rows = (block_indices // blocks_per_row) * merge_size + (
-            merged_indices // merge_size % merge_size
-        )
-        patch_columns = (block_indices % blocks_per_row) * merge_size + (
-            merged_indices % merge_size
-        )
-        height_coordinates = torch.cat(
-            [
-                torch.linspace(
-                    0, grid_side - 1, height, dtype=torch.float32, device=device
-                )
-                for height in heights
-            ]
-        )[grid_height_offsets[patch_grids] + patch_rows]
-        width_coordinates = torch.cat(
-            [
-                torch.linspace(
-                    0, grid_side - 1, width, dtype=torch.float32, device=device
-                )
-                for width in widths
-            ]
-        )[grid_width_offsets[patch_grids] + patch_columns]
+            h_floor = h_idxs.to(torch.long)
+            w_floor = w_idxs.to(torch.long)
+            h_ceil = torch.clamp(h_floor + 1, max=num_grid_per_side - 1)
+            w_ceil = torch.clamp(w_floor + 1, max=num_grid_per_side - 1)
 
-        height_floor = height_coordinates.to(torch.long)
-        width_floor = width_coordinates.to(torch.long)
-        height_ceil = torch.clamp(height_floor + 1, max=grid_side - 1)
-        width_ceil = torch.clamp(width_floor + 1, max=grid_side - 1)
-        height_fraction = height_coordinates - height_floor
-        width_fraction = width_coordinates - width_floor
-        weight_11 = height_fraction * width_fraction
-        weight_10 = height_fraction - weight_11
-        weight_01 = width_fraction - weight_11
-        weight_00 = 1 - height_fraction - weight_01
-        tap_indices = torch.stack(
-            [
-                height_floor * grid_side + width_floor,
-                height_floor * grid_side + width_ceil,
-                height_ceil * grid_side + width_floor,
-                height_ceil * grid_side + width_ceil,
-            ]
-        )
-        tap_weights = torch.stack([weight_00, weight_01, weight_10, weight_11])
-        frame_embeddings = (
-            self.pos_embed(tap_indices) * tap_weights.to(table.dtype)[:, :, None]
-        ).sum(dim=0)
+            dh = h_idxs - h_floor
+            dw = w_idxs - w_floor
 
-        output_grids = torch.repeat_interleave(
-            grid_output_patches, output_size=total_output_patches
+            dh_grid, dw_grid = torch.meshgrid(dh, dw, indexing="ij")
+            h_floor_grid, w_floor_grid = torch.meshgrid(h_floor, w_floor, indexing="ij")
+            h_ceil_grid, w_ceil_grid = torch.meshgrid(h_ceil, w_ceil, indexing="ij")
+
+            w11 = dh_grid * dw_grid
+            w10 = dh_grid - w11
+            w01 = dw_grid - w11
+            w00 = 1 - dh_grid - w01
+
+            h_grid = torch.stack([h_floor_grid, h_floor_grid, h_ceil_grid, h_ceil_grid])
+            w_grid = torch.stack([w_floor_grid, w_ceil_grid, w_floor_grid, w_ceil_grid])
+            h_grid_idx = h_grid * num_grid_per_side
+
+            indices = (h_grid_idx + w_grid).reshape(4, -1)
+            weights = torch.stack([w00, w01, w10, w11], dim=0).reshape(4, -1, 1)
+            weights = weights.to(dtype=dtype)
+
+            embeds = self.pos_embed(indices)
+            embeds *= weights
+            combined = embeds.sum(dim=0)
+
+            combined = combined.reshape(
+                h // m_size, m_size, w // m_size, m_size, hidden_dim
+            )
+            combined = combined.permute(0, 2, 1, 3, 4).reshape(1, -1, hidden_dim)
+            repeated = combined.expand(t, -1, -1).reshape(-1, hidden_dim)
+            outputs.append(repeated)
+
+        return torch.cat(outputs, dim=0)
+
+    def fast_pos_embed_interpolate_vectorized(
+        self,
+        grid_thw: list[list[int]],
+    ) -> torch.Tensor:
+        """fast_pos_embed_interpolate_from_list over all grid rows at once, equal bit for bit."""
+        num_grid_per_side = self.num_grid_per_side
+        m = self.spatial_merge_size
+        dtype = self.pos_embed.weight.dtype
+        device = self.pos_embed.weight.device
+
+        ts = [g[0] for g in grid_thw]
+        hs = [g[1] for g in grid_thw]
+        ws = [g[2] for g in grid_thw]
+        num_images = len(grid_thw)
+
+        hw_list = [h * w for h, w in zip(hs, ws)]
+        thw_list = [t * s for t, s in zip(ts, hw_list)]
+        total_hw = sum(hw_list)
+        total_out = sum(thw_list)
+
+        def exclusive_prefix(sizes: list[int]) -> torch.Tensor:
+            out, acc = [], 0
+            for s in sizes:
+                out.append(acc)
+                acc += s
+            return torch.tensor(out, device=device, dtype=torch.long)
+
+        hw_off = exclusive_prefix(hw_list)
+        thw_off = exclusive_prefix(thw_list)
+        image_arange = torch.arange(num_images, device=device)
+
+        base_image_id = torch.repeat_interleave(
+            image_arange, torch.tensor(hw_list, device=device)
         )
-        frame_indices = (
-            torch.arange(total_output_patches, device=device)
-            - grid_output_offsets[output_grids]
-        ) % grid_frame_patches[output_grids]
-        return frame_embeddings[grid_frame_offsets[output_grids] + frame_indices]
+        base_local = torch.arange(total_hw, device=device) - hw_off[base_image_id]
+        w_of = torch.tensor(ws, device=device)[base_image_id]
+        row = base_local // w_of
+        col = base_local % w_of
+
+        uniq_h, inv_h = torch.unique(
+            torch.tensor(hs, device=device), return_inverse=True
+        )
+        uniq_w, inv_w = torch.unique(
+            torch.tensor(ws, device=device), return_inverse=True
+        )
+        h_luts = [
+            torch.linspace(0, num_grid_per_side - 1, h, device=device)
+            for h in uniq_h.tolist()
+        ]
+        w_luts = [
+            torch.linspace(0, num_grid_per_side - 1, w, device=device)
+            for w in uniq_w.tolist()
+        ]
+        h_lut_off = exclusive_prefix([len(x) for x in h_luts])
+        w_lut_off = exclusive_prefix([len(x) for x in w_luts])
+        h_idxs = torch.cat(h_luts)[h_lut_off[inv_h[base_image_id]] + row]
+        w_idxs = torch.cat(w_luts)[w_lut_off[inv_w[base_image_id]] + col]
+
+        h_floor = h_idxs.to(torch.long)
+        w_floor = w_idxs.to(torch.long)
+        h_ceil = torch.clamp(h_floor + 1, max=num_grid_per_side - 1)
+        w_ceil = torch.clamp(w_floor + 1, max=num_grid_per_side - 1)
+        dh = h_idxs - h_floor
+        dw = w_idxs - w_floor
+        w11 = dh * dw
+        w10 = dh - w11
+        w01 = dw - w11
+        w00 = 1 - dh - w01
+
+        base_h = h_floor * num_grid_per_side
+        base_h_ceil = h_ceil * num_grid_per_side
+        indices = torch.stack(
+            [
+                base_h + w_floor,
+                base_h + w_ceil,
+                base_h_ceil + w_floor,
+                base_h_ceil + w_ceil,
+            ],
+            dim=0,
+        )
+        weights = torch.stack([w00, w01, w10, w11], dim=0).to(dtype=dtype)
+        embeds = self.pos_embed(indices) * weights[:, :, None]
+        base_embeds = embeds.sum(dim=0)
+
+        out_image_id = torch.repeat_interleave(
+            image_arange, torch.tensor(thw_list, device=device)
+        )
+        pos_in_image = torch.arange(total_out, device=device) - thw_off[out_image_id]
+        hw_of_out = torch.tensor(hw_list, device=device)[out_image_id]
+        frame_idx = pos_in_image // hw_of_out
+        local_idx = pos_in_image % hw_of_out
+        patch = base_embeds[hw_off[out_image_id] + local_idx]
+
+        all_w = torch.tensor(ws, device=device)[out_image_id]
+        rows = local_idx // all_w
+        cols = local_idx % all_w
+        out_within = (
+            frame_idx * hw_of_out
+            + ((rows // m) * (all_w // m) + (cols // m)) * m * m
+            + (rows % m) * m
+            + (cols % m)
+        )
+        merged = torch.empty_like(patch)
+        merged[out_within + thw_off[out_image_id]] = patch
+        return merged
 
     @merge_with_config_defaults
     @capture_outputs
@@ -185,7 +241,11 @@ class Qwen3OmniMoeVisionEncoderCompat(hf_modeling.Qwen3OmniMoeVisionEncoder):
         position_ids = position_ids.to(device, non_blocking=True)
 
         hidden_states = self.patch_embed(hidden_states)
-        pos_embeds = self.interpolate_position_embeddings(host_grid_thw.tolist())
+        grid_thw_list = host_grid_thw.tolist()
+        if len(grid_thw_list) >= VECTORIZED_POS_EMBED_MIN_IMAGES:
+            pos_embeds = self.fast_pos_embed_interpolate_vectorized(grid_thw_list)
+        else:
+            pos_embeds = self.fast_pos_embed_interpolate_from_list(grid_thw_list)
         hidden_states = hidden_states + pos_embeds.to(hidden_states.dtype)
         cos, sin = self.rotary_pos_emb(hidden_states, position_ids)
 
