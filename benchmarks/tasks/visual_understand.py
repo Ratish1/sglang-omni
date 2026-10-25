@@ -14,7 +14,7 @@ from typing import TypedDict
 import aiohttp
 
 from benchmarks.benchmarker.conditions import sampling_seed_field
-from benchmarks.benchmarker.data import RequestResult
+from benchmarks.benchmarker.data import RequestResult, chat_completion_finish_reason
 from benchmarks.benchmarker.runner import SendFn
 from benchmarks.dataset.mmmu import MMMUSample
 
@@ -273,6 +273,7 @@ def make_mmmu_send_fn(
             message = body.get("choices", [{}])[0].get("message", {})
             content = message.get("content", "")
             result.text = content or ""
+            result.finish_reason = chat_completion_finish_reason(body)
 
             if enable_audio and audio_dir:
                 audio_obj = message.get("audio")

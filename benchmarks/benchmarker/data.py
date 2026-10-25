@@ -15,6 +15,14 @@ class FinishReason(str, Enum):
     LENGTH = "length"
 
 
+def chat_completion_finish_reason(body: dict) -> FinishReason:
+    """The first choice's finish reason in a chat completion body."""
+    try:
+        return FinishReason(body.get("choices", [{}])[0].get("finish_reason"))
+    except ValueError:
+        return FinishReason.UNKNOWN
+
+
 @dataclass
 class RequestResult:
     request_id: str = ""
