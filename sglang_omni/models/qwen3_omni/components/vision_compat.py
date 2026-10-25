@@ -39,7 +39,7 @@ class Qwen3OmniMoeVisionEncoderCompat(hf_modeling.Qwen3OmniMoeVisionEncoder):
     def prepare_attention_metadata(
         self,
         sequence_patch_counts: tuple[int, ...],
-        cu_seqlens: torch.Tensor,
+        cumulative_sequence_lengths: torch.Tensor,
     ) -> dict[str, VisionSequenceMetadata]:
         """The extra attention keywords every block receives."""
         return {}

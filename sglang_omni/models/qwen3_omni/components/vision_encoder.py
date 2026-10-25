@@ -72,7 +72,7 @@ class Qwen3OmniVisionEncoder(Qwen3OmniMoeVisionEncoderCompat):
     def prepare_attention_metadata(
         self,
         sequence_patch_counts: tuple[int, ...],
-        cu_seqlens: torch.Tensor,
+        cumulative_sequence_lengths: torch.Tensor,
     ) -> dict[str, VisionSequenceMetadata]:
         # note (yzxiao): Reuse host lengths to avoid per-layer device synchronization.
         return {
@@ -80,8 +80,8 @@ class Qwen3OmniVisionEncoder(Qwen3OmniMoeVisionEncoderCompat):
                 sequence_patch_counts=sequence_patch_counts,
                 packed_attention_metadata=(
                     prepare_vision_attention_metadata(
-                        cu_seqlens,
-                        cu_seqlens.device,
+                        cumulative_sequence_lengths,
+                        cumulative_sequence_lengths.device,
                         max_seqlen=max(sequence_patch_counts),
                     )
                     if self.packed_attention is not None

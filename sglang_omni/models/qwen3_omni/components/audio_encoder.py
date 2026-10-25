@@ -307,12 +307,12 @@ class Qwen3OmniAudioEncoder(nn.Module):
             tower.n_window,
         )
         self.segment_splits.value = (cu_seqlens[1:] - cu_seqlens[:-1]).tolist()
-        max_seqlen = max(self.segment_splits.value)
+        max_sequence_length = max(self.segment_splits.value)
         valid_indices = valid_indices.to(self.device, non_blocking=True)
         cu_seqlens = cu_seqlens.to(self.device, non_blocking=True)
         self.segment_splits.attention_metadata = (
             prepare_vision_attention_metadata(
-                cu_seqlens, cu_seqlens.device, max_seqlen=max_seqlen
+                cu_seqlens, cu_seqlens.device, max_seqlen=max_sequence_length
             )
             if self.packed_attention is not None
             else None
@@ -325,7 +325,7 @@ class Qwen3OmniAudioEncoder(nn.Module):
                 chunk_lengths=chunk_lengths,
                 valid_indices=valid_indices,
                 cu_seqlens=cu_seqlens,
-                max_seqlen=max_seqlen,
+                max_seqlen=max_sequence_length,
             )
         finally:
             self.segment_splits.value = None
