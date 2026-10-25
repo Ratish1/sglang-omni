@@ -342,7 +342,11 @@ class Qwen3TtsEngineBuilder(TtsEngineBuilder[Qwen3TTSSGLangRequestData]):
             pass
         if model.speaker_encoder_graph_runner is not None:
             model.speaker_encoder_graph_runner.capture(
-                self.reference_encoder_cuda_graph_bucket_frames,
+                tuple(
+                    frames
+                    for frames in self.reference_encoder_cuda_graph_bucket_frames
+                    if frames <= 256
+                ),
                 speech_tokenizer.model.encode_downsample_rate,
             )
         else:

@@ -21,7 +21,9 @@ logger = logging.getLogger(__name__)
 # note(ratish): a replay costs a floor plus a small per frame term and a key costs
 # 32 MiB, so keys below 32 frames save nothing measurable; the step keeps the padding
 # under half a clip, and clips past 256 frames run eager.
-DEFAULT_QWEN3_TTS_REFERENCE_ENCODER_BUCKET_FRAMES = (32, 48, 64, 96, 128, 192, 256)
+DEFAULT_QWEN3_TTS_REFERENCE_ENCODER_BUCKET_FRAMES = (
+    32, 48, 64, 96, 128, 192, 256, 512, 768, 1024, 1280,
+)
 
 
 class ReferenceEncoderGraphStats(TypedDict):
