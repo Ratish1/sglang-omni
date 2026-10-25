@@ -586,13 +586,25 @@ def ring_window_attention(
     )
 
 
+def ring_window_attention_fake(
+    query: torch.Tensor,
+    key_ring: torch.Tensor,
+    value_ring: torch.Tensor,
+    page_table: torch.Tensor,
+    window_lengths: torch.Tensor,
+    softmax_scale: float,
+    retained_frames: int,
+) -> torch.Tensor:
+    return query.new_empty(query.shape)
+
+
 if current_platform.is_cuda():
     # note (ratish): FA3 has no fake implementation, so a compiled decode calls it as this op.
     compiled_ring_window_attention = register_custom_op(
         ring_window_attention,
         op_name="qwen3_tts_codec_ring_window_attention",
         mutates_args=[],
-        out_shape="query",
+        fake_impl=ring_window_attention_fake,
     )
 else:
     pass
