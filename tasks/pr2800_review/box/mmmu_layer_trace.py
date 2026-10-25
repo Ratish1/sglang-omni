@@ -181,6 +181,90 @@ def features(arm: str, out: Path) -> None:
     (out / f"vision_layers_{arm}.json").write_text(json.dumps(layers))
 
 
+def vision_ablation(out: Path) -> None:
+    """The served encoder with each omni op put back to HF's, one at a time and all together, against FP32."""
+    import torch
+    from transformers.models.qwen3_omni_moe import modeling_qwen3_omni_moe as hf_modeling
+
+    from sglang_omni.models.qwen3_omni.components.image_encoder import Qwen3OmniImageEncoder
+
+    full_precision()
+    checkpoint = checkpoint_dir()
+    _, questions, request_inputs = requests()
+    truth = hf_visual(checkpoint, torch.float32)
+    floor = hf_visual(checkpoint, torch.bfloat16)
+
+    def hf_attention(visual) -> None:
+        visual.packed_attention = None
+        for block in visual.blocks:
+            block.attn.packed_attention = None
+
+    def hf_rotary(visual) -> None:
+        visual.joint_rope_kernel = None
+        for block in visual.blocks:
+            block.attn.joint_rope_kernel = None
+
+    def hf_interpolation(visual) -> None:
+        def interpolate(grid_thw):
+            indices, weights = hf_modeling.get_vision_interpolation_indices_and_weights(
+                grid_thw.to(visual.pos_embed.weight.device),
+                num_grid_per_side=visual.num_grid_per_side,
+                mode=visual.interpolation_mode,
+                align_corners=visual.interpolation_align_corners,
+                spatial_merge_size=visual.config.spatial_merge_size,
+                kwargs={},
+            )
+            return (visual.pos_embed(indices) * weights[:, :, None]).sum(1)
+
+        visual.legacy_pos_embed_interpolate = interpolate
+
+    def hf_patch_embed(visual) -> None:
+        visual.patch_embed = floor.patch_embed
+
+    swaps = {
+        "attention": [hf_attention],
+        "rotary": [hf_rotary],
+        "interpolation": [hf_interpolation],
+        "patch embed": [hf_patch_embed],
+        "all four": [hf_attention, hf_rotary, hf_interpolation, hf_patch_embed],
+    }
+    variants = {"served": [], **{f"hf {name}": functions for name, functions in swaps.items()}}
+    encoders = {}
+    for name, functions in variants.items():
+        encoder = Qwen3OmniImageEncoder(checkpoint, device="cuda:0")
+        for function in functions:
+            function(encoder.visual)
+        encoders[name] = encoder
+
+    def outputs_of(visual, pixels, grid):
+        with torch.inference_mode():
+            output = visual(pixels.to(visual.dtype), grid_thw=grid)
+        return [output.pooler_output.float(), *(feature.float() for feature in output.deepstack_features)]
+
+    errors = {name: [] for name in ["hf_bf16", *variants]}
+    closure = []
+    for sample, inputs in zip(questions, request_inputs):
+        pixels = inputs["pixel_values"].to("cuda:0")
+        grid = inputs["image_grid_thw"].to("cuda:0")
+        reference = outputs_of(truth, pixels, grid)
+        floor_outputs = outputs_of(floor, pixels, grid)
+        errors["hf_bf16"].append([relative_l2(o, r) for o, r in zip(floor_outputs, reference)])
+        for name, encoder in encoders.items():
+            with torch.inference_mode():
+                encoded = encoder(pixel_values=pixels, image_grid_thw=grid)
+            outputs = [encoded["image_embeds"].float(), *(f.float() for f in encoded["deepstack_visual_embeds_image"])]
+            errors[name].append([relative_l2(o, r) for o, r in zip(outputs, reference)])
+            if name == "hf all four":
+                closure.append(max((o - f).abs().max().item() for o, f in zip(outputs, floor_outputs)))
+            else:
+                pass
+    (out / "vision_ablation.json").write_text(json.dumps({"errors": errors, "closure_max_abs": closure}))
+    for name, rows in errors.items():
+        means = [sum(row[index] for row in rows) / len(rows) for index in range(4)]
+        print(f"{name:20s} merged {means[0]:.3e} deepstack " + " ".join(f"{value:.3e}" for value in means[1:]), flush=True)
+    print(f"all four put back against HF BF16, largest abs difference per request: {closure}", flush=True)
+
+
 def choice_logits(tokenizer, tokens: list[int], step_logits, choices: list[str]) -> dict[str, object]:
     """The choice letters' logits at the step that emits the final answer letter, and their top-two margin."""
     for step in range(len(tokens) - 1, -1, -1):
@@ -483,7 +567,7 @@ def read(arms: list[str], out: Path) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("mode", choices=("run", "read", "features", "answers", "internals"))
+    parser.add_argument("mode", choices=("run", "read", "features", "answers", "internals", "vision_ablation"))
     parser.add_argument("--arms")
     parser.add_argument("--arm")
     parser.add_argument("--thinker", choices=("float32", "bfloat16"))
@@ -499,6 +583,8 @@ def main() -> None:
         features(args.arm, args.out)
     elif args.mode == "answers":
         answers(args.thinker, args.sources.split(","), args.out)
+    elif args.mode == "vision_ablation":
+        vision_ablation(args.out)
     else:
         internals(args.out)
 
