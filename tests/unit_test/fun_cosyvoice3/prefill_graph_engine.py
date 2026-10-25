@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Fun-CosyVoice3's TTS engine on a two layer synthetic checkpoint, run in its own process
 by test_model_runner.py: every prompt prefill is recorded beside the eager forward over
-the same composed rows."""
+each request's enqueued prompt rows in its extend window."""
 
 from __future__ import annotations
 
@@ -20,7 +20,6 @@ from sglang.srt.sampling.sampling_params import SamplingParams
 from transformers import Qwen2Config, Qwen2ForCausalLM
 
 import sglang_omni.models.fun_cosyvoice3.engine_builder as engine_builder_module
-from sglang_omni.model_runner.prefill_inputs import get_omni_prefill_inputs
 from sglang_omni.models.fun_cosyvoice3.engine_builder import FunCosyVoice3EngineBuilder
 from sglang_omni.models.fun_cosyvoice3.model_runner import FunCosyVoice3ModelRunner
 from sglang_omni.models.fun_cosyvoice3.request_builders import (
@@ -93,7 +92,9 @@ def write_synthetic_checkpoint(checkpoint_directory: Path) -> None:
 
 
 def record_prefills_beside_eager(
-    model_runner: FunCosyVoice3ModelRunner, records: list[PrefillRecord]
+    model_runner: FunCosyVoice3ModelRunner,
+    prompt_rows_by_request: dict[str, torch.Tensor],
+    records: list[PrefillRecord],
 ) -> None:
     forward_batch_generation = model_runner.tp_worker.forward_batch_generation
 
@@ -102,11 +103,22 @@ def record_prefills_beside_eager(
             return forward_batch_generation(forward_batch)
         else:
             pass
-        # note (ratish): the eager forward goes first and over a copy of the rows, since
-        # it updates its input in place; the served forward then rewrites the same KV.
-        prefill_inputs = get_omni_prefill_inputs(forward_batch)
+        # note (ratish): the eager forward reads each request's enqueued rows, not the
+        # rows the prefill hands on, and runs first so the served forward's KV is kept.
+        eager_input_embeds = torch.cat(
+            [
+                prompt_rows_by_request[request_id][
+                    prefix_token_count : prefix_token_count + extend_token_count
+                ]
+                for request_id, prefix_token_count, extend_token_count in zip(
+                    forward_batch.rids,
+                    forward_batch.extend_prefix_lens_cpu,
+                    forward_batch.extend_seq_lens_cpu,
+                )
+            ]
+        )
         eager_result = model_runner.forward_with_input_embeds(
-            copy.copy(forward_batch), prefill_inputs.input_embeds.clone()
+            copy.copy(forward_batch), eager_input_embeds
         )
         served_result = forward_batch_generation(forward_batch)
         records.append(
@@ -193,8 +205,6 @@ def main() -> None:
         str(arguments.checkpoint_directory), device="cuda", gpu_id=0
     )
     model_runner = scheduler.model_runner
-    records: list[PrefillRecord] = []
-    record_prefills_beside_eager(model_runner, records)
     prompt_token_count = FIRST_PROMPT_TOKEN_COUNT + SECOND_PROMPT_TOKEN_COUNT
     prompt_keys = list(range(FIRST_PROMPT_KEY, FIRST_PROMPT_KEY + prompt_token_count))
     text_ids = torch.randint(
@@ -206,13 +216,22 @@ def main() -> None:
         prompt_rows = model_runner.model.text_embed_tokens(text_ids.cuda())
     first_keys = prompt_keys[:FIRST_PROMPT_TOKEN_COUNT]
     first_rows = prompt_rows[:FIRST_PROMPT_TOKEN_COUNT]
+    second_rows = prompt_rows[FIRST_PROMPT_TOKEN_COUNT:]
+    records: list[PrefillRecord] = []
+    record_prefills_beside_eager(
+        model_runner,
+        {
+            "first": first_rows,
+            "second": second_rows,
+            "first-cached": first_rows,
+            "first-extended": prompt_rows,
+        },
+        records,
+    )
     try:
         enqueue_prompt(scheduler, "first", first_keys, first_rows)
         enqueue_prompt(
-            scheduler,
-            "second",
-            prompt_keys[FIRST_PROMPT_TOKEN_COUNT:],
-            prompt_rows[FIRST_PROMPT_TOKEN_COUNT:],
+            scheduler, "second", prompt_keys[FIRST_PROMPT_TOKEN_COUNT:], second_rows
         )
         run_until_idle(scheduler)
         enqueue_prompt(scheduler, "first-cached", first_keys, first_rows)
