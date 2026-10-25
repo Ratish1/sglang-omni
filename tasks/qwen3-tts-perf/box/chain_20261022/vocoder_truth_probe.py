@@ -15,6 +15,7 @@ usage: PYTHONPATH=<tree> python3 vocoder_truth_probe.py run LIST OUT.json [--car
 
 import argparse
 import hashlib
+import inspect
 import json
 import math
 import statistics
@@ -56,7 +57,14 @@ def run(args: argparse.Namespace) -> None:
     served_decoder = served_tokenizer.model.decoder.eval()
     fuse_vocoder_decoder(served_decoder)
     incremental = Qwen3TTSIncrementalDecoder(served_decoder)
-    arena = Qwen3TTSCodecStateArena(incremental, num_slots=4, device=device, dtype=torch.bfloat16)
+    # a tree whose arena keeps K/V rings takes the widest in-place decode, the served stride
+    ring_options = (
+        {"in_place_frames": STEADY_STRIDE}
+        if "in_place_frames" in inspect.signature(Qwen3TTSCodecStateArena.__init__).parameters
+        else {}
+    )
+    arena = Qwen3TTSCodecStateArena(incremental, num_slots=4, device=device, dtype=torch.bfloat16, **ring_options)
+    print(f"arena K/V rings: {bool(getattr(arena, 'key_rings', []))}")
     probe_slot = arena.acquire()
     # the slot conv stack's state carries the cohort's slot index; main's state class has no such field
     print(f"gathered state holds the arena's pools: {getattr(arena.gather([probe_slot]), 'slot_index', None) is not None}")

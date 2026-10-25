@@ -8,6 +8,7 @@ usage: PYTHONPATH=<tree> python3 vocoder_decode_bench.py [--card 3] [--replays 1
 """
 
 import argparse
+import inspect
 import statistics
 
 import torch
@@ -68,7 +69,16 @@ def main() -> None:
     decoder = tokenizer.model.decoder.eval()
     fuse_vocoder_decoder(decoder)
     incremental = Qwen3TTSIncrementalDecoder(decoder)
-    arena = Qwen3TTSCodecStateArena(incremental, num_slots=4 * max(BATCHES), device=device, dtype=dtype)
+    # a tree whose arena keeps K/V rings takes the widest in-place decode, the served warm width
+    ring_options = (
+        {"in_place_frames": max(WARM_WIDTHS)}
+        if "in_place_frames" in inspect.signature(Qwen3TTSCodecStateArena.__init__).parameters
+        else {}
+    )
+    arena = Qwen3TTSCodecStateArena(
+        incremental, num_slots=4 * max(BATCHES), device=device, dtype=dtype, **ring_options
+    )
+    print(f"arena K/V rings: {bool(getattr(arena, 'key_rings', []))}")
     config = decoder.config
     cold = Qwen3TTSIncrementalCodecCudaGraphRunner(
         incremental,
