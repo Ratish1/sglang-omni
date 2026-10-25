@@ -6,15 +6,17 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
-from sglang.srt.arg_groups.cuda_graph_hook import (
-    generate_prefill_cuda_graph_batch_sizes,
+from sglang.srt.arg_groups.model_override_base import (
+    attention_backends_of,
+    resolved_view,
 )
-from sglang.srt.arg_groups.model_override_base import resolved_view
+from sglang.srt.runtime_context import override_platform
 from sglang.srt.server_args import ServerArgs
 
 import sglang_omni.models.fun_cosyvoice3.engine_builder as engine_builder_module
 from sglang_omni.models.fun_cosyvoice3.engine_builder import FunCosyVoice3EngineBuilder
 from sglang_omni.scheduling.generation_batch_policy import (
+    FULL_PREFILL_ATTENTION_BACKENDS,
     CudaGraphBackend,
     build_generation_batch_overrides,
 )
@@ -93,45 +95,50 @@ def resolved_cuda_server_args(
     return server_args
 
 
-@pytest.mark.parametrize("declared_ladder", [None, [4, 8]])
-def test_a_cached_prompts_one_token_prefill_has_a_graph_bucket(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, declared_ladder: list[int] | None
+@pytest.mark.parametrize(
+    "declared_ladder",
+    [
+        {"cuda_graph_bs_prefill": [4, 8], "cuda_graph_max_bs_prefill": 8},
+        {"cuda_graph_config": {"prefill": {"bs": [4, 8], "max_bs": 8}}},
+    ],
+    ids=["flat", "nested"],
+)
+def test_a_declared_prefill_ladder_is_served_without_an_added_bucket(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    declared_ladder: dict[str, object],
 ) -> None:
     server_args = resolved_cuda_server_args(
-        tmp_path,
-        monkeypatch,
-        {
-            "attention_backend": "fa3",
-            **(
-                {}
-                if declared_ladder is None
-                else {
-                    "cuda_graph_bs_prefill": declared_ladder,
-                    "cuda_graph_max_bs_prefill": 8,
-                }
-            ),
-        },
+        tmp_path, monkeypatch, {"attention_backend": "fa3", **declared_ladder}
     )
+    prefill = resolved_view(server_args).cuda_graph_config.prefill
+
+    assert prefill.backend == CudaGraphBackend.FULL
+    assert prefill.bs == [4, 8]
+
+
+@pytest.mark.parametrize(
+    ("server_args_overrides", "platform"),
+    [
+        ({"attention_backend": "triton"}, {}),
+        ({}, {"is_sm100": True, "is_hopper_with_cuda_12_3": False}),
+    ],
+    ids=["operator_triton", "sm100_default"],
+)
+def test_prefill_stays_eager_where_the_attention_backend_cannot_capture_it(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    server_args_overrides: dict[str, object],
+    platform: dict[str, bool],
+) -> None:
+    """An attention backend that cannot capture a full prefill graph, the operator's or
+    SGLang's default on SM100, leaves the prefill eager instead of the breakable graph
+    this model refuses."""
+    with override_platform(**platform):
+        server_args = resolved_cuda_server_args(
+            tmp_path, monkeypatch, server_args_overrides
+        )
     resolved = resolved_view(server_args)
 
-    assert resolved.cuda_graph_config.prefill.backend == CudaGraphBackend.FULL
-    assert resolved.cuda_graph_config.prefill.bs == (
-        [1, *generate_prefill_cuda_graph_batch_sizes(resolved.chunked_prefill_size)]
-        if declared_ladder is None
-        else declared_ladder
-    )
-
-
-def test_prefill_stays_eager_where_the_attention_backend_cannot_capture_it(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """With an attention backend that cannot capture a full prefill graph, the default
-    full graph fell back to the breakable one this model refuses, and startup failed."""
-    server_args = resolved_cuda_server_args(
-        tmp_path, monkeypatch, {"attention_backend": "triton"}
-    )
-
-    assert (
-        resolved_view(server_args).cuda_graph_config.prefill.backend
-        == CudaGraphBackend.DISABLED
-    )
+    assert attention_backends_of(resolved)[0] not in FULL_PREFILL_ATTENTION_BACKENDS
+    assert resolved.cuda_graph_config.prefill.backend == CudaGraphBackend.DISABLED
