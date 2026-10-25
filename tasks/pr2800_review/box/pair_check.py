@@ -102,6 +102,7 @@ TREES = {
     "ipr": ("ipr_040a3134c", "origin", "040a3134c1f075c2f472eca4135f6a6a16da860e"),
     "itq": ("itq_05e0d23c0", "origin", "05e0d23c0170d72b07e1c4c0ea522e990baa41ed"),
     "vpi": ("vpi_8b60a522a", "origin", "8b60a522ab19d66783311ca2b85b077eecd10438"),
+    "ima": ("ima_184398c7f", "origin", "184398c7f401273f5885c84396b0adc69eadc185"),
 }
 # note (ratish): every arm is measured by one client and scored by one ASR server, both from main; from the SGLang
 # 0.5.22 stack on (057d97629) a tree from before it no longer runs, and main's client records each chunk's length.
@@ -115,6 +116,8 @@ ARMS = {
     "iprb": ("ipr", [], [0.7769]),
     "itq": ("itq", [], [0.7769]),
     "itqb": ("itq", [], [0.7769]),
+    "ima": ("ima", [], [0.7769]),
+    "imab": ("ima", [], [0.7769]),
     "upz": ("upz", [], [0.7769]),
     "c2r": ("c2r", [], [0.7769]),
     "vpi": ("vpi", [], [0.7769]),
