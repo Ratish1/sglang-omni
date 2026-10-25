@@ -101,6 +101,7 @@ TREES = {
     "c2r": ("c2r_4c2b6ec22", "origin", "4c2b6ec223cc2c1a935162b30f4b7990d6f52840"),
     "ipr": ("ipr_040a3134c", "origin", "040a3134c1f075c2f472eca4135f6a6a16da860e"),
     "itq": ("itq_05e0d23c0", "origin", "05e0d23c0170d72b07e1c4c0ea522e990baa41ed"),
+    "vpi": ("vpi_8b60a522a", "origin", "8b60a522ab19d66783311ca2b85b077eecd10438"),
 }
 # note (ratish): every arm is measured by one client and scored by one ASR server, both from main; from the SGLang
 # 0.5.22 stack on (057d97629) a tree from before it no longer runs, and main's client records each chunk's length.
