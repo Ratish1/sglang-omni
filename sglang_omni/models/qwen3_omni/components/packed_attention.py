@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""The packed varlen attention Qwen3-Omni's audio and vision encoders run on a CUDA device."""
+"""The packed variable-length attention Qwen3-Omni's audio and vision encoders run on a CUDA device."""
 
 from __future__ import annotations
 

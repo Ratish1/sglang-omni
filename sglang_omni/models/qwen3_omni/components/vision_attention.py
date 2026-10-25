@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Qwen3-Omni vision attention with platform rotary and packed varlen attention."""
+"""Qwen3-Omni vision attention with platform rotary and packed variable-length attention."""
 
 from __future__ import annotations
 
