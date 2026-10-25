@@ -24,6 +24,10 @@ from benchmarks.dataset.prepare import DATASETS
 from benchmarks.dataset.videomme import load_videomme_samples
 from sglang_omni.models.qwen3_omni.components.preprocessor import Qwen3OmniPreprocessor
 from sglang_omni.proto.request import OmniRequest, StagePayload
+from tests.test_model.qwen3_omni_component_accuracy.mmmu_requests import (
+    load_image_questions,
+    reference_inputs,
+)
 from tests.test_model.test_qwen3_omni_mmmu_talker_ci import MMMU_TTS_PROMPT
 
 pytestmark = pytest.mark.benchmark
@@ -195,3 +199,40 @@ def test_vision_preprocessing_matches_reference(
     assert (
         not different
     ), f"vision preprocessing differs from the reference: {different}"
+
+
+def test_image_inputs_match_processor(model_path: str, report_dir: Path | None) -> None:
+    preprocessor = Qwen3OmniPreprocessor(model_path)
+    processor = Qwen3OmniMoeProcessor.from_pretrained(model_path)
+    records = []
+    for sample in load_image_questions():
+        omni_ids, omni_media = omni_inputs(
+            preprocessor,
+            sample.sample_id,
+            {
+                "messages": [{"role": "user", "content": sample.prompt}],
+                "images": list(sample.image_data_uris),
+            },
+        )
+        records.append(
+            compare(
+                f"image/{sample.sample_id}",
+                omni_ids,
+                omni_media,
+                reference_inputs(processor, sample),
+                "pixel_values",
+                "image_grid_thw",
+            )
+        )
+
+    if report_dir is not None:
+        (report_dir / "image_inputs.json").write_text(json.dumps(records, indent=1))
+    else:
+        pass
+    print("\n[image_inputs] " + "\n".join(json.dumps(record) for record in records))
+    different = [
+        record["case"]
+        for record in records
+        if not (record["input_ids_equal"] and record["pixels_max_abs"] == 0.0)
+    ]
+    assert not different, f"omni's image inputs differ from HF's processor: {different}"
