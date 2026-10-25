@@ -123,8 +123,6 @@ def test_vision_encoder_follows_reference(
     floor = reference_copy(
         reference_model.thinker.visual, device=component_device, dtype=torch.bfloat16
     )
-    # note (ratish): a model loaded in BF16 keeps its rotary table in float32, which the cast copy rounded.
-    floor.rotary_pos_emb.inv_freq = truth.rotary_pos_emb.inv_freq.clone()
     legacy_interpolation = (
         Qwen3OmniMoeVisionEncoderCompat._from_config(  # noqa: leading-underscore  # Transformers construction API
             truth.config

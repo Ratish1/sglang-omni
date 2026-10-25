@@ -64,7 +64,29 @@ class CaseRecord:
 def reference_copy(
     module: torch.nn.Module, *, device: str, dtype: torch.dtype
 ) -> torch.nn.Module:
-    return copy.deepcopy(module).to(device=device, dtype=dtype).eval()
+    """The module in dtype as a Transformers load in dtype holds it: the buffers its constructor makes in float32,
+    such as rotary tables, stay float32."""
+    copied = copy.deepcopy(module).to(device=device, dtype=dtype).eval()
+    with torch.device("meta"):
+        native = type(
+            module
+        )._from_config(  # noqa: leading-underscore  # Transformers construction API
+            module.config, dtype=dtype
+        )
+    kept = {
+        name for name, buffer in native.named_buffers() if buffer.dtype == torch.float32
+    }
+    for name, buffer in module.named_buffers():
+        if name in kept and buffer.is_floating_point():
+            owner_name, _, buffer_name = name.rpartition(".")
+            setattr(
+                copied.get_submodule(owner_name),
+                buffer_name,
+                buffer.detach().to(device=device, dtype=torch.float32),
+            )
+        else:
+            pass
+    return copied
 
 
 def parameter_mismatches(
