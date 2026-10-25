@@ -38,16 +38,16 @@ def stack_qkv_projection(attention: nn.Module) -> None:
     with torch.no_grad():
         weight = torch.cat([projection.weight for projection in projections])
         bias = torch.cat([projection.bias for projection in projections])
-    qkv_proj = nn.Linear(weight.shape[1], weight.shape[0], device="meta")
-    qkv_proj.weight = nn.Parameter(weight)
-    qkv_proj.bias = nn.Parameter(bias)
-    attention.qkv_proj = qkv_proj
-    start = 0
+    stacked_projection = nn.Linear(weight.shape[1], weight.shape[0], device="meta")
+    stacked_projection.weight = nn.Parameter(weight)
+    stacked_projection.bias = nn.Parameter(bias)
+    attention.qkv_proj = stacked_projection
+    start_row = 0
     for projection in projections:
-        end = start + projection.out_features
-        projection.weight = nn.Parameter(weight[start:end])
-        projection.bias = nn.Parameter(bias[start:end])
-        start = end
+        end_row = start_row + projection.out_features
+        projection.weight = nn.Parameter(weight[start_row:end_row])
+        projection.bias = nn.Parameter(bias[start_row:end_row])
+        start_row = end_row
 
 
 def packed_attention_forward(
