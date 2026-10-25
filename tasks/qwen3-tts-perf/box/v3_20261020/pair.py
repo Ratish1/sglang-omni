@@ -26,6 +26,8 @@ import httpx
 
 MODEL = "Qwen/Qwen3-TTS-12Hz-1.7B-Base"
 ASR_MODEL = "Qwen/Qwen3-ASR-1.7B"
+# transcription requests in flight while scoring, on the user's word (the scorer's default is 32)
+ASR_CONCURRENCY = 64
 ROOT = Path(os.environ.get("PAIR_ROOT", "/data/v3_20261020/pairs"))
 KIT = Path("/workspace/t_marks/tasks/omni_step_profiling_20260918/scripts")
 HEALTH_TIMEOUT_S = 1800.0
@@ -258,7 +260,8 @@ def score(out: Path, card: int, port: int, tree: str, meta: str) -> None:
         wait_healthy(port, asr)
         with open(out / "score--transcribe-only.log", "w", encoding="utf-8") as score_log:
             subprocess.run(
-                [*scorer, "--transcribe-only", "--use-existing-server", "--host", "127.0.0.1", "--port", str(port)],
+                [*scorer, "--transcribe-only", "--use-existing-server", "--host", "127.0.0.1", "--port", str(port),
+                 "--asr-concurrency", str(ASR_CONCURRENCY)],
                 cwd=tree, env=env, stdout=score_log, stderr=subprocess.STDOUT, timeout=BENCH_TIMEOUT_S, check=False,
             )
     finally:
