@@ -8,7 +8,8 @@ tree, so they run against the arm's own sglang_omni. Phase 1 runs the component 
 each: image inputs against HF's processor, the vision encoder on synthetic grids and on the stage's images alone and
 packed, MRoPE positions, the audio encoder and preprocessing, the talker prefill and code2wav. Phase 2 serves each arm
 in the CI's bf16 disaggregated shape on cards 0+1 and runs the image thinker check with the FP32 reference on card 2
-and its BF16 floor on card 3. Reports land in <out>/<arm>/{suite,thinker}/ with the pytest logs beside them; --read
+and its BF16 floor on card 3; the HF recordings are computed for the first arm and reused for the rest through
+<out>/thinker_reference.json. Reports land in <out>/<arm>/{suite,thinker}/ with the pytest logs beside them; --read
 prints each arm's verdicts and numbers next to each other.
 """
 
@@ -113,6 +114,7 @@ def thinker(out: Path, arm: str) -> None:
                 "QWEN3_OMNI_ACCURACY_SERVER": f"http://127.0.0.1:{port}",
                 "QWEN3_OMNI_ACCURACY_REFERENCE_DEVICE": "cuda:0",
                 "QWEN3_OMNI_ACCURACY_FLOOR_DEVICE": "cuda:1",
+                "QWEN3_OMNI_ACCURACY_REFERENCE_CACHE": str(out / "thinker_reference.json"),
             },
         )
     finally:
