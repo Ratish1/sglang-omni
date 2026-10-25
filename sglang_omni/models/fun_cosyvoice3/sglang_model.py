@@ -67,7 +67,6 @@ class FunCosyVoice3SGLangModel(Qwen2ForCausalLM):
         input_embeds: torch.Tensor | None = None,
         get_embedding: bool = False,
         pp_proxy_tensors: PPProxyTensors | None = None,
-        omni_prefill_rids: list[str] | None = None,
     ) -> LogitsProcessorOutput:
         """Logits of each request's last position; omni_prefill_rids comes with the
         prefill embeddings and the logits do not depend on it."""
