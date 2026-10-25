@@ -4,7 +4,8 @@ Run on the box from an arm's tree (cwd and PYTHONPATH the tree):
     python3 vision_interp_one_form.py run --forms <name>=<method> [...] --calls <name>=<dir> [...] --out <json>
     python3 vision_interp_one_form.py compare <json> <json>
 The served vision encoder is built (Qwen3-Omni Instruct, bf16, card 0); each form is a method of it, called with a grid
-list. "dispatch" names the tree's own choice: the vectorized method at VECTORIZED_POS_EMBED_MIN_IMAGES grids or more.
+list. "dispatch" names the tree's own choice: the vectorized method at VECTORIZED_POS_EMBED_MIN_IMAGES grids or more;
+"legacy" is main's legacy_pos_embed_interpolate, given the grid list as the host tensor its forward passes.
 Inputs: "same" N copies of the median recorded image grid and "mixed" the first N distinct recorded image grids, for N
 in SWEEP_COUNTS; then every interpolation of each served call set (grids_*.jsonl from encoder_grids/sitecustomize.py).
 Per input and form: the sha256 of the bf16 output and of the fp32 output (the encoder cast to fp32), the bf16 output's
@@ -113,6 +114,10 @@ def run(args: argparse.Namespace) -> None:
                 visual.fast_pos_embed_interpolate_vectorized(grid)
                 if len(grid) >= threshold
                 else visual.fast_pos_embed_interpolate_from_list(grid)
+            )
+        elif method == "legacy":
+            forms[name] = lambda grid: visual.legacy_pos_embed_interpolate(
+                torch.tensor(grid)
             )
         else:
             forms[name] = getattr(visual, method)
