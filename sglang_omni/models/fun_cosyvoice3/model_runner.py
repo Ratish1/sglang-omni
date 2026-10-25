@@ -86,7 +86,8 @@ class FunCosyVoice3ModelRunner(ModelRunner):
             # note (ratish): the standard forward replays the prefill from its CUDA graph
             # for the batch's token bucket and takes the embeddings as model inputs.
             attach_omni_prefill_inputs(
-                forward_batch, OmniPrefillInputs(input_embeds=input_embeds)
+                forward_batch,
+                OmniPrefillInputs(input_embeds=torch.zeros_like(input_embeds)),
             )
             return None
         else:
