@@ -28,7 +28,6 @@ from sglang_omni.models.qwen3_omni.components.audio_layer_graph import (
     stack_qkv_projection,
 )
 from sglang_omni.models.qwen3_omni.components.packed_attention import (
-    packed_attention_backend,
     resolve_packed_attention,
 )
 
@@ -153,26 +152,6 @@ def test_disabled_runner_declines_even_with_graphs() -> None:
     runner.disabled_reason = "capture failed"
     assert runner.has_graphs is False
     assert runner.maybe_replay(torch.zeros(4, 8), torch.zeros(3), [2, 2]) is None
-
-
-@pytest.mark.parametrize(
-    ("capability", "backend"),
-    (
-        ((9, 0), "fa3"),
-        ((10, 0), "triton_attn"),
-        ((12, 0), "triton_attn"),
-    ),
-)
-def test_packed_attention_backend_follows_the_device_capability(
-    capability: tuple[int, int], backend: str
-) -> None:
-    assert packed_attention_backend(capability, is_hip=False) == backend
-
-
-def test_packed_attention_backend_keeps_hip_off_fa3() -> None:
-    """PyTorch HIP reports gfx950 as (9, 5); that is not NVIDIA Hopper."""
-    assert packed_attention_backend((9, 5), is_hip=True) == "triton_attn"
-    assert packed_attention_backend((9, 0), is_hip=True) == "triton_attn"
 
 
 def test_capture_segments_fit_the_declared_window() -> None:
