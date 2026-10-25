@@ -12,7 +12,11 @@ from sglang_omni.models.qwen3_tts.codec_state_arena import Qwen3TTSCodecStateAre
 from sglang_omni.models.qwen3_tts.compat import (
     apply_qwen_tts_transformers_compatibility_patches,
 )
-from sglang_omni.models.qwen3_tts.incremental_codec import Qwen3TTSIncrementalDecoder
+from sglang_omni.models.qwen3_tts.incremental_codec import (
+    Qwen3TTSIncrementalCodecState,
+    Qwen3TTSIncrementalDecoder,
+    incremental_transformer,
+)
 from sglang_omni.models.qwen3_tts.incremental_codec_cuda_graph import (
     IncrementalCodecGraphPool,
     Qwen3TTSIncrementalCodecCudaGraphRunner,
@@ -70,6 +74,7 @@ def main():
         assert [arena.acquire() for _ in range(4)] == [0, 1, 2, 3]
     pool = IncrementalCodecGraphPool(stream_priority=0)
     runners = {}
+    reference_runners = {}
     for name, mode, widths, compiled, emit in [
         ("cold", "cold", (1, 2), (1, 2), 0),
         ("window", "window", (8, 64), (8,), 0),
@@ -92,6 +97,23 @@ def main():
         runner.capture()
         assert runner.enabled, runner.stats()
         runners[name] = runner
+        reference_runner = Qwen3TTSIncrementalCodecCudaGraphRunner(
+            incremental,
+            device=device,
+            dtype=torch.bfloat16,
+            num_quantizers=decoder.config.num_quantizers,
+            mode=mode,
+            fresh_frames=widths,
+            batch_sizes=(4,),
+            min_free_gb=0,
+            compile_fresh_frames=compiled,
+            arena=buffered,
+            graph_pool=IncrementalCodecGraphPool(stream_priority=0),
+            emit_frames=emit,
+        )
+        reference_runner.capture()
+        assert reference_runner.enabled, reference_runner.stats()
+        reference_runners[name] = reference_runner
         print("CAPTURED", name, flush=True)
     generator = torch.Generator(device=device).manual_seed(3176)
     records = []
@@ -105,14 +127,11 @@ def main():
             device=device,
             generator=generator,
         )
-        reference_state = buffered.gather(slots)
-        if valid is None:
-            expected = incremental.decode(codes, reference_state)
-        else:
-            expected = incremental.decode_tail(
-                codes, torch.tensor(valid, device=device), reference_state, 1
-            )
-        buffered.scatter(slots, reference_state)
+        expected = reference_runners[name].decode_slots(
+            codes, slots, valid_frames=valid
+        )
+        assert expected is not None
+        expected = expected.clone()
         actual = runners[name].decode_slots(codes, slots, valid_frames=valid)
         assert actual is not None
         actual = actual.clone()
@@ -129,6 +148,7 @@ def main():
             **metrics(actual, expected),
         }
         fp_rows = []
+        fp_states = []
         for row, slot in enumerate(slots):
             history[slot].append(
                 codes[row : row + 1, :, : width if valid is None else valid[row]]
@@ -139,6 +159,11 @@ def main():
                     ..., -frames * decoder.total_upsample :
                 ]
             )
+            fp_state = Qwen3TTSIncrementalCodecState()
+            full_codes = torch.cat(history[slot], dim=-1)
+            fp_inputs = fp32.pre_conv(fp32.quantizer.decode(full_codes)).transpose(1, 2)
+            incremental_transformer(fp32.pre_transformer, fp_inputs, fp_state)
+            fp_states.append(fp_state)
             last_by_slot[slot] = actual[row : row + 1].clone()
         fp_pcm = torch.cat(fp_rows)
         record["ring_to_fp32"] = metrics(actual, fp_pcm)
@@ -156,21 +181,54 @@ def main():
                 + torch.arange(position - count, position, device=device)
                 % rings.ring_frames
             )
-            for layer, ring in enumerate(rings.key_rings):
-                actual_keys = ring[indices].view(count, -1, 64).transpose(0, 1)
-                expected_keys = buffered.storage.transformer_keys[layer][
-                    slot, :, -count:
-                ]
-                torch.testing.assert_close(
-                    actual_keys, expected_keys, rtol=0.03, atol=0.03
-                )
+            for kind, ring_tensors, buffered_tensors, gold_tensors in (
+                (
+                    "keys",
+                    rings.key_rings,
+                    buffered.storage.transformer_keys,
+                    fp_states[row].transformer_keys,
+                ),
+                (
+                    "values",
+                    rings.value_rings,
+                    buffered.storage.transformer_values,
+                    fp_states[row].transformer_values,
+                ),
+            ):
+                for layer, ring in enumerate(ring_tensors):
+                    actual_keys = (
+                        ring[indices].view(count, -1, 64).transpose(0, 1).float()
+                    )
+                    expected_keys = buffered_tensors[layer][slot, :, -count:].float()
+                    gold_keys = gold_tensors[layer][0, :, -count:]
+                    ring_error = (actual_keys - gold_keys).norm()
+                    buffered_error = (expected_keys - gold_keys).norm()
+                    ratio = float(ring_error / buffered_error.clamp_min(1e-20))
+                    record.setdefault("kv_error_ratios", []).append(
+                        {
+                            "slot": slot,
+                            "kind": kind,
+                            "layer": layer,
+                            "ring_over_buffered_to_fp32": ratio,
+                        }
+                    )
+                    assert ratio <= 1.1, record["kv_error_ratios"][-1]
         assert int(rings.storage.frame_positions[4]) == 0
         assert not any(
             torch.count_nonzero(ring.view(6, 79, -1)[4])
             for ring in (*rings.key_rings, *rings.value_rings)
         )
         records.append(record)
-        print(json.dumps(record), flush=True)
+        print(
+            json.dumps(
+                {
+                    name: value
+                    for name, value in record.items()
+                    if name != "kv_error_ratios"
+                }
+            ),
+            flush=True,
+        )
 
     step("cold", [0, 1, 2], 1)
     step("tail", [3], 581, [581])
@@ -184,44 +242,7 @@ def main():
     history[0] = []
     step("cold", [0], 2)
     step("window", [0, 1], 8)
-    buffered_runner = Qwen3TTSIncrementalCodecCudaGraphRunner(
-        incremental,
-        device=device,
-        dtype=torch.bfloat16,
-        num_quantizers=decoder.config.num_quantizers,
-        mode="warm",
-        fresh_frames=(8,),
-        batch_sizes=(4,),
-        min_free_gb=0,
-        compile_fresh_frames=(8,),
-        arena=buffered,
-        graph_pool=IncrementalCodecGraphPool(stream_priority=0),
-    )
-    buffered_runner.capture()
-    assert buffered_runner.enabled, buffered_runner.stats()
-    timings = {"ring": [], "buffered": []}
-    timed_graphs = {
-        "ring": next(
-            entry.graph
-            for key, entry in runners["window"].graphs.items()
-            if key.fresh_frames == 8
-        ),
-        "buffered": next(iter(buffered_runner.graphs.values())).graph,
-    }
-    for turn in range(10):
-        for name in ("ring", "buffered") if turn % 2 else ("buffered", "ring"):
-            start_event, end_event = torch.cuda.Event(
-                enable_timing=True
-            ), torch.cuda.Event(enable_timing=True)
-            start_event.record()
-            for _ in range(20):
-                timed_graphs[name].replay()
-            end_event.record()
-            end_event.synchronize()
-            timings[name].append(start_event.elapsed_time(end_event) / 20)
-    print("TIMINGS_MS", json.dumps(timings), flush=True)
     result = {
-        "timings_ms": timings,
         "ring_frames": rings.ring_frames,
         "ring_bytes_per_slot": rings.bytes_per_slot,
         "buffered_bytes_per_slot": buffered.bytes_per_slot,
