@@ -68,6 +68,9 @@ def main() -> None:
     parser.add_argument("--no-compile", action="store_true")
     parser.add_argument("--ring-frames", type=int, default=0)
     parser.add_argument("--kernel-table", action="store_true")
+    # a long reference's first chunk decodes its reach plus one emitted frame (one tail width)
+    parser.add_argument("--reach-tail", action="store_true")
+    parser.add_argument("--only-tail", action="store_true")
     args = parser.parse_args()
     global KERNEL_TABLE
     KERNEL_TABLE = args.kernel_table
@@ -78,6 +81,9 @@ def main() -> None:
     decoder = tokenizer.model.decoder.eval()
     fuse_vocoder_decoder(decoder)
     incremental = Qwen3TTSIncrementalDecoder(decoder)
+    tail_widths = (
+        (TAIL_WIDTH, 128, incremental.first_chunk_reference_frames(1) + 1) if args.reach_tail else (TAIL_WIDTH,)
+    )
     # a tree whose arena keeps K/V rings takes the widest in-place decode, the widest cold or warm width, as served;
     # --ring-frames overrides it (a ring narrower than a compiled width sends that width to the gathered step)
     ring_options = (
@@ -122,7 +128,7 @@ def main() -> None:
         dtype=dtype,
         num_quantizers=config.num_quantizers,
         mode="tail",
-        fresh_frames=(TAIL_WIDTH,),
+        fresh_frames=tail_widths,
         batch_sizes=BATCHES,
         min_free_gb=0.0,
         arena=arena,
@@ -134,7 +140,10 @@ def main() -> None:
         warm.capture()
         tail.capture()
         generator = torch.Generator(device="cpu").manual_seed(0)
-        for runner, widths in ((cold, COLD_WIDTHS), (warm, WARM_WIDTHS), (tail, (TAIL_WIDTH,))):
+        runs = ((tail, tail_widths),) if args.only_tail else (
+            (cold, COLD_WIDTHS), (warm, WARM_WIDTHS), (tail, tail_widths)
+        )
+        for runner, widths in runs:
             for width in widths:
                 for batch in BATCHES:
                     slots = [arena.acquire() for _ in range(batch)]
