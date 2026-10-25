@@ -8,6 +8,7 @@ from pathlib import Path
 
 import torch
 from safetensors.torch import save_file
+from sglang.srt.runtime_context import override_platform
 from torch.nn.attention import SDPBackend, sdpa_kernel
 from transformers.models.qwen3_omni_moe import modeling_qwen3_omni_moe as hf
 from transformers.models.qwen3_omni_moe.configuration_qwen3_omni_moe import (
@@ -124,6 +125,12 @@ def run(root, label, output, dtype, trained):
                 outcome="passed",
                 **summary(first),
             )
+            attention = (
+                model.packed_attention
+                if kind == "audio"
+                else model.visual.packed_attention
+            )
+            record["attention_backend"] = type(attention).__name__
             torch.save(
                 {
                     key: (
@@ -238,22 +245,26 @@ def main():
     parser.add_argument("--dtype", default="bfloat16")
     parser.add_argument("--graphs", action="store_true")
     parser.add_argument("--trained", action="store_true")
+    parser.add_argument("--triton", action="store_true")
     options = parser.parse_args()
     options.output.mkdir(parents=True, exist_ok=True)
     if options.make:
         make_checkpoint(options.checkpoint)
     else:
         pass
-    if options.graphs:
-        graph_transitions(options.checkpoint, options.output, options.label)
-    else:
-        run(
-            options.checkpoint,
-            options.label,
-            options.output,
-            options.dtype,
-            options.trained,
-        )
+    with (
+        override_platform(is_sm90=False) if options.triton else contextlib.nullcontext()
+    ):
+        if options.graphs:
+            graph_transitions(options.checkpoint, options.output, options.label)
+        else:
+            run(
+                options.checkpoint,
+                options.label,
+                options.output,
+                options.dtype,
+                options.trained,
+            )
 
 
 if __name__ == "__main__":
