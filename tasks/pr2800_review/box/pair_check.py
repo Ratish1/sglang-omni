@@ -97,6 +97,8 @@ TREES = {
     "upy": ("upy_6756aebd8", "origin", "6756aebd86a556d64a961910b86e74f9c048ea24"),
     "vpg": ("vpg_c33d90cb7", "origin", "c33d90cb79933d0d7eaf6483647ca1faa0cbe60a"),
     "acc": ("acc_2ffb5f303", "origin", "2ffb5f303df76ebe752b829548767bc5d9f37619"),
+    "ipr": ("ipr_040a3134c", "origin", "040a3134c1f075c2f472eca4135f6a6a16da860e"),
+    "itq": ("itq_05e0d23c0", "origin", "05e0d23c0170d72b07e1c4c0ea522e990baa41ed"),
 }
 # note (ratish): every arm is measured by one client and scored by one ASR server, both from main; from the SGLang
 # 0.5.22 stack on (057d97629) a tree from before it no longer runs, and main's client records each chunk's length.
@@ -106,6 +108,10 @@ ASR_TREE = "upr"
 ARMS = {
     "upy": ("upy", [], [0.7769]),
     "vpg": ("vpg", [], [0.7769]),
+    "ipr": ("ipr", [], [0.7769]),
+    "iprb": ("ipr", [], [0.7769]),
+    "itq": ("itq", [], [0.7769]),
+    "itqb": ("itq", [], [0.7769]),
     "upn": ("upn", [], [0.7769]),
     "s3z": ("s3z", [], [0.7769]),
     "s4z": ("s4z", [], [0.7769]),

@@ -7,7 +7,8 @@ Each arm serves one replica of the CI's FP8 colocated worker (examples/configs/q
 video at 2 fps, at most 128 frames of at most 401408 pixels, a spoken audio question, text out, greedy, 256 tokens,
 videoamme-ci-50. A pass boots its own server, since a repeated prompt is a prefix-cache hit that computes differently.
 --benchmark mmmu sends test_qwen3_omni_mmmu_ci.py's requests instead (mmmu-ci-50, image and text in, text out,
-greedy, two warmup requests) and writes mmmu.json in place of videoamme.json.
+greedy, two warmup requests) and writes mmmu.json in place of videoamme.json; --benchmark mmmu-full sends the same
+requests over all 900 of MMMU validation.
 The client runs in each tree's own code (this file in its --client mode). Writes <out>/<pass>/<arm>/videoamme.json,
 the server's KV pool line in <out>/<pass>/<arm>/kv_pool.txt and <out>/summary.json.
 """
@@ -84,9 +85,13 @@ def run_client(benchmark: str, port: int, concurrency: int, out: Path) -> None:
         # note (ratish): test_qwen3_omni_mmmu_ci.py's request: greedy, 2048 tokens, two warmup requests.
         config = MMMUEvalConfig(
             model="qwen3-omni", host="127.0.0.1", port=port, max_concurrency=concurrency, output_dir=str(out),
-            repo_id=DATASETS["mmmu-ci-50"], warmup=2, disable_tqdm=True)
+            repo_id=None if benchmark == "mmmu-full" else DATASETS["mmmu-ci-50"], warmup=2, disable_tqdm=True)
         results = asyncio.run(run_mmmu_eval(config))
-    (out / f"{benchmark}.json").write_text(json.dumps(results, indent=1, default=str))
+    (out / results_name(benchmark)).write_text(json.dumps(results, indent=1, default=str))
+
+
+def results_name(benchmark: str) -> str:
+    return "mmmu.json" if benchmark.startswith("mmmu") else f"{benchmark}.json"
 
 
 def run_pass(
@@ -135,7 +140,7 @@ def run_pass(
         return dict(rc=rc)
     else:
         pass
-    results = json.loads((arm_out / f"{benchmark}.json").read_text())
+    results = json.loads((arm_out / results_name(benchmark)).read_text())
     summary = results.get("summary") or results.get("accuracy") or {}
     speed = results.get("speed") or {}
     pair_check.log(
@@ -167,7 +172,7 @@ def main() -> None:
     parser.add_argument("--concurrency", type=int)
     parser.add_argument("--config", default=CI_CONFIG, help="the pipeline config, relative to the tree or absolute")
     parser.add_argument("--model", default=MODEL, help="the checkpoint, served with --config's matching precision")
-    parser.add_argument("--benchmark", choices=("videoamme", "mmmu", "mmsu"), default="videoamme")
+    parser.add_argument("--benchmark", choices=("videoamme", "mmmu", "mmmu-full", "mmsu"), default="videoamme")
     parser.add_argument("--serve-arg", action="append", default=[], help="one more serve argument, repeatable")
     parser.add_argument("--layer-dump", action="store_true", help="serve with layer_dump/sitecustomize.py's hooks")
     parser.add_argument("--request-events", action="store_true", help="record request events, <pass>/<arm>/events")

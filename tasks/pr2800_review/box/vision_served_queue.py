@@ -1,10 +1,13 @@
-"""MMMU and Video-AMME served, main 6e75cba89 (upx) against the device position interpolation branch.
+"""MMMU and Video-AMME served, a base tree against an arm, two same-time pairs at once on the lease's four cards.
 
-Run on the box: python3 /workspace/box/tasks/pr2800_review/box/vision_served_queue.py --run run318 --arm vdk
-For each benchmark (MMMU in CI stage 3's shape, Video-AMME in CI stage 9's shape), three same-time rounds on the two
-cards through videoamme_pair.py, c1 then c16, each pass on a fresh server: upx@0 with the arm on card 1, then
-swapped, then upx@0 with upxb@1 (main against main, the band). Writes /data/pr2800/<run>/<benchmark>_<round> and
-<run>.log.
+Run on the box:
+    python3 /workspace/box/tasks/pr2800_review/box/vision_served_queue.py --run run321 --base ipr --arm itq
+        --expected c05cbb4d,8b623e1d [--benchmarks mmmu-full,videoamme] [--config ...] [--model ...]
+For each benchmark through videoamme_pair.py, c1 then c16, each pass on a fresh server: phase "pair" runs base@0 with
+arm@1 and arm@2 with base@3 at the same time (each pair same-time, the arms' cards swapped between the two); phase
+"aa" runs base@0 with base@1 and arm@2 with arm@3 (each tree against itself, the band). Both trees must carry the
+Mac's sglang_omni tree hashes (--expected) and be clean. Writes /data/pr2800/<run>/<benchmark>_<phase>_<pair>/ and
+/data/pr2800/<run>.log.
 """
 
 from __future__ import annotations
@@ -13,6 +16,7 @@ import argparse
 import os
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -23,8 +27,6 @@ from followups_merge_queue import card_pins  # noqa: E402
 from pair_check import tree  # noqa: E402
 
 DATA = Path("/data/pr2800")
-EXPECTED_TREES = {"upx": "8c3034da", "vdk": "bf85c3b1"}
-OUT = DATA
 LOG = DATA / "unset.log"
 
 
@@ -35,49 +37,71 @@ def log(message: str) -> None:
         handle.write(line + "\n")
 
 
+def run_pair(out: Path, benchmark: str, arms: str, config: str, model: str) -> None:
+    out.mkdir(parents=True, exist_ok=True)
+    log(f"{out.name} {arms}")
+    rc = subprocess.run(
+        [sys.executable, str(BOX / "videoamme_pair.py"), "--benchmark", benchmark, "--arms", arms, "--passes",
+         "c1,c16", "--config", config, "--model", model, "--out", str(out)],
+        cwd=BOX, env=os.environ.copy(), stdout=open(out / "pair.log", "w"), stderr=subprocess.STDOUT,
+    ).returncode
+    for line in (out / "driver.log").read_text().splitlines():
+        if "accuracy" in line or "rc" in line:
+            log(f"  {out.name} {line}")
+        else:
+            pass
+    log(f"{out.name} rc {rc}")
+
+
 def main() -> None:
-    global OUT, LOG
+    global LOG
     parser = argparse.ArgumentParser()
     parser.add_argument("--run", required=True)
-    parser.add_argument("--arm", required=True, choices=sorted(set(EXPECTED_TREES) - {"upx"}))
+    parser.add_argument("--base", required=True)
+    parser.add_argument("--arm", required=True)
+    parser.add_argument("--expected", required=True, help="base and arm sglang_omni tree hash prefixes")
+    parser.add_argument("--benchmarks", default="mmmu-full,videoamme")
+    parser.add_argument("--config", default=pair_check.CONFIG)
+    parser.add_argument("--model", default=pair_check.MODEL)
     args = parser.parse_args()
-    OUT, LOG = DATA / args.run, DATA / f"{args.run}.log"
-    rounds = (("r1", f"upx@0,{args.arm}@1"), ("r2", f"{args.arm}@0,upx@1"), ("aa", "upx@0,upxb@1"))
-    OUT.mkdir(parents=True, exist_ok=True)
+    out, LOG = DATA / args.run, DATA / f"{args.run}.log"
+    out.mkdir(parents=True, exist_ok=True)
     cpus, node = card_pins()
     os.environ.update(PR2800_CARD_CPUS=cpus, PR2800_NODE=node)
     # note (ratish): pair_check read the pins at import, before they were known; pinned() reads these.
     pair_check.CARD_CPUS = {int(card): card_cpus for card, card_cpus in (entry.split("=", 1) for entry in cpus.split(";"))}
     pair_check.NODE = node
     box_head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=BOX, capture_output=True, text=True).stdout.strip()
-    log(f"pins {cpus} node {node}; box branch {box_head[:9]}")
-    for arm in ("upx", args.arm):
+    log(f"pins {cpus} node {node}; box branch {box_head[:9]}; config {args.config}; model {args.model}")
+    for arm, expected in zip((args.base, args.arm), args.expected.split(",")):
         path = tree(arm)
         tree_hash = subprocess.run(
             ["git", "rev-parse", "HEAD:sglang_omni"], cwd=path, capture_output=True, text=True).stdout.strip()
         dirty = subprocess.run(["git", "diff", "--quiet", "HEAD", "--", "sglang_omni"], cwd=path).returncode
-        log(f"{arm} sglang_omni {tree_hash} expected {EXPECTED_TREES[arm]} dirty {dirty}")
-        if not tree_hash.startswith(EXPECTED_TREES[arm]) or dirty:
+        log(f"{arm} sglang_omni {tree_hash} expected {expected} dirty {dirty}")
+        if not tree_hash.startswith(expected) or dirty:
             log("stopped: a tree is not the Mac's")
             return
         else:
             pass
-    for benchmark in ("mmmu", "videoamme"):
-        for round_name, arms in rounds:
-            run_out = OUT / f"{benchmark}_{round_name}"
-            run_out.mkdir(parents=True, exist_ok=True)
-            log(f"{benchmark} {round_name} {arms}")
-            rc = subprocess.run(
-                [sys.executable, str(BOX / "videoamme_pair.py"), "--benchmark", benchmark, "--arms", arms, "--passes",
-                 "c1,c16", "--out", str(run_out)],
-                cwd=BOX, env=os.environ.copy(), stdout=open(run_out / "pair.log", "w"), stderr=subprocess.STDOUT,
-            ).returncode
-            for line in (run_out / "driver.log").read_text().splitlines():
-                if "accuracy" in line or "rc" in line:
-                    log(f"  {line}")
-                else:
-                    pass
-            log(f"{benchmark} {round_name} rc {rc}")
+    base, arm = args.base, args.arm
+    phases = (
+        ("pair", (("r1", f"{base}@0,{arm}@1"), ("r2", f"{arm}@2,{base}@3"))),
+        ("aa", ((base, f"{base}@0,{base}b@1"), (arm, f"{arm}@2,{arm}b@3"))),
+    )
+    for phase, pairs in phases:
+        for benchmark in args.benchmarks.split(","):
+            threads = [
+                threading.Thread(
+                    target=run_pair,
+                    args=(out / f"{benchmark}_{phase}_{name}", benchmark, arms, args.config, args.model),
+                )
+                for name, arms in pairs
+            ]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join()
     log("queue done")
 
 
