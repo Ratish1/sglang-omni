@@ -442,6 +442,7 @@ def test_prefix_pool_leaves_its_reserve_under_the_allocator_cap() -> None:
     gc.collect()
     torch.cuda.empty_cache()
     total_bytes = torch.cuda.get_device_properties(device).total_memory
+    entry_fraction = torch.cuda.get_per_process_memory_fraction(device)
     torch.cuda.set_per_process_memory_fraction(
         (torch.cuda.memory_reserved(device) + 8 * 2**30) / total_bytes, device
     )
@@ -460,7 +461,7 @@ def test_prefix_pool_leaves_its_reserve_under_the_allocator_cap() -> None:
         step = torch.empty(reserve_bytes, dtype=torch.uint8, device=device)
         del step, pool
     finally:
-        torch.cuda.set_per_process_memory_fraction(1.0, device)
+        torch.cuda.set_per_process_memory_fraction(entry_fraction, device)
         torch.cuda.empty_cache()
 
 

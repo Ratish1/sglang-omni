@@ -68,6 +68,7 @@ from sglang_omni.models.fun_cosyvoice3.packed_dit import (
     pack_rows,
     scatter_rows,
     solve_flow_euler_packed,
+    supports_ragged_attention,
 )
 from sglang_omni.models.fun_cosyvoice3.payload_types import FunCosyVoice3State
 from sglang_omni.models.fun_cosyvoice3.prefix_cache import (
@@ -2513,8 +2514,17 @@ def create_vocoder_executor(
     else:
         pass
     device_obj = torch.device(device)
-    is_prefix_cache_requested = flow_prefix_cache_gb is None or flow_prefix_cache_gb > 0
-    if is_prefix_cache_requested:
+    # note (ratish): decided before the load, because the prefix cache reads free memory
+    # before it. The TensorRT estimator replaces the packed DiT.
+    has_ragged_attention = (
+        not enable_flow_estimator_trt
+        and supports_ragged_attention(device_obj)
+        and autocast_dtype in FA3_DTYPES
+    )
+    has_prefix_pool = has_ragged_attention and (
+        flow_prefix_cache_gb is None or flow_prefix_cache_gb > 0
+    )
+    if has_prefix_pool:
         # note (ratish): this stage's allocations start here, read once the allocator
         # has returned what earlier stages freed.
         gc.collect()
@@ -2547,11 +2557,6 @@ def create_vocoder_executor(
         enable_flow_estimator_trt=enable_flow_estimator_trt,
     )
 
-    has_ragged_attention = (
-        flow.packed_estimator is not None
-        and flow.packed_estimator.is_ragged
-        and autocast_dtype in FA3_DTYPES
-    )
     flow.is_buffered_packed = has_ragged_attention
     if enable_flow_cuda_graph and (
         not supports_device_streams(device_obj)
@@ -2581,8 +2586,6 @@ def create_vocoder_executor(
         compile_dit_backbone(flow, autocast_dtype=autocast_dtype)
     else:
         pass
-
-    has_prefix_pool = is_prefix_cache_requested and has_ragged_attention
 
     if enable_flow_cuda_graph and not flow.is_buffered_packed:
         capture_shapes = verify_flow_cuda_graph_capture_shapes(
