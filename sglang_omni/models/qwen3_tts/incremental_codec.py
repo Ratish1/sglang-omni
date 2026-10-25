@@ -91,14 +91,14 @@ class Qwen3TTSIncrementalCodecStateSpec:
 @dataclass(frozen=True)
 class Qwen3TTSKVRings:
     """Every layer's keys and values, read and written in place: cohort row i keeps frame p of
-    its stream at ring row slot_rows[i] + p % ring_frames, and frames a decode does not keep go
-    to trash_row."""
+    its stream at ring row slot_rows[i] + p % ring_frames, and frame p of a decode it does not
+    keep goes to trash_slot_row + p % ring_frames, a slot no stream reads."""
 
     keys: list[torch.Tensor]
     values: list[torch.Tensor]
     ring_frames: int
     slot_rows: torch.Tensor
-    trash_row: int
+    trash_slot_row: int
 
     def clone(self) -> Qwen3TTSKVRings:
         return Qwen3TTSKVRings(
@@ -106,7 +106,7 @@ class Qwen3TTSKVRings:
             values=[ring.clone() for ring in self.values],
             ring_frames=self.ring_frames,
             slot_rows=self.slot_rows.clone(),
-            trash_row=self.trash_row,
+            trash_slot_row=self.trash_slot_row,
         )
 
 
@@ -873,11 +873,16 @@ class FusedIncrementalTransformer:
                 fresh_frames if valid_frames is None else valid_frames
             )
             # note (ratish): a decode wider than the ring past its window stores only the frames
-            # the next decode reads, so no two of its frames share a ring row.
+            # the next decode reads, so no two of its frames share a ring row; the rest spread
+            # over the trash slot's rows, since a long first chunk discards hundreds a row.
             is_kept = (
                 query_positions >= (valid_ends - retained_context).unsqueeze(1)
             ) & (query_positions < valid_ends.unsqueeze(1))
-            write_rows = torch.where(is_kept, frame_rows, rings.trash_row).reshape(rows)
+            write_rows = torch.where(
+                is_kept,
+                frame_rows,
+                rings.trash_slot_row + query_positions % rings.ring_frames,
+            ).reshape(rows)
         hidden_states = hidden_states.reshape(rows, hidden_size)
         for layer_index, layer in enumerate(transformer.layers):
             head_dim = int(layer.self_attn.head_dim)

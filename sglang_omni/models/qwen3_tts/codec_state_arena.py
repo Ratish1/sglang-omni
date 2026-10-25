@@ -310,7 +310,7 @@ class Qwen3TTSCodecStateArena:
                 values=self.value_rings,
                 ring_frames=self.ring_frames,
                 slot_rows=index * self.ring_frames,
-                trash_row=self.scratch_slot * self.ring_frames,
+                trash_slot_row=self.scratch_slot * self.ring_frames,
             )
         else:
             pass

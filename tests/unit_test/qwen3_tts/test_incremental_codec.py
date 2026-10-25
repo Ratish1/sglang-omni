@@ -662,7 +662,7 @@ def test_ring_steps_track_fp32_and_wide_ring_steps_equal_the_buffered_step() -> 
                 values=[torch.zeros_like(ring) for ring in keys],
                 ring_frames=ring_frames,
                 slot_rows=slots * ring_frames,
-                trash_row=3 * ring_frames,
+                trash_slot_row=3 * ring_frames,
             ),
         )
 
