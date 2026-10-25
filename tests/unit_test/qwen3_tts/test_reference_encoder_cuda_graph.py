@@ -166,7 +166,11 @@ def test_reference_code_batcher_replays_captured_buckets_and_encodes_the_rest(
     torch.manual_seed(5)
     device = torch.device("cuda", torch.cuda.current_device())
     config = small_mimi_config()
-    model = MimiModel(config).to(device).eval()
+    model = MimiModel(config)
+    for module in model.modules():
+        if isinstance(module, MimiEuclideanCodebook):
+            module.embed_sum.normal_()
+    model = model.to(device).eval()
     move_conv_padding_to_host(model)
     tokenizer = SimpleNamespace(
         model=SimpleNamespace(
@@ -179,9 +183,7 @@ def test_reference_code_batcher_replays_captured_buckets_and_encodes_the_rest(
     batcher = qwen3_request_builders.Qwen3TTSRefCodeBatcher(
         tokenizer, max_batch_wait_ms=0, graph_bucket_frames=(4,)
     )
-    beyond_waveforms = [
-        np.random.rand(frames * HOP).astype(np.float32) for frames in (5, 7)
-    ]
+    beyond_waveforms = [torch.rand(frames * HOP).numpy() for frames in (5, 7)]
     encode = model.encode
     encoded_samples = []
 
@@ -194,7 +196,7 @@ def test_reference_code_batcher_replays_captured_buckets_and_encodes_the_rest(
     monkeypatch.setattr(model, "encode", recording_encode)
     try:
         assert batcher.graph_runner is not None
-        inside = batcher.encode(np.random.rand(3 * HOP + 1).astype(np.float32), 24000)
+        inside = batcher.encode(torch.rand(3 * HOP + 1).numpy(), 24000)
         beyond = [batcher.encode(waveform, 24000) for waveform in beyond_waveforms]
     finally:
         batcher.close()
@@ -206,6 +208,7 @@ def test_reference_code_batcher_replays_captured_buckets_and_encodes_the_rest(
             codes = encode(values, num_quantizers=2, return_dict=True).audio_codes
             expected.append(codes[0, :, : waveform.size // HOP].transpose(0, 1))
 
+    assert all(int(codes.unique().numel()) > 1 for codes in expected)
     assert inside.shape == (4, 2) and inside.is_cuda
     assert encoded_samples == [8 * HOP, 8 * HOP]
     assert [tuple(codes.shape) for codes in beyond] == [(5, 2), (7, 2)]
