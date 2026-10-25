@@ -106,7 +106,7 @@ class Qwen3TTSCodecStateArena:
             self._num_slots + 1,  # noqa: leading-underscore
             device=self.device,
             dtype=dtype,
-            transformer_kv=not self.key_rings,
+            has_key_value_buffers=not self.key_rings,
         )
         self.lock = threading.Lock()
         self.staging = threading.local()

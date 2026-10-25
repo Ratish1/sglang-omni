@@ -884,12 +884,12 @@ class FusedIncrementalTransformer:
             key_ring = rings.keys[layer_index]
             value_ring = rings.values[layer_index]
             query, key, value = self.projected_qkv(layer, hidden_states)
-            if is_in_place:
-                pass
-            else:
+            if not is_in_place:
                 # note (ratish): read before the store, which can reuse a prior frame's ring row.
                 prior_keys = key_ring[prior_rows]
                 prior_values = value_ring[prior_rows]
+            else:
+                pass
             apply_rope_inplace_with_kvcache(
                 query,
                 key,
@@ -901,7 +901,7 @@ class FusedIncrementalTransformer:
                 write_rows,
                 is_neox=True,
             )
-            kv_heads = int(key.shape[1])
+            key_value_heads = int(key.shape[1])
             query = query.view(batch_size, fresh_frames, -1, head_dim)
             if is_in_place and self.is_paged_attention:
                 window_attention = (
@@ -911,8 +911,8 @@ class FusedIncrementalTransformer:
                 )
                 attended = window_attention(
                     query,
-                    key_ring.view(-1, 1, kv_heads, head_dim),
-                    value_ring.view(-1, 1, kv_heads, head_dim),
+                    key_ring.view(-1, 1, key_value_heads, head_dim),
+                    value_ring.view(-1, 1, key_value_heads, head_dim),
                     page_table,
                     window_lengths,
                     float(layer.self_attn.scaling),
@@ -923,10 +923,10 @@ class FusedIncrementalTransformer:
                     layer,
                     query.transpose(1, 2),
                     key_ring[window_rows]
-                    .view(batch_size, -1, kv_heads, head_dim)
+                    .view(batch_size, -1, key_value_heads, head_dim)
                     .transpose(1, 2),
                     value_ring[window_rows]
-                    .view(batch_size, -1, kv_heads, head_dim)
+                    .view(batch_size, -1, key_value_heads, head_dim)
                     .transpose(1, 2),
                     attention_mask,
                 )
@@ -937,10 +937,10 @@ class FusedIncrementalTransformer:
                     torch.cat(
                         (
                             prior_keys.view(
-                                batch_size, retained_context, kv_heads, head_dim
+                                batch_size, retained_context, key_value_heads, head_dim
                             ).transpose(1, 2),
                             key.view(
-                                batch_size, fresh_frames, kv_heads, head_dim
+                                batch_size, fresh_frames, key_value_heads, head_dim
                             ).transpose(1, 2),
                         ),
                         dim=-2,
@@ -948,10 +948,10 @@ class FusedIncrementalTransformer:
                     torch.cat(
                         (
                             prior_values.view(
-                                batch_size, retained_context, kv_heads, head_dim
+                                batch_size, retained_context, key_value_heads, head_dim
                             ).transpose(1, 2),
                             value.view(
-                                batch_size, fresh_frames, kv_heads, head_dim
+                                batch_size, fresh_frames, key_value_heads, head_dim
                             ).transpose(1, 2),
                         ),
                         dim=-2,
@@ -1240,10 +1240,10 @@ class Qwen3TTSIncrementalDecoder:
         *,
         device: torch.device,
         dtype: torch.dtype,
-        transformer_kv: bool = True,
+        has_key_value_buffers: bool = True,
     ) -> Qwen3TTSIncrementalCodecState:
         """Allocate a zeroed state with full-width buffers, the transformer's K/V among them
-        unless transformer_kv is False.
+        unless has_key_value_buffers is False.
 
         Note (Qihao Liu): unlike the lazily grown state, the Transformer K/V
         buffers start at their retained width. A stream that has not filled
@@ -1268,7 +1268,7 @@ class Qwen3TTSIncrementalDecoder:
                 device=device,
                 dtype=dtype,
             )
-        for layer_index in range(spec.num_layers if transformer_kv else 0):
+        for layer_index in range(spec.num_layers if has_key_value_buffers else 0):
             shape = (
                 batch_size,
                 spec.num_key_value_heads,
