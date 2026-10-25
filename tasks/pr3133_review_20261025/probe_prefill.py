@@ -1,6 +1,7 @@
 """Compare real CosyVoice prefills through the scheduler, before sampling."""
 
 import json
+import copy
 from pathlib import Path
 
 import torch
@@ -39,6 +40,8 @@ def main() -> None:
     assert graph_runner is not None
     assert 1 in graph_runner.capture_num_tokens
     assert graph_runner.buffer_registry.has_slot("input_embeds")
+    print(json.dumps({"graph_slots": graph_runner._capture_req_slots,
+                      "graph_buckets": graph_runner.capture_num_tokens}), flush=True)
     original_forward = worker.forward_batch_generation
     records = []
 
@@ -48,12 +51,13 @@ def main() -> None:
         sidecar = get_omni_prefill_inputs(forward_batch)
         assert sidecar is not None
         assert forward_batch.input_embeds is None
-        reference_embeds = sidecar.input_embeds.clone()
-        reference = runner.forward_with_input_embeds(
-            forward_batch, reference_embeds
-        ).logits_output.next_token_logits.clone()
+        eligible = graph_runner.can_run_graph(forward_batch)
         result = original_forward(forward_batch, **kwargs)
         actual = result.logits_output.next_token_logits.clone()
+        reference_embeds = sidecar.input_embeds.clone()
+        reference = runner.forward_with_input_embeds(
+            copy.copy(forward_batch), reference_embeds
+        ).logits_output.next_token_logits.clone()
         assert actual.shape == reference.shape
         assert torch.isfinite(actual).all()
         log_reference = torch.log_softmax(reference.float(), dim=-1)
@@ -65,6 +69,8 @@ def main() -> None:
             "extend_lengths": forward_batch.extend_seq_lens_cpu,
             "prefix_lengths": forward_batch.extend_prefix_lens_cpu,
             "graph": bool(result.can_run_cuda_graph),
+            "eligible": eligible,
+            "token_indices_to_pool": forward_batch.token_indices_to_pool is not None,
             "max_logit_error": (actual-reference).abs().max().item(),
             "max_kl": divergence.max().item(),
             "top1_equal": bool(torch.equal(actual.argmax(-1), reference.argmax(-1))),
@@ -72,7 +78,8 @@ def main() -> None:
         })
         print(json.dumps(records[-1]), flush=True)
         assert divergence.max().item() < 0.001
-        return result
+        # Restore the graph-produced K/V after the reference writes the same slots.
+        return original_forward(forward_batch, **kwargs)
 
     worker.forward_batch_generation = checked_forward
     prompt_ids = {}
