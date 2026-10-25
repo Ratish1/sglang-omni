@@ -27,7 +27,7 @@ def compute_mmmu_metrics(per_sample: list["MMMURecord"]) -> dict:
         "correct": correct,
         "accuracy": round(accuracy, 4),
         "failed": failed,
-        "mc_fallback": sum(record["is_mc_fallback"] for record in per_sample),
+        "unparsed": sum(record["is_unparsed"] for record in per_sample),
     }
     return summary
 
@@ -48,5 +48,5 @@ def print_mmmu_accuracy_summary(
         f"({metrics['accuracy'] * 100:.1f}%)"
     )
     print(f"  {'Failed requests:':<{lw}} {metrics['failed']}")
-    print(f"  {'MC parse fallback:':<{lw}} {metrics['mc_fallback']}")
+    print(f"  {'Unparsed (wrong):':<{lw}} {metrics['unparsed']}")
     print(f"{'=' * ACCURACY_LINE_WIDTH}\n")

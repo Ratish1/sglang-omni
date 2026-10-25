@@ -8,7 +8,6 @@ import base64
 import binascii
 import logging
 import os
-import random
 import struct
 import time
 from typing import Any, TypedDict
@@ -52,7 +51,7 @@ class VideoMMERecord(TypedDict):
     raw_response: str
     is_correct: bool
     is_success: bool
-    is_mc_fallback: bool
+    is_unparsed: bool
     error: str
 
 
@@ -195,7 +194,6 @@ def build_videomme_result_records(
     assert len(samples) == len(
         results
     ), f"Sample/result count mismatch: {len(samples)} samples vs {len(results)} results"
-    random.seed(42)
 
     per_sample: list[VideoMMERecord] = []
 
@@ -228,7 +226,7 @@ def build_videomme_result_records(
             "raw_response": result.error,
             "is_correct": False,
             "is_success": False,
-            "is_mc_fallback": False,
+            "is_unparsed": False,
             "error": result.error,
         }
 
@@ -236,21 +234,23 @@ def build_videomme_result_records(
             per_sample.append(record)
             continue
 
-        predicted, is_fallback = parse_multi_choice_response(
+        predicted, is_unparsed = parse_multi_choice_response(
             result.text,
             sample.all_choices,
             sample.index2ans,
         )
         is_correct = predicted == sample.answer
-        if is_fallback:
-            logger.debug("Video-MME parse fallback for sample %s", sample.sample_id)
+        if is_unparsed:
+            logger.debug("Video-MME answer unparsed for sample %s", sample.sample_id)
+        else:
+            pass
 
         record.update(
             predicted=predicted,
             raw_response=result.text,
             is_correct=is_correct,
             is_success=True,
-            is_mc_fallback=is_fallback,
+            is_unparsed=is_unparsed,
             error="",
         )
         per_sample.append(record)
