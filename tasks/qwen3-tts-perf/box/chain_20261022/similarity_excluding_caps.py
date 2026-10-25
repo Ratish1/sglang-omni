@@ -16,6 +16,11 @@ import sys
 from pathlib import Path
 
 MODEL = "Qwen/Qwen3-TTS-12Hz-1.7B-Base"
+# the scorer pads each similarity batch to its longest clip; minutes-long outputs need fewer clips a batch
+SCORER = (
+    "import runpy, sys; import benchmarks.tasks.tts as tts; tts.SPEAKER_SIMILARITY_BATCH_SIZE = int(sys.argv.pop(1)); "
+    "runpy.run_module('benchmarks.eval.benchmark_tts_seedtts', run_name='__main__', alter_sys=True)"
+)
 
 
 def main() -> None:
@@ -25,6 +30,7 @@ def main() -> None:
     parser.add_argument("--card", type=int, required=True)
     parser.add_argument("--max-seconds", type=float, default=60.0)
     parser.add_argument("--meta", default="")
+    parser.add_argument("--batch-size", type=int, default=8)
     args = parser.parse_args()
     root = Path(os.environ["PAIR_ROOT"]) / args.label
     generated = {arm: json.loads((root / arm / "bench" / "generated.json").read_text()) for arm in ("a", "b")}
@@ -44,7 +50,7 @@ def main() -> None:
         (sim_dir / "generated.json").write_text(json.dumps(rows))
         with open(sim_dir / "score--similarity-only.log", "w", encoding="utf-8") as log:
             subprocess.run(
-                [sys.executable, "-m", "benchmarks.eval.benchmark_tts_seedtts", "--model", MODEL, "--lang", "en",
+                [sys.executable, "-c", SCORER, str(args.batch_size), "--model", MODEL, "--lang", "en",
                  "--skip-gpu-cleanup", "--output-dir", str(sim_dir), "--similarity-only", "--device",
                  f"cuda:{args.card}", *(["--meta", args.meta] if args.meta else [])],
                 cwd=args.tree, env=dict(os.environ, PYTHONPATH=args.tree), stdout=log, stderr=subprocess.STDOUT,
