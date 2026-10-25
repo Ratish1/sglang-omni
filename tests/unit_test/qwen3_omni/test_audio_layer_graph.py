@@ -358,13 +358,17 @@ def test_capture_survives_a_collection_that_frees_dead_graphs(
         return run_layers(hidden_states, cu_seqlens, max_seqlen)
 
     monkeypatch.setattr(runner, "run_layers", run_layers_collecting)
+    was_enabled = gc.isenabled()
     gc.collect()
     gc.disable()
     try:
         DeadGraphCycle(device)
         runner.capture_all()
     finally:
-        gc.enable()
+        if was_enabled:
+            gc.enable()
+        else:
+            pass
 
     assert runner.has_graphs, runner.disabled_reason
     assert sorted(runner.graphs) == sorted(DEFAULT_TOKEN_BUCKETS)
