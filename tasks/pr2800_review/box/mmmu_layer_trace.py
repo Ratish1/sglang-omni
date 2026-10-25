@@ -99,7 +99,12 @@ def patch_vision(thinker, stored: list, grid) -> None:
         pooler_output=torch.split(merged, split_sizes),
         deepstack_features=[torch.split(feature, split_sizes) for feature in deepstack],
     )
-    thinker.get_image_features = lambda *args, **kwargs: output
+
+    # note (ratish): generate pre-encodes images through this method, choosing its arguments by parameter name.
+    def get_image_features(pixel_values, image_grid_thw=None, **kwargs):
+        return output
+
+    thinker.get_image_features = get_image_features
 
 
 def stored_features(out: Path, source: str) -> dict:
@@ -464,12 +469,15 @@ def in_parallel(jobs: list[tuple[tuple[int, ...], Path, list[str], Path]], out: 
             log.write(f"{' '.join(args[:3])} cards {cards} rc {codes[index]} ({log_path.name})\n")
 
 
-def run(arms: list[str], out: Path) -> None:
+def run(arms: list[str], out: Path, with_features: bool) -> None:
     trees = {arm: pair_check.tree(pair_check.ARMS[arm][0]) for arm in arms}
-    in_parallel(
-        [((card,), trees[arm], ["features", "--arm", arm, "--out", str(out)], out / f"features_{arm}.log") for card, arm in enumerate(arms)],
-        out,
-    )
+    if with_features:
+        in_parallel(
+            [((card,), trees[arm], ["features", "--arm", arm, "--out", str(out)], out / f"features_{arm}.log") for card, arm in enumerate(arms)],
+            out,
+        )
+    else:
+        pass
     sources = ["fp32", "hf_bf16", *arms]
     answer_tree = trees[ANSWER_TREE]
     in_parallel(
@@ -573,10 +581,11 @@ def main() -> None:
     parser.add_argument("--thinker", choices=("float32", "bfloat16"))
     parser.add_argument("--sources")
     parser.add_argument("--out", type=Path, required=True)
+    parser.add_argument("--skip-features", action="store_true", help="reuse the features already under --out")
     args = parser.parse_args()
     args.out.mkdir(parents=True, exist_ok=True)
     if args.mode == "run":
-        run(args.arms.split(","), args.out)
+        run(args.arms.split(","), args.out, not args.skip_features)
     elif args.mode == "read":
         read(args.arms.split(","), args.out)
     elif args.mode == "features":
