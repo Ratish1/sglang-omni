@@ -809,10 +809,8 @@ class FusedIncrementalTransformer:
         state: Qwen3TTSIncrementalCodecState,
         valid_frames: torch.Tensor | None,
     ) -> torch.Tensor:
-        """The step for a cohort whose K/V live in an arena's rings. A decode whose window and
-        new frames fit the ring stores every new frame and attends its window in place; any
-        other decode attends its gathered prior window and keeps each row's last retained
-        frames, as the buffered step does."""
+        """The step for a cohort whose K/V live in an arena's rings: in place when a decode's
+        window and new frames fit the ring, else on its gathered prior window."""
         transformer = self.transformer
         rings = state.kv_rings
         hidden_states = transformer.input_proj(hidden_states)

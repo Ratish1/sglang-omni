@@ -87,9 +87,7 @@ class Qwen3TTSCodecStateArena:
         spec = decoder.state_spec()
         if decoder.fused_transformer is not None and in_place_frames > 0:
             self.ring_frames = spec.retained_context + int(in_place_frames)
-            ring_rows = (
-                self._num_slots + 1
-            ) * self.ring_frames  # noqa: leading-underscore
+            ring_rows = (self.scratch_slot + 1) * self.ring_frames
             ring_width = spec.num_key_value_heads * spec.head_dim
             self.key_rings: list[torch.Tensor] = [
                 torch.zeros(ring_rows, ring_width, device=self.device, dtype=dtype)
