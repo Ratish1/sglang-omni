@@ -948,8 +948,8 @@ class Qwen3TTSStreamingVocoderScheduler(
         self.codec_arena = self.build_codec_arena(
             int(codec_state_slots),
             dtype=codec_state_dtype,
-            # note (ratish): the widest cold and follow-up decodes, which graphs may compile,
-            # so each attends in place.
+            # note (ratish): the widest cold and follow-up decodes, which graphs may compile, so
+            # each attends in place; compiled, the gathered step would copy every ring a decode.
             in_place_frames=max(
                 (self.stream_followup_stride, *self.followup_stride_ramp, *cold_frames)
             ),
