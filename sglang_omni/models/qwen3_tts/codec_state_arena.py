@@ -84,8 +84,8 @@ class Qwen3TTSCodecStateArena:
             device=self.device,
             dtype=dtype,  # noqa: leading-underscore
         )
-        # note (ratish): every layer's keys, and values, in one tensor, so a cohort's
-        # K/V moves in one launch each way instead of one a layer.
+        # note (ratish): every layer's keys in one tensor and values in another, so a
+        # cohort's K/V moves in one launch each way instead of one a layer.
         self.key_cache = torch.stack(list(self.storage.transformer_keys.values()))
         self.value_cache = torch.stack(list(self.storage.transformer_values.values()))
         self.storage.transformer_keys = self.layer_views(self.key_cache)
@@ -285,7 +285,7 @@ class Qwen3TTSCodecStateArena:
     @staticmethod
     def layer_views(layers: torch.Tensor) -> dict[int, torch.Tensor]:
         """Each layer of a (layers, rows, ...) tensor as its own view, writable in place
-        under autograd, which unbind's views are not."""
+        with grad mode on, which unbind's views are not."""
         return {layer: layers[layer] for layer in range(layers.shape[0])}
 
     def scatter(
@@ -313,7 +313,7 @@ class Qwen3TTSCodecStateArena:
                 self.copy_rows(buffer, index, state.transconv_overlaps[key], key)
         else:
             pass
-        for cache, layers, key in (
+        for cache, layers, name in (
             (self.key_cache, state.transformer_keys, "keys"),
             (self.value_cache, state.transformer_values, "values"),
         ):
@@ -321,7 +321,7 @@ class Qwen3TTSCodecStateArena:
                 cache,
                 index,
                 torch.stack([layers[layer] for layer in range(cache.shape[0])]),
-                key,
+                name,
                 dim=1,
             )
 
