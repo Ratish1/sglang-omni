@@ -22,6 +22,14 @@ from tests.test_model.qwen3_omni_component_accuracy.stage6_requests import (
 )
 
 
+@pytest.fixture(scope="session", autouse=True)
+def float32_without_tf32() -> None:
+    # note (ratish): the FP32 reference is the truth only at full precision; cuDNN runs float32 convolutions such
+    # as the vision patch embedding in TF32 by default.
+    torch.backends.cuda.matmul.allow_tf32 = False
+    torch.backends.cudnn.allow_tf32 = False
+
+
 @pytest.fixture(scope="session")
 def model_path() -> str:
     path = os.environ.get("QWEN3_OMNI_ACCURACY_MODEL")
