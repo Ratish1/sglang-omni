@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import subprocess
+import sys
 from array import array
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -14,7 +17,6 @@ from sglang.srt.utils import DynamicGradMode
 from torch._dynamo.utils import counters
 
 import sglang_omni.models.fun_cosyvoice3.model_runner as model_runner_module
-from sglang_omni.model_runner.prefill_inputs import get_omni_prefill_inputs
 from sglang_omni.models.fun_cosyvoice3.model_runner import FunCosyVoice3ModelRunner
 from sglang_omni.models.fun_cosyvoice3.request_builders import (
     CosyVoice3SGLangRequestData,
@@ -26,6 +28,11 @@ from sglang_omni.models.fun_cosyvoice3.sglang_model import (
     FunCosyVoice3SGLangModel,
 )
 from sglang_omni.sampling.seed import SAMPLING_SEED_MASK
+from tests.unit_test.fixtures.accelerator import require_cuda
+from tests.unit_test.fun_cosyvoice3.prefill_graph_engine import PrefillRecord
+
+REPO_ROOT = Path(__file__).resolve().parents[3]
+ENGINE_TIMEOUT_SECONDS = 900
 
 
 def test_cosyvoice3_runner_collects_speech_tokens_and_skips_eos() -> None:
@@ -513,30 +520,43 @@ def test_cosyvoice3_runner_builds_prefill_embedding_slice_after_prefix() -> None
     )
 
 
-def test_cosyvoice3_cuda_prefill_hands_its_embeddings_to_the_standard_forward(
-    monkeypatch: pytest.MonkeyPatch,
+@pytest.mark.accelerator
+def test_cuda_prefill_graphs_replay_the_composed_rows_as_the_eager_forward(
+    tmp_path: Path,
 ) -> None:
-    monkeypatch.setattr(
-        model_runner_module,
-        "current_platform",
-        SimpleNamespace(is_cuda=lambda: True),
+    require_cuda()
+    output_path = tmp_path / "prefills.pt"
+    engine = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "tests.unit_test.fun_cosyvoice3.prefill_graph_engine",
+            "--checkpoint-directory",
+            str(tmp_path / "checkpoint"),
+            "--output",
+            str(output_path),
+        ],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+        timeout=ENGINE_TIMEOUT_SECONDS,
     )
-    runner = object.__new__(FunCosyVoice3ModelRunner)
-    runner.model = torch.nn.Linear(3, 3, bias=False).to(torch.bfloat16)
-    requests = [
-        SimpleNamespace(
-            data=SimpleNamespace(
-                req=SimpleNamespace(extend_len=2, prefix_len=1),
-                prompt_input_embeds=torch.arange(12, dtype=torch.float32).reshape(3, 4),
-            )
-        )
+    assert engine.returncode == 0, engine.stdout[-4000:] + engine.stderr[-4000:]
+    records = [
+        PrefillRecord(**record) for record in torch.load(output_path, weights_only=True)
     ]
-    forward_batch = SimpleNamespace(
-        input_ids=torch.zeros(2, dtype=torch.long), replace_embeds=None
-    )
 
-    assert runner.custom_prefill_forward(forward_batch, None, requests) is None
-    assert torch.equal(
-        get_omni_prefill_inputs(forward_batch).input_embeds,
-        torch.tensor([[4, 5, 6, 7], [8, 9, 10, 11]], dtype=torch.bfloat16),
+    assert all(record.is_graph_replay for record in records)
+    for record in records:
+        torch.testing.assert_close(
+            record.graph_hidden_states, record.eager_hidden_states
+        )
+    assert any(len(record.extend_token_counts) > 1 for record in records)
+    assert any(
+        record.extend_token_counts == [1] and record.prefix_token_counts[0] > 0
+        for record in records
+    )
+    assert any(
+        record.extend_token_counts[0] > 1 and record.prefix_token_counts[0] > 0
+        for record in records
     )
