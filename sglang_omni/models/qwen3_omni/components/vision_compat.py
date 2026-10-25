@@ -6,7 +6,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 import torch
-import torch.nn.functional as F
 from transformers.models.qwen3_omni_moe import modeling_qwen3_omni_moe as hf_modeling
 from transformers.processing_utils import Unpack
 from transformers.utils.generic import TransformersKwargs, merge_with_config_defaults
@@ -47,20 +46,53 @@ class Qwen3OmniMoeVisionEncoderCompat(hf_modeling.Qwen3OmniMoeVisionEncoder):
         grid_thw: list[list[int]],
     ) -> torch.Tensor:
         """Bilinear position embeddings of every grid, in merge-block order, repeated per frame."""
+        side = self.num_grid_per_side
         merge_size = self.spatial_merge_size
         hidden_size = self.pos_embed.embedding_dim
-        # note (ratish): the table viewed as one channels-last image, which the bilinear kernel reads in place.
-        table = self.pos_embed.weight.reshape(
-            1, self.num_grid_per_side, self.num_grid_per_side, hidden_size
-        ).permute(0, 3, 1, 2)
+        device = self.pos_embed.weight.device
+        # note (ratish): Transformers 5.6's arithmetic, kept bit for bit; the checkpoint scores lower with one-rounding
+        # bilinear. fp32 linspace coordinates (CUDA's equal the CPU's), corner weights rounded to the table dtype,
+        # the four weighted rows added in order in that dtype.
         embeddings = []
         for frames, height, width in grid_thw:
-            resampled = F.interpolate(
-                table, size=(height, width), mode="bilinear", align_corners=True
+            rows = torch.linspace(
+                0, side - 1, height, dtype=torch.float32, device=device
             )
+            columns = torch.linspace(
+                0, side - 1, width, dtype=torch.float32, device=device
+            )
+            rows_floor = rows.int()
+            columns_floor = columns.int()
+            rows_ceil = (rows_floor + 1).clip(max=side - 1)
+            columns_ceil = (columns_floor + 1).clip(max=side - 1)
+            row_fractions = rows - rows_floor
+            column_fractions = columns - columns_floor
+            row_bases = (rows_floor * side)[:, None]
+            row_ceil_bases = (rows_ceil * side)[:, None]
+            corner_indices = torch.stack(
+                (
+                    row_bases + columns_floor,
+                    row_bases + columns_ceil,
+                    row_ceil_bases + columns_floor,
+                    row_ceil_bases + columns_ceil,
+                )
+            ).reshape(4, -1)
+            corner_weights = (
+                torch.stack(
+                    (
+                        (1 - row_fractions)[:, None] * (1 - column_fractions),
+                        (1 - row_fractions)[:, None] * column_fractions,
+                        row_fractions[:, None] * (1 - column_fractions),
+                        row_fractions[:, None] * column_fractions,
+                    )
+                )
+                .reshape(4, -1)
+                .to(self.pos_embed.weight.dtype)
+            )
+            corners = self.pos_embed(corner_indices) * corner_weights[:, :, None]
+            spatial = corners[0] + corners[1] + corners[2] + corners[3]
             merged = (
-                resampled.permute(0, 2, 3, 1)
-                .reshape(
+                spatial.reshape(
                     height // merge_size,
                     merge_size,
                     width // merge_size,
