@@ -18,12 +18,12 @@ def main():
     cases = (
         ("cpu_default", "cpu", "bfloat16", None, False, False, False),
         ("cpu_positive_cap", "cpu", "bfloat16", 2.0, False, False, False),
-        ("cuda_float32", "cuda:0", "float32", None, False, False, False),
-        ("cuda_disabled_cache", "cuda:0", "bfloat16", 0.0, False, False, False),
-        ("cuda_tensor_rt", "cuda:0", "bfloat16", None, True, False, False),
-        ("cuda_no_fa3", "cuda:0", "bfloat16", None, False, True, False),
-        ("cuda_default", "cuda:0", "bfloat16", None, False, False, True),
-        ("cuda_float16", "cuda:0", "float16", None, False, False, True),
+        ("cuda_float32", "cuda", "float32", None, False, False, False),
+        ("cuda_disabled_cache", "cuda", "bfloat16", 0.0, False, False, False),
+        ("cuda_tensor_rt", "cuda", "bfloat16", None, True, False, False),
+        ("cuda_no_fa3", "cuda", "bfloat16", None, False, True, False),
+        ("cuda_default", "cuda", "bfloat16", None, False, False, True),
+        ("cuda_float16", "cuda", "float16", None, False, False, True),
     )
     for name, device, dtype, cache_size, tensor_rt, no_fa3, expects_queries in cases:
         with (
@@ -46,6 +46,7 @@ def main():
                 stages.create_vocoder_executor(
                     "checkpoint",
                     device=device,
+                    gpu_id=0 if device == "cuda" else None,
                     dtype=dtype,
                     flow_prefix_cache_gb=cache_size,
                     enable_dit_torch_compile=False,
