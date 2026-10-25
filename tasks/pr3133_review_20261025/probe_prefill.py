@@ -52,10 +52,11 @@ def main() -> None:
         sidecar = get_omni_prefill_inputs(forward_batch)
         assert sidecar is not None
         assert forward_batch.input_embeds is None
+        pristine_embeds = sidecar.input_embeds.clone()
+        reference_embeds = pristine_embeds.clone()
         eligible = graph_runner.can_run_graph(forward_batch)
         result = original_forward(forward_batch, **kwargs)
         actual = result.logits_output.next_token_logits.clone()
-        reference_embeds = sidecar.input_embeds.clone()
         reference = runner.forward_with_input_embeds(
             copy.copy(forward_batch), reference_embeds
         ).logits_output.next_token_logits.clone()
@@ -75,11 +76,12 @@ def main() -> None:
             "max_logit_error": (actual-reference).abs().max().item(),
             "max_kl": divergence.max().item(),
             "top1_equal": bool(torch.equal(actual.argmax(-1), reference.argmax(-1))),
-            "eager_mutates_input": not bool(torch.equal(reference_embeds, sidecar.input_embeds)),
+            "eager_mutates_input": not bool(torch.equal(reference_embeds, pristine_embeds)),
         })
         print(json.dumps(records[-1]), flush=True)
         assert divergence.max().item() < 0.001
         # Restore the graph-produced K/V after the reference writes the same slots.
+        sidecar.input_embeds.copy_(pristine_embeds)
         return original_forward(forward_batch, **kwargs)
 
     worker.forward_batch_generation = checked_forward
