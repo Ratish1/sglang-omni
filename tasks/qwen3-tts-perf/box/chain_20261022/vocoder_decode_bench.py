@@ -29,6 +29,7 @@ BATCHES = (1, 4, 8)
 COLD_WIDTHS = (8, 9)
 WARM_WIDTHS = (1, 4, 8)
 TAIL_WIDTH = 64
+KERNEL_TABLE = False
 
 
 def time_graph(runner, codes, slots, valid_frames, replays: int, device) -> tuple[float, float, float, float]:
@@ -53,6 +54,10 @@ def time_graph(runner, codes, slots, valid_frames, replays: int, device) -> tupl
             graph.replay()
         torch.cuda.synchronize(device)
     kernels = sum(1 for event in profiler.events() if event.device_type == torch.autograd.DeviceType.CUDA)
+    if KERNEL_TABLE:
+        print(profiler.key_averages().table(sort_by="cuda_time_total", row_limit=12, max_name_column_width=70))
+    else:
+        pass
     return statistics.median(times_us), quantiles[0], quantiles[-1], kernels / profiled
 
 
@@ -61,7 +66,11 @@ def main() -> None:
     parser.add_argument("--card", type=int, default=3)
     parser.add_argument("--replays", type=int, default=100)
     parser.add_argument("--no-compile", action="store_true")
+    parser.add_argument("--ring-frames", type=int, default=0)
+    parser.add_argument("--kernel-table", action="store_true")
     args = parser.parse_args()
+    global KERNEL_TABLE
+    KERNEL_TABLE = args.kernel_table
     torch.cuda.set_device(args.card)
     device = torch.device("cuda", args.card)
     dtype = torch.bfloat16
@@ -69,9 +78,10 @@ def main() -> None:
     decoder = tokenizer.model.decoder.eval()
     fuse_vocoder_decoder(decoder)
     incremental = Qwen3TTSIncrementalDecoder(decoder)
-    # a tree whose arena keeps K/V rings takes the widest in-place decode, the served warm width
+    # a tree whose arena keeps K/V rings takes the widest in-place decode, the widest cold or warm width, as served;
+    # --ring-frames overrides it (a ring narrower than a compiled width sends that width to the gathered step)
     ring_options = (
-        {"in_place_frames": max(WARM_WIDTHS)}
+        {"in_place_frames": args.ring_frames or max((*COLD_WIDTHS, *WARM_WIDTHS))}
         if "in_place_frames" in inspect.signature(Qwen3TTSCodecStateArena.__init__).parameters
         else {}
     )
