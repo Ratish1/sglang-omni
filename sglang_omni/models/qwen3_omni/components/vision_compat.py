@@ -50,9 +50,9 @@ class Qwen3OmniMoeVisionEncoderCompat(hf_modeling.Qwen3OmniMoeVisionEncoder):
         merge_size = self.spatial_merge_size
         hidden_size = self.pos_embed.embedding_dim
         # note (ratish): the table viewed as one channels-last image, which the bilinear kernel reads in place.
-        table = self.pos_embed.weight.T.reshape(
-            1, hidden_size, self.num_grid_per_side, self.num_grid_per_side
-        )
+        table = self.pos_embed.weight.reshape(
+            1, self.num_grid_per_side, self.num_grid_per_side, hidden_size
+        ).permute(0, 3, 1, 2)
         embeddings = []
         for frames, height, width in grid_thw:
             resampled = F.interpolate(
