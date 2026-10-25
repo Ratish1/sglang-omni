@@ -21,6 +21,7 @@ import bisect
 import importlib.util
 import json
 import os
+import sys
 
 import torch
 
@@ -72,6 +73,8 @@ def load_main_runner(main_tree):
         "main_prefix_cuda_graph", os.path.join(main_tree, "sglang_omni/models/fun_cosyvoice3/prefix_cuda_graph.py")
     )
     module = importlib.util.module_from_spec(spec)
+    # note (ratish): a dataclass under postponed annotations looks its module up in sys.modules.
+    sys.modules[spec.name] = module
     spec.loader.exec_module(module)
     return module.PrefixCudaGraphRunner
 
