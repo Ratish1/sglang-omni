@@ -96,7 +96,7 @@ TREES = {
     "rvf": ("rvf_d18506df4", "origin", "d18506df427fd8f266e1e859f2fedc751c691b0b"),
     "upy": ("upy_6756aebd8", "origin", "6756aebd86a556d64a961910b86e74f9c048ea24"),
     "vpg": ("vpg_c33d90cb7", "origin", "c33d90cb79933d0d7eaf6483647ca1faa0cbe60a"),
-    "acc": ("acc_021667e97", "origin", "021667e97c474c2837878ccd700d6350c78730e6"),
+    "acc": ("acc_2ffb5f303", "origin", "2ffb5f303df76ebe752b829548767bc5d9f37619"),
 }
 # note (ratish): every arm is measured by one client and scored by one ASR server, both from main; from the SGLang
 # 0.5.22 stack on (057d97629) a tree from before it no longer runs, and main's client records each chunk's length.
