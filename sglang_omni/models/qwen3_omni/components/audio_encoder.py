@@ -24,6 +24,7 @@ from sglang_omni.models.qwen3_omni.components.audio_layer_graph import (
 )
 from sglang_omni.models.qwen3_omni.components.common import load_thinker_config
 from sglang_omni.models.qwen3_omni.components.packed_attention import (
+    PackedAttention,
     resolve_packed_attention,
 )
 from sglang_omni.models.weight_loader import load_module, resolve_dtype
@@ -151,7 +152,7 @@ def forward_with_shared_segments(
 
 
 def share_segment_splits(
-    tower: nn.Module, splits: SegmentSplits, packed_attention: nn.Module | None
+    tower: nn.Module, splits: SegmentSplits, packed_attention: PackedAttention | None
 ) -> None:
     # Note (wenyao): the stock attention derives its split sizes with a
     # device-to-host copy, so every one of the 32 layers stalls on the same
@@ -222,7 +223,7 @@ class Qwen3OmniAudioEncoder(nn.Module):
         )  # noqa: leading-underscore  # upstream spelling, or the public name is already taken
         self.segment_splits = SegmentSplits()
         # note (ratish): one attention kernel for a clip whether or not its batch fits a layer graph.
-        self.packed_attention: nn.Module | None = resolve_packed_attention(
+        self.packed_attention: PackedAttention | None = resolve_packed_attention(
             self.device, torch_dtype
         )
         if self.packed_attention is not None:

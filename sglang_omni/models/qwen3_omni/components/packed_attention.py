@@ -4,17 +4,18 @@
 from __future__ import annotations
 
 import torch
-import torch.nn as nn
 from sglang.srt.layers.attention.vision import (
     VisionFlash3Attention,
     VisionTritonAttention,
 )
 from sglang.srt.runtime_context import get_platform
 
+PackedAttention = VisionFlash3Attention | VisionTritonAttention
+
 
 def resolve_packed_attention(
     device: torch.device, dtype: torch.dtype
-) -> nn.Module | None:
+) -> PackedAttention | None:
     """The packed attention for an encoder on this device in this dtype, or None to keep Transformers' attention."""
     # note (ratish): FA3 rejects float32 and Triton's dot runs float32 as TF32, so a float32 encoder keeps float32 attention.
     if device.type != "cuda" or dtype not in (torch.float16, torch.bfloat16):

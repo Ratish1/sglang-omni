@@ -15,6 +15,8 @@ from sglang.srt.layers.attention.vision import (
 )
 from sglang.srt.model_executor.runner.base_cuda_graph_runner import freeze_gc
 
+from sglang_omni.models.qwen3_omni.components.packed_attention import PackedAttention
+
 logger = logging.getLogger(__name__)
 
 DEFAULT_TOKEN_BUCKETS: tuple[int, ...] = (128, 256, 512, 1024, 2048, 4096)
@@ -50,7 +52,7 @@ def stack_qkv_projection(attention: nn.Module) -> None:
 
 def packed_attention_forward(
     attention: nn.Module,
-    packed_attention: nn.Module,
+    packed_attention: PackedAttention,
     hidden_states: torch.Tensor,
     attention_metadata: VisionAttentionMetadata,
 ) -> torch.Tensor:
@@ -87,7 +89,7 @@ class AudioLayerGraphRunner:
         *,
         device: torch.device,
         window: int,
-        packed_attention: nn.Module,
+        packed_attention: PackedAttention,
         token_buckets: tuple[int, ...] = DEFAULT_TOKEN_BUCKETS,
         max_batch_rows: int = 32,
     ) -> None:
@@ -111,7 +113,7 @@ class AudioLayerGraphRunner:
         self.owner_pid = os.getpid()
         self.dtype = next(tower.parameters()).dtype
         self.hidden = tower.config.d_model
-        self.packed_attention: nn.Module = packed_attention
+        self.packed_attention: PackedAttention = packed_attention
 
     @property
     def has_graphs(self) -> bool:

@@ -5,13 +5,13 @@ from __future__ import annotations
 
 import torch
 from sglang.srt.layers.attention.vision import prepare_vision_attention_metadata
-from torch import nn
 from transformers.initialization import no_init_weights
 from transformers.models.qwen3_omni_moe.configuration_qwen3_omni_moe import (
     Qwen3OmniMoeVisionEncoderConfig,
 )
 
 from sglang_omni.models.qwen3_omni.components.packed_attention import (
+    PackedAttention,
     resolve_packed_attention,
 )
 from sglang_omni.models.qwen3_omni.components.vision_attention import (
@@ -33,11 +33,11 @@ class Qwen3OmniVisionEncoder(Qwen3OmniMoeVisionEncoderCompat):
         config: Qwen3OmniMoeVisionEncoderConfig,
         *,
         joint_rope_kernel: JointRopeInplaceKernel | None,
-        packed_attention: nn.Module | None,
+        packed_attention: PackedAttention | None,
     ) -> None:
         super().__init__(config)
         self.joint_rope_kernel: JointRopeInplaceKernel | None = joint_rope_kernel
-        self.packed_attention: nn.Module | None = packed_attention
+        self.packed_attention: PackedAttention | None = packed_attention
         # note (yzxiao): Keep attention and its RoPE input format paired at construction.
         for block in self.blocks:
             block.attn = Qwen3OmniVisionAttention(
