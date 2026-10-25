@@ -185,7 +185,44 @@ def main():
     history[0] = []
     step("cold", [0], 2)
     step("window", [0, 1], 8)
+    buffered_runner = Qwen3TTSIncrementalCodecCudaGraphRunner(
+        incremental,
+        device=device,
+        dtype=torch.bfloat16,
+        num_quantizers=decoder.config.num_quantizers,
+        mode="warm",
+        fresh_frames=(8,),
+        batch_sizes=(4,),
+        min_free_gb=0,
+        compile_fresh_frames=(8,),
+        arena=buffered,
+        graph_pool=IncrementalCodecGraphPool(stream_priority=0),
+    )
+    buffered_runner.capture()
+    assert buffered_runner.enabled, buffered_runner.stats()
+    timings = {"ring": [], "buffered": []}
+    timed_graphs = {
+        "ring": next(
+            entry.graph
+            for key, entry in runners["window"].graphs.items()
+            if key.fresh_frames == 8
+        ),
+        "buffered": next(iter(buffered_runner.graphs.values())).graph,
+    }
+    for turn in range(10):
+        for name in ("ring", "buffered") if turn % 2 else ("buffered", "ring"):
+            start_event, end_event = torch.cuda.Event(
+                enable_timing=True
+            ), torch.cuda.Event(enable_timing=True)
+            start_event.record()
+            for _ in range(20):
+                timed_graphs[name].replay()
+            end_event.record()
+            end_event.synchronize()
+            timings[name].append(start_event.elapsed_time(end_event) / 20)
+    print("TIMINGS_MS", json.dumps(timings), flush=True)
     result = {
+        "timings_ms": timings,
         "ring_frames": rings.ring_frames,
         "ring_bytes_per_slot": rings.bytes_per_slot,
         "buffered_bytes_per_slot": buffered.bytes_per_slot,
