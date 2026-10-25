@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""CPU contracts for Qwen3-Omni vision encoding."""
+"""Contracts for Qwen3-Omni vision encoding."""
 
 from pathlib import Path
 from types import SimpleNamespace
@@ -26,10 +26,22 @@ GRID_CASES = {
     "video-plus-image": [[3, 12, 16], [1, 20, 28], [2, 8, 8]],
     "many": [[1, 24, 24]] * 8,
 }
-BILINEAR_TOLERANCES = {torch.bfloat16: 1e-2, torch.float32: 1e-5}
+BILINEAR_TOLERANCES = {torch.bfloat16: 2**-9 + 1e-5, torch.float32: 1e-5}
+DEVICES = [
+    "cpu",
+    pytest.param(
+        "cuda",
+        marks=[
+            pytest.mark.accelerator,
+            pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA"),
+        ],
+    ),
+]
 
 
-def make_encoder(dtype: torch.dtype) -> vision_compat.Qwen3OmniMoeVisionEncoderCompat:
+def make_encoder(
+    dtype: torch.dtype, device: str
+) -> vision_compat.Qwen3OmniMoeVisionEncoderCompat:
     encoder = vision_compat.Qwen3OmniMoeVisionEncoderCompat.__new__(
         vision_compat.Qwen3OmniMoeVisionEncoderCompat
     )
@@ -40,6 +52,7 @@ def make_encoder(dtype: torch.dtype) -> vision_compat.Qwen3OmniMoeVisionEncoderC
         48 * 48,
         16,
         dtype=dtype,
+        device=device,
     )
     with torch.no_grad():
         values = torch.arange(
@@ -50,14 +63,16 @@ def make_encoder(dtype: torch.dtype) -> vision_compat.Qwen3OmniMoeVisionEncoderC
     return encoder
 
 
+@pytest.mark.parametrize("device", DEVICES)
 @pytest.mark.parametrize("dtype", list(BILINEAR_TOLERANCES), ids=["bf16", "fp32"])
 @pytest.mark.parametrize("grid_thw", list(GRID_CASES.values()), ids=list(GRID_CASES))
 def test_position_interpolation_matches_float64_bilinear(
     grid_thw: list[list[int]],
     dtype: torch.dtype,
+    device: str,
 ) -> None:
-    encoder = make_encoder(dtype)
-    table = encoder.pos_embed.weight.detach().double().T.reshape(1, -1, 48, 48)
+    encoder = make_encoder(dtype, device)
+    table = encoder.pos_embed.weight.detach().cpu().double().T.reshape(1, -1, 48, 48)
     expected = torch.cat(
         [
             F.interpolate(table, size=(h, w), mode="bilinear", align_corners=True)[0]
@@ -71,8 +86,9 @@ def test_position_interpolation_matches_float64_bilinear(
 
     actual = encoder.interpolate_position_embeddings(grid_thw)
 
+    assert actual.device == encoder.pos_embed.weight.device
     torch.testing.assert_close(
-        actual.double(), expected, rtol=0, atol=BILINEAR_TOLERANCES[dtype]
+        actual.cpu().double(), expected, rtol=0, atol=BILINEAR_TOLERANCES[dtype]
     )
 
 
