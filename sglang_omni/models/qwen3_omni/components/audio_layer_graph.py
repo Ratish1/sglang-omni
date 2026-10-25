@@ -9,6 +9,7 @@ from dataclasses import dataclass
 
 import torch
 import torch.nn as nn
+from sglang.srt.model_executor.runner.base_cuda_graph_runner import freeze_gc
 
 logger = logging.getLogger(__name__)
 
@@ -233,15 +234,18 @@ class AudioLayerGraphRunner:
             return
         else:
             pass
-        for bucket in self.token_buckets:
-            captured = self.capture(bucket)
-            if captured is None:
-                self.disabled_reason = f"capture failed at bucket {bucket}"
-                self.graphs.clear()
-                return
-            else:
-                pass
-            self.graphs[bucket] = captured
+        # note (ratish): a collection during capture can free what a reference cycle holds,
+        # a dead runner's graphs among them, and invalidate the capture.
+        with freeze_gc(enable_cudagraph_gc=False):
+            for bucket in self.token_buckets:
+                captured = self.capture(bucket)
+                if captured is None:
+                    self.disabled_reason = f"capture failed at bucket {bucket}"
+                    self.graphs.clear()
+                    return
+                else:
+                    pass
+                self.graphs[bucket] = captured
         logger.info(
             "audio layer CUDA graphs captured for buckets %s with %s attention",
             list(self.graphs),
