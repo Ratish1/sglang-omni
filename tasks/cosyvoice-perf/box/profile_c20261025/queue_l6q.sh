@@ -28,6 +28,8 @@ bundled() {
   git -C /workspace/sglang-omni fetch -q $P/l6q.bundle $1
   git -C /workspace/sglang-omni rev-parse FETCH_HEAD
 }
+git -C /workspace/sglang-omni fetch -q origin perf/cosyvoice3-prefix-graph-ladder-v2
+git -C /workspace/sglang-omni fetch -q origin perf/cosyvoice3-prefill-graphs-v3
 tree t_l6q $(bundled perf/cosyvoice3-prefix-graph-ladder-v2)
 tree t_l5q $(bundled perf/cosyvoice3-prefill-graphs-v3)
 tree t_mq $(git -C /workspace/sglang-omni rev-parse 0b9be5746^2)
