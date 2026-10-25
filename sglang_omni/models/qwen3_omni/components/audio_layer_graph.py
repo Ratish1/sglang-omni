@@ -9,12 +9,11 @@ from dataclasses import dataclass
 
 import torch
 import torch.nn as nn
-from sglang.srt.model_executor.runner.base_cuda_graph_runner import freeze_gc
-
-from sglang_omni.models.qwen3_omni.components.packed_attention import (
-    PackedAttentionMetadata,
-    prepare_packed_attention_metadata,
+from sglang.srt.layers.attention.vision import (
+    VisionAttentionMetadata,
+    prepare_vision_attention_metadata,
 )
+from sglang.srt.model_executor.runner.base_cuda_graph_runner import freeze_gc
 
 logger = logging.getLogger(__name__)
 
@@ -53,7 +52,7 @@ def packed_attention_forward(
     attention: nn.Module,
     packed_attention: nn.Module,
     hidden_states: torch.Tensor,
-    attention_metadata: PackedAttentionMetadata,
+    attention_metadata: VisionAttentionMetadata,
 ) -> torch.Tensor:
     seq_length, _ = hidden_states.size()
     # note (ratish): the packed attention reads strided q, k and v, so one GEMM projects all three without copies.
@@ -143,7 +142,9 @@ class AudioLayerGraphRunner:
 
     def run_layers(self, hidden_states, cu_seqlens, max_seqlen: int):
         # An int max_seqlen avoids the device-to-host max() that would break capture.
-        attention_metadata = prepare_packed_attention_metadata(cu_seqlens, max_seqlen)
+        attention_metadata = prepare_vision_attention_metadata(
+            cu_seqlens, cu_seqlens.device, max_seqlen=max_seqlen
+        )
         for layer in self.tower.layers:
             residual = hidden_states
             hidden_states = layer.self_attn_layer_norm(hidden_states)

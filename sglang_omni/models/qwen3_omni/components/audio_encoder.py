@@ -8,6 +8,10 @@ from types import MethodType
 
 import torch
 import torch.nn as nn
+from sglang.srt.layers.attention.vision import (
+    VisionAttentionMetadata,
+    prepare_vision_attention_metadata,
+)
 from transformers.models.qwen3_omni_moe import modeling_qwen3_omni_moe as hf_modeling
 from transformers.models.qwen3_omni_moe.configuration_qwen3_omni_moe import (
     Qwen3OmniMoeThinkerConfig,
@@ -20,8 +24,6 @@ from sglang_omni.models.qwen3_omni.components.audio_layer_graph import (
 )
 from sglang_omni.models.qwen3_omni.components.common import load_thinker_config
 from sglang_omni.models.qwen3_omni.components.packed_attention import (
-    PackedAttentionMetadata,
-    prepare_packed_attention_metadata,
     resolve_packed_attention,
 )
 from sglang_omni.models.weight_loader import load_module, resolve_dtype
@@ -87,7 +89,7 @@ class SegmentSplits:
 
     def __init__(self) -> None:
         self.value: list[int] | None = None
-        self.attention_metadata: PackedAttentionMetadata | None = None
+        self.attention_metadata: VisionAttentionMetadata | None = None
 
 
 def forward_with_shared_segments(
@@ -308,7 +310,9 @@ class Qwen3OmniAudioEncoder(nn.Module):
         valid_indices = valid_indices.to(self.device, non_blocking=True)
         cu_seqlens = cu_seqlens.to(self.device, non_blocking=True)
         self.segment_splits.attention_metadata = (
-            prepare_packed_attention_metadata(cu_seqlens, max_seqlen)
+            prepare_vision_attention_metadata(
+                cu_seqlens, cu_seqlens.device, max_seqlen=max_seqlen
+            )
             if self.packed_attention is not None
             else None
         )

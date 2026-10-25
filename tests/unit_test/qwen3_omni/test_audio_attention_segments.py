@@ -7,6 +7,7 @@ from unittest.mock import Mock
 
 import torch
 import torch.nn as nn
+from sglang.srt.layers.attention.vision import prepare_vision_attention_metadata
 from transformers.models.qwen3_omni_moe import modeling_qwen3_omni_moe as hf_modeling
 
 from sglang_omni.models.qwen3_omni.components.audio_encoder import (
@@ -15,9 +16,6 @@ from sglang_omni.models.qwen3_omni.components.audio_encoder import (
 )
 from sglang_omni.models.qwen3_omni.components.audio_layer_graph import (
     stack_qkv_projection,
-)
-from sglang_omni.models.qwen3_omni.components.packed_attention import (
-    prepare_packed_attention_metadata,
 )
 
 HEADS, HEAD_DIM = 4, 16
@@ -118,7 +116,9 @@ def test_packed_attention_receives_the_call_metadata_in_every_layer() -> None:
     segments = [104, 104, 52]
     hs, cu = inputs(segments)
     splits.value = segments
-    splits.attention_metadata = prepare_packed_attention_metadata(cu, max(segments))
+    splits.attention_metadata = prepare_vision_attention_metadata(
+        cu, cu.device, max_seqlen=max(segments)
+    )
     with torch.no_grad():
         for layer in tower.layers:
             attention = layer.self_attn

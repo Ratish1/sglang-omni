@@ -14,7 +14,10 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from safetensors.torch import save_file
-from sglang.srt.layers.attention.vision import VisionTritonAttention
+from sglang.srt.layers.attention.vision import (
+    VisionTritonAttention,
+    prepare_vision_attention_metadata,
+)
 from torch.nn.attention import SDPBackend, sdpa_kernel
 from transformers.models.qwen3_omni_moe import modeling_qwen3_omni_moe as hf_modeling
 
@@ -26,7 +29,6 @@ from sglang_omni.models.qwen3_omni.components.audio_layer_graph import (
 )
 from sglang_omni.models.qwen3_omni.components.packed_attention import (
     packed_attention_backend,
-    prepare_packed_attention_metadata,
     resolve_packed_attention,
 )
 
@@ -291,7 +293,9 @@ def test_packed_attention_matches_fp32_sdpa_per_segment_and_head() -> None:
             bsz=1,
             seq_len=q.shape[0],
             softmax_scale=HEAD_DIM**-0.5,
-            forward_metadata=prepare_packed_attention_metadata(cu_seqlens, WINDOW),
+            forward_metadata=prepare_vision_attention_metadata(
+                cu_seqlens, device, max_seqlen=WINDOW
+            ),
         )
         with sdpa_kernel(SDPBackend.MATH):
             reference = segmented_sdpa(

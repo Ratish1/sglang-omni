@@ -6,15 +6,12 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 import torch
+from sglang.srt.layers.attention.vision import VisionAttentionMetadata
 from transformers.models.qwen3_omni_moe import modeling_qwen3_omni_moe as hf_modeling
 from transformers.processing_utils import Unpack
 from transformers.utils.generic import TransformersKwargs, merge_with_config_defaults
 from transformers.utils.output_capturing import capture_outputs
 from transformers.vision_utils import get_vision_cu_seqlens, get_vision_position_ids
-
-from sglang_omni.models.qwen3_omni.components.packed_attention import (
-    PackedAttentionMetadata,
-)
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -26,7 +23,7 @@ class VisionRotaryInputs:
 @dataclass(frozen=True, kw_only=True)
 class VisionSequenceMetadata:
     sequence_patch_counts: tuple[int, ...]
-    packed_attention_metadata: PackedAttentionMetadata | None
+    packed_attention_metadata: VisionAttentionMetadata | None
 
 
 class Qwen3OmniMoeVisionEncoderCompat(hf_modeling.Qwen3OmniMoeVisionEncoder):

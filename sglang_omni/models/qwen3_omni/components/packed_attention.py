@@ -3,20 +3,10 @@
 
 from __future__ import annotations
 
-from typing import Protocol
-
 import torch
 import torch.nn as nn
 
 HOPPER_CAPABILITY_MAJOR = 9
-
-
-class PackedAttentionMetadata(Protocol):
-    """Every sequence's bounds and the longest one, built once per encoder call for all its layers."""
-
-    cu_seqlens: torch.Tensor
-    seq_lens: torch.Tensor
-    max_seqlen: int
 
 
 def packed_attention_backend(capability: tuple[int, int], *, is_hip: bool) -> str:
@@ -56,17 +46,5 @@ def resolve_packed_attention(
     else:
         impl_class = vision.VisionTritonAttention
     # The encoder process holds no sglang parallel state to read.
+    # note (ratish): callers pass forward_metadata; given it, the kernels ignore SGLANG_VIT_ENABLE_CUDA_GRAPH, which changes how they read cu_seqlens.
     return impl_class(use_data_parallel=True)
-
-
-def prepare_packed_attention_metadata(
-    cu_seqlens: torch.Tensor, max_seqlen: int
-) -> PackedAttentionMetadata:
-    """The packed attention's metadata for one encoder call, with the longest sequence from the host."""
-    # Local import, for the same reason as in resolve_packed_attention.
-    from sglang.srt.layers.attention import vision
-
-    # note (ratish): given metadata, the kernels ignore SGLANG_VIT_ENABLE_CUDA_GRAPH, which changes how they read cu_seqlens.
-    return vision.prepare_vision_attention_metadata(
-        cu_seqlens, cu_seqlens.device, max_seqlen=max_seqlen
-    )

@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import torch
+from sglang.srt.layers.attention.vision import prepare_vision_attention_metadata
 from torch import nn
 from transformers.initialization import no_init_weights
 from transformers.models.qwen3_omni_moe.configuration_qwen3_omni_moe import (
@@ -11,7 +12,6 @@ from transformers.models.qwen3_omni_moe.configuration_qwen3_omni_moe import (
 )
 
 from sglang_omni.models.qwen3_omni.components.packed_attention import (
-    prepare_packed_attention_metadata,
     resolve_packed_attention,
 )
 from sglang_omni.models.qwen3_omni.components.vision_attention import (
@@ -79,8 +79,10 @@ class Qwen3OmniVisionEncoder(Qwen3OmniMoeVisionEncoderCompat):
             "sequence_metadata": VisionSequenceMetadata(
                 sequence_patch_counts=sequence_patch_counts,
                 packed_attention_metadata=(
-                    prepare_packed_attention_metadata(
-                        cu_seqlens, max(sequence_patch_counts)
+                    prepare_vision_attention_metadata(
+                        cu_seqlens,
+                        cu_seqlens.device,
+                        max_seqlen=max(sequence_patch_counts),
                     )
                     if self.packed_attention is not None
                     else None
