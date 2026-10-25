@@ -80,7 +80,7 @@ def init_sglang_cuda_graphs(
         # Attention backends have already captured the model's real modality.
         # Only the prefill graph runner needs this temporary view so it allocates
         # the upstream input_embeds replay buffer.
-        model_config.is_multimodal = True
+        model_config.is_multimodal = original_is_multimodal
         try:
             model_worker.model_runner.init_cuda_graphs()
         finally:
