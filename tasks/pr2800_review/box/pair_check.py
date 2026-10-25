@@ -94,6 +94,8 @@ TREES = {
     "vdm": ("vdm_47315b507", "origin", "47315b5075bab157eaee5051cab33e2d3a34a31d"),
     "pam": ("pam_352c20afc", "origin", "352c20afc1dc361aac93bb5ff3c550650f6209a1"),
     "rvf": ("rvf_d18506df4", "origin", "d18506df427fd8f266e1e859f2fedc751c691b0b"),
+    "upy": ("upy_6756aebd8", "origin", "6756aebd86a556d64a961910b86e74f9c048ea24"),
+    "vpg": ("vpg_c33d90cb7", "origin", "c33d90cb79933d0d7eaf6483647ca1faa0cbe60a"),
 }
 # note (ratish): every arm is measured by one client and scored by one ASR server, both from main; from the SGLang
 # 0.5.22 stack on (057d97629) a tree from before it no longer runs, and main's client records each chunk's length.
@@ -101,6 +103,8 @@ BENCH_TREE = "upr"
 ASR_TREE = "upr"
 # arm: (tree, extra serve args, leading chunk seconds of the window walk before the 0.8 s windows)
 ARMS = {
+    "upy": ("upy", [], [0.7769]),
+    "vpg": ("vpg", [], [0.7769]),
     "upn": ("upn", [], [0.7769]),
     "s3z": ("s3z", [], [0.7769]),
     "s4z": ("s4z", [], [0.7769]),
