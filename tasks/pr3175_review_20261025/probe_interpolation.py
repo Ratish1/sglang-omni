@@ -92,11 +92,15 @@ def main() -> None:
     timing = []
     for name in ("rectangular-down", "large-up", "mixed-video-image", "many"):
         grid = cases[name]
+        host_grid = torch.tensor(grid)
+        port_method = (
+            PortEncoder.fast_pos_embed_interpolate_vectorized
+            if len(grid) >= 6
+            else PortEncoder.fast_pos_embed_interpolate_from_list
+        )
         methods = (
-            lambda: BaseEncoder.legacy_pos_embed_interpolate(
-                encoder, torch.tensor(grid)
-            ),
-            lambda: PortEncoder.fast_pos_embed_interpolate_from_list(encoder, grid),
+            lambda: BaseEncoder.legacy_pos_embed_interpolate(encoder, host_grid),
+            lambda: port_method(encoder, grid),
             lambda: encoder.interpolate_position_embeddings(grid),
         )
         for method in methods:
