@@ -1866,3 +1866,71 @@ def test_real_tts_fused_decoder_pcm_equal_and_streaming_pcm_tracks_fp32() -> Non
     assert relative_error(fused_pcm, reference_pcm) < relative_error(
         expected[1], reference_pcm
     )
+
+
+@pytest.mark.benchmark
+@pytest.mark.accelerator
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_real_tts_arena_rings_start_reused_slots_cold_and_keep_rows_apart() -> None:
+    checkpoint = os.environ.get("QWEN3_TTS_TOKENIZER_PATH")
+    if checkpoint is None:
+        pytest.skip("Set QWEN3_TTS_TOKENIZER_PATH to run the real checkpoint gate")
+    else:
+        pass
+    apply_qwen_tts_transformers_compatibility_patches()
+    from qwen_tts import Qwen3TTSTokenizer
+
+    tokenizer = Qwen3TTSTokenizer.from_pretrained(
+        checkpoint,
+        device_map="cuda:0",
+        dtype=torch.bfloat16,
+        attn_implementation="sdpa",
+    )
+    decoder = tokenizer.model.decoder.eval()
+    snake_beta.fuse_vocoder_decoder(decoder)
+    incremental = Qwen3TTSIncrementalDecoder(decoder)
+    arena = Qwen3TTSCodecStateArena(
+        incremental,
+        num_slots=2,
+        device=torch.device("cuda:0"),
+        dtype=torch.bfloat16,
+        in_place_frames=4,
+    )
+    assert arena.key_rings
+    generator = torch.Generator(device="cuda:0").manual_seed(11)
+    streams = {
+        name: torch.randint(
+            decoder.config.codebook_size,
+            (1, decoder.config.num_quantizers, 100),
+            device="cuda:0",
+            generator=generator,
+        )
+        for name in ("a", "b", "c")
+    }
+
+    def decode_pair(first: str, second: str) -> torch.Tensor:
+        slots = [arena.acquire(), arena.acquire()]
+        arena.start_slot(slots[0], 30)
+        waveforms = []
+        offset = 0
+        for width in (12, *([4] * 22)):
+            codes = torch.cat(
+                (
+                    streams[first][..., offset : offset + width],
+                    streams[second][..., offset : offset + width],
+                )
+            )
+            state = arena.gather(slots)
+            waveforms.append(incremental.decode(codes, state))
+            arena.scatter(slots, state)
+            offset += width
+        for slot in slots:
+            arena.release(slot)
+        return torch.cat(waveforms, dim=-1)
+
+    with torch.inference_mode():
+        first_pair = decode_pair("a", "b")
+        other_partner = decode_pair("c", "b")
+        reused_slots = decode_pair("a", "b")
+    assert torch.equal(reused_slots, first_pair)
+    assert torch.equal(other_partner[1], first_pair[1])
