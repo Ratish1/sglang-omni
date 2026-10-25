@@ -9,11 +9,16 @@ from pathlib import Path
 import httpx
 import numpy as np
 import soundfile as sf
+from huggingface_hub import hf_hub_download
 
 
 async def main():
     root = Path("/data/review3176oct26")
-    short = "/data/review3132oct25/reference.wav"
+    short = hf_hub_download(
+        "zhaochenyang20/seed-tts-eval-mini",
+        "en/prompt-wavs/common_voice_en_10119832.wav",
+        repo_type="dataset",
+    )
     audio, rate = sf.read(short, dtype="float32")
     tiled = np.concatenate((audio, np.zeros(6000, dtype=np.float32)))
     long = str(root / "long.wav")

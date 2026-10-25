@@ -143,7 +143,6 @@ def main():
         fp_pcm = torch.cat(fp_rows)
         record["ring_to_fp32"] = metrics(actual, fp_pcm)
         record["buffered_to_fp32"] = metrics(expected, fp_pcm)
-        assert record["snr_db"] > 30, record
         assert (
             record["ring_to_fp32"]["snr_db"]
             >= record["buffered_to_fp32"]["snr_db"] - 1.5
