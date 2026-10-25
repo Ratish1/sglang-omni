@@ -100,15 +100,6 @@ class Qwen3TTSKVRings:
     slot_rows: torch.Tensor
     trash_slot_row: int
 
-    def clone(self) -> Qwen3TTSKVRings:
-        return Qwen3TTSKVRings(
-            keys=[ring.clone() for ring in self.keys],
-            values=[ring.clone() for ring in self.values],
-            ring_frames=self.ring_frames,
-            slot_rows=self.slot_rows.clone(),
-            trash_slot_row=self.trash_slot_row,
-        )
-
 
 @dataclass
 class Qwen3TTSIncrementalCodecState:
@@ -171,7 +162,6 @@ class Qwen3TTSIncrementalCodecState:
             ),
             slot_index=None if self.slot_index is None else self.slot_index.clone(),
             pad_slot=self.pad_slot,
-            kv_rings=None if self.kv_rings is None else self.kv_rings.clone(),
             transformer_keys={
                 key: value.clone() for key, value in self.transformer_keys.items()
             },
