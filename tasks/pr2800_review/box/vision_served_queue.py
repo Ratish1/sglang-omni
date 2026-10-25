@@ -63,6 +63,9 @@ def main() -> None:
     parser.add_argument("--benchmarks", default="mmmu-full,videoamme")
     parser.add_argument("--config", default=pair_check.CONFIG)
     parser.add_argument("--model", default=pair_check.MODEL)
+    parser.add_argument(
+        "--phases", default="pair,aa", help="pair runs every tree twice at once already; aa adds a second band"
+    )
     args = parser.parse_args()
     out, LOG = DATA / args.run, DATA / f"{args.run}.log"
     out.mkdir(parents=True, exist_ok=True)
@@ -89,7 +92,7 @@ def main() -> None:
         ("pair", (("r1", f"{base}@0,{arm}@1"), ("r2", f"{arm}@2,{base}@3"))),
         ("aa", ((base, f"{base}@0,{base}b@1"), (arm, f"{arm}@2,{arm}b@3"))),
     )
-    for phase, pairs in phases:
+    for phase, pairs in (entry for entry in phases if entry[0] in args.phases.split(",")):
         for benchmark in args.benchmarks.split(","):
             threads = [
                 threading.Thread(
