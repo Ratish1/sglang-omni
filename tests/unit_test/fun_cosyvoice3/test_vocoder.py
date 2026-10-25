@@ -861,10 +861,10 @@ def test_admission_budget_below_the_first_tier_keeps_finals_eager(monkeypatch) -
     graph to capture: startup keeps every final, however long, on the eager solve
     instead of failing on the empty ladder."""
     fake_flow = RunnableFakeFlow()
-    fake_flow.packed_estimator.is_ragged = True
     flow = stages.FunCosyVoice3Flow(
         fake_flow, packed_estimator=fake_flow.packed_estimator
     )
+    monkeypatch.setattr(stages, "supports_ragged_attention", lambda device: True)
     monkeypatch.setattr(
         stages, "resolve_concrete_device", lambda device, gpu_id: torch.device("cuda")
     )
@@ -1020,6 +1020,8 @@ def prepare_vocoder_startup(
         )
     else:
         pass
+    is_ragged = packed_estimator is not None and packed_estimator.is_ragged
+    monkeypatch.setattr(stages, "supports_ragged_attention", lambda device: is_ragged)
     resolved_device = torch.device(device_type)
     monkeypatch.setattr(
         stages,
@@ -1590,10 +1592,10 @@ def test_prefix_pool_leaves_the_runtime_headroom_and_the_largest_step(
     """A declared share's baseline counted memory an earlier stage had freed but the
     allocator still cached, so the pool took that memory beyond the share."""
     fake_flow = RunnableFakeFlow()
-    fake_flow.packed_estimator.is_ragged = True
     flow = stages.FunCosyVoice3Flow(
         fake_flow, packed_estimator=fake_flow.packed_estimator
     )
+    monkeypatch.setattr(stages, "supports_ragged_attention", lambda device: True)
     monkeypatch.setattr(
         stages, "resolve_concrete_device", lambda device, gpu_id: torch.device("cuda")
     )
@@ -1690,7 +1692,6 @@ def test_a_share_that_holds_no_block_serves_without_the_prefix_cache(
     """With the prefix graphs on, a declared share the vocoder's load filled failed
     startup on the throwaway pool instead of serving without the prefix cache."""
     fake_flow = RunnableFakeFlow()
-    fake_flow.packed_estimator.is_ragged = True
     fake_flow.decoder.estimator.transformer_blocks = [
         SimpleNamespace(attn=SimpleNamespace(heads=2, inner_dim=8))
     ] * 2
@@ -1714,6 +1715,7 @@ def test_a_share_that_holds_no_block_serves_without_the_prefix_cache(
         loaded_bytes.append(load_bytes)
         return flow, FakeHiFT()
 
+    monkeypatch.setattr(stages, "supports_ragged_attention", lambda device: True)
     monkeypatch.setattr(
         stages, "resolve_concrete_device", lambda device, gpu_id: torch.device("cuda")
     )
@@ -1761,6 +1763,35 @@ def test_a_share_that_holds_no_block_serves_without_the_prefix_cache(
 
     assert scheduler.vocoder.flow.prefix_pool is None
     assert scheduler.vocoder.flow.prefix_cuda_graph_runner is None
+
+
+def test_a_cpu_vocoder_serves_without_the_default_prefix_cache(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A CPU vocoder with the default prefix cache size read the accelerator's memory
+    before its model loaded, so startup failed on a CUDA host."""
+    monkeypatch.setattr(
+        stages, "resolve_concrete_device", lambda device, gpu_id: torch.device("cpu")
+    )
+    monkeypatch.setattr(stages, "resolve_checkpoint", lambda model_path: "/checkpoint")
+    monkeypatch.setattr(stages, "patch_chunk_mask", lambda: None)
+    monkeypatch.setattr(
+        stages,
+        "load_cosyvoice3_flow_hift",
+        lambda checkpoint_dir, device, fp16, **kwargs: (RunnableFakeFlow(), FakeHiFT()),
+    )
+
+    scheduler = stages.create_vocoder_executor(
+        "model",
+        device="cpu",
+        flow_prefix_cache_gb=None,
+        enable_flow_prefix_cuda_graph=True,
+        enable_flow_whole_history_cuda_graph=True,
+        enable_hift_cuda_graph=False,
+        enable_dit_torch_compile=False,
+    )
+
+    assert scheduler.vocoder.flow.prefix_pool is None
 
 
 def step_measurement_vocoder(
