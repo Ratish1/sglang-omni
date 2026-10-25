@@ -124,10 +124,20 @@ def main() -> None:
     parser.add_argument("--meta", default="")
     parser.add_argument("--skip-score", action="store_true")
     parser.add_argument("--events", action="store_true")
+    # the ASR server admits 4 long-audio transcriptions at once (audio_chunking.max_concurrent_long_audio_requests)
+    parser.add_argument("--asr-concurrency", type=int, default=ASR_CONCURRENCY)
+    parser.add_argument("--score-only", action="store_true")
     args = parser.parse_args()
     arms = {"a": (args.a_card, "", args.port), "b": (args.b_card, args.b_args, args.port + 200)}
     outs = {arm: ROOT / args.label / arm for arm in arms}
     trees = {"a": args.tree, "b": args.b_tree or args.tree}
+    if args.score_only:
+        for index, arm in enumerate(arms):
+            score(outs[arm], arms[arm][0], args.port + 400 + 400 * index, args.tree, args.meta, args.asr_concurrency)
+        print("scored", flush=True)
+        return
+    else:
+        pass
     servers = {}
     spawned = {}
     for arm, (card, extra, port) in arms.items():
@@ -237,12 +247,12 @@ def main() -> None:
         pass
     else:
         for index, arm in enumerate(arms):
-            score(outs[arm], arms[arm][0], args.port + 400 + 400 * index, args.tree, args.meta)
+            score(outs[arm], arms[arm][0], args.port + 400 + 400 * index, args.tree, args.meta, args.asr_concurrency)
         print("scored", flush=True)
     print("pair done", flush=True)
 
 
-def score(out: Path, card: int, port: int, tree: str, meta: str) -> None:
+def score(out: Path, card: int, port: int, tree: str, meta: str, asr_concurrency: int) -> None:
     """WER from an ASR server on the arm's own card, then speaker similarity on that card: the scorer's own servers
     default to card 0, which another container may own. The ASR pipeline is one stage, so one rendezvous port. A
     --meta list goes to the scorer too, whose similarity pass reads each sample's reference from it."""
@@ -261,7 +271,7 @@ def score(out: Path, card: int, port: int, tree: str, meta: str) -> None:
         with open(out / "score--transcribe-only.log", "w", encoding="utf-8") as score_log:
             subprocess.run(
                 [*scorer, "--transcribe-only", "--use-existing-server", "--host", "127.0.0.1", "--port", str(port),
-                 "--asr-concurrency", str(ASR_CONCURRENCY)],
+                 "--asr-concurrency", str(asr_concurrency)],
                 cwd=tree, env=env, stdout=score_log, stderr=subprocess.STDOUT, timeout=BENCH_TIMEOUT_S, check=False,
             )
     finally:
