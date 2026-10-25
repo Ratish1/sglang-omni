@@ -107,6 +107,31 @@ def patch_vision(thinker, stored: list, grid) -> None:
     thinker.get_image_features = get_image_features
 
 
+def fp32_routers(thinker) -> None:
+    """Every MoE router computes its logits, softmax and top-k from an FP32 copy of its weight; the rest stays."""
+    import torch
+    from transformers.models.qwen3_omni_moe import modeling_qwen3_omni_moe as hf_modeling
+
+    for module in thinker.modules():
+        if isinstance(module, hf_modeling.Qwen3OmniMoeThinkerTextTopKRouter):
+            module.register_buffer("weight_fp32", module.weight.detach().float(), persistent=False)
+
+            def forward(hidden_states, router=module):
+                hidden_states = hidden_states.reshape(-1, router.hidden_dim)
+                router_logits = torch.nn.functional.linear(hidden_states.float(), router.weight_fp32)
+                router_probs = torch.softmax(router_logits, dim=-1)
+                top_value, indices = torch.topk(router_probs, router.top_k, dim=-1)
+                if router.norm_topk_prob:
+                    top_value /= top_value.sum(dim=-1, keepdim=True)
+                else:
+                    pass
+                return router_logits, top_value.to(hidden_states.dtype), indices
+
+            module.forward = forward
+        else:
+            pass
+
+
 def stored_features(out: Path, source: str) -> dict:
     import torch
 
@@ -291,7 +316,7 @@ def choice_logits(tokenizer, tokens: list[int], step_logits, choices: list[str])
     return {"step": None, "letter_logits": {}, "margin": None}
 
 
-def answers(thinker_dtype: str, sources: list[str], out: Path) -> None:
+def answers(thinker_dtype: str, sources: list[str], out: Path, with_fp32_router: bool) -> None:
     import torch
     from transformers import Qwen3OmniMoeForConditionalGeneration
 
@@ -305,6 +330,12 @@ def answers(thinker_dtype: str, sources: list[str], out: Path) -> None:
     thinker = Qwen3OmniMoeForConditionalGeneration.from_pretrained(
         MODEL, dtype=dtype, device_map={"": "cuda:0"}, enable_audio_output=False, experts_implementation="eager"
     ).thinker.eval()
+    label = thinker_dtype
+    if with_fp32_router:
+        fp32_routers(thinker)
+        label = f"{thinker_dtype}-fp32router"
+    else:
+        pass
     eos_token_id = processor.tokenizer.convert_tokens_to_ids("<|im_end|>")
     for source in sources:
         stored = stored_features(out, source)
@@ -348,11 +379,11 @@ def answers(thinker_dtype: str, sources: list[str], out: Path) -> None:
             record.update(
                 predicted=result["predicted"], is_correct=result["is_correct"], gold=result["expected"], text=text
             )
-        (out / f"answers_{thinker_dtype}_{source}.json").write_text(json.dumps(records))
-        print(f"{thinker_dtype} thinker, {source} features: {sum(r['is_correct'] for r in records)} correct", flush=True)
+        (out / f"answers_{label}_{source}.json").write_text(json.dumps(records))
+        print(f"{label} thinker, {source} features: {sum(r['is_correct'] for r in records)} correct", flush=True)
 
 
-def internals(out: Path) -> None:
+def internals(out: Path, with_fp32_router: bool) -> None:
     import torch
     from transformers import Qwen3OmniMoeForConditionalGeneration
 
@@ -365,6 +396,10 @@ def internals(out: Path) -> None:
         ).thinker.eval()
         for name, dtype, device in (("fp32", torch.float32, "cuda:0"), ("bf16", torch.bfloat16, "cuda:1"))
     }
+    if with_fp32_router:
+        fp32_routers(thinkers["bf16"])
+    else:
+        pass
     truth_features = stored_features(out, "fp32")
     report = {}
     for sample, inputs in zip(questions, request_inputs):
@@ -426,7 +461,7 @@ def internals(out: Path) -> None:
             ),
         }
         print(f"{sample.sample_id}: departures {len(departures)}, first {first}", flush=True)
-    (out / "internals.json").write_text(json.dumps(report))
+    (out / ("internals_fp32_router.json" if with_fp32_router else "internals.json")).write_text(json.dumps(report))
 
 
 def subprocess_on(cards: tuple[int, ...], tree: Path, args: list[str], log_path: Path) -> int:
@@ -582,6 +617,7 @@ def main() -> None:
     parser.add_argument("--sources")
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--skip-features", action="store_true", help="reuse the features already under --out")
+    parser.add_argument("--fp32-router", action="store_true", help="the BF16 thinker's routers in FP32")
     args = parser.parse_args()
     args.out.mkdir(parents=True, exist_ok=True)
     if args.mode == "run":
@@ -591,11 +627,11 @@ def main() -> None:
     elif args.mode == "features":
         features(args.arm, args.out)
     elif args.mode == "answers":
-        answers(args.thinker, args.sources.split(","), args.out)
+        answers(args.thinker, args.sources.split(","), args.out, args.fp32_router)
     elif args.mode == "vision_ablation":
         vision_ablation(args.out)
     else:
-        internals(args.out)
+        internals(args.out, args.fp32_router)
 
 
 if __name__ == "__main__":
