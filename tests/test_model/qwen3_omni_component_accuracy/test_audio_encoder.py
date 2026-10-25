@@ -141,7 +141,19 @@ def test_audio_encoder_follows_reference(
         name.replace("layers.layers.", "layers."): tensor
         for name, tensor in served.audio_tower.state_dict().items()
     }
-    mismatches = parameter_mismatches(served_state, floor.state_dict())
+    reference_state = dict(floor.state_dict())
+    for name in served_state:
+        if ".self_attn.qkv_proj." in name:
+            layer, parameter = name.split(".self_attn.qkv_proj.")
+            reference_state[name] = torch.cat(
+                [
+                    reference_state[f"{layer}.self_attn.{projection}.{parameter}"]
+                    for projection in ("q_proj", "k_proj", "v_proj")
+                ]
+            )
+        else:
+            pass
+    mismatches = parameter_mismatches(served_state, reference_state)
     assert not mismatches, f"omni audio tower weights differ: {mismatches[:10]}"
 
     records: list[CaseRecord] = []
