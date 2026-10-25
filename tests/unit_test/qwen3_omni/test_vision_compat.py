@@ -69,12 +69,10 @@ def test_position_interpolation_matches_float64_bilinear(
         ]
     )
 
-    looped = encoder.fast_pos_embed_interpolate_from_list(grid_thw)
-    vectorized = encoder.fast_pos_embed_interpolate_vectorized(grid_thw)
+    actual = encoder.interpolate_position_embeddings(grid_thw)
 
-    assert torch.equal(vectorized, looped)
     torch.testing.assert_close(
-        looped.double(), expected, rtol=0, atol=BILINEAR_TOLERANCES[dtype]
+        actual.double(), expected, rtol=0, atol=BILINEAR_TOLERANCES[dtype]
     )
 
 
