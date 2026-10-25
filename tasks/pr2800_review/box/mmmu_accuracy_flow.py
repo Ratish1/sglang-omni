@@ -84,9 +84,9 @@ def run_pytest(
         ).returncode
 
 
-def suite(out: Path, arm: str, card: int) -> None:
+def suite(out: Path, arm: str, card: int, files: list[str]) -> None:
     arm_tree = pair_check.tree(pair_check.ARMS[arm][0])
-    rc = run_pytest(arm_tree, list(SUITE), (card,), out / arm / "suite", {"QWEN3_OMNI_ACCURACY_DEVICE": "cuda:0"})
+    rc = run_pytest(arm_tree, files, (card,), out / arm / "suite", {"QWEN3_OMNI_ACCURACY_DEVICE": "cuda:0"})
     videoamme_talker_tp2.log(out, f"{arm} suite card {card} rc {rc}")
 
 
@@ -120,16 +120,19 @@ def thinker(out: Path, arm: str) -> None:
     videoamme_talker_tp2.log(out, f"{arm} thinker rc {rc}")
 
 
-def run(out: Path, arms: list[str]) -> None:
+def run(out: Path, arms: list[str], files: list[str], with_thinker: bool) -> None:
     for arm in arms:
         overlay(pair_check.tree(pair_check.ARMS[arm][0]))
-    threads = [threading.Thread(target=suite, args=(out, arm, card)) for card, arm in enumerate(arms)]
+    threads = [threading.Thread(target=suite, args=(out, arm, card, files)) for card, arm in enumerate(arms)]
     for thread in threads:
         thread.start()
     for thread in threads:
         thread.join()
-    for arm in arms:
-        thinker(out, arm)
+    if with_thinker:
+        for arm in arms:
+            thinker(out, arm)
+    else:
+        pass
     videoamme_talker_tp2.log(out, "done")
 
 
@@ -185,12 +188,14 @@ def main() -> None:
     parser.add_argument("--arms", required=True)
     parser.add_argument("--out", type=Path)
     parser.add_argument("--read", type=Path)
+    parser.add_argument("--suite", default=",".join(SUITE), help="the suite's test files to run")
+    parser.add_argument("--no-thinker", action="store_true", help="run the suite only")
     args = parser.parse_args()
     if args.read is not None:
         read(args.read, args.arms.split(","))
     else:
         args.out.mkdir(parents=True, exist_ok=True)
-        run(args.out, args.arms.split(","))
+        run(args.out, args.arms.split(","), args.suite.split(","), not args.no_thinker)
 
 
 if __name__ == "__main__":
