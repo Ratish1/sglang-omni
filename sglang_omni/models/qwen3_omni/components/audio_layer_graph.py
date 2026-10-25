@@ -9,6 +9,7 @@ from dataclasses import dataclass
 
 import torch
 import torch.nn as nn
+from sglang.srt.model_executor.runner.base_cuda_graph_runner import freeze_gc
 
 from sglang_omni.models.qwen3_omni.components.packed_attention import (
     PackedAttentionMetadata,
@@ -199,9 +200,6 @@ class AudioLayerGraphRunner:
         return Captured(graph, hidden_states, cu_seqlens, output, slots)
 
     def capture_all(self) -> None:
-        # Local import: only a process that captures these graphs loads the graph runner's imports.
-        from sglang.srt.model_executor.runner.base_cuda_graph_runner import freeze_gc
-
         # note (ratish): a collection during capture can free what a reference cycle holds,
         # a dead runner's graphs among them, and invalidate the capture.
         with freeze_gc(enable_cudagraph_gc=False):
