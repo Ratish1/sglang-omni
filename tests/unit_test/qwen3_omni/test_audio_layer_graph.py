@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+import gc
+
 import pytest
 import torch
 import torch.nn as nn
@@ -289,6 +291,49 @@ def test_capture_all_records_a_graph_for_every_bucket() -> None:
     tower = RealTower().to(torch.device("cuda", 0), torch.bfloat16)
     runner = AudioLayerGraphRunner(tower, device=torch.device("cuda", 0), window=WINDOW)
     runner.capture_all()
+    assert runner.has_graphs, runner.disabled_reason
+    assert sorted(runner.graphs) == sorted(DEFAULT_TOKEN_BUCKETS)
+
+
+class DeadGraphCycle:
+    def __init__(self, device: torch.device) -> None:
+        self.cycle = self
+        self.inputs = torch.zeros(8, device=device)
+        self.graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(self.graph):
+            self.outputs = self.inputs + 1
+
+
+@pytest.mark.accelerator
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_capture_survives_a_collection_that_frees_dead_graphs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Capture succeeds when a garbage collection runs inside it while dead graphs wait in a reference cycle."""
+    device = torch.device("cuda", 0)
+    runner = AudioLayerGraphRunner(
+        RealTower().to(device, torch.bfloat16), device=device, window=WINDOW
+    )
+    run_layers = runner.run_layers
+
+    def run_layers_collecting(
+        hidden_states: torch.Tensor, cu_seqlens: torch.Tensor, max_seqlen: int
+    ) -> torch.Tensor:
+        if torch.cuda.is_current_stream_capturing():
+            gc.collect()
+        else:
+            pass
+        return run_layers(hidden_states, cu_seqlens, max_seqlen)
+
+    monkeypatch.setattr(runner, "run_layers", run_layers_collecting)
+    gc.collect()
+    gc.disable()
+    try:
+        DeadGraphCycle(device)
+        runner.capture_all()
+    finally:
+        gc.enable()
+
     assert runner.has_graphs, runner.disabled_reason
     assert sorted(runner.graphs) == sorted(DEFAULT_TOKEN_BUCKETS)
 
