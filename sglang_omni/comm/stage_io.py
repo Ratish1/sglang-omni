@@ -596,7 +596,8 @@ async def write_tensor(
     packed = tensor.contiguous().view(torch.uint8).reshape(-1)
     target_device = torch.device(relay_device(relay))
     if packed.device != target_device:
-        packed = packed.to(device=target_device)
+        with torch.profiler.record_function("diagnostic.stream_source_to_device"):
+            packed = packed.to(device=target_device)
     else:
         pass
     offset = pad_offset(0, dtype_alignment(tensor.dtype))

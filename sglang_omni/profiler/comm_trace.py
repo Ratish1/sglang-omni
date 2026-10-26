@@ -8,12 +8,20 @@ import logging
 import os
 import time
 
+from sglang_omni.profiler.event_recorder import get_recorder
+
 logger = logging.getLogger("sglang_omni.comm_trace")
 
 
 def enabled() -> bool:
     value = os.getenv("SGLANG_OMNI_COMM_TRACE", "")
-    return value.lower() not in {"", "0", "false", "no", "off"}
+    return get_recorder().is_active() or value.lower() not in {
+        "",
+        "0",
+        "false",
+        "no",
+        "off",
+    }
 
 
 def now_ns() -> int:
