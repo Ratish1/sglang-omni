@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from dataclasses import replace
 from multiprocessing.queues import Queue
 
@@ -1166,6 +1167,16 @@ class HeldRelay(SessionHooks):
     def append(
         self, chunk: TimedChunk, payload: StagePayload, context: SessionContext
     ) -> StagePayload:
+        if self.name == "sink":
+            reply = {"turn": payload.data["turn"]}
+            context.emit(TimedChunk("text", 0, 0, chunk.seq, reply, format="text"))
+            time.sleep(0.5)
+            self.events.put(
+                ("append", self.name, context.session_identity.id, chunk.turn)
+            )
+            return payload
+        else:
+            pass
         self.events.put(("append", self.name, context.session_identity.id, chunk.turn))
         if self.name == "source" and chunk.turn == 1:
             context.cancelled.wait(OUTPUT_TIMEOUT_S)
