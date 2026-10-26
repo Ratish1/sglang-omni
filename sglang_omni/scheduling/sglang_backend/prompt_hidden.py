@@ -4,7 +4,9 @@
 from __future__ import annotations
 
 import collections
+import json
 import logging
+import time
 from dataclasses import dataclass
 
 import torch
@@ -16,6 +18,8 @@ from sglang.srt.mem_cache.pool_host.common import (  # noqa: leading-underscore 
     _cuda_host_unregister,
     alloc_with_host_register,
 )
+
+from sglang_omni.profiler.event_recorder import get_recorder
 
 logger = logging.getLogger(__name__)
 
@@ -112,9 +116,26 @@ class PromptHiddenStore:
     @torch.profiler.record_function("diagnostic.read")
     def read(self, request_pool_index: int, positions: torch.Tensor) -> torch.Tensor:
         """The rows at a request's prompt positions, through the slots its KV holds now."""
+        start_ns = time.perf_counter_ns()
         req_to_token = self.req_to_token_pool.req_to_token
         slot_ids = req_to_token[
             request_pool_index, positions.to(req_to_token.device)
         ].cpu()
+        slots_ready_ns = time.perf_counter_ns()
         self.store_copied(wait=True)
-        return self.hidden_states[slot_ids]
+        committed_ns = time.perf_counter_ns()
+        hidden_states = self.hidden_states[slot_ids]
+        gathered_ns = time.perf_counter_ns()
+        if get_recorder().is_active():
+            timing = {
+                "pool_index": request_pool_index,
+                "bytes": hidden_states.nbytes,
+                "slot_read_ms": (slots_ready_ns - start_ns) / 1e6,
+                "commit_ms": (committed_ns - slots_ready_ns) / 1e6,
+                "gather_ms": (gathered_ns - committed_ns) / 1e6,
+                "total_ms": (gathered_ns - start_ns) / 1e6,
+            }
+            logger.info(f"DIAGNOSTIC_PROMPT_READ {json.dumps(timing)}")
+        else:
+            pass
+        return hidden_states
