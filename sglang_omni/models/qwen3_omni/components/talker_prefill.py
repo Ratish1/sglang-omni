@@ -227,6 +227,10 @@ class TalkerPrefillBuilder:
             prompt_hidden[captured_positions] = prompt_chunk.data.to(prompt_hidden)
         else:
             pass
+        if str(payload.request_id).startswith("diagnostic-zero-prompt-"):
+            prompt_hidden.zero_()
+        else:
+            pass
         thinker_hidden = torch.cat([prompt_hidden, assistant_embed], dim=0)
 
         tts_bos_embed, tts_eos_embed, tts_pad_embed = self.get_tts_special_embeds()
