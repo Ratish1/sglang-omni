@@ -142,8 +142,11 @@ def main() -> None:
     thinker = next(pid for pid, stage in stages.items() if stage == "thinker")
     db = sqlite3.connect(args.trace)
     rows = device_rows(db, args.device)
-    window_start = min(row[0] for row in rows) + int(args.skip_head_s * 1e9)
-    window_end = max(row[1] for row in rows) - int(args.skip_tail_s * 1e9)
+    # note (ratish): device records buffered since launch reach back before the collection; the runtime
+    # calls cover only the collection, so they set the window
+    first_call, last_call = db.execute("SELECT min(start), max(end) FROM CUPTI_ACTIVITY_KIND_RUNTIME").fetchone()
+    window_start = first_call + int(args.skip_head_s * 1e9)
+    window_end = last_call - int(args.skip_tail_s * 1e9)
     window = window_end - window_start
     by_pid: dict[int, list[tuple[int, int]]] = defaultdict(list)
     time_by_name: dict[int, dict[str, int]] = defaultdict(lambda: defaultdict(int))
