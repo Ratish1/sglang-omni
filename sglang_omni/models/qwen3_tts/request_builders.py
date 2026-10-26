@@ -8,6 +8,7 @@ import contextlib
 import json
 import logging
 import math
+import os
 import queue
 import threading
 import time
@@ -661,7 +662,10 @@ def resolve_non_streaming_mode(
             return bool(source["non_streaming_mode"])
         else:
             pass
-    return task_type in (QWEN3_TTS_TASK_CUSTOM_VOICE, QWEN3_TTS_TASK_VOICE_DESIGN)
+    return task_type in (
+        QWEN3_TTS_TASK_CUSTOM_VOICE,
+        QWEN3_TTS_TASK_VOICE_DESIGN,
+    ) or os.environ.get("QWEN3_TTS_PROBE_WHOLE_TEXT") == "1"
 
 
 def resolve_stream_codec_output(
