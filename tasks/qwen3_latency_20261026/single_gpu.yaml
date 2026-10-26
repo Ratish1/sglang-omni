@@ -9,14 +9,16 @@ stages:
     gpu: 0
   thinker:
     gpu: 0
+    gpu_memory_fraction: 0.65
     engine:
-      mem_fraction_static: 0.65
+      max_total_tokens: 202308
     factory:
       max_seq_len: 32768
   talker_ar:
     gpu: 0
+    gpu_memory_fraction: 0.12
     engine:
-      mem_fraction_static: 0.12
+      max_total_tokens: 514526
   code2wav:
     gpu: 0
   preprocessing:
