@@ -371,6 +371,7 @@ class LengthSession(RecordingSession):
 
 @pytest.mark.asyncio
 async def test_mmmu_and_video_requests_record_the_finish_reason() -> None:
+    """MMMU and video requests keep the server's finish reason, so cut answers are counted."""
     mmmu = await make_mmmu_send_fn("qwen3-omni", "http://localhost/v1")(
         LengthSession(), mmmu_sample()
     )

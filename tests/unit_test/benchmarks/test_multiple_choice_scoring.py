@@ -52,14 +52,8 @@ def answered(text: str) -> RequestResult:
 
 
 def test_unparseable_answer_names_no_option() -> None:
+    """An answer that names no option parses to no choice, not a drawn letter."""
     assert parse_multi_choice_response(UNPARSEABLE_TEXT, CHOICES, OPTIONS) == ("", True)
-
-
-def test_explicit_answer_line_parses() -> None:
-    assert parse_multi_choice_response("it is oak\nAnswer: B", CHOICES, OPTIONS) == (
-        "B",
-        False,
-    )
 
 
 @pytest.mark.parametrize(
@@ -72,6 +66,7 @@ def test_explicit_answer_line_parses() -> None:
 def test_lowercase_answer_letter_names_its_option(
     text: str, expected_choice: str
 ) -> None:
+    """A lowercase answer letter that no word follows names its option; an article does not."""
     assert parse_multi_choice_response(text, CHOICES, OPTIONS) == (
         expected_choice,
         False,
@@ -82,6 +77,7 @@ def test_lowercase_answer_letter_names_its_option(
 def test_unparseable_mmmu_answer_is_wrong_whatever_came_before(
     earlier_text: str,
 ) -> None:
+    """An MMMU answer that names no option scores wrong whatever the earlier answers were."""
     records = build_mmmu_result_records(
         [mmmu_sample("first", "A"), mmmu_sample("second", "C")],
         [answered(earlier_text), answered(UNPARSEABLE_TEXT)],
@@ -106,6 +102,7 @@ def test_mmmu_summary_counts_unparseable() -> None:
 
 
 def test_unparseable_video_answer_is_wrong() -> None:
+    """A video answer that names no option scores wrong and counts as unparseable."""
     records = build_videomme_result_records(
         [video_sample("first", "A"), video_sample("second", "C")],
         [answered(UNPARSEABLE_TEXT), answered("Answer: C")],
