@@ -9,6 +9,8 @@ import time
 from pathlib import Path
 
 import torch
+from huggingface_hub import hf_hub_download
+from safetensors import safe_open
 from transformers.models.qwen3_omni_moe.configuration_qwen3_omni_moe import (
     Qwen3OmniMoeVisionEncoderConfig,
 )
@@ -32,6 +34,7 @@ class LegacyVisionEncoder(Qwen3OmniMoeVisionEncoderCompat):
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--model", type=str, default=None)
     arguments = parser.parse_args()
     torch.manual_seed(42)
     torch.set_num_threads(4)
@@ -40,6 +43,16 @@ def main() -> None:
     failures: list[dict[str, int | str | list[list[int]] | float]] = []
     comparisons = 0
     hf_changed_elements = 0
+    position_table: torch.Tensor | None = None
+    if arguments.model is not None:
+        index_path = hf_hub_download(arguments.model, "model.safetensors.index.json")
+        weight_map = json.loads(Path(index_path).read_text())["weight_map"]
+        weight_name = "thinker.visual.pos_embed.weight"
+        shard_path = hf_hub_download(arguments.model, weight_map[weight_name])
+        with safe_open(shard_path, framework="pt", device="cpu") as shard:
+            position_table = shard.get_tensor(weight_name)
+    else:
+        pass
     for dtype in (torch.bfloat16, torch.float32):
         encoder = Qwen3OmniMoeVisionEncoderCompat.__new__(
             Qwen3OmniMoeVisionEncoderCompat
@@ -50,6 +63,11 @@ def main() -> None:
         encoder.pos_embed = torch.nn.Embedding(
             48 * 48, 1152, device="cuda", dtype=dtype
         )
+        if position_table is not None:
+            with torch.no_grad():
+                encoder.pos_embed.weight.copy_(position_table)
+        else:
+            pass
         for grid_thw in grid_cases:
             with torch.inference_mode():
                 expected = transformers_5_6_pos_embed_interpolate(encoder, grid_thw)
@@ -152,6 +170,7 @@ def main() -> None:
     )
     results = {
         "torch": torch.__version__,
+        "model": arguments.model,
         "device": torch.cuda.get_device_name(0),
         "interpolation_comparisons": comparisons,
         "interpolation_failures": failures,
