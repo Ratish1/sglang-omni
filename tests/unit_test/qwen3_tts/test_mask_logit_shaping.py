@@ -52,7 +52,13 @@ def test_qwen3_tts_suppresses_configured_codec_tail_with_basic_slices() -> None:
     original = logits.clone()
     logits_output = types.SimpleNamespace(next_token_logits=logits)
 
-    runner.apply_codec_suppress_tokens(logits_output, [object(), object()])
+    runner.apply_codec_suppress_tokens(
+        logits_output,
+        [
+            make_scheduled_request(mask_leading_silence=False, generated_frames=2),
+            make_scheduled_request(mask_leading_silence=False, generated_frames=2),
+        ],
+    )
 
     suppress_start = configured_vocab - 1024
     assert torch.equal(logits[:2, :suppress_start], original[:2, :suppress_start])
@@ -106,3 +112,22 @@ def test_qwen3_tts_masks_silence_ids_only_in_opening_frames_of_flagged_requests(
     assert torch.isneginf(logits[:2, silence]).all()
     assert torch.equal(logits[:2, speech], original[:2, speech])
     assert torch.equal(logits[2:, silence], original[2:, silence])
+
+
+def test_qwen3_tts_holds_codec_eos_until_the_second_frame() -> None:
+    """An EOS sampled on the first frame ended the request with no audio."""
+    codec_eos = 2150
+    runner = make_runner(vocab_size=3072, codec_eos_token_id=codec_eos)
+    requests = [
+        make_scheduled_request(mask_leading_silence=False, generated_frames=frames)
+        for frames in (0, 1, 2)
+    ]
+    logits = torch.randn(len(requests), 6144)
+    original = logits.clone()
+
+    runner.apply_codec_suppress_tokens(
+        types.SimpleNamespace(next_token_logits=logits), requests
+    )
+
+    assert torch.isneginf(logits[:2, codec_eos]).all()
+    assert torch.equal(logits[2, codec_eos], original[2, codec_eos])
