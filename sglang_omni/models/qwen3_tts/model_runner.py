@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import os
 from types import ModuleType
 from typing import TYPE_CHECKING, TypedDict
 
@@ -67,6 +68,12 @@ class Qwen3TTSModelRunner(ModelRunner):
         self.codes_event_module = (
             torch.get_device_module(self.device)
             if has_device_streams(self.device)
+            else None
+        )
+        probe_dir = os.environ.get("QWEN3_TTS_PROBE_EOS_DIR")
+        self.eos_probe_file = (
+            open(f"{probe_dir}/eos_{os.getpid()}.txt", "a", buffering=1)
+            if probe_dir
             else None
         )
 
@@ -181,6 +188,27 @@ class Qwen3TTSModelRunner(ModelRunner):
                 active_logits[row_index, codec_eos] = float("-inf")
             else:
                 pass
+        if self.eos_probe_file is not None:
+            # probe: EOS under the default sampling (temperature 0.9, top-k 50), repetition penalty left out
+            scaled = active_logits.float() / 0.9
+            top_values = torch.topk(scaled, 50, dim=-1).values
+            log_normalizer = torch.logsumexp(top_values, dim=-1)
+            eos_scaled = scaled[:, codec_eos]
+            eos_probability = torch.where(
+                eos_scaled >= top_values[:, -1],
+                torch.exp(eos_scaled - log_normalizer),
+                torch.zeros_like(eos_scaled),
+            )
+            eos_rank = (scaled > eos_scaled[:, None]).sum(dim=-1).float()
+            top_probability = torch.exp(top_values[:, 0] - log_normalizer)
+            rows = torch.stack((eos_probability, eos_rank, top_probability), dim=1).tolist()
+            for (probability, rank, top), scheduled_request in zip(rows, requests):
+                self.eos_probe_file.write(
+                    f"{scheduled_request.request_id} {len(scheduled_request.data.output_codes)} "
+                    f"{probability:.6g} {int(rank)} {top:.4g}\n"
+                )
+        else:
+            pass
 
     def install_sampling_seeds(
         self,
