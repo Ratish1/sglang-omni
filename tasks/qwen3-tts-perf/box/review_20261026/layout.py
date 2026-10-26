@@ -6,6 +6,7 @@ usage: python3 layout.py serve CASES.jsonl --base-url URL --model PATH --label L
           [--modes icl xvec] [--max-new-tokens 300] [--concurrency 16]
        python3 layout.py score DIR [DIR ...] [--asr-port PORT] [--sim-card CARD]
        python3 layout.py summary OFFICIAL.json [OFFICIAL.json ...] --served DIR [DIR ...] [--max-new-tokens 300]
+       python3 layout.py compare BASE_DIR DIR [DIR ...] [--max-new-tokens 300]
 
 serve posts every case as a streaming PCM request (voice default, the reference as a server-side path with its text in
 ICL mode, no seed, max_new_tokens the shared cap), keeps the audio as DIR/audio/<id>.wav, and takes the finish reason
@@ -14,6 +15,7 @@ and frames from the stream's outcome. Opening silence is the time to the first 5
 server on PORT (WER against the target after the Whisper English normalizer) and, with --sim-card, scores every
 natural stop's WavLM speaker similarity against its own reference clip. summary prints one row per checkpoint,
 configuration, language and set, official first; an official row without EOS returns one frame fewer than the cap.
+compare pairs every arm with a base arm case by case.
 """
 
 import argparse
@@ -29,7 +31,7 @@ import httpx
 import numpy as np
 import soundfile
 from jiwer import process_words
-from scipy.stats import fisher_exact
+from scipy.stats import binomtest, fisher_exact
 
 from benchmarks.metrics.speaker_similarity import WavLMSpeakerSimilarity
 from benchmarks.metrics.speaker_similarity_assets import ensure_speaker_similarity_assets
@@ -239,6 +241,63 @@ def summary(official_paths: list[Path], served_dirs: list[Path], max_new_tokens:
             )
 
 
+def compare(base_dir: Path, other_dirs: list[Path], max_new_tokens: int) -> None:
+    """Paired per case against base_dir: runaways (discordant pairs, exact binomial), empties, and over cases that stop
+    naturally in both arms the onset, WER, failures and similarity, each with its paired mean difference and 95 % CI."""
+
+    def load(out_dir: Path) -> dict[str, dict[str, object]]:
+        source = out_dir / "scored.jsonl" if (out_dir / "scored.jsonl").exists() else out_dir / "results.jsonl"
+        records = [json.loads(line) for line in source.read_text(encoding="utf-8").splitlines() if line]
+        return {str(record["id"]): record for record in records}
+
+    def paired(values: list[tuple[float, float]]) -> str:
+        if len(values) < 2:
+            return "-"
+        else:
+            pass
+        deltas = np.array([other - base for base, other in values])
+        half = 1.96 * deltas.std(ddof=1) / np.sqrt(len(deltas))
+        return (f"{np.mean([base for base, _ in values]):.4f} -> {np.mean([other for _, other in values]):.4f} "
+                f"(d {deltas.mean():+.4f} +- {half:.4f})")
+
+    base = load(base_dir)
+    for other_dir in other_dirs:
+        other = load(other_dir)
+        print(f"== {base_dir.name} -> {other_dir.name}")
+        for set_name in sorted({str(record["set"]) for record in base.values()}):
+            ids = [case_id for case_id, record in base.items() if record["set"] == set_name and case_id in other]
+            if not ids:
+                continue
+            else:
+                pass
+
+            def runaway(record: dict[str, object]) -> bool:
+                return int(record.get("frames", 0)) >= max_new_tokens
+
+            def natural(record: dict[str, object]) -> bool:
+                return "error" not in record and not runaway(record)
+
+            only_base = sum(runaway(base[i]) and not runaway(other[i]) for i in ids)
+            only_other = sum(runaway(other[i]) and not runaway(base[i]) for i in ids)
+            discordant = only_base + only_other
+            p_value = binomtest(only_other, discordant).pvalue if discordant else 1.0
+            both = [i for i in ids if natural(base[i]) and natural(other[i])]
+            onsets = [(float(base[i]["onset_ms"]), float(other[i]["onset_ms"])) for i in both]
+            wers = [(float(base[i]["wer"]), float(other[i]["wer"])) for i in both if "wer" in base[i] and "wer" in other[i]]
+            failures = [(float(b > WER_FAILURE), float(o > WER_FAILURE)) for b, o in wers]
+            sims = [
+                (float(base[i]["similarity"]), float(other[i]["similarity"]))
+                for i in both if "similarity" in base[i] and "similarity" in other[i]
+            ]
+            print(
+                f"{set_name} | n {len(ids)} | runaways {sum(runaway(base[i]) for i in ids)} -> "
+                f"{sum(runaway(other[i]) for i in ids)} (only base {only_base}, only other {only_other}, p {p_value:.3f}) | "
+                f"empty {sum('error' in base[i] for i in ids)} -> {sum('error' in other[i] for i in ids)} | "
+                f"both natural {len(both)} | onset ms {paired(onsets)} | WER {paired(wers)} | "
+                f"failures {paired(failures)} | SIM {paired(sims)}"
+            )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     commands = parser.add_subparsers(dest="command", required=True)
@@ -260,14 +319,20 @@ def main() -> None:
     summary_parser.add_argument("official", type=Path, nargs="+")
     summary_parser.add_argument("--served", type=Path, nargs="+", required=True)
     summary_parser.add_argument("--max-new-tokens", type=int, default=300)
+    compare_parser = commands.add_parser("compare")
+    compare_parser.add_argument("base", type=Path)
+    compare_parser.add_argument("others", type=Path, nargs="+")
+    compare_parser.add_argument("--max-new-tokens", type=int, default=300)
     args = parser.parse_args()
     if args.command == "serve":
         asyncio.run(serve(args.cases, args.base_url, args.model, args.label, args.language, args.out, args.modes,
                           args.max_new_tokens, args.concurrency))
     elif args.command == "score":
         score(args.dirs, args.asr_port, args.sim_card)
-    else:
+    elif args.command == "summary":
         summary(args.official, args.served, args.max_new_tokens)
+    else:
+        compare(args.base, args.others, args.max_new_tokens)
 
 
 if __name__ == "__main__":
