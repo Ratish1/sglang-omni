@@ -7,7 +7,6 @@ import concurrent.futures
 import contextlib
 import json
 import logging
-import math
 import queue
 import threading
 import time
@@ -68,16 +67,12 @@ else:
 
 
 QWEN3_TTS_DEFAULT_MAX_NEW_TOKENS = 2048
-# note (luojiaxuan): The 12Hz codec emits one frame per 80 ms of audio.
-QWEN3_TTS_CODEC_FRAMES_PER_S = 12.5
-# note (luojiaxuan): Over 4460 natural stops of Qwen3-TTS-12Hz-1.7B-Base, a target text of n tokens never ran longer than 1.38 s + 0.39 s per token; the default budget allows twice that, so speech at half the slowest observed rate still ends at its codec EOS while a runaway on a few words stops within seconds.
-QWEN3_TTS_SLOWEST_STOP_S = 1.38
-QWEN3_TTS_SLOWEST_STOP_S_PER_TOKEN = 0.39
-QWEN3_TTS_BUDGET_MARGIN = 2.0
 QWEN3_TTS_TASK_BASE = "Base"
 QWEN3_TTS_TASK_CUSTOM_VOICE = "CustomVoice"
 QWEN3_TTS_TASK_VOICE_DESIGN = "VoiceDesign"
 QWEN3_TTS_DEFAULT_CUSTOM_VOICE = "Vivian"
+# note (ratish): the talker reads input_id[3:-5] as the target text; the other tokens are the chat template.
+QWEN3_TTS_TARGET_TEMPLATE_TOKENS = 8
 _QWEN3_TTS_PREPARED_MARKER = "_qwen3_tts_prepared_request"
 _QWEN3_TTS_REF_CODE_BATCH_STOP = object()
 
@@ -768,19 +763,26 @@ def resolve_x_vector_only_mode(
     return not bool(ref_text)
 
 
-def text_length_budget(text_tokens: int) -> int:
-    """The codec frames a target text of `text_tokens` tokens may take without an explicit max_new_tokens."""
-    return min(
-        QWEN3_TTS_DEFAULT_MAX_NEW_TOKENS,
-        math.ceil(
-            QWEN3_TTS_BUDGET_MARGIN
-            * (
-                QWEN3_TTS_SLOWEST_STOP_S
-                + QWEN3_TTS_SLOWEST_STOP_S_PER_TOKEN * text_tokens
-            )
-            * QWEN3_TTS_CODEC_FRAMES_PER_S
-        ),
-    )
+@dataclass(frozen=True, kw_only=True)
+class Qwen3TTSFrameCeiling:
+    """Codec frames a request may generate without an explicit max_new_tokens."""
+
+    frames_per_text_token: int
+    minimum_frames: int
+
+
+# note (ratish): cut at these ceilings, no English natural stop of Base 0.6B or 1.7B, CustomVoice (a native and a non-native voice, plain and slow) or VoiceDesign (plain and slow) loses a target word, sentences and one- and three-word spans alike.
+QWEN3_TTS_FRAME_CEILINGS = {
+    QWEN3_TTS_TASK_BASE: Qwen3TTSFrameCeiling(
+        frames_per_text_token=12, minimum_frames=192
+    ),
+    QWEN3_TTS_TASK_CUSTOM_VOICE: Qwen3TTSFrameCeiling(
+        frames_per_text_token=40, minimum_frames=400
+    ),
+    QWEN3_TTS_TASK_VOICE_DESIGN: Qwen3TTSFrameCeiling(
+        frames_per_text_token=40, minimum_frames=400
+    ),
+}
 
 
 def build_generation_kwargs(
@@ -1437,6 +1439,7 @@ def validate_qwen3_tts_model_task(model: PromptModel, state: Qwen3TTSState) -> N
 def prepare_qwen3_tts_base_request(
     *,
     state: Qwen3TTSState,
+    input_id: torch.Tensor,
     model: PromptModel,
     wrapper: Qwen3TTSModel,
     prompt_constants: Qwen3TTSPromptConstants,
@@ -1468,9 +1471,6 @@ def prepare_qwen3_tts_base_request(
             ),
         )
 
-    input_id = wrapper._tokenize_texts([wrapper._build_assistant_text(state.text)])[
-        0
-    ]  # noqa: leading-underscore  # upstream spelling, or the public name is already taken
     ref_id = (
         wrapper._tokenize_texts([wrapper._build_ref_text(ref_text)])[
             0
@@ -1494,13 +1494,11 @@ def prepare_qwen3_tts_base_request(
 def prepare_qwen3_tts_custom_voice_request(
     *,
     state: Qwen3TTSState,
+    input_id: torch.Tensor,
     model: "PromptModel",
     wrapper: "Qwen3TTSModel",
     prompt_constants: Qwen3TTSPromptConstants,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
-    input_id = wrapper._tokenize_texts([wrapper._build_assistant_text(state.text)])[
-        0
-    ]  # noqa: leading-underscore  # upstream spelling, or the public name is already taken
     # Note(yzxiao): QwenLM/Qwen3-TTS (qwen-tts 0.1.1) drops 0.6B instructions
     # in its wrapper. Preserve this path's existing prompt passthrough for both
     # sizes; accepting an instruction does not guarantee 0.6B style control.
@@ -1519,13 +1517,11 @@ def prepare_qwen3_tts_custom_voice_request(
 def prepare_qwen3_tts_voice_design_request(
     *,
     state: Qwen3TTSState,
+    input_id: torch.Tensor,
     model: "PromptModel",
     wrapper: "Qwen3TTSModel",
     prompt_constants: Qwen3TTSPromptConstants,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
-    input_id = wrapper._tokenize_texts([wrapper._build_assistant_text(state.text)])[
-        0
-    ]  # noqa: leading-underscore  # upstream spelling, or the public name is already taken
     instruct_id = build_instruct_id(wrapper, state.instructions)
     with torch.no_grad():
         return model.build_voice_design_inputs(
@@ -1551,16 +1547,23 @@ def prepare_qwen3_tts_request(
     )
 
     validate_qwen3_tts_model_task(model, state)
+    input_id = wrapper._tokenize_texts([wrapper._build_assistant_text(state.text)])[
+        0
+    ]  # noqa: leading-underscore  # upstream spelling, or the public name is already taken
     if "max_new_tokens" in state.generation_kwargs:
         generation_kwargs = state.generation_kwargs
     else:
-        # note (luojiaxuan): The default budget counts the target text only; reference text and instructions are prompt, not speech.
-        target_ids = wrapper._tokenize_texts([state.text])[
-            0
-        ]  # noqa: leading-underscore  # upstream spelling, or the public name is already taken
+        ceiling = QWEN3_TTS_FRAME_CEILINGS[state.task_type]
+        text_tokens = input_id.shape[-1] - QWEN3_TTS_TARGET_TEMPLATE_TOKENS
         generation_kwargs = {
             **state.generation_kwargs,
-            "max_new_tokens": text_length_budget(target_ids.shape[-1]),
+            "max_new_tokens": min(
+                QWEN3_TTS_DEFAULT_MAX_NEW_TOKENS,
+                max(
+                    ceiling.minimum_frames,
+                    ceiling.frames_per_text_token * text_tokens,
+                ),
+            ),
         }
     gen_kwargs = wrapper._merge_generate_kwargs(
         **generation_kwargs
@@ -1573,6 +1576,7 @@ def prepare_qwen3_tts_request(
             ref_code,
         ) = prepare_qwen3_tts_base_request(
             state=state,
+            input_id=input_id,
             model=model,
             wrapper=wrapper,
             prompt_constants=prompt_constants,
@@ -1585,6 +1589,7 @@ def prepare_qwen3_tts_request(
             ref_code,
         ) = prepare_qwen3_tts_custom_voice_request(
             state=state,
+            input_id=input_id,
             model=model,
             wrapper=wrapper,
             prompt_constants=prompt_constants,
@@ -1597,6 +1602,7 @@ def prepare_qwen3_tts_request(
             ref_code,
         ) = prepare_qwen3_tts_voice_design_request(
             state=state,
+            input_id=input_id,
             model=model,
             wrapper=wrapper,
             prompt_constants=prompt_constants,
