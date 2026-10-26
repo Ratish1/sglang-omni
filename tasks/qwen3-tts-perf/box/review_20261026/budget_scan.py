@@ -390,6 +390,47 @@ def truncated(check_path: Path, asr_port: int, concurrency: int) -> None:
     )
 
 
+def reference_rate(results_path: Path, cases_path: Path, model: str) -> None:
+    """For Base clones: the output's frames per target token against the reference's own frames per reference-text
+    token (its audio at 12.5 frames a second), over natural stops, sentences and spans apart."""
+    apply_qwen_tts_transformers_compatibility_patches()
+    from qwen_tts.inference import qwen3_tts_model as official
+
+    AutoConfig.register("qwen3_tts", official.Qwen3TTSConfig)
+    AutoProcessor.register(official.Qwen3TTSConfig, official.Qwen3TTSProcessor)
+    processor = AutoProcessor.from_pretrained(resolve_checkpoint(model), fix_mistral_regex=True)
+    cases = {
+        case["id"]: case
+        for case in (json.loads(line) for line in cases_path.read_text(encoding="utf-8").splitlines() if line)
+    }
+    reference_frames_per_token: dict[str, float] = {}
+    rows: dict[str, list[tuple[float, float]]] = {}
+    for line in results_path.read_text(encoding="utf-8").splitlines():
+        record = json.loads(line)
+        if record.get("finish_reason") != "stop":
+            continue
+        else:
+            pass
+        case = cases[record["id"]]
+        if case["ref_audio"] not in reference_frames_per_token:
+            reference_tokens = int(processor(text=case["ref_text"], return_tensors="pt")["input_ids"].shape[-1])
+            reference_s = soundfile.info(case["ref_audio"]).duration
+            reference_frames_per_token[case["ref_audio"]] = reference_s / SECONDS_PER_FRAME / reference_tokens
+        else:
+            pass
+        rows.setdefault(str(record["set"]), []).append(
+            (reference_frames_per_token[case["ref_audio"]], record["frames"] / record["text_tokens"])
+        )
+    print("set | natural stops | corr(reference rate, output rate) | output / reference rate p50 / p99 / max")
+    for name, pairs in sorted(rows.items()):
+        reference, output = (np.array(values) for values in zip(*pairs))
+        ratio = np.sort(output / reference)
+        print(
+            f"{name} | {len(pairs)} | {np.corrcoef(reference, output)[0, 1]:.2f} | "
+            f"{ratio[len(ratio) // 2]:.2f} / {ratio[int(len(ratio) * 0.99)]:.2f} / {ratio[-1]:.2f}"
+        )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     commands = parser.add_subparsers(dest="command", required=True)
@@ -411,6 +452,10 @@ def main() -> None:
     check_parser.add_argument("--concurrency", type=int, default=16)
     speech_parser = commands.add_parser("speech")
     speech_parser.add_argument("check", type=Path)
+    rate_parser = commands.add_parser("refrate")
+    rate_parser.add_argument("results", type=Path)
+    rate_parser.add_argument("cases", type=Path)
+    rate_parser.add_argument("--model", required=True)
     truncated_parser = commands.add_parser("truncated")
     truncated_parser.add_argument("check", type=Path)
     truncated_parser.add_argument("--asr-port", type=int, required=True)
@@ -428,6 +473,8 @@ def main() -> None:
         speech(args.check)
     elif args.command == "truncated":
         truncated(args.check, args.asr_port, args.concurrency)
+    elif args.command == "refrate":
+        reference_rate(args.results, args.cases, args.model)
     else:
         summarize(args.results)
 
