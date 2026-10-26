@@ -21,12 +21,22 @@ for model in Qwen/Qwen3-TTS-12Hz-1.7B-Base Qwen/Qwen3-TTS-12Hz-0.6B-Base Qwen/Qw
   echo "download $model rc $? $(date +%T)" >> $L
 done
 (cd $M && PYTHONPATH=$M python3 $SCAN cases $D/cases >> $L 2>&1)
+for cases in base_seedtts base_spans customvoice voicedesign; do
+  if [ ! -s $D/cases/$cases.jsonl ]; then
+    echo "stopped: no $cases cases" >> $L
+    echo "queue_budget_done $(date +%T)" >> $L
+    exit 1
+  else
+    :
+  fi
+done
 run_model() {
   local label=$1 model=$2 port=$3
   shift 3
-  (cd $M && SGLANG_OMNI_STRICT_PORT=1 PYTHONPATH=$M setsid python3 -m sglang_omni.cli serve --model-path $model \
-    --host 127.0.0.1 --port $port --tts_engine.gpu $CARD --vocoder.gpu $CARD > $D/serve_$label.log 2>&1 < /dev/null &
-    echo $! > $D/serve_$label.pid)
+  (cd $M && SGLANG_OMNI_STRICT_PORT=1 PYTHONPATH=$M setsid bash -c "echo \$\$ > $D/serve_$label.pid; exec python3 \
+    -m sglang_omni.cli serve --model-path $model --host 127.0.0.1 --port $port --tts_engine.gpu $CARD \
+    --vocoder.gpu $CARD" > $D/serve_$label.log 2>&1 < /dev/null &)
+  sleep 2
   local pgid=$(cat $D/serve_$label.pid)
   local waited=0
   until curl -sf http://127.0.0.1:$port/health > /dev/null; do

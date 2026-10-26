@@ -22,11 +22,13 @@ import sys
 from pathlib import Path
 
 import httpx
-from qwen_tts.inference import qwen3_tts_model as official
 from transformers import AutoConfig, AutoProcessor
 
 from benchmarks.dataset.prepare import SEEDTTS_DATASET_ID
 from benchmarks.dataset.seedtts import load_seedtts_samples
+from sglang_omni.models.qwen3_tts.compat import (
+    apply_qwen_tts_transformers_compatibility_patches,
+)
 from sglang_omni.models.qwen3_tts.request_builders import text_length_budget
 from sglang_omni.utils.checkpoint import resolve_checkpoint
 
@@ -127,6 +129,10 @@ def build_cases(out_dir: Path) -> None:
 async def scan(
     cases_path: Path, base_url: str, model: str, label: str, out_path: Path, concurrency: int
 ) -> None:
+    # note (ratish): qwen-tts imports only after the transformers shim the server applies first.
+    apply_qwen_tts_transformers_compatibility_patches()
+    from qwen_tts.inference import qwen3_tts_model as official
+
     AutoConfig.register("qwen3_tts", official.Qwen3TTSConfig)
     AutoProcessor.register(official.Qwen3TTSConfig, official.Qwen3TTSProcessor)
     processor = AutoProcessor.from_pretrained(resolve_checkpoint(model), fix_mistral_regex=True)
