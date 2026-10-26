@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
-# 0.6B ICL last three words, language English: ours runs away about three times as often as official qwen-tts (five
-# draws against three) while every auto cell and ICL last word match. Main, one server per configuration, two draws
-# each at c16: default, the talker's radix cache off, CUDA graphs off; one draw at c1 on the default server. Cap 300 as
-# in the official draws. Card 1 only, after queue_branches.sh.
+# 0.6B ICL last three words, language English: ours runs away at 0.78 % against official qwen-tts's 0.39 % (five
+# draws each) and against our own auto's 0.31 %, while official English and auto match. Main, one server per
+# configuration, two English draws each at c16: default, the talker's radix cache off, CUDA graphs off; on the default
+# server also two auto draws and one English draw at c1. Cap 300 as in the official draws. Card 1 only, after
+# queue_branches.sh.
 set -u
 D=${D:?the results directory}
 T=${T:?the kit tree}
@@ -47,9 +48,9 @@ stop_server() {
   echo "$1 stopped $(date +%T)" >> $L
 }
 draw() {
-  local label=$1 concurrency=$2
+  local label=$1 concurrency=$2 language=${3:-English}
   (cd $M && PYTHONPATH=$M python3 $HERE/layout.py serve $CASES --base-url http://127.0.0.1:24000 \
-    --model Qwen/Qwen3-TTS-12Hz-0.6B-Base --label $label --language English --out $D/icl3/$label --modes icl \
+    --model Qwen/Qwen3-TTS-12Hz-0.6B-Base --label $label --language $language --out $D/icl3/$label --modes icl \
     --max-new-tokens 300 --concurrency $concurrency >> $L 2>&1)
   echo "icl3 $label rc $? $(date +%T)" >> $L
 }
@@ -61,6 +62,8 @@ for config in "default|" "radix_off|--tts_engine.engine.disable_radix_cache true
     draw 06_${name}_1 16
     draw 06_${name}_2 16
     if [ $name = default ]; then
+      draw 06_default_auto_1 16 auto
+      draw 06_default_auto_2 16 auto
       draw 06_default_c1 1
     else
       :
