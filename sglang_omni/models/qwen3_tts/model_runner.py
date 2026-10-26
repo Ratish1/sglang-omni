@@ -60,15 +60,10 @@ class Qwen3TTSModelRunner(ModelRunner):
         self,
         tp_worker: ModelWorker,
         output_processor: SGLangOutputProcessor,
-        *,
-        leading_silence_mask_frames: int,
-        silence_codec_ids: torch.Tensor,
     ) -> None:
         super().__init__(tp_worker, output_processor)
         self.has_pending_code_step = False
         self.row_ids_cache: torch.Tensor | None = None
-        self.leading_silence_mask_frames = leading_silence_mask_frames
-        self.silence_codec_ids = silence_codec_ids
         self.codes_event_module = (
             torch.get_device_module(self.device)
             if has_device_streams(self.device)
@@ -186,24 +181,6 @@ class Qwen3TTSModelRunner(ModelRunner):
                 active_logits[row_index, codec_eos] = float("-inf")
             else:
                 pass
-
-        # note (luojiaxuan): a cold-start clone that samples a silence id first
-        # tends to stay silent for several frames, so silence ids are excluded
-        # from its opening frames.
-        if self.leading_silence_mask_frames > 0:
-            for row_index, scheduled_request in enumerate(requests):
-                if (
-                    scheduled_request.data.mask_leading_silence
-                    and len(scheduled_request.data.output_codes)
-                    < self.leading_silence_mask_frames
-                ):
-                    active_logits[row_index].index_fill_(
-                        0, self.silence_codec_ids, float("-inf")
-                    )
-                else:
-                    pass
-        else:
-            pass
 
     def install_sampling_seeds(
         self,
