@@ -358,22 +358,32 @@ def test_fused_layer_is_deterministic_and_batch_invariant() -> None:
 @accelerator
 @pytest.mark.accelerator
 @pytest.mark.usefixtures("published_server_args")
-def test_a_pass_runs_fused_up_to_the_fused_rows_and_plain_above() -> None:
-    """A pass above MAX_FUSED_ROWS rows, the opening pair or a single token, must equal
-    the plain path bit for bit; a pass of exactly MAX_FUSED_ROWS rows runs fused."""
+def test_a_pass_past_the_fused_rows_runs_fused_over_row_groups() -> None:
+    """A row must get the same bits whether or not its pass exceeds MAX_FUSED_ROWS: past
+    the limit the opening pair ran plain, so a request's codes followed how many requests
+    shared its talker step."""
     device = torch.device("cuda")
-    batch_size = MAX_FUSED_ROWS + 1
-    plain_talker = build_talker(device, seed=21, max_bs=batch_size)
-    fused_talker = fuse(build_talker(device, seed=21, max_bs=batch_size))
-    steps = predictor_inputs(device, batch_size, seed=22)
-    plain = run_sequence(plain_talker, steps)
-    fused = run_sequence(fused_talker, steps)
-    assert all(torch.equal(a, b) for a, b in zip(plain, fused))
-    assert torch.equal(plain_talker.predictor_k_cache, fused_talker.predictor_k_cache)
-    assert torch.equal(plain_talker.predictor_v_cache, fused_talker.predictor_v_cache)
-    residual = fused_talker.predictor_fused_layers.residual
+    group_size = MAX_FUSED_ROWS // 2
+    talker = fuse(build_talker(device, seed=21, max_bs=group_size + 1))
+    steps = predictor_inputs(device, group_size + 1, seed=22)
+    whole = run_sequence(talker, steps)
+    k_whole = talker.predictor_k_cache.clone()
+    v_whole = talker.predictor_v_cache.clone()
+    head = run_sequence(talker, [step[:group_size] for step in steps])
+    assert all(torch.equal(a[:group_size], b) for a, b in zip(whole, head))
+    assert torch.equal(
+        k_whole[:, :group_size], talker.predictor_k_cache[:, :group_size]
+    )
+    assert torch.equal(
+        v_whole[:, :group_size], talker.predictor_v_cache[:, :group_size]
+    )
+    tail = run_sequence(talker, [step[group_size:] for step in steps])
+    assert all(torch.equal(a[group_size:], b) for a, b in zip(whole, tail))
+    assert torch.equal(k_whole[:, group_size], talker.predictor_k_cache[:, 0])
+    assert torch.equal(v_whole[:, group_size], talker.predictor_v_cache[:, 0])
+    residual = talker.predictor_fused_layers.residual
     residual.fill_(float("nan"))
-    run_sequence(fused_talker, [steps[0][: MAX_FUSED_ROWS // 2]])
+    run_sequence(talker, [steps[0][:group_size]])
     assert not torch.any(torch.isnan(residual))
 
 
