@@ -1,4 +1,5 @@
 config_cls: Qwen3OmniSpeechPipelineConfig
+placement_policy: null
 model_path: Qwen/Qwen3-Omni-30B-A3B-Instruct
 
 stages:
