@@ -8,6 +8,7 @@ import contextlib
 import json
 import logging
 import math
+import os
 import queue
 import threading
 import time
@@ -1822,6 +1823,7 @@ def build_sglang_qwen3_tts_request(
         repetition_penalty=float(gen_kwargs.get("repetition_penalty", 1.05)),
         stop_token_ids=[int(model.config.codec_eos_token_id)],
         sampling_seed=request_sampling_seed,
+        min_new_tokens=int(os.environ.get("QWEN3_TTS_PROBE_MIN_NEW_TOKENS", "0")),
     )
     sampling_params.normalize(None)
     sampling_params.verify(int(model.config.vocab_size))

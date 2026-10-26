@@ -1074,8 +1074,12 @@ class Qwen3TTSTalker(Qwen3TTSPromptBuilderMixin, nn.Module):
         self.predictor_rope_stores_kv = self.resolve_predictor_rope_store(
             cp_attn, device=device
         )
-        self.predictor_fused_layers = resolve_fused_predictor_layers(
-            self.code_predictor, predictor_len, max_batch_size, device, dtype
+        self.predictor_fused_layers = (
+            None
+            if os.environ.get("QWEN3_TTS_PROBE_PLAIN_PREDICTOR") == "1"
+            else resolve_fused_predictor_layers(
+                self.code_predictor, predictor_len, max_batch_size, device, dtype
+            )
         )
         self.sampled_token_ids = torch.zeros(
             max_batch_size, dtype=torch.long, device=device
