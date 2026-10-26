@@ -67,7 +67,11 @@ def cut(served: Path, out_dir: Path, min_ms: float, outcome: str) -> None:
             pass
         samples, rate = soundfile.read(str(record["audio"]), dtype="float32")
         start = next(
-            (start for start, length in zero_runs_ms(str(record["audio"])) if start > 0 and length >= min_ms), None
+            (
+                start for start, length in zero_runs_ms(str(record["audio"]))
+                if start > float(record["onset_ms"]) and length >= min_ms
+            ),
+            None,
         )
         if outcome == "stop" and start is None:
             continue
