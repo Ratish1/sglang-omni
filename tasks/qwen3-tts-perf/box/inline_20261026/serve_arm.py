@@ -111,10 +111,10 @@ def main() -> None:
         f"samples {len(used_mib)}"
     )
     (out / "memory.txt").write_text(memory + "\n", encoding="utf-8")
-    outcome = re.findall(r"success=\S+ failed=\S+", (out / "bench.log").read_text(errors="replace"))
+    outcome = re.findall(r"Completed requests: +\d+|Failed requests: +\d+", (out / "bench.log").read_text(errors="replace"))
     failures = len(FAILURE_PATTERN.findall((out / "serve.log").read_text(errors="replace")))
     print(
-        f"{args.label} bench rc {bench_rc} {outcome[-1] if outcome else 'no outcome line'}; serve log failure lines "
+        f"{args.label} bench rc {bench_rc} {', '.join(outcome[-2:]) if outcome else 'no outcome line'}; serve log failure lines "
         f"{failures}; {memory}; {identity.split()[1] if len(identity.split()) > 1 else identity!r}",
         flush=True,
     )
