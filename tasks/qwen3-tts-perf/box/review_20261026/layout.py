@@ -105,6 +105,7 @@ async def serve(cases_path: Path, base_url: str, model: str, label: str, languag
                     else:
                         pass
                     speech_id = response.headers["X-SGLang-Omni-Speech-Id"]
+                    record["speech_id"] = speech_id
                     worker = response.headers.get("X-SGLang-Omni-Worker")
                     pcm = b"".join([chunk async for chunk in response.aiter_bytes()])
                 outcome = await client.get(
