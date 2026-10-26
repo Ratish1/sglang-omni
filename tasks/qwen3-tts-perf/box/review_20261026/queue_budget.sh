@@ -1,8 +1,7 @@
 #!/usr/bin/env bash
-# #3157's default budget against natural utterance lengths beyond its calibration (budget_scan.py): Base 1.7B and
-# 0.6B on SeedTTS EN and ZH and the cascade's short spans, CustomVoice 1.7B plain and slow on SeedTTS and FLEURS in
-# eight more languages, VoiceDesign 1.7B plain and slow on SeedTTS. Every server on card 1 only, one at a time, after
-# the unit queue ends. A natural stop past its budget is speech #3157's default cuts.
+# Natural utterance lengths per task in English against #3157's default budget and vLLM-Omni's per-task ceilings
+# (budget_scan.py): Base 1.7B and 0.6B on SeedTTS EN and its short spans, CustomVoice 1.7B (a native and a non-native
+# speaker, plain and slow), VoiceDesign 1.7B (plain and slow). Every server on card 1 only, one at a time.
 set -u
 D=${D:?the results directory}
 M=${M:?the main tree}
@@ -21,7 +20,7 @@ for model in Qwen/Qwen3-TTS-12Hz-1.7B-Base Qwen/Qwen3-TTS-12Hz-0.6B-Base Qwen/Qw
   echo "download $model rc $? $(date +%T)" >> $L
 done
 (cd $M && PYTHONPATH=$M python3 $SCAN cases $D/cases >> $L 2>&1)
-for cases in base_seedtts base_spans customvoice voicedesign; do
+for cases in base customvoice voicedesign; do
   if [ ! -s $D/cases/$cases.jsonl ]; then
     echo "stopped: no $cases cases" >> $L
     echo "queue_budget_done $(date +%T)" >> $L
@@ -64,10 +63,10 @@ run_model() {
   kill -KILL -$pgid 2> /dev/null
   echo "$label stopped $(date +%T)" >> $L
 }
-run_model base17 Qwen/Qwen3-TTS-12Hz-1.7B-Base 21000 base_seedtts base_spans
-run_model base06 Qwen/Qwen3-TTS-12Hz-0.6B-Base 21200 base_seedtts base_spans
-run_model custom17 Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice 21400 customvoice
-run_model design17 Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign 21600 voicedesign
-(cd $M && PYTHONPATH=$M python3 $SCAN summarize $D/*_base_seedtts.jsonl $D/*_base_spans.jsonl $D/*_customvoice.jsonl \
-  $D/*_voicedesign.jsonl > $D/summary.txt 2>&1)
+run_model base17 Qwen/Qwen3-TTS-12Hz-1.7B-Base 21000 base
+run_model base06 Qwen/Qwen3-TTS-12Hz-0.6B-Base 21200 base
+run_model customvoice17 Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice 21400 customvoice
+run_model voicedesign17 Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign 21600 voicedesign
+(cd $M && PYTHONPATH=$M python3 $SCAN summarize $D/base17_base.jsonl $D/base06_base.jsonl \
+  $D/customvoice17_customvoice.jsonl $D/voicedesign17_voicedesign.jsonl > $D/summary.txt 2>&1)
 echo "queue_budget_done $(date +%T)" >> $L
