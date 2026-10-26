@@ -23,7 +23,8 @@ STARTUP = re.compile(r"sglang_ar_startup stage=(\w+) gpu_id=\d+ .*pid=(\d+)")
 
 
 def pid_of(global_id: int) -> int:
-    return (global_id >> 24) & 0xFFFFFFFF
+    # note (ratish): nsys packs the pid into 24 bits above the thread id; the bits above hold the host id
+    return (global_id >> 24) & 0xFFFFFF
 
 
 def merged(intervals: list[tuple[int, int]]) -> list[list[int]]:
@@ -167,7 +168,7 @@ def main() -> None:
     thinker_rows = [row for row in rows if row[2] == thinker and window_start <= row[0] and row[1] <= window_end]
     correlations = {row[3] for row in thinker_rows}
     calls = {}
-    query = "SELECT correlationId, start FROM CUPTI_ACTIVITY_KIND_RUNTIME WHERE ((globalTid >> 24) & 4294967295) = ?"
+    query = "SELECT correlationId, start FROM CUPTI_ACTIVITY_KIND_RUNTIME WHERE ((globalTid >> 24) & 16777215) = ?"
     for correlation, start in db.execute(query, (thinker,)):
         if correlation in correlations:
             calls[correlation] = start
