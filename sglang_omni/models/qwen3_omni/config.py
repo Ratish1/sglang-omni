@@ -43,6 +43,10 @@ ENABLE_TALKER_START_TOPOLOGY = False
 
 TALKER_MAX_RUNNING_REQUESTS = 32
 
+# note (ratish): two workers overlap one request's media decode and HF processor call with
+# the next one's (Video-MME CI c16 +20 % cold, +64 % hot req/s; SeedTTS level, H200).
+PREPROCESSING_WORKERS = 2
+
 # SGLang reads this when DeepGEMM compile utilities are imported. Qwen AR
 # stages can first hit some dense FP8 shapes after readiness; disable all-M
 # precompile so that miss does not become a long post-ready compile session.
@@ -74,7 +78,7 @@ def preprocessing_stage(*, process: str, speech_enabled: bool = False) -> StageC
         name="preprocessing",
         process=process,
         factory_path=f"{_PKG}.stages.create_preprocessing_executor",
-        factory=FactoryArgs(),
+        factory=FactoryArgs(max_concurrency=PREPROCESSING_WORKERS),
         next=next_stages,
         route_fn=route_fn,
         project_payload={
