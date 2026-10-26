@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import os
 from types import ModuleType
 from typing import TYPE_CHECKING, TypedDict
 
@@ -178,6 +179,12 @@ class Qwen3TTSModelRunner(ModelRunner):
             active_logits[:, codec_eos + 1 : suppress_stop] = float("-inf")
         else:
             active_logits[:, suppress_start:suppress_stop] = float("-inf")
+        min_new_frames = int(os.environ.get("QWEN3_TTS_PROBE_MIN_NEW_TOKENS", "0"))
+        for row_index, scheduled_request in enumerate(requests):
+            if len(scheduled_request.data.output_codes) < min_new_frames:
+                active_logits[row_index, codec_eos] = float("-inf")
+            else:
+                pass
 
         # note (luojiaxuan): a cold-start clone that samples a silence id first
         # tends to stay silent for several frames, so silence ids are excluded
