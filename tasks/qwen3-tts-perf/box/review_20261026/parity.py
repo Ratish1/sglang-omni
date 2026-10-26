@@ -27,6 +27,7 @@ from benchmarks.dataset.prepare import SEEDTTS_DATASET_ID
 from benchmarks.dataset.seedtts import load_seedtts_samples
 
 REQUEST_TIMEOUT_S = 900.0
+PROGRESS_EVERY = 500
 
 
 def build_cases(out_dir: Path) -> None:
@@ -60,8 +61,27 @@ async def serve(cases_path: Path, base_url: str, model: str, label: str, out_pat
                 concurrency: int) -> None:
     cases = [json.loads(line) for line in cases_path.read_text(encoding="utf-8").splitlines() if line]
     limit = asyncio.Semaphore(concurrency)
+    progress = {"done": 0, "runaways": 0, "errors": 0}
+
+    def report(record: dict[str, object]) -> None:
+        progress["done"] += 1
+        progress["runaways"] += int(record.get("frames", 0) >= max_new_tokens)
+        progress["errors"] += int("error" in record)
+        if progress["done"] % PROGRESS_EVERY == 0 or progress["done"] == len(cases):
+            print(
+                f"{label}: {progress['done']} of {len(cases)} done, {progress['runaways']} runaways, "
+                f"{progress['errors']} errors",
+                flush=True,
+            )
+        else:
+            pass
 
     async def one(client: httpx.AsyncClient, case: dict[str, str]) -> dict[str, object]:
+        record = await request(client, case)
+        report(record)
+        return record
+
+    async def request(client: httpx.AsyncClient, case: dict[str, str]) -> dict[str, object]:
         reference: dict[str, str] = {"audio_path": case["ref_audio"]}
         if "ref_text" in case:
             reference["text"] = case["ref_text"]
