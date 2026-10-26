@@ -6,6 +6,7 @@ from __future__ import annotations
 import collections
 import json
 import logging
+import os
 import time
 from dataclasses import dataclass
 
@@ -64,38 +65,53 @@ class PromptHiddenStore:
         req_to_token_pool: ReqToTokenPool,
         device: str,
     ) -> None:
-        allocate = ALLOC_MEMORY_FUNCS[device]
-        self.hidden_states: torch.Tensor | None = allocate(
-            (slot_count, hidden_size),
-            dtype=dtype,
-            device="cpu",
-            pin_memory=True,
-            allocator=HostTensorAllocator(),
+        self.use_gpu_cache: bool = (
+            os.environ.get("SGLANG_OMNI_DIAGNOSTIC_GPU_PROMPT_CACHE") == "1"
         )
-        self.is_host_registered = allocate is alloc_with_host_register
+        self.hidden_states: torch.Tensor | None
+        if self.use_gpu_cache:
+            self.hidden_states = torch.empty(
+                (slot_count, hidden_size), dtype=dtype, device=device
+            )
+            self.is_host_registered = False
+        else:
+            allocate = ALLOC_MEMORY_FUNCS[device]
+            self.hidden_states = allocate(
+                (slot_count, hidden_size),
+                dtype=dtype,
+                device="cpu",
+                pin_memory=True,
+                allocator=HostTensorAllocator(),
+            )
+            self.is_host_registered = allocate is alloc_with_host_register
         self.req_to_token_pool = req_to_token_pool
         self.device_module = torch.get_device_module(device)
         self.staged: collections.deque[StagedPromptHidden] = collections.deque()
         logger.info(
             f"Prompt hidden store: {slot_count} slots of {hidden_size} {dtype}, "
-            f"{self.hidden_states.nbytes / BYTES_PER_GIB:.2f} GiB pinned"
+            f"{self.hidden_states.nbytes / BYTES_PER_GIB:.2f} GiB on {self.hidden_states.device}"
         )
 
     @torch.profiler.record_function("diagnostic.stage")
     def stage(self, slot_ids: torch.Tensor, hidden_states: torch.Tensor) -> None:
         """Copy a forward's rows and their slot ids to host behind the forward on its stream."""
-        staged = StagedPromptHidden(
-            slot_ids=torch.empty(slot_ids.shape, dtype=slot_ids.dtype, pin_memory=True),
-            hidden_states=torch.empty(
-                hidden_states.shape, dtype=hidden_states.dtype, pin_memory=True
-            ),
-            copy_done=self.device_module.Event(),
-        )
-        staged.slot_ids.copy_(slot_ids, non_blocking=True)
-        staged.hidden_states.copy_(hidden_states, non_blocking=True)
-        staged.copy_done.record()
-        self.staged.append(staged)
-        self.store_copied(wait=False)
+        if self.use_gpu_cache:
+            self.hidden_states[slot_ids] = hidden_states
+        else:
+            staged = StagedPromptHidden(
+                slot_ids=torch.empty(
+                    slot_ids.shape, dtype=slot_ids.dtype, pin_memory=True
+                ),
+                hidden_states=torch.empty(
+                    hidden_states.shape, dtype=hidden_states.dtype, pin_memory=True
+                ),
+                copy_done=self.device_module.Event(),
+            )
+            staged.slot_ids.copy_(slot_ids, non_blocking=True)
+            staged.hidden_states.copy_(hidden_states, non_blocking=True)
+            staged.copy_done.record()
+            self.staged.append(staged)
+            self.store_copied(wait=False)
 
     @torch.profiler.record_function("diagnostic.store_copied")
     def store_copied(self, *, wait: bool) -> None:
@@ -118,6 +134,13 @@ class PromptHiddenStore:
         """The rows at a request's prompt positions, through the slots its KV holds now."""
         start_ns = time.perf_counter_ns()
         req_to_token = self.req_to_token_pool.req_to_token
+        if self.use_gpu_cache:
+            slot_ids = req_to_token[
+                request_pool_index, positions.to(req_to_token.device)
+            ]
+            return self.hidden_states[slot_ids]
+        else:
+            pass
         slot_ids = req_to_token[
             request_pool_index, positions.to(req_to_token.device)
         ].cpu()
