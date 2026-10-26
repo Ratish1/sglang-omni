@@ -177,11 +177,18 @@ def parse_multi_choice_response(
     Priority: Answer: X, then (A), then a space-padded letter, then the option text, with the last occurrence breaking ties.
     Returns (choice, is_unparseable); a response that names no option returns an empty choice, which scores as wrong.
     """
-    answer_matches = re.findall(r"[Aa]nswer\s*:\s*\*?\*?\s*\(?([A-Z])\)?", response)
+    # note (ratish): a lowercase letter counts only when no word follows it, so the article in "Answer: a dog" is not read as A.
+    answer_matches = re.findall(
+        r"[Aa]nswer\s*:\s*\*?\*?\s*\(?([A-Z]|[a-z](?![\w ]))\)?", response
+    )
     if answer_matches:
-        candidate = answer_matches[-1]
+        candidate = answer_matches[-1].upper()
         if candidate in all_choices:
             return candidate, False
+        else:
+            pass
+    else:
+        pass
 
     for char in (",", ".", "!", "?", ";", ":", "'"):
         response = response.strip(char)

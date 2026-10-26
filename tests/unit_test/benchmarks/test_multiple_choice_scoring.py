@@ -62,6 +62,22 @@ def test_explicit_answer_line_parses() -> None:
     )
 
 
+@pytest.mark.parametrize(
+    ("text", "expected_choice"),
+    [
+        ("the last tree in the clip\nAnswer: d", "D"),
+        ("Answer: a birch, the tall tree here", "D"),
+    ],
+)
+def test_lowercase_answer_letter_names_its_option(
+    text: str, expected_choice: str
+) -> None:
+    assert parse_multi_choice_response(text, CHOICES, OPTIONS) == (
+        expected_choice,
+        False,
+    )
+
+
 @pytest.mark.parametrize("earlier_text", ["Answer: A", UNPARSEABLE_TEXT])
 def test_unparseable_mmmu_answer_is_wrong_whatever_came_before(
     earlier_text: str,
