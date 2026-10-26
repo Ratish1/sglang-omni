@@ -20,7 +20,7 @@ from benchmarks.benchmarker.conditions import (
     sampling_seed_field,
     warn_if_tail_percentile_is_thin,
 )
-from benchmarks.benchmarker.data import FinishReason, chat_completion_finish_reason
+from benchmarks.benchmarker.data import FinishReason, finish_reason_from_server
 from benchmarks.dataset.mmmu import MMMUSample
 from benchmarks.dataset.mmsu import MmsuSample
 from benchmarks.dataset.videomme import VideoMMESample
@@ -384,16 +384,15 @@ async def test_mmmu_and_video_requests_record_the_finish_reason() -> None:
 
 
 @pytest.mark.parametrize(
-    ("body", "expected"),
+    ("value", "expected"),
     [
-        ({"choices": [{"finish_reason": "stop"}]}, FinishReason.STOP),
-        ({"choices": [{"finish_reason": "tool_calls"}]}, FinishReason.UNKNOWN),
-        ({"choices": [{}]}, FinishReason.UNKNOWN),
-        ({}, FinishReason.UNKNOWN),
+        ("stop", FinishReason.STOP),
+        ("tool_calls", FinishReason.UNKNOWN),
+        (None, FinishReason.UNKNOWN),
     ],
 )
-def test_chat_completion_finish_reason(body: dict, expected: FinishReason) -> None:
-    assert chat_completion_finish_reason(body) == expected
+def test_finish_reason_from_server(value: str | None, expected: FinishReason) -> None:
+    assert finish_reason_from_server(value) == expected
 
 
 @pytest.mark.asyncio

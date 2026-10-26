@@ -15,7 +15,7 @@ from typing import Any, TypedDict
 import aiohttp
 
 from benchmarks.benchmarker.conditions import sampling_seed_field
-from benchmarks.benchmarker.data import RequestResult, chat_completion_finish_reason
+from benchmarks.benchmarker.data import RequestResult, finish_reason_from_server
 from benchmarks.benchmarker.runner import SendFn
 from benchmarks.benchmarker.utils import get_wav_duration
 from benchmarks.dataset.videomme import VideoAMMESample, VideoMMESample
@@ -64,7 +64,9 @@ def _apply_chat_completion_response(
 ) -> bool:
     message = body.get("choices", [{}])[0].get("message", {})
     result.text = message.get("content", "") or ""
-    result.finish_reason = chat_completion_finish_reason(body)
+    result.finish_reason = finish_reason_from_server(
+        body.get("choices", [{}])[0].get("finish_reason")
+    )
     wav_bytes = b""
 
     if audio_output_dir:

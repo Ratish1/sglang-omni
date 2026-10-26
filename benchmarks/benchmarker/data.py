@@ -15,11 +15,12 @@ class FinishReason(str, Enum):
     LENGTH = "length"
 
 
-def chat_completion_finish_reason(body: dict) -> FinishReason:
-    """The first choice's finish reason in a chat completion body."""
+def finish_reason_from_server(value: str | None) -> FinishReason:
     try:
-        return FinishReason(body.get("choices", [{}])[0].get("finish_reason"))
+        return FinishReason(value)
     except ValueError:
+        # note (Yucheng Hu): absent from servers without the field; other
+        # values are engine states this metric does not classify.
         return FinishReason.UNKNOWN
 
 
