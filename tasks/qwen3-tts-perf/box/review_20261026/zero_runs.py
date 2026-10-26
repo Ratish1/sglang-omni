@@ -1,7 +1,7 @@
 """Runs of exact digital zero in served Qwen3-TTS audio, natural stops against runaways. scan prints, per outcome and
-set, how many clips hold a zero run of at least each length and where a runaway's first such run starts; cut writes a
-layout.py serve directory of the runaways ended where their first zero run of at least --min-ms starts; report prints
-it against eos_trim.py's capped arm after layout.py score.
+set, how many clips hold a zero run of at least each length and where a runaway's first such run after the opening
+starts; cut writes a layout.py serve directory of the runaways ended where their first zero run of at least --min-ms
+after the opening starts; report prints it against eos_trim.py's capped arm after layout.py score.
 
 usage: python3 zero_runs.py scan SERVED_DIR
        python3 zero_runs.py cut SERVED_DIR OUT_DIR [--min-ms 1000]
@@ -43,7 +43,7 @@ def scan(served: Path) -> None:
         outcome = "runaway" if record.get("finish_reason") == "length" else "natural"
         rows[f"{outcome} {record['set']}"].append(runs)
         if outcome == "runaway":
-            start = next((f"{start:.0f}" for start, length in runs if length >= 1000), "-")
+            start = next((f"{start:.0f}" for start, length in runs if start > 0 and length >= 1000), "-")
             first_long.append(f"{record['id']} | {record['input']} | {start}")
         else:
             pass
@@ -65,7 +65,9 @@ def cut(served: Path, out_dir: Path, min_ms: float) -> None:
         else:
             pass
         samples, rate = soundfile.read(str(record["audio"]), dtype="float32")
-        start = next((start for start, length in zero_runs_ms(str(record["audio"])) if length >= min_ms), None)
+        start = next(
+            (start for start, length in zero_runs_ms(str(record["audio"])) if start > 0 and length >= min_ms), None
+        )
         kept = samples if start is None else samples[: int(start * rate / 1000)]
         audio = out_dir / "audio" / Path(str(record["audio"])).name
         soundfile.write(str(audio), kept, rate, subtype="PCM_16")
