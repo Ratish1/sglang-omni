@@ -135,10 +135,13 @@ class PromptHiddenStore:
         start_ns = time.perf_counter_ns()
         req_to_token = self.req_to_token_pool.req_to_token
         if self.use_gpu_cache:
+            self.device_module.synchronize()
             slot_ids = req_to_token[
                 request_pool_index, positions.to(req_to_token.device)
             ]
-            return self.hidden_states[slot_ids]
+            hidden_states = self.hidden_states[slot_ids]
+            self.device_module.synchronize()
+            return hidden_states
         else:
             pass
         slot_ids = req_to_token[
