@@ -169,8 +169,12 @@ class Transformer(nn.Module):
 
 
 class Quantizer(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.register_buffer("scale", torch.tensor(1 / 16))
+
     def decode(self, codes: torch.Tensor) -> torch.Tensor:
-        return codes[:, :2].to(torch.float32) / 16.0
+        return codes[:, :2].to(self.scale.dtype) * self.scale
 
 
 class SnakeBeta(nn.Module):
@@ -1541,6 +1545,104 @@ def test_arena_bound_graph_replays_match_eager_and_advance_the_arena() -> None:
         *arena.storage.transconv_overlaps.values(),
     )
     assert not any(pool[arena.scratch_slot].any() for pool in scratch_pools)
+
+
+@pytest.mark.accelerator
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_arena_rings_keep_each_slot_apart_across_cohorts_and_graph_replays() -> None:
+    """A stream continues exactly as it would alone while other cohorts decode at other slots, eagerly and through padded graph replays."""
+    apply_qwen_tts_transformers_compatibility_patches()
+    from qwen_tts.core.tokenizer_12hz.configuration_qwen3_tts_tokenizer_v2 import (
+        Qwen3TTSTokenizerV2DecoderConfig,
+    )
+    from qwen_tts.core.tokenizer_12hz.modeling_qwen3_tts_tokenizer_v2 import (
+        Qwen3TTSTokenizerV2DecoderTransformerModel,
+    )
+
+    torch.manual_seed(31)
+    device = torch.device("cuda", torch.cuda.current_device())
+    decoder = Decoder(block_channels=(16, 8))
+    decoder.pre_transformer = Qwen3TTSTokenizerV2DecoderTransformerModel(
+        Qwen3TTSTokenizerV2DecoderConfig(
+            hidden_size=512,
+            latent_dim=2,
+            num_attention_heads=16,
+            num_key_value_heads=16,
+            head_dim=64,
+            intermediate_size=1024,
+            num_hidden_layers=2,
+        )
+    )
+    incremental = Qwen3TTSIncrementalDecoder(decoder.to(device).bfloat16().eval())
+    arenas = []
+    runners = []
+    for _ in range(2):
+        arena = Qwen3TTSCodecStateArena(
+            incremental,
+            num_slots=4,
+            device=device,
+            dtype=torch.bfloat16,
+            in_place_frames=8,
+        )
+        assert arena.key_rings
+        assert [arena.acquire() for _ in range(4)] == [0, 1, 2, 3]
+        runner = Qwen3TTSIncrementalCodecCudaGraphRunner(
+            incremental,
+            device=device,
+            dtype=torch.bfloat16,
+            num_quantizers=2,
+            mode="warm",
+            fresh_frames=(8,),
+            batch_sizes=(2,),
+            min_free_gb=0.0,
+            arena=arena,
+            graph_pool=IncrementalCodecGraphPool(stream_priority=0),
+        )
+        runner.capture()
+        arenas.append(arena)
+        runners.append(runner)
+    alone, mixed = arenas
+    alone_runner, mixed_runner = runners
+    stream = torch.randint(0, 16, (1, 2, 44), device=device)
+
+    def eager_step(
+        arena: Qwen3TTSCodecStateArena, slots: list[int], codes: torch.Tensor
+    ) -> torch.Tensor:
+        state = arena.gather(slots)
+        waveform = incremental.decode(codes, state).clone()
+        arena.scatter(slots, state)
+        return waveform
+
+    with torch.inference_mode():
+        assert torch.equal(
+            eager_step(alone, [3], stream[..., :12]),
+            eager_step(mixed, [3], stream[..., :12]),
+        )
+        eager_step(mixed, [1, 0], torch.randint(0, 16, (2, 2, 64), device=device))
+        eager_step(mixed, [1, 0], torch.randint(0, 16, (2, 2, 8), device=device))
+        assert torch.equal(
+            eager_step(mixed, [3], stream[..., 12:20]),
+            eager_step(alone, [3], stream[..., 12:20]),
+        )
+        for offset in (20, 28, 36):
+            mixed_runner.decode_slots(
+                torch.randint(0, 16, (2, 2, 8), device=device), [0, 1]
+            )
+            mixed_runner.decode_slots(
+                torch.randint(0, 16, (1, 2, 8), device=device), [1]
+            )
+            actual = mixed_runner.decode_slots(stream[..., offset : offset + 8], [3])
+            assert actual is not None
+            actual = actual.clone()
+            expected = alone_runner.decode_slots(stream[..., offset : offset + 8], [3])
+            assert expected is not None
+            torch.cuda.synchronize()
+            assert torch.equal(actual, expected), offset
+    untouched = [
+        ring.view(-1, mixed.ring_frames, ring.shape[1])[2]
+        for ring in (*mixed.key_rings, *mixed.value_rings)
+    ]
+    assert not any(rows.any() for rows in untouched)
 
 
 @pytest.mark.accelerator
