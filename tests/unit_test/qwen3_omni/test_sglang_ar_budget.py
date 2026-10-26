@@ -580,6 +580,7 @@ def test_session_thinker_hands_continuation_aware_admission_to_its_scheduler(
     qwen_stages.create_sglang_thinker_executor_from_config(
         "dummy",
         execution_mode="session",
+        max_running_requests=THINKER_MAX_RUNNING_REQUESTS,
         total_gpu_memory_fraction=0.75,
         continuation_aware_admission=continuation_aware_admission,
     )
