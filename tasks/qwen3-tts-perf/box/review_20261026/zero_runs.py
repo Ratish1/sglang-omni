@@ -1,11 +1,12 @@
 """Runs of exact digital zero in served Qwen3-TTS audio, natural stops against runaways. scan prints, per outcome and
 set, how many clips hold a zero run of at least each length and where a runaway's first such run after the opening
-starts; cut writes a layout.py serve directory of the runaways ended where their first zero run of at least --min-ms
-after the opening starts; report prints it against eos_trim.py's capped arm after layout.py score.
+starts; cut writes a layout.py serve directory of the runaways (--outcome length) or of the natural stops that hold
+such a run (--outcome stop), ended where their first zero run of at least --min-ms after the opening starts; report
+prints it against the same clips as served (a scored.jsonl) after layout.py score.
 
 usage: python3 zero_runs.py scan SERVED_DIR
-       python3 zero_runs.py cut SERVED_DIR OUT_DIR [--min-ms 1000]
-       python3 zero_runs.py report TRIM_DIR OUT_DIR
+       python3 zero_runs.py cut SERVED_DIR OUT_DIR [--min-ms 1000] [--outcome {length,stop}]
+       python3 zero_runs.py report BASE_SCORED_JSONL OUT_DIR
 """
 
 import argparse
@@ -56,11 +57,11 @@ def scan(served: Path) -> None:
     print("\n".join(first_long))
 
 
-def cut(served: Path, out_dir: Path, min_ms: float) -> None:
+def cut(served: Path, out_dir: Path, min_ms: float, outcome: str) -> None:
     (out_dir / "audio").mkdir(parents=True, exist_ok=True)
     rows = []
     for record in load(served):
-        if record.get("finish_reason") != "length":
+        if record.get("finish_reason") != outcome:
             continue
         else:
             pass
@@ -68,6 +69,10 @@ def cut(served: Path, out_dir: Path, min_ms: float) -> None:
         start = next(
             (start for start, length in zero_runs_ms(str(record["audio"])) if start > 0 and length >= min_ms), None
         )
+        if outcome == "stop" and start is None:
+            continue
+        else:
+            pass
         kept = samples if start is None else samples[: int(start * rate / 1000)]
         audio = out_dir / "audio" / Path(str(record["audio"])).name
         soundfile.write(str(audio), kept, rate, subtype="PCM_16")
@@ -75,22 +80,23 @@ def cut(served: Path, out_dir: Path, min_ms: float) -> None:
     (out_dir / "results.jsonl").write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
 
 
-def report(trim_dir: Path, out_dir: Path) -> None:
+def report(base_path: Path, out_dir: Path) -> None:
     def scored(path: Path) -> dict[str, dict[str, object]]:
         return {
             record["id"]: record
             for record in (json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line)
         }
 
-    capped, zero = scored(trim_dir / "capped" / "scored.jsonl"), scored(out_dir / "scored.jsonl")
-    print("id | input | zero run starts at ms | capped WER: transcript | zero-cut WER: transcript")
+    zero = scored(out_dir / "scored.jsonl")
+    capped = {key: value for key, value in scored(base_path).items() if key in zero}
+    print("id | input | zero run starts at ms | served WER: transcript | zero-cut WER: transcript")
     for case_id in sorted(capped, key=lambda key: (capped[key]["set"], key)):
         print(
             f"{case_id} | {capped[case_id]['input']} | {zero[case_id]['zero_start_ms']} | "
             f"{capped[case_id]['wer']:.2f}: {capped[case_id]['transcript']} | "
             f"{zero[case_id]['wer']:.2f}: {zero[case_id]['transcript']}"
         )
-    for arm, records in (("capped", capped), ("zero", zero)):
+    for arm, records in (("served", capped), ("zero", zero)):
         values = [float(record["wer"]) for record in records.values()]
         print(f"{arm}: n {len(values)}, exact {sum(value == 0 for value in values)}, mean WER {np.mean(values):.3f}")
 
@@ -104,16 +110,17 @@ def main() -> None:
     cut_parser.add_argument("served", type=Path)
     cut_parser.add_argument("out", type=Path)
     cut_parser.add_argument("--min-ms", type=float, default=1000.0)
+    cut_parser.add_argument("--outcome", choices=("length", "stop"), default="length")
     report_parser = commands.add_parser("report")
-    report_parser.add_argument("trim", type=Path)
+    report_parser.add_argument("base", type=Path)
     report_parser.add_argument("out", type=Path)
     args = parser.parse_args()
     if args.command == "scan":
         scan(args.served)
     elif args.command == "cut":
-        cut(args.served, args.out, args.min_ms)
+        cut(args.served, args.out, args.min_ms, args.outcome)
     else:
-        report(args.trim, args.out)
+        report(args.base, args.out)
 
 
 if __name__ == "__main__":
