@@ -1830,6 +1830,27 @@ class Qwen3OmniTalker(nn.Module):
                 k_cache=self.predictor_k_cache,
                 v_cache=self.predictor_v_cache,
             )
+        elif fused is not None:
+            # note (ratish): a pass past the fused rows runs fused over row groups, so a
+            # row's values do not depend on how many requests share its talker step.
+            group_size = fused.max_rows // seq_len
+            return torch.cat(
+                [
+                    fused.forward(
+                        layers=self.code_predictor.model.layers,
+                        final_norm=self.code_predictor.model.norm,
+                        token_embeds=token_embeds[start : start + group_size],
+                        batch_size=min(group_size, batch_size - start),
+                        cache_len=cache_len,
+                        positions=positions[
+                            start * seq_len : (start + group_size) * seq_len
+                        ],
+                        k_cache=self.predictor_k_cache[:, start:],
+                        v_cache=self.predictor_v_cache[:, start:],
+                    )
+                    for start in range(0, batch_size, group_size)
+                ]
+            )
         else:
             pass
         hidden_states = token_embeds.reshape(-1, hidden_size)
