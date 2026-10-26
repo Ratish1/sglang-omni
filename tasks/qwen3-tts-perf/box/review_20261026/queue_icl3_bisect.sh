@@ -3,7 +3,7 @@
 # draws each) and against our own auto's 0.31 %, while official English and auto match. Main, one server per
 # configuration, two English draws each at c16: default, the talker's radix cache off, CUDA graphs off; on the default
 # server also two auto draws and one English draw at c1. Cap 300 as in the official draws. Card 1 only, after
-# queue_branches.sh.
+# queue_branches2.sh.
 set -u
 D=${D:?the results directory}
 T=${T:?the kit tree}
@@ -13,7 +13,7 @@ HERE=$T/tasks/qwen3-tts-perf/box/review_20261026
 CARD=1
 L=$D/queue.log
 mkdir -p $D/icl3
-until grep -q queue_branches_done $L; do
+until grep -q queue_branches2_done $L; do
   sleep 30
 done
 echo "queue icl3 bisect start $(date +%T) main $(git -C $M rev-parse HEAD HEAD:sglang_omni | tr '\n' ' ')kit $(git -C $T rev-parse HEAD)" >> $L
