@@ -340,6 +340,56 @@ def speech(check_path: Path) -> None:
     )
 
 
+def truncated(check_path: Path, asr_port: int, concurrency: int) -> None:
+    """Each checked output that speaks the target, cut where #3157's budget and vLLM-Omni's ceiling would stop it and
+    transcribed again: a cut that drops target words loses natural speech."""
+    asr = load_router_asr(asr_port)
+    records = [
+        json.loads(line) for line in check_path.read_text(encoding="utf-8").splitlines() if line
+    ]
+    spoken = [record for record in records if record["verdict"] != "loop"]
+    cut_dir = check_path.parent / "cut_audio"
+    cut_dir.mkdir(exist_ok=True)
+
+    def transcribe_cut(record: dict[str, object]) -> None:
+        audio, rate = soundfile.read(str(record["audio"]), dtype="float32", always_2d=False)
+        reference = normalize_text(str(record["input"]), "en")
+        full_hits = process_words(reference, normalize_text(str(record["transcript"]), "en")).hits
+        for name, cut_frames in (
+            ("3157", text_length_budget(record["text_tokens"])),
+            ("vllm", vllm_omni_ceiling(str(record["task"]), record["text_tokens"])),
+        ):
+            if record["frames"] <= cut_frames:
+                record[f"words_lost_{name}"] = 0
+                continue
+            else:
+                pass
+            cut_path = cut_dir / f"{Path(str(record['audio'])).stem}_{name}.wav"
+            soundfile.write(cut_path, audio[: int(cut_frames * SECONDS_PER_FRAME * rate)], rate, subtype="PCM_16")
+            cut_hits = process_words(reference, normalize_text(transcribe(asr, str(cut_path), "en", "cpu"), "en")).hits
+            record[f"words_lost_{name}"] = max(full_hits - cut_hits, 0)
+
+    with ThreadPoolExecutor(concurrency) as pool:
+        list(pool.map(transcribe_cut, spoken))
+    print(
+        "set | spoken outputs past #3157's budget | of which the cut drops target words (#3157) | words dropped "
+        "| of which the cut drops target words (vLLM-Omni)"
+    )
+    by_set: dict[str, list[dict[str, object]]] = {}
+    for record in spoken:
+        by_set.setdefault(str(record["set"]), []).append(record)
+    for name, group in sorted(by_set.items()):
+        lossy_3157 = [record for record in group if record["words_lost_3157"] > 0]
+        lossy_vllm = [record for record in group if record["words_lost_vllm"] > 0]
+        print(
+            f"{name} | {len(group)} | {len(lossy_3157)} | {sum(record['words_lost_3157'] for record in group)} "
+            f"| {len(lossy_vllm)}"
+        )
+    check_path.with_name("truncated.jsonl").write_text(
+        "".join(json.dumps(record, ensure_ascii=False) + "\n" for record in spoken), encoding="utf-8"
+    )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     commands = parser.add_subparsers(dest="command", required=True)
@@ -361,6 +411,10 @@ def main() -> None:
     check_parser.add_argument("--concurrency", type=int, default=16)
     speech_parser = commands.add_parser("speech")
     speech_parser.add_argument("check", type=Path)
+    truncated_parser = commands.add_parser("truncated")
+    truncated_parser.add_argument("check", type=Path)
+    truncated_parser.add_argument("--asr-port", type=int, required=True)
+    truncated_parser.add_argument("--concurrency", type=int, default=16)
     args = parser.parse_args()
     if args.command == "cases":
         build_cases(args.out_dir)
@@ -372,6 +426,8 @@ def main() -> None:
         check(args.results, args.asr_port, args.concurrency)
     elif args.command == "speech":
         speech(args.check)
+    elif args.command == "truncated":
+        truncated(args.check, args.asr_port, args.concurrency)
     else:
         summarize(args.results)
 
