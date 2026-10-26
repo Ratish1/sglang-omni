@@ -630,6 +630,7 @@ def test_ring_steps_track_fp32_and_wide_ring_steps_equal_the_buffered_step() -> 
         reference.norm.weight.uniform_(0.5, 1.5)
     plain = copy.deepcopy(reference).bfloat16()
     fused = FusedIncrementalTransformer(copy.deepcopy(reference).bfloat16())
+    is_fa3_supported = fused.is_paged_attention
     retained = int(reference.window_size) - 1
     ring_frames = retained + 8
     slots = torch.tensor([2, 0, 1], device="cuda")
@@ -693,7 +694,7 @@ def test_ring_steps_track_fp32_and_wide_ring_steps_equal_the_buffered_step() -> 
         (17, torch.tensor([17, 14, 9])),
         (8, None),
     ]
-    for is_paged_attention in (True, False):
+    for is_paged_attention in (True, False) if is_fa3_supported else (False,):
         fused.is_paged_attention = is_paged_attention
         states = {
             "reference": buffered_state(torch.float32),
@@ -717,7 +718,7 @@ def test_ring_steps_track_fp32_and_wide_ring_steps_equal_the_buffered_step() -> 
                 for state in states.values():
                     advance(state, width, valid)
 
-    fused.is_paged_attention = True
+    fused.is_paged_attention = is_fa3_supported
     compiled = torch.compile(fused.__call__, dynamic=False, fullgraph=True)
     states = {
         "reference": buffered_state(torch.float32),
