@@ -57,13 +57,16 @@ def tails(text: str) -> dict[int, str]:
 
 
 def build_cases(out_dir: Path) -> None:
-    out_dir.mkdir(parents=True, exist_ok=True)
+    (out_dir / "wavs").mkdir(parents=True, exist_ok=True)
     samples = load_seedtts_samples(SEEDTTS_DATASET_ID, split="en")
     base = []
     custom = []
     design = []
     for sample in samples:
-        reference = {"ref_audio": sample.ref_audio, "ref_text": sample.ref_text}
+        # note (ratish): the loader's clips live in a temporary directory removed when this process exits.
+        wav_path = out_dir / "wavs" / f"{sample.sample_id}.wav"
+        wav_path.write_bytes(Path(sample.ref_audio).read_bytes())
+        reference = {"ref_audio": str(wav_path), "ref_text": sample.ref_text}
         base.append({"id": sample.sample_id, "set": "base", "input": sample.target_text, **reference})
         for count, tail in tails(sample.target_text).items():
             base.append({"id": f"{sample.sample_id}_tail{count}", "set": f"base span {count}", "input": tail, **reference})
