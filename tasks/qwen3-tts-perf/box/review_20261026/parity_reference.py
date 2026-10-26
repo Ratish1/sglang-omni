@@ -68,7 +68,8 @@ def main() -> None:
             records += [{"id": case["id"], "set": case["set"], "frames": count} for case, count in zip(batch, frames)]
             print(
                 f"{args.model} {set_name} rows {start}-{start + len(batch) - 1}: "
-                f"{sum(count >= args.max_new_tokens for count in frames)} reached {args.max_new_tokens}, "
+                f"{sum(count >= args.max_new_tokens - 1 for count in frames)} reached {args.max_new_tokens - 1} "
+                f"(no EOS), "
                 f"{time.perf_counter() - began:.0f} s",
                 flush=True,
             )

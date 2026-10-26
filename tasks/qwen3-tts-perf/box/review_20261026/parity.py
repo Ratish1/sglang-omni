@@ -140,16 +140,18 @@ def compare(reference_path: Path, served_paths: list[Path], max_new_tokens: int)
           "| KS p against official")
     for set_name in sorted(arms["official"]):
         official = arms["official"][set_name]
-        official_runaways = sum(frames >= max_new_tokens for frames in official)
-        official_natural = sorted(frames for frames in official if frames < max_new_tokens)
+        official_runaways = sum(frames >= max_new_tokens - 1 for frames in official)
+        official_natural = sorted(frames for frames in official if frames < max_new_tokens - 1)
         for arm, sets in arms.items():
             frames = sets.get(set_name, [])
             if not frames:
                 continue
             else:
                 pass
-            runaways = sum(count >= max_new_tokens for count in frames)
-            natural = sorted(count for count in frames if count < max_new_tokens)
+            # note (ratish): official generate returns one frame fewer than the cap for a row that never emits EOS.
+            cap = max_new_tokens - 1 if arm == "official" else max_new_tokens
+            runaways = sum(count >= cap for count in frames)
+            natural = sorted(count for count in frames if count < cap)
             if arm == "official":
                 fisher_text = "-"
                 ks_text = "-"
