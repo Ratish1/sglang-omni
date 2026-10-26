@@ -28,7 +28,6 @@ SPEAKER_MEL_HOP = 256
 SPEAKER_MEL_FMIN = 0
 SPEAKER_MEL_FMAX = 12000
 SPEAKER_MEL_CLIP = 1e-5
-SPEAKER_MEL_PADDING = (SPEAKER_MEL_N_FFT - SPEAKER_MEL_HOP) // 2
 
 
 def reflect_index(length: torch.Tensor, width: int, pad: int) -> torch.Tensor:
@@ -41,10 +40,24 @@ def reflect_index(length: torch.Tensor, width: int, pad: int) -> torch.Tensor:
     return index.clamp(0, width - 1)
 
 
-def padded_log_mel(
-    padded: torch.Tensor, window: torch.Tensor, mel_basis: torch.Tensor
+def log_mel(
+    waveform: torch.Tensor,
+    window: torch.Tensor,
+    mel_basis: torch.Tensor,
+    padded_frames: int | None = None,
 ) -> torch.Tensor:
-    """Log mel (1, mels, frames) of a clip already carrying the front end's reflect pad."""
+    """Log mel (1, mels, frames) of a waveform (1, samples) through the checkpoint's front
+    end, whose reflect pad of (n_fft - hop) / 2 a side gives samples // hop frames; with
+    padded_frames, zeros after the reflect pad extend it to that many frames."""
+    padding_samples = (SPEAKER_MEL_N_FFT - SPEAKER_MEL_HOP) // 2
+    padded = F.pad(waveform, (padding_samples, padding_samples), mode="reflect")
+    if padded_frames is not None:
+        # note (ratish): up to the longest input with padded_frames frames, so the count
+        # is never negative; no frame inside the clip reads the zeros.
+        tail_samples = SPEAKER_MEL_HOP * (padded_frames + 1) - 1 - waveform.shape[1]
+        padded = F.pad(padded, (0, tail_samples))
+    else:
+        pass
     spectrum = torch.stft(
         padded,
         SPEAKER_MEL_N_FFT,
@@ -60,18 +73,6 @@ def padded_log_mel(
     return torch.log(
         torch.clamp(torch.matmul(mel_basis, magnitude), min=SPEAKER_MEL_CLIP)
     )
-
-
-def mel_frames(samples: int) -> int:
-    """The log mel's frame count for a clip of samples."""
-    return (
-        samples + 2 * SPEAKER_MEL_PADDING - SPEAKER_MEL_N_FFT
-    ) // SPEAKER_MEL_HOP + 1
-
-
-def reflect_padded_samples(frames: int) -> int:
-    """The longest reflect-padded clip whose log mel has frames frames."""
-    return SPEAKER_MEL_HOP * (frames + 1) - 1 + 2 * SPEAKER_MEL_PADDING
 
 
 def time_delay_block(
@@ -187,11 +188,7 @@ class Qwen3TTSSpeakerEncoderCudaGraphRunner:
 
     def mel(self, waveform: torch.Tensor) -> torch.Tensor:
         """Log mel (1, mels, frames) of a CPU waveform (1, samples)."""
-        return padded_log_mel(
-            F.pad(waveform, (SPEAKER_MEL_PADDING, SPEAKER_MEL_PADDING), mode="reflect"),
-            self.mel_window,
-            self.mel_basis,
-        )
+        return log_mel(waveform, self.mel_window, self.mel_basis)
 
     def capture(self, codec_frame_buckets: Iterable[int], codec_hop: int) -> None:
         """One graph per bucket of the reference encoder's ladder, in mel frames;
@@ -263,11 +260,12 @@ class Qwen3TTSSpeakerEncoderCudaGraphRunner:
             self.device_mel_basis = self.mel_basis.to(param.device)
             # note (ratish): the first device FFT initializes cuFFT, which waits for the
             # whole device, so it runs here, at the first width past the graphs.
-            first_width = reflect_padded_samples(2 * buckets[-1])
             with torch.inference_mode(), device_guard(param.device):
-                padded_log_mel(
+                log_mel(
                     torch.zeros(
-                        (1, first_width), device=param.device, dtype=torch.float32
+                        (1, SPEAKER_MEL_HOP * 2 * buckets[-1]),
+                        device=param.device,
+                        dtype=torch.float32,
                     ),
                     self.device_mel_window,
                     self.device_mel_basis,
@@ -289,7 +287,7 @@ class Qwen3TTSSpeakerEncoderCudaGraphRunner:
     def embed(self, waveform: np.ndarray) -> torch.Tensor:
         """Speaker embedding (enc_dim,) of a waveform at the encoder's sample rate."""
         samples = torch.from_numpy(waveform).unsqueeze(0)
-        frames = mel_frames(samples.shape[1])
+        frames = samples.shape[1] // SPEAKER_MEL_HOP
         assert frames > max(self.pads)
         param = next(self.encoder.parameters())
         bucket = smallest_bucket(frames, self.graphs)
@@ -299,16 +297,11 @@ class Qwen3TTSSpeakerEncoderCudaGraphRunner:
             # rounded up to the largest bucket so cuDNN and cuFFT plan each width once.
             largest_frames = max(self.graphs)
             padded_frames = -(-frames // largest_frames) * largest_frames
-            reflected = F.pad(
+            mels = log_mel(
                 samples.to(param.device),
-                (SPEAKER_MEL_PADDING, SPEAKER_MEL_PADDING),
-                mode="reflect",
-            )
-            tail = reflect_padded_samples(padded_frames) - reflected.shape[1]
-            mels = padded_log_mel(
-                F.pad(reflected, (0, tail)),
                 self.device_mel_window,
                 self.device_mel_basis,
+                padded_frames,
             )
             with self.lock:
                 self.misses += 1
