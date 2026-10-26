@@ -2227,7 +2227,11 @@ class Stage:
             )
         else:
             pass
-        if data.is_cuda and self.comm.router.can_use_direct_cuda_ipc(target):
+        if (
+            data.is_cuda
+            and self.comm.router.can_use_direct_cuda_ipc(target)
+            and stage_io.should_use_direct_cuda_ipc_stream_chunk(data, metadata)
+        ):
             direct_ref = stage_io.serialize_direct_cuda_ipc_stream_chunk(data, metadata)
             _emit_event(
                 request_id=request_id,
