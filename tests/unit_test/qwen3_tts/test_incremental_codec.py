@@ -1561,7 +1561,7 @@ def test_arena_rings_keep_each_slot_apart_across_cohorts_and_graph_replays() -> 
 
     torch.manual_seed(31)
     device = torch.device("cuda", torch.cuda.current_device())
-    decoder = Decoder()
+    decoder = Decoder(block_channels=(16, 8))
     decoder.pre_transformer = Qwen3TTSTokenizerV2DecoderTransformerModel(
         Qwen3TTSTokenizerV2DecoderConfig(
             hidden_size=512,
