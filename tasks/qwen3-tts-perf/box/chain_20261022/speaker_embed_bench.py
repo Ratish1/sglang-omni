@@ -1,7 +1,8 @@
 """The Qwen3-TTS speaker embedding of SeedTTS EN references as serving computes it, on the tree on PYTHONPATH (one arm
 per process): the prompt frontend loaded and its speaker encoder graphs captured at the reference encoder's bucket
 ladder, each reference resampled to the encoder's rate as the request builder does. Per reference: the wall time of
-embed() to a synchronized embedding (its first call and the median of the repeats); the embeddings are saved, so two
+embed() to a synchronized embedding (its first call and the median of the repeats) and the device's peak allocation
+over what was resident before its first call; the embeddings are saved, so two
 trees compare with --compare (cosine similarity and max |delta|). --meta takes the references of a long-reference
 list instead of SeedTTS EN.
 
@@ -67,10 +68,14 @@ def main() -> None:
     embeddings = []
     medians_ms = []
     first_ms = []
+    rises_mib = []
     with torch.inference_mode():
         for reference in references:
             audio, source_rate = soundfile.read(reference, dtype="float32")
             waveform = librosa.resample(audio, orig_sr=source_rate, target_sr=rate) if source_rate != rate else audio
+            torch.cuda.synchronize(device)
+            resident = torch.cuda.memory_allocated(device)
+            torch.cuda.reset_peak_memory_stats(device)
             times_ms = []
             for _ in range(args.repeats):
                 torch.cuda.synchronize(device)
@@ -81,15 +86,20 @@ def main() -> None:
             embeddings.append(embedding.float().cpu())
             medians_ms.append(statistics.median(times_ms[1:]))
             first_ms.append(times_ms[0])
+            rises_mib.append((torch.cuda.max_memory_allocated(device) - resident) / 2**20)
             if args.meta is not None:
-                print(f"{Path(reference).name}: {len(waveform)} samples, first {times_ms[0]:.1f} ms, then {medians_ms[-1]:.1f} ms")
+                print(
+                    f"{Path(reference).name}: {len(waveform)} samples, first {times_ms[0]:.1f} ms, then "
+                    f"{medians_ms[-1]:.1f} ms, peak +{rises_mib[-1]:.1f} MiB"
+                )
             else:
                 pass
     median_ms = statistics.median(medians_ms)
     print(
         f"embed wall ms over {len(references)} references: median {median_ms:.3f}, "
         f"min {min(medians_ms):.3f}, max {max(medians_ms):.3f}; first calls median {statistics.median(first_ms):.3f}, "
-        f"max {max(first_ms):.3f}; replays {runner.replays}, misses {runner.misses}"
+        f"max {max(first_ms):.3f}; replays {runner.replays}, misses {runner.misses}; peak allocation above resident "
+        f"median {statistics.median(rises_mib):.1f} MiB, max {max(rises_mib):.1f} MiB"
     )
     torch.save({"embeddings": torch.stack(embeddings), "median_ms": median_ms}, args.out)
 
