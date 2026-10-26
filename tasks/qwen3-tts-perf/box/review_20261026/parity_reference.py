@@ -1,10 +1,11 @@
 """Generated codec frames of the official qwen-tts 0.1.1 Base voice clone for parity.py's cases: the steps of
 Qwen3TTSModel.generate_voice_clone up to the talker's codes (the vocoder decode skipped, it never changes length), at
-the checkpoint's own sampling defaults, language English, ICL or x-vector-only per case, max_new_tokens as given. A
-row of max_new_tokens frames never emitted codec EOS.
+the checkpoint's own sampling defaults, ICL or x-vector-only per case, max_new_tokens as given, in the simulated
+streaming-text prompt (the clone default) or with --whole-text the whole-text prompt (non_streaming_mode True), and
+language English or auto. A row of max_new_tokens - 1 frames never emitted codec EOS.
 
 usage: /data/refenv/bin/python parity_reference.py CASES.jsonl OUT.json --model Qwen/Qwen3-TTS-12Hz-0.6B-Base
-       --card 1 [--batch 64] [--max-new-tokens 300] [--seed 0]
+       --card 1 [--batch 64] [--max-new-tokens 300] [--seed 0] [--language {auto,English}] [--whole-text]
 
 Runs in a venv holding qwen-tts 0.1.1's pins (transformers 4.57.3, accelerate 1.12.0, torch 2.10.0): its talker does
 not load under the serving image's Transformers.
@@ -29,6 +30,8 @@ def main() -> None:
     parser.add_argument("--batch", type=int, default=64)
     parser.add_argument("--max-new-tokens", type=int, default=300)
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--language", choices=("auto", "English"), default="English")
+    parser.add_argument("--whole-text", action="store_true")
     args = parser.parse_args()
     model = Qwen3TTSModel.from_pretrained(
         args.model, device_map=f"cuda:{args.card}", dtype=torch.bfloat16, attn_implementation="sdpa"
@@ -60,8 +63,8 @@ def main() -> None:
                     input_ids=input_ids,
                     ref_ids=ref_ids,
                     voice_clone_prompt=model._prompt_items_to_voice_clone_prompt(items),
-                    languages=["English"] * len(batch),
-                    non_streaming_mode=False,
+                    languages=[args.language] * len(batch),
+                    non_streaming_mode=args.whole_text,
                     **model._merge_generate_kwargs(max_new_tokens=args.max_new_tokens),
                 )
             frames = [int(code.shape[0]) for code in codes]
@@ -74,7 +77,11 @@ def main() -> None:
                 flush=True,
             )
     args.out.write_text(
-        json.dumps({"model": args.model, "max_new_tokens": args.max_new_tokens, "records": records}), encoding="utf-8"
+        json.dumps({
+            "model": args.model, "max_new_tokens": args.max_new_tokens, "language": args.language,
+            "whole_text": args.whole_text, "records": records,
+        }),
+        encoding="utf-8",
     )
 
 
