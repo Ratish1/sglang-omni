@@ -17,6 +17,7 @@ cuts; a stop at 2048 is a runaway.
 
 import argparse
 import asyncio
+import base64
 import json
 import math
 import sys
@@ -108,11 +109,17 @@ async def scan(cases_path: Path, base_url: str, model: str, label: str, out_path
             "model": model, "input": case["input"], "language": "English", "response_format": "wav",
             "stream": False, "seed": SCAN_SEED, "max_new_tokens": SCAN_MAX_NEW_TOKENS,
         }
-        for field in ("voice", "instructions", "ref_audio", "ref_text"):
+        for field in ("voice", "instructions", "ref_text"):
             if field in case:
                 body[field] = case[field]
             else:
                 pass
+        if "ref_audio" in case:
+            # note (ratish): the API takes reference audio as a data URI, as the SeedTTS client sends it.
+            encoded = base64.b64encode(Path(case["ref_audio"]).read_bytes()).decode("ascii")
+            body["ref_audio"] = f"data:audio/wav;base64,{encoded}"
+        else:
+            pass
         record: dict[str, object] = {
             "id": case["id"], "set": f"{label} {case['set']}", "task": label.rstrip("0123456789"),
             "text_tokens": text_tokens,
@@ -120,7 +127,11 @@ async def scan(cases_path: Path, base_url: str, model: str, label: str, out_path
         async with limit:
             try:
                 response = await client.post(f"{base_url}/v1/audio/speech", json=body)
-                response.raise_for_status()
+                if response.status_code != 200:
+                    record["error"] = f"HTTP {response.status_code}: {response.text[:300]}"
+                    return record
+                else:
+                    pass
                 record["finish_reason"] = response.headers.get("X-Finish-Reason")
                 record["frames"] = int(response.headers["X-Completion-Tokens"])
             except (httpx.HTTPError, KeyError, ValueError) as error:
@@ -169,6 +180,8 @@ def summarize(paths: list[Path]) -> None:
             f"{name} | {len(records)} | {len(errors)} | {len(capped)} | {len(natural)} | {rate_text} | "
             f"{longest_text} | {len(cut_3157)} | {len(cut_vllm)}"
         )
+        for message in sorted({str(record["error"]) for record in errors})[:2]:
+            print(f"  error: {message}")
         for record in sorted(cut_3157, key=lambda record: -record["frames"] / text_length_budget(record["text_tokens"]))[:5]:
             print(
                 f"  cut by #3157: {record['id']} {record['text_tokens']} tokens, {record['frames']} frames, "
