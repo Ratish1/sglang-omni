@@ -9,7 +9,7 @@ usage: python3 layout.py serve CASES.jsonl --base-url URL --model PATH --label L
        python3 layout.py compare BASE_DIR DIR [DIR ...] [--max-new-tokens 300]
 
 serve posts every case as a streaming PCM request (voice default, the reference as a server-side path with its text in
-ICL mode, no seed, max_new_tokens the shared cap), keeps the audio as DIR/audio/<id>.wav, and takes the finish reason
+ICL mode, no seed, max_new_tokens the shared cap, or none at --max-new-tokens 0), keeps the audio as DIR/audio/<id>.wav, and takes the finish reason
 and frames from the stream's outcome. Opening silence is the time to the first 5 ms window at -34 dBFS or louder
 (#2357's onset), closing silence the time after the last such window. score transcribes every clip with the Qwen3-ASR
 server on PORT (WER against the target after the Whisper English normalizer) and, with --sim-card, scores every
@@ -81,8 +81,12 @@ async def serve(cases_path: Path, base_url: str, model: str, label: str, languag
             pass
         body: dict[str, object] = {
             "model": model, "voice": "default", "input": case["input"], "response_format": "pcm", "stream": True,
-            "references": [reference], "max_new_tokens": max_new_tokens,
+            "references": [reference],
         }
+        if max_new_tokens > 0:
+            body["max_new_tokens"] = max_new_tokens
+        else:
+            pass
         if language != "auto":
             body["language"] = language
         else:
@@ -123,7 +127,7 @@ async def serve(cases_path: Path, base_url: str, model: str, label: str, languag
     async def one(client: httpx.AsyncClient, case: dict[str, str]) -> dict[str, object]:
         record = await request(client, case)
         progress["done"] += 1
-        progress["runaways"] += int(record.get("frames", 0) >= max_new_tokens)
+        progress["runaways"] += int(record.get("finish_reason") == "length")
         progress["errors"] += int("error" in record)
         if progress["done"] % PROGRESS_EVERY == 0 or progress["done"] == len(cases):
             print(

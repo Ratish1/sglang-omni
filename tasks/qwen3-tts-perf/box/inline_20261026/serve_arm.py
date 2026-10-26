@@ -2,18 +2,20 @@
 single card, where pair.py's two arms at once do not fit; two arms' seeded runs compare with --compare.
 
 usage: python3 serve_arm.py --label c1s_pr --tree /workspace/pr_52983c59d --card 0 --port 4400 --concurrency 1
-       [--seed 1234] [--no-stream] [--meta LIST]
+       [--seed 1234] [--no-stream] [--meta LIST] [--model PATH] [--bench-args "--no-ref-text"] [--score]
        python3 serve_arm.py --compare c1s_pr c1s_inline
 
 The server takes its card from the stage gpu flags and binds 127.0.0.1 with SGLANG_OMNI_STRICT_PORT; the bench is
-pair.py's (full corpus or --meta, warmup 1, streaming unless --no-stream). nvidia-smi samples the card's used memory
-every 100 ms from health to the bench's end; memory.txt has the card at health, its peak during the bench and the
-peak's rise over health. Results under $ARM_ROOT/<label> (default /data/inline_20261026/arms).
+pair.py's (full corpus or --meta, warmup 1, streaming unless --no-stream, --bench-args appended). nvidia-smi samples the
+card's used memory every 100 ms from health to the bench's end; memory.txt has the card at health, its peak during the
+bench and the peak's rise over health. --score then runs pair.py's WER and similarity scoring on the same card. Results
+under $ARM_ROOT/<label> (default /data/inline_20261026/arms).
 """
 
 import argparse
 import os
 import re
+import shlex
 import subprocess
 import sys
 import time
@@ -21,7 +23,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "v3_20261020"))
 
-from pair import BENCH_TIMEOUT_S, MODEL, audio_hashes, stop_group, wait_healthy  # noqa: E402
+from pair import BENCH_TIMEOUT_S, MODEL, audio_hashes, score, stop_group, wait_healthy  # noqa: E402
 
 ROOT = Path(os.environ.get("ARM_ROOT", "/data/inline_20261026/arms"))
 SAMPLE_INTERVAL_MS = 100
@@ -38,6 +40,9 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=None)
     parser.add_argument("--no-stream", action="store_true")
     parser.add_argument("--meta", default="")
+    parser.add_argument("--model", default=MODEL)
+    parser.add_argument("--bench-args", default="")
+    parser.add_argument("--score", action="store_true")
     parser.add_argument("--compare", nargs=2)
     args = parser.parse_args()
     if args.compare:
@@ -60,7 +65,7 @@ def main() -> None:
         cwd=args.tree, env=server_env, capture_output=True, text=True,
     ).stdout
     (out / "tree.txt").write_text(f"{args.tree} card {args.card}\n{identity}imports {imported}", encoding="utf-8")
-    command = [sys.executable, "-m", "sglang_omni.cli", "serve", "--model-path", MODEL, "--host", "127.0.0.1",
+    command = [sys.executable, "-m", "sglang_omni.cli", "serve", "--model-path", args.model, "--host", "127.0.0.1",
                "--port", str(args.port), "--tts_engine.gpu", str(args.card), "--vocoder.gpu", str(args.card)]
     with open(out / "serve.log", "w", encoding="utf-8") as serve_log:
         spawned = time.monotonic()
@@ -79,10 +84,11 @@ def main() -> None:
                  "-lms", str(SAMPLE_INTERVAL_MS)],
                 stdout=trace, stderr=subprocess.STDOUT,
             )
-        bench = [sys.executable, "-m", "benchmarks.eval.benchmark_tts_seedtts", "--model", MODEL,
+        bench = [sys.executable, "-m", "benchmarks.eval.benchmark_tts_seedtts", "--model", args.model,
                  "--use-existing-server", "--host", "127.0.0.1", "--port", str(args.port), "--generate-only",
                  *([] if args.no_stream else ["--stream"]), "--lang", "en", "--warmup", "1",
-                 "--max-concurrency", str(args.concurrency), "--output-dir", str(out / "bench")]
+                 "--max-concurrency", str(args.concurrency), "--output-dir", str(out / "bench"),
+                 *shlex.split(args.bench_args)]
         if args.seed is not None:
             bench += ["--seed", str(args.seed)]
         else:
@@ -118,6 +124,11 @@ def main() -> None:
         f"{failures}; {memory}; {identity.split()[1] if len(identity.split()) > 1 else identity!r}",
         flush=True,
     )
+    if args.score:
+        score(out, args.card, args.port + 400, args.tree, args.meta, 64)
+        print(f"{args.label} scored", flush=True)
+    else:
+        pass
 
 
 if __name__ == "__main__":
