@@ -96,6 +96,7 @@ class ThinkerModelRunner(ModelRunner):
 
     # note (ratish): a capturing thinker's graphs are captured at FULL, so a prefill chunk asking
     # for hidden states still replays them.
+    @torch.profiler.record_function("diagnostic.requested_capture_hidden_mode_prefill")
     def requested_capture_hidden_mode_prefill(
         self, schedule_batch: ScheduleBatch, requests: list[SchedulerRequest]
     ) -> CaptureHiddenMode:
@@ -119,6 +120,7 @@ class ThinkerModelRunner(ModelRunner):
         del schedule_batch, requests
         return CaptureHiddenMode.NULL
 
+    @torch.profiler.record_function("diagnostic.post_prefill")
     def post_prefill(
         self,
         result: GenerationBatchResult,

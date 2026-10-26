@@ -176,6 +176,7 @@ class TalkerPrefillBuilder:
             tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None
         ) = None
 
+    @torch.profiler.record_function("diagnostic.talker.build_prompt_prefill")
     def build_prompt_prefill(
         self,
         payload: StagePayload,

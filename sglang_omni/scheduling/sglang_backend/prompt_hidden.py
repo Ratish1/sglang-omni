@@ -77,6 +77,7 @@ class PromptHiddenStore:
             f"{self.hidden_states.nbytes / BYTES_PER_GIB:.2f} GiB pinned"
         )
 
+    @torch.profiler.record_function("diagnostic.stage")
     def stage(self, slot_ids: torch.Tensor, hidden_states: torch.Tensor) -> None:
         """Copy a forward's rows and their slot ids to host behind the forward on its stream."""
         staged = StagedPromptHidden(
@@ -92,6 +93,7 @@ class PromptHiddenStore:
         self.staged.append(staged)
         self.store_copied(wait=False)
 
+    @torch.profiler.record_function("diagnostic.store_copied")
     def store_copied(self, *, wait: bool) -> None:
         """Write staged rows into their slots in forward order, so a reused slot keeps its last forward's row."""
         while self.staged and (wait or self.staged[0].copy_done.query()):
@@ -107,6 +109,7 @@ class PromptHiddenStore:
             pass
         self.hidden_states = None
 
+    @torch.profiler.record_function("diagnostic.read")
     def read(self, request_pool_index: int, positions: torch.Tensor) -> torch.Tensor:
         """The rows at a request's prompt positions, through the slots its KV holds now."""
         req_to_token = self.req_to_token_pool.req_to_token

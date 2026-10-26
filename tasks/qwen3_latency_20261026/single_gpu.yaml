@@ -1,0 +1,23 @@
+config_cls: Qwen3OmniSpeechPipelineConfig
+model_path: Qwen/Qwen3-Omni-30B-A3B-Instruct
+
+stages:
+  image_encoder:
+    gpu: 0
+  audio_encoder:
+    gpu: 0
+  thinker:
+    gpu: 0
+    engine:
+      mem_fraction_static: 0.65
+    factory:
+      max_seq_len: 32768
+  talker_ar:
+    gpu: 0
+    engine:
+      mem_fraction_static: 0.12
+  code2wav:
+    gpu: 0
+  preprocessing:
+    factory:
+      max_seq_len: 32768

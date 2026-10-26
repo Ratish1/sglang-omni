@@ -11,6 +11,7 @@ import os
 import random
 import struct
 import time
+import uuid
 from typing import Any, TypedDict
 
 import aiohttp
@@ -133,6 +134,7 @@ def make_video_send_fn(
 
         payload: dict[str, Any] = {
             "model": model_name,
+            "request_id": f"diagnostic-{sample.sample_id}-{uuid.uuid4()}",
             "messages": [{"role": "user", "content": prompt}],
             "videos": [sample.video_path],
             "modalities": modalities,
