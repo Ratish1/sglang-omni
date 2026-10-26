@@ -50,16 +50,18 @@ def log_mel(
     end, whose reflect pad of (n_fft - hop) / 2 a side gives samples // hop frames; with
     padded_frames, zeros after the reflect pad extend it to that many frames."""
     padding_samples = (SPEAKER_MEL_N_FFT - SPEAKER_MEL_HOP) // 2
-    padded = F.pad(waveform, (padding_samples, padding_samples), mode="reflect")
+    padded_waveform = F.pad(
+        waveform, (padding_samples, padding_samples), mode="reflect"
+    )
     if padded_frames is not None:
         # note (ratish): up to the longest input with padded_frames frames, so the count
         # is never negative; no frame inside the clip reads the zeros.
         tail_samples = SPEAKER_MEL_HOP * (padded_frames + 1) - 1 - waveform.shape[1]
-        padded = F.pad(padded, (0, tail_samples))
+        padded_waveform = F.pad(padded_waveform, (0, tail_samples))
     else:
         pass
     spectrum = torch.stft(
-        padded,
+        padded_waveform,
         SPEAKER_MEL_N_FFT,
         hop_length=SPEAKER_MEL_HOP,
         win_length=SPEAKER_MEL_N_FFT,
