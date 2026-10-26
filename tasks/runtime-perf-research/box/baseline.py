@@ -10,6 +10,8 @@ One server from this tree, placed on --card with the stage gpu flags, healthy be
   pyspy   the same with py-spy record (--threads --nonblocking, 100 Hz, running threads only) on every server
           process for --pyspy-seconds, starting --pyspy-delay seconds into the benchmark
   pyspygil  the same with --gil (one sample per tick, the interpreter lock holder)
+  nsys    the same with an nsys collection of --nsys-seconds starting --nsys-delay seconds into the benchmark, the
+          server launched under the nsys session --nsys-session (CUDA trace, graph level), exported to trace.sqlite
   warm    a full benchmark pass whose numbers are not read (absorbs first-use work after the server's warmup)
 
 Every pass also stores the CPU seconds of every server thread at its start and end (thread_cpu.json) and the
@@ -260,6 +262,18 @@ def run_pass(args, server: subprocess.Popen, load: int, kind: str, warmup: bool)
                      "--output", str(out / f"pyspy_{pid}.txt")],
                     stdout=subprocess.DEVNULL, stderr=open(out / f"pyspy_{pid}.err", "w"),
                 ))
+        elif kind == "nsys":
+            time.sleep(args.nsys_delay)
+            with open(out / "nsys.log", "w", encoding="utf-8") as nsys_log:
+                subprocess.run(["nsys", "start", f"--session={args.nsys_session}", "--sample=none", "--cpuctxsw=none",
+                                f"--output={out / 'trace'}", "--force-overwrite=true"],
+                               stdout=nsys_log, stderr=subprocess.STDOUT, check=False)
+                nsys_start = time.time()
+                time.sleep(args.nsys_seconds)
+                subprocess.run(["nsys", "stop", f"--session={args.nsys_session}"], stdout=nsys_log,
+                               stderr=subprocess.STDOUT, check=False)
+            (out / "nsys_window.json").write_text(json.dumps({"start": nsys_start, "end": time.time()}),
+                                                  encoding="utf-8")
         else:
             pass
         rc = bench.wait(timeout=BENCH_TIMEOUT_S)
@@ -281,6 +295,12 @@ def run_pass(args, server: subprocess.Popen, load: int, kind: str, warmup: bool)
     if kind == "events":
         (out / "events_stop.json").write_text(post(args.port, "/stop_request_profile", {"run_id": f"c{load}"}),
                                               encoding="utf-8")
+    elif kind == "nsys":
+        # note (ratish): exported after the benchmark ends, so the export's CPU does not land in a traced window
+        with open(out / "nsys.log", "a", encoding="utf-8") as nsys_log:
+            subprocess.run(["nsys", "export", "--type", "sqlite", "--force-overwrite=true", "--output",
+                            str(out / "trace.sqlite"), str(out / "trace.nsys-rep")],
+                           stdout=nsys_log, stderr=subprocess.STDOUT, check=False)
     else:
         pass
     (out / "thread_cpu.json").write_text(json.dumps({"start": cpu_start, "end": cpu_end}), encoding="utf-8")
@@ -304,6 +324,10 @@ def main() -> None:
     parser.add_argument("--passes", default="clean,events,pyspy")
     parser.add_argument("--pyspy-delay", type=float, default=8.0)
     parser.add_argument("--pyspy-seconds", type=float, default=15.0)
+    parser.add_argument("--nsys-session", default="",
+                        help="launch the server under this nsys session (needed by nsys passes)")
+    parser.add_argument("--nsys-delay", type=float, default=10.0)
+    parser.add_argument("--nsys-seconds", type=float, default=10.0)
     parser.add_argument("--serve-extra", default="")
     parser.add_argument("--probe", action="store_true",
                         help="boot with hop_probe (queue hops, loop lag, GC) writing to <out>/probe/p.<pid>.jsonl")
@@ -345,6 +369,11 @@ def main() -> None:
         "--host", "127.0.0.1", "--port", str(args.port),
         *shlex.split(spec["placement"].format(card=args.card)), *shlex.split(args.serve_extra),
     ]
+    if args.nsys_session:
+        serve = ["nsys", "launch", f"--session-new={args.nsys_session}", "--trace=cuda", "--cuda-graph-trace=graph",
+                 *serve]
+    else:
+        pass
     (out / "identity.txt").write_text(
         f"tree {TREE}\n{identity}imports {imported}serve {shlex.join(serve)}\npythonpath {env['PYTHONPATH']}\n"
         f"serve env {args.serve_env}\nloadavg {os.getloadavg()}\n",
@@ -372,6 +401,10 @@ def main() -> None:
         )
     finally:
         stop_group(server)
+        if args.nsys_session:
+            subprocess.run(["nsys", "shutdown", f"--session={args.nsys_session}"], capture_output=True, check=False)
+        else:
+            pass
         with open(out / "progress.txt", "a", encoding="utf-8") as progress:
             progress.write(f"{time.strftime('%H:%M:%S')} done, group left {group_pids(server.pid)}\n")
 
