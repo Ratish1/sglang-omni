@@ -30,6 +30,8 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import httpx
+import numpy as np
+import soundfile
 from jiwer import process_words
 from transformers import AutoConfig, AutoProcessor
 
@@ -54,6 +56,11 @@ VOICE_DESIGN_SLOW = (
 VLLM_OMNI_CEILINGS = {"base": (192, 12.0), "customvoice": (400, 40.0), "voicedesign": (400, 40.0)}
 # A saved output with WER at most this is the target spoken; one with more insertions than target words is a loop.
 VALID_WER = 0.5
+SECONDS_PER_FRAME = 0.08
+# A 20 ms frame is speech when its RMS is within this of the clip's loudest frame; the cut keeps speech that ends
+# within the tolerance of it.
+SPEECH_FLOOR_DB = -35.0
+SPEECH_END_TOLERANCE_S = 0.1
 
 
 def write_cases(path: Path, cases: list[dict[str, str]]) -> None:
@@ -273,6 +280,66 @@ def check(paths: list[Path], asr_port: int, concurrency: int) -> None:
         print(f"{name} | {counts[0]} | {counts[1]} | {longest_text}")
 
 
+def last_voiced_s(wav_path: str) -> float:
+    """Time the last 20 ms frame ends whose RMS is within SPEECH_FLOOR_DB of the clip's loudest frame."""
+    audio, rate = soundfile.read(wav_path, dtype="float32", always_2d=False)
+    frame = int(rate * 0.02)
+    frames = len(audio) // frame
+    rms = np.sqrt(np.mean(audio[: frames * frame].reshape(frames, frame) ** 2, axis=1))
+    voiced = np.flatnonzero(rms > max(rms.max() * 10 ** (SPEECH_FLOOR_DB / 20), 1e-4))
+    return float((voiced[-1] + 1) * frame / rate) if voiced.size else 0.0
+
+
+def speech(check_path: Path) -> None:
+    """Whether each checked output past #3157's budget still speaks after the budget's cut, or only falls silent."""
+    records = [json.loads(line) for line in check_path.read_text(encoding="utf-8").splitlines() if line]
+    print(
+        "set | cut by #3157: speech lost / silence only / loop | cut by vLLM-Omni's ceiling: speech lost / "
+        "silence only / loop | latest speech end past #3157's cut, s (tokens)"
+    )
+    by_set: dict[str, list[dict[str, object]]] = {}
+    for record in records:
+        record["speech_end_s"] = last_voiced_s(str(record["audio"]))
+        by_set.setdefault(str(record["set"]), []).append(record)
+
+    def verdict(record: dict[str, object], cut_frames: int) -> str:
+        if record["verdict"] == "loop":
+            return "loop"
+        elif record["speech_end_s"] > cut_frames * SECONDS_PER_FRAME + SPEECH_END_TOLERANCE_S:
+            return "speech lost"
+        else:
+            return "silence only"
+
+    for name, flagged in sorted(by_set.items()):
+        counts = []
+        for cut_of in (
+            lambda record: text_length_budget(record["text_tokens"]),
+            lambda record: vllm_omni_ceiling(str(record["task"]), record["text_tokens"]),
+        ):
+            over = [record for record in flagged if record["frames"] > cut_of(record)]
+            verdicts = [verdict(record, cut_of(record)) for record in over]
+            counts.append(" / ".join(str(verdicts.count(kind)) for kind in ("speech lost", "silence only", "loop")))
+        lost = [
+            record for record in flagged
+            if verdict(record, text_length_budget(record["text_tokens"])) == "speech lost"
+        ]
+        worst = max(
+            lost,
+            key=lambda record: record["speech_end_s"] - text_length_budget(record["text_tokens"]) * SECONDS_PER_FRAME,
+            default=None,
+        )
+        worst_text = (
+            f"{worst['speech_end_s'] - text_length_budget(worst['text_tokens']) * SECONDS_PER_FRAME:.1f} "
+            f"({worst['text_tokens']})"
+            if worst is not None
+            else "-"
+        )
+        print(f"{name} | {counts[0]} | {counts[1]} | {worst_text}")
+    check_path.with_name("speech.jsonl").write_text(
+        "".join(json.dumps(record, ensure_ascii=False) + "\n" for record in records), encoding="utf-8"
+    )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     commands = parser.add_subparsers(dest="command", required=True)
@@ -292,6 +359,8 @@ def main() -> None:
     check_parser.add_argument("results", type=Path, nargs="+")
     check_parser.add_argument("--asr-port", type=int, required=True)
     check_parser.add_argument("--concurrency", type=int, default=16)
+    speech_parser = commands.add_parser("speech")
+    speech_parser.add_argument("check", type=Path)
     args = parser.parse_args()
     if args.command == "cases":
         build_cases(args.out_dir)
@@ -301,6 +370,8 @@ def main() -> None:
         )
     elif args.command == "check":
         check(args.results, args.asr_port, args.concurrency)
+    elif args.command == "speech":
+        speech(args.check)
     else:
         summarize(args.results)
 
