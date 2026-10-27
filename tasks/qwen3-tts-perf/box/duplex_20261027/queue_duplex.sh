@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Full-duplex A/B: the cascade's Qwen3-TTS requests (duplex_ab.py) against main and the first batch, each server
 # started as the profiles start it (their config and static fraction), one arm a card, then the cards swapped.
-# Per model pair: one request at a time on the sentence sets (first audio as one conversation hears it), barge-in
-# interrupts, then 16 at a time on every set. Then Qwen3-ASR on card 0 and WavLM on card 1 score every clip.
+# Per model pair: one request at a time on the English sentences (first audio as one conversation hears it), barge-in
+# interrupts, then 16 at a time on every set. Then Qwen3-ASR on card 0 and WavLM on card 1 score the c16 clips.
 set -u
 D=${D:?the results directory}
 MAIN=${MAIN:?the main tree}
@@ -78,7 +78,7 @@ for order in o1 o2; do
       serve_both $order $model icl06 16 c16
     else
       serve_both $order $model xvec17 1 c1 --sets "en sentence"
-      serve_both $order $model icl17zh 1 c1 --sets "zh sentence"
+      serve_both $order $model icl17zh 1 c1 --sets "en sentence"
       serve_both $order $model xvec17 16 interrupt --sets "en sentence" --interrupt
       serve_both $order $model xvec17 16 c16
       serve_both $order $model icl17zh 16 c16
@@ -88,7 +88,7 @@ for order in o1 o2; do
   done
 done
 start_server asr $MAIN 4700 --model-path Qwen/Qwen3-ASR-1.7B --asr.gpu 0 --mem-fraction-static 0.5 || exit 1
-DIRS=$(ls -d $D/runs/*_c1 $D/runs/*_c16)
+DIRS=$(ls -d $D/runs/*_c16)
 (cd $MAIN && PYTHONPATH=$MAIN python3 $HERE/duplex_ab.py score $DIRS --asr-port 4700 --sim-card 1 >> $D/logs/score.log 2>&1)
 echo "score rc $? $(tail -n 1 $D/logs/score.log) $(date +%T)" >> $L
 stop_server asr
