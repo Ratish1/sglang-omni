@@ -151,12 +151,14 @@ def load_qwen3_tts_tokenizer(
             device,
             attn_implementation or "upstream-default",
         )
-        tokenizer = Qwen3TTSTokenizer.from_pretrained(tokenizer_path, **kwargs)
         if os.environ.get("QWEN3_TTS_PROBE_ENCODER_FP32") == "1":
-            # probe: the reference codec encoder in the checkpoint's own dtype, the decoder unchanged
-            tokenizer.model.encoder.to(torch.float32)
+            # probe: the codec loaded from its float32 checkpoint, the decoder cast to the server dtype as before
+            tokenizer = Qwen3TTSTokenizer.from_pretrained(
+                tokenizer_path, **{**kwargs, "dtype": torch.float32}
+            )
+            tokenizer.model.decoder.to(torch_dtype)
         else:
-            pass
+            tokenizer = Qwen3TTSTokenizer.from_pretrained(tokenizer_path, **kwargs)
         move_conv_padding_to_host(tokenizer.model.encoder)
         _SPEECH_TOKENIZERS[key] = tokenizer
         return tokenizer
