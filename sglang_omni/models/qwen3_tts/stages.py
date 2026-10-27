@@ -426,7 +426,6 @@ def create_vocoder_executor(
     incremental_codec_cuda_graph_window_frames: Sequence[int] | None = None,
     incremental_codec_cuda_graph_min_free_gb: float = 3.0,
     suppress_bootstrap_silence: bool = True,
-    suppress_bootstrap_max_streams: int = 24,
     running_stream_count: int | None = None,
 ) -> Qwen3TTSStreamingVocoderScheduler:
     device = str(resolve_concrete_device(device, gpu_id))
@@ -506,7 +505,6 @@ def create_vocoder_executor(
             incremental_codec_cuda_graph_min_free_gb
         ),
         suppress_bootstrap_silence=suppress_bootstrap_silence,
-        suppress_bootstrap_max_streams=suppress_bootstrap_max_streams,
         # note (ratish): only a Base checkpoint clones a reference voice, so only its
         # first chunks carry reference codes.
         has_reference_prefixed_first_chunks=model_type == "base",
