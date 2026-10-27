@@ -2,13 +2,16 @@
 
 from __future__ import annotations
 
+import copy
 import sys
 import types
+from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
 import pytest
 import torch
+from safetensors.torch import save_file
 from transformers import MimiConfig, MimiModel
 from transformers.models.mimi.modeling_mimi import (
     MimiConv1d,
@@ -84,6 +87,9 @@ def test_speech_tokenizer_loader_moves_the_encoder_padding_to_host(
     )
     monkeypatch.setattr(qwen3_stages, "_resolve_checkpoint", lambda path: path)
     monkeypatch.setattr(qwen3_stages, "_SPEECH_TOKENIZERS", {})
+    monkeypatch.setattr(
+        qwen3_stages, "load_float32_encoder_weights", lambda tokenizer, path: None
+    )
 
     tokenizer = qwen3_stages.load_qwen3_tts_tokenizer(
         "/ckpt", device="cpu", dtype="float32", attn_implementation=None
@@ -92,6 +98,63 @@ def test_speech_tokenizer_loader_moves_the_encoder_padding_to_host(
     convs = [m for m in tokenizer.model.encoder.modules() if isinstance(m, MimiConv1d)]
     assert len(convs) == 1 + 2 * (2 + 1) + 1
     assert all(conv.padding_total.device.type == "cpu" for conv in convs)
+
+
+def test_speech_tokenizer_loader_gives_the_encoder_its_float32_checkpoint_weights(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A bf16 server encoded references with bf16-rounded weights, which flipped most residual codes against the float32 checkpoint."""
+    torch.manual_seed(5)
+    config = small_mimi_config()
+    checkpoint_encoder = MimiModel(config)
+    checkpoint = {
+        name: tensor.contiguous()
+        for name, tensor in checkpoint_encoder.state_dict().items()
+    }
+    (tmp_path / "speech_tokenizer").mkdir()
+    save_file(
+        {f"encoder.{name}": tensor for name, tensor in checkpoint.items()},
+        str(tmp_path / "speech_tokenizer" / "model.safetensors"),
+    )
+
+    class FakeDecoder(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.proj = torch.nn.Linear(4, 4)
+            self.register_buffer("inv_freq", torch.rand(4), persistent=False)
+
+    class FakeQwen3TTSTokenizer:
+        @classmethod
+        def from_pretrained(cls, path, **kwargs):
+            decoder = FakeDecoder()
+            decoder.proj.to(kwargs["dtype"])
+            tokenizer = cls()
+            tokenizer.model = SimpleNamespace(
+                encoder=copy.deepcopy(checkpoint_encoder).to(kwargs["dtype"]),
+                decoder=decoder,
+            )
+            return tokenizer
+
+    qwen_tts_module = types.ModuleType("qwen_tts")
+    qwen_tts_module.Qwen3TTSTokenizer = FakeQwen3TTSTokenizer
+    monkeypatch.setitem(sys.modules, "qwen_tts", qwen_tts_module)
+    monkeypatch.setattr(
+        qwen3_stages, "apply_qwen_tts_transformers_compatibility_patches", lambda: None
+    )
+    monkeypatch.setattr(qwen3_stages, "_resolve_checkpoint", lambda path: path)
+    monkeypatch.setattr(qwen3_stages, "_SPEECH_TOKENIZERS", {})
+
+    tokenizer = qwen3_stages.load_qwen3_tts_tokenizer(
+        str(tmp_path), device="cpu", dtype="bfloat16", attn_implementation=None
+    )
+
+    loaded = tokenizer.model.encoder.state_dict()
+    assert loaded.keys() == checkpoint.keys()
+    for name, tensor in checkpoint.items():
+        assert loaded[name].dtype == torch.float32
+        assert torch.equal(loaded[name], tensor)
+    assert tokenizer.model.decoder.proj.weight.dtype == torch.bfloat16
+    assert tokenizer.model.decoder.inv_freq.dtype == torch.float32
 
 
 def test_smallest_bucket_picks_the_first_bucket_that_fits() -> None:

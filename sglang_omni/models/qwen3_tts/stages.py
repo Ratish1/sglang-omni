@@ -39,6 +39,7 @@ from sglang_omni.models.qwen3_tts.streaming_vocoder import (
     Qwen3TTSStreamingVocoderScheduler,
     UnsupportedAdminData,
 )
+from sglang_omni.models.weight_loader import load_weights_by_prefix
 from sglang_omni.platforms import current_platform
 from sglang_omni.proto.admin import ADMIN_MODEL_INFO
 from sglang_omni.proto.request import StagePayload
@@ -104,6 +105,17 @@ def resolve_qwen3_tts_attn_implementation(
     return attn_implementation or "sdpa"
 
 
+def load_float32_encoder_weights(
+    tokenizer: "Qwen3TTSTokenizer", tokenizer_path: str
+) -> None:
+    """Give the codec encoder its float32 checkpoint weights; the decoder is untouched."""
+    # note (ratish): the encoder's quantizers pick each codeword by nearest distance,
+    # which bf16 rounding flips, so the encoder keeps the checkpoint's float32.
+    encoder = tokenizer.model.encoder
+    encoder.to(torch.float32)
+    encoder.load_state_dict(load_weights_by_prefix(tokenizer_path, prefix="encoder."))
+
+
 def load_qwen3_tts_tokenizer(
     model_path: str,
     *,
@@ -152,6 +164,7 @@ def load_qwen3_tts_tokenizer(
             attn_implementation or "upstream-default",
         )
         tokenizer = Qwen3TTSTokenizer.from_pretrained(tokenizer_path, **kwargs)
+        load_float32_encoder_weights(tokenizer, tokenizer_path)
         move_conv_padding_to_host(tokenizer.model.encoder)
         _SPEECH_TOKENIZERS[key] = tokenizer
         return tokenizer
