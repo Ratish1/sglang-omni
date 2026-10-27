@@ -328,15 +328,15 @@ class TalkerPrefillBuilder:
             return self.model.text_projection(chunk_tensor)[0].detach()
         else:
             pass
-        # note (ratish): a token's projected row depends only on its id, so each id is projected once
-        # and every request shares the row, as the tts special rows are shared.
-        projected = self.projected_text_cache.get(int(token_id))
+        # note (ratish): a token's projected row depends only on its id, so each id is projected once and every request shares the row, as the tts special rows are shared.
+        token_id = int(token_id)
+        projected = self.projected_text_cache.get(token_id)
         if projected is None:
             chunk_tensor = self.load_prompt_token_embeddings(
-                torch.tensor([int(token_id)], dtype=torch.long)
+                torch.tensor([token_id], dtype=torch.long)
             )
             projected = self.model.text_projection(chunk_tensor)[0].detach()
-            self.projected_text_cache[int(token_id)] = projected
+            self.projected_text_cache[token_id] = projected
         else:
             pass
         return projected
