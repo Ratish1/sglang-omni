@@ -1,9 +1,9 @@
 """Reference codes of the Qwen3-TTS codec encoder four ways on the same clips: official's tokenizer encode of one clip
-at its exact length in bf16 and in fp32, and our reference batcher in bf16 eagerly and through its CUDA graphs as
-served. Prints, for every pair, the share of codes that agree overall and on codebook 0, the share of clips with every
-code equal, and the median first frame where a clip's codes part.
+at its exact length in bf16 and in fp32, and our reference batcher eagerly and through its CUDA graphs as served, in
+bf16 or with --ours-fp32 on the float32 tokenizer. Prints, for every pair, the share of codes that agree overall and on
+codebook 0, the share of clips with every code equal, and the median first frame where a clip's codes part.
 
-usage: python3 ref_codes_check.py WAV_DIR --model Qwen/Qwen3-TTS-12Hz-0.6B-Base [--card 0] [--clips 200]
+usage: python3 ref_codes_check.py WAV_DIR --model Qwen/Qwen3-TTS-12Hz-0.6B-Base [--card 0] [--clips 200] [--ours-fp32]
 """
 
 import argparse
@@ -25,13 +25,15 @@ def main() -> None:
     parser.add_argument("--model", required=True)
     parser.add_argument("--card", type=int, default=0)
     parser.add_argument("--clips", type=int, default=200)
+    parser.add_argument("--ours-fp32", action="store_true")
     args = parser.parse_args()
     device = f"cuda:{args.card}"
     torch.cuda.set_device(device)
     bf16 = load_qwen3_tts_tokenizer(args.model, device=device, dtype="bfloat16", attn_implementation=None)
     fp32 = load_qwen3_tts_tokenizer(args.model, device=device, dtype="float32", attn_implementation=None)
-    eager = Qwen3TTSRefCodeBatcher(bf16)
-    graphs = Qwen3TTSRefCodeBatcher(bf16, graph_bucket_frames=DEFAULT_QWEN3_TTS_REFERENCE_ENCODER_BUCKET_FRAMES)
+    ours = fp32 if args.ours_fp32 else bf16
+    eager = Qwen3TTSRefCodeBatcher(ours)
+    graphs = Qwen3TTSRefCodeBatcher(ours, graph_bucket_frames=DEFAULT_QWEN3_TTS_REFERENCE_ENCODER_BUCKET_FRAMES)
     arms: dict[str, list[torch.Tensor]] = {"official_bf16": [], "official_fp32": [], "ours_eager": [], "ours_graphs": []}
     for path in sorted(args.wavs.glob("*.wav"))[: args.clips]:
         waveform, sample_rate = librosa.load(str(path), sr=None, mono=True)
