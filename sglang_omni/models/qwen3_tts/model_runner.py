@@ -178,7 +178,8 @@ class Qwen3TTSModelRunner(ModelRunner):
             active_logits[:, suppress_start:suppress_stop] = float("-inf")
         for row_index, scheduled_request in enumerate(requests):
             if len(scheduled_request.data.output_codes) < QWEN3_TTS_MIN_NEW_FRAMES:
-                active_logits[row_index, codec_eos] = float("-inf")
+                # note (ratish): a slice fills on the device; assigning one element copies a host scalar and waits for the stream.
+                active_logits[row_index, codec_eos : codec_eos + 1] = float("-inf")
             else:
                 pass
 
