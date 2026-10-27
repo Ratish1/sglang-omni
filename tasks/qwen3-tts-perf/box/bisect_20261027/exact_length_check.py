@@ -14,8 +14,8 @@ from pathlib import Path
 
 import librosa
 import torch
-from qwen_tts import Qwen3TTSTokenizer
 
+from sglang_omni.models.qwen3_tts.compat import apply_qwen_tts_transformers_compatibility_patches
 from sglang_omni.models.qwen3_tts.reference_encoder_cuda_graph import DEFAULT_QWEN3_TTS_REFERENCE_ENCODER_BUCKET_FRAMES
 from sglang_omni.models.qwen3_tts.request_builders import Qwen3TTSRefCodeBatcher
 from sglang_omni.models.qwen3_tts.stages import load_qwen3_tts_tokenizer
@@ -52,6 +52,9 @@ def main() -> None:
     args = parser.parse_args()
     device = f"cuda:{args.card}"
     torch.cuda.set_device(device)
+    apply_qwen_tts_transformers_compatibility_patches()
+    from qwen_tts import Qwen3TTSTokenizer
+
     ours = load_qwen3_tts_tokenizer(args.model, device=device, dtype="bfloat16", attn_implementation=None)
     official = Qwen3TTSTokenizer.from_pretrained(
         os.path.join(resolve_checkpoint(args.model), "speech_tokenizer"), device_map=device, dtype=torch.float32
