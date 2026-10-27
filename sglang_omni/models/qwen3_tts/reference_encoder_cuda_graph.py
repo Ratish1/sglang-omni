@@ -68,16 +68,13 @@ def pad_tail(
 
 
 def pad_strided_conv_tails(encoder: MimiModel) -> None:
-    """Make a padded encode give the codes of the clip's exact-length encode.
+    """Make a padded encode give the clip's exact-length codes.
 
-    At the exact length every strided conv pads its own input past the clip in its
-    pad mode (zeros in the encoder, the last frame in the downsample), so its last
-    frame reads that padding; padded, it would read the convs' output over the
-    padding instead. A stride-1 causal conv keeps the length and a stride-s conv
-    yields ceil(L / s) frames, so the clip spans its samples over the strides
-    before a conv, rounded up. Every encode first sets the clip's samples in
-    `encoder.clip_samples`.
+    Every encode first sets the clip's samples in encoder.clip_samples.
     """
+    # note (ratish): at the exact length each strided conv pads past the clip in its own
+    # mode, and a stride-s conv yields ceil(L / s) frames, so the clip spans its samples
+    # over the strides before the conv, rounded up.
     device = next(encoder.parameters()).device
     encoder.register_buffer(
         "clip_samples",

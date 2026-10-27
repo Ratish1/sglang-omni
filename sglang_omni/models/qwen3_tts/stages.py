@@ -105,7 +105,7 @@ def load_float32_encoder_weights(
     tokenizer: "Qwen3TTSTokenizer", tokenizer_path: str
 ) -> None:
     """Give the codec encoder its float32 checkpoint weights; the decoder is untouched."""
-    # note(ratish): the encoder's quantizers pick each codeword by nearest distance,
+    # note (ratish): the encoder's quantizers pick each codeword by nearest distance,
     # which bf16 rounding flips, so the encoder keeps the checkpoint's float32.
     encoder = tokenizer.model.encoder
     encoder.to(torch.float32)

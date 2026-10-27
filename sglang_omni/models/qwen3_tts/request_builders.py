@@ -1062,7 +1062,7 @@ class Qwen3TTSRefCodeBatcher:
         else:
             pass
         frames = -(-samples.numel() // self.hop)
-        # note(ratish): whole frames, so the eager encode has the shape the graphs capture;
+        # note (ratish): whole frames, so the eager encode has the shape the graphs capture;
         # past the ladder a new length costs cuDNN a plan per conv, so lengths round up to
         # the largest bucket.
         if (
