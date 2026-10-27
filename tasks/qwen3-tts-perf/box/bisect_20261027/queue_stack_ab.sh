@@ -22,7 +22,8 @@ echo "queue stack ab start $(date +%T) arms [$ARMS] main $(git -C $MAIN rev-pars
 port=$PORT
 for spec in "c16n_main1 $MAIN 16 --no-stream" "c16n_stack1 $STACK 16 --no-stream" "c16n_stack2 $STACK 16 --no-stream" \
   "c16n_main2 $MAIN 16 --no-stream" "c1n_main $MAIN 1 --no-stream" "c1n_stack $STACK 1 --no-stream" \
-  "c16s_main $MAIN 16" "c16s_stack $STACK 16"; do
+  "c16s_main $MAIN 16" "c16s_stack $STACK 16" "c16s_stack2 $STACK 16" "c16s_main2 $MAIN 16" \
+  "c64s_main $MAIN 64" "c64s_stack $STACK 64" "c64s_stack2 $STACK 64" "c64s_main2 $MAIN 64"; do
   set -- $spec
   if [[ " $ARMS " != *" $1 "* ]]; then
     port=$((port + 20))
