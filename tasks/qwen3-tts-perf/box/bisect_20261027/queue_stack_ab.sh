@@ -20,8 +20,12 @@ for spec in "c16n_main1 $MAIN 16 --no-stream" "c16n_stack1 $STACK 16 --no-stream
   "c16n_main2 $MAIN 16 --no-stream" "c1n_main $MAIN 1 --no-stream" "c1n_stack $STACK 1 --no-stream" \
   "c16s_main $MAIN 16" "c16s_stack $STACK 16"; do
   set -- $spec
-  ARM_ROOT=$D/arms python3 $ARM --label $1 --tree $2 --card 0 --port $port --concurrency $3 $4 --score >> $L 2>&1
-  echo "arm $1 rc $? $(date +%T)" >> $L
+  if [ -f $D/arms/$1/bench/similarity_results.json ]; then
+    echo "arm $1 already scored, skipped $(date +%T)" >> $L
+  else
+    ARM_ROOT=$D/arms python3 $ARM --label $1 --tree $2 --card 0 --port $port --concurrency $3 ${4:-} --score >> $L 2>&1
+    echo "arm $1 rc $? $(date +%T)" >> $L
+  fi
   port=$((port + 20))
 done
 echo "queue_stack_ab_done $(date +%T)" >> $L
