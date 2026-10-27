@@ -185,7 +185,7 @@ def ms(ns) -> float:
 
 
 class Report:
-    def __init__(self, path: str, bench_log: str | None):
+    def __init__(self, path: str, bench_log: str | None, skip_s: float | None = None):
         self.db = sqlite3.connect(path)
         self.strings = dict(self.db.execute("select id, value from StringIds"))
         self.tables = {
@@ -196,6 +196,19 @@ class Report:
         }
         if bench_log:
             self.t0, self.t1 = bench_window(self.db, bench_log)
+        elif skip_s is not None:
+            # from skip_s after the first request reaches preprocessing to the last chunk at the coordinator
+            marks = [
+                (start, self.text(text, text_id))
+                for start, text, text_id in self.db.execute(
+                    "select start, text, textId from NVTX_EVENTS where eventType = ?",
+                    (MARK,),
+                )
+            ]
+            self.t0 = min(
+                start for start, label in marks if label.startswith("q preprocessing.in.put")
+            ) + int(skip_s * 1e9)
+            self.t1 = max(start for start, label in marks if label.startswith("coord.recv"))
         else:
             self.t0, self.t1 = self.db.execute(
                 "select min(start), max(end) from CUPTI_ACTIVITY_KIND_RUNTIME"
@@ -982,8 +995,9 @@ def main() -> None:
     parser.add_argument("--bench-log")
     parser.add_argument("--top", type=int, default=25)
     parser.add_argument("--sections", default="ABCDEFGH")
+    parser.add_argument("--skip-s", type=float)
     args = parser.parse_args()
-    r = Report(args.report, args.bench_log)
+    r = Report(args.report, args.bench_log, args.skip_s)
     print(
         f"window {r.t0 / 1e9:.3f} .. {r.t1 / 1e9:.3f} s ({(r.t1 - r.t0) / 1e9:.1f} s)"
     )
