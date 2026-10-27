@@ -73,7 +73,9 @@ def test_speech_tokenizer_loader_moves_the_encoder_padding_to_host(
         @classmethod
         def from_pretrained(cls, path, **kwargs):
             tokenizer = cls()
-            tokenizer.model = SimpleNamespace(encoder=MimiModel(config).encoder)
+            tokenizer.model = SimpleNamespace(
+                encoder=MimiModel(config).encoder, decoder=torch.nn.Linear(4, 4)
+            )
             return tokenizer
 
     qwen_tts_module = types.ModuleType("qwen_tts")
@@ -92,6 +94,49 @@ def test_speech_tokenizer_loader_moves_the_encoder_padding_to_host(
     convs = [m for m in tokenizer.model.encoder.modules() if isinstance(m, MimiConv1d)]
     assert len(convs) == 1 + 2 * (2 + 1) + 1
     assert all(conv.padding_total.device.type == "cpu" for conv in convs)
+
+
+def test_speech_tokenizer_loader_keeps_the_encoder_in_the_checkpoint_dtype(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A bf16 server encoded references in bf16, which flipped most residual codes against the float32 checkpoint."""
+    config = small_mimi_config()
+
+    class FakeQwen3TTSTokenizer:
+        @classmethod
+        def from_pretrained(cls, path, **kwargs):
+            checkpoint_dtype = torch.float32
+            loaded_dtype = (
+                checkpoint_dtype if kwargs["dtype"] == "auto" else kwargs["dtype"]
+            )
+            tokenizer = cls()
+            tokenizer.model = SimpleNamespace(
+                encoder=MimiModel(config).encoder.to(loaded_dtype),
+                decoder=torch.nn.Linear(4, 4).to(loaded_dtype),
+            )
+            return tokenizer
+
+    qwen_tts_module = types.ModuleType("qwen_tts")
+    qwen_tts_module.Qwen3TTSTokenizer = FakeQwen3TTSTokenizer
+    monkeypatch.setitem(sys.modules, "qwen_tts", qwen_tts_module)
+    monkeypatch.setattr(
+        qwen3_stages, "apply_qwen_tts_transformers_compatibility_patches", lambda: None
+    )
+    monkeypatch.setattr(qwen3_stages, "_resolve_checkpoint", lambda path: path)
+    monkeypatch.setattr(qwen3_stages, "_SPEECH_TOKENIZERS", {})
+
+    tokenizer = qwen3_stages.load_qwen3_tts_tokenizer(
+        "/ckpt", device="cpu", dtype="bfloat16", attn_implementation=None
+    )
+
+    encoder_dtypes = {
+        parameter.dtype for parameter in tokenizer.model.encoder.parameters()
+    }
+    decoder_dtypes = {
+        parameter.dtype for parameter in tokenizer.model.decoder.parameters()
+    }
+    assert encoder_dtypes == {torch.float32}
+    assert decoder_dtypes == {torch.bfloat16}
 
 
 def test_smallest_bucket_picks_the_first_bucket_that_fits() -> None:

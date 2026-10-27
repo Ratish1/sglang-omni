@@ -130,9 +130,10 @@ def load_qwen3_tts_tokenizer(
             return tokenizer
         else:
             pass
+        # note (ratish): the encoder's quantizers pick each codeword by nearest distance, which bf16 rounding flips, so the codec loads in its checkpoint's dtype and only the decoder takes the server dtype.
         kwargs: dict[str, str | torch.dtype] = {
             "device_map": device,
-            "dtype": torch_dtype,
+            "dtype": "auto",
         }
         if attn_implementation is not None:
             kwargs["attn_implementation"] = attn_implementation
@@ -147,6 +148,7 @@ def load_qwen3_tts_tokenizer(
             attn_implementation or "upstream-default",
         )
         tokenizer = Qwen3TTSTokenizer.from_pretrained(tokenizer_path, **kwargs)
+        tokenizer.model.decoder.to(torch_dtype)
         move_conv_padding_to_host(tokenizer.model.encoder)
         _SPEECH_TOKENIZERS[key] = tokenizer
         return tokenizer
