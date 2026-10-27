@@ -1079,7 +1079,10 @@ class Qwen3TTSRefCodeBatcher:
             [waveform], sr=sample_rate
         )
         samples = torch.from_numpy(audio[0])
-        if self.graph_runner is not None:
+        if samples.numel() == 0:
+            # note (ratish): the encoder's tail padding repeats a clip's last step, which an empty clip does not have.
+            raise ValueError("Qwen3-TTS reference audio has no samples")
+        elif self.graph_runner is not None:
             codes = self.graph_runner.encode(samples)
             if codes is not None:
                 return codes

@@ -101,6 +101,19 @@ def test_speech_tokenizer_loader_moves_the_encoder_padding_to_host(
     assert all(conv.padding_total.device.type == "cpu" for conv in convs)
 
 
+def fake_speech_tokenizer(encoder: MimiModel, quantizers: int) -> SimpleNamespace:
+    return SimpleNamespace(
+        model=SimpleNamespace(
+            encoder=encoder,
+            encode_downsample_rate=HOP,
+            encoder_valid_num_quantizers=quantizers,
+        ),
+        _normalize_audio_inputs=lambda waveforms, sr: [
+            np.asarray(waveform, dtype=np.float32) for waveform in waveforms
+        ],
+    )
+
+
 def exact_length_codes(model: MimiModel, waveform: np.ndarray) -> torch.Tensor:
     return (
         model.encode(
@@ -122,16 +135,8 @@ def test_reference_codes_match_the_exact_length_encode() -> None:
             module.embed_sum.normal_()
     model.eval()
     unhooked_model = copy.deepcopy(model)
-    tokenizer = SimpleNamespace(
-        model=SimpleNamespace(
-            encoder=model, encode_downsample_rate=HOP, encoder_valid_num_quantizers=4
-        ),
-        _normalize_audio_inputs=lambda waveforms, sr: [
-            np.asarray(waveform, dtype=np.float32) for waveform in waveforms
-        ],
-    )
     batcher = qwen3_request_builders.Qwen3TTSRefCodeBatcher(
-        tokenizer, max_batch_wait_ms=0
+        fake_speech_tokenizer(model, quantizers=4), max_batch_wait_ms=0
     )
     waveforms = [torch.randn(frames * HOP + 7).numpy() for frames in (2, 5, 9)]
 
@@ -154,6 +159,19 @@ def test_reference_codes_match_the_exact_length_encode() -> None:
     assert all(
         torch.equal(got, wanted) for got, wanted in zip(codes_after_batcher, want)
     )
+
+
+def test_reference_code_batcher_refuses_an_empty_reference() -> None:
+    """An empty reference reached the encoder graphs, whose tail padding read the clip's last step at index -1 and asserted on the device, failing every later request."""
+    batcher = qwen3_request_builders.Qwen3TTSRefCodeBatcher(
+        fake_speech_tokenizer(MimiModel(small_mimi_config()).eval(), quantizers=4),
+        max_batch_wait_ms=0,
+    )
+    try:
+        with pytest.raises(ValueError, match="no samples"):
+            batcher.encode(np.zeros(0, dtype=np.float32), 24000)
+    finally:
+        batcher.close()
 
 
 def test_speech_tokenizer_loader_gives_the_encoder_its_float32_checkpoint_weights(
@@ -293,16 +311,10 @@ def test_reference_code_batcher_replays_captured_buckets_and_encodes_the_rest(
             module.embed_sum.normal_()
     model = model.to(device).eval()
     move_conv_padding_to_host(model)
-    tokenizer = SimpleNamespace(
-        model=SimpleNamespace(
-            encoder=model, encode_downsample_rate=HOP, encoder_valid_num_quantizers=2
-        ),
-        _normalize_audio_inputs=lambda waveforms, sr: [
-            np.asarray(w, dtype=np.float32) for w in waveforms
-        ],
-    )
     batcher = qwen3_request_builders.Qwen3TTSRefCodeBatcher(
-        tokenizer, max_batch_wait_ms=0, graph_bucket_frames=(4,)
+        fake_speech_tokenizer(model, quantizers=2),
+        max_batch_wait_ms=0,
+        graph_bucket_frames=(4,),
     )
     beyond_waveforms = [torch.rand(frames * HOP).numpy() for frames in (5, 7)]
     encode = model.encode
