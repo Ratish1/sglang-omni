@@ -24,8 +24,8 @@ from sglang_omni.models.qwen3_tts import stages as qwen3_stages
 from sglang_omni.models.qwen3_tts.reference_encoder_cuda_graph import (
     Qwen3TTSReferenceEncoderCudaGraphRunner,
     move_conv_padding_to_host,
+    pad_strided_conv_tails,
     smallest_bucket,
-    zero_strided_conv_tails,
 )
 
 HOP = 16
@@ -91,7 +91,7 @@ def test_speech_tokenizer_loader_moves_the_encoder_padding_to_host(
     monkeypatch.setattr(
         qwen3_stages, "load_float32_encoder_weights", lambda tokenizer, path: None
     )
-    monkeypatch.setattr(qwen3_stages, "zero_strided_conv_tails", lambda encoder: None)
+    monkeypatch.setattr(qwen3_stages, "pad_strided_conv_tails", lambda encoder: None)
 
     tokenizer = qwen3_stages.load_qwen3_tts_tokenizer(
         "/ckpt", device="cpu", dtype="float32", attn_implementation=None
@@ -246,7 +246,7 @@ def test_reference_encoder_graph_replays_match_eager_and_miss_above_the_largest_
             module.embed_sum.normal_()
     model = model.to(device).eval()
     move_conv_padding_to_host(model)
-    zero_strided_conv_tails(model)
+    pad_strided_conv_tails(model)
     hop = HOP
     quantizers = 2
     stream = torch.cuda.Stream(device)
@@ -304,7 +304,7 @@ def test_reference_code_batcher_replays_captured_buckets_and_encodes_the_rest(
             module.embed_sum.normal_()
     model = model.to(device).eval()
     move_conv_padding_to_host(model)
-    zero_strided_conv_tails(model)
+    pad_strided_conv_tails(model)
     tokenizer = SimpleNamespace(
         model=SimpleNamespace(
             encoder=model, encode_downsample_rate=HOP, encoder_valid_num_quantizers=2
