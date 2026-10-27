@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import os
 from types import ModuleType
 from typing import TYPE_CHECKING, TypedDict
 
@@ -67,6 +68,18 @@ class Qwen3TTSModelRunner(ModelRunner):
         self.codes_event_module = (
             torch.get_device_module(self.device)
             if has_device_streams(self.device)
+            else None
+        )
+        # probe: per step, codec EOS against the whole vocabulary and each stored frame's 16 codes
+        probe_dir = os.environ.get("QWEN3_TTS_PROBE_DIR")
+        self.probe_eos_file = (
+            open(f"{probe_dir}/eos_{os.getpid()}.txt", "a", buffering=1)
+            if probe_dir
+            else None
+        )
+        self.probe_codes_file = (
+            open(f"{probe_dir}/codes_{os.getpid()}.txt", "a", buffering=1)
+            if probe_dir
             else None
         )
 
@@ -181,6 +194,30 @@ class Qwen3TTSModelRunner(ModelRunner):
                 active_logits[row_index, codec_eos] = float("-inf")
             else:
                 pass
+        if self.probe_eos_file is not None:
+            # probe: log-probabilities at temperature 1 over the shaped logits, and EOS under temperature 0.9 and top-k 50
+            shaped = active_logits.float()
+            log_probs = torch.log_softmax(shaped, dim=-1)
+            top_log_prob, top_id = log_probs.max(dim=-1)
+            scaled = shaped / 0.9
+            top_values = torch.topk(scaled, 50, dim=-1).values
+            eos_scaled = scaled[:, codec_eos]
+            eos_top_k = torch.where(
+                eos_scaled >= top_values[:, -1],
+                torch.exp(eos_scaled - torch.logsumexp(top_values, dim=-1)),
+                torch.zeros_like(eos_scaled),
+            )
+            eos_rank = (shaped > shaped[:, codec_eos : codec_eos + 1]).sum(dim=-1)
+            rows = torch.stack(
+                (log_probs[:, codec_eos], eos_top_k, eos_rank.float(), top_id.float(), top_log_prob), dim=1
+            ).tolist()
+            for (eos_log_prob, eos_probability, rank, top, top_log), scheduled_request in zip(rows, requests):
+                self.probe_eos_file.write(
+                    f"{scheduled_request.request_id} {len(scheduled_request.data.output_codes)} {eos_log_prob:.6g} "
+                    f"{eos_probability:.6g} {int(rank)} {int(top)} {top_log:.6g}\n"
+                )
+        else:
+            pass
 
     def install_sampling_seeds(
         self,
@@ -260,6 +297,7 @@ class Qwen3TTSModelRunner(ModelRunner):
             codes_ready.record()
         else:
             pass
+        probe_codes = codes_snap.tolist() if self.probe_codes_file is not None else None
         for row_idx, sched_req in enumerate(scheduler_output.requests):
             req_output = outputs[sched_req.request_id]
             # note (ratish): a middle prefill chunk samples at a prompt row; SGLang drops
@@ -274,6 +312,13 @@ class Qwen3TTSModelRunner(ModelRunner):
                 pass
             code_chunk = codes_snap[row_idx]
             sched_req.data.output_codes.append(code_chunk)
+            if probe_codes is not None:
+                self.probe_codes_file.write(
+                    f"{sched_req.request_id} {len(sched_req.data.output_codes) - 1} "
+                    f"{' '.join(str(code) for code in probe_codes[row_idx])}\n"
+                )
+            else:
+                pass
             sched_req.data.latest_stream_code_chunk = code_chunk
             sched_req.data.codes_ready_event = codes_ready
             sched_req.data.pending_feedback_queue.append(embeds_snap[row_idx])
