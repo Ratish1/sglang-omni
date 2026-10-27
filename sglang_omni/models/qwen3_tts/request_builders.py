@@ -409,15 +409,17 @@ def build_qwen3_tts_state(
     ref_audio = None
     ref_text = None
     x_vector_only_mode = False
-    non_streaming_mode = resolve_non_streaming_mode(
-        task_type=task_type,
-        params=params,
-        tts_params=tts_params,
-    )
     stream_codec_output = resolve_stream_codec_output(
         params=params,
         tts_params=tts_params,
         default=default_stream_codec_output,
+    )
+    # Note (Jiaxin Deng): this is prompt-side text/codec interleaving, not output
+    # transport; codec streaming is resolved independently above.
+    non_streaming_mode = resolve_non_streaming_mode(
+        task_type=task_type,
+        params=params,
+        tts_params=tts_params,
     )
     voice = normalize_qwen3_tts_voice(
         tts_params.get("voice") or tts_params.get("speaker") or params.get("voice")
@@ -455,9 +457,6 @@ def build_qwen3_tts_state(
         else:
             pass
         voice = voice or QWEN3_TTS_DEFAULT_CUSTOM_VOICE
-        # Note (Jiaxin Deng): this is prompt-side text/codec interleaving, not output
-        # transport; codec streaming is resolved independently above.
-        non_streaming_mode = True
     elif task_type == QWEN3_TTS_TASK_VOICE_DESIGN:
         if has_param(tts_params, params, "ref_audio") or references_contain_audio(
             references
@@ -480,7 +479,6 @@ def build_qwen3_tts_state(
         else:
             pass
         voice = None
-        non_streaming_mode = True
     else:
         raise AssertionError(f"unhandled Qwen3-TTS task type: {task_type}")
 

@@ -2357,6 +2357,29 @@ def test_qwen3_tts_stream_codec_output_request_override_disables_streaming(
     assert state.stream_codec_output is False
 
 
+@pytest.mark.parametrize(
+    "task_params",
+    [
+        {"task_type": "CustomVoice"},
+        {"task_type": "VoiceDesign", "instructions": "A warm adult voice."},
+    ],
+)
+def test_qwen3_tts_honors_an_explicit_streaming_text_prompt(
+    task_params: dict[str, str],
+) -> None:
+    """An explicit non_streaming_mode false was overridden for CustomVoice and VoiceDesign, which official honours."""
+    payload = make_payload(
+        inputs="target",
+        params={"non_streaming_mode": False},
+        tts_params=task_params,
+    )
+
+    state = build_qwen3_tts_state(payload)
+
+    assert state.non_streaming_mode is False
+    assert state.stream_codec_output is True
+
+
 def test_qwen3_tts_stream_codec_output_honors_explicit_non_streaming_mode() -> None:
     payload = make_payload(
         inputs={"text": "target", "references": [{"audio_path": "v.wav", "text": "r"}]},
