@@ -7,7 +7,7 @@ import time
 from collections import deque
 from dataclasses import replace
 
-from sglang.srt.managers.schedule_batch import ScheduleBatch
+from sglang.srt.managers.schedule_batch import NextBatchPlan, ScheduleBatch
 from sglang.srt.server_args import ServerArgs
 from typing_extensions import Unpack
 
@@ -194,6 +194,32 @@ class QwenTalkerScheduler(OmniScheduler[SGLangARRequestData]):
         else:
             pass
         return batch
+
+    def get_new_batch_prefill(self, running_batch: ScheduleBatch) -> NextBatchPlan:
+        # note (ratish): running rows ride an admission's forward as one-token extends,
+        # so a stream does not wait out admissions arriving back to back for its next frame.
+        mix_default = self.is_mixed_chunk
+        self.is_mixed_chunk = self.running_rows_can_mix(running_batch)
+        try:
+            return super().get_new_batch_prefill(running_batch)
+        finally:
+            self.is_mixed_chunk = mix_default
+
+    def running_rows_can_mix(self, running_batch: ScheduleBatch) -> bool:
+        """Whether every live running row has its next decode input; a mixed step cannot defer one."""
+        if (
+            not self.waiting_queue
+            or running_batch.is_empty()
+            or not self.model_runner.feedback_enabled
+        ):
+            return False
+        else:
+            pass
+        return all(
+            request.finished()
+            or self.model_runner.data_has_next_decode_input(request.omni_data)
+            for request in running_batch.reqs
+        )
 
     def rollback_decode_prep_after_skip(self, batch: ScheduleBatch) -> None:
         if not batch.forward_mode.is_decode():

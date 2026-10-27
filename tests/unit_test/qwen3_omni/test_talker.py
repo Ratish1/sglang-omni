@@ -927,6 +927,56 @@ def test_a_finished_reply_without_spoken_tokens_is_not_generated() -> None:
     assert scheduler.complete_without_generation(unfinished, None) is None
 
 
+@pytest.mark.parametrize(
+    ("waiting_queue", "row_states", "mixes"),
+    [
+        (["new"], [(True, True, False)], True),
+        (["new"], [(True, True, False), (True, False, False)], False),
+        (["new"], [(True, True, False), (False, False, True)], True),
+        (["new"], [], False),
+        ([], [(True, True, False)], False),
+    ],
+)
+def test_an_admission_mixes_running_rows_only_when_each_live_row_has_its_next_input(
+    monkeypatch: pytest.MonkeyPatch,
+    waiting_queue: list[str],
+    row_states: list[tuple[bool, bool, bool]],
+    mixes: bool,
+) -> None:
+    """An admission carries the running rows of the merged batch only when none would wait for an input, and the setting holds for that call alone."""
+    seen_mix_settings: list[bool] = []
+    monkeypatch.setattr(
+        OmniScheduler,
+        "get_new_batch_prefill",
+        lambda self, running_batch: seen_mix_settings.append(self.is_mixed_chunk),
+    )
+    runner = object.__new__(QwenTalkerModelRunner)
+    runner.feedback_enabled = True
+    scheduler = object.__new__(QwenTalkerScheduler)
+    scheduler.is_mixed_chunk = False
+    scheduler.waiting_queue = waiting_queue
+    scheduler.model_runner = runner
+    rows = [
+        SimpleNamespace(
+            finished=lambda finished=finished: finished,
+            omni_data=SimpleNamespace(
+                pending_feedback_queue=deque([torch.zeros(2)] if has_feedback else []),
+                pending_text_queue=deque([torch.zeros(2)] if has_text else []),
+                thinker_chunks_done=False,
+                tts_pad_embed=None,
+            ),
+        )
+        for has_feedback, has_text, finished in row_states
+    ]
+
+    scheduler.get_new_batch_prefill(
+        SimpleNamespace(reqs=rows, is_empty=lambda: not rows)
+    )
+
+    assert seen_mix_settings == [mixes]
+    assert scheduler.is_mixed_chunk is False
+
+
 def test_partial_disabled_preserves_legacy_path() -> None:
     """enable_partial_start=False preserves legacy stream_done-only gating."""
     scheduler = fresh_partial_scheduler(enable_partial_start=False)
