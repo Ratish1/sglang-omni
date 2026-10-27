@@ -48,6 +48,11 @@ Names (rid = request id; the first word is the kind the census groups by):
   mark mr.decode_reuse hit=H n=N             whether the talker reused its decode buffers
   tk.build rid=R chunks=C done=D, tk.text_chunk
                                              talker prompt build from the thinker stream
+  ph.stage n=N, ph.store wait=W staged=S, ph.read n=N
+                                             the prompt hidden rows: a forward's N rows staged
+                                             to host, staged copies written into the host
+                                             table (W=1 waits for every copy), N rows read for
+                                             the talker's first chunk
   c2w.ingest rid=R, c2w.decode rid=R final=F, c2w.emit rid=R, c2w.step rows=N,
   c2w.sub rows=N, c2w.replay rows=N frames=F code2wav
   cap <site>                                 one CUDA graph capture
@@ -643,6 +648,24 @@ def patch_talker_prefill(module):
     )
 
 
+def patch_prompt_hidden(module):
+    store = module.PromptHiddenStore
+    store.stage = ranged(
+        store.stage,
+        lambda self, slot_ids, hidden_states: f"ph.stage n={int(slot_ids.shape[0])}",
+    )
+    store.store_copied = ranged(
+        store.store_copied,
+        lambda self, *, wait: f"ph.store wait={int(wait)} staged={len(self.staged)}",
+    )
+    store.read = ranged(
+        store.read,
+        lambda self, request_pool_index, positions: (
+            f"ph.read n={int(positions.shape[0])}"
+        ),
+    )
+
+
 def patch_code2wav(module):
     scheduler = module.Code2WavScheduler
     scheduler.ingest = ranged(
@@ -707,6 +730,7 @@ PATCHES = {
     "sglang_omni.models.qwen3_omni.talker_model_runner": patch_talker_runner,
     "sglang_omni.models.qwen3_omni.components.talker": patch_talker_model,
     "sglang_omni.models.qwen3_omni.components.talker_prefill": patch_talker_prefill,
+    "sglang_omni.scheduling.sglang_backend.prompt_hidden": patch_prompt_hidden,
     "sglang_omni.models.qwen3_omni.components.code2wav_scheduler": patch_code2wav,
     "sglang_omni.models.qwen3_omni.components.code2wav_cuda_graph": patch_code2wav_graph,
 }
