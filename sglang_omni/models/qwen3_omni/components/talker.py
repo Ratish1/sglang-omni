@@ -1138,8 +1138,7 @@ class Qwen3OmniTalker(nn.Module):
             suppress_tokens = (
                 data.suppress_tokens or req._codec_suppress_tokens
             )  # noqa: leading-underscore  # upstream spelling, or the public name is already taken
-            # note (ratish): each request's set resolves once, so a batch change does not
-            # expand or hash every row's ids again.
+            # note (ratish): each request's set resolves once, so a batch change does not expand or hash every row's ids again.
             resolved_suppress = self.suppress_token_ids_by_request.get(req.rid)
             if (
                 resolved_suppress is not None
@@ -1147,12 +1146,16 @@ class Qwen3OmniTalker(nn.Module):
             ):
                 suppress_token_ids = resolved_suppress[1]
             elif suppress_tokens:
-                suppress_content = tuple(int(tok) for tok in suppress_tokens)
+                suppress_content = tuple(int(token_id) for token_id in suppress_tokens)
                 if suppress_content not in self.suppress_token_cache:
-                    valid_sup = [t for t in suppress_content if 0 <= t < sup_vocab]
+                    valid_token_ids = [
+                        token_id
+                        for token_id in suppress_content
+                        if 0 <= token_id < sup_vocab
+                    ]
                     self.suppress_token_cache[suppress_content] = (
-                        torch.tensor(valid_sup, dtype=torch.long, device=device)
-                        if valid_sup
+                        torch.tensor(valid_token_ids, dtype=torch.long, device=device)
+                        if valid_token_ids
                         else None
                     )
                 else:
