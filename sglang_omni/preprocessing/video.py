@@ -527,12 +527,14 @@ def load_video_path(
             min_pixels=min_pixels,
             max_pixels=max_pixels,
         )
+    # note (ratish): a uint8 resize returns uint8 pixels, which every processor converts
+    # itself; a float copy here would only carry the same values in four times the bytes.
     video = tv_f.resize(
         video,
         [resized_height, resized_width],
         interpolation=InterpolationMode.BICUBIC,
         antialias=True,
-    ).float()
+    )
     return video, sample_fps
 
 
