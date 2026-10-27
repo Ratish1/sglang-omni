@@ -4,7 +4,9 @@ checkpoint's sampling defaults, a seed per draw; each draw's audio and frame cou
 its score step reads both arms alike.
 
 usage: /data/refenv/bin/python speaker_loss_reference.py CASES.jsonl --ids ID [ID ...] --model PATH --out DIR
-       [--draws 100] [--batch 16] [--card 0] [--seed 0]
+       [--draws 100] [--batch 16] [--card 0] [--seed 0] [--encoder-fp32]
+
+--encoder-fp32 runs the speech tokenizer's encoder in its checkpoint dtype (float32), the rest in bf16.
 
 Runs in a venv holding qwen-tts 0.1.1's pins (transformers 4.57.3, accelerate 1.12.0, torch 2.10.0).
 """
@@ -28,6 +30,7 @@ def main() -> None:
     parser.add_argument("--batch", type=int, default=16)
     parser.add_argument("--card", type=int, default=0)
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--encoder-fp32", action="store_true")
     args = parser.parse_args()
     cases = {
         case["id"]: case
@@ -36,6 +39,10 @@ def main() -> None:
     model = Qwen3TTSModel.from_pretrained(
         args.model, device_map=f"cuda:{args.card}", dtype=torch.bfloat16, attn_implementation="sdpa"
     )
+    if args.encoder_fp32:
+        model.model.speech_tokenizer.model.encoder.to(torch.float32)
+    else:
+        pass
     (args.out / "audio").mkdir(parents=True, exist_ok=True)
     records = []
     for case_id in args.ids:
