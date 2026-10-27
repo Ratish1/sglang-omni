@@ -178,6 +178,7 @@ class Qwen3TTSReferenceEncoderCudaGraphRunner:
         static_input = torch.zeros(
             (1, 1, frames * self.hop), device=self.device, dtype=self.dtype
         )
+        self.encoder.clip_samples.fill_(frames * self.hop)
         self.stream.wait_stream(self.device_module.current_stream(self.device))
         with torch.inference_mode(), self.device_module.stream(self.stream):
             for _ in range(2):
