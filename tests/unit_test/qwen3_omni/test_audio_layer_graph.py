@@ -14,10 +14,16 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from safetensors.torch import save_file
+from sglang.kernels.ops.attention.flash_attention_v4 import (
+    is_flash_attention_v4_available,
+)
 from sglang.srt.layers.attention.vision import (
+    VisionFlash3Attention,
+    VisionFlash4Attention,
     VisionTritonAttention,
     prepare_vision_attention_metadata,
 )
+from sglang.srt.runtime_context import override_platform
 from torch.nn.attention import SDPBackend, sdpa_kernel
 from transformers.models.qwen3_omni_moe import modeling_qwen3_omni_moe as hf_modeling
 
@@ -253,6 +259,29 @@ def make_cu_seqlens(segments: list[int], device: torch.device) -> torch.Tensor:
 
 @pytest.mark.accelerator
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize(
+    ("is_sm90", "is_sm100", "packed_attention_class"),
+    [
+        (True, False, VisionFlash3Attention),
+        (False, True, VisionFlash4Attention),
+        (False, False, VisionTritonAttention),
+    ],
+)
+def test_packed_attention_is_the_platforms_vision_attention(
+    is_sm90: bool,
+    is_sm100: bool,
+    packed_attention_class: type[nn.Module],
+) -> None:
+    with override_platform(is_sm90=is_sm90, is_sm100=is_sm100):
+        packed_attention = resolve_packed_attention(
+            torch.device("cuda", 0), torch.bfloat16
+        )
+
+    assert type(packed_attention) is packed_attention_class
+
+
+@pytest.mark.accelerator
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_packed_attention_matches_fp32_sdpa_per_segment_and_head() -> None:
     torch.manual_seed(0)
     device = torch.device("cuda", 0)
@@ -376,22 +405,39 @@ def test_capture_survives_a_collection_that_frees_dead_graphs(
 
 @pytest.mark.accelerator
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-@pytest.mark.parametrize("backend", ["platform", "triton"])
+@pytest.mark.parametrize(
+    "backend",
+    [
+        "platform",
+        "triton",
+        pytest.param(
+            "fa4",
+            marks=pytest.mark.skipif(
+                not torch.cuda.is_available()
+                or not is_flash_attention_v4_available()
+                or torch.cuda.get_device_capability()[0] not in (9, 10),
+                reason="FlashAttention 4 runs on SM 9.x and 10.x",
+            ),
+        ),
+    ],
+)
 def test_replay_matches_the_uncaptured_packed_stack_across_bucket_boundaries(
-    backend: Literal["platform", "triton"],
+    backend: Literal["platform", "triton", "fa4"],
 ) -> None:
     torch.manual_seed(0)
     device = torch.device("cuda", 0)
     tower = real_tower(device)
+    if backend == "platform":
+        packed_attention = resolve_packed_attention(device, torch.bfloat16)
+    elif backend == "triton":
+        packed_attention = VisionTritonAttention()
+    else:
+        packed_attention = VisionFlash4Attention()
     runner = AudioLayerGraphRunner(
         tower,
         device=device,
         window=WINDOW,
-        packed_attention=(
-            resolve_packed_attention(device, torch.bfloat16)
-            if backend == "platform"
-            else VisionTritonAttention()
-        ),
+        packed_attention=packed_attention,
     )
     runner.capture_all()
     assert runner.has_graphs, runner.disabled_reason
