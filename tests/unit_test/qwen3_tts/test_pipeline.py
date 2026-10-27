@@ -386,7 +386,7 @@ def test_qwen3_tts_speech_tokenizer_is_loaded_once_per_process_key(
     loads: list[tuple[str, dict[str, object]]] = []
 
     class FakeQwen3TTSTokenizer:
-        model = SimpleNamespace(encoder=torch.nn.Module(), decoder=torch.nn.Module())
+        model = SimpleNamespace(encoder=torch.nn.Module())
 
         @classmethod
         def from_pretrained(cls, path, **kwargs):
@@ -401,6 +401,9 @@ def test_qwen3_tts_speech_tokenizer_is_loaded_once_per_process_key(
     )
     monkeypatch.setattr(qwen3_stages, "_resolve_checkpoint", lambda path: path)
     monkeypatch.setattr(qwen3_stages, "_SPEECH_TOKENIZERS", {})
+    monkeypatch.setattr(
+        qwen3_stages, "load_float32_encoder_weights", lambda tokenizer, path: None
+    )
 
     vocoder_copy = qwen3_stages.load_qwen3_tts_tokenizer(
         "/ckpt", device="cuda:0", dtype="bfloat16", attn_implementation=None
@@ -422,13 +425,17 @@ def test_qwen3_tts_speech_tokenizer_is_loaded_once_per_process_key(
     assert len({id(vocoder_copy), id(other_device), id(other_attention)}) == 3
     assert other_checkpoint is not vocoder_copy
     assert loads == [
-        ("/ckpt/speech_tokenizer", {"device_map": "cuda:0", "dtype": "auto"}),
-        ("/ckpt/speech_tokenizer", {"device_map": "cuda:1", "dtype": "auto"}),
+        ("/ckpt/speech_tokenizer", {"device_map": "cuda:0", "dtype": torch.bfloat16}),
+        ("/ckpt/speech_tokenizer", {"device_map": "cuda:1", "dtype": torch.bfloat16}),
         (
             "/ckpt/speech_tokenizer",
-            {"device_map": "cuda:0", "dtype": "auto", "attn_implementation": "sdpa"},
+            {
+                "device_map": "cuda:0",
+                "dtype": torch.bfloat16,
+                "attn_implementation": "sdpa",
+            },
         ),
-        ("/other/speech_tokenizer", {"device_map": "cuda:0", "dtype": "auto"}),
+        ("/other/speech_tokenizer", {"device_map": "cuda:0", "dtype": torch.bfloat16}),
     ]
 
 
@@ -504,6 +511,9 @@ def test_qwen3_tts_engine_attaches_the_vocoder_speech_tokenizer_before_the_pool(
         qwen3_stages, "load_qwen3_tts_generate_defaults", lambda path: {}
     )
     monkeypatch.setattr(qwen3_stages, "_SPEECH_TOKENIZERS", {})
+    monkeypatch.setattr(
+        qwen3_stages, "load_float32_encoder_weights", lambda tokenizer, path: None
+    )
     monkeypatch.setattr(
         qwen3_stages,
         "load_qwen3_tts_checkpoint_config",
@@ -1270,7 +1280,6 @@ def fake_speech_tokenizer(encode=None, *, hop=8, quantizers=2, device="cpu"):
             encoder=FakeReferenceEncoder(
                 encode or default, quantizers=quantizers, device=device
             ),
-            decoder=torch.nn.Module(),
             encode_downsample_rate=hop,
             encoder_valid_num_quantizers=quantizers,
         ),
