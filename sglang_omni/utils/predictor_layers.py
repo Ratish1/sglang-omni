@@ -87,6 +87,12 @@ NUM_WARPS = 4
 # note (ratish): the 16-row block runs faster on two warps; wider blocks spill there.
 QKV_SMALL_BLOCK_WARPS = 2
 NUM_STAGES = 3
+# note (migumnakkittikul): at 64 rows the gate_up launch keeps 132096 bytes of shared memory
+# in flight over three stages and 66048 over two; SM 8.6, 8.9 and 12.x GPUs cap a block at
+# 101376, so they pipeline two.
+FULL_PIPELINE_SHARED_MEMORY = 132096
+REDUCED_NUM_STAGES = 2
+REDUCED_PIPELINE_SHARED_MEMORY = 66048
 
 
 if HAS_TRITON:
@@ -624,7 +630,8 @@ def add_rmsnorm_rounded(
 
 @dataclass(frozen=True)
 class PredictorLayerShape:
-    """The predictor layer's dimensions and the K split of its residual launches."""
+    """The predictor layer's dimensions, the K split of its residual launches and the
+    pipeline stages the GPU's shared memory allows."""
 
     hidden_size: int
     head_dim: int
@@ -633,6 +640,7 @@ class PredictorLayerShape:
     intermediate_size: int
     split_qkv: int
     split_hidden: int
+    num_stages: int
 
 
 def is_plain_bf16_linear(linear: torch.nn.Module) -> bool:
@@ -702,7 +710,14 @@ def resolve_predictor_layer_shape(
             return None
         else:
             pass
-    sm_count = torch.cuda.get_device_properties(device).multi_processor_count
+    properties = torch.cuda.get_device_properties(device)
+    if properties.shared_memory_per_block_optin >= FULL_PIPELINE_SHARED_MEMORY:
+        num_stages = NUM_STAGES
+    elif properties.shared_memory_per_block_optin >= REDUCED_PIPELINE_SHARED_MEMORY:
+        num_stages = REDUCED_NUM_STAGES
+    else:
+        return None
+    sm_count = properties.multi_processor_count
     heads = attention.num_heads + 2 * attention.num_kv_heads
     split_hidden = min(
         split_count(hidden_size // BLOCK_N, attention.num_heads, sm_count),
@@ -716,6 +731,7 @@ def resolve_predictor_layer_shape(
         intermediate_size=intermediate_size,
         split_qkv=split_count(heads, hidden_size // BLOCK_K, sm_count),
         split_hidden=split_hidden,
+        num_stages=num_stages,
     )
 
 
@@ -803,7 +819,7 @@ def attention_inputs(
         BLOCK_K=BLOCK_K,
         USE_GDC=use_gdc,
         num_warps=QKV_SMALL_BLOCK_WARPS if block_m == MIN_BLOCK_M else NUM_WARPS,
-        num_stages=NUM_STAGES,
+        num_stages=shape.num_stages,
         launch_pdl=use_gdc,
     )
 
@@ -882,7 +898,7 @@ def o_proj_add(
         BLOCK_K=BLOCK_K,
         USE_GDC=use_gdc,
         num_warps=NUM_WARPS,
-        num_stages=NUM_STAGES,
+        num_stages=shape.num_stages,
         launch_pdl=use_gdc,
     )
 
@@ -916,7 +932,7 @@ def mlp_up(
         BLOCK_K=MLP_BLOCK_K,
         USE_GDC=use_gdc,
         num_warps=NUM_WARPS,
-        num_stages=NUM_STAGES,
+        num_stages=shape.num_stages,
         launch_pdl=use_gdc,
     )
 
@@ -955,7 +971,7 @@ def down_add(
         BLOCK_K=BLOCK_K,
         USE_GDC=use_gdc,
         num_warps=NUM_WARPS,
-        num_stages=NUM_STAGES,
+        num_stages=shape.num_stages,
         launch_pdl=use_gdc,
     )
 

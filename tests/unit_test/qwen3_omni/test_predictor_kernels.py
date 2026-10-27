@@ -31,6 +31,8 @@ from sglang_omni.utils import predictor_layers
 from sglang_omni.utils.predictor_layers import (
     HIDDEN_SIZE,
     MAX_FUSED_ROWS,
+    NUM_STAGES,
+    REDUCED_NUM_STAGES,
     PredictorLayerShape,
     add_rmsnorm_rounded,
     codebook_step,
@@ -451,6 +453,31 @@ def test_resolver_keeps_the_plain_path_for_a_quantized_projection() -> None:
 
 @accelerator
 @pytest.mark.accelerator
+@pytest.mark.parametrize(
+    ("shared_memory", "expected_stages"),
+    [(232448, NUM_STAGES), (101376, REDUCED_NUM_STAGES), (65536, None)],
+)
+def test_resolver_pipelines_the_stages_a_block_can_hold(
+    monkeypatch: pytest.MonkeyPatch, shared_memory: int, expected_stages: int | None
+) -> None:
+    """Three stages at 64 rows overflow a 99 KiB block (SM 8.6, 8.9, 12.x) at launch."""
+    device = torch.device("cuda")
+    talker = build_talker(device, seed=12)
+    sm_count = torch.cuda.get_device_properties(device).multi_processor_count
+    monkeypatch.setattr(
+        torch.cuda,
+        "get_device_properties",
+        lambda device: SimpleNamespace(
+            shared_memory_per_block_optin=shared_memory,
+            multi_processor_count=sm_count,
+        ),
+    )
+    shape = resolve_predictor_layer_shape(talker.code_predictor, PREDICTOR_LEN, device)
+    assert (None if shape is None else shape.num_stages) == expected_stages
+
+
+@accelerator
+@pytest.mark.accelerator
 @pytest.mark.usefixtures("published_server_args")
 def test_split_launches_leave_the_tile_counters_at_zero() -> None:
     """The last program of a tile resets its counter; a missed reset would make the
@@ -683,6 +710,7 @@ def test_decode_attention_tracks_fp32_and_reads_no_slot_past_a_rows_position(
             intermediate_size=INTERMEDIATE,
             split_qkv=1,
             split_hidden=1,
+            num_stages=NUM_STAGES,
         ),
     )
     queries = q.view(row_groups, tokens_per_row, NUM_HEADS, HEAD_DIM).transpose(1, 2)
