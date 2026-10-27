@@ -52,11 +52,30 @@ def compiled_ptx(module) -> list[str]:
 
 
 def normalized(ptx: str) -> list[str]:
-    return [
-        line
-        for line in ptx.splitlines()
-        if line.strip() and not line.strip().startswith("//")
-    ]
+    """The PTX's instructions and declarations, without comments and the debug lines that
+    carry each tree's file path and source line numbers."""
+    lines = []
+    in_debug_section = False
+    for line in ptx.splitlines():
+        stripped = line.strip()
+        if stripped.startswith(".section") and ".debug" in stripped:
+            in_debug_section = True
+            continue
+        elif in_debug_section:
+            in_debug_section = stripped != "}"
+            continue
+        elif not stripped or stripped.startswith(("//", ".loc", ".file")):
+            continue
+        else:
+            lines.append(stripped)
+    return lines
+
+
+def first_difference(old_lines: list[str], new_lines: list[str]) -> str:
+    for index, (old_line, new_line) in enumerate(zip(old_lines, new_lines)):
+        if old_line != new_line:
+            return f"line {index}: old {old_line!r} new {new_line!r}"
+    return f"lengths {len(old_lines)} and {len(new_lines)}"
 
 
 def graph_microseconds(fn, replays: int = 200) -> float:
@@ -131,9 +150,16 @@ def main() -> None:
     old_ptx, new_ptx = compiled_ptx(old), compiled_ptx(new)
     print(f"compiled variants old {len(old_ptx)} new {len(new_ptx)}")
     for index, (old_text, new_text) in enumerate(zip(sorted(old_ptx), sorted(new_ptx))):
+        old_lines, new_lines = normalized(old_text), normalized(new_text)
+        identical = old_lines == new_lines
+        detail = "" if identical else f"; {first_difference(old_lines, new_lines)}"
         print(
-            f"variant {index}: PTX identical {normalized(old_text) == normalized(new_text)} ({len(normalized(old_text))} lines)"
+            f"variant {index}: PTX identical {identical} ({len(old_lines)} lines){detail}"
         )
+    if "--ptx-only" in sys.argv:
+        return
+    else:
+        pass
 
     print(
         "plain path: old copies q out of the qkv rows then reads it, new reads the rows in place"
