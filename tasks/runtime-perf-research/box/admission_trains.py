@@ -1,7 +1,9 @@
 """Qwen3-Omni talker admissions against its decode steps, from an events cell and the hop probe's talker batches
 (OMNI_HOP_PROBE_TALKER_BATCHES=1), boots of one arm pooled.
 
-A talker prefill step is the requests whose talker_ar scheduler_prefill_end share one timestamp. A decode interval is
+A talker prefill step is a cluster of talker_ar scheduler_prefill_start events, which the scheduler emits per request in
+one loop when it selects a batch (microseconds apart; steps are at least a forward apart), checked against the
+batch_size the step's scheduler_prefill_end events carry. A decode interval is
 the time between two consecutive "tb" records (each talker decode step), inside the events pass. Printed per arm:
 prefill steps and requests a step; decode intervals holding two or more prefill steps (admissions back to back), the
 slowest 1 % of intervals with their prefill steps, intervals above 150 ms; each request's first gap (its first to
@@ -18,15 +20,21 @@ import statistics
 from collections import defaultdict
 
 LONG_INTERVAL_MS = 150.0
+STEP_SPLIT_NS = 1_000_000
 
 
 def boot_records(boot: str, cell: str):
     events = defaultdict(lambda: defaultdict(list))
+    batch_sizes = {}
     for path in glob.glob(f"{boot}/{cell}/events/*.jsonl"):
         with open(path, encoding="utf-8") as source:
             for line in source:
                 record = json.loads(line)
                 events[record["request_id"]][(record["stage"], record["event_name"])].append(record["timestamp_ns"])
+                if record["stage"] == "talker_ar" and record["event_name"] == "scheduler_prefill_end":
+                    batch_sizes[record["request_id"]] = (record.get("metadata") or {}).get("batch_size")
+                else:
+                    pass
     steps = []
     for path in glob.glob(f"{boot}/probe/p.*.jsonl"):
         with open(path, encoding="utf-8") as source:
@@ -35,21 +43,34 @@ def boot_records(boot: str, cell: str):
                     steps.append(json.loads(line)["ns"])
                 else:
                     pass
-    return events, sorted(steps)
+    return events, batch_sizes, sorted(steps)
 
 
 def boot_rows(boot: str, cell: str):
-    events, steps = boot_records(boot, cell)
-    starts, ends = {}, defaultdict(list)
+    events, batch_sizes, steps = boot_records(boot, cell)
+    started = []
     for rid, by_name in events.items():
         start = by_name.get(("talker_ar", "scheduler_prefill_start"))
         end = by_name.get(("talker_ar", "scheduler_prefill_end"))
         if start and end:
-            starts[rid] = min(start)
-            ends[min(end)].append(rid)
+            started.append((min(start), max(end), rid))
         else:
             pass
-    prefill_steps = sorted((min(starts[rid] for rid in rids), end, len(rids)) for end, rids in ends.items())
+    started.sort()
+    clusters = []
+    for start, end, rid in started:
+        if clusters and start - clusters[-1][-1][0] <= STEP_SPLIT_NS:
+            clusters[-1].append((start, end, rid))
+        else:
+            clusters.append([(start, end, rid)])
+    prefill_steps = []
+    for cluster in clusters:
+        reported = {batch_sizes.get(rid) for _, _, rid in cluster}
+        if reported != {len(cluster)}:
+            raise ValueError(f"{boot}: a prefill cluster of {len(cluster)} requests reports batch sizes {reported}")
+        else:
+            pass
+        prefill_steps.append((cluster[0][0], max(end for _, end, _ in cluster), len(cluster)))
     window_start = min(step[0] for step in prefill_steps)
     window_end = max(step[1] for step in prefill_steps)
     steps = [ns for ns in steps if window_start <= ns <= window_end]
