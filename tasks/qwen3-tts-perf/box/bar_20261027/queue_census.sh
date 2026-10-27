@@ -3,7 +3,9 @@
 # Systems with the pipeline_nvtx probe (every stage hop, scheduler phase, model-runner phase and vocoder step, joined by
 # request id), 1.7B CustomVoice at default settings, Nari's client unmodified at 1 req/s (Ryan, English, Poisson, 20 s
 # warm-up, 60 s measured, seed 0); then pipeline_census.py sections A (probe coverage), B (components), C (hops) and F
-# (first-chunk critical path per request) over the whole report. Waits for AFTER_LOG to hold AFTER_LINE. Card 0.
+# (first-chunk critical path per request) over the whole report; NSYS_ARGS and SECTIONS override the trace and the
+# sections (python-gil with E for the interpreter lock, node graph tracing with G for line attribution). Waits for
+# AFTER_LOG to hold AFTER_LINE. Card 0.
 set -u
 D=${D:?the results directory}
 T=${T:?the kit tree}
@@ -13,7 +15,8 @@ AFTER_LINE=${AFTER_LINE:?the line to wait for}
 PORT=${PORT:-33000}
 S=$T/tasks/omni_step_profiling_20260918/scripts
 MODEL=Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice
-NSYS_ARGS="--trace=cuda,nvtx,osrt --cuda-graph-trace=graph --sample=none --cpuctxsw=none"
+NSYS_ARGS=${NSYS_ARGS:-"--trace=cuda,nvtx,osrt --cuda-graph-trace=graph --sample=none --cpuctxsw=none"}
+SECTIONS=${SECTIONS:-ABCF}
 L=$D/queue.log
 mkdir -p $D
 until grep -q "$AFTER_LINE" $AFTER_LOG 2> /dev/null; do
@@ -66,7 +69,7 @@ for arm in $ARMS; do
   if [ $healthy = 1 ]; then
     nsys export --type sqlite --force-overwrite=true -o $out/serve.sqlite $out/serve.nsys-rep > $out/export.log 2>&1
     echo "$label exported rc $? $(date +%T)" >> $L
-    (cd $S && python3 pipeline_census.py $out/serve.sqlite --sections ABCF > $out/census.txt 2>&1)
+    (cd $S && python3 pipeline_census.py $out/serve.sqlite --sections $SECTIONS > $out/census.txt 2>&1)
     echo "$label census rc $? $(date +%T)" >> $L
   else
     :
