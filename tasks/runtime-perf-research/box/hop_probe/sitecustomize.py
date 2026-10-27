@@ -16,6 +16,10 @@ clock of the request event recorder, so records join its events per request.
   kind "heap" once per process, when its first new request reaches a stage inbox: tracked objects, the 25 most
               common types and owning packages, and the duration of one full collection over that heap
   kind "frozen" every OMNI_HOP_PROBE_FREEZE_COUNT_S seconds when set: objects in the permanent generation
+  kind "tb"   with OMNI_HOP_PROBE_TALKER_BATCHES=1, each Qwen3-Omni talker decode step: its rows and their request
+              ids (Qwen3OmniTalker.prepare_decode_buffers)
+  kind "req"  with OMNI_HOP_PROBE_TALKER_BATCHES=1, each Qwen3-Omni request at preprocessing: its id and the text of
+              its last message, which joins a benchmark sample to its request id
 """
 
 import atexit
@@ -44,6 +48,7 @@ FREEZE_STARTUP_GC = os.environ.get("OMNI_FREEZE_STARTUP_GC") == "1"
 # OMNI_HOP_PROBE_FREEZE_COUNT_S=<s> records gc.get_freeze_count() every s seconds, which walks the permanent
 # generation under the GIL, so it is for a check boot and not for a measured one
 FREEZE_COUNT_PERIOD_S = float(os.environ.get("OMNI_HOP_PROBE_FREEZE_COUNT_S", "0"))
+TALKER_BATCHES = os.environ.get("OMNI_HOP_PROBE_TALKER_BATCHES") == "1"
 LAG_PERIOD_S = 0.005
 LAG_REPORT_S = 0.002
 STALL_S = 0.2
@@ -340,6 +345,47 @@ def patch_coordinator(module):
     coordinator.run_completion_loop = run_sampled
 
 
+def patch_talker(module):
+    talker = module.Qwen3OmniTalker
+    prepare = talker.prepare_decode_buffers
+
+    @functools.wraps(prepare)
+    def prepare_recorded(self, requests):
+        record(
+            {
+                "k": "tb",
+                "rows": len(requests),
+                "rids": [request.data.req.rid for request in requests],
+            }
+        )
+        return prepare(self, requests)
+
+    talker.prepare_decode_buffers = prepare_recorded
+
+
+def patch_preprocessor(module):
+    preprocessor = module.Qwen3OmniPreprocessor
+    call_impl = preprocessor.call_impl
+
+    @functools.wraps(call_impl)
+    async def call_recorded(self, payload):
+        # note: a probe must not fail a request, so an input of another shape records no text
+        try:
+            content = payload.request.inputs["messages"][-1]["content"]
+        except (AttributeError, IndexError, KeyError, TypeError):
+            content = None
+        record(
+            {
+                "k": "req",
+                "rid": payload.request_id,
+                "text": content[:300] if isinstance(content, str) else None,
+            }
+        )
+        return await call_impl(self, payload)
+
+    preprocessor.call_impl = call_recorded
+
+
 def bind_thread_device(fixed_device):
     """New threads set a CUDA device before their target runs: fixed_device when given, else the device that was
     current in the creating thread."""
@@ -372,6 +418,13 @@ PATCHES = {
     "sglang_omni.models.qwen3_omni.talker_model_runner": patch_put_messages,
     "sglang_omni.pipeline.coordinator": patch_coordinator,
 }
+if TALKER_BATCHES:
+    PATCHES["sglang_omni.models.qwen3_omni.components.talker"] = patch_talker
+    PATCHES["sglang_omni.models.qwen3_omni.components.preprocessor"] = (
+        patch_preprocessor
+    )
+else:
+    pass
 
 
 class PatchOnImport(importlib.abc.MetaPathFinder):
