@@ -233,8 +233,10 @@ class Qwen3OmniAudioEncoder(nn.Module):
     ) -> dict[str, torch.Tensor]:
         if feature_attention_mask is not None:
             audio_feature_lengths = torch.sum(feature_attention_mask, dim=1)
+            # note (ratish): a host-to-device copy that also changes dtype converts on this
+            # process's intra-op threads first; copying before the cast converts on the device.
             input_features = pack_padded_audio_features(
-                input_features.to(device=self.device, dtype=self.audio_tower.dtype),
+                input_features.to(device=self.device).to(dtype=self.audio_tower.dtype),
                 feature_attention_mask,
                 audio_feature_lengths,
             )
@@ -249,8 +251,8 @@ class Qwen3OmniAudioEncoder(nn.Module):
 
         lengths_cpu = audio_feature_lengths.to("cpu", dtype=torch.long)
         audio_feature_lengths = lengths_cpu.to(self.device, non_blocking=True)
-        input_features = input_features.to(
-            device=self.device, dtype=self.audio_tower.dtype
+        input_features = input_features.to(device=self.device).to(
+            dtype=self.audio_tower.dtype
         )
         tower = self.audio_tower
         padded_feature, chunk_lengths = hf_modeling.chunk_and_pad_features(

@@ -203,7 +203,11 @@ class Qwen3OmniImageEncoder(nn.Module):
             image_grid_thw, torch.Tensor
         ):
             image_grid_thw = image_grid_thw.to(dtype=torch.long)
-            pixel_values = pixel_values.to(device=self.device, dtype=self.visual.dtype)
+            # note (ratish): a host-to-device copy that also changes dtype converts on this
+            # process's intra-op threads first; copying before the cast converts on the device.
+            pixel_values = pixel_values.to(device=self.device).to(
+                dtype=self.visual.dtype
+            )
             image_embeds, image_embeds_multiscale = unpack_visual_output(
                 self.visual(pixel_values, grid_thw=image_grid_thw)
             )
@@ -223,8 +227,8 @@ class Qwen3OmniImageEncoder(nn.Module):
             video_grid_thw, torch.Tensor
         ):
             video_grid_thw = video_grid_thw.to(dtype=torch.long)
-            pixel_values_videos = pixel_values_videos.to(
-                device=self.device, dtype=self.visual.dtype
+            pixel_values_videos = pixel_values_videos.to(device=self.device).to(
+                dtype=self.visual.dtype
             )
             video_embeds, video_embeds_multiscale = unpack_visual_output(
                 self.visual(pixel_values_videos, grid_thw=video_grid_thw)
