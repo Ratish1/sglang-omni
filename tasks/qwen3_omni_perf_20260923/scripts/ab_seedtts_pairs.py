@@ -49,10 +49,13 @@ def describe(boot: Path, arm: str) -> str:
     parts = [f"{boot.parent.name}/{boot.name}"]
     if speed:
         summary = speed["summary"]
+        # note (ratish): a non-streaming arm reports no first audio, its audio arriving once.
+        first_audio = summary.get("audio_ttfp_mean_s")
         parts.append(
             f"req/s {summary['throughput_qps']:.3f} lat {summary['latency_mean_s']:.3f}/"
-            f"{summary['latency_p99_s']:.3f} first_audio {summary['audio_ttfp_mean_s']:.3f} "
-            f"rtf {summary['rtf_mean']:.4f} fail {summary['failed_requests']}"
+            f"{summary['latency_p99_s']:.3f} "
+            + ("" if first_audio is None else f"first_audio {first_audio:.3f} ")
+            + f"rtf {summary['rtf_mean']:.4f} fail {summary['failed_requests']}"
         )
     else:
         parts.append("no speed results")
