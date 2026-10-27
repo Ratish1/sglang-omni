@@ -91,10 +91,7 @@ def test_qwen3_tts_logit_shaping_never_waits_on_the_device() -> None:
     """Holding EOS by assigning one CUDA element copied a host scalar and synchronized the stream on each opening step."""
     codec_eos = 2150
     runner = make_runner(vocab_size=3072, codec_eos_token_id=codec_eos)
-    requests = [
-        make_scheduled_request(mask_leading_silence=False, generated_frames=frames)
-        for frames in (0, 1, 2)
-    ]
+    requests = [make_scheduled_request(generated_frames=frames) for frames in (0, 1, 2)]
     logits = torch.randn(len(requests), 6144, device="cuda")
 
     torch.cuda.set_sync_debug_mode("error")
