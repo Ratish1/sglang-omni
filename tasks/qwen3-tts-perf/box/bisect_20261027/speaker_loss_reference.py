@@ -6,7 +6,8 @@ its score step reads both arms alike.
 usage: /data/refenv/bin/python speaker_loss_reference.py CASES.jsonl --ids ID [ID ...] --model PATH --out DIR
        [--draws 100] [--batch 16] [--card 0] [--seed 0] [--encoder-fp32]
 
---encoder-fp32 runs the speech tokenizer's encoder in its checkpoint dtype (float32), the rest in bf16.
+--encoder-fp32 reloads the speech tokenizer from its float32 checkpoint and casts only its decoder to bf16, so the
+reference encoder runs on the checkpoint's own weights and dtype.
 
 Runs in a venv holding qwen-tts 0.1.1's pins (transformers 4.57.3, accelerate 1.12.0, torch 2.10.0).
 """
@@ -17,7 +18,8 @@ from pathlib import Path
 
 import soundfile
 import torch
-from qwen_tts import Qwen3TTSModel
+from huggingface_hub import snapshot_download
+from qwen_tts import Qwen3TTSModel, Qwen3TTSTokenizer
 
 
 def main() -> None:
@@ -40,7 +42,13 @@ def main() -> None:
         args.model, device_map=f"cuda:{args.card}", dtype=torch.bfloat16, attn_implementation="sdpa"
     )
     if args.encoder_fp32:
-        model.model.speech_tokenizer.model.encoder.to(torch.float32)
+        tokenizer = Qwen3TTSTokenizer.from_pretrained(
+            str(Path(snapshot_download(args.model)) / "speech_tokenizer"),
+            device_map=f"cuda:{args.card}",
+            dtype=torch.float32,
+        )
+        tokenizer.model.decoder.to(torch.bfloat16)
+        model.model.load_speech_tokenizer(tokenizer)
     else:
         pass
     (args.out / "audio").mkdir(parents=True, exist_ok=True)
