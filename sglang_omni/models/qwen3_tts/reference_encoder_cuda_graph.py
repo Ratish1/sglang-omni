@@ -75,7 +75,10 @@ def pad_tail(
 def exact_length_encode(
     encoder: torch.nn.Module, clip_samples: torch.Tensor
 ) -> Iterator[None]:
-    """Inside the block, the encoder gives the codes of its input's first clip_samples samples at their exact length."""
+    """Inside the block, the encoder gives the codes of its input's first clip_samples samples at their exact length.
+
+    The hooks act on every forward of the encoder inside the block, so the block must hold the encoder's only caller.
+    """
     # note (ratish): at the exact length each strided conv pads past the clip in its own mode, and a stride-s conv yields ceil(L / s) steps, so the clip covers its samples over the strides before the conv, rounded up.
     hook_handles: list[RemovableHandle] = []
     samples_per_step = 1
