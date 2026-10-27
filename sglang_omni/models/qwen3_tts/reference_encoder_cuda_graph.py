@@ -213,9 +213,9 @@ class Qwen3TTSReferenceEncoderCudaGraphRunner:
         else:
             pass
         captured = self.graphs[bucket]
+        # note (ratish): the tail padding hooks keep the last clip's samples past this one out of every code.
         self.encoder.clip_samples.fill_(samples)
         captured.static_input[0, 0, :samples].copy_(waveform)
-        captured.static_input[0, 0, samples:].zero_()
         captured.graph.replay()
         self.replays += 1
         # note(ratish): the graph rewrites its output on the next replay.
