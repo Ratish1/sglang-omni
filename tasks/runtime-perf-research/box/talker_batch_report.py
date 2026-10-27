@@ -84,7 +84,7 @@ def boot_rows(boot: Path, sample_by_prefix: dict[str, str]) -> list[dict]:
             pass
     out = []
     for pass_index, pass_dir in enumerate(passes):
-        if pass_dir.parent.name != "c64_clean":
+        if "c64_clean" not in pass_dir.parts:
             continue
         else:
             pass
