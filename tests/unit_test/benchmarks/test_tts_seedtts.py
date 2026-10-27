@@ -10,6 +10,7 @@ import threading
 from collections.abc import AsyncIterator
 from contextlib import contextmanager
 from pathlib import Path
+from types import SimpleNamespace
 from typing import BinaryIO
 from unittest.mock import MagicMock
 
@@ -36,6 +37,7 @@ from benchmarks.metrics.wer import SampleOutput, calculate_wer_metrics
 from benchmarks.tasks import asr
 from benchmarks.tasks.tts import (
     _build_tts_payload,
+    _transcribe_generated_via_runner,
     make_tts_send_fn,
     stream_outcome_collector,
 )
@@ -142,6 +144,52 @@ def test_filtered_wer_mean_keeps_exactly_50_percent_and_excludes_failures():
     assert metrics["n_above_50_pct_wer"] == 1
     assert metrics["evaluated"] == 3
     assert metrics["skipped"] == 1
+
+
+def test_wer_scores_natural_stops_and_counts_length_stops(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A runaway stopped at the client's token limit was transcribed and its babble counted into corpus WER."""
+    generated = [
+        {
+            "sample_id": sample_id,
+            "target_text": "hello world",
+            "wav_path": str(tmp_path / f"{sample_id}.wav"),
+            "is_success": True,
+            "finish_reason": finish_reason,
+            "latency_s": 0.5,
+            "audio_duration_s": duration_s,
+        }
+        for sample_id, finish_reason, duration_s in (
+            ("natural", "stop", 1.0),
+            ("runaway", "length", 163.84),
+        )
+    ]
+    transcripts = {"natural": "hello world", "runaway": "hello world " * 40}
+
+    async def transcribe(samples, **kwargs):
+        return [
+            SimpleNamespace(
+                request_id=sample.sample_id,
+                is_success=True,
+                text=transcripts[sample.sample_id],
+                latency_s=0.1,
+                error="",
+            )
+            for sample in samples
+        ], 1.0
+
+    monkeypatch.setattr("benchmarks.tasks.tts.run_asr_transcription", transcribe)
+
+    outputs, _ = _transcribe_generated_via_runner(generated, 12345, "asr", "en", 2)
+    metrics = calculate_wer_metrics(outputs, "en")
+
+    assert metrics["wer_corpus"] == 0.0
+    assert (metrics["evaluated"], metrics["skipped"], metrics["length_stops"]) == (
+        1,
+        0,
+        1,
+    )
 
 
 def test_explicit_cli_overrides_model_profile_defaults(monkeypatch):
