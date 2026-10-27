@@ -23,6 +23,7 @@ from sglang_omni.models.qwen3_tts.reference_encoder_cuda_graph import (
     DEFAULT_QWEN3_TTS_REFERENCE_ENCODER_BUCKET_FRAMES,
     Qwen3TTSReferenceEncoderCudaGraphRunner,
     ReferenceEncoderGraphStats,
+    exact_length_encode,
 )
 from sglang_omni.models.qwen3_tts.sglang_model import Qwen3TTSPromptConstants
 from sglang_omni.platforms import current_platform
@@ -948,6 +949,7 @@ class Qwen3TTSRefCodeBatcher:
         param = next(self.encoder.parameters())
         self.encoder_device = param.device
         self.encoder_dtype = param.dtype
+        self.clip_samples = torch.zeros((), dtype=torch.long, device=param.device)
         self.max_batch_size = max(int(max_batch_size), 1)
         self.max_batch_wait_s = max(float(max_batch_wait_ms), 0.0) / 1000.0
         self.encode_stream = new_encode_stream(self.encoder_device)
@@ -1080,10 +1082,11 @@ class Qwen3TTSRefCodeBatcher:
             dtype=self.encoder_dtype,
         )
         values[0, 0, : samples.numel()].copy_(samples)
-        self.encoder.clip_samples.fill_(samples.numel())
-        codes = self.encoder.encode(
-            values, num_quantizers=self.num_quantizers, return_dict=True
-        ).audio_codes
+        self.clip_samples.fill_(samples.numel())
+        with exact_length_encode(self.encoder, self.clip_samples):
+            codes = self.encoder.encode(
+                values, num_quantizers=self.num_quantizers, return_dict=True
+            ).audio_codes
         return codes[0, :, :frames].transpose(0, 1)
 
     def run(self) -> None:

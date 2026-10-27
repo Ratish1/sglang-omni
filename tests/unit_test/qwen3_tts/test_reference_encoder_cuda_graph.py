@@ -23,8 +23,8 @@ from sglang_omni.models.qwen3_tts import request_builders as qwen3_request_build
 from sglang_omni.models.qwen3_tts import stages as qwen3_stages
 from sglang_omni.models.qwen3_tts.reference_encoder_cuda_graph import (
     Qwen3TTSReferenceEncoderCudaGraphRunner,
+    exact_length_encode,
     move_conv_padding_to_host,
-    pad_strided_conv_tails,
     smallest_bucket,
 )
 
@@ -91,7 +91,6 @@ def test_speech_tokenizer_loader_moves_the_encoder_padding_to_host(
     monkeypatch.setattr(
         qwen3_stages, "load_float32_encoder_weights", lambda tokenizer, path: None
     )
-    monkeypatch.setattr(qwen3_stages, "pad_strided_conv_tails", lambda encoder: None)
 
     tokenizer = qwen3_stages.load_qwen3_tts_tokenizer(
         "/ckpt", device="cpu", dtype="float32", attn_implementation=None
@@ -102,9 +101,19 @@ def test_speech_tokenizer_loader_moves_the_encoder_padding_to_host(
     assert all(conv.padding_total.device.type == "cpu" for conv in convs)
 
 
-def test_reference_codes_match_the_exact_length_encode(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def exact_length_codes(model: MimiModel, waveform: np.ndarray) -> torch.Tensor:
+    return (
+        model.encode(
+            torch.from_numpy(waveform).view(1, 1, -1),
+            num_quantizers=4,
+            return_dict=True,
+        )
+        .audio_codes[0]
+        .transpose(0, 1)
+    )
+
+
+def test_reference_codes_match_the_exact_length_encode() -> None:
     """A reference padded to whole frames encoded its last frame from the padding's conv outputs, so its codes left the exact-length encode's and a voice clone lost its speaker several times as often."""
     torch.manual_seed(7)
     model = MimiModel(small_mimi_config())
@@ -113,34 +122,13 @@ def test_reference_codes_match_the_exact_length_encode(
             module.embed_sum.normal_()
     model.eval()
     exact = copy.deepcopy(model)
-
-    class FakeQwen3TTSTokenizer:
-        @classmethod
-        def from_pretrained(cls, path, **kwargs):
-            return SimpleNamespace(
-                model=SimpleNamespace(
-                    encoder=model,
-                    encode_downsample_rate=HOP,
-                    encoder_valid_num_quantizers=4,
-                ),
-                _normalize_audio_inputs=lambda waveforms, sr: [
-                    np.asarray(w, dtype=np.float32) for w in waveforms
-                ],
-            )
-
-    qwen_tts_module = types.ModuleType("qwen_tts")
-    qwen_tts_module.Qwen3TTSTokenizer = FakeQwen3TTSTokenizer
-    monkeypatch.setitem(sys.modules, "qwen_tts", qwen_tts_module)
-    monkeypatch.setattr(
-        qwen3_stages, "apply_qwen_tts_transformers_compatibility_patches", lambda: None
-    )
-    monkeypatch.setattr(qwen3_stages, "_resolve_checkpoint", lambda path: path)
-    monkeypatch.setattr(qwen3_stages, "_SPEECH_TOKENIZERS", {})
-    monkeypatch.setattr(
-        qwen3_stages, "load_float32_encoder_weights", lambda tokenizer, path: None
-    )
-    tokenizer = qwen3_stages.load_qwen3_tts_tokenizer(
-        "/ckpt", device="cpu", dtype="float32", attn_implementation=None
+    tokenizer = SimpleNamespace(
+        model=SimpleNamespace(
+            encoder=model, encode_downsample_rate=HOP, encoder_valid_num_quantizers=4
+        ),
+        _normalize_audio_inputs=lambda waveforms, sr: [
+            np.asarray(w, dtype=np.float32) for w in waveforms
+        ],
     )
     batcher = qwen3_request_builders.Qwen3TTSRefCodeBatcher(
         tokenizer, max_batch_wait_ms=0
@@ -153,18 +141,11 @@ def test_reference_codes_match_the_exact_length_encode(
         batcher.close()
 
     with torch.inference_mode():
-        want = [
-            exact.encode(
-                torch.from_numpy(waveform).view(1, 1, -1),
-                num_quantizers=4,
-                return_dict=True,
-            )
-            .audio_codes[0]
-            .transpose(0, 1)
-            for waveform in waveforms
-        ]
+        want = [exact_length_codes(exact, waveform) for waveform in waveforms]
+        after = [exact_length_codes(model, waveform) for waveform in waveforms]
     assert [tuple(c.shape) for c in codes] == [(3, 4), (6, 4), (10, 4)]
     assert all(torch.equal(got, wanted) for got, wanted in zip(codes, want))
+    assert all(torch.equal(got, wanted) for got, wanted in zip(after, want))
 
 
 def test_speech_tokenizer_loader_gives_the_encoder_its_float32_checkpoint_weights(
@@ -246,7 +227,6 @@ def test_reference_encoder_graph_replays_match_eager_and_miss_above_the_largest_
             module.embed_sum.normal_()
     model = model.to(device).eval()
     move_conv_padding_to_host(model)
-    pad_strided_conv_tails(model)
     hop = HOP
     quantizers = 2
     stream = torch.cuda.Stream(device)
@@ -278,10 +258,11 @@ def test_reference_encoder_graph_replays_match_eager_and_miss_above_the_largest_
         for waveform, bucket in ((short, 4), (long, 8), (long_other, 8)):
             values = torch.zeros((1, 1, bucket * hop), device=device)
             values[0, 0, : waveform.numel()].copy_(waveform)
-            model.clip_samples.fill_(waveform.numel())
-            codes = model.encode(
-                values, num_quantizers=quantizers, return_dict=True
-            ).audio_codes
+            clip_samples = torch.tensor(waveform.numel(), device=device)
+            with exact_length_encode(model, clip_samples):
+                codes = model.encode(
+                    values, num_quantizers=quantizers, return_dict=True
+                ).audio_codes
             frames = -(-waveform.numel() // hop)
             eager.append(codes[0, :, :frames].transpose(0, 1))
     assert not torch.equal(eager[1], eager[2])
@@ -304,7 +285,6 @@ def test_reference_code_batcher_replays_captured_buckets_and_encodes_the_rest(
             module.embed_sum.normal_()
     model = model.to(device).eval()
     move_conv_padding_to_host(model)
-    pad_strided_conv_tails(model)
     tokenizer = SimpleNamespace(
         model=SimpleNamespace(
             encoder=model, encode_downsample_rate=HOP, encoder_valid_num_quantizers=2
@@ -338,8 +318,9 @@ def test_reference_code_batcher_replays_captured_buckets_and_encodes_the_rest(
         for waveform in beyond_waveforms:
             values = torch.zeros((1, 1, 8 * HOP), device=device)
             values[0, 0, : waveform.size].copy_(torch.from_numpy(waveform))
-            model.clip_samples.fill_(waveform.size)
-            codes = encode(values, num_quantizers=2, return_dict=True).audio_codes
+            clip_samples = torch.tensor(waveform.size, device=device)
+            with exact_length_encode(model, clip_samples):
+                codes = encode(values, num_quantizers=2, return_dict=True).audio_codes
             expected.append(codes[0, :, : waveform.size // HOP].transpose(0, 1))
 
     assert all(int(codes.unique().numel()) > 1 for codes in expected)
