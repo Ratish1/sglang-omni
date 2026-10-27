@@ -30,6 +30,7 @@ def load(tree: pathlib.Path, name: str):
         name, tree / "sglang_omni/utils/predictor_layers.py"
     )
     module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
     spec.loader.exec_module(module)
     return module
 
