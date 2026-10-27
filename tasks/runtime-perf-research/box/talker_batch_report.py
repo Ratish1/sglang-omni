@@ -1,9 +1,11 @@
 """The talker batch sizes each request decoded in, against its quality and its playback, from boots run with the hop
 probe and OMNI_HOP_PROBE_TALKER_BATCHES=1 ("req": request id and prompt text; "tb": each decode step's rows and ids).
 
-usage: python3 talker_batch_report.py <boot dir> [<boot dir> ...]
+usage: PYTHONPATH=<tree> python3 talker_batch_report.py <boot dir> [<boot dir> ...]
 
-Per boot, requests are matched to benchmark samples by the sample's target text inside the prompt, in pass order:
+Per boot, requests are matched to benchmark samples by the probe's first 300 characters of the prompt, rebuilt for
+each SeedTTS EN sample with the benchmark's voice-clone template (a prefix shared by two samples is dropped), in pass
+order:
 c64_warm, the c64_clean repeats in order, c64_events (a text's earliest extra requests, the warmup's, are dropped).
 Each request's decode steps give its mean and peak rows and its share of steps above 32 rows. Over the clean
 repeats, requests are grouped by outcome: WER above 50 %, a run-on (more than 1 s of audio per completion token),
@@ -17,7 +19,24 @@ import statistics
 from collections import defaultdict
 from pathlib import Path
 
+from benchmarks.dataset.seedtts import load_seedtts_samples
+
 RUN_ON_SECONDS_PER_TOKEN = 1.0
+SEEDTTS = "zhaochenyang20/seed-tts-eval-arrow"
+PROMPT_PREFIX_CHARS = 300
+
+
+def sample_by_prompt_prefix() -> dict[str, str]:
+    """The probe's text prefix of each SeedTTS EN voice-clone prompt, as benchmarks/tasks/tts.py builds it."""
+    by_prefix: dict[str, list[str]] = defaultdict(list)
+    for sample in load_seedtts_samples(SEEDTTS, None, split="en"):
+        prompt = (
+            f'Listen to the audio above. The speaker is reading: "{sample.ref_text}". '
+            f"Now please read the following text out loud in the same voice and style: "
+            f"{sample.target_text}"
+        )
+        by_prefix[prompt[:PROMPT_PREFIX_CHARS]].append(sample.sample_id)
+    return {prefix: ids[0] for prefix, ids in by_prefix.items() if len(ids) == 1}
 
 
 def probe_records(boot: Path) -> tuple[list[dict], list[dict]]:
@@ -47,28 +66,22 @@ def stall_s(request: dict) -> float:
     return worst
 
 
-def boot_rows(boot: Path) -> list[dict]:
+def boot_rows(boot: Path, sample_by_prefix: dict[str, str]) -> list[dict]:
     passes = [boot / "c64_warm" / "bench"]
     passes += sorted((boot / "c64_clean" / "bench").glob("rep*"))
     passes += [boot / "c64_events" / "bench"]
-    samples_by_text: dict[str, list[str]] = defaultdict(list)
-    with open(passes[1] / "speed_results.json", encoding="utf-8") as source:
-        for request in json.load(source)["per_request"]:
-            samples_by_text[request["text"]].append(request["id"])
     requests, steps = probe_records(boot)
     rows_by_rid: dict[str, list[int]] = defaultdict(list)
     for step in steps:
         for rid in step["rids"]:
             rows_by_rid[rid].append(step["rows"])
-    rids_by_text: dict[str, list[tuple[int, str]]] = defaultdict(list)
+    rids_by_sample: dict[str, list[tuple[int, str]]] = defaultdict(list)
     for request in requests:
-        text = request.get("text") or ""
-        for target in samples_by_text:
-            if text.endswith(target):
-                rids_by_text[target].append((request["ns"], request["rid"]))
-                break
-            else:
-                pass
+        sample = sample_by_prefix.get(request.get("text") or "")
+        if sample is not None:
+            rids_by_sample[sample].append((request["ns"], request["rid"]))
+        else:
+            pass
     out = []
     for pass_index, pass_dir in enumerate(passes):
         if pass_dir.parent.name != "c64_clean":
@@ -82,14 +95,13 @@ def boot_rows(boot: Path) -> list[dict]:
             if wer_path.exists()
             else {}
         )
-        for text, sample_ids in samples_by_text.items():
-            ordered = [rid for _, rid in sorted(rids_by_text.get(text, []))]
-            if len(sample_ids) != 1 or len(ordered) < len(passes):
+        for sample, timed_rids in rids_by_sample.items():
+            ordered = [rid for _, rid in sorted(timed_rids)]
+            if len(ordered) < len(passes):
                 continue
             else:
                 pass
             rid = ordered[len(ordered) - len(passes) + pass_index]
-            sample = sample_ids[0]
             request = speed.get(sample)
             rows = rows_by_rid.get(rid, [])
             if request is None or not request["is_success"] or not rows:
@@ -130,8 +142,9 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("boots", nargs="+")
     args = parser.parse_args()
+    sample_by_prefix = sample_by_prompt_prefix()
     for boot in args.boots:
-        rows = boot_rows(Path(boot))
+        rows = boot_rows(Path(boot), sample_by_prefix)
         print(f"== {boot}: {len(rows)} matched clean requests")
         summarize("WER above 50 %", [r for r in rows if r["bad_wer"]])
         summarize("run-on", [r for r in rows if r["run_on"]])
