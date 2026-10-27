@@ -299,25 +299,31 @@ class CommRouter:
         return kind, self.relay(kind)
 
     def outbound_payload(self, target: str, payload: object) -> TransportKind:
+        return self.note_transport(
+            "payload", target, self.payload_transport(target, payload)
+        )
+
+    def payload_transport(self, target: str, payload: object) -> TransportKind:
+        """The transport a payload to this target takes, without recording the choice."""
         if target in self.remote_stage_names:
-            kind = TransportKind.MOONCAKE
+            return TransportKind.MOONCAKE
         else:
-            devices = tensor_devices(getattr(payload, "data", payload))
-            if not devices or devices == {"cpu"}:
-                kind = TransportKind.SHM
-            elif current_platform.device_type in devices and devices <= {
-                "cpu",
-                current_platform.device_type,
-            }:
-                if self.self_is_gpu and target in self.gpu_stage_names:
-                    kind = self.intra_node_transport(target)
-                else:
-                    kind = TransportKind.SHM
+            pass
+        devices = tensor_devices(getattr(payload, "data", payload))
+        if not devices or devices == {"cpu"}:
+            return TransportKind.SHM
+        elif current_platform.device_type in devices and devices <= {
+            "cpu",
+            current_platform.device_type,
+        }:
+            if self.self_is_gpu and target in self.gpu_stage_names:
+                return self.intra_node_transport(target)
             else:
-                raise ValueError(
-                    f"mixed or unsupported tensor devices in payload: {devices}"
-                )
-        return self.note_transport("payload", target, kind)
+                return TransportKind.SHM
+        else:
+            raise ValueError(
+                f"mixed or unsupported tensor devices in payload: {devices}"
+            )
 
     def relay_for_stream(
         self, target: str, data: torch.Tensor

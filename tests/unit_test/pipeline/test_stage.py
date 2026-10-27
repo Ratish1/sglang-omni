@@ -813,7 +813,8 @@ def test_stage_fan_out_cuda_payload_copies_to_same_process_targets(
     monkeypatch,
 ) -> None:
     """A same-process fan-out target of a CUDA payload once got the CUDA IPC relay,
-    whose event handle a process cannot open in itself."""
+    whose event handle a process cannot open in itself; a target the relay reaches
+    over shared memory keeps it."""
     events: list[dict] = []
     monkeypatch.setattr(
         "sglang_omni.pipeline.stage.runtime._emit_event",
@@ -826,25 +827,33 @@ def test_stage_fan_out_cuda_payload_copies_to_same_process_targets(
         control_plane = RecordingStageControlPlane()
         thinker_scheduler = FakeScheduler()
         talker_scheduler = FakeScheduler()
+        decode_scheduler = FakeScheduler()
         thinker = make_stage(name="thinker", scheduler=thinker_scheduler)
         talker = make_stage(name="talker", scheduler=talker_scheduler)
+        decode = make_stage(name="decode", scheduler=decode_scheduler)
         sender = make_stage(
             name="encoder",
-            get_next=lambda request_id, output: ["thinker", "talker"],
-            endpoints={"thinker": "inproc://thinker", "talker": "inproc://talker"},
+            gpu_id=0,
+            get_next=lambda request_id, output: ["thinker", "talker", "decode"],
+            endpoints={
+                "thinker": "inproc://thinker",
+                "talker": "inproc://talker",
+                "decode": "inproc://decode",
+            },
             relay=relay,
             control_plane=control_plane,
-            same_process_targets={"thinker", "talker"},
+            same_process_targets={"thinker", "talker", "decode"},
+            gpu_stage_names={"thinker", "talker"},
             local_dispatcher=dispatcher,
         )
-        dispatcher.register_many([sender, thinker, talker])
+        dispatcher.register_many([sender, thinker, talker, decode])
         tensor = torch.arange(4, device="cuda")
         payload = make_stage_payload(request_id="req-cuda", data={"embeds": tensor})
 
         await sender.route_result("req-cuda", payload)
 
-        assert relay.storage == {}
-        assert control_plane.sent_to_stage == []
+        assert [target for target, _, _ in control_plane.sent_to_stage] == ["decode"]
+        assert decode_scheduler.inbox.empty()
         received = [
             scheduler.inbox.get_nowait().data
             for scheduler in (thinker_scheduler, talker_scheduler)
@@ -862,7 +871,7 @@ def test_stage_fan_out_cuda_payload_copies_to_same_process_targets(
         for event in events
         if event["event_name"] == "stage_hop_sent"
     ]
-    assert transports == ["local_copy", "local_copy"]
+    assert transports == ["local_copy", "local_copy", TransportKind.SHM.value]
 
 
 def test_stage_applies_projector_before_local_object_send() -> None:

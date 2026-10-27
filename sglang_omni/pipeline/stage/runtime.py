@@ -26,7 +26,7 @@ from typing import Awaitable, Callable, Literal, Protocol
 import torch
 
 from sglang_omni.comm import stage_io
-from sglang_omni.comm.data_ref import DataKind, DataRef
+from sglang_omni.comm.data_ref import DataKind, DataRef, TransportKind
 from sglang_omni.comm.engine import CommEngine, KVTransferCancelled, KVTransferRejected
 from sglang_omni.comm.kv_transfer import KVPageTransfer
 from sglang_omni.comm.router import CommRouter
@@ -1929,7 +1929,9 @@ class Stage:
             )
         )
         if sends_locally and (
-            use_local_object or stage_io.payload_has_cuda_tensor(projected_payload)
+            use_local_object
+            or self.comm.router.payload_transport(target, projected_payload)
+            is TransportKind.CUDA_IPC
         ):
             if self.local_dispatcher is None:
                 raise RuntimeError(
@@ -1943,8 +1945,8 @@ class Stage:
                 transport = "local_object"
             else:
                 # note (ratish): a process cannot open a CUDA IPC handle it created, so a
-                # same-process target that must not share the payload gets its own copy,
-                # complete on this stream before it is handed over.
+                # same-process target the relay would reach over CUDA IPC gets its own copy,
+                # complete on this stream before it is handed over; other relays still work.
                 local_payload = copy.deepcopy(projected_payload)
                 torch.cuda.current_stream().synchronize()
                 transport = "local_copy"
