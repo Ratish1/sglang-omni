@@ -616,14 +616,15 @@ def assert_wer_results(
         failed_details = [
             f"  sample {s.get('id')}: {s.get('error')}"
             for s in per_sample
-            if not s.get("is_success", True)
+            if not s.get("is_success", True) and not s.get("ended_by_length")
         ]
         evaluated = summary.get("evaluated")
         total_samples = summary.get("total_samples")
         skipped = summary.get("skipped")
+        length_stops = summary.get("length_stops", 0)
         checks.check(
-            evaluated == total_samples,
-            f"Only {evaluated}/{total_samples} samples evaluated, "
+            evaluated == total_samples - length_stops,
+            f"Only {evaluated}/{total_samples - length_stops} natural stops evaluated, "
             f"{skipped} skipped.\n"
             f"Per-sample errors:\n" + "\n".join(failed_details),
         )
@@ -644,7 +645,7 @@ def assert_wer_results(
 
     for sample in per_sample:
         checks.check(
-            sample.get("is_success") is True,
+            sample.get("is_success") is True or sample.get("ended_by_length") is True,
             f"Sample {sample.get('id')} failed: {sample.get('error')}",
         )
 

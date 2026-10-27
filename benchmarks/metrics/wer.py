@@ -35,17 +35,23 @@ class SampleOutput:
     asr_latency_s: float = 0.0
     is_success: bool = False
     error: str = ""
+    ended_by_length: bool = False
 
 
 def calculate_wer_metrics(outputs: list[SampleOutput], lang: str) -> dict:
-    """Compute corpus-level WER metrics from per-sample outputs."""
+    """Compute corpus-level WER metrics from per-sample outputs.
+
+    A sample that ended by length is counted in length_stops, neither scored nor skipped.
+    """
     successes = [o for o in outputs if o.is_success]
+    length_stops = sum(1 for o in outputs if o.ended_by_length)
     if not successes:
         return {
             "lang": lang,
             "total_samples": len(outputs),
             "evaluated": 0,
-            "skipped": len(outputs),
+            "skipped": len(outputs) - length_stops,
+            "length_stops": length_stops,
             "wer_corpus": 0.0,
             "wer_per_sample_mean": 0.0,
             "wer_per_sample_median": 0.0,
@@ -92,7 +98,8 @@ def calculate_wer_metrics(outputs: list[SampleOutput], lang: str) -> dict:
         "lang": lang,
         "total_samples": len(outputs),
         "evaluated": len(successes),
-        "skipped": len(outputs) - len(successes),
+        "skipped": len(outputs) - len(successes) - length_stops,
+        "length_stops": length_stops,
         "wer_corpus": float(corpus_wer),
         "wer_per_sample_mean": float(np.mean(wer_arr)),
         "wer_per_sample_median": float(np.median(wer_arr)),
@@ -153,6 +160,10 @@ def _print_wer_summary_table(
         f"{metrics.get('evaluated', 0)}/{metrics.get('total_samples', 0)}"
     )
     print(f"  {'Skipped:':<{lw}} {metrics.get('skipped', 0)}")
+    if metrics.get("length_stops"):
+        print(f"  {'Ended by length:':<{lw}} {metrics['length_stops']}")
+    else:
+        pass
     print(f"{'-' * w}")
     print(
         f"  {'WER (corpus, micro-avg):':<{lw}} "

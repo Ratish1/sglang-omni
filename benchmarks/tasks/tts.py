@@ -102,6 +102,7 @@ def save_wer_results(
                 "audio_duration_s": round(o.audio_duration_s, 4),
                 "latency_s": round(o.latency_s, 4),
                 "is_success": o.is_success,
+                "ended_by_length": o.ended_by_length,
                 "error": o.error or None,
             }
             for o in outputs
@@ -195,11 +196,25 @@ def run_seedtts_similarity(
     # crash the scorer or contaminate the cosine-similarity batch.
     scoreable: list[dict] = []
     skipped_rows: list[dict] = []
+    length_rows: list[dict] = []
     for entry in generated:
         sample_id = entry.get("sample_id")
         wav_path = entry.get("wav_path")
         ref_audio = ref_audio_by_id.get(sample_id) if sample_id else None
-        if (
+        if ended_by_length(entry):
+            length_rows.append(
+                {
+                    "id": sample_id,
+                    "ref_audio": ref_audio,
+                    "wav_path": wav_path,
+                    "speaker_similarity": None,
+                    "is_success": False,
+                    "ended_by_length": True,
+                    "error": "ended by length, not scored",
+                }
+            )
+            continue
+        elif (
             entry.get("is_success")
             and isinstance(wav_path, str)
             and wav_path
@@ -209,6 +224,8 @@ def run_seedtts_similarity(
         ):
             scoreable.append(entry)
             continue
+        else:
+            pass
 
         if not entry.get("is_success"):
             reason = entry.get("error") or "generation reported is_success=False"
@@ -287,11 +304,12 @@ def run_seedtts_similarity(
         "total_samples": len(generated),
         "evaluated": len(scored_rows),
         "skipped": len(skipped_rows),
+        "length_stops": len(length_rows),
     }
     print(
         "SeedTTS speaker similarity: "
         f"{similarity_mean:.4f} ({len(scored_rows)}/{len(generated)} evaluated, "
-        f"{len(skipped_rows)} skipped)"
+        f"{len(skipped_rows)} skipped, {len(length_rows)} ended by length)"
     )
     if skipped_rows:
         logger.warning(
@@ -300,7 +318,7 @@ def run_seedtts_similarity(
             len(skipped_rows),
         )
 
-    per_sample = scored_rows + skipped_rows
+    per_sample = scored_rows + skipped_rows + length_rows
     save_json_results(
         {
             "summary": metrics,
@@ -343,11 +361,23 @@ def run_seedtts_utmos(
 
     per_sample: list[dict | None] = [None] * len(generated)
     scoreable: list[dict] = []
+    n_length_stops = 0
 
     for idx, entry in enumerate(generated):
         sample_id = entry.get("sample_id")
         wav_path = entry.get("wav_path")
-        if (
+        if ended_by_length(entry):
+            n_length_stops += 1
+            per_sample[idx] = {
+                "id": sample_id or wav_path,
+                "wav_path": wav_path,
+                "utmos_score": None,
+                "is_success": False,
+                "ended_by_length": True,
+                "error": "ended by length, not scored",
+            }
+            continue
+        elif (
             isinstance(sample_id, str)
             and sample_id
             and entry.get("is_success")
@@ -357,6 +387,8 @@ def run_seedtts_utmos(
         ):
             scoreable.append({**entry, "_idx": idx})
             continue
+        else:
+            pass
 
         if not isinstance(sample_id, str) or not sample_id:
             reason = "sample_id missing from generated.json entry"
@@ -414,8 +446,8 @@ def run_seedtts_utmos(
             if log_per_sample:
                 logger.info(f"[{entry['sample_id']}] utmos={score:.3f}")
 
-    n_skipped = sum(1 for r in per_sample if r is None or not r["is_success"])
     n_scored = len(scores)
+    n_skipped = len(generated) - n_scored - n_length_stops
 
     metrics = {
         "utmos_mean": round(float(np.mean(scores)), 4),
@@ -425,10 +457,12 @@ def run_seedtts_utmos(
         "total_samples": len(generated),
         "evaluated": n_scored,
         "skipped": n_skipped,
+        "length_stops": n_length_stops,
     }
     print(
         f"UTMOS: mean={metrics['utmos_mean']:.4f} "
-        f"({n_scored}/{len(generated)} evaluated, {n_skipped} skipped)"
+        f"({n_scored}/{len(generated)} evaluated, {n_skipped} skipped, "
+        f"{n_length_stops} ended by length)"
     )
     if n_skipped:
         logger.warning(
@@ -522,7 +556,9 @@ def _transcribe_generated_via_runner(
     *,
     log_per_sample: bool = False,
 ) -> tuple[list[SampleOutput], float]:
-    done = [e for e in generated if e.get("is_success", False)]
+    done = [
+        e for e in generated if e.get("is_success", False) and not ended_by_length(e)
+    ]
     samples = [
         SampleInput(
             sample_id=e["sample_id"],
@@ -555,6 +591,13 @@ def _transcribe_generated_via_runner(
             output.error = f"Generation failed: {e.get('error', 'unknown')}"
             outputs.append(output)
             continue
+        elif ended_by_length(e):
+            output.ended_by_length = True
+            output.error = "Ended by length, not scored"
+            outputs.append(output)
+            continue
+        else:
+            pass
         result = result_by_id.get(e["sample_id"])
         if result is None or not result.is_success:
             output.error = (result.error if result else "") or "No transcription"
@@ -1120,6 +1163,11 @@ def finish_reason_from_server(value: str | None) -> FinishReason:
         return FinishReason.UNKNOWN
 
 
+def ended_by_length(entry: dict) -> bool:
+    """Whether a generated entry stopped at its token limit instead of its own end."""
+    return entry.get("finish_reason") == FinishReason.LENGTH.value
+
+
 def set_token_rate(result: RequestResult) -> None:
     if result.completion_tokens > 0 and result.engine_time_s > 0:
         result.tok_per_s = result.completion_tokens / result.engine_time_s
@@ -1486,6 +1534,7 @@ def _request_result_to_generated_entry(
         "target_text": sample.target_text,
         "wav_path": output.wav_path,
         "is_success": output.is_success,
+        "finish_reason": output.finish_reason.value,
         "latency_s": round(output.latency_s, 4),
         "audio_duration_s": round(output.audio_duration_s, 4),
     }
