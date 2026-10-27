@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import functools
 import logging
 from collections.abc import Iterable
 from dataclasses import dataclass
@@ -47,6 +48,57 @@ def move_conv_padding_to_host(encoder: torch.nn.Module) -> int:
         else:
             pass
     return count
+
+
+def pad_tail(
+    encoder: MimiModel,
+    strides_before: int,
+    module: MimiConv1d,
+    args: tuple[torch.Tensor, ...],
+) -> tuple[torch.Tensor, ...]:
+    """Fill a strided conv's input past the clip's span as the conv pads the clip."""
+    hidden = args[0]
+    span = (encoder.clip_samples + strides_before - 1) // strides_before
+    inside = torch.arange(hidden.shape[-1], device=hidden.device) < span
+    if module.pad_mode == "replicate":
+        tail = hidden.index_select(-1, (span - 1).view(1))
+    else:
+        tail = 0.0
+    return (torch.where(inside, hidden, tail), *args[1:])
+
+
+def pad_strided_conv_tails(encoder: MimiModel) -> None:
+    """Make a padded encode give the codes of the clip's exact-length encode.
+
+    At the exact length every strided conv pads its own input past the clip in its
+    pad mode (zeros in the encoder, the last frame in the downsample), so its last
+    frame reads that padding; padded, it would read the convs' output over the
+    padding instead. A stride-1 causal conv keeps the length and a stride-s conv
+    yields ceil(L / s) frames, so the clip spans its samples over the strides
+    before a conv, rounded up. Every encode first sets the clip's samples in
+    `encoder.clip_samples`.
+    """
+    device = next(encoder.parameters()).device
+    encoder.register_buffer(
+        "clip_samples",
+        torch.zeros((), dtype=torch.long, device=device),
+        persistent=False,
+    )
+    convs = [m for m in encoder.encoder.modules() if isinstance(m, MimiConv1d)]
+    strides_before = 1
+    for conv in [*convs, encoder.downsample]:
+        stride = int(conv.stride)
+        if stride == 1:
+            continue
+        elif conv.pad_mode not in ("constant", "replicate"):
+            raise ValueError(
+                f"Qwen3-TTS reference encoder cannot pad a {conv.pad_mode!r} conv's tail"
+            )
+        else:
+            conv.register_forward_pre_hook(
+                functools.partial(pad_tail, encoder, strides_before)
+            )
+            strides_before *= stride
 
 
 def smallest_bucket(frames: int, buckets: Iterable[int]) -> int | None:
@@ -163,6 +215,7 @@ class Qwen3TTSReferenceEncoderCudaGraphRunner:
         else:
             pass
         captured = self.graphs[bucket]
+        self.encoder.clip_samples.fill_(samples)
         captured.static_input[0, 0, :samples].copy_(waveform)
         captured.static_input[0, 0, samples:].zero_()
         captured.graph.replay()
@@ -185,5 +238,6 @@ __all__ = [
     "DEFAULT_QWEN3_TTS_REFERENCE_ENCODER_BUCKET_FRAMES",
     "Qwen3TTSReferenceEncoderCudaGraphRunner",
     "move_conv_padding_to_host",
+    "pad_strided_conv_tails",
     "smallest_bucket",
 ]

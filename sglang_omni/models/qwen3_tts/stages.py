@@ -22,6 +22,7 @@ from sglang_omni.models.qwen3_tts.config import (
 from sglang_omni.models.qwen3_tts.reference_encoder_cuda_graph import (
     DEFAULT_QWEN3_TTS_REFERENCE_ENCODER_BUCKET_FRAMES,
     move_conv_padding_to_host,
+    pad_strided_conv_tails,
 )
 from sglang_omni.models.qwen3_tts.request_builders import (
     Qwen3TTSReferenceEncoderStats,
@@ -161,6 +162,7 @@ def load_qwen3_tts_tokenizer(
         tokenizer = Qwen3TTSTokenizer.from_pretrained(tokenizer_path, **kwargs)
         load_float32_encoder_weights(tokenizer, tokenizer_path)
         move_conv_padding_to_host(tokenizer.model.encoder)
+        pad_strided_conv_tails(tokenizer.model.encoder)
         _SPEECH_TOKENIZERS[key] = tokenizer
         return tokenizer
 

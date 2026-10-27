@@ -404,6 +404,7 @@ def test_qwen3_tts_speech_tokenizer_is_loaded_once_per_process_key(
     monkeypatch.setattr(
         qwen3_stages, "load_float32_encoder_weights", lambda tokenizer, path: None
     )
+    monkeypatch.setattr(qwen3_stages, "pad_strided_conv_tails", lambda encoder: None)
 
     vocoder_copy = qwen3_stages.load_qwen3_tts_tokenizer(
         "/ckpt", device="cuda:0", dtype="bfloat16", attn_implementation=None
@@ -514,6 +515,7 @@ def test_qwen3_tts_engine_attaches_the_vocoder_speech_tokenizer_before_the_pool(
     monkeypatch.setattr(
         qwen3_stages, "load_float32_encoder_weights", lambda tokenizer, path: None
     )
+    monkeypatch.setattr(qwen3_stages, "pad_strided_conv_tails", lambda encoder: None)
     monkeypatch.setattr(
         qwen3_stages,
         "load_qwen3_tts_checkpoint_config",
@@ -1254,6 +1256,11 @@ class FakeReferenceEncoder(torch.nn.Module):
     def __init__(self, encode, *, quantizers, device):
         super().__init__()
         self.scale = torch.nn.Parameter(torch.ones(1, device=device))
+        self.register_buffer(
+            "clip_samples",
+            torch.zeros((), dtype=torch.long, device=device),
+            persistent=False,
+        )
         self.encoder = encode
         self.quantizers = quantizers
 
