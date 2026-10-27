@@ -10,6 +10,7 @@ Dispatches all compute to scheduler (OmniScheduler or SimpleScheduler).
 from __future__ import annotations
 
 import asyncio
+import copy
 import gc
 import inspect
 import logging
@@ -1916,10 +1917,8 @@ class Stage:
             )
         )
 
-        if (
-            use_local_object
-            and target in self.same_process_targets
-            and self.can_send_full_payload_locally(
+        sends_locally = target in self.same_process_targets and (
+            self.can_send_full_payload_locally(
                 request_id,
                 target,
                 (
@@ -1928,6 +1927,9 @@ class Stage:
                     else stream_targets_for_request
                 ),
             )
+        )
+        if sends_locally and (
+            use_local_object or stage_io.payload_has_cuda_tensor(projected_payload)
         ):
             if self.local_dispatcher is None:
                 raise RuntimeError(
@@ -1936,18 +1938,28 @@ class Stage:
                 )
             else:
                 pass
+            if use_local_object:
+                local_payload = projected_payload
+                transport = "local_object"
+            else:
+                # note (ratish): a process cannot open a CUDA IPC handle it created, so a
+                # same-process target that must not share the payload gets its own copy,
+                # complete on this stream before it is handed over.
+                local_payload = copy.deepcopy(projected_payload)
+                torch.cuda.current_stream().synchronize()
+                transport = "local_copy"
 
             _emit_event(
                 request_id=request_id,
                 stage=self.name,
                 event_name="stage_hop_sent",
-                metadata={"to_stage": target, "transport": "local_object"},
+                metadata={"to_stage": target, "transport": transport},
             )
             await self.local_dispatcher.send_payload(
                 from_stage=self.name,
                 to_stage=target,
                 request_id=request_id,
-                payload=projected_payload,
+                payload=local_payload,
                 replica_bindings=self.replica_bindings.get(request_id),
             )
             return

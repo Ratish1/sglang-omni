@@ -807,6 +807,64 @@ def test_stage_sends_same_process_payload_as_local_object(monkeypatch) -> None:
     ]
 
 
+@pytest.mark.accelerator
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a CUDA tensor")
+def test_stage_fan_out_cuda_payload_copies_to_same_process_targets(
+    monkeypatch,
+) -> None:
+    """A same-process fan-out target of a CUDA payload once got the CUDA IPC relay,
+    whose event handle a process cannot open in itself."""
+    events: list[dict] = []
+    monkeypatch.setattr(
+        "sglang_omni.pipeline.stage.runtime._emit_event",
+        lambda **kwargs: events.append(kwargs),
+    )
+
+    async def run() -> None:
+        dispatcher = LocalStageDispatcher()
+        relay = FakeRelay()
+        control_plane = RecordingStageControlPlane()
+        thinker_scheduler = FakeScheduler()
+        talker_scheduler = FakeScheduler()
+        thinker = make_stage(name="thinker", scheduler=thinker_scheduler)
+        talker = make_stage(name="talker", scheduler=talker_scheduler)
+        sender = make_stage(
+            name="encoder",
+            get_next=lambda request_id, output: ["thinker", "talker"],
+            endpoints={"thinker": "inproc://thinker", "talker": "inproc://talker"},
+            relay=relay,
+            control_plane=control_plane,
+            same_process_targets={"thinker", "talker"},
+            local_dispatcher=dispatcher,
+        )
+        dispatcher.register_many([sender, thinker, talker])
+        tensor = torch.arange(4, device="cuda")
+        payload = make_stage_payload(request_id="req-cuda", data={"embeds": tensor})
+
+        await sender.route_result("req-cuda", payload)
+
+        assert relay.storage == {}
+        assert control_plane.sent_to_stage == []
+        received = [
+            scheduler.inbox.get_nowait().data
+            for scheduler in (thinker_scheduler, talker_scheduler)
+        ]
+        assert received[0].data is not received[1].data
+        for copied in received:
+            assert copied.data is not payload.data
+            assert copied.data["embeds"].data_ptr() != tensor.data_ptr()
+            assert torch.equal(copied.data["embeds"], tensor)
+
+    asyncio.run(run())
+
+    transports = [
+        event["metadata"]["transport"]
+        for event in events
+        if event["event_name"] == "stage_hop_sent"
+    ]
+    assert transports == ["local_copy", "local_copy"]
+
+
 def test_stage_applies_projector_before_local_object_send() -> None:
     async def run() -> None:
         dispatcher = LocalStageDispatcher()
