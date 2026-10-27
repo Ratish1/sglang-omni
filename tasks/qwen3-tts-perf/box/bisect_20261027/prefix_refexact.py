@@ -6,6 +6,7 @@ usage: PYTHONPATH=TREE python3 prefix_refexact.py BRANCH_TEST_FILE
 
 import importlib.util
 import sys
+import traceback
 
 import sglang_omni
 from sglang_omni.models.qwen3_tts import reference_encoder_cuda_graph
@@ -19,7 +20,8 @@ module = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(module)
 try:
     module.test_reference_codes_match_the_exact_length_encode()
-except AssertionError as exc:
-    print(f"FAILED: {exc!r}")
+except AssertionError:
+    print("FAILED at:")
+    traceback.print_exc(limit=-1, file=sys.stdout)
 else:
     print("PASSED")
