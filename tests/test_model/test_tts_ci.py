@@ -1011,6 +1011,7 @@ def test_voice_cloning_wer(
             assert_wer_results(
                 results,
                 THRESHOLDS.wer_corpus,
+                max_length_stops=THRESHOLDS.max_length_stops,
                 collector=checks,
             )
     checks.assert_all()
@@ -1105,6 +1106,7 @@ def test_voice_cloning_streaming_wer(
             assert_wer_results(
                 results,
                 THRESHOLDS.stream_wer_corpus,
+                max_length_stops=THRESHOLDS.max_length_stops,
                 collector=checks,
             )
     checks.assert_all()

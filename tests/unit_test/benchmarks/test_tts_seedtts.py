@@ -39,10 +39,15 @@ from benchmarks.tasks.tts import (
     _build_tts_payload,
     _transcribe_generated_via_runner,
     make_tts_send_fn,
+    save_wer_results,
     stream_outcome_collector,
 )
 from sglang_omni.admission import QueueFullError
-from tests.utils import QWEN3_ASR_WER_CONCURRENCY, assert_wer_partitioned
+from tests.utils import (
+    QWEN3_ASR_WER_CONCURRENCY,
+    assert_wer_partitioned,
+    assert_wer_results,
+)
 
 SEEDTTS_SAMPLE = SampleInput(
     sample_id="sample-1",
@@ -149,7 +154,7 @@ def test_filtered_wer_mean_keeps_exactly_50_percent_and_excludes_failures():
 def test_wer_scores_natural_stops_and_counts_length_stops(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """A runaway stopped at the client's token limit was transcribed and its babble counted into corpus WER."""
+    """A runaway stopped at the client's token limit was transcribed and its babble counted into corpus WER, and no CI gate counted such stops."""
     generated = [
         {
             "sample_id": sample_id,
@@ -190,6 +195,11 @@ def test_wer_scores_natural_stops_and_counts_length_stops(
         0,
         1,
     )
+    save_wer_results(outputs, metrics, {}, str(tmp_path))
+    results = json.loads((tmp_path / "wer_results.json").read_text())
+    assert_wer_results(results, 0.0, max_length_stops=1)
+    with pytest.raises(AssertionError, match=r"1 samples stopped .* > threshold 0"):
+        assert_wer_results(results, 0.0, max_length_stops=0)
 
 
 def test_explicit_cli_overrides_model_profile_defaults(monkeypatch):

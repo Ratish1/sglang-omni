@@ -605,6 +605,7 @@ def assert_wer_results(
     max_corpus_wer: float,
     max_per_sample_wer: float | None = None,
     *,
+    max_length_stops: int | None = None,
     collector: MetricCheckCollector | None = None,
 ) -> None:
     """Verify WER results are within thresholds."""
@@ -638,6 +639,18 @@ def assert_wer_results(
             f"Corpus WER {wer_corpus:.4f} ({wer_corpus * 100:.2f}%) "
             f"> threshold {max_corpus_wer} ({max_corpus_wer * 100:.0f}%)",
         )
+
+    if max_length_stops is not None:
+        length_stopped_ids = [
+            sample.get("id") for sample in per_sample if sample.get("ended_by_length")
+        ]
+        checks.check(
+            summary.get("length_stops", 0) <= max_length_stops,
+            f"{summary.get('length_stops', 0)} samples stopped at their token limit "
+            f"> threshold {max_length_stops}: {length_stopped_ids}",
+        )
+    else:
+        pass
 
     if max_per_sample_wer is None:
         assert_metric_collector_if_local(collector, checks)

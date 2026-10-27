@@ -39,6 +39,8 @@ class TtsCiThresholdPreset:
     # topology it was not measured on, so gating on one fails builds for no
     # reason or waves regressions through; a contract test refuses that pair.
     calibrated: bool = True
+    # note (ratish): None leaves a model that reports no finish reason ungated.
+    max_length_stops: int | None = None
 
 
 @dataclass(frozen=True)
@@ -156,6 +158,8 @@ QWEN3_TTS_VC_STREAM_WER_CORPUS_THRESHOLD = apply_wer_slack(
 QWEN3_TTS_VC_SIMILARITY_MEAN_MIN = 69.37776275634765
 QWEN3_TTS_VC_UTMOS_MEAN_REFERENCE = 4.1975
 QWEN3_TTS_VC_UTMOS_MEAN_MIN = apply_mos_slack(QWEN3_TTS_VC_UTMOS_MEAN_REFERENCE)
+# note (ratish): a clean full-corpus stage ends 0.05 to 0.07 samples at the token limit (measured 10-27), so more than 2 fails fewer than one clean stage in 6,500 and catches a 0.5 % runaway rate nine times in ten.
+QWEN3_TTS_VC_MAX_LENGTH_STOPS = 2
 
 QWEN3_TTS_VC_NON_STREAM_P95 = {
     16: {
@@ -335,6 +339,7 @@ TTS_CI_PRESETS: dict[str, TtsCiPreset] = {
             stream_wer_corpus=QWEN3_TTS_VC_STREAM_WER_CORPUS_THRESHOLD,
             similarity_mean_min=QWEN3_TTS_VC_SIMILARITY_MEAN_MIN,
             utmos_mean_min=QWEN3_TTS_VC_UTMOS_MEAN_MIN,
+            max_length_stops=QWEN3_TTS_VC_MAX_LENGTH_STOPS,
         ),
         latency=QWEN3_TTS_VC_LATENCY_GATES,
     ),
