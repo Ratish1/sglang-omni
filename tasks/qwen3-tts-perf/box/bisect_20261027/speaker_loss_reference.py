@@ -9,6 +9,10 @@ usage: /data/refenv/bin/python speaker_loss_reference.py CASES.jsonl --ids ID [I
 --encoder-fp32 reloads the speech tokenizer from its float32 checkpoint and casts only its decoder to bf16, so the
 reference encoder runs on the checkpoint's own weights and dtype.
 
+--ref-codes FILE.pt (ref_codes_case.py's output) builds official's own voice-clone prompt for each case, prints its
+reference codes against FILE's `--ref-codes-key` frame by frame, then draws with that tensor in place of official's
+codes, or with only its last frame in place (--last-frame-only); the speaker embedding and text stay official's.
+
 Runs in a venv holding qwen-tts 0.1.1's pins (transformers 4.57.3, accelerate 1.12.0, torch 2.10.0).
 """
 
@@ -33,6 +37,9 @@ def main() -> None:
     parser.add_argument("--card", type=int, default=0)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--encoder-fp32", action="store_true")
+    parser.add_argument("--ref-codes", type=Path)
+    parser.add_argument("--ref-codes-key", default="ours_graphs")
+    parser.add_argument("--last-frame-only", action="store_true")
     args = parser.parse_args()
     cases = {
         case["id"]: case
@@ -55,6 +62,23 @@ def main() -> None:
     records = []
     for case_id in args.ids:
         case = cases[case_id]
+        if args.ref_codes is not None:
+            items = model.create_voice_clone_prompt(ref_audio=case["ref_audio"], ref_text=case["ref_text"])
+            official = items[0].ref_code
+            swap = torch.load(args.ref_codes)[args.ref_codes_key].to(device=official.device, dtype=official.dtype)
+            frames = min(official.shape[0], swap.shape[0])
+            differing = torch.nonzero(~(official[:frames] == swap[:frames]).all(dim=-1)).flatten().tolist()
+            print(f"{case_id}: official {tuple(official.shape)} / {args.ref_codes_key} {tuple(swap.shape)}, frames differing {differing}", flush=True)
+            torch.save(official.cpu(), args.out / f"{case_id}_official_codes.pt")
+            if args.last_frame_only:
+                replaced = official.clone()
+                replaced[-1] = swap[-1]
+            else:
+                replaced = swap
+            items[0].ref_code = replaced
+            prompt = {"voice_clone_prompt": items}
+        else:
+            prompt = {"ref_audio": [case["ref_audio"]], "ref_text": [case["ref_text"]]}
         for start in range(0, args.draws, args.batch):
             count = min(args.batch, args.draws - start)
             torch.manual_seed(args.seed + start)
@@ -62,8 +86,7 @@ def main() -> None:
                 wavs, sample_rate = model.generate_voice_clone(
                     text=[case["input"]] * count,
                     language=["Auto"] * count,
-                    ref_audio=[case["ref_audio"]] * count,
-                    ref_text=[case["ref_text"]] * count,
+                    **{name: value * count for name, value in prompt.items()},
                 )
             for offset, wav in enumerate(wavs):
                 draw = start + offset
