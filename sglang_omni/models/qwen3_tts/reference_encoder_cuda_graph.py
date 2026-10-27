@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from typing import TypedDict
 
 import torch
+from torch.utils.hooks import RemovableHandle
 from transformers import MimiModel
 from transformers.models.mimi.modeling_mimi import MimiConv1d
 
@@ -53,19 +54,21 @@ def move_conv_padding_to_host(encoder: torch.nn.Module) -> int:
 
 def pad_tail(
     clip_samples: torch.Tensor,
-    strides_before: int,
-    module: MimiConv1d,
-    args: tuple[torch.Tensor, ...],
+    samples_per_step: int,
+    conv: MimiConv1d,
+    inputs: tuple[torch.Tensor, ...],
 ) -> tuple[torch.Tensor, ...]:
-    """Fill a strided conv's input past the clip's span as the conv pads the clip."""
-    hidden = args[0]
-    span = (clip_samples + strides_before - 1) // strides_before
-    inside = torch.arange(hidden.shape[-1], device=hidden.device) < span
-    if module.pad_mode == "replicate":
-        tail = hidden.index_select(-1, (span - 1).view(1))
+    """Fill a strided conv's input past the clip's steps as the conv pads the clip."""
+    hidden_states = inputs[0]
+    clip_steps = (clip_samples + samples_per_step - 1) // samples_per_step
+    is_inside_clip = (
+        torch.arange(hidden_states.shape[-1], device=hidden_states.device) < clip_steps
+    )
+    if conv.pad_mode == "replicate":
+        tail_values = hidden_states.index_select(-1, (clip_steps - 1).view(1))
     else:
-        tail = 0.0
-    return (torch.where(inside, hidden, tail), *args[1:])
+        tail_values = 0.0
+    return (torch.where(is_inside_clip, hidden_states, tail_values), *inputs[1:])
 
 
 @contextlib.contextmanager
@@ -73,11 +76,9 @@ def exact_length_encode(
     encoder: torch.nn.Module, clip_samples: torch.Tensor
 ) -> Iterator[None]:
     """Inside the block, the encoder gives the codes of its input's first clip_samples samples at their exact length."""
-    # note (ratish): at the exact length each strided conv pads past the clip in its own
-    # mode, and a stride-s conv yields ceil(L / s) frames, so the clip spans its samples
-    # over the strides before the conv, rounded up.
-    handles = []
-    strides_before = 1
+    # note (ratish): at the exact length each strided conv pads past the clip in its own mode, and a stride-s conv yields ceil(L / s) steps, so the clip covers its samples over the strides before the conv, rounded up.
+    hook_handles: list[RemovableHandle] = []
+    samples_per_step = 1
     try:
         for conv in encoder.modules():
             if not isinstance(conv, MimiConv1d) or int(conv.stride) == 1:
@@ -87,16 +88,16 @@ def exact_length_encode(
                     f"Qwen3-TTS reference encoder cannot pad a {conv.pad_mode!r} conv's tail"
                 )
             else:
-                handles.append(
+                hook_handles.append(
                     conv.register_forward_pre_hook(
-                        functools.partial(pad_tail, clip_samples, strides_before)
+                        functools.partial(pad_tail, clip_samples, samples_per_step)
                     )
                 )
-                strides_before *= int(conv.stride)
+                samples_per_step *= int(conv.stride)
         yield
     finally:
-        for handle in handles:
-            handle.remove()
+        for hook_handle in hook_handles:
+            hook_handle.remove()
 
 
 def smallest_bucket(frames: int, buckets: Iterable[int]) -> int | None:

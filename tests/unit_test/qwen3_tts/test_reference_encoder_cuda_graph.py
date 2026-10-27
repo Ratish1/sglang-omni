@@ -121,13 +121,13 @@ def test_reference_codes_match_the_exact_length_encode() -> None:
         if isinstance(module, MimiEuclideanCodebook):
             module.embed_sum.normal_()
     model.eval()
-    exact = copy.deepcopy(model)
+    unhooked_model = copy.deepcopy(model)
     tokenizer = SimpleNamespace(
         model=SimpleNamespace(
             encoder=model, encode_downsample_rate=HOP, encoder_valid_num_quantizers=4
         ),
         _normalize_audio_inputs=lambda waveforms, sr: [
-            np.asarray(w, dtype=np.float32) for w in waveforms
+            np.asarray(waveform, dtype=np.float32) for waveform in waveforms
         ],
     )
     batcher = qwen3_request_builders.Qwen3TTSRefCodeBatcher(
@@ -141,11 +141,19 @@ def test_reference_codes_match_the_exact_length_encode() -> None:
         batcher.close()
 
     with torch.inference_mode():
-        want = [exact_length_codes(exact, waveform) for waveform in waveforms]
-        after = [exact_length_codes(model, waveform) for waveform in waveforms]
-    assert [tuple(c.shape) for c in codes] == [(3, 4), (6, 4), (10, 4)]
+        want = [exact_length_codes(unhooked_model, waveform) for waveform in waveforms]
+        codes_after_batcher = [
+            exact_length_codes(model, waveform) for waveform in waveforms
+        ]
+    assert [tuple(clip_codes.shape) for clip_codes in codes] == [
+        (3, 4),
+        (6, 4),
+        (10, 4),
+    ]
     assert all(torch.equal(got, wanted) for got, wanted in zip(codes, want))
-    assert all(torch.equal(got, wanted) for got, wanted in zip(after, want))
+    assert all(
+        torch.equal(got, wanted) for got, wanted in zip(codes_after_batcher, want)
+    )
 
 
 def test_speech_tokenizer_loader_gives_the_encoder_its_float32_checkpoint_weights(
