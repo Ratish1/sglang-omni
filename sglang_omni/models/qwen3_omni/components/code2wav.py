@@ -4,6 +4,8 @@ fused kernels, and its incremental decode from a codec state pool."""
 
 from __future__ import annotations
 
+from typing import Literal
+
 import torch
 import torch.nn.functional as F
 from sglang.kernels.ops.activation import silu_and_mul
@@ -11,6 +13,7 @@ from sglang.kernels.ops.attention.flash_attention import flash_attn_with_kvcache
 from sglang.kernels.ops.attention.flash_attention_v3 import _is_fa3_supported
 from sglang.kernels.ops.attention.rope import apply_rope_inplace_with_kvcache
 from sglang.kernels.ops.layernorm import rmsnorm
+from sglang.srt.runtime_context import get_platform
 from transformers.modeling_outputs import BaseModelOutputWithPast
 from transformers.models.qwen3_omni_moe.configuration_qwen3_omni_moe import (
     Qwen3OmniMoeCode2WavConfig,
@@ -173,11 +176,11 @@ class FusedCode2WavTransformer(torch.nn.Module):
         addresses: RingAddresses,
         *,
         first_decode: bool,
-        is_paged_attention: bool,
+        flash_attention_version: Literal[3, 4] | None,
     ) -> torch.Tensor:
         """The normed hidden states of the rows' new frames. Every layer's rope kernel stores
         its new K/V in the rows' rings; a first decode attends to its own frames and a later
-        one to its ring window, through the page table when is_paged_attention."""
+        one to its ring window, paged on flash_attention_version, else gathered."""
         batch_size, length, hidden_size = inputs_embeds.shape
         head_dim = self.transformer.layers[0].self_attn.head_dim
         sliding_window = self.transformer.config.sliding_window
@@ -187,7 +190,7 @@ class FusedCode2WavTransformer(torch.nn.Module):
             frame_offsets = torch.arange(length, device=inputs_embeds.device)
             distances = frame_offsets[:, None] - frame_offsets[None, :]
             window_mask = (distances >= 0) & (distances < sliding_window)
-        elif is_paged_attention:
+        elif flash_attention_version is not None:
             window_mask = None
             page_table = addresses.window_rows.to(torch.int32)
             window_lengths = addresses.window_lengths.to(torch.int32)
@@ -213,7 +216,7 @@ class FusedCode2WavTransformer(torch.nn.Module):
                 addresses.write_rows,
                 is_neox=True,
             )
-            if first_decode or not is_paged_attention:
+            if first_decode or flash_attention_version is None:
                 if first_decode:
                     keys = key.view(batch_size, length, -1, head_dim)
                     values = value.view(batch_size, length, -1, head_dim)
@@ -241,6 +244,7 @@ class FusedCode2WavTransformer(torch.nn.Module):
                     softmax_scale=layer.self_attn.scaling,
                     causal=True,
                     window_size=(pool.retained_frames, 0),
+                    ver=flash_attention_version,
                 ).reshape(batch_size * length, -1)
             hidden_states = self.layer_output(layer, hidden_states, attended)
         hidden_states = rmsnorm(
@@ -385,9 +389,13 @@ class Qwen3OmniIncrementalCodec:
             model
         ), "slot decodes need the fused channels-last code2wav"
         self.model = model
-        # note (ratish): FlashAttention 3 runs on SM 8.x and 9.x with CUDA 12.3 or newer; other
-        # GPUs gather each row's window out of the ring for SDPA.
-        self.is_paged_attention = _is_fa3_supported()
+        # note (ratish): FlashAttention 3 runs on SM 8.x and 9.x with CUDA 12.3 or newer and FlashAttention 4 on SM 10.x; other GPUs gather each row's window out of the ring for SDPA.
+        if _is_fa3_supported():
+            self.flash_attention_version: Literal[3, 4] | None = 3
+        elif get_platform().is_sm100:
+            self.flash_attention_version = 4
+        else:
+            self.flash_attention_version = None
         transformer = model.pre_transformer.transformer
         conv_histories, transconv_overlaps = conv_stack_state_layout(model)
         self.spec = CodecStateSpec(
@@ -448,7 +456,7 @@ class Qwen3OmniIncrementalCodec:
             pool,
             addresses,
             first_decode=first_decode,
-            is_paged_attention=self.is_paged_attention,
+            flash_attention_version=self.flash_attention_version,
         )
         waveform = slot_conv_stack(
             self.model,

@@ -6,17 +6,22 @@ import json
 import logging
 import threading
 from types import SimpleNamespace
+from typing import Literal
 
 import numpy as np
 import pytest
 import torch
 from sglang.kernels.ops.attention.flash_attention_v3 import _is_fa3_supported
+from sglang.kernels.ops.attention.flash_attention_v4 import (
+    is_flash_attention_v4_available,
+)
+from sglang.srt.runtime_context import override_platform
 from transformers.models.qwen3_omni_moe.configuration_qwen3_omni_moe import (
     Qwen3OmniMoeCode2WavConfig,
 )
 
 from sglang_omni.config.schema import StageConfig
-from sglang_omni.models.qwen3_omni.components import code2wav_scheduler
+from sglang_omni.models.qwen3_omni.components import code2wav, code2wav_scheduler
 from sglang_omni.models.qwen3_omni.components.code2wav import (
     Qwen3OmniCode2Wav,
     Qwen3OmniIncrementalCodec,
@@ -1153,16 +1158,25 @@ def decode_in_parts(
 @pytest.mark.accelerator
 @SLOT_DECODES
 @pytest.mark.parametrize(
-    "is_paged_attention",
+    "flash_attention_version",
     [
         pytest.param(
-            True,
+            3,
             marks=pytest.mark.skipif(
                 not torch.cuda.is_available() or not _is_fa3_supported(),
                 reason="FlashAttention 3 runs on SM 8.x and 9.x with CUDA 12.3 or newer",
             ),
         ),
-        False,
+        pytest.param(
+            4,
+            marks=pytest.mark.skipif(
+                not torch.cuda.is_available()
+                or not is_flash_attention_v4_available()
+                or torch.cuda.get_device_capability()[0] not in (9, 10),
+                reason="FlashAttention 4 runs on SM 9.x and 10.x",
+            ),
+        ),
+        None,
     ],
 )
 @pytest.mark.parametrize("parts", [(4, 6, 7), (1,) * 17, (10, 7)])
@@ -1170,7 +1184,7 @@ def decode_in_parts(
 def test_slot_decodes_error_to_fp32_is_the_fused_forward_error(
     monkeypatch: pytest.MonkeyPatch,
     parts: tuple[int, ...],
-    is_paged_attention: bool,
+    flash_attention_version: Literal[3, 4] | None,
     dtype: torch.dtype,
 ) -> None:
     monkeypatch.setattr(torch.backends.cudnn, "allow_tf32", False)
@@ -1190,7 +1204,7 @@ def test_slot_decodes_error_to_fp32_is_the_fused_forward_error(
             snake_beta.fuse_vocoder_decoder(model.decoder)
             whole = model(codes)
             incremental_codec = Qwen3OmniIncrementalCodec(model)
-            incremental_codec.is_paged_attention = is_paged_attention
+            incremental_codec.flash_attention_version = flash_attention_version
             incremental = decode_in_parts(incremental_codec, codes, parts)
         whole_error += float((whole.float() - reference).norm() / reference.norm())
         incremental_error += float(
@@ -1198,6 +1212,27 @@ def test_slot_decodes_error_to_fp32_is_the_fused_forward_error(
         )
 
     assert incremental_error <= 1.25 * whole_error
+
+
+@pytest.mark.accelerator
+@SLOT_DECODES
+@pytest.mark.parametrize(
+    ("is_fa3_supported", "is_sm100", "flash_attention_version"),
+    [(True, False, 3), (False, True, 4), (False, False, None)],
+)
+def test_later_decodes_take_the_platforms_flash_attention(
+    monkeypatch: pytest.MonkeyPatch,
+    is_fa3_supported: bool,
+    is_sm100: bool,
+    flash_attention_version: Literal[3, 4] | None,
+) -> None:
+    model = make_fused_tiny_code2wav()
+    monkeypatch.setattr(code2wav, "_is_fa3_supported", lambda: is_fa3_supported)
+
+    with override_platform(is_sm100=is_sm100):
+        incremental_codec = Qwen3OmniIncrementalCodec(model)
+
+    assert incremental_codec.flash_attention_version == flash_attention_version
 
 
 @pytest.mark.accelerator
