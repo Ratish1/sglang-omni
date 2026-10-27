@@ -8,6 +8,7 @@ import contextlib
 import json
 import logging
 import math
+import os
 import queue
 import threading
 import time
@@ -1602,6 +1603,19 @@ def prepare_qwen3_tts_request(
         )
     else:
         raise AssertionError(f"unhandled Qwen3-TTS task type: {state.task_type}")
+    probe_prompt_dir = os.environ.get("QWEN3_TTS_PROBE_PROMPT_DIR")
+    if probe_prompt_dir:
+        # probe: the talker prompt as built, for comparison with official qwen-tts's
+        torch.save(
+            {
+                "input_embeds": input_embeds.detach().float().cpu(),
+                "trailing_text_hidden": trailing_text_hidden.detach().float().cpu(),
+                "ref_code": None if ref_code is None else ref_code.detach().cpu(),
+            },
+            f"{probe_prompt_dir}/{payload.request_id}.pt",
+        )
+    else:
+        pass
 
     codec_embedding_weight = model.model.codec_embedding.weight
     prompt_input_embeds = (
