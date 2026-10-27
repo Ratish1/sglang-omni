@@ -1352,18 +1352,17 @@ def test_qwen3_tts_preprocessing_does_not_mutate_global_rng(
 
 @pytest.mark.parametrize(
     ("params", "max_new_tokens"),
-    [
-        ({}, qwen3_request_builders.text_length_budget(len("target"))),
-        ({"max_new_tokens": 256}, 256),
-    ],
-    ids=["default", "explicit"],
+    [({}, 8192), ({"max_new_tokens": 256}, 256)],
+    ids=["checkpoint_default", "explicit"],
 )
-def test_qwen3_tts_budgets_generation_by_the_target_text(
+def test_qwen3_tts_generation_limit_defaults_to_the_checkpoint_generation_config(
     params: dict[str, object], max_new_tokens: int
 ) -> None:
-    """Without max_new_tokens a request could run to 2048 codec frames, 163.84 s of audio for a one-word text; the default now counts the target text's tokens, not the reference's."""
+    """Without max_new_tokens a request was cut at a limit fitted to one voice's speaking rate, ending slow natural speech early; the checkpoint's generation default applies."""
 
     class FakeWrapper:
+        generate_defaults = {"max_new_tokens": 8192}
+
         def _normalize_audio_inputs(self, ref_audio):
             return [(np.zeros(32, dtype=np.float32), 24000)]
 
@@ -1377,7 +1376,7 @@ def test_qwen3_tts_budgets_generation_by_the_target_text(
             return text
 
         def _merge_generate_kwargs(self, **kwargs):
-            return kwargs
+            return {**self.generate_defaults, **kwargs}
 
     class FakeModel:
         device = torch.device("cpu")
@@ -1421,16 +1420,6 @@ def test_qwen3_tts_budgets_generation_by_the_target_text(
     )
 
     assert prepared.gen_kwargs["max_new_tokens"] == max_new_tokens
-
-
-@pytest.mark.parametrize(
-    ("text_tokens", "frames"),
-    [(1, 45), (3, 64), (30, 328), (200, 1985), (300, 2048)],
-)
-def test_the_text_length_budget_is_twice_the_slowest_natural_stop(
-    text_tokens: int, frames: int
-) -> None:
-    assert qwen3_request_builders.text_length_budget(text_tokens) == frames
 
 
 def test_qwen3_tts_uploaded_voice_clone_prompt_uses_shared_cache(
