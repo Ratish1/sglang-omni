@@ -1254,6 +1254,11 @@ class FakeReferenceEncoder(torch.nn.Module):
     def __init__(self, encode, *, quantizers, device):
         super().__init__()
         self.scale = torch.nn.Parameter(torch.ones(1, device=device))
+        self.register_buffer(
+            "clip_samples",
+            torch.zeros((), dtype=torch.long, device=device),
+            persistent=False,
+        )
         self.encoder = encode
         self.quantizers = quantizers
 

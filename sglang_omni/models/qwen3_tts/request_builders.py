@@ -1062,9 +1062,9 @@ class Qwen3TTSRefCodeBatcher:
         else:
             pass
         frames = -(-samples.numel() // self.hop)
-        # note(ratish): whole frames, so every conv layer's own tail padding is
-        # zero and the eager encode has the shape the graphs capture; past the ladder a new
-        # length costs cuDNN a plan per conv, so lengths round up to the largest bucket.
+        # note(ratish): whole frames, so the eager encode has the shape the graphs capture;
+        # past the ladder a new length costs cuDNN a plan per conv, so lengths round up to
+        # the largest bucket.
         if (
             current_platform.is_cuda()
             and self.graph_runner is not None
@@ -1080,6 +1080,7 @@ class Qwen3TTSRefCodeBatcher:
             dtype=self.encoder_dtype,
         )
         values[0, 0, : samples.numel()].copy_(samples)
+        self.encoder.clip_samples.fill_(samples.numel())
         codes = self.encoder.encode(
             values, num_quantizers=self.num_quantizers, return_dict=True
         ).audio_codes

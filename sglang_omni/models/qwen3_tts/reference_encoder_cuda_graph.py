@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import functools
 import logging
 from collections.abc import Iterable
 from dataclasses import dataclass
@@ -47,6 +48,49 @@ def move_conv_padding_to_host(encoder: torch.nn.Module) -> int:
         else:
             pass
     return count
+
+
+def zero_tail(
+    encoder: MimiModel,
+    strides_before: int,
+    module: torch.nn.Module,
+    args: tuple[torch.Tensor, ...],
+) -> tuple[torch.Tensor, ...]:
+    """Zero a strided conv's input past the clip's span at that conv."""
+    del module
+    hidden = args[0]
+    span = (encoder.clip_samples + strides_before - 1) // strides_before
+    inside = torch.arange(hidden.shape[-1], device=hidden.device) < span
+    return (hidden.masked_fill(~inside, 0.0), *args[1:])
+
+
+def zero_strided_conv_tails(encoder: MimiModel) -> None:
+    """Make a padded encode give the codes of the clip's exact-length encode.
+
+    At the exact length every strided conv pads its own input with zeros, so its
+    last frame reads zeros past the clip; padded, it would read the convs' output
+    over the padding instead. A stride-1 causal conv keeps the length and a
+    stride-s conv yields ceil(L / s) frames, so the clip spans its samples over the
+    strides before a conv, rounded up. Every encode first sets the clip's samples
+    in `encoder.clip_samples`.
+    """
+    device = next(encoder.parameters()).device
+    encoder.register_buffer(
+        "clip_samples",
+        torch.zeros((), dtype=torch.long, device=device),
+        persistent=False,
+    )
+    convs = [m for m in encoder.encoder.modules() if isinstance(m, MimiConv1d)]
+    strides_before = 1
+    for conv in [*convs, encoder.downsample]:
+        stride = int(conv.stride)
+        if stride > 1:
+            conv.register_forward_pre_hook(
+                functools.partial(zero_tail, encoder, strides_before)
+            )
+            strides_before *= stride
+        else:
+            pass
 
 
 def smallest_bucket(frames: int, buckets: Iterable[int]) -> int | None:
@@ -163,6 +207,7 @@ class Qwen3TTSReferenceEncoderCudaGraphRunner:
         else:
             pass
         captured = self.graphs[bucket]
+        self.encoder.clip_samples.fill_(samples)
         captured.static_input[0, 0, :samples].copy_(waveform)
         captured.static_input[0, 0, samples:].zero_()
         captured.graph.replay()
@@ -186,4 +231,5 @@ __all__ = [
     "Qwen3TTSReferenceEncoderCudaGraphRunner",
     "move_conv_padding_to_host",
     "smallest_bucket",
+    "zero_strided_conv_tails",
 ]
