@@ -2415,25 +2415,65 @@ def test_talker_prepare_decode_buffers_steady_state_reuse() -> None:
     assert torch.equal(fake.suppress_mask, fresh.suppress_mask)
 
 
-@pytest.mark.parametrize("share_rows", [True, False])
+SHARED_SUPPRESS = [1, 6, 7, 9, -2]
+
+
+@pytest.mark.parametrize(
+    "steps",
+    [
+        pytest.param(
+            [
+                [
+                    ("a", SHARED_SUPPRESS),
+                    ("b", SHARED_SUPPRESS),
+                    ("c", SHARED_SUPPRESS),
+                    ("d", SHARED_SUPPRESS),
+                ],
+                [
+                    ("e", SHARED_SUPPRESS),
+                    ("f", SHARED_SUPPRESS),
+                    ("g", SHARED_SUPPRESS),
+                ],
+            ],
+            id="shared",
+        ),
+        pytest.param(
+            [
+                [
+                    ("a", SHARED_SUPPRESS),
+                    ("b", [2, 3]),
+                    ("c", None),
+                    ("d", SHARED_SUPPRESS),
+                ],
+                [("e", [2, 3]), ("f", SHARED_SUPPRESS), ("g", [4])],
+            ],
+            id="distinct",
+        ),
+        pytest.param(
+            [
+                [("a", SHARED_SUPPRESS), ("b", [2, 3]), ("c", None)],
+                [("b", [2, 3]), ("d", [4]), ("a", SHARED_SUPPRESS)],
+            ],
+            id="kept-at-new-rows",
+        ),
+    ],
+)
 def test_talker_prepare_decode_buffers_masks_each_rows_own_suppress_set(
-    share_rows: bool,
+    steps: list[list[tuple[str, list[int] | None]]],
 ) -> None:
     vocab = 8
-    shared = [1, 6, 7, 9, -2]
-    if share_rows:
-        batches = ([shared] * 4, [shared] * 3)
-    else:
-        batches = ([shared, [2, 3], None, shared], [[2, 3], shared, [4]])
     fake = talker_seed_self(vocab=vocab)
-    for step, suppress_per_row in enumerate(batches):
+    requests_by_id: dict[str, SimpleNamespace] = {}
+    for step, rows in enumerate(steps):
         requests = [
-            talker_prep_req(f"step{step}-row{row}", suppress=suppress)
-            for row, suppress in enumerate(suppress_per_row)
+            requests_by_id.setdefault(
+                request_id, talker_prep_req(request_id, suppress=suppress)
+            )
+            for request_id, suppress in rows
         ]
         Qwen3OmniTalker.prepare_decode_buffers(fake, requests)
         expected = torch.zeros(len(requests), vocab, dtype=torch.bool)
-        for row, suppress in enumerate(suppress_per_row):
+        for row, (_, suppress) in enumerate(rows):
             expected[row, [token for token in suppress or [] if 0 <= token < vocab]] = (
                 True
             )
