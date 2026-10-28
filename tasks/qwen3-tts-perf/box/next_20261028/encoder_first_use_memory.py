@@ -56,6 +56,8 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", required=True)
     parser.add_argument("--snapshot", action="store_true")
+    parser.add_argument("--warm-codebooks", action="store_true")
+    parser.add_argument("--warm-gemm", action="store_true")
     args = parser.parse_args()
     print(f"sglang_omni from {sglang_omni.__file__}, CUDA_MODULE_LOADING={os.environ.get('CUDA_MODULE_LOADING', 'unset')}", flush=True)
     device = torch.device("cuda:0")
@@ -65,6 +67,17 @@ def main() -> None:
     tokenizer = load_qwen3_tts_tokenizer(args.model, device=str(device), dtype="bfloat16", attn_implementation="sdpa")
     encoder_dtypes = sorted({str(parameter.dtype) for parameter in tokenizer.model.encoder.parameters()})
     report(f"tokenizer (encoder {', '.join(encoder_dtypes)})")
+    if args.warm_codebooks:
+        tables = [module.embed for module in tokenizer.model.encoder.modules() if type(module).__name__ == "MimiEuclideanCodebook"]
+        report(f"codebook tables built at load ({len(tables)})")
+    else:
+        pass
+    if args.warm_gemm:
+        weight = next(tokenizer.model.encoder.parameters())
+        torch.ones(8, 8, device=device, dtype=weight.dtype) @ torch.ones(8, 8, device=device, dtype=weight.dtype)
+        report("one small gemm")
+    else:
+        pass
     if args.snapshot:
         torch.cuda.memory._record_memory_history(max_entries=200000)
     else:
