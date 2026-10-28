@@ -2,8 +2,8 @@
 serves every non-streaming CustomVoice and VoiceDesign batch, under three backend choices.
 
 Each arm runs in its own process, since cuDNN's plan caches live per process. The workload is
-block 6's CustomVoice ZH part01 in case order, eight requests a batch as the vocoder batches
-them; each request's codes are a slice of real speech, SeedTTS ZH references encoded by the
+block 6's CustomVoice ZH part01 in case order, batched by --batch-cycle (the vocoder batches 1 to
+8 requests); each request's codes are a slice of real speech, SeedTTS ZH references encoded by the
 checkpoint's speech tokenizer and laid end to end. The decoder is built as the vocoder builds it
 (load_qwen3_tts_tokenizer, then fuse_vocoder_decoder) and called as vocode_payloads calls it.
 
@@ -34,7 +34,6 @@ from benchmarks.dataset.seedtts import load_seedtts_samples
 from sglang_omni.models.qwen3_tts.stages import load_qwen3_tts_tokenizer
 from sglang_omni.utils.snake_beta import fuse_vocoder_decoder
 
-BATCH_REQUESTS = 8
 CHUNK_FRAMES = 300
 CONTEXT_FRAMES = 25
 CHECK_EVERY_BATCHES = 40
@@ -116,6 +115,11 @@ def main() -> None:
         "--room-gib block left for activations) and count each batch's failures by kind",
     )
     parser.add_argument("--room-gib", type=int, default=8)
+    parser.add_argument(
+        "--batch-cycle",
+        default="8",
+        help="requests per batch, cycled, as comma-separated counts (the vocoder batches 1 to 8)",
+    )
     arguments = parser.parse_args()
     device = arguments.device
     torch.cuda.set_device(torch.device(device))
@@ -126,11 +130,14 @@ def main() -> None:
         for line in arguments.frames.read_text().splitlines()
         if json.loads(line).get("frames")
     ]
+    batch_cycle = [int(count) for count in arguments.batch_cycle.split(",")]
     batches = []
     offset = 0
-    for start in range(0, len(frames), BATCH_REQUESTS):
+    start = 0
+    while start < len(frames):
+        batch_requests = batch_cycle[len(batches) % len(batch_cycle)]
         batch = []
-        for request_frames in frames[start : start + BATCH_REQUESTS]:
+        for request_frames in frames[start : start + batch_requests]:
             if offset + request_frames > int(pool.shape[0]):
                 offset = 0
             else:
@@ -138,6 +145,7 @@ def main() -> None:
             batch.append(pool[offset : offset + request_frames].clone())
             offset += request_frames
         batches.append(batch)
+        start += batch_requests
     shapes = {
         shape
         for batch in batches
