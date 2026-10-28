@@ -522,6 +522,7 @@ def test_a_speech_thinker_refuses_a_speculative_draft(
     with pytest.raises(ValueError, match="does not support speech output"):
         qwen_stages.create_sglang_thinker_executor_from_config(
             "dummy",
+            max_running_requests=THINKER_MAX_RUNNING_REQUESTS,
             speech_enabled=True,
             server_args_overrides={
                 "speculative_algorithm": speculative_algorithm,
@@ -558,7 +559,9 @@ def test_the_thinker_checks_the_speculative_algorithm_and_draft_together(
 
     with pytest.raises(ValueError, match=message):
         qwen_stages.create_sglang_thinker_executor_from_config(
-            "dummy", server_args_overrides=speculative_overrides
+            "dummy",
+            max_running_requests=THINKER_MAX_RUNNING_REQUESTS,
+            server_args_overrides=speculative_overrides,
         )
 
 
