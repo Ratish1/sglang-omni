@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
+import sys
 import uuid
 from collections.abc import Mapping
 from multiprocessing import shared_memory as _shm
@@ -34,14 +36,37 @@ class ShmPutMetadata(TypedDict):
     transfer_info: ShmTransferInfo
 
 
+# Bytes above which torch splits a byte tensor's copy over its intra-op threads (at::internal::GRAIN_SIZE).
+TORCH_COPY_GRAIN_BYTES = 32768
+
+
 def shm_create_from_tensor(tensor: torch.Tensor) -> _shm.SharedMemory:
     t_np = tensor.numpy().reshape(-1)
     size = t_np.nbytes
 
     # note (Junnan Li): SharedMemory rejects size 0, and the receiver expects a block for every tensor.
     shm = _shm.SharedMemory(create=True, size=max(size, 1))
-    shm_view = np.ndarray(t_np.shape, dtype=t_np.dtype, buffer=shm.buf)
-    shm_view[:] = t_np[:]
+    # note (ratish): under two grains torch's split saves about what waking its threads costs, so smaller payloads keep the plain copy unchanged.
+    if size >= 2 * TORCH_COPY_GRAIN_BYTES:
+        try:
+            # note (ratish): reserving the pages first turns a full /dev/shm into an error instead of a SIGBUS mid-copy and keeps page allocation out of the parallel copy.
+            if sys.platform == "linux":
+                shm_file_descriptor = (
+                    shm._fd
+                )  # noqa: leading-underscore  # upstream spelling, or the public name is already taken
+                os.posix_fallocate(shm_file_descriptor, 0, size)
+            else:
+                pass
+            torch.frombuffer(shm.buf, dtype=torch.uint8, count=size).copy_(
+                tensor.reshape(-1).view(torch.uint8)
+            )
+        except BaseException:
+            shm.close()
+            shm.unlink()
+            raise
+    else:
+        shm_view = np.ndarray(t_np.shape, dtype=t_np.dtype, buffer=shm.buf)
+        shm_view[:] = t_np[:]
 
     return shm
 
