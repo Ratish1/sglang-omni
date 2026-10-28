@@ -5,12 +5,14 @@ SGLang-native Talker model for Qwen3-Omni compatiable with hf formatting.
 from __future__ import annotations
 
 import logging
+import weakref
 from typing import Iterable, Optional, Tuple
 
 import torch
 from sglang.kernels.fused_op import get_fused_op_backend
 from sglang.kernels.spec import KernelBackend
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.model_executor.runner_utils.capture_mode import get_is_capture_mode
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.runtime_context import get_context, get_schedule
@@ -942,9 +944,6 @@ class Qwen3OmniTalker(nn.Module):
             device=device,
         )
         self.suppress_token_cache: dict[tuple[int, ...], torch.Tensor | None] = {}
-        self.suppress_token_ids_by_request: dict[
-            str, tuple[list[int] | tuple[int, ...] | None, torch.Tensor | None]
-        ] = {}
         self.sampling_temperatures = torch.ones(
             max_batch_size,
             1,
@@ -993,6 +992,7 @@ class Qwen3OmniTalker(nn.Module):
             torch.get_device_module().Event() if device.type != "cpu" else None
         )
         self.decode_prep_rids: list[str] | None = None
+        self.decode_prep_requests: list[weakref.ref[Req]] = []
         self.decode_prep_out_lens: list[int] = []
         self.decode_prep_rep_rows: torch.Tensor | None = None
         self.output_codes = torch.zeros(
@@ -1089,50 +1089,49 @@ class Qwen3OmniTalker(nn.Module):
         device = self.repetition_mask.device
         rep_vocab = self.repetition_mask.shape[1]
         sup_vocab = self.suppress_mask.shape[1]
+        # note (ratish): a request of the last prepare keeps its buffers, moved to its new row; only its tokens sampled since then join its repetition mask.
+        previous_rows: dict[int, int] = {}
+        for row_idx, request_reference in enumerate(self.decode_prep_requests):
+            previous_request = request_reference()
+            if previous_request is not None:
+                previous_rows[id(previous_request)] = row_idx
+            else:
+                pass
 
-        self.repetition_mask[:batch_size] = False
-        self.suppress_mask[:batch_size] = False
-
+        moved_rows: list[int] = []
+        moved_from_rows: list[int] = []
+        joined_rows: list[int] = []
         rep_penalties: list[float] = []
         temperatures: list[float] = []
         top_ps: list[float] = []
         top_ks: list[int] = []
         min_ps: list[float] = []
         sampling_seeds: list[int] = []
+        rep_active_rows: list[int] = []
         rep_rows: list[int] = []
         rep_toks: list[int] = []
         suppress_groups: dict[int, tuple[torch.Tensor, list[int]]] = {}
-        suppress_token_ids_by_request: dict[
-            str, tuple[list[int] | tuple[int, ...] | None, torch.Tensor | None]
-        ] = {}
 
         for row_idx, sched_req in enumerate(requests):
             data = sched_req.data
             req = data.req
             sp = req.sampling_params
-
             penalty = float(sp.repetition_penalty)
-            rep_penalties.append(penalty)
-            temperatures.append(float(sp.temperature))
-            top_ps.append(float(sp.top_p))
-            top_ks.append(int(sp.top_k))
-            min_ps.append(float(sp.min_p))
-            # Unseeded: rank-shared seed from the request id (same on every TP
-            # rank), not os.urandom, else the ranks desync.
-            seed = sp.sampling_seed
-            if seed is None:
-                seed = derive_sampling_seed("sglang-omni-unseeded-row", req.rid)
-            elif not (0 <= seed <= SAMPLING_SEED_MASK):
-                seed = resolve_row_seed(seed)
-                sp.sampling_seed = seed
+            previous_row = previous_rows.get(id(req))
+
+            if penalty != 1.0:
+                rep_active_rows.append(row_idx)
             else:
                 pass
-            sampling_seeds.append(seed)
-
             if penalty != 1.0 and req.output_ids:
+                first_new_token = (
+                    0
+                    if previous_row is None
+                    else self.decode_prep_out_lens[previous_row]
+                )
                 unique = {
                     t
-                    for t in (int(tok) for tok in req.output_ids)
+                    for t in (int(tok) for tok in req.output_ids[first_new_token:])
                     if 0 <= t < rep_vocab
                 }
                 if unique:
@@ -1143,81 +1142,139 @@ class Qwen3OmniTalker(nn.Module):
             else:
                 pass
 
-            suppress_tokens = (
-                data.suppress_tokens or req._codec_suppress_tokens
-            )  # noqa: leading-underscore  # upstream spelling, or the public name is already taken
-            # note (ratish): each request's set resolves once, so a batch change does not expand or hash every row's ids again.
-            resolved_suppress = self.suppress_token_ids_by_request.get(req.rid)
-            if (
-                resolved_suppress is not None
-                and resolved_suppress[0] is suppress_tokens
-            ):
-                suppress_token_ids = resolved_suppress[1]
-            elif suppress_tokens:
-                suppress_content = tuple(int(token_id) for token_id in suppress_tokens)
-                if suppress_content not in self.suppress_token_cache:
-                    valid_token_ids = [
-                        token_id
-                        for token_id in suppress_content
-                        if 0 <= token_id < sup_vocab
-                    ]
-                    self.suppress_token_cache[suppress_content] = (
-                        torch.tensor(valid_token_ids, dtype=torch.long, device=device)
-                        if valid_token_ids
-                        else None
-                    )
+            if previous_row is not None:
+                if previous_row != row_idx:
+                    moved_rows.append(row_idx)
+                    moved_from_rows.append(previous_row)
                 else:
                     pass
-                suppress_token_ids = self.suppress_token_cache[suppress_content]
             else:
-                suppress_token_ids = None
-            suppress_token_ids_by_request[req.rid] = (
-                suppress_tokens,
-                suppress_token_ids,
-            )
-            if suppress_token_ids is None:
-                pass
-            elif id(suppress_token_ids) in suppress_groups:
-                suppress_groups[id(suppress_token_ids)][1].append(row_idx)
-            else:
-                suppress_groups[id(suppress_token_ids)] = (
-                    suppress_token_ids,
-                    [row_idx],
-                )
+                joined_rows.append(row_idx)
+                rep_penalties.append(penalty)
+                temperatures.append(float(sp.temperature))
+                top_ps.append(float(sp.top_p))
+                top_ks.append(int(sp.top_k))
+                min_ps.append(float(sp.min_p))
+                # Unseeded: rank-shared seed from the request id (same on every TP
+                # rank), not os.urandom, else the ranks desync.
+                seed = sp.sampling_seed
+                if seed is None:
+                    seed = derive_sampling_seed("sglang-omni-unseeded-row", req.rid)
+                elif not (0 <= seed <= SAMPLING_SEED_MASK):
+                    seed = resolve_row_seed(seed)
+                    sp.sampling_seed = seed
+                else:
+                    pass
+                sampling_seeds.append(seed)
 
-        if self.sampling_staging_event is not None:
-            # Note (akazaakane): guards the prior async copy still reading
-            # this buffer before we overwrite it.
-            self.sampling_staging_event.synchronize()
+                suppress_tokens = (
+                    data.suppress_tokens or req._codec_suppress_tokens
+                )  # noqa: leading-underscore  # upstream spelling, or the public name is already taken
+                if suppress_tokens:
+                    suppress_content = tuple(
+                        int(token_id) for token_id in suppress_tokens
+                    )
+                    if suppress_content not in self.suppress_token_cache:
+                        valid_token_ids = [
+                            token_id
+                            for token_id in suppress_content
+                            if 0 <= token_id < sup_vocab
+                        ]
+                        self.suppress_token_cache[suppress_content] = (
+                            torch.tensor(
+                                valid_token_ids, dtype=torch.long, device=device
+                            )
+                            if valid_token_ids
+                            else None
+                        )
+                    else:
+                        pass
+                    suppress_token_ids = self.suppress_token_cache[suppress_content]
+                else:
+                    suppress_token_ids = None
+                if suppress_token_ids is None:
+                    pass
+                elif id(suppress_token_ids) in suppress_groups:
+                    suppress_groups[id(suppress_token_ids)][1].append(row_idx)
+                else:
+                    suppress_groups[id(suppress_token_ids)] = (
+                        suppress_token_ids,
+                        [row_idx],
+                    )
+
+        if moved_rows or joined_rows:
+            row_index = torch.tensor(
+                moved_rows + moved_from_rows + joined_rows,
+                dtype=torch.long,
+                device=device,
+            )
+        else:
+            row_index = None
+        moved_count = len(moved_rows)
+        if moved_rows:
+            moved_index = row_index[:moved_count]
+            moved_from_index = row_index[moved_count : 2 * moved_count]
+            for buffer in (
+                self.repetition_mask,
+                self.suppress_mask,
+                self.repetition_penalties,
+                self.sampling_temperatures,
+                self.sampling_top_ps,
+                self.sampling_min_ps,
+                self.sampling_top_ks,
+                self.sampling_seeds,
+            ):
+                buffer[moved_index] = buffer[moved_from_index]
         else:
             pass
-        staging_cpu = self.sampling_staging_cpu
-        staging_cpu_f64 = staging_cpu.view(torch.float64)
-        staging_cpu_f64[0, :batch_size] = torch.tensor(
-            rep_penalties, dtype=torch.float64
-        )
-        staging_cpu_f64[1, :batch_size] = torch.tensor(
-            temperatures, dtype=torch.float64
-        )
-        staging_cpu_f64[2, :batch_size] = torch.tensor(top_ps, dtype=torch.float64)
-        staging_cpu_f64[3, :batch_size] = torch.tensor(min_ps, dtype=torch.float64)
-        staging_cpu[4, :batch_size] = torch.tensor(top_ks, dtype=torch.int64)
-        staging_cpu[5, :batch_size] = torch.tensor(sampling_seeds, dtype=torch.int64)
-        staging_gpu = self.sampling_staging_gpu
-        staging_gpu.copy_(staging_cpu, non_blocking=True)
-        if self.sampling_staging_event is not None:
-            self.sampling_staging_event.record()
+
+        if joined_rows:
+            joined_count = len(joined_rows)
+            joined_index = row_index[2 * moved_count :]
+            self.repetition_mask[joined_index] = False
+            self.suppress_mask[joined_index] = False
+            if self.sampling_staging_event is not None:
+                # Note (akazaakane): guards the prior async copy still reading
+                # this buffer before we overwrite it.
+                self.sampling_staging_event.synchronize()
+            else:
+                pass
+            staging_cpu = self.sampling_staging_cpu
+            staging_cpu_f64 = staging_cpu.view(torch.float64)
+            staging_cpu_f64[0, :joined_count] = torch.tensor(
+                rep_penalties, dtype=torch.float64
+            )
+            staging_cpu_f64[1, :joined_count] = torch.tensor(
+                temperatures, dtype=torch.float64
+            )
+            staging_cpu_f64[2, :joined_count] = torch.tensor(
+                top_ps, dtype=torch.float64
+            )
+            staging_cpu_f64[3, :joined_count] = torch.tensor(
+                min_ps, dtype=torch.float64
+            )
+            staging_cpu[4, :joined_count] = torch.tensor(top_ks, dtype=torch.int64)
+            staging_cpu[5, :joined_count] = torch.tensor(
+                sampling_seeds, dtype=torch.int64
+            )
+            staging_gpu = self.sampling_staging_gpu
+            staging_gpu.copy_(staging_cpu, non_blocking=True)
+            if self.sampling_staging_event is not None:
+                self.sampling_staging_event.record()
+            else:
+                pass
+            staging_gpu_f64 = staging_gpu.view(torch.float64)
+            for buffer, staged_values in (
+                (self.repetition_penalties[:, 0], staging_gpu_f64[0]),
+                (self.sampling_temperatures[:, 0], staging_gpu_f64[1]),
+                (self.sampling_top_ps, staging_gpu_f64[2]),
+                (self.sampling_min_ps, staging_gpu_f64[3]),
+                (self.sampling_top_ks, staging_gpu[4]),
+                (self.sampling_seeds, staging_gpu[5]),
+            ):
+                buffer[joined_index] = staged_values[:joined_count].to(buffer.dtype)
         else:
             pass
-        staging_gpu_f64 = staging_gpu.view(torch.float64)
-        self.repetition_penalties[:batch_size, 0].copy_(staging_gpu_f64[0, :batch_size])
-        self.sampling_temperatures[:batch_size, 0].copy_(
-            staging_gpu_f64[1, :batch_size]
-        )
-        self.sampling_top_ps[:batch_size].copy_(staging_gpu_f64[2, :batch_size])
-        self.sampling_min_ps[:batch_size].copy_(staging_gpu_f64[3, :batch_size])
-        self.sampling_top_ks[:batch_size].copy_(staging_gpu[4, :batch_size])
-        self.sampling_seeds[:batch_size].copy_(staging_gpu[5, :batch_size])
 
         if rep_rows:
             rep_pairs = torch.tensor(
@@ -1235,15 +1292,14 @@ class Qwen3OmniTalker(nn.Module):
             else:
                 row_ids = torch.tensor(suppress_rows, dtype=torch.long, device=device)
                 self.suppress_mask[row_ids[:, None], suppress_token_ids[None, :]] = True
-        self.suppress_token_ids_by_request = suppress_token_ids_by_request
 
         self.decode_prep_rids = [sched_req.data.req.rid for sched_req in requests]
+        self.decode_prep_requests = [
+            weakref.ref(sched_req.data.req) for sched_req in requests
+        ]
         self.decode_prep_out_lens = [
             len(sched_req.data.req.output_ids) if sched_req.data.req.output_ids else 0
             for sched_req in requests
-        ]
-        rep_active_rows = [
-            row_idx for row_idx, penalty in enumerate(rep_penalties) if penalty != 1.0
         ]
         self.decode_prep_rep_rows = (
             torch.tensor(rep_active_rows, dtype=torch.long, device=device)
