@@ -141,14 +141,13 @@ def main() -> None:
         for num_stages in STAGES:
             predictor_layers.NUM_STAGES = num_stages
             for rows in (16, 32, 64):
-                for tokens_per_row in (1, 2):
-                    launches = Launches(rows, tokens_per_row, device)
-                    for name in NAMES:
-                        launches.run(name, {})
-                    if num_stages == STAGES[0]:
-                        launches.run_decode_attention()
-                    else:
-                        pass
+                launches = Launches(rows, 1, device)
+                for name in NAMES:
+                    launches.run(name, {})
+                if num_stages == STAGES[0]:
+                    launches.run_decode_attention()
+                else:
+                    pass
         seen = set()
         for kernel_name, block_m, tokens_per_row, num_stages, shared, _ in records:
             line = f"sm{options.arch} {kernel_name} BLOCK_M {block_m} T {tokens_per_row} stages {num_stages}: {shared} bytes"
