@@ -36,7 +36,7 @@ def arm_values(boot: Path, arm: str) -> dict[str, float]:
     speech = boot / arm / "speed_results.json"
     if speech.exists():
         summary = json.loads(speech.read_text())["summary"]
-        values = {field: summary[field] for field in SPEECH_FIELDS}
+        values = {field: summary[field] for field in SPEECH_FIELDS if field in summary}
         values["completed"] = summary["completed_requests"]
         return values
     else:
