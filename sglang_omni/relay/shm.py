@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
+import sys
 import uuid
 from collections.abc import Mapping
 from multiprocessing import shared_memory as _shm
@@ -35,14 +37,28 @@ class ShmPutMetadata(TypedDict):
 
 
 def shm_create_from_tensor(tensor: torch.Tensor) -> _shm.SharedMemory:
-    t_np = tensor.numpy().reshape(-1)
-    size = t_np.nbytes
+    source = tensor.contiguous().view(torch.uint8).reshape(-1)
+    size = source.numel()
 
     # note (Junnan Li): SharedMemory rejects size 0, and the receiver expects a block for every tensor.
     shm = _shm.SharedMemory(create=True, size=max(size, 1))
-    shm_view = np.ndarray(t_np.shape, dtype=t_np.dtype, buffer=shm.buf)
-    shm_view[:] = t_np[:]
-
+    try:
+        if size:
+            # note (ratish): reserving the pages first turns a full /dev/shm into an error instead of a SIGBUS mid-copy and keeps page allocation out of the copy, which torch spreads over its intra-op threads.
+            if sys.platform == "linux":
+                shm_fd = (
+                    shm._fd
+                )  # noqa: leading-underscore  # upstream spelling, or the public name is already taken
+                os.posix_fallocate(shm_fd, 0, size)
+            else:
+                pass
+            torch.frombuffer(shm.buf, dtype=torch.uint8, count=size).copy_(source)
+        else:
+            pass
+    except BaseException:
+        shm.close()
+        shm.unlink()
+        raise
     return shm
 
 
