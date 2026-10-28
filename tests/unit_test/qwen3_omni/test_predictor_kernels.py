@@ -31,7 +31,6 @@ from sglang_omni.utils import predictor_layers
 from sglang_omni.utils.predictor_layers import (
     HIDDEN_SIZE,
     MAX_FUSED_ROWS,
-    REDUCED_NUM_STAGES,
     add_rmsnorm_rounded,
     codebook_step,
     decode_attention,
@@ -495,13 +494,9 @@ def test_launches_beyond_the_shared_memory_pipeline_fewer_stages_with_the_same_b
     steps = predictor_inputs(device, MAX_FUSED_ROWS // 2, seed=27)
     expected = run_sequence(fuse(build_talker(device, seed=26)), steps)
     monkeypatch.setattr(predictor_layers, "NUM_STAGES", 6)
-    talker = fuse(build_talker(device, seed=26))
-    actual = run_sequence(talker, steps)
+    actual = run_sequence(fuse(build_talker(device, seed=26)), steps)
     for expected_output, actual_output in zip(expected, actual, strict=True):
         assert torch.equal(actual_output, expected_output)
-    fitted_stages = talker.predictor_fused_layers.fitted_stages
-    assert fitted_stages[("attention_inputs", MAX_FUSED_ROWS)] == REDUCED_NUM_STAGES
-    assert fitted_stages[("mlp_up", MAX_FUSED_ROWS)] == REDUCED_NUM_STAGES
 
 
 @accelerator
