@@ -12,6 +12,14 @@ import triton.language as tl
 GROUP_SIZE_M = 8
 VECTOR_BYTES = 16
 THREADS_PER_PROGRAM = 256
+# note (ratish): measured on H100 over the reference encoder's GEMMs (64 to 512 rows by 512 or 2048): eight
+# K splits fill the SMs that so few row tiles leave idle, and beat FFMA at every row count.
+BLOCK_M = 64
+BLOCK_N = 64
+BLOCK_K = 64
+SPLITS = 8
+NUM_WARPS = 4
+NUM_STAGES = 3
 
 
 @triton.jit
@@ -82,21 +90,12 @@ def sum_splits_kernel(
     tl.store(output_ptr + offsets, total, mask=is_element)
 
 
-def tf32x3_linear(
-    hidden_states: torch.Tensor,
-    weight: torch.Tensor,
-    *,
-    block_m: int,
-    block_n: int,
-    block_k: int,
-    splits: int,
-    num_warps: int,
-    num_stages: int,
-) -> torch.Tensor:
+def tf32x3_linear(hidden_states: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
     """hidden_states @ weight.T for a float32 (..., in_features) activation and a contiguous float32
     (out_features, in_features) weight, the in_features cut into splits summed in order.
     """
     out_features, in_features = weight.shape
+    block_m, block_n, block_k, splits = BLOCK_M, BLOCK_N, BLOCK_K, SPLITS
     assert (
         hidden_states.dtype == torch.float32 and weight.dtype == torch.float32
     ), "float32 operands"
@@ -121,8 +120,8 @@ def tf32x3_linear(
         BLOCK_N=block_n,
         BLOCK_K=block_k,
         GROUP_SIZE_M=GROUP_SIZE_M,
-        num_warps=num_warps,
-        num_stages=num_stages,
+        num_warps=NUM_WARPS,
+        num_stages=NUM_STAGES,
     )
     if splits > 1:
         element_count = row_count * out_features
@@ -138,3 +137,15 @@ def tf32x3_linear(
     else:
         pass
     return output.view(*hidden_states.shape[:-1], out_features)
+
+
+class Tf32x3Linear(torch.nn.Module):
+    """A bias-free float32 nn.Linear whose products run as three TF32 passes on tensor cores."""
+
+    def __init__(self, linear: torch.nn.Linear) -> None:
+        super().__init__()
+        assert linear.bias is None, "a bias-free projection"
+        self.weight = linear.weight
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        return tf32x3_linear(hidden_states, self.weight)
