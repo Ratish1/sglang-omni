@@ -131,7 +131,11 @@ def extract_cuda_tensors(
             }, {path: obj}
         else:
             pass
-        return obj, {}
+        # note (ratish): a CPU tensor stays in the pickled header, and pickle writes its whole storage, so a view into a received transfer buffer is copied out to send only its own bytes.
+        if obj.untyped_storage().nbytes() > obj.numel() * obj.element_size():
+            return obj.clone(memory_format=torch.contiguous_format), {}
+        else:
+            return obj, {}
     else:
         pass
     if isinstance(obj, dict):

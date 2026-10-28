@@ -1448,6 +1448,22 @@ def test_direct_cuda_ipc_payload_preserves_inline_cpu_tensors() -> None:
     assert [entry["path"] for entry in ref["tensors"]] == ["gpu"]
 
 
+@pytest.mark.accelerator
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_direct_cuda_ipc_payload_header_sends_a_cpu_views_own_bytes() -> None:
+    transfer_buffer = torch.arange(1 << 20, dtype=torch.int64)
+    grid = transfer_buffer[3:6].view(1, 3)
+    payload = make_stage_payload(
+        data={"gpu": torch.arange(2, device="cuda:0"), "grid": grid}
+    )
+
+    ref = stage_io.serialize_direct_cuda_ipc_payload(payload)
+    header = pickle.loads(ref["header"])
+
+    assert len(ref["header"]) < transfer_buffer.untyped_storage().nbytes()
+    assert torch.equal(header.data["grid"], grid)
+
+
 def test_direct_cuda_ipc_payload_allows_large_ordinary_header(monkeypatch) -> None:
     payload = make_stage_payload(
         data={"gpu": "placeholder"},
