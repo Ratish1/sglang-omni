@@ -93,7 +93,9 @@ class TTSParams(RequiredTTSParams, total=False):
     seed: int
 
 
-SpeechReferenceDescriptor = dict[str, str | int | list[int] | list[list[int]]]
+SpeechReferenceDescriptor = dict[
+    str, str | int | list[int] | list[list[int]] | list[float]
+]
 
 
 class SpeechPrompt(TypedDict):
