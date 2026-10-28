@@ -46,9 +46,10 @@ def shm_create_from_tensor(tensor: torch.Tensor) -> _shm.SharedMemory:
         if size:
             # note (ratish): reserving the pages first turns a full /dev/shm into an error instead of a SIGBUS mid-copy and keeps page allocation out of the copy, which torch spreads over its intra-op threads.
             if sys.platform == "linux":
-                os.posix_fallocate(
-                    shm._fd, 0, size
+                shm_fd = (
+                    shm._fd
                 )  # noqa: leading-underscore  # upstream spelling, or the public name is already taken
+                os.posix_fallocate(shm_fd, 0, size)
             else:
                 pass
             torch.frombuffer(shm.buf, dtype=torch.uint8, count=size).copy_(source)
