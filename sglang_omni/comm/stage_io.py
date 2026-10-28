@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import io
 import pickle
+import sys
 from dataclasses import fields, is_dataclass
 from multiprocessing.reduction import ForkingPickler
 from typing import Protocol, overload
@@ -28,6 +29,7 @@ from sglang_omni.proto.messages import (
     StageDataRef,
 )
 from sglang_omni.relay.base import Relay, RelayOperation
+from sglang_omni.relay.shm import ShmRelay
 
 
 class StageMessageSender(Protocol):
@@ -838,6 +840,11 @@ async def read_transfer_buffer(
     request_id: str,
     data_ref: DataRef,
 ) -> torch.Tensor:
+    # note (ratish): on Linux a host block is read by mapping it copy-on-write, so the receiver pays no zero fill and no copy; its pages stay in /dev/shm while the tensor lives.
+    if isinstance(relay, ShmRelay) and sys.platform == "linux":
+        return relay.read_mapped(data_ref.buffer.info, data_ref.buffer.length)
+    else:
+        pass
     buf = torch.zeros(
         data_ref.buffer.length,
         dtype=torch.uint8,
