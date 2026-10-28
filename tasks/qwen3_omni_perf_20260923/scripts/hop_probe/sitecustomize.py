@@ -35,11 +35,13 @@ TARGETS = {
         (None, "deserialize_direct_cuda_ipc_payload"),
         (None, "write_payload"),
         (None, "pack_tensors"),
+        (None, "pack_tensor_chunks"),
         (None, "read_payload"),
         (None, "read_transfer_buffer"),
     ],
     "sglang_omni.relay.shm": [
         ("ShmRelay", "put_async"),
+        ("ShmRelay", "put_chunks_async"),
         ("ShmGetOperation", "wait_for_completion"),
     ],
     "sglang_omni.models.qwen3_omni.stages": [
@@ -119,8 +121,13 @@ def wrap(fn, name):
 
 
 def patch(module):
+    # A tree has only the functions of its own version (pack_tensors on main,
+    # pack_tensor_chunks and put_chunks_async on the one-copy put), so a target
+    # the tree lacks is skipped.
     for owner_name, attribute in TARGETS[module.__name__]:
         owner = module if owner_name is None else getattr(module, owner_name)
+        if not hasattr(owner, attribute):
+            continue
         name = attribute if owner_name is None else f"{owner_name}.{attribute}"
         setattr(owner, attribute, wrap(getattr(owner, attribute), name))
 

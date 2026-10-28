@@ -1,5 +1,7 @@
-"""SHM relay puts per stage process from shm_put_size_probe records: count, size buckets around
-the put's 64 KiB torch threshold, median bytes, and median and p90 put wall time per bucket.
+"""SHM relay puts and payload packing per stage process from shm_put_size_probe records: per
+process and function, count, size buckets, median bytes, and median and p90 wall time per bucket.
+
+Records older than the function field count as shm_create_from_tensor.
 
 usage: python shm_put_sizes.py RECORD_DIR
 """
@@ -30,24 +32,27 @@ def main() -> None:
         for path in sorted(Path(sys.argv[1]).glob("put_*.jsonl"))
         for line in path.read_text().splitlines()
     ]
-    processes = sorted({record["process"] for record in records})
-    print(f"{len(records)} puts")
-    for process in processes:
+    for record in records:
+        record.setdefault("function", "shm_create_from_tensor")
+    print(f"{len(records)} records")
+    for process in sorted({record["process"] for record in records}):
         mine = [record for record in records if record["process"] == process]
-        print(f"{process}: {len(mine)} puts")
-        for label, low, high in BUCKETS:
-            rows = [record for record in mine if low <= record["bytes"] < high]
-            if not rows:
-                continue
-            else:
-                pass
-            sizes = [record["bytes"] for record in rows]
-            walls = [record["wall_us"] for record in rows]
-            print(
-                f"  {label:16s} n={len(rows):6d} bytes median {statistics.median(sizes):12.0f}"
-                f" min {min(sizes):10d} max {max(sizes):11d}"
-                f"  wall median {statistics.median(walls):9.1f} us p90 {percentile(walls, 0.9):9.1f} us"
-            )
+        for function in sorted({record["function"] for record in mine}):
+            calls = [record for record in mine if record["function"] == function]
+            print(f"{process} {function}: {len(calls)} calls")
+            for label, low, high in BUCKETS:
+                rows = [record for record in calls if low <= record["bytes"] < high]
+                if not rows:
+                    continue
+                else:
+                    pass
+                sizes = [record["bytes"] for record in rows]
+                walls = [record["wall_us"] for record in rows]
+                print(
+                    f"  {label:16s} n={len(rows):6d} bytes median {statistics.median(sizes):12.0f}"
+                    f" min {min(sizes):10d} max {max(sizes):11d}"
+                    f"  wall median {statistics.median(walls):9.1f} us p90 {percentile(walls, 0.9):9.1f} us"
+                )
 
 
 if __name__ == "__main__":
