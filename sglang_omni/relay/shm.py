@@ -57,9 +57,7 @@ def shm_create_from_tensor(tensor: torch.Tensor) -> _shm.SharedMemory:
                 os.posix_fallocate(shm_file_descriptor, 0, size)
             else:
                 pass
-            torch.frombuffer(shm.buf, dtype=torch.uint8, count=size).copy_(
-                tensor.reshape(-1).view(torch.uint8)
-            )
+            np.ndarray(t_np.shape, dtype=t_np.dtype, buffer=shm.buf)[:] = t_np
         except BaseException:
             shm.close()
             shm.unlink()
