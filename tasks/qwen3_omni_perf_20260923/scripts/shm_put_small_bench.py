@@ -121,6 +121,18 @@ def time_parts(size: int, repeats: int) -> dict[str, list[float]]:
     return rows
 
 
+def time_single(size: int, repeats: int) -> dict[str, list[float]]:
+    tensor = torch.randint(0, 255, (size,), dtype=torch.uint8)
+    rows: dict[str, list[float]] = {}
+    for _ in range(repeats):
+        for label, put in PUTS.items():
+            start = time.perf_counter_ns()
+            shm = put(tensor)
+            rows.setdefault(label, []).append((time.perf_counter_ns() - start) / 1e3)
+            release(shm)
+    return rows
+
+
 def time_bursts(size: int, repeats: int, burst: int) -> dict[str, list[float]]:
     tensor = torch.randint(0, 255, (size,), dtype=torch.uint8)
     rows: dict[str, list[float]] = {}
@@ -158,12 +170,28 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--sizes", type=int, nargs="+", required=True)
     parser.add_argument("--repeats", type=int, default=3000)
+    parser.add_argument(
+        "--tree-put-only",
+        action="store_true",
+        help="time only the PYTHONPATH tree's own shm_create_from_tensor, in every scenario",
+    )
     args = parser.parse_args()
+    if args.tree_put_only:
+        from sglang_omni.relay.shm import shm_create_from_tensor
+
+        PUTS.clear()
+        PUTS["put tree"] = shm_create_from_tensor
+    else:
+        pass
     print(f"torch threads {torch.get_num_threads()}")
     for size in args.sizes:
         print(f"\n{size} bytes")
         for group in (
-            time_parts(size, args.repeats),
+            (
+                time_single(size, args.repeats)
+                if args.tree_put_only
+                else time_parts(size, args.repeats)
+            ),
             time_bursts(size, args.repeats, 16),
             time_threads(size, args.repeats, 8),
         ):
