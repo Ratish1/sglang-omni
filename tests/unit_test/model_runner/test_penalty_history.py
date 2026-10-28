@@ -4,6 +4,7 @@
 import contextlib
 from types import SimpleNamespace
 
+import pytest
 import torch
 from sglang.srt.sampling.penaltylib import (
     BatchedFrequencyPenalizer,
@@ -25,17 +26,17 @@ class Batch(SimpleNamespace):
 def sampling(batch):
     n = len(batch.reqs)
     return SamplingBatchInfo(
-        temperatures=torch.ones(n, 1),
-        top_ps=torch.ones(n),
-        top_ks=torch.ones(n, dtype=torch.int32),
-        min_ps=torch.zeros(n),
+        temperatures=torch.ones(n, 1, device=batch.device),
+        top_ps=torch.ones(n, device=batch.device),
+        top_ks=torch.ones(n, dtype=torch.int32, device=batch.device),
+        min_ps=torch.zeros(n, device=batch.device),
         is_all_greedy=True,
         is_any_greedy=True,
         need_top_p_sampling=False,
         need_top_k_sampling=False,
         need_min_p_sampling=False,
         vocab_size=8,
-        device="cpu",
+        device=batch.device,
         penalizer_orchestrator=BatchedPenalizerOrchestrator(
             vocab_size=8,
             batch=batch,
@@ -48,8 +49,8 @@ def sampling(batch):
     )
 
 
-def make_batch(rows):
-    batch = Batch(reqs=[], device="cpu")
+def make_batch(rows, device="cpu"):
+    batch = Batch(reqs=[], device=device)
     batch.forward_mode = SimpleNamespace(is_extend=lambda: True)
     for history, rp, freq, presence in rows:
         batch.reqs.append(
@@ -114,6 +115,39 @@ def test_mixed_restore_and_forward_snapshot_isolation():
         make_logits(batch.sampling_info.copy_for_forward()), changed
     )
     torch.testing.assert_close(make_logits(snapshot), expected)
+
+
+@pytest.mark.accelerator
+@pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="stream synchronization requires CUDA"
+)
+def test_restore_does_not_synchronize():
+    """Restoring the running rows' penalty history waited for every queued kernel to finish."""
+    rows = [([2, 2, 5, -1, 8], 1.3, 0.25, -0.5), ([2, 5, 5], 2.0, 0.5, 0.25)]
+    host = make_batch(rows)
+    ModelRunner.restore_output_penalty_history(host)
+    batch = make_batch(rows, device="cuda")
+    torch.cuda.synchronize()
+
+    torch.cuda.set_sync_debug_mode("error")
+    try:
+        ModelRunner.restore_output_penalty_history(batch)
+    finally:
+        torch.cuda.set_sync_debug_mode("default")
+
+    for penalizer, state in (
+        (BatchedRepetitionPenalizer, "cumulated_repetition_penalties"),
+        (BatchedFrequencyPenalizer, "cumulated_frequency_penalties"),
+        (BatchedPresencePenalizer, "cumulated_presence_penalties"),
+    ):
+        assert torch.equal(
+            getattr(
+                batch.sampling_info.penalizer_orchestrator.penalizers[penalizer], state
+            ).cpu(),
+            getattr(
+                host.sampling_info.penalizer_orchestrator.penalizers[penalizer], state
+            ),
+        ), state
 
 
 def test_chunked_reprefill_rebuild_then_one_committed_decode():

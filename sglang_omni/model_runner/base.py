@@ -14,7 +14,7 @@ from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Generic, Protocol, TypeAlias
 
 import torch
-from sglang.srt.utils.common import is_pin_memory_available
+from sglang.srt.utils.common import async_h2d, is_pin_memory_available
 
 from sglang_omni.model_runner.model_worker import ModelWorker
 from sglang_omni.model_runner.prefill_inputs import (
@@ -370,15 +370,16 @@ class ModelRunner(Generic[RequestDataInput]):
             pass
 
         device = prepared[0][0].device
-        row_indices = torch.tensor(rows, dtype=torch.long, device=device)
-        token_indices = torch.tensor(token_ids, dtype=torch.long, device=device)
+        # note (ratish): a mixed admission restores every running row here, so the history crosses from pinned memory without waiting on the stream.
+        row_indices = async_h2d(rows, dtype=torch.long, device=device)
+        token_indices = async_h2d(token_ids, dtype=torch.long, device=device)
         for state, param_name in prepared:
             values = [
                 float(getattr(schedule_batch.reqs[row].sampling_params, param_name))
                 * (count if param_name == "frequency_penalty" else 1)
                 for row, count in zip(rows, counts)
             ]
-            state[row_indices, token_indices] = torch.tensor(
+            state[row_indices, token_indices] = async_h2d(
                 values, dtype=state.dtype, device=device
             )
 
