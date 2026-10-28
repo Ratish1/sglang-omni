@@ -29,13 +29,23 @@ REPEATS = 50
 
 
 def time_us(function, *args) -> float:
-    for _ in range(5):
-        function(*args)
+    """Device time per call, the calls replayed from one CUDA graph as the encoder's graphs replay them, so no host
+    launch time enters."""
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        for _ in range(3):
+            function(*args)
+    torch.cuda.current_stream().wait_stream(stream)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        for _ in range(REPEATS):
+            function(*args)
+    graph.replay()
     torch.cuda.synchronize()
     start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
     start.record()
-    for _ in range(REPEATS):
-        function(*args)
+    graph.replay()
     end.record()
     torch.cuda.synchronize()
     return 1e3 * start.elapsed_time(end) / REPEATS
