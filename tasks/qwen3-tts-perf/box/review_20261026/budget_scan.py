@@ -264,8 +264,17 @@ def summarize(paths: list[Path]) -> None:
             )
 
 
+def language_of(record: dict[str, object]) -> str:
+    """The ASR language of a record: zh for the wide cases' Chinese sets, en otherwise (10-26's sets are English)."""
+    if " zh " in f" {record['set']} ":
+        return "zh"
+    else:
+        return "en"
+
+
 def check(paths: list[Path], asr_port: int, concurrency: int) -> None:
-    """Transcribe every saved natural stop past #3157's budget and sort it into valid speech, a loop or unclear."""
+    """Transcribe every saved natural stop past #3157's budget and sort it into valid speech, a loop or unclear.
+    Chinese is scored per character, as SeedTTS ZH scores it."""
     asr = load_router_asr(asr_port)
     records = [
         json.loads(line) for path in paths for line in path.read_text(encoding="utf-8").splitlines() if line
@@ -273,9 +282,10 @@ def check(paths: list[Path], asr_port: int, concurrency: int) -> None:
     saved = [record for record in records if "audio" in record]
 
     def transcribe_one(record: dict[str, object]) -> None:
-        transcript = transcribe(asr, str(record["audio"]), "en", "cpu")
-        reference = normalize_text(str(record["input"]), "en")
-        measures = process_words(reference, normalize_text(transcript, "en"))
+        language = language_of(record)
+        transcript = transcribe(asr, str(record["audio"]), language, "cpu")
+        reference = normalize_text(str(record["input"]), language)
+        measures = process_words(reference, normalize_text(transcript, language))
         record["transcript"] = transcript
         record["wer"] = measures.wer
         record["insertions"] = measures.insertions
@@ -390,8 +400,9 @@ def truncated(check_path: Path, asr_port: int, concurrency: int) -> None:
 
     def transcribe_cut(record: dict[str, object]) -> None:
         audio, rate = soundfile.read(str(record["audio"]), dtype="float32", always_2d=False)
-        reference = normalize_text(str(record["input"]), "en")
-        full_hits = process_words(reference, normalize_text(str(record["transcript"]), "en")).hits
+        language = language_of(record)
+        reference = normalize_text(str(record["input"]), language)
+        full_hits = process_words(reference, normalize_text(str(record["transcript"]), language)).hits
         for name, cut_frames in (
             ("3157", text_length_budget(record["text_tokens"])),
             ("vllm", vllm_omni_ceiling(str(record["task"]), record["text_tokens"])),
@@ -403,7 +414,9 @@ def truncated(check_path: Path, asr_port: int, concurrency: int) -> None:
                 pass
             cut_path = cut_dir / f"{Path(str(record['audio'])).stem}_{name}.wav"
             soundfile.write(cut_path, audio[: int(cut_frames * SECONDS_PER_FRAME * rate)], rate, subtype="PCM_16")
-            cut_hits = process_words(reference, normalize_text(transcribe(asr, str(cut_path), "en", "cpu"), "en")).hits
+            cut_hits = process_words(
+                reference, normalize_text(transcribe(asr, str(cut_path), language, "cpu"), language)
+            ).hits
             record[f"words_lost_{name}"] = max(full_hits - cut_hits, 0)
 
     with ThreadPoolExecutor(concurrency) as pool:
