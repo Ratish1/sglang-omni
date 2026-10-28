@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import mmap
 import uuid
 from collections.abc import Mapping
 from multiprocessing import shared_memory as _shm
@@ -266,6 +267,35 @@ class ShmRelay(Relay):
     ) -> ShmGetOperation:
         # Note: metadata validation is implicit here based on usage in test
         return ShmGetOperation(metadata=metadata, dest_tensor=dest_tensor)
+
+    def read_mapped(
+        self, metadata: Mapping[str, object] | ShmPutMetadata, length: int
+    ) -> torch.Tensor:
+        """The block's bytes as a private copy-on-write mapping; the block is unlinked."""
+        shm_name = metadata["transfer_info"]["shm_name"]
+        try:
+            existing_shm = _shm.SharedMemory(name=shm_name)
+        except FileNotFoundError:
+            raise RuntimeError(f"SHM block {shm_name} not found.")
+        try:
+            if length:
+                mapping = mmap.mmap(
+                    existing_shm._fd,  # noqa: leading-underscore  # stdlib name
+                    length,
+                    access=mmap.ACCESS_COPY,
+                )
+            else:
+                mapping = None
+        finally:
+            existing_shm.close()
+            try:
+                existing_shm.unlink()
+            except FileNotFoundError:
+                logger.debug(f"SHM block {shm_name} was already unlinked")
+        if mapping is None:
+            return torch.empty(0, dtype=torch.uint8)
+        else:
+            return torch.frombuffer(mapping, dtype=torch.uint8)
 
     def cleanup(self, request_id: str) -> None:
         pass
