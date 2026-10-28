@@ -19,6 +19,7 @@ import logging
 import os
 import time
 import wave
+from collections.abc import Mapping
 from contextlib import asynccontextmanager
 from typing import AsyncIterator, Literal, Protocol, TypedDict
 from urllib.parse import quote
@@ -1158,7 +1159,7 @@ def _resolve_tts_generation_kwargs(
     return resolved
 
 
-def ended_by_length(entry: dict) -> bool:
+def ended_by_length(entry: Mapping[str, object]) -> bool:
     """Whether a generated entry stopped at its token limit instead of its own end."""
     return entry.get("finish_reason") == FinishReason.LENGTH.value
 
