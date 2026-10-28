@@ -13,6 +13,7 @@ usage: PYTHONPATH=TREE python3 predictor_fit.py bytes --arch 86
 """
 
 import argparse
+import hashlib
 import inspect
 import time
 from types import SimpleNamespace
@@ -118,8 +119,11 @@ def compile_only(records: list) -> None:
 
     def run(self, *run_args, grid, warmup, **kwargs):
         kernel = original_run(self, *run_args, grid=grid, warmup=True, **kwargs)
+        ptx_lines = kernel.asm["ptx"].split(".section\t.debug")[0].splitlines()
+        ptx = "\n".join(line for line in ptx_lines if not line.strip().startswith((".loc", ".file", "$L__")))
         records.append((self.fn.__name__, kwargs.get("BLOCK_M", kwargs.get("BLOCK_Q")), kwargs.get("T"),
-                        kwargs.get("num_stages"), kernel.metadata.shared, kernel.hash))
+                        kwargs.get("num_stages"), kernel.metadata.shared,
+                        f"{kernel.hash[:12]} ptx-without-lines {hashlib.sha256(ptx.encode()).hexdigest()[:16]}"))
         return kernel
 
     jit.JITFunction.run = run
