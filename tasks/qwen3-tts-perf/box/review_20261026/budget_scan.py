@@ -2,6 +2,7 @@
 runaway ceilings.
 
 usage: python3 budget_scan.py cases OUT_DIR                     (from an omni tree, so benchmarks/ imports)
+       python3 budget_scan.py cases-wide OUT_DIR --custom-voice-model PATH   (every speaker, EN and ZH, VoiceDesign ZH)
        python3 budget_scan.py scan CASES.jsonl --base-url URL --model PATH --label L --out RESULTS.jsonl [--save-over]
        python3 budget_scan.py summarize RESULTS.jsonl [RESULTS.jsonl ...]
        python3 budget_scan.py check RESULTS.jsonl [RESULTS.jsonl ...] --asr-port PORT
@@ -117,6 +118,42 @@ def build_cases(out_dir: Path) -> None:
     write_cases(out_dir / "voicedesign.jsonl", design)
 
 
+def build_wide_cases(out_dir: Path, custom_voice_model: str) -> None:
+    """Every CustomVoice speaker (the checkpoint's talker_config.spk_id) on every SeedTTS EN and ZH sentence, plain;
+    the slow instruction on every ZH sentence for ryan and vivian; VoiceDesign plain and slow on every ZH sentence.
+    Each case carries its language."""
+    out_dir.mkdir(parents=True, exist_ok=True)
+    config = json.loads((Path(resolve_checkpoint(custom_voice_model)) / "config.json").read_text(encoding="utf-8"))
+    speakers = sorted(config["talker_config"]["spk_id"])
+    custom = []
+    design = []
+    for split, language in (("en", "English"), ("zh", "Chinese")):
+        for sample in load_seedtts_samples(SEEDTTS_DATASET_ID, split=split):
+            for speaker in speakers:
+                custom.append({
+                    "id": f"{split}_{sample.sample_id}_{speaker}", "set": f"customvoice {split} {speaker} plain",
+                    "input": sample.target_text, "language": language, "task_type": "CustomVoice", "voice": speaker,
+                })
+            if split == "zh":
+                for speaker in ("ryan", "vivian"):
+                    custom.append({
+                        "id": f"{split}_{sample.sample_id}_{speaker}_slow", "set": f"customvoice {split} {speaker} slow",
+                        "input": sample.target_text, "language": language, "task_type": "CustomVoice",
+                        "voice": speaker, "instructions": SLOW_INSTRUCTION,
+                    })
+                for style, description in (("plain", VOICE_DESIGN_PLAIN), ("slow", VOICE_DESIGN_SLOW)):
+                    design.append({
+                        "id": f"{split}_{sample.sample_id}_{style}", "set": f"voicedesign {split} {style}",
+                        "input": sample.target_text, "language": language, "task_type": "VoiceDesign",
+                        "instructions": description,
+                    })
+            else:
+                pass
+    print(f"speakers: {', '.join(speakers)}")
+    write_cases(out_dir / "customvoice_wide.jsonl", custom)
+    write_cases(out_dir / "voicedesign_wide.jsonl", design)
+
+
 async def scan(
     cases_path: Path, base_url: str, model: str, label: str, out_path: Path, concurrency: int, save_over: bool
 ) -> None:
@@ -135,7 +172,7 @@ async def scan(
     async def one(client: httpx.AsyncClient, case: dict[str, str]) -> dict[str, object]:
         text_tokens = int(processor(text=case["input"], return_tensors="pt", padding=True)["input_ids"].shape[-1])
         body: dict[str, object] = {
-            "model": model, "input": case["input"], "language": "English", "response_format": "wav",
+            "model": model, "input": case["input"], "language": case.get("language", "English"), "response_format": "wav",
             "stream": False, "seed": SCAN_SEED, "max_new_tokens": SCAN_MAX_NEW_TOKENS,
         }
         for field in ("task_type", "voice", "instructions", "ref_text"):
@@ -436,6 +473,9 @@ def main() -> None:
     commands = parser.add_subparsers(dest="command", required=True)
     cases_parser = commands.add_parser("cases")
     cases_parser.add_argument("out_dir", type=Path)
+    wide_parser = commands.add_parser("cases-wide")
+    wide_parser.add_argument("out_dir", type=Path)
+    wide_parser.add_argument("--custom-voice-model", required=True)
     scan_parser = commands.add_parser("scan")
     scan_parser.add_argument("cases", type=Path)
     scan_parser.add_argument("--base-url", required=True)
@@ -463,6 +503,8 @@ def main() -> None:
     args = parser.parse_args()
     if args.command == "cases":
         build_cases(args.out_dir)
+    elif args.command == "cases-wide":
+        build_wide_cases(args.out_dir, args.custom_voice_model)
     elif args.command == "scan":
         asyncio.run(
             scan(args.cases, args.base_url, args.model, args.label, args.out, args.concurrency, args.save_over)
