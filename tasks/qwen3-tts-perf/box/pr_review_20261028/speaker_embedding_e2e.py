@@ -40,20 +40,34 @@ def speech(client: httpx.Client, base_url: str, body: dict[str, object]) -> tupl
 def run_exact(args: argparse.Namespace) -> None:
     dump_dir = Path(args.dump_dir)
     embeddings: dict[str, list[float]] = {}
-    seen_dumps = 0
+    if args.from_dumps:
+        for path in sorted(dump_dir.glob("*.pt")):
+            dump = torch.load(path)
+            if dump["ref_audio"].startswith("/"):
+                embeddings[Path(dump["ref_audio"]).name] = dump["embedding"].tolist()
+            else:
+                pass
+        print(f"{len(embeddings)} embeddings from earlier dumps", flush=True)
+    else:
+        pass
+    seen_dumps = len(list(dump_dir.glob("*.pt")))
     records = []
     with httpx.Client(timeout=TIMEOUT_S, trust_env=False) as client:
         for sample in load_seedtts_samples(SEEDTTS_DATASET_ID, split="en"):
+            clip_name = Path(sample.ref_audio).name
             base = {"model": args.model, "input": sample.target_text, "response_format": "wav", "seed": SEED}
             reference = {**base, "ref_audio": sample.ref_audio, "x_vector_only_mode": True}
             status_a, audio_a, latency_a = speech(client, args.base_url, reference)
-            dumps = sorted(dump_dir.glob("*.pt"))
-            for path in dumps[seen_dumps:]:
-                embeddings[sample.ref_audio] = torch.load(path)["embedding"].tolist()
-            seen_dumps = len(dumps)
+            if not args.from_dumps:
+                dumps = sorted(dump_dir.glob("*.pt"))
+                for path in dumps[seen_dumps:]:
+                    embeddings[clip_name] = torch.load(path)["embedding"].tolist()
+                seen_dumps = len(dumps)
+            else:
+                pass
             record = {"id": sample.sample_id, "status_a": status_a, "latency_a_ms": latency_a}
-            if sample.ref_audio in embeddings:
-                embedded = {**base, "speaker_embedding": embeddings[sample.ref_audio]}
+            if clip_name in embeddings:
+                embedded = {**base, "speaker_embedding": embeddings[clip_name]}
                 status_b, audio_b, latency_b = speech(client, args.base_url, embedded)
                 status_c, audio_c, latency_c = speech(client, args.base_url, reference)
                 record.update(
@@ -180,6 +194,7 @@ def run_contract(args: argparse.Namespace) -> None:
         ("websocket, embedding", {"model": args.model, "speaker_embedding": embedding, "response_format": "pcm", "stream_audio": True}),
         ("websocket, embedding with ref_audio", {"model": args.model, "speaker_embedding": embedding, "ref_audio": args.reference}),
         ("websocket, NaN", {"model": args.model, "speaker_embedding": [float("nan")] + embedding[1:]}),
+        ("websocket, 1e39", {"model": args.model, "speaker_embedding": [1e39] + embedding[1:]}),
     ):
         try:
             outcome = asyncio.run(websocket_case(args.base_url, session))
@@ -196,6 +211,7 @@ def main() -> None:
     exact.add_argument("--model", required=True)
     exact.add_argument("--dump-dir", required=True)
     exact.add_argument("--out", required=True)
+    exact.add_argument("--from-dumps", action="store_true")
     contract = commands.add_parser("contract")
     contract.add_argument("--base-url", required=True)
     contract.add_argument("--model", required=True)
