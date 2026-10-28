@@ -6,6 +6,8 @@
 # census over that window. The container sees the stage's two cards as 0 and 1.
 #   videomme_talker   stage 8: bf16 disaggregated, thinker and encoders on 0, talker and code2wav on 1, 20 samples
 #   videoamme_talker  stage 10: FP8, thinker TP2 on 0 and 1, talker and code2wav on 1, 10 samples
+# PROBE_PATH puts another sitecustomize directory on the server's PYTHONPATH (with NSYS_ARGS=none,
+# e.g. ipc_payload_probe with OMNI_IPC_PROBE=<dir>).
 # usage: run_probe_boot_ci_video.sh <tree> <out dir> <port> <videomme_talker|videoamme_talker>
 set -u
 TREE=$1 OUT=$2 PORT=$3 ARM=$4
@@ -38,13 +40,13 @@ fi
 
 echo "start $(date +%T) $ARM samples $SAMPLES nsys '${NSYS_ARGS}'" > "$OUT/progress.txt"
 git -C "$TREE" rev-parse HEAD HEAD:sglang_omni > "$OUT/head.txt"
-md5sum "$0" "$S/run_bench.py" "$S/omni_census.py" "$S/omni_pipeline_nvtx/sitecustomize.py" > "$OUT/md5.txt"
+md5sum "$0" "$S/run_bench.py" "$S/omni_census.py" "$S/omni_pipeline_nvtx/sitecustomize.py" ${PROBE_PATH:+"$PROBE_PATH/sitecustomize.py"} > "$OUT/md5.txt"
 echo "$MODEL | $EXTRA | $NSYS_ARGS | $PROBE" > "$OUT/serve_args.txt"
 nvidia-smi > "$OUT/gpus_before.txt"
 (while true; do cat /proc/loadavg; sleep 30; done) > "$OUT/loadavg.log" 2>&1 &
 LOADS=$!
 
-env PYTHONPATH=$TREE${PROBE:+:$S/omni_pipeline_nvtx} $PROBE \
+env PYTHONPATH=$TREE${PROBE:+:$S/omni_pipeline_nvtx}${PROBE_PATH:+:$PROBE_PATH} $PROBE \
   setsid $PIN $WRAP python3 -u examples/run_qwen3_omni_speech_server.py --model-path $MODEL --port $PORT \
   --model-name qwen3-omni --thinker-max-seq-len 32768 $EXTRA > "$OUT/serve.log" 2>&1 &
 WRAP_PID=$!
