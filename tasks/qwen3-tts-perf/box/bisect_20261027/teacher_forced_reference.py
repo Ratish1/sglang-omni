@@ -7,7 +7,10 @@ at temperature 1, EOS under temperature 0.9 and top-k 50, EOS's rank, the top id
 fields `probe/qwen3-tts-teacher-forced` logs on our side.
 
 usage: /data/refenv/bin/python teacher_forced_reference.py SERVED_DIR PROBE_DIR CASES.jsonl OUT.jsonl
-       --model Qwen/Qwen3-TTS-12Hz-0.6B-Base [--card 0] [--natural-per-set 50] [--language English]
+       --model Qwen/Qwen3-TTS-12Hz-0.6B-Base [--card 0] [--natural-per-set 50] [--language English] [--encoder-fp32]
+
+--encoder-fp32 reloads the speech tokenizer from its float32 checkpoint and casts only its decoder to bf16, so official
+encodes the reference with the checkpoint's own weights and dtype at the clip's exact length.
 
 Runs in a venv holding qwen-tts 0.1.1's pins (transformers 4.57.3, accelerate 1.12.0, torch 2.10.0): its talker does
 not load under the serving image's Transformers.
@@ -21,7 +24,8 @@ from collections import defaultdict
 from pathlib import Path
 
 import torch
-from qwen_tts import Qwen3TTSModel
+from huggingface_hub import snapshot_download
+from qwen_tts import Qwen3TTSModel, Qwen3TTSTokenizer
 
 SPEECH_ID = re.compile(r"speech-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
 CONTROL_IDS = 1024
@@ -109,6 +113,7 @@ def main() -> None:
     parser.add_argument("--card", type=int, default=0)
     parser.add_argument("--natural-per-set", type=int, default=50)
     parser.add_argument("--language", choices=("auto", "English"), default="English")
+    parser.add_argument("--encoder-fp32", action="store_true")
     args = parser.parse_args()
     cases = {
         case["id"]: case
@@ -118,6 +123,16 @@ def main() -> None:
     model = Qwen3TTSModel.from_pretrained(
         args.model, device_map=f"cuda:{args.card}", dtype=torch.bfloat16, attn_implementation="sdpa"
     )
+    if args.encoder_fp32:
+        tokenizer = Qwen3TTSTokenizer.from_pretrained(
+            str(Path(snapshot_download(args.model)) / "speech_tokenizer"),
+            device_map=f"cuda:{args.card}",
+            dtype=torch.float32,
+        )
+        tokenizer.model.decoder.to(torch.bfloat16)
+        model.model.load_speech_tokenizer(tokenizer)
+    else:
+        pass
     talker = model.model.talker
     talker.generate = capture_talker_inputs
     codec_eos = int(talker.config.codec_eos_token_id)
