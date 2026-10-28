@@ -120,6 +120,34 @@ def load_float32_encoder_weights(
             module.embed
         else:
             pass
+    use_tf32x3_transformer_linears(encoder)
+
+
+def use_tf32x3_transformer_linears(encoder: torch.nn.Module) -> int:
+    """Run the float32 encoder transformer's projections as three-pass TF32 GEMMs on CUDA GPUs with TF32 tensor
+    cores; returns how many were replaced, none elsewhere, where they stay float32 FFMA GEMMs.
+    """
+    # note (ratish): official's codes need float32 products in the transformer; FFMA GEMMs at these few rows hold SMs beside the talker's steps for longer than three tensor-core passes do.
+    device = next(encoder.parameters()).device
+    if not (
+        current_platform.is_cuda()
+        and device.type == "cuda"
+        and torch.cuda.get_device_capability(device) >= (8, 0)
+    ):
+        return 0
+    else:
+        pass
+    from sglang_omni.kernels.tf32x3_linear import Tf32x3Linear
+
+    replacements = [
+        (parent, name, child)
+        for parent in encoder.encoder_transformer.modules()
+        for name, child in parent.named_children()
+        if isinstance(child, torch.nn.Linear)
+    ]
+    for parent, name, child in replacements:
+        setattr(parent, name, Tf32x3Linear(child))
+    return len(replacements)
 
 
 def load_qwen3_tts_tokenizer(
