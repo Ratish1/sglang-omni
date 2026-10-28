@@ -1551,7 +1551,11 @@ def prepare_qwen3_tts_request(
     )
 
     validate_qwen3_tts_model_task(model, state)
-    if "max_new_tokens" in state.generation_kwargs:
+    # note (ratish): only Base clones run away, so CustomVoice and VoiceDesign take the checkpoint's generation_config limit, which the scheduler clamps to the context and the KV pool.
+    if (
+        "max_new_tokens" in state.generation_kwargs
+        or state.task_type != QWEN3_TTS_TASK_BASE
+    ):
         generation_kwargs = state.generation_kwargs
     else:
         # note (luojiaxuan): The default budget counts the target text only; reference text and instructions are prompt, not speech.
