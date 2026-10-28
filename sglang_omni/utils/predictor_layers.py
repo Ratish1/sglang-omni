@@ -39,6 +39,7 @@ The module imports where Triton is unavailable; the resolvers then keep the plai
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Protocol
 
 import torch
 from sglang.kernels.jit.utils import is_arch_support_pdl
@@ -87,12 +88,8 @@ NUM_WARPS = 4
 # note (ratish): the 16-row block runs faster on two warps; wider blocks spill there.
 QKV_SMALL_BLOCK_WARPS = 2
 NUM_STAGES = 3
-# note (migumnakkittikul): at 64 rows the gate_up launch keeps 132096 bytes of shared memory
-# in flight over three stages and 66048 over two; SM 8.6, 8.9 and 12.x GPUs cap a block at
-# 101376, so they pipeline two.
-FULL_PIPELINE_SHARED_MEMORY = 132096
+# note (ratish): a launch whose tiles over NUM_STAGES exceed the GPU's shared memory per block, as the 64-row qkv and gate_up blocks do on SM 8.6, 8.9 and 12.x, pipelines this many.
 REDUCED_NUM_STAGES = 2
-REDUCED_PIPELINE_SHARED_MEMORY = 66048
 
 
 if HAS_TRITON:
@@ -649,8 +646,7 @@ def add_rmsnorm_rounded(
 
 @dataclass(frozen=True)
 class PredictorLayerShape:
-    """The predictor layer's dimensions, the K split of its residual launches and the
-    pipeline stages the GPU's shared memory allows."""
+    """The predictor layer's dimensions and the K split of its residual launches."""
 
     hidden_size: int
     head_dim: int
@@ -659,7 +655,6 @@ class PredictorLayerShape:
     intermediate_size: int
     split_qkv: int
     split_hidden: int
-    num_stages: int
 
 
 def is_plain_bf16_linear(linear: torch.nn.Module) -> bool:
@@ -729,14 +724,7 @@ def resolve_predictor_layer_shape(
             return None
         else:
             pass
-    properties = torch.cuda.get_device_properties(device)
-    if properties.shared_memory_per_block_optin >= FULL_PIPELINE_SHARED_MEMORY:
-        num_stages = NUM_STAGES
-    elif properties.shared_memory_per_block_optin >= REDUCED_PIPELINE_SHARED_MEMORY:
-        num_stages = REDUCED_NUM_STAGES
-    else:
-        return None
-    sm_count = properties.multi_processor_count
+    sm_count = torch.cuda.get_device_properties(device).multi_processor_count
     heads = attention.num_heads + 2 * attention.num_kv_heads
     split_hidden = min(
         split_count(hidden_size // BLOCK_N, attention.num_heads, sm_count),
@@ -750,12 +738,38 @@ def resolve_predictor_layer_shape(
         intermediate_size=intermediate_size,
         split_qkv=split_count(heads, hidden_size // BLOCK_K, sm_count),
         split_hidden=split_hidden,
-        num_stages=num_stages,
     )
 
 
 def block_rows(rows: int) -> int:
     return max(MIN_BLOCK_M, triton.next_power_of_2(rows))
+
+
+class PipelinedLaunch(Protocol):
+    """A fused launch at a given number of pipeline stages."""
+
+    def __call__(self, num_stages: int) -> None: ...
+
+
+def launch_at_fitted_stages(
+    launch: PipelinedLaunch,
+    launch_name: str,
+    block_m: int,
+    fitted_stages: dict[tuple[str, int], int],
+) -> None:
+    """Launch at the stages this launch and row block loaded with before; the first time
+    at NUM_STAGES, or at REDUCED_NUM_STAGES where Triton refuses to load NUM_STAGES
+    because the tiles exceed the GPU's shared memory per block."""
+    num_stages = fitted_stages.get((launch_name, block_m))
+    if num_stages is not None:
+        launch(num_stages=num_stages)
+    else:
+        try:
+            launch(num_stages=NUM_STAGES)
+            fitted_stages[(launch_name, block_m)] = NUM_STAGES
+        except triton.runtime.OutOfResources:
+            launch(num_stages=REDUCED_NUM_STAGES)
+            fitted_stages[(launch_name, block_m)] = REDUCED_NUM_STAGES
 
 
 def allocate_split_scratch(
@@ -798,6 +812,7 @@ def attention_inputs(
     sum_sq_partials: torch.Tensor,
     counters: torch.Tensor,
     shape: PredictorLayerShape,
+    fitted_stages: dict[tuple[str, int], int],
 ) -> None:
     """Norm x's rows, project them, norm and rotate q and k; q into q_out and k and v
     into the caches at each row's position. x is (rows, hidden) with unit column stride;
@@ -806,41 +821,45 @@ def attention_inputs(
     block_m = block_rows(rows)
     heads = shape.num_q_heads + 2 * shape.num_kv_heads
     use_gdc = is_arch_support_pdl()
-    norm_qkv_rope_store_kernel[(heads, shape.split_qkv)](
-        x,
-        tokens_per_row * x.stride(0),
-        x.stride(0),
-        rows,
-        norm.weight,
-        norm.variance_epsilon,
-        attention.qkv_proj.weight,
-        q_out,
-        attention.q_norm.weight,
-        attention.k_norm.weight,
-        attention.q_norm.variance_epsilon,
-        attention.rotary_emb.cos_sin_cache,
-        positions,
-        k_cache,
-        v_cache,
-        k_cache.stride(0),
-        k_cache.stride(1),
-        k_cache.stride(2),
-        partials,
-        sum_sq_partials,
-        counters,
-        T=tokens_per_row,
-        K=shape.hidden_size,
-        HEAD_DIM=shape.head_dim,
-        NUM_Q_HEADS=shape.num_q_heads,
-        NUM_KV_HEADS=shape.num_kv_heads,
-        SPLIT=shape.split_qkv,
-        BLOCK_M=block_m,
-        BLOCK_K=BLOCK_K,
-        USE_GDC=use_gdc,
-        num_warps=QKV_SMALL_BLOCK_WARPS if block_m == MIN_BLOCK_M else NUM_WARPS,
-        num_stages=shape.num_stages,
-        launch_pdl=use_gdc,
-    )
+
+    def launch(num_stages: int) -> None:
+        norm_qkv_rope_store_kernel[(heads, shape.split_qkv)](
+            x,
+            tokens_per_row * x.stride(0),
+            x.stride(0),
+            rows,
+            norm.weight,
+            norm.variance_epsilon,
+            attention.qkv_proj.weight,
+            q_out,
+            attention.q_norm.weight,
+            attention.k_norm.weight,
+            attention.q_norm.variance_epsilon,
+            attention.rotary_emb.cos_sin_cache,
+            positions,
+            k_cache,
+            v_cache,
+            k_cache.stride(0),
+            k_cache.stride(1),
+            k_cache.stride(2),
+            partials,
+            sum_sq_partials,
+            counters,
+            T=tokens_per_row,
+            K=shape.hidden_size,
+            HEAD_DIM=shape.head_dim,
+            NUM_Q_HEADS=shape.num_q_heads,
+            NUM_KV_HEADS=shape.num_kv_heads,
+            SPLIT=shape.split_qkv,
+            BLOCK_M=block_m,
+            BLOCK_K=BLOCK_K,
+            USE_GDC=use_gdc,
+            num_warps=QKV_SMALL_BLOCK_WARPS if block_m == MIN_BLOCK_M else NUM_WARPS,
+            num_stages=num_stages,
+            launch_pdl=use_gdc,
+        )
+
+    launch_at_fitted_stages(launch, "attention_inputs", block_m, fitted_stages)
 
 
 def decode_attention(
@@ -891,37 +910,43 @@ def o_proj_add(
     partials: torch.Tensor,
     counters: torch.Tensor,
     shape: PredictorLayerShape,
+    fitted_stages: dict[tuple[str, int], int],
 ) -> None:
     """residual_out = bf16(bf16(attention_output @ weight.T) + residual_in), reading the
     attention output in its (row group, head, token, head dim) layout and residual_in
     with its own row stride."""
     rows = residual_out.shape[0]
+    block_m = block_rows(rows)
     use_gdc = is_arch_support_pdl()
-    gemv_add_kernel[(shape.hidden_size // BLOCK_N, shape.split_hidden)](
-        attention_output,
-        attention_output.stride(0),
-        attention_output.stride(2),
-        attention_output.stride(1),
-        rows,
-        weight,
-        residual_in,
-        residual_in.stride(0),
-        residual_out,
-        partials,
-        counters,
-        T=tokens_per_row,
-        D=shape.head_dim,
-        K=shape.num_q_heads * shape.head_dim,
-        N=shape.hidden_size,
-        SPLIT=shape.split_hidden,
-        BLOCK_M=block_rows(rows),
-        BLOCK_N=BLOCK_N,
-        BLOCK_K=BLOCK_K,
-        USE_GDC=use_gdc,
-        num_warps=NUM_WARPS,
-        num_stages=shape.num_stages,
-        launch_pdl=use_gdc,
-    )
+
+    def launch(num_stages: int) -> None:
+        gemv_add_kernel[(shape.hidden_size // BLOCK_N, shape.split_hidden)](
+            attention_output,
+            attention_output.stride(0),
+            attention_output.stride(2),
+            attention_output.stride(1),
+            rows,
+            weight,
+            residual_in,
+            residual_in.stride(0),
+            residual_out,
+            partials,
+            counters,
+            T=tokens_per_row,
+            D=shape.head_dim,
+            K=shape.num_q_heads * shape.head_dim,
+            N=shape.hidden_size,
+            SPLIT=shape.split_hidden,
+            BLOCK_M=block_m,
+            BLOCK_N=BLOCK_N,
+            BLOCK_K=BLOCK_K,
+            USE_GDC=use_gdc,
+            num_warps=NUM_WARPS,
+            num_stages=num_stages,
+            launch_pdl=use_gdc,
+        )
+
+    launch_at_fitted_stages(launch, "o_proj_add", block_m, fitted_stages)
 
 
 def mlp_up(
@@ -931,31 +956,37 @@ def mlp_up(
     weight: torch.Tensor,
     activated: torch.Tensor,
     shape: PredictorLayerShape,
+    fitted_stages: dict[tuple[str, int], int],
 ) -> None:
     """activated = bf16(silu(bf16(normed @ gate.T)) * bf16(normed @ up.T)) with the
     normed residual, gate and up being the halves of the merged weight."""
     rows = residual.shape[0]
+    block_m = block_rows(rows)
     use_gdc = is_arch_support_pdl()
-    norm_gate_up_silu_kernel[(shape.intermediate_size // BLOCK_N,)](
-        residual,
-        residual.stride(0),
-        residual.stride(0),
-        rows,
-        norm.weight,
-        norm.variance_epsilon,
-        weight,
-        activated,
-        T=1,
-        K=shape.hidden_size,
-        INTERMEDIATE=shape.intermediate_size,
-        BLOCK_M=block_rows(rows),
-        BLOCK_N=BLOCK_N,
-        BLOCK_K=MLP_BLOCK_K,
-        USE_GDC=use_gdc,
-        num_warps=NUM_WARPS,
-        num_stages=shape.num_stages,
-        launch_pdl=use_gdc,
-    )
+
+    def launch(num_stages: int) -> None:
+        norm_gate_up_silu_kernel[(shape.intermediate_size // BLOCK_N,)](
+            residual,
+            residual.stride(0),
+            residual.stride(0),
+            rows,
+            norm.weight,
+            norm.variance_epsilon,
+            weight,
+            activated,
+            T=1,
+            K=shape.hidden_size,
+            INTERMEDIATE=shape.intermediate_size,
+            BLOCK_M=block_m,
+            BLOCK_N=BLOCK_N,
+            BLOCK_K=MLP_BLOCK_K,
+            USE_GDC=use_gdc,
+            num_warps=NUM_WARPS,
+            num_stages=num_stages,
+            launch_pdl=use_gdc,
+        )
+
+    launch_at_fitted_stages(launch, "mlp_up", block_m, fitted_stages)
 
 
 def down_add(
@@ -966,35 +997,41 @@ def down_add(
     partials: torch.Tensor,
     counters: torch.Tensor,
     shape: PredictorLayerShape,
+    fitted_stages: dict[tuple[str, int], int],
 ) -> None:
     """residual = bf16(bf16(activated @ weight.T) + residual), in place."""
     rows = residual.shape[0]
+    block_m = block_rows(rows)
     use_gdc = is_arch_support_pdl()
-    gemv_add_kernel[(shape.hidden_size // BLOCK_N, shape.split_hidden)](
-        activated,
-        activated.stride(0),
-        activated.stride(0),
-        BLOCK_K,
-        rows,
-        weight,
-        residual,
-        residual.stride(0),
-        residual,
-        partials,
-        counters,
-        T=1,
-        D=BLOCK_K,
-        K=shape.intermediate_size,
-        N=shape.hidden_size,
-        SPLIT=shape.split_hidden,
-        BLOCK_M=block_rows(rows),
-        BLOCK_N=BLOCK_N,
-        BLOCK_K=BLOCK_K,
-        USE_GDC=use_gdc,
-        num_warps=NUM_WARPS,
-        num_stages=shape.num_stages,
-        launch_pdl=use_gdc,
-    )
+
+    def launch(num_stages: int) -> None:
+        gemv_add_kernel[(shape.hidden_size // BLOCK_N, shape.split_hidden)](
+            activated,
+            activated.stride(0),
+            activated.stride(0),
+            BLOCK_K,
+            rows,
+            weight,
+            residual,
+            residual.stride(0),
+            residual,
+            partials,
+            counters,
+            T=1,
+            D=BLOCK_K,
+            K=shape.intermediate_size,
+            N=shape.hidden_size,
+            SPLIT=shape.split_hidden,
+            BLOCK_M=block_m,
+            BLOCK_N=BLOCK_N,
+            BLOCK_K=BLOCK_K,
+            USE_GDC=use_gdc,
+            num_warps=NUM_WARPS,
+            num_stages=num_stages,
+            launch_pdl=use_gdc,
+        )
+
+    launch_at_fitted_stages(launch, "down_add", block_m, fitted_stages)
 
 
 def codebook_step(
@@ -1033,7 +1070,7 @@ def codebook_step(
 class FusedPredictorLayers:
     """The predictor's decoder layers as five fused launches per layer, with q, the
     attention output, the residual stream and the MLP activation in buffers of max_rows
-    rows."""
+    rows, and the pipeline stages each launch and row block loaded with."""
 
     def __init__(
         self,
@@ -1057,6 +1094,7 @@ class FusedPredictorLayers:
         self.partials, self.sum_sq_partials, self.counters = allocate_split_scratch(
             shape, max_rows, device
         )
+        self.fitted_stages: dict[tuple[str, int], int] = {}
 
     def covers(self, rows: int) -> bool:
         return rows <= self.max_rows
@@ -1102,6 +1140,7 @@ class FusedPredictorLayers:
                 sum_sq_partials=self.sum_sq_partials,
                 counters=self.counters,
                 shape=shape,
+                fitted_stages=self.fitted_stages,
             )
             decode_attention(
                 q=q_out,
@@ -1122,6 +1161,7 @@ class FusedPredictorLayers:
                 partials=self.partials,
                 counters=self.counters,
                 shape=shape,
+                fitted_stages=self.fitted_stages,
             )
             hidden = residual
             mlp_up(
@@ -1130,6 +1170,7 @@ class FusedPredictorLayers:
                 weight=layer.mlp.gate_up_proj.weight,
                 activated=activated,
                 shape=shape,
+                fitted_stages=self.fitted_stages,
             )
             down_add(
                 activated=activated,
@@ -1138,6 +1179,7 @@ class FusedPredictorLayers:
                 partials=self.partials,
                 counters=self.counters,
                 shape=shape,
+                fitted_stages=self.fitted_stages,
             )
         normed = final_norm(residual)
         return normed.reshape(batch_size, num_tokens, hidden_size)

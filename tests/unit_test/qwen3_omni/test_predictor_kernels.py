@@ -31,7 +31,6 @@ from sglang_omni.utils import predictor_layers
 from sglang_omni.utils.predictor_layers import (
     HIDDEN_SIZE,
     MAX_FUSED_ROWS,
-    NUM_STAGES,
     REDUCED_NUM_STAGES,
     add_rmsnorm_rounded,
     codebook_step,
@@ -485,27 +484,24 @@ def test_resolver_keeps_the_plain_path_for_a_quantized_projection() -> None:
 
 @accelerator
 @pytest.mark.accelerator
-@pytest.mark.parametrize(
-    ("shared_memory", "expected_stages"),
-    [(232448, NUM_STAGES), (101376, REDUCED_NUM_STAGES), (65536, None)],
-)
-def test_resolver_pipelines_the_stages_a_block_can_hold(
-    monkeypatch: pytest.MonkeyPatch, shared_memory: int, expected_stages: int | None
+@pytest.mark.usefixtures("published_server_args")
+def test_launches_beyond_the_shared_memory_pipeline_fewer_stages_with_the_same_bits(
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Three stages at 64 rows overflow a 99 KiB block (SM 8.6, 8.9, 12.x) at launch."""
+    """At 64 rows the qkv and gate_up launches need more shared memory over three stages
+    than SM 8.6, 8.9 and 12.x GPUs give a block, and the predictor failed to load there;
+    a launch beyond the GPU's shared memory must step down and give the same bits."""
     device = torch.device("cuda")
-    talker = build_talker(device, seed=12)
-    sm_count = torch.cuda.get_device_properties(device).multi_processor_count
-    monkeypatch.setattr(
-        torch.cuda,
-        "get_device_properties",
-        lambda device: SimpleNamespace(
-            shared_memory_per_block_optin=shared_memory,
-            multi_processor_count=sm_count,
-        ),
-    )
-    shape = resolve_predictor_layer_shape(talker.code_predictor, PREDICTOR_LEN, device)
-    assert (None if shape is None else shape.num_stages) == expected_stages
+    steps = predictor_inputs(device, MAX_FUSED_ROWS // 2, seed=27)
+    expected = run_sequence(fuse(build_talker(device, seed=26)), steps)
+    monkeypatch.setattr(predictor_layers, "NUM_STAGES", 6)
+    talker = fuse(build_talker(device, seed=26))
+    actual = run_sequence(talker, steps)
+    for expected_output, actual_output in zip(expected, actual, strict=True):
+        assert torch.equal(actual_output, expected_output)
+    fitted_stages = talker.predictor_fused_layers.fitted_stages
+    assert fitted_stages[("attention_inputs", MAX_FUSED_ROWS)] == REDUCED_NUM_STAGES
+    assert fitted_stages[("mlp_up", MAX_FUSED_ROWS)] == REDUCED_NUM_STAGES
 
 
 @accelerator
