@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import sys
 
 import pytest
 import torch
@@ -39,6 +40,29 @@ def test_shm_put_timeout_unlinks_block_and_releases_credit() -> None:
             assert not os.path.exists(shm_path2)
 
     asyncio.run(run())
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="blocks are mapped on Linux")
+@pytest.mark.parametrize("numel", [0, 1001])
+def test_shm_mapped_read_returns_writable_block_bytes_and_unlinks_block(
+    numel: int,
+) -> None:
+    async def scenario() -> None:
+        relay = ShmRelay(engine_id="e", device="cpu")
+        source = torch.randn(numel, dtype=torch.float32)
+        put = await relay.put_async(source, request_id="r0")
+        transfer_info = put.metadata["transfer_info"]
+
+        received = relay.read_mapped(put.metadata, transfer_info["size"]).view(
+            torch.float32
+        )
+
+        assert torch.equal(received, source)
+        assert not os.path.exists(f"/dev/shm/{transfer_info['shm_name']}")
+        received.add_(1.0)
+        assert torch.equal(received, source + 1.0)
+
+    asyncio.run(scenario())
 
 
 def test_shm_round_trips_zero_byte_tensor() -> None:
