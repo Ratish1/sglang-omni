@@ -582,7 +582,7 @@ def resolve_voice_clone_reference(
     references: list[dict[str, object]],
     tts_params: dict[str, object],
     *,
-    speaker_embedding: list[float] | None = None,
+    speaker_embedding: list[float] | None,
 ) -> tuple[object, str | None]:
     reference = references[0] if references else {}
     ref_audio = (
@@ -805,7 +805,7 @@ def resolve_x_vector_only_mode(
     params: dict[str, object],
     tts_params: dict[str, object],
     ref_text: str | None,
-    speaker_embedding: list[float] | None = None,
+    speaker_embedding: list[float] | None,
 ) -> bool:
     for source in (params, tts_params):
         if "x_vector_only_mode" in source:
@@ -979,12 +979,11 @@ def qwen3_tts_voice_prompt_from_cache(
     return prompt, str(ref_text) if ref_text is not None else None
 
 
-def qwen3_tts_voice_prompt_from_params(
+def qwen3_tts_voice_prompt_from_speaker_embedding(
     speaker_embedding: list[float],
-    ref_text: str | None,
     *,
     embedding_size: int,
-) -> tuple[VoicePrompt, str | None]:
+) -> VoicePrompt:
     """The x-vector prompt of a precomputed speaker embedding as a CPU float32 tensor,
     which the talker places on its device and dtype as it does an encoded reference's.
     """
@@ -1002,12 +1001,11 @@ def qwen3_tts_voice_prompt_from_params(
         )
     else:
         pass
-    prompt: VoicePrompt = {
+    return {
         "ref_spk_embedding": [embedding],
         "ref_code": [None],
         "icl_mode": [False],
     }
-    return prompt, ref_text
 
 
 @dataclass(frozen=True)
@@ -1532,11 +1530,11 @@ def prepare_qwen3_tts_base_request(
         else None
     )
     if state.speaker_embedding is not None:
-        voice_clone_prompt, ref_text = qwen3_tts_voice_prompt_from_params(
+        voice_clone_prompt = qwen3_tts_voice_prompt_from_speaker_embedding(
             state.speaker_embedding,
-            state.ref_text,
             embedding_size=model.root_config.speaker_encoder_config.enc_dim,
         )
+        ref_text = state.ref_text
     elif cached_prompt is not None:
         voice_clone_prompt, ref_text = cached_prompt
     elif cache_key is None:

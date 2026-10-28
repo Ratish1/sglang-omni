@@ -1086,8 +1086,8 @@ class PipelineConfig(BaseModel):
         """Return whether this pipeline can serve /v1/audio/translations."""
         return False
 
-    def resolve_speaker_embedding_dim(self) -> int | None:
-        """Return the accepted precomputed speaker embedding dimension.
+    def resolve_speaker_embedding_size(self) -> int | None:
+        """Return the number of values a precomputed speaker embedding carries.
 
         None rejects requests carrying speaker_embedding at validation time.
         """

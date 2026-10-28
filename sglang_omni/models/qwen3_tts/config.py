@@ -207,7 +207,7 @@ class Qwen3TTSPipelineConfig(PipelineConfig):
         }
         return load_qwen3_tts_checkpoint_config(engine_factory_kwargs["model_path"])
 
-    def resolve_speaker_embedding_dim(self) -> int | None:
+    def resolve_speaker_embedding_size(self) -> int | None:
         checkpoint_config = self.load_engine_checkpoint_config()
         model_type = normalize_qwen3_tts_model_type(
             checkpoint_config.get("tts_model_type")

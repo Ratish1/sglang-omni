@@ -7,13 +7,13 @@ import asyncio
 import base64
 import binascii
 import logging
-import math
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, TypeAlias, TypedDict
 from urllib.parse import urlparse
 
+import torch
 from pydantic import AliasChoices, BaseModel, ValidationError
 
 from sglang_omni.client import ClientError, GenerateRequest, SamplingParams
@@ -136,7 +136,7 @@ class SpeechRequestValidator:
         supports_uploaded_voice_references: bool = True,
         custom_voice_config: CustomVoiceConfig | None = None,
         required_speech_reference_count: int | None = None,
-        speaker_embedding_dim: int | None = None,
+        speaker_embedding_size: int | None = None,
         speech_reference_text_required: bool = False,
         speech_reference_text_excludes_instructions: bool = False,
         additional_speech_languages: frozenset[str] = frozenset(),
@@ -158,10 +158,12 @@ class SpeechRequestValidator:
             raise ValueError("required_speech_reference_count must be greater than 0")
         else:
             pass
-        if speaker_embedding_dim is not None and (
-            isinstance(speaker_embedding_dim, bool) or speaker_embedding_dim < 1
+        if speaker_embedding_size is not None and (
+            isinstance(speaker_embedding_size, bool) or speaker_embedding_size < 1
         ):
-            raise ValueError("speaker_embedding_dim must be a positive integer or None")
+            raise ValueError(
+                "speaker_embedding_size must be a positive integer or None"
+            )
         else:
             pass
         if max_speech_input_chars is not None and (
@@ -196,7 +198,7 @@ class SpeechRequestValidator:
             else frozenset()
         )
         self.required_speech_reference_count = required_speech_reference_count
-        self.speaker_embedding_dim = speaker_embedding_dim
+        self.speaker_embedding_size = speaker_embedding_size
         self.speech_reference_text_required = speech_reference_text_required
         self.max_speech_input_chars = max_speech_input_chars
         self.speech_reference_text_excludes_instructions = (
@@ -417,7 +419,7 @@ class SpeechRequestValidator:
 
     def validate_speaker_embedding(
         self,
-        request: CreateSpeechRequest,
+        request: CreateSpeechRequest | CreateSpeechBatchRequest,
         *,
         task_type: str | None,
     ) -> None:
@@ -425,31 +427,28 @@ class SpeechRequestValidator:
             return
         else:
             pass
-        if self.speaker_embedding_dim is None:
+        if self.speaker_embedding_size is None:
             raise bad_request(
                 "speaker_embedding is not supported by this model",
                 param="speaker_embedding",
             )
         else:
             pass
-        if not request.speaker_embedding:
+        if len(request.speaker_embedding) != self.speaker_embedding_size:
             raise bad_request(
-                "speaker_embedding must be a non-empty list of numbers",
-                param="speaker_embedding",
-            )
-        else:
-            pass
-        if len(request.speaker_embedding) != self.speaker_embedding_dim:
-            raise bad_request(
-                f"speaker_embedding must contain {self.speaker_embedding_dim} "
+                f"speaker_embedding must contain {self.speaker_embedding_size} "
                 f"values, got {len(request.speaker_embedding)}",
                 param="speaker_embedding",
             )
         else:
             pass
-        if not all(math.isfinite(value) for value in request.speaker_embedding):
+        if not bool(
+            torch.isfinite(
+                torch.tensor(request.speaker_embedding, dtype=torch.float32)
+            ).all()
+        ):
             raise bad_request(
-                "speaker_embedding values must be finite numbers",
+                "speaker_embedding values must be finite float32 numbers",
                 param="speaker_embedding",
             )
         else:
@@ -842,6 +841,7 @@ class SpeechRequestValidator:
             else None
         )
         self.validate_custom_voice_request(batch, task_type=task_type)
+        self.validate_speaker_embedding(batch, task_type=task_type)
         if batch.language is not None:
             self.normalize_language(batch.language)
         else:
@@ -1174,8 +1174,6 @@ def build_tts_params(
         pass
     if request.speaker_embedding is not None:
         tts_params["speaker_embedding"] = request.speaker_embedding
-        # note (Zhifu-Liu): embedding-only requests carry no reference audio, so task_type inference would otherwise land on CustomVoice.
-        tts_params["task_type"] = "Base"
     else:
         pass
     if request.stream_codec_output is not None:

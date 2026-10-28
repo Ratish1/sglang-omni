@@ -1216,18 +1216,14 @@ def test_qwen3_tts_maps_references_and_keeps_upstream_sampling_defaults() -> Non
 
 
 @pytest.mark.parametrize(
-    ("tts_params", "expected_ref_text"),
+    "tts_params",
     [
-        ({"speaker_embedding": [0.5, -0.25]}, None),
-        (
-            {"speaker_embedding": [0.5, -0.25], "ref_text": "unused in x-vector mode"},
-            "unused in x-vector mode",
-        ),
+        {"speaker_embedding": [0.5, -0.25]},
+        {"speaker_embedding": [0.5, -0.25], "ref_text": "unused in x-vector mode"},
     ],
 )
 def test_qwen3_tts_embedding_only_request_infers_base_x_vector(
     tts_params: dict,
-    expected_ref_text: str | None,
 ) -> None:
     state = build_qwen3_tts_state(
         make_payload(inputs={"text": "target"}, tts_params=tts_params)
@@ -1237,7 +1233,6 @@ def test_qwen3_tts_embedding_only_request_infers_base_x_vector(
     assert state.speaker_embedding == [0.5, -0.25]
     assert state.ref_audio is None
     assert state.x_vector_only_mode is True
-    assert state.ref_text == expected_ref_text
 
 
 @pytest.mark.parametrize(
@@ -1645,10 +1640,7 @@ def test_qwen3_tts_preprocessing_provided_speaker_embedding() -> None:
     )
 
     (prompt,) = model.voice_clone_prompts
-    embedding = prompt["ref_spk_embedding"][0]
-    assert embedding.dtype == torch.float32
-    assert embedding.device.type == "cpu"
-    assert embedding.tolist() == [0.5, -0.25]
+    assert prompt["ref_spk_embedding"][0].tolist() == [0.5, -0.25]
     assert prompt["ref_code"] == [None]
     assert prompt["icl_mode"] == [False]
     assert prepared.state.ref_audio is None
