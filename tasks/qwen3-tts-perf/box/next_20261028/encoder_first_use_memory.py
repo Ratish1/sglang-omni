@@ -18,6 +18,8 @@ import torch
 
 import sglang_omni
 from sglang_omni.models.qwen3_tts.engine_builder import derive_silence_codec_ids
+from sglang_omni.models.qwen3_tts.reference_encoder_cuda_graph import DEFAULT_QWEN3_TTS_REFERENCE_ENCODER_BUCKET_FRAMES
+from sglang_omni.models.qwen3_tts.request_builders import Qwen3TTSRefCodeBatcher
 from sglang_omni.models.qwen3_tts.stages import load_qwen3_tts_tokenizer
 
 
@@ -58,6 +60,7 @@ def main() -> None:
     parser.add_argument("--snapshot", action="store_true")
     parser.add_argument("--warm-codebooks", action="store_true")
     parser.add_argument("--warm-gemm", action="store_true")
+    parser.add_argument("--graphs", action="store_true")
     args = parser.parse_args()
     print(f"sglang_omni from {sglang_omni.__file__}, CUDA_MODULE_LOADING={os.environ.get('CUDA_MODULE_LOADING', 'unset')}", flush=True)
     device = torch.device("cuda:0")
@@ -91,6 +94,14 @@ def main() -> None:
         pass
     derive_silence_codec_ids(tokenizer, device)
     report("second silence probe")
+    if args.graphs:
+        batcher = Qwen3TTSRefCodeBatcher(tokenizer, graph_bucket_frames=DEFAULT_QWEN3_TTS_REFERENCE_ENCODER_BUCKET_FRAMES)
+        report("reference graphs")
+        torch._C._cuda_clearCublasWorkspaces()
+        report("reference graphs, cuBLAS workspaces cleared")
+        batcher.close()
+    else:
+        pass
 
 
 if __name__ == "__main__":
