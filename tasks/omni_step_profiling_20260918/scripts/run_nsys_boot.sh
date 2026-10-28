@@ -25,6 +25,7 @@ echo "start $(date +%T)" > "$OUT/progress.txt"
 # a privileged container; pass it through NSYS_ARGS where it is allowed
 NSYS_ARGS=${NSYS_ARGS:---trace=cuda,nvtx --cuda-graph-trace=node --sample=none --cpuctxsw=none}
 #NSYS_ARGS=none serves without nsys: the clean boot of the same cell
+#BENCH_STREAM set and empty benchmarks non-streaming requests; unset, the benchmark streams
 if [ "$NSYS_ARGS" = none ]; then
   WRAP=""
 else
@@ -51,7 +52,7 @@ done
 if [ $healthy = 1 ]; then
   echo "healthy $(date +%T)" >> "$OUT/progress.txt"
   PYTHONPATH=$TREE $PY -m benchmarks.eval.benchmark_tts_seedtts --model $MODEL --lang en --meta "$META" \
-    --use-existing-server --host 127.0.0.1 --port $PORT --warmup 1 --stream --generate-only \
+    --use-existing-server --host 127.0.0.1 --port $PORT --warmup 1 ${BENCH_STREAM---stream} --generate-only \
     --concurrency "$CONC" --max-samples "$SAMPLES" --output-dir "$OUT/bench" > "$OUT/bench.log" 2>&1
   echo "bench rc $? $(date +%T)" >> "$OUT/progress.txt"
 else
