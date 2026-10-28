@@ -8197,7 +8197,7 @@ def test_qwen3_tts_prepare_voice_design_uses_instruction_path(
 @pytest.mark.parametrize(
     ("model_type", "tts_params", "message"),
     [
-        ("base", {}, "Base requires ref_audio or speaker_embedding"),
+        ("base", {}, "Base requires ref_audio or references"),
         ("base", {"task_type": "Base"}, "Base requires reference audio"),
         (
             "base",

@@ -1494,7 +1494,7 @@ def validate_qwen3_tts_model_task(model: PromptModel, state: Qwen3TTSState) -> N
     if model_type == "base" and state.task_type != QWEN3_TTS_TASK_BASE:
         if not state.task_type_explicit:
             raise ValueError(
-                "Qwen3-TTS Base requires ref_audio or speaker_embedding; "
+                "Qwen3-TTS Base requires ref_audio or references[0].speaker_embedding; "
                 "text-only requests require a CustomVoice or VoiceDesign checkpoint"
             )
         else:
