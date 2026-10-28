@@ -1465,10 +1465,16 @@ def prepare_qwen3_tts_base_request(
         else None
     )
     if state.speaker_embedding is not None:
+        speaker_embedding = torch.tensor(state.speaker_embedding, dtype=torch.float32)
+        if not bool(torch.isfinite(speaker_embedding.to(model.dtype)).all()):
+            raise ValueError(
+                "Qwen3-TTS Base does not accept a speaker_embedding with values that "
+                f"are not finite in the talker's {model.dtype}"
+            )
+        else:
+            pass
         voice_clone_prompt = {
-            "ref_spk_embedding": [
-                torch.tensor(state.speaker_embedding, dtype=torch.float32)
-            ],
+            "ref_spk_embedding": [speaker_embedding],
             "ref_code": [None],
             "icl_mode": [False],
         }

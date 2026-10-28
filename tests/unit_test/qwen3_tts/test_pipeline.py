@@ -1546,6 +1546,7 @@ class EmbeddingPromptWrapper:
 
 class EmbeddingPromptModel:
     device = torch.device("cpu")
+    dtype = torch.bfloat16
     tts_model_type = "base"
     root_config = SimpleNamespace(tts_pad_token_id=0)
     model = SimpleNamespace(codec_embedding=torch.nn.Embedding(1, 4))
@@ -1595,6 +1596,24 @@ def test_qwen3_tts_preprocessing_provided_speaker_embedding() -> None:
     assert prompt["icl_mode"] == [False]
     assert prepared.state.ref_audio is None
     assert prepared.state.speaker_embedding == [0.5, -0.25]
+
+
+def test_qwen3_tts_refuses_an_embedding_infinite_in_the_talker_dtype() -> None:
+    """A value finite in float32 but past the talker's dtype passed the speech route and
+    produced babble to the length cap with a success status."""
+    with pytest.raises(ValueError, match="not finite in the talker's torch.bfloat16"):
+        qwen3_request_builders.prepare_qwen3_tts_request(
+            make_payload(
+                inputs={
+                    "text": "target",
+                    "references": [{"speaker_embedding": [3.4e38, 0.5]}],
+                }
+            ),
+            model=EmbeddingPromptModel(),
+            wrapper=EmbeddingPromptWrapper(),
+            prompt_constants=placeholder_prompt_constants(),
+            prompt_row_cache_keys=placeholder_prompt_row_cache_keys(),
+        )
 
 
 def test_qwen3_tts_uploaded_voice_clone_prompt_uses_shared_cache(
