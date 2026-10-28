@@ -5,7 +5,6 @@ from __future__ import annotations
 import base64
 import ipaddress
 from pathlib import Path
-from types import SimpleNamespace
 from unittest.mock import Mock
 
 import httpx
@@ -172,34 +171,89 @@ SPEAKER_EMBEDDING = [0.01] * 1024
 REFERENCE_DATA_URL = f"data:audio/wav;base64,{base64.b64encode(b'RIFF').decode()}"
 
 
+EMBEDDING_PARAM = "references.0.speaker_embedding"
+
+
 @pytest.mark.parametrize(
     ("fields", "speaker_embedding_size", "param"),
     [
-        ({"speaker_embedding": []}, 1024, "speaker_embedding"),
-        ({"speaker_embedding": [0.01, "x"]}, 1024, "speaker_embedding"),
-        ({"speaker_embedding": [True] * 1024}, 1024, "speaker_embedding"),
-        ({"speaker_embedding": SPEAKER_EMBEDDING[:-1]}, 1024, "speaker_embedding"),
+        ({"references": [{"speaker_embedding": []}]}, 1024, EMBEDDING_PARAM),
+        ({"references": [{"speaker_embedding": [0.01, "x"]}]}, 1024, EMBEDDING_PARAM),
         (
-            {"speaker_embedding": [float("nan"), *SPEAKER_EMBEDDING[1:]]},
+            {"references": [{"speaker_embedding": [True] * 1024}]},
             1024,
-            "speaker_embedding",
+            EMBEDDING_PARAM,
         ),
         (
-            {"speaker_embedding": [1e39, *SPEAKER_EMBEDDING[1:]]},
+            {"references": [{"speaker_embedding": SPEAKER_EMBEDDING[:-1]}]},
             1024,
-            "speaker_embedding",
+            EMBEDDING_PARAM,
         ),
         (
-            {"speaker_embedding": SPEAKER_EMBEDDING, "x_vector_only_mode": False},
+            {
+                "references": [
+                    {"speaker_embedding": [float("nan"), *SPEAKER_EMBEDDING[1:]]}
+                ]
+            },
+            1024,
+            EMBEDDING_PARAM,
+        ),
+        (
+            {"references": [{"speaker_embedding": [1e39, *SPEAKER_EMBEDDING[1:]]}]},
+            1024,
+            EMBEDDING_PARAM,
+        ),
+        (
+            {
+                "references": [
+                    {
+                        "speaker_embedding": SPEAKER_EMBEDDING,
+                        "audio": REFERENCE_DATA_URL,
+                    }
+                ]
+            },
+            1024,
+            EMBEDDING_PARAM,
+        ),
+        (
+            {
+                "references": [
+                    {"speaker_embedding": SPEAKER_EMBEDDING},
+                    {"audio": REFERENCE_DATA_URL},
+                ]
+            },
+            1024,
+            EMBEDDING_PARAM,
+        ),
+        (
+            {
+                "references": [{"speaker_embedding": SPEAKER_EMBEDDING}],
+                "ref_audio": REFERENCE_DATA_URL,
+            },
+            1024,
+            EMBEDDING_PARAM,
+        ),
+        (
+            {
+                "references": [{"speaker_embedding": SPEAKER_EMBEDDING}],
+                "x_vector_only_mode": False,
+            },
             1024,
             "x_vector_only_mode",
         ),
         (
-            {"speaker_embedding": SPEAKER_EMBEDDING, "task_type": "CustomVoice"},
+            {
+                "references": [{"speaker_embedding": SPEAKER_EMBEDDING}],
+                "task_type": "CustomVoice",
+            },
             1024,
             "task_type",
         ),
-        ({"speaker_embedding": SPEAKER_EMBEDDING}, None, "speaker_embedding"),
+        (
+            {"references": [{"speaker_embedding": SPEAKER_EMBEDDING}]},
+            None,
+            EMBEDDING_PARAM,
+        ),
     ],
 )
 def test_speaker_embedding_rejects_invalid_requests(
@@ -224,48 +278,19 @@ def test_batch_default_speaker_embedding_is_refused_before_any_item() -> None:
     with pytest.raises(SpeechAPIError) as exc_info:
         service.parse_batch_request(
             {
-                "speaker_embedding": SPEAKER_EMBEDDING[:-1],
+                "references": [{"speaker_embedding": SPEAKER_EMBEDDING[:-1]}],
                 "items": [{"input": "first"}, {"input": "second"}],
             }
         )
 
     assert exc_info.value.status_code == 400
-    assert exc_info.value.param == "speaker_embedding"
+    assert exc_info.value.param == EMBEDDING_PARAM
 
 
-@pytest.mark.parametrize(
-    "reference",
-    [
-        {"ref_audio": REFERENCE_DATA_URL},
-        {"references": [{"audio": REFERENCE_DATA_URL}]},
-        {"voice": "saved"},
-    ],
-)
-def test_speaker_embedding_excludes_every_reference_source(
-    reference: dict[str, object],
-) -> None:
-    store = Mock(spec=["get", "resolve_reference"])
-    store.resolve_reference.return_value = SimpleNamespace(
-        ref_audio=REFERENCE_DATA_URL,
-        voice=SimpleNamespace(ref_text=None, normalized_name="saved", created_at=1),
-    )
-    service = SpeechRequestValidator(
-        default_model="tts", speaker_embedding_size=1024, voice_store=store
-    )
-
-    with pytest.raises(SpeechAPIError) as exc_info:
-        service.parse_generation_request(
-            {"input": "hello", "speaker_embedding": SPEAKER_EMBEDDING, **reference}
-        )
-
-    assert exc_info.value.status_code == 400
-    assert exc_info.value.param == "speaker_embedding"
-
-
-def test_speaker_embedding_lowers_without_references() -> None:
+def test_speaker_embedding_reference_lowers_into_the_prompt() -> None:
     service = SpeechRequestValidator(default_model="tts", speaker_embedding_size=1024)
     prepared = service.parse_generation_request(
-        {"input": "hello", "speaker_embedding": SPEAKER_EMBEDDING}
+        {"input": "hello", "references": [{"speaker_embedding": SPEAKER_EMBEDDING}]}
     )
     generated = service.build_generate_request(
         prepared.request,
@@ -273,10 +298,10 @@ def test_speaker_embedding_lowers_without_references() -> None:
         reference_descriptors=prepared.reference_descriptors,
     )
 
-    params = generated.metadata["tts_params"]
-    assert isinstance(params, dict)
-    assert params["speaker_embedding"] == SPEAKER_EMBEDDING
-    assert generated.prompt == "hello"
+    assert generated.prompt == {
+        "text": "hello",
+        "references": [{"speaker_embedding": SPEAKER_EMBEDDING}],
+    }
 
 
 def test_speech_generation_accepts_seedtts_reference_payload_without_voice() -> None:

@@ -418,7 +418,7 @@ sgl-omni serve \
 
 ### Precomputed Speaker Embedding
 
-A Base request can carry the speaker embedding in `speaker_embedding` instead of a reference clip. The server then loads and encodes no audio, and every replica serves every voice without stored voice state.
+A Base reference can be given as its speaker embedding, `references[0].speaker_embedding`, instead of its clip. The server then loads and encodes no audio, and every replica serves every voice without stored voice state.
 
 The embedding is the x-vector the checkpoint's speaker encoder computes from a reference clip: 1024 values for 0.6B Base and 2048 for 1.7B Base. An embedding from one checkpoint size does not fit the other. Sending the embedding the server computes for a clip produces the same audio as sending that clip with `x_vector_only_mode: true`, including the x-vector leading-silence mask above.
 
@@ -454,7 +454,7 @@ resp = requests.post(
     json={
         "model": "Qwen/Qwen3-TTS-12Hz-0.6B-Base",
         "input": "Get the trust fund to the bank early.",
-        "speaker_embedding": speaker_embedding,
+        "references": [{"speaker_embedding": speaker_embedding}],
     },
 )
 resp.raise_for_status()
@@ -462,7 +462,7 @@ with open("output.wav", "wb") as f:
     f.write(resp.content)
 ```
 
-The request runs in x-vector mode. `ref_text` is not used, and `x_vector_only_mode` may be omitted or set to `true`. `speaker_embedding` cannot be combined with `ref_audio`, `references`, or an uploaded voice, and every value must be a finite float32 number. CustomVoice and VoiceDesign checkpoints reject it.
+The request runs in x-vector mode. A transcript is not used, and `x_vector_only_mode` may be omitted or set to `true`. The embedding reference must be the only reference, with no audio, no `vq_codes` and no `ref_audio`, and every value must be a finite float32 number. CustomVoice and VoiceDesign checkpoints reject it.
 
 ### Language Hint
 
@@ -618,9 +618,8 @@ only the first chunk.
 | `model` | served model | Served model identifier |
 | `input` | (required) | Text to synthesize |
 | `voice` | `default` | Voice identifier. For Base reference cloning, the reference clip provides the speaker conditioning |
-| `references` | `null` | Reference clip for cloning. Each item has `audio_path` and `text` |
+| `references` | `null` | Reference clip for cloning. Each item has `audio_path` and `text`, or only `speaker_embedding`: the checkpoint's speaker-encoder x-vector of the clip, 1024 values for 0.6B Base and 2048 for 1.7B Base. See [Precomputed Speaker Embedding](#precomputed-speaker-embedding) |
 | `ref_audio` / `ref_text` | `null` | Shorthand for `references[0].audio_path` / `references[0].text` |
-| `speaker_embedding` | `null` | The checkpoint's speaker-encoder x-vector in place of a reference clip: 1024 values for 0.6B Base, 2048 for 1.7B Base. See [Precomputed Speaker Embedding](#precomputed-speaker-embedding) |
 | `language` | `auto` | Target-language hint (see list above) |
 | `temperature` | `0.9` | Sampling temperature |
 | `top_p` | `1.0` | Top-p sampling |
@@ -645,7 +644,7 @@ quality) at a larger memory and latency cost; the 0.6B model is lighter and fast
 
 ## CustomVoice Checkpoints
 
-CustomVoice generates speech with built-in speakers through the same pipeline. Use it without reference audio; omit `ref_audio`, `ref_text`, `references`, `x_vector_only_mode`, and `speaker_embedding`. Omit `task_type` or set it to `CustomVoice`.
+CustomVoice generates speech with built-in speakers through the same pipeline. Use it without reference audio; omit `ref_audio`, `ref_text`, `references`, and `x_vector_only_mode`. Omit `task_type` or set it to `CustomVoice`.
 
 | Checkpoint | Config | Instruction guidance |
 |---|---|---|

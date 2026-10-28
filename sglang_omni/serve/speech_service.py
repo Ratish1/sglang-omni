@@ -85,7 +85,6 @@ class TTSParams(RequiredTTSParams, total=False):
     uploaded_voice_name: str
     uploaded_voice_created_at: int
     x_vector_only_mode: bool
-    speaker_embedding: list[float]
     stream_codec_output: bool
     suppress_bootstrap_silence: bool
     initial_codec_chunk_frames: int
@@ -423,45 +422,65 @@ class SpeechRequestValidator:
         *,
         task_type: str | None,
     ) -> None:
-        if request.speaker_embedding is None:
+        references = request.references or []
+        embedded_indexes = [
+            index
+            for index, reference in enumerate(references)
+            if reference.speaker_embedding is not None
+        ]
+        if not embedded_indexes:
             return
         else:
             pass
+        index = embedded_indexes[0]
+        reference = references[index]
+        param = f"references.{index}.speaker_embedding"
         if self.speaker_embedding_size is None:
             raise bad_request(
-                "speaker_embedding is not supported by this model",
-                param="speaker_embedding",
+                "speaker_embedding is not supported by this model", param=param
             )
-        else:
-            pass
-        if len(request.speaker_embedding) != self.speaker_embedding_size:
+        elif len(references) != 1 or request.ref_audio is not None:
+            raise bad_request(
+                "a reference given as speaker_embedding must be the only reference",
+                param=param,
+            )
+        elif any(
+            value is not None
+            for value in (
+                reference.audio_path,
+                reference.ref_audio,
+                reference.audio,
+                reference.data,
+                reference.vq_codes,
+            )
+        ):
+            raise bad_request(
+                "a reference given as speaker_embedding cannot also carry audio or "
+                "vq_codes",
+                param=param,
+            )
+        elif len(reference.speaker_embedding) != self.speaker_embedding_size:
             raise bad_request(
                 f"speaker_embedding must contain {self.speaker_embedding_size} "
-                f"values, got {len(request.speaker_embedding)}",
-                param="speaker_embedding",
+                f"values, got {len(reference.speaker_embedding)}",
+                param=param,
             )
-        else:
-            pass
-        if not bool(
+        elif not bool(
             torch.isfinite(
-                torch.tensor(request.speaker_embedding, dtype=torch.float32)
+                torch.tensor(reference.speaker_embedding, dtype=torch.float32)
             ).all()
         ):
             raise bad_request(
                 "speaker_embedding values must be finite float32 numbers",
-                param="speaker_embedding",
+                param=param,
             )
-        else:
-            pass
-        if request.x_vector_only_mode is False:
+        elif request.x_vector_only_mode is False:
             raise bad_request(
                 "speaker_embedding implies x-vector-only mode; omit "
                 "x_vector_only_mode or set it to true",
                 param="x_vector_only_mode",
             )
-        else:
-            pass
-        if task_type is not None and task_type != "Base":
+        elif task_type is not None and task_type != "Base":
             raise bad_request(
                 "speaker_embedding is only supported for the Base task",
                 param="task_type",
@@ -483,17 +502,6 @@ class SpeechRequestValidator:
         request: CreateSpeechRequest,
         prepared_references: PreparedSpeechReferences,
     ) -> None:
-        if request.speaker_embedding is not None and (
-            request.ref_audio is not None
-            or request.references
-            or prepared_references.uploaded_voice is not None
-        ):
-            raise bad_request(
-                "speaker_embedding is mutually exclusive with reference audio",
-                param="speaker_embedding",
-            )
-        else:
-            pass
         references = prepared_references.reference_descriptors
         required_count = self.required_speech_reference_count
         if required_count is not None and len(references) != required_count:
@@ -981,20 +989,28 @@ class SpeechRequestValidator:
                     pass
             else:
                 pass
-        if "speaker_embedding" in payload and payload["speaker_embedding"] is not None:
-            value = payload["speaker_embedding"]
-            if not isinstance(value, list) or any(
-                isinstance(item, bool) or not isinstance(item, (int, float))
-                for item in value
+        references = payload.get("references")
+        for index, reference in enumerate(
+            references if isinstance(references, list) else []
+        ):
+            value = (
+                reference.get("speaker_embedding")
+                if isinstance(reference, Mapping)
+                else None
+            )
+            if value is not None and (
+                not isinstance(value, list)
+                or any(
+                    isinstance(item, bool) or not isinstance(item, (int, float))
+                    for item in value
+                )
             ):
                 raise bad_request(
                     "speaker_embedding must be a list of numbers",
-                    param="speaker_embedding",
+                    param=f"references.{index}.speaker_embedding",
                 )
             else:
                 pass
-        else:
-            pass
         for field_name in (
             "stream",
             "x_vector_only_mode",
@@ -1170,10 +1186,6 @@ def build_tts_params(
         pass
     if request.x_vector_only_mode is not None:
         tts_params["x_vector_only_mode"] = request.x_vector_only_mode
-    else:
-        pass
-    if request.speaker_embedding is not None:
-        tts_params["speaker_embedding"] = request.speaker_embedding
     else:
         pass
     if request.stream_codec_output is not None:
