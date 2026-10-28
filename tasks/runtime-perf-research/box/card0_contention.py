@@ -131,6 +131,7 @@ def main() -> None:
     parser.add_argument("--device", type=int, default=0)
     parser.add_argument("--skip-head-s", type=float, default=1.0)
     parser.add_argument("--skip-tail-s", type=float, default=1.0)
+    parser.add_argument("--stage", default="thinker", help="the stage whose waits are attributed, e.g. talker_ar")
     args = parser.parse_args()
     stages = {}
     with open(args.serve_log, encoding="utf-8", errors="replace") as log:
@@ -139,7 +140,7 @@ def main() -> None:
                 stages[int(match[2])] = match[1]
             else:
                 pass
-    thinker = next(pid for pid, stage in stages.items() if stage == "thinker")
+    thinker = next(pid for pid, stage in stages.items() if stage == args.stage)
     db = sqlite3.connect(args.trace)
     rows = device_rows(db, args.device)
     # note (ratish): device records buffered since launch reach back before the collection; the runtime
@@ -184,12 +185,12 @@ def main() -> None:
     replays = max(len(graphs), 1)
     others = merged([tuple(interval) for pid, intervals in busy.items() if pid != thinker for interval in intervals])
     unmatched = sum(1 for row in thinker_rows if row[3] not in calls)
-    print(f"\nthinker: {len(thinker_rows)} device activities ({unmatched} without a runtime call), "
+    print(f"\n{args.stage}: {len(thinker_rows)} device activities ({unmatched} without a runtime call), "
           f"{len(graphs)} graph replays, one replay every {window / replays / 1e6:.2f} ms, "
           f"device busy {length(thinker_busy) / replays / 1e6:.2f} ms a replay")
-    print(f"submitted and waiting while the card runs no thinker work: {length(waiting) / 1e6:.0f} ms "
+    print(f"submitted and waiting while the card runs no {args.stage} work: {length(waiting) / 1e6:.0f} ms "
           f"({length(waiting) / replays / 1e6:.3f} ms a replay)")
-    print("| pid | stage | ms of that wait | ms a replay | ms inside the thinker's own device work |")
+    print(f"| pid | stage | ms of that wait | ms a replay | ms inside the {args.stage}'s own device work |")
     print("|---|---|---|---|---|")
     for pid, intervals in sorted(busy.items(), key=lambda item: -length(intersect(waiting, item[1]))):
         if pid == thinker:

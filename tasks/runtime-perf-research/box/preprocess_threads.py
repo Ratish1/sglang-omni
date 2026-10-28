@@ -7,7 +7,8 @@ usage: OMP_NUM_THREADS=16 PYTHONPATH=<tree> python3 preprocess_threads.py run --
 run: Qwen3OmniPreprocessor.call_impl, serially, on SeedTTS EN reference audio (the voice-clone input), the Video-MME
 CI videos at the CI's video settings (fps 2, 128 frames, 401,408 pixels, max_seq_len 32768), and with --modalities
 also the full MMMU validation images, the full MMSU audio and the Video-AMME CI videos with their sound tracks;
-records a hash of every tensor in the output state and the wall time of each call. One fresh process per setting.
+records a hash of every tensor in the output state, every encoder cache key, and the wall time of each call. One
+fresh process per setting.
 compare: per input, the tensors whose hash differs from the first file's, and each file's time per call.
 """
 
@@ -43,6 +44,8 @@ def tensor_hashes(value: object, prefix: str, hashes: dict[str, str]) -> None:
             f"{value.dtype} {tuple(value.shape)} "
             + hashlib.sha256(flat.numpy().tobytes()).hexdigest()[:16]
         )
+    elif isinstance(value, str) and prefix.endswith(".cache_key"):
+        hashes[prefix] = value
     elif isinstance(value, dict):
         for name, item in value.items():
             tensor_hashes(item, f"{prefix}.{name}", hashes)
