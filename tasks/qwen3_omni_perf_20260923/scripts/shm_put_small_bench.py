@@ -73,9 +73,18 @@ def put_fallocate_numpy(tensor: torch.Tensor) -> shared_memory.SharedMemory:
     return shm
 
 
+def put_torch_without_reservation(tensor: torch.Tensor) -> shared_memory.SharedMemory:
+    source = tensor.contiguous().view(torch.uint8).reshape(-1)
+    size = source.numel()
+    shm = create(size)
+    torch.frombuffer(shm.buf, dtype=torch.uint8, count=size).copy_(source)
+    return shm
+
+
 PUTS = {
     "put main (numpy)": put_main,
     "put branch (fallocate + torch)": put_branch,
+    "put torch, no reservation": put_torch_without_reservation,
     "put fallocate + memoryview": put_fallocate_memoryview,
     "put fallocate + numpy": put_fallocate_numpy,
 }
