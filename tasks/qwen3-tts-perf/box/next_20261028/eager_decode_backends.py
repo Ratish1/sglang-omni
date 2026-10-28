@@ -84,11 +84,13 @@ def code_pool(model_path: str, device: str, reference_count: int) -> torch.Tenso
         "zhaochenyang20/seed-tts-eval-arrow", reference_count, split="zh"
     )
     codes = []
-    for start in range(0, len(samples), 16):
-        encoded = tokenizer.encode(
-            [sample.ref_audio for sample in samples[start : start + 16]]
-        )
-        codes.extend(code.cpu() for code in encoded.audio_codes)
+    # note (ratish): no cuDNN SDPA kernel launches before the decode, which the full device mode reads.
+    with sdpa_kernel([SDPBackend.EFFICIENT_ATTENTION, SDPBackend.MATH]):
+        for start in range(0, len(samples), 16):
+            encoded = tokenizer.encode(
+                [sample.ref_audio for sample in samples[start : start + 16]]
+            )
+            codes.extend(code.cpu() for code in encoded.audio_codes)
     return torch.cat(codes, dim=0)
 
 
@@ -106,6 +108,14 @@ def main() -> None:
     parser.add_argument("--frames", type=Path, required=True)
     parser.add_argument("--references", type=int, default=400)
     parser.add_argument("--out", type=Path, required=True)
+    parser.add_argument(
+        "--full-device-mib",
+        type=int,
+        default=0,
+        help="fill the device to this many free MiB before the first decode (a cached "
+        "--room-gib block left for activations) and count each batch's failures by kind",
+    )
+    parser.add_argument("--room-gib", type=int, default=8)
     arguments = parser.parse_args()
     device = arguments.device
     torch.cuda.set_device(torch.device(device))
@@ -145,6 +155,48 @@ def main() -> None:
     reference_tokenizer = load_qwen3_tts_tokenizer(
         arguments.model, device=device, dtype="float32", attn_implementation="sdpa"
     )
+
+    if arguments.full_device_mib:
+        room = torch.empty(arguments.room_gib * 1024 * MIB, dtype=torch.uint8, device=device)
+        del room
+        free_bytes, _ = torch.cuda.mem_get_info(device)
+        filler = torch.empty(
+            free_bytes - arguments.full_device_mib * MIB, dtype=torch.uint8, device=device
+        )
+        free_bytes, _ = torch.cuda.mem_get_info(device)
+        print(
+            f"full device from the start: reserved {torch.cuda.memory_reserved(device) / MIB:.0f} MiB, "
+            f"device free {free_bytes / MIB:.1f} MiB",
+            flush=True,
+        )
+        failures: dict[str, list[int]] = {}
+        for index, batch in enumerate(batches):
+            try:
+                with arm_context(arguments.arm):
+                    tokenizer.decode([{"audio_codes": code} for code in batch])
+            except RuntimeError as error:
+                kind = str(error).split("\n")[0][:160]
+                failures.setdefault(kind, []).append(index)
+            else:
+                pass
+        free_bytes, _ = torch.cuda.mem_get_info(device)
+        result = {
+            "arm": arguments.arm,
+            "full_device_mib": arguments.full_device_mib,
+            "batches": len(batches),
+            "failed_batches": sum(len(indices) for indices in failures.values()),
+            "failures": {
+                kind: {"batches": len(indices), "first": indices[:5]}
+                for kind, indices in failures.items()
+            },
+            "device_free_after_mib": free_bytes / MIB,
+        }
+        del filler
+        print(json.dumps(result, indent=1))
+        arguments.out.write_text(json.dumps(result, indent=1))
+        return
+    else:
+        pass
 
     decode_ms = []
     errors = []
