@@ -245,6 +245,22 @@ def test_speech_tokenizer_loader_gives_the_encoder_its_float32_checkpoint_weight
     for name, tensor in checkpoint.items():
         assert loaded[name].dtype == encoder_dtype
         assert torch.equal(loaded[name], tensor.to(encoder_dtype))
+    codebooks = [
+        module
+        for module in tokenizer.model.encoder.modules()
+        if isinstance(module, MimiEuclideanCodebook)
+    ]
+    assert codebooks
+    for codebook in codebooks:
+        table = codebook._embed  # noqa: leading-underscore  # production name
+        if model_type == "base":
+            assert torch.equal(
+                table,
+                codebook.embed_sum
+                / codebook.cluster_usage.clamp(min=codebook.epsilon)[:, None],
+            )
+        else:
+            assert table is None
     assert tokenizer.model.decoder.proj.weight.dtype == torch.bfloat16
     assert tokenizer.model.decoder.inv_freq.dtype == torch.float32
 

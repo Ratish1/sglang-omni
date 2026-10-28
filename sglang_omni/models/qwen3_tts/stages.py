@@ -11,6 +11,7 @@ from collections.abc import Mapping, Sequence
 from typing import TYPE_CHECKING, Literal, TypedDict
 
 import torch
+from transformers.models.mimi.modeling_mimi import MimiEuclideanCodebook
 
 from sglang_omni.models.qwen3_tts.compat import (
     apply_qwen_tts_transformers_compatibility_patches,
@@ -108,11 +109,17 @@ def resolve_qwen3_tts_attn_implementation(
 def load_float32_encoder_weights(
     tokenizer: "Qwen3TTSTokenizer", tokenizer_path: str
 ) -> None:
-    """Give the codec encoder its float32 checkpoint weights; the decoder is untouched."""
+    """Give the codec encoder its float32 checkpoint weights and build its codebook tables from them; the decoder is untouched."""
     # note (ratish): the encoder's quantizers pick each codeword by nearest distance, which bf16 rounding flips, so the encoder keeps the checkpoint's float32.
     encoder = tokenizer.model.encoder
     encoder.to(torch.float32)
     encoder.load_state_dict(load_weights_by_prefix(tokenizer_path, prefix="encoder."))
+    # note (ratish): a table built lazily by the first encode sits inside that encode's float32 activations and keeps them reserved when the KV pool is sized.
+    for module in encoder.modules():
+        if isinstance(module, MimiEuclideanCodebook):
+            module.embed
+        else:
+            pass
 
 
 def load_qwen3_tts_tokenizer(
