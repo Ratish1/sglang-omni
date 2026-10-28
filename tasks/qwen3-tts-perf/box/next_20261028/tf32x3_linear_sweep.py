@@ -22,9 +22,8 @@ SHAPES = {"qkvo": (512, 512), "fc1": (2048, 512), "fc2": (512, 2048)}
 LAYER_MIX = {"qkvo": 4, "fc1": 1, "fc2": 1}
 LAYERS = 8
 CONFIGS = [
-    dict(block_m=bm, block_n=bn, block_k=bk, num_warps=warps, num_stages=stages)
-    for bm, bn, bk, warps, stages in itertools.product((16, 32, 64), (32, 64, 128), (32, 64), (4,), (3, 4))
-    if bm * bn <= 64 * 128
+    dict(block_m=bm, block_n=bn, block_k=bk, splits=splits, num_warps=4, num_stages=3)
+    for bm, bn, bk, splits in itertools.product((16, 32, 64), (32, 64), (32, 64), (1, 2, 4, 8))
 ]
 REPEATS = 50
 
@@ -87,6 +86,15 @@ def main() -> None:
             error = max(per_case[frames, name][1] for name in SHAPES)
             shape_us = ", ".join(f"{name} {per_case[frames, name][0]:.1f}" for name in SHAPES)
             print(f"   {encode_us:7.1f} us per encode, error {error:.2e}: {label} ({shape_us})", flush=True)
+    for name in SHAPES:
+        by_shape = sorted(
+            totals.items(), key=lambda item: sum(item[1][frames, name][0] for frames in BUCKET_FRAMES)
+        )
+        ffma = ", ".join(f"{cases[frames, name][3]:.1f}" for frames in BUCKET_FRAMES)
+        print(f"== {name}: FFMA per bucket {ffma} us", flush=True)
+        for label, per_case in by_shape[:3]:
+            kernel = ", ".join(f"{per_case[frames, name][0]:.1f}" for frames in BUCKET_FRAMES)
+            print(f"   {kernel} us: {label}", flush=True)
     overall = sorted(
         totals.items(),
         key=lambda item: sum(
