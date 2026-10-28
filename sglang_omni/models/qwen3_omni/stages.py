@@ -1070,10 +1070,12 @@ def create_image_encoder_executor(
 
     device = str(resolve_concrete_device(device, gpu_id))
     model = Qwen3OmniImageEncoder(model_path=model_path, device=device, dtype=dtype)
+    # note (ratish): a miss stores its outputs before they are sent, and a video's 230 MB copy to pinned host memory takes a fraction of a copy through pageable staging.
     cache = StageOutputCache(
         max_size=QWEN3_ENCODER_CACHE_MAX_ENTRIES,
         max_bytes=QWEN3_ENCODER_CACHE_MAX_BYTES,
         cache_device="cpu",
+        pin_memory=True,
     )
 
     def _encode(payload: StagePayload) -> StagePayload:
