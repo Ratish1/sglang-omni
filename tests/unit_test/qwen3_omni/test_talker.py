@@ -2565,6 +2565,39 @@ def test_talker_prepare_decode_buffers_cuda_matches_fresh_rebuild() -> None:
         torch.testing.assert_close(getattr(fake, name), getattr(fresh, name))
 
 
+@pytest.mark.accelerator
+@pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="stream synchronization requires CUDA"
+)
+def test_talker_prepare_decode_buffers_does_not_synchronize() -> None:
+    device = torch.device("cuda")
+    fake = talker_seed_self(device=device)
+    requests = [
+        talker_prep_req(request_id, penalty=1.5, output_ids=[2], suppress=[3])
+        for request_id in ("a", "b", "c")
+    ]
+    Qwen3OmniTalker.prepare_decode_buffers(fake, requests)
+    fake.sampled_token_ids[:3] = torch.tensor([4, 5, 6], device=device)
+    for sched_req, token_id in zip(requests, (4, 5, 6)):
+        sched_req.data.req.output_ids.append(token_id)
+    torch.cuda.synchronize(device)
+
+    torch.cuda.set_sync_debug_mode("error")
+    try:
+        Qwen3OmniTalker.prepare_decode_buffers(fake, requests)
+        for sched_req in requests:
+            sched_req.data.req.output_ids.append(7)
+        Qwen3OmniTalker.prepare_decode_buffers(fake, [requests[0], requests[2]])
+    finally:
+        torch.cuda.set_sync_debug_mode("default")
+
+    fresh = talker_seed_self(device=device)
+    Qwen3OmniTalker.prepare_decode_buffers(fresh, [requests[0], requests[2]])
+    torch.cuda.synchronize(device)
+    for name in ("repetition_mask", "suppress_mask", "sampling_seeds"):
+        assert torch.equal(getattr(fake, name)[:2], getattr(fresh, name)[:2]), name
+
+
 def test_talker_prepare_decode_buffers_rebuild_triggers() -> None:
     def prepared() -> tuple[SimpleNamespace, list[SimpleNamespace]]:
         fake = talker_seed_self()
