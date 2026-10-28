@@ -3,7 +3,11 @@ and reserved bytes against the card's used memory, before and after the x-vector
 encode), then after a second probe. Memory the allocator does not hold is the CUDA context's (loaded kernel modules,
 library workspaces), which SGLang's KV budget reads as used.
 
-usage: PYTHONPATH=TREE python3 encoder_first_use_memory.py --model Qwen/Qwen3-TTS-12Hz-0.6B-Base [--module-loading LAZY]
+usage: PYTHONPATH=TREE python3 encoder_first_use_memory.py --model Qwen/Qwen3-TTS-12Hz-0.6B-Base [--snapshot]
+
+--snapshot records allocation history over the first probe and prints, for every segment still reserved after it, its
+size, the bytes still allocated in it and the innermost frames under sglang_omni, qwen_tts or transformers of each block
+still allocated, which names the tensors that keep a segment from being released.
 """
 
 import argparse
@@ -27,9 +31,31 @@ def report(label: str) -> None:
     print(f"{label}: used {used:.0f} MiB, allocated {allocated:.0f}, reserved {reserved:.0f}, outside the allocator {used - reserved:.0f}", flush=True)
 
 
+def frames_of(block: dict[str, object]) -> str:
+    frames = [
+        f"{frame['filename'].split('site-packages/')[-1].split('/workspace/')[-1]}:{frame['line']} {frame['name']}"
+        for frame in block.get("frames", [])
+        if any(part in frame["filename"] for part in ("sglang_omni", "qwen_tts", "transformers"))
+    ]
+    return " <- ".join(frames[:3]) if frames else "no recorded frames"
+
+
+def print_segments() -> None:
+    for segment in torch.cuda.memory._snapshot()["segments"]:
+        active = [block for block in segment["blocks"] if block["state"] == "active_allocated"]
+        held = sum(block["size"] for block in active)
+        print(f"segment {segment['total_size'] / (1 << 20):.1f} MiB, still allocated {held / (1 << 20):.1f} MiB in {len(active)} blocks", flush=True)
+        if segment["total_size"] - held >= 32 << 20:
+            for block in active:
+                print(f"    {block['size'] / (1 << 20):.2f} MiB: {frames_of(block)}", flush=True)
+        else:
+            pass
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", required=True)
+    parser.add_argument("--snapshot", action="store_true")
     args = parser.parse_args()
     print(f"sglang_omni from {sglang_omni.__file__}, CUDA_MODULE_LOADING={os.environ.get('CUDA_MODULE_LOADING', 'unset')}", flush=True)
     device = torch.device("cuda:0")
@@ -39,8 +65,17 @@ def main() -> None:
     tokenizer = load_qwen3_tts_tokenizer(args.model, device=str(device), dtype="bfloat16", attn_implementation="sdpa")
     encoder_dtypes = sorted({str(parameter.dtype) for parameter in tokenizer.model.encoder.parameters()})
     report(f"tokenizer (encoder {', '.join(encoder_dtypes)})")
+    if args.snapshot:
+        torch.cuda.memory._record_memory_history(max_entries=200000)
+    else:
+        pass
     ids = derive_silence_codec_ids(tokenizer, device)
     report(f"first silence probe ({ids.numel()} ids)")
+    if args.snapshot:
+        print_segments()
+        torch.cuda.memory._record_memory_history(enabled=None)
+    else:
+        pass
     derive_silence_codec_ids(tokenizer, device)
     report("second silence probe")
 
