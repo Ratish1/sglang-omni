@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import json
 import sys
 import types
 from pathlib import Path
@@ -91,6 +92,11 @@ def test_speech_tokenizer_loader_moves_the_encoder_padding_to_host(
     monkeypatch.setattr(
         qwen3_stages, "load_float32_encoder_weights", lambda tokenizer, path: None
     )
+    monkeypatch.setattr(
+        qwen3_stages,
+        "load_qwen3_tts_checkpoint_config",
+        lambda model_path: {"tts_model_type": "base"},
+    )
 
     tokenizer = qwen3_stages.load_qwen3_tts_tokenizer(
         "/ckpt", device="cpu", dtype="float32", attn_implementation=None
@@ -174,8 +180,19 @@ def test_reference_code_batcher_refuses_an_empty_reference() -> None:
         batcher.close()
 
 
+@pytest.mark.parametrize(
+    ("model_type", "encoder_dtype"),
+    [
+        ("base", torch.float32),
+        ("custom_voice", torch.bfloat16),
+        ("voice_design", torch.bfloat16),
+    ],
+)
 def test_speech_tokenizer_loader_gives_the_encoder_its_float32_checkpoint_weights(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    model_type: str,
+    encoder_dtype: torch.dtype,
 ) -> None:
     """A bf16 server encoded references with bf16-rounded weights, which flipped most residual codes against the float32 checkpoint."""
     torch.manual_seed(5)
@@ -185,6 +202,7 @@ def test_speech_tokenizer_loader_gives_the_encoder_its_float32_checkpoint_weight
         name: tensor.contiguous()
         for name, tensor in checkpoint_encoder.state_dict().items()
     }
+    (tmp_path / "config.json").write_text(json.dumps({"tts_model_type": model_type}))
     (tmp_path / "speech_tokenizer").mkdir()
     save_file(
         {f"encoder.{name}": tensor for name, tensor in checkpoint.items()},
@@ -225,8 +243,8 @@ def test_speech_tokenizer_loader_gives_the_encoder_its_float32_checkpoint_weight
     loaded = tokenizer.model.encoder.state_dict()
     assert loaded.keys() == checkpoint.keys()
     for name, tensor in checkpoint.items():
-        assert loaded[name].dtype == torch.float32
-        assert torch.equal(loaded[name], tensor)
+        assert loaded[name].dtype == encoder_dtype
+        assert torch.equal(loaded[name], tensor.to(encoder_dtype))
     assert tokenizer.model.decoder.proj.weight.dtype == torch.bfloat16
     assert tokenizer.model.decoder.inv_freq.dtype == torch.float32
 

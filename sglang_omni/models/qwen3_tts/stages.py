@@ -163,7 +163,14 @@ def load_qwen3_tts_tokenizer(
             attn_implementation or "upstream-default",
         )
         tokenizer = Qwen3TTSTokenizer.from_pretrained(tokenizer_path, **kwargs)
-        load_float32_encoder_weights(tokenizer, tokenizer_path)
+        model_type = normalize_qwen3_tts_model_type(
+            load_qwen3_tts_checkpoint_config(checkpoint_dir).get("tts_model_type")
+        )
+        # note (ratish): only Base checkpoints encode references, so other tasks keep main's encoder and its memory.
+        if model_type == "base":
+            load_float32_encoder_weights(tokenizer, tokenizer_path)
+        else:
+            pass
         move_conv_padding_to_host(tokenizer.model.encoder)
         _SPEECH_TOKENIZERS[key] = tokenizer
         return tokenizer
