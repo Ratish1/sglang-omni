@@ -67,7 +67,7 @@ def run_exact(args: argparse.Namespace) -> None:
                 pass
             record = {"id": sample.sample_id, "status_a": status_a, "latency_a_ms": latency_a}
             if clip_name in embeddings:
-                embedded = {**base, "speaker_embedding": embeddings[clip_name]}
+                embedded = {**base, "references": [{"speaker_embedding": embeddings[clip_name]}]}
                 status_b, audio_b, latency_b = speech(client, args.base_url, embedded)
                 status_c, audio_c, latency_c = speech(client, args.base_url, reference)
                 record.update(
@@ -127,35 +127,42 @@ async def websocket_case(base_url: str, session: dict[str, object]) -> str:
 def run_contract(args: argparse.Namespace) -> None:
     embedding = torch.load(args.embedding)["embedding"].tolist()
     base = {"model": args.model, "input": "Good morning, how can I help you today?", "seed": SEED}
+    def given(values: object, **reference: object) -> list[dict[str, object]]:
+        return [{"speaker_embedding": values, **reference}]
+
     cases = [
-        ("valid, wav", {"speaker_embedding": embedding, "response_format": "wav"}),
-        ("valid, streaming pcm", {"speaker_embedding": embedding, "response_format": "pcm", "stream": True}),
-        ("valid, x_vector_only_mode true", {"speaker_embedding": embedding, "x_vector_only_mode": True}),
-        ("valid, task_type Base", {"speaker_embedding": embedding, "task_type": "Base"}),
-        ("valid, with ref_text", {"speaker_embedding": embedding, "ref_text": "unused"}),
-        ("one value short", {"speaker_embedding": embedding[:-1]}),
-        ("empty", {"speaker_embedding": []}),
-        ("a string item", {"speaker_embedding": ["x"] + embedding[1:]}),
-        ("a boolean item", {"speaker_embedding": [True] + embedding[1:]}),
-        ("nested", {"speaker_embedding": [embedding]}),
-        ("an object", {"speaker_embedding": {"values": embedding}}),
-        ("with ref_audio", {"speaker_embedding": embedding, "ref_audio": args.reference}),
-        ("with references", {"speaker_embedding": embedding, "references": [{"audio_path": args.reference}]}),
-        ("with x_vector_only_mode false", {"speaker_embedding": embedding, "x_vector_only_mode": False}),
-        ("with task_type CustomVoice", {"speaker_embedding": embedding, "task_type": "CustomVoice"}),
-        ("with task_type VoiceDesign", {"speaker_embedding": embedding, "task_type": "VoiceDesign", "instructions": "warm"}),
-        ("NaN first", {"speaker_embedding": [float("nan")] + embedding[1:]}),
-        ("Infinity first", {"speaker_embedding": [float("inf")] + embedding[1:]}),
-        ("1e39 first (past float32)", {"speaker_embedding": [1e39] + embedding[1:]}),
-        ("1e6 everywhere", {"speaker_embedding": [1e6] * len(embedding)}),
-        ("zeros", {"speaker_embedding": [0.0] * len(embedding)}),
+        ("valid, wav", {"references": given(embedding), "response_format": "wav"}),
+        ("valid, streaming pcm", {"references": given(embedding), "response_format": "pcm", "stream": True}),
+        ("valid, x_vector_only_mode true", {"references": given(embedding), "x_vector_only_mode": True}),
+        ("valid, task_type Base", {"references": given(embedding), "task_type": "Base"}),
+        ("valid, with the reference's text", {"references": given(embedding, text="unused")}),
+        ("valid, with ref_text", {"references": given(embedding), "ref_text": "unused"}),
+        ("one value short", {"references": given(embedding[:-1])}),
+        ("empty", {"references": given([])}),
+        ("a string item", {"references": given(["x"] + embedding[1:])}),
+        ("a boolean item", {"references": given([True] + embedding[1:])}),
+        ("nested", {"references": given([embedding])}),
+        ("an object", {"references": given({"values": embedding})}),
+        ("with audio in the same reference", {"references": given(embedding, audio_path=args.reference)}),
+        ("with a second reference", {"references": given(embedding) + [{"audio_path": args.reference}]}),
+        ("with ref_audio", {"references": given(embedding), "ref_audio": args.reference}),
+        ("with x_vector_only_mode false", {"references": given(embedding), "x_vector_only_mode": False}),
+        ("with task_type CustomVoice", {"references": given(embedding), "task_type": "CustomVoice"}),
+        ("with task_type VoiceDesign", {"references": given(embedding), "task_type": "VoiceDesign", "instructions": "warm"}),
+        ("NaN first", {"references": given([float("nan")] + embedding[1:])}),
+        ("Infinity first", {"references": given([float("inf")] + embedding[1:])}),
+        ("1e39 first (past float32)", {"references": given([1e39] + embedding[1:])}),
+        ("3.4e38 first (past bfloat16)", {"references": given([3.4e38] + embedding[1:])}),
+        ("1e6 everywhere", {"references": given([1e6] * len(embedding))}),
+        ("zeros", {"references": given([0.0] * len(embedding))}),
+        ("the old top-level field", {"speaker_embedding": embedding}),
     ]
     with httpx.Client(timeout=TIMEOUT_S, trust_env=False) as client:
         for name, extra in cases:
             status, content, latency = speech(client, args.base_url, {**base, **extra})
             detail = content[:160].decode("utf-8", "replace") if status != 200 else f"{len(content)} bytes"
             health_status, health_content, _ = speech(
-                client, args.base_url, {**base, "speaker_embedding": embedding, "response_format": "wav"}
+                client, args.base_url, {**base, "references": given(embedding), "response_format": "wav"}
             )
             print(
                 f"{name}: HTTP {status} ({latency:.0f} ms) {detail} | then a valid request: HTTP {health_status} "
@@ -163,7 +170,7 @@ def run_contract(args: argparse.Namespace) -> None:
                 flush=True,
             )
         batch = {
-            "model": args.model, "speaker_embedding": embedding, "seed": SEED, "response_format": "wav",
+            "model": args.model, "references": given(embedding), "seed": SEED, "response_format": "wav",
             "items": [{"input": "First line."}, {"input": "Second line."}, {"input": "Third.", "ref_audio": args.reference}],
         }
         response = client.post(f"{args.base_url}/v1/audio/speech/batch", json=batch)
@@ -180,21 +187,29 @@ def run_contract(args: argparse.Namespace) -> None:
                 data={"name": "probe_voice", "consent": "recorded with consent for testing"},
             )
         print(f"upload voice: HTTP {upload.status_code} {upload.text[:120]}", flush=True)
-        status, content, _ = speech(client, args.base_url, {**base, "voice": "probe_voice", "speaker_embedding": embedding})
-        print(f"uploaded voice with embedding: HTTP {status} {content[:160].decode('utf-8', 'replace')}", flush=True)
+        status, content, _ = speech(
+            client, args.base_url, {**base, "voice": "probe_voice", "references": given(embedding), "response_format": "wav"}
+        )
+        reference_only = speech(client, args.base_url, {**base, "references": given(embedding), "response_format": "wav"})
+        print(
+            f"uploaded voice name with an embedding reference: HTTP {status} {len(content)} bytes, same bytes as the "
+            f"reference alone {content == reference_only[1]}",
+            flush=True,
+        )
         if args.custom_voice_url:
             status, content, _ = speech(
                 client, args.custom_voice_url,
-                {"model": args.custom_voice_model, "input": base["input"], "speaker_embedding": embedding},
+                {"model": args.custom_voice_model, "input": base["input"], "references": given(embedding)},
             )
             print(f"CustomVoice server with embedding: HTTP {status} {content[:160].decode('utf-8', 'replace')}", flush=True)
         else:
             pass
     for name, session in (
-        ("websocket, embedding", {"model": args.model, "speaker_embedding": embedding, "response_format": "pcm", "stream_audio": True}),
-        ("websocket, embedding with ref_audio", {"model": args.model, "speaker_embedding": embedding, "ref_audio": args.reference}),
-        ("websocket, NaN", {"model": args.model, "speaker_embedding": [float("nan")] + embedding[1:]}),
-        ("websocket, 1e39", {"model": args.model, "speaker_embedding": [1e39] + embedding[1:]}),
+        ("websocket, embedding", {"model": args.model, "references": given(embedding), "response_format": "pcm", "stream_audio": True}),
+        ("websocket, embedding with ref_audio", {"model": args.model, "references": given(embedding), "ref_audio": args.reference}),
+        ("websocket, NaN", {"model": args.model, "references": given([float("nan")] + embedding[1:])}),
+        ("websocket, 1e39", {"model": args.model, "references": given([1e39] + embedding[1:])}),
+        ("websocket, 3.4e38", {"model": args.model, "references": given([3.4e38] + embedding[1:])}),
     ):
         try:
             outcome = asyncio.run(websocket_case(args.base_url, session))
