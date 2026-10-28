@@ -1453,8 +1453,13 @@ def test_direct_cuda_ipc_payload_preserves_inline_cpu_tensors() -> None:
 def test_direct_cuda_ipc_payload_header_sends_a_cpu_views_own_bytes() -> None:
     transfer_buffer = torch.arange(1 << 20, dtype=torch.int64)
     grid = transfer_buffer[3:6].view(1, 3)
+    positions = transfer_buffer[8:20].view(3, 4).t()
     payload = make_stage_payload(
-        data={"gpu": torch.arange(2, device="cuda:0"), "grid": grid}
+        data={
+            "gpu": torch.arange(2, device="cuda:0"),
+            "grid": grid,
+            "positions": positions,
+        }
     )
 
     ref = stage_io.serialize_direct_cuda_ipc_payload(payload)
@@ -1462,6 +1467,8 @@ def test_direct_cuda_ipc_payload_header_sends_a_cpu_views_own_bytes() -> None:
 
     assert len(ref["header"]) < transfer_buffer.untyped_storage().nbytes()
     assert torch.equal(header.data["grid"], grid)
+    assert torch.equal(header.data["positions"], positions)
+    assert header.data["positions"].stride() == positions.stride()
 
 
 def test_direct_cuda_ipc_payload_allows_large_ordinary_header(monkeypatch) -> None:
