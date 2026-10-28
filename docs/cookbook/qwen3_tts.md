@@ -462,7 +462,7 @@ with open("output.wav", "wb") as f:
     f.write(resp.content)
 ```
 
-The request runs in x-vector mode. A transcript is not used, and `x_vector_only_mode` may be omitted or set to `true`. The embedding reference must be the only reference, with no audio, no `vq_codes` and no `ref_audio`, and every value must be finite in the model's dtype. CustomVoice and VoiceDesign checkpoints reject it.
+The request runs in x-vector mode. A transcript is not used, and `x_vector_only_mode` may be omitted or set to `true`. The embedding reference must be the only reference, with no audio, no `vq_codes` and no `ref_audio`, and every value must be a finite float32 number. CustomVoice and VoiceDesign checkpoints reject it.
 
 ### Language Hint
 
