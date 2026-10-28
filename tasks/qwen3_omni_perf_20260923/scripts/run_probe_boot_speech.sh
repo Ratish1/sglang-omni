@@ -8,6 +8,7 @@
 # same report. NSYS_ARGS=none serves the same cell clean (no probe, no profiler).
 # EXTRA_SERVE_ARGS is appended to the serve args (for example the talker's running cap).
 # PYSPY=1 samples the talker process with py-spy over the measured window (raw, per thread).
+# PIN_CPUS and PIN_NODE bind the server and the benchmark client to the cards' NUMA node.
 # usage: run_probe_boot_speech.sh <tree> <out dir> <port> <concurrency> <arm>
 set -u
 TREE=$1 OUT=$2 PORT=$3 CONC=$4 ARM=$5
@@ -21,6 +22,7 @@ else
   WRAP="nsys profile -o $OUT/serve --force-overwrite=true $NSYS_ARGS"
   PROBE="OMNI_PIPE_NVTX=1 OMNI_PIPE_LINES=${LINES:-}"
 fi
+PIN=${PIN_CPUS:+numactl --physcpubind=$PIN_CPUS --membind=${PIN_NODE:-0}}
 mkdir -p "$OUT"
 OUT=$(cd "$OUT" && pwd)
 cd "$TREE" || exit 1
@@ -51,7 +53,7 @@ DMON=$!
 APPS=$!
 
 env PYTHONPATH=$TREE${PROBE:+:$S/omni_pipeline_nvtx} $PROBE \
-  setsid $WRAP python3 -u -m sglang_omni.cli serve --model-path $MODEL $SERVE_ARGS --host 127.0.0.1 --port $PORT \
+  setsid $PIN $WRAP python3 -u -m sglang_omni.cli serve --model-path $MODEL $SERVE_ARGS --host 127.0.0.1 --port $PORT \
   > "$OUT/serve.log" 2>&1 &
 WRAP_PID=$!
 echo "pgid $WRAP_PID" >> "$OUT/progress.txt"
@@ -64,7 +66,7 @@ for _ in $(seq 360); do
 done
 if [ $healthy = 1 ]; then
   echo "healthy $(date +%T)" >> "$OUT/progress.txt"
-  PYTHONPATH=$TREE python3 "$S/run_bench.py" gen --arm "$ARM" --port "$PORT" \
+  PYTHONPATH=$TREE $PIN python3 "$S/run_bench.py" gen --arm "$ARM" --port "$PORT" \
     --concurrency "$CONC" --out "$OUT/warm" --max-samples "${WARM_SAMPLES:-32}" > "$OUT/warm_$ARM.log" 2>&1
   echo "warm rc $? $(date +%T)" >> "$OUT/progress.txt"
   PYSPY_PID=""
@@ -78,7 +80,7 @@ if [ $healthy = 1 ]; then
     :
   fi
   date +%s.%N > "$OUT/window.txt"
-  PYTHONPATH=$TREE python3 "$S/run_bench.py" gen --arm "$ARM" --port "$PORT" \
+  PYTHONPATH=$TREE $PIN python3 "$S/run_bench.py" gen --arm "$ARM" --port "$PORT" \
     --concurrency "$CONC" --out "$OUT" --max-samples "${MAX_SAMPLES:-128}" \
     --skip-samples "${WARM_SAMPLES:-32}" > "$OUT/gen_$ARM.log" 2>&1
   echo "gen rc $? $(date +%T)" >> "$OUT/progress.txt"
