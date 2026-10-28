@@ -8,6 +8,7 @@ import contextlib
 import json
 import logging
 import math
+import os
 import queue
 import threading
 import time
@@ -1302,6 +1303,19 @@ class Qwen3TTSAdhocReferenceHook(
                 audio=speaker_waveform,
                 sr=speaker_sample_rate,
             )
+            probe_dir = os.environ.get("QWEN3_TTS_PROBE_SPEAKER_DIR")
+            if probe_dir:
+                probe_index = len(os.listdir(probe_dir))
+                torch.save(
+                    {
+                        "ref_audio": str(item.ref_audio)[:512],
+                        "embedding": speaker_embedding.detach().float().cpu(),
+                        "dtype": str(speaker_embedding.dtype),
+                    },
+                    os.path.join(probe_dir, f"{probe_index:06d}.pt"),
+                )
+            else:
+                pass
             ref_code = (
                 record_ref_code_consumer_stream(ref_code_future.result(timeout=130.0))
                 if ref_code_future is not None
