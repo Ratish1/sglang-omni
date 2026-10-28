@@ -30,9 +30,11 @@ def main() -> None:
     parser.add_argument("wavs", type=Path)
     parser.add_argument("--model", required=True)
     parser.add_argument("--clips", type=int, default=200)
+    parser.add_argument("--tf32", action="store_true")
     args = parser.parse_args()
     device = "cuda:0"
     torch.cuda.set_device(device)
+    torch.backends.cuda.matmul.allow_tf32 = args.tf32
     clips = [librosa.load(str(path), sr=None, mono=True) for path in sorted(args.wavs.glob("*.wav"))[: args.clips]]
     seconds = [len(waveform) / sample_rate for waveform, sample_rate in clips]
     print(f"sglang_omni from {sglang_omni.__file__}", flush=True)

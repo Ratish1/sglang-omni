@@ -49,6 +49,7 @@ def main() -> None:
     parser.add_argument("--model", required=True)
     parser.add_argument("--card", type=int, default=0)
     parser.add_argument("--clips", type=int, default=200)
+    parser.add_argument("--tf32", action="store_true")
     args = parser.parse_args()
     device = f"cuda:{args.card}"
     torch.cuda.set_device(device)
@@ -59,6 +60,7 @@ def main() -> None:
     official = Qwen3TTSTokenizer.from_pretrained(
         os.path.join(resolve_checkpoint(args.model), "speech_tokenizer"), device_map=device, dtype=torch.float32
     )
+    torch.backends.cuda.matmul.allow_tf32 = args.tf32
     eager = Qwen3TTSRefCodeBatcher(ours)
     graphs = Qwen3TTSRefCodeBatcher(ours, graph_bucket_frames=DEFAULT_QWEN3_TTS_REFERENCE_ENCODER_BUCKET_FRAMES)
     arms: dict[str, list[torch.Tensor]] = {"official_exact": [], "ours_graphs": [], "ours_eager": []}
@@ -67,11 +69,14 @@ def main() -> None:
         waveform, sample_rate = librosa.load(str(path), sr=None, mono=True)
         clips.append((waveform, sample_rate))
         with torch.inference_mode():
+            torch.backends.cuda.matmul.allow_tf32 = False
             arms["official_exact"].append(official.encode([waveform], sr=sample_rate).audio_codes[0].cpu())
+            torch.backends.cuda.matmul.allow_tf32 = args.tf32
             arms["ours_graphs"].append(graphs.encode_waveform(waveform, sample_rate).cpu())
             arms["ours_eager"].append(eager.encode_waveform(waveform, sample_rate).cpu())
         torch.cuda.synchronize()
-    print(f"clips {len(clips)}, encoder dtype {next(ours.model.encoder.parameters()).dtype}")
+    torch.backends.cuda.matmul.allow_tf32 = False
+    print(f"clips {len(clips)}, encoder dtype {next(ours.model.encoder.parameters()).dtype}, ours with TF32 matmuls {args.tf32}")
     for first, second in itertools.combinations(arms, 2):
         print(f"{first} / {second}: {compare(arms[first], arms[second])}")
     lengths = [waveform.size / sample_rate for waveform, sample_rate in clips]
