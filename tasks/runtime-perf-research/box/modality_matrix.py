@@ -1,10 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 """Every Qwen3-Omni input and output pairing against one running server, scored after it stops.
 
-usage: python3 modality_matrix.py serve --port 20000 --out /data/runtime-perf/l28/q_a1/matrix
+usage: python3 modality_matrix.py serve --port 20000 --out /data/runtime-perf/l28/q_a1/matrix [--cells mmsu_talker,...]
+           [--concurrency 64]
        python3 modality_matrix.py score --asr-port 21000 --out /data/runtime-perf/l28/q_a1/matrix
 
-serve runs the family benchmarks the Qwen3-Omni CI runs, as the CI calls them, at c16: text output for image (MMMU,
+Run only the cells a change can move (read from the code first; an exact change needs none). serve runs the family
+benchmarks the Qwen3-Omni CI runs, as the CI calls them, at c64 by default: text output for image (MMMU,
 full validation), audio (MMSU, full), video (Video-MME CI sample) and video with its sound (Video-AMME CI sample);
 audio output for the same inputs on the CI's talker sets (MMMU CI sample with its reasoning prompt, so replies run
 long; the MMSU CI set and Video-MME CI sample with the CI's short answer prompt; Video-AMME CI sample with its fixed
@@ -25,7 +27,7 @@ import time
 from dataclasses import asdict, is_dataclass
 from pathlib import Path
 
-CONCURRENCY = 16
+CONCURRENCY = 64
 ASR_CONCURRENCY = 64
 TALKER_MAX_TOKENS = 256
 VIDEO_PRESETS = {"video_fps": 2, "video_max_frames": 128, "video_max_pixels": 401408}
@@ -176,6 +178,8 @@ def run_seedtts(port: int, out: Path, voice_clone: bool) -> dict:
 
 
 def serve(args: argparse.Namespace) -> None:
+    global CONCURRENCY
+    CONCURRENCY = args.concurrency
     out = Path(args.out)
     for cell in args.cells.split(","):
         cell_out = out / cell
@@ -251,6 +255,7 @@ def main() -> None:
     serve_parser.add_argument("--port", type=int, required=True)
     serve_parser.add_argument("--out", required=True)
     serve_parser.add_argument("--cells", default=",".join(SEEDTTS_CELLS + TEXT_CELLS + TALKER_CELLS))
+    serve_parser.add_argument("--concurrency", type=int, default=CONCURRENCY)
     score_parser = commands.add_parser("score")
     score_parser.add_argument("--asr-port", type=int, required=True)
     score_parser.add_argument("--out", required=True)
