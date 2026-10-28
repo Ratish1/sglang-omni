@@ -223,28 +223,21 @@ curl -X POST http://localhost:8000/v1/audio/speech \
   --output output.wav
 ```
 
-Qwen3-TTS Base also accepts a precomputed speaker embedding instead of
-reference audio, so callers that store x-vectors offline can skip shipping
-the reference clip:
+Qwen3-TTS Base also accepts the speaker embedding itself in place of reference audio, so a deployment that stores each voice's embedding sends no audio and keeps no voice state on the server. Here `speaker_embedding.json` holds one stored embedding as a JSON list:
 
 ```bash
-EMB=$(python -c "import json; print(json.dumps([0.01] * 1024))")
 curl -X POST http://localhost:8000/v1/audio/speech \
   -H "Content-Type: application/json" \
   -d "{
     \"model\": \"Qwen/Qwen3-TTS-12Hz-0.6B-Base\",
     \"voice\": \"default\",
     \"input\": \"Get the trust fund to the bank early.\",
-    \"speaker_embedding\": $EMB
+    \"speaker_embedding\": $(cat speaker_embedding.json)
   }" \
   --output output.wav
 ```
 
-`speaker_embedding` must be a non-empty list of numbers whose length matches
-the checkpoint's speaker encoder dimension (1024 for 0.6B, 2048 for 1.7B).
-It is mutually exclusive with `ref_audio`, `references`, and uploaded voices,
-and it implies `x_vector_only_mode`, so `ref_text` is neither required nor
-used.
+`speaker_embedding` is the x-vector the same checkpoint's speaker encoder computes from a reference clip: 1024 finite float32 numbers for 0.6B Base, 2048 for 1.7B Base, so an embedding from one size does not fit the other. It is mutually exclusive with `ref_audio`, `references`, and uploaded voices, and it implies `x_vector_only_mode`, so `ref_text` is neither required nor used. See [Precomputed speaker embedding](../cookbook/qwen3_tts.md#precomputed-speaker-embedding) for how to compute one.
 
 Qwen3-TTS CustomVoice uses a built-in speaker without reference audio:
 
@@ -682,7 +675,7 @@ The table below lists all parameters accepted by the `/v1/audio/speech` endpoint
 | `token_count` | int | `null` | Model-specific duration token target |
 | `duration_tokens` | int | `null` | Alias-style duration token target for models that expose duration control |
 | `x_vector_only_mode` | bool | `null` | Qwen3-TTS Base speaker-embedding mode |
-| `speaker_embedding` | list[float] | `null` | Qwen3-TTS Base only. Precomputed x-vector speaker embedding for Base cloning, mutually exclusive with `ref_audio` / `references` / uploaded voices. Implies x-vector-only mode, so `ref_text` is neither required nor used. Length must match the checkpoint's speaker encoder dimension (1024 for 0.6B, 2048 for 1.7B) |
+| `speaker_embedding` | list[float] | `null` | Qwen3-TTS Base only. The x-vector the same checkpoint's speaker encoder computes from a reference clip, in place of that clip: 1024 finite float32 numbers for 0.6B, 2048 for 1.7B. Mutually exclusive with `ref_audio` / `references` / uploaded voices. Implies x-vector-only mode, so `ref_text` is neither required nor used |
 | `temperature` | float | `null` | Sampling temperature |
 | `top_p` | float | `null` | Top-p sampling |
 | `top_k` | int | `null` | Top-k sampling |
