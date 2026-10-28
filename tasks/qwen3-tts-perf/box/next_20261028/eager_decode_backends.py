@@ -21,6 +21,8 @@ PYTHONPATH=<main tree> python3 eager_decode_backends.py --arm main --device cuda
 
 import argparse
 import contextlib
+import ctypes
+import ctypes.util
 import json
 import statistics
 import time
@@ -116,6 +118,12 @@ def main() -> None:
     )
     parser.add_argument("--room-gib", type=int, default=8)
     parser.add_argument(
+        "--exhaust",
+        action="store_true",
+        help="after the fill, take the device's last bytes with cudaMalloc outside PyTorch "
+        "(1 MiB, then 64 KiB, then 4 KiB pieces until each fails)",
+    )
+    parser.add_argument(
         "--batch-cycle",
         default="8",
         help="requests per batch, cycled, as comma-separated counts (the vocoder batches 1 to 8)",
@@ -171,6 +179,24 @@ def main() -> None:
         filler = torch.empty(
             free_bytes - arguments.full_device_mib * MIB, dtype=torch.uint8, device=device
         )
+        if arguments.exhaust:
+            runtime = ctypes.CDLL(ctypes.util.find_library("cudart") or "libcudart.so.13")
+            runtime.cudaSetDevice(torch.device(device).index)
+            pointers = []
+            for piece_bytes in (MIB, 64 * 1024, 4 * 1024):
+                while True:
+                    pointer = ctypes.c_void_p()
+                    status = runtime.cudaMalloc(
+                        ctypes.byref(pointer), ctypes.c_size_t(piece_bytes)
+                    )
+                    if status != 0:
+                        runtime.cudaGetLastError()
+                        break
+                    else:
+                        pointers.append(pointer)
+            print(f"exhausted with {len(pointers)} cudaMalloc pieces", flush=True)
+        else:
+            pass
         free_bytes, _ = torch.cuda.mem_get_info(device)
         print(
             f"full device from the start: reserved {torch.cuda.memory_reserved(device) / MIB:.0f} MiB, "
