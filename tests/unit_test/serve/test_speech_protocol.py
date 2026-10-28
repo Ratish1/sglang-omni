@@ -168,37 +168,117 @@ def test_custom_voice_config_rejects_invalid_inputs_before_io(
 
 
 SPEAKER_EMBEDDING = [0.01] * 1024
+REFERENCE_DATA_URL = f"data:audio/wav;base64,{base64.b64encode(b'RIFF').decode()}"
+
+
 EMBEDDING_PARAM = "references.0.speaker_embedding"
 
 
 @pytest.mark.parametrize(
-    ("speaker_embedding", "supports_speaker_embedding_references"),
-    [([0.01, "x"], True), ([True] * 1024, True), (SPEAKER_EMBEDDING, False)],
+    ("fields", "speaker_embedding_size", "param"),
+    [
+        ({"references": [{"speaker_embedding": []}]}, 1024, EMBEDDING_PARAM),
+        ({"references": [{"speaker_embedding": [0.01, "x"]}]}, 1024, EMBEDDING_PARAM),
+        (
+            {"references": [{"speaker_embedding": [True] * 1024}]},
+            1024,
+            EMBEDDING_PARAM,
+        ),
+        (
+            {"references": [{"speaker_embedding": SPEAKER_EMBEDDING[:-1]}]},
+            1024,
+            EMBEDDING_PARAM,
+        ),
+        (
+            {
+                "references": [
+                    {"speaker_embedding": [float("nan"), *SPEAKER_EMBEDDING[1:]]}
+                ]
+            },
+            1024,
+            EMBEDDING_PARAM,
+        ),
+        (
+            {"references": [{"speaker_embedding": [1e39, *SPEAKER_EMBEDDING[1:]]}]},
+            1024,
+            EMBEDDING_PARAM,
+        ),
+        (
+            {
+                "references": [
+                    {
+                        "speaker_embedding": SPEAKER_EMBEDDING,
+                        "audio": REFERENCE_DATA_URL,
+                    }
+                ]
+            },
+            1024,
+            EMBEDDING_PARAM,
+        ),
+        (
+            {
+                "references": [
+                    {"speaker_embedding": SPEAKER_EMBEDDING},
+                    {"audio": REFERENCE_DATA_URL},
+                ]
+            },
+            1024,
+            EMBEDDING_PARAM,
+        ),
+        (
+            {
+                "references": [{"speaker_embedding": SPEAKER_EMBEDDING}],
+                "ref_audio": REFERENCE_DATA_URL,
+            },
+            1024,
+            EMBEDDING_PARAM,
+        ),
+        (
+            {
+                "references": [{"speaker_embedding": SPEAKER_EMBEDDING}],
+                "x_vector_only_mode": False,
+            },
+            1024,
+            "x_vector_only_mode",
+        ),
+        (
+            {
+                "references": [{"speaker_embedding": SPEAKER_EMBEDDING}],
+                "task_type": "CustomVoice",
+            },
+            1024,
+            "task_type",
+        ),
+        (
+            {"references": [{"speaker_embedding": SPEAKER_EMBEDDING}]},
+            None,
+            EMBEDDING_PARAM,
+        ),
+    ],
 )
-def test_speaker_embedding_reference_refuses_non_numbers_and_unsupported_models(
-    speaker_embedding: list[object], supports_speaker_embedding_references: bool
+def test_speaker_embedding_rejects_invalid_requests(
+    fields: dict[str, object], speaker_embedding_size: int | None, param: str
 ) -> None:
+    """NaN, Infinity or a value past float32 once reached the talker, which answered
+    with babble to the length cap and a success status."""
     service = SpeechRequestValidator(
-        default_model="tts",
-        supports_speaker_embedding_references=supports_speaker_embedding_references,
+        default_model="tts", speaker_embedding_size=speaker_embedding_size
     )
 
     with pytest.raises(SpeechAPIError) as exc_info:
-        service.parse_generation_request(
-            {"input": "hello", "references": [{"speaker_embedding": speaker_embedding}]}
-        )
+        service.parse_generation_request({"input": "hello", **fields})
 
     assert exc_info.value.status_code == 400
-    assert exc_info.value.param == EMBEDDING_PARAM
+    assert exc_info.value.param == param
 
 
-def test_batch_default_speaker_embedding_is_refused_on_an_unsupported_model() -> None:
-    service = SpeechRequestValidator(default_model="tts")
+def test_batch_default_speaker_embedding_is_refused_before_any_item() -> None:
+    service = SpeechRequestValidator(default_model="tts", speaker_embedding_size=1024)
 
     with pytest.raises(SpeechAPIError) as exc_info:
         service.parse_batch_request(
             {
-                "references": [{"speaker_embedding": SPEAKER_EMBEDDING}],
+                "references": [{"speaker_embedding": SPEAKER_EMBEDDING[:-1]}],
                 "items": [{"input": "first"}, {"input": "second"}],
             }
         )
@@ -208,9 +288,7 @@ def test_batch_default_speaker_embedding_is_refused_on_an_unsupported_model() ->
 
 
 def test_speaker_embedding_reference_lowers_into_the_prompt() -> None:
-    service = SpeechRequestValidator(
-        default_model="tts", supports_speaker_embedding_references=True
-    )
+    service = SpeechRequestValidator(default_model="tts", speaker_embedding_size=1024)
     prepared = service.parse_generation_request(
         {"input": "hello", "references": [{"speaker_embedding": SPEAKER_EMBEDDING}]}
     )
