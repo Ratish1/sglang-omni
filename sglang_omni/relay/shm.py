@@ -10,8 +10,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import os
-import sys
 import uuid
 from collections.abc import Mapping
 from multiprocessing import shared_memory as _shm
@@ -50,13 +48,6 @@ def shm_create_from_tensor(tensor: torch.Tensor) -> _shm.SharedMemory:
     if size >= 2 * TORCH_COPY_GRAIN_BYTES:
         try:
             # note (ratish): reserving the pages first turns a full /dev/shm into an error instead of a SIGBUS mid-copy and keeps page allocation out of the parallel copy.
-            if sys.platform == "linux":
-                shm_file_descriptor = (
-                    shm._fd
-                )  # noqa: leading-underscore  # upstream spelling, or the public name is already taken
-                os.posix_fallocate(shm_file_descriptor, 0, size)
-            else:
-                pass
             torch.frombuffer(shm.buf, dtype=torch.uint8, count=size).copy_(
                 tensor.reshape(-1).view(torch.uint8)
             )
