@@ -2276,7 +2276,6 @@ def talker_seed_self(
         repetition_mask=torch.zeros(max_bs, vocab, dtype=torch.bool, device=device),
         suppress_mask=torch.zeros(max_bs, vocab, dtype=torch.bool, device=device),
         suppress_token_cache={},
-        suppress_token_ids_by_request={},
         repetition_penalties=torch.ones(max_bs, 1, device=device),
         sampling_temperatures=torch.ones(max_bs, 1, device=device),
         sampling_top_ps=torch.ones(max_bs, device=device),
@@ -2294,6 +2293,7 @@ def talker_seed_self(
         sampling_staging_event=(torch.cuda.Event() if device.type == "cuda" else None),
         sampled_token_ids=torch.zeros(max_bs, dtype=torch.long, device=device),
         decode_prep_rids=None,
+        decode_prep_requests=[],
         decode_prep_out_lens=[],
         decode_prep_rep_rows=None,
     )
@@ -2565,31 +2565,72 @@ def test_talker_prepare_decode_buffers_cuda_matches_fresh_rebuild() -> None:
         torch.testing.assert_close(getattr(fake, name), getattr(fresh, name))
 
 
-def test_talker_prepare_decode_buffers_rebuild_triggers() -> None:
-    def prepared() -> tuple[SimpleNamespace, list[SimpleNamespace]]:
-        fake = talker_seed_self()
+@pytest.mark.parametrize(
+    "steps",
+    [
+        pytest.param(
+            [(["a", "b"], False), (["a", "b"], False), (["a", "b", "c"], False)],
+            id="joined-after-running-rows",
+        ),
+        pytest.param([(["a", "b"], False), (["c", "a", "b"], True)], id="mixed"),
+        pytest.param([(["a", "b", "c"], False), (["a", "c"], False)], id="row-left"),
+        pytest.param(
+            [(["a", "b"], False), (["a"], False), (["b", "a"], True)],
+            id="request-returned",
+        ),
+    ],
+)
+def test_talker_decode_rows_carried_through_batch_changes_match_a_fresh_rebuild(
+    steps: list[tuple[list[str], bool]],
+) -> None:
+    vocab = 8
+    fake = talker_seed_self(vocab=vocab)
+    requests_by_id: dict[str, SimpleNamespace] = {}
+    previous_requests: list[SimpleNamespace] = []
+    for step, (request_ids, mixed) in enumerate(steps):
+        for row, sched_req in enumerate(previous_requests):
+            fake.sampled_token_ids[row] = (step + row) % vocab
+            sched_req.data.req.output_ids.append((step + row) % vocab)
+        if mixed:
+            fake.invalidate_decode_buffers()
+            for sched_req in previous_requests:
+                sched_req.data.req.output_ids.append((3 * step + 1) % vocab)
+        else:
+            pass
         requests = [
-            talker_prep_req("a", penalty=1.5, output_ids=[2]),
-            talker_prep_req("b", penalty=1.5, output_ids=[4]),
+            requests_by_id.setdefault(
+                request_id,
+                talker_prep_req(
+                    request_id,
+                    penalty=1.25 + "abc".index(request_id) / 4,
+                    temperature=0.5 + "abc".index(request_id) / 10,
+                    top_k=10 + "abc".index(request_id),
+                    seed=11 + "abc".index(request_id),
+                    output_ids=["abc".index(request_id)],
+                    suppress=["abc".index(request_id) + 4],
+                ),
+            )
+            for request_id in request_ids
         ]
         Qwen3OmniTalker.prepare_decode_buffers(fake, requests)
-        fake.sampling_temperatures[0, 0] = 123.0
-        return fake, requests
+        fresh = talker_seed_self(vocab=vocab)
+        Qwen3OmniTalker.prepare_decode_buffers(fresh, requests)
 
-    def advance(requests: list[SimpleNamespace]) -> None:
-        for sched_req in requests:
-            sched_req.data.req.output_ids.append(5)
-
-    fake, requests = prepared()
-    advance(requests)
-    Qwen3OmniTalker.prepare_decode_buffers(fake, list(reversed(requests)))
-    assert float(fake.sampling_temperatures[0, 0]) == pytest.approx(0.8)
-
-    fake, requests = prepared()
-    advance(requests)
-    requests[0].data.req.output_ids.append(6)
-    Qwen3OmniTalker.prepare_decode_buffers(fake, requests)
-    assert float(fake.sampling_temperatures[0, 0]) == pytest.approx(0.8)
+        for name in (
+            "repetition_mask",
+            "suppress_mask",
+            "repetition_penalties",
+            "sampling_temperatures",
+            "sampling_top_ps",
+            "sampling_min_ps",
+            "sampling_top_ks",
+            "sampling_seeds",
+        ):
+            assert torch.equal(
+                getattr(fake, name)[: len(requests)],
+                getattr(fresh, name)[: len(requests)],
+            ), (step, name)
+        previous_requests = requests
 
 
 def test_talker_prefill_forward_invalidates_next_decode_reuse() -> None:
@@ -2606,9 +2647,8 @@ def test_talker_prefill_forward_invalidates_next_decode_reuse() -> None:
     fake = talker_seed_self()
     requests = [talker_prep_req("a", penalty=1.5, output_ids=[2])]
     Qwen3OmniTalker.prepare_decode_buffers(fake, requests)
-    fake.sampling_temperatures[0, 0] = 123.0
     fake.sampled_token_ids[0] = 3
-    requests[0].data.req.output_ids.append(3)
+    requests[0].data.req.output_ids.append(4)
 
     fake.uses_mrope = False
     fake.model = lambda **_: torch.zeros(1, 2)
@@ -2648,7 +2688,7 @@ def test_talker_prefill_forward_invalidates_next_decode_reuse() -> None:
         forward_batch=decode_batch,
     )
 
-    assert float(fake.sampling_temperatures[0, 0]) == pytest.approx(0.8)
+    assert fake.repetition_mask[0].nonzero().flatten().tolist() == [2, 4]
 
 
 def test_talker_samples_from_fp32_logits() -> None:
