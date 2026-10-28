@@ -215,18 +215,7 @@ class Qwen3TTSPipelineConfig(PipelineConfig):
         if model_type != "base":
             return None
         else:
-            pass
-        speaker_encoder_config = checkpoint_config.get("speaker_encoder_config")
-        enc_dim = (
-            speaker_encoder_config.get("enc_dim")
-            if isinstance(speaker_encoder_config, dict)
-            else None
-        )
-        if isinstance(enc_dim, int) and enc_dim >= 1:
-            return enc_dim
-        else:
-            pass
-        return None
+            return int(checkpoint_config["speaker_encoder_config"]["enc_dim"])
 
     def resolve_custom_voice_config(self) -> CustomVoiceConfig | None:
         checkpoint_config = self.load_engine_checkpoint_config()

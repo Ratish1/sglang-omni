@@ -5,6 +5,7 @@ from __future__ import annotations
 import base64
 import ipaddress
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import Mock
 
 import httpx
@@ -165,6 +166,96 @@ def test_custom_voice_config_rejects_invalid_inputs_before_io(
     assert exc.value.param == field
     load.assert_not_called()
     assert store.mock_calls == []
+
+
+SPEAKER_EMBEDDING = [0.01] * 1024
+REFERENCE_DATA_URL = f"data:audio/wav;base64,{base64.b64encode(b'RIFF').decode()}"
+
+
+@pytest.mark.parametrize(
+    ("fields", "speaker_embedding_dim", "param"),
+    [
+        ({"speaker_embedding": []}, 1024, "speaker_embedding"),
+        ({"speaker_embedding": [0.01, "x"]}, 1024, "speaker_embedding"),
+        ({"speaker_embedding": [True] * 1024}, 1024, "speaker_embedding"),
+        ({"speaker_embedding": SPEAKER_EMBEDDING[:-1]}, 1024, "speaker_embedding"),
+        (
+            {"speaker_embedding": [float("nan"), *SPEAKER_EMBEDDING[1:]]},
+            1024,
+            "speaker_embedding",
+        ),
+        (
+            {"speaker_embedding": SPEAKER_EMBEDDING, "x_vector_only_mode": False},
+            1024,
+            "x_vector_only_mode",
+        ),
+        (
+            {"speaker_embedding": SPEAKER_EMBEDDING, "task_type": "CustomVoice"},
+            1024,
+            "task_type",
+        ),
+        ({"speaker_embedding": SPEAKER_EMBEDDING}, None, "speaker_embedding"),
+    ],
+)
+def test_speaker_embedding_rejects_invalid_requests(
+    fields: dict[str, object], speaker_embedding_dim: int | None, param: str
+) -> None:
+    service = SpeechRequestValidator(
+        default_model="tts", speaker_embedding_dim=speaker_embedding_dim
+    )
+
+    with pytest.raises(SpeechAPIError) as exc_info:
+        service.parse_generation_request({"input": "hello", **fields})
+
+    assert exc_info.value.status_code == 400
+    assert exc_info.value.param == param
+
+
+@pytest.mark.parametrize(
+    "reference",
+    [
+        {"ref_audio": REFERENCE_DATA_URL},
+        {"references": [{"audio": REFERENCE_DATA_URL}]},
+        {"voice": "saved"},
+    ],
+)
+def test_speaker_embedding_excludes_every_reference_source(
+    reference: dict[str, object],
+) -> None:
+    store = Mock(spec=["get", "resolve_reference"])
+    store.resolve_reference.return_value = SimpleNamespace(
+        ref_audio=REFERENCE_DATA_URL,
+        voice=SimpleNamespace(ref_text=None, normalized_name="saved", created_at=1),
+    )
+    service = SpeechRequestValidator(
+        default_model="tts", speaker_embedding_dim=1024, voice_store=store
+    )
+
+    with pytest.raises(SpeechAPIError) as exc_info:
+        service.parse_generation_request(
+            {"input": "hello", "speaker_embedding": SPEAKER_EMBEDDING, **reference}
+        )
+
+    assert exc_info.value.status_code == 400
+    assert exc_info.value.param == "speaker_embedding"
+
+
+def test_speaker_embedding_lowers_to_a_base_request_without_references() -> None:
+    service = SpeechRequestValidator(default_model="tts", speaker_embedding_dim=1024)
+    prepared = service.parse_generation_request(
+        {"input": "hello", "speaker_embedding": SPEAKER_EMBEDDING}
+    )
+    generated = service.build_generate_request(
+        prepared.request,
+        validate=False,
+        reference_descriptors=prepared.reference_descriptors,
+    )
+
+    params = generated.metadata["tts_params"]
+    assert isinstance(params, dict)
+    assert params["speaker_embedding"] == SPEAKER_EMBEDDING
+    assert params["task_type"] == "Base"
+    assert generated.prompt == "hello"
 
 
 def test_speech_generation_accepts_seedtts_reference_payload_without_voice() -> None:

@@ -7,6 +7,7 @@ import asyncio
 import base64
 import binascii
 import logging
+import math
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -442,6 +443,13 @@ class SpeechRequestValidator:
             raise bad_request(
                 f"speaker_embedding must contain {self.speaker_embedding_dim} "
                 f"values, got {len(request.speaker_embedding)}",
+                param="speaker_embedding",
+            )
+        else:
+            pass
+        if not all(math.isfinite(value) for value in request.speaker_embedding):
+            raise bad_request(
+                "speaker_embedding values must be finite numbers",
                 param="speaker_embedding",
             )
         else:
@@ -1166,8 +1174,7 @@ def build_tts_params(
         pass
     if request.speaker_embedding is not None:
         tts_params["speaker_embedding"] = request.speaker_embedding
-        # Embedding-only requests carry no reference audio, so task_type
-        # inference would otherwise land on CustomVoice.
+        # note (Zhifu-Liu): embedding-only requests carry no reference audio, so task_type inference would otherwise land on CustomVoice.
         tts_params["task_type"] = "Base"
     else:
         pass
