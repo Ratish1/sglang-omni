@@ -17,6 +17,7 @@ import os
 import torch
 
 import sglang_omni
+from sglang_omni.models.qwen3_tts import request_builders
 from sglang_omni.models.qwen3_tts.engine_builder import derive_silence_codec_ids
 from sglang_omni.models.qwen3_tts.reference_encoder_cuda_graph import DEFAULT_QWEN3_TTS_REFERENCE_ENCODER_BUCKET_FRAMES
 from sglang_omni.models.qwen3_tts.request_builders import Qwen3TTSRefCodeBatcher
@@ -61,7 +62,21 @@ def main() -> None:
     parser.add_argument("--warm-codebooks", action="store_true")
     parser.add_argument("--warm-gemm", action="store_true")
     parser.add_argument("--graphs", action="store_true")
+    parser.add_argument("--warm-handle", action="store_true")
+    parser.add_argument("--warm-encode-stream", action="store_true")
     args = parser.parse_args()
+    if args.warm_encode_stream:
+        make_stream = request_builders.new_encode_stream
+
+        def warmed_stream(device: torch.device) -> torch.Stream | None:
+            stream = make_stream(device)
+            with torch.cuda.stream(stream):
+                torch.cuda.current_blas_handle()
+            return stream
+
+        request_builders.new_encode_stream = warmed_stream
+    else:
+        pass
     print(f"sglang_omni from {sglang_omni.__file__}, CUDA_MODULE_LOADING={os.environ.get('CUDA_MODULE_LOADING', 'unset')}", flush=True)
     device = torch.device("cuda:0")
     torch.cuda.set_device(device)
@@ -79,6 +94,11 @@ def main() -> None:
         weight = next(tokenizer.model.encoder.parameters())
         torch.ones(8, 8, device=device, dtype=weight.dtype) @ torch.ones(8, 8, device=device, dtype=weight.dtype)
         report("one small gemm")
+    else:
+        pass
+    if args.warm_handle:
+        torch.cuda.current_blas_handle()
+        report("current cuBLAS handle")
     else:
         pass
     if args.snapshot:
