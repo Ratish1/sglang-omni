@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import threading
+import weakref
 from collections import deque
 from types import SimpleNamespace
 from typing import Any
@@ -2304,6 +2305,10 @@ def talker_seed_self(
     return fake
 
 
+class TalkerRequestFake(SimpleNamespace):
+    pass
+
+
 def talker_seed_req(seed: int | None, rid: str) -> SimpleNamespace:
     sp = SimpleNamespace(
         repetition_penalty=1.0,  # keep rep/suppress branches off
@@ -2313,7 +2318,7 @@ def talker_seed_req(seed: int | None, rid: str) -> SimpleNamespace:
         min_p=0.0,
         sampling_seed=seed,
     )
-    req = SimpleNamespace(
+    req = TalkerRequestFake(
         sampling_params=sp, output_ids=[], _codec_suppress_tokens=None, rid=rid
     )
     return SimpleNamespace(data=SimpleNamespace(req=req, suppress_tokens=None))
@@ -2369,7 +2374,7 @@ def talker_prep_req(
         min_p=min_p,
         sampling_seed=seed,
     )
-    req = SimpleNamespace(
+    req = TalkerRequestFake(
         sampling_params=sp,
         output_ids=list(output_ids or []),
         _codec_suppress_tokens=None,
@@ -2631,6 +2636,17 @@ def test_talker_decode_rows_carried_through_batch_changes_match_a_fresh_rebuild(
                 getattr(fresh, name)[: len(requests)],
             ), (step, name)
         previous_requests = requests
+
+
+def test_talker_decode_rows_do_not_keep_a_finished_request_alive() -> None:
+    fake = talker_seed_self()
+    requests = [talker_prep_req("a", penalty=1.5, output_ids=[2])]
+    Qwen3OmniTalker.prepare_decode_buffers(fake, requests)
+    request_reference = weakref.ref(requests[0].data.req)
+
+    del requests
+
+    assert request_reference() is None
 
 
 def test_talker_prefill_forward_invalidates_next_decode_reuse() -> None:

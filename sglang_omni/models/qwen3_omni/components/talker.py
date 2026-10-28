@@ -5,6 +5,7 @@ SGLang-native Talker model for Qwen3-Omni compatiable with hf formatting.
 from __future__ import annotations
 
 import logging
+import weakref
 from typing import Iterable, Optional, Tuple
 
 import torch
@@ -991,7 +992,7 @@ class Qwen3OmniTalker(nn.Module):
             torch.get_device_module().Event() if device.type != "cpu" else None
         )
         self.decode_prep_rids: list[str] | None = None
-        self.decode_prep_requests: list[Req] = []
+        self.decode_prep_requests: list[weakref.ref[Req]] = []
         self.decode_prep_out_lens: list[int] = []
         self.decode_prep_rep_rows: torch.Tensor | None = None
         self.output_codes = torch.zeros(
@@ -1089,9 +1090,13 @@ class Qwen3OmniTalker(nn.Module):
         rep_vocab = self.repetition_mask.shape[1]
         sup_vocab = self.suppress_mask.shape[1]
         # note (ratish): a request of the last prepare keeps its buffers, moved to its new row; only its tokens sampled since then join its repetition mask.
-        previous_rows = {
-            id(req): row_idx for row_idx, req in enumerate(self.decode_prep_requests)
-        }
+        previous_rows: dict[int, int] = {}
+        for row_idx, request_reference in enumerate(self.decode_prep_requests):
+            previous_request = request_reference()
+            if previous_request is not None:
+                previous_rows[id(previous_request)] = row_idx
+            else:
+                pass
 
         moved_rows: list[int] = []
         moved_from_rows: list[int] = []
@@ -1289,7 +1294,9 @@ class Qwen3OmniTalker(nn.Module):
                 self.suppress_mask[row_ids[:, None], suppress_token_ids[None, :]] = True
 
         self.decode_prep_rids = [sched_req.data.req.rid for sched_req in requests]
-        self.decode_prep_requests = [sched_req.data.req for sched_req in requests]
+        self.decode_prep_requests = [
+            weakref.ref(sched_req.data.req) for sched_req in requests
+        ]
         self.decode_prep_out_lens = [
             len(sched_req.data.req.output_ids) if sched_req.data.req.output_ids else 0
             for sched_req in requests
