@@ -393,7 +393,7 @@ def build_qwen3_tts_state(
         pass
 
     text, references = normalize_qwen3_tts_inputs(inputs)
-    speaker_embedding = resolve_speaker_embedding(references)
+    speaker_embedding = references[0].get("speaker_embedding") if references else None
     has_reference = has_voice_clone_reference(references, tts_params)
     task_type_raw = tts_params.get("task_type") or params.get("task_type")
     task_type_explicit = task_type_raw is not None and str(task_type_raw).strip() != ""
@@ -427,17 +427,6 @@ def build_qwen3_tts_state(
     )
 
     if task_type == QWEN3_TTS_TASK_BASE:
-        if speaker_embedding is not None and (
-            len(references) != 1
-            or has_param(tts_params, params, "ref_audio")
-            or references_contain_audio(references)
-        ):
-            raise ValueError(
-                "Qwen3-TTS Base does not accept speaker_embedding with reference "
-                "audio or a second reference"
-            )
-        else:
-            pass
         ref_audio, ref_text = resolve_voice_clone_reference(
             references, tts_params, speaker_embedding=speaker_embedding
         )
@@ -447,12 +436,7 @@ def build_qwen3_tts_state(
             ref_text=ref_text,
             speaker_embedding=speaker_embedding,
         )
-        if speaker_embedding is not None and not x_vector_only_mode:
-            raise ValueError(
-                "Qwen3-TTS Base does not accept speaker_embedding with "
-                "x_vector_only_mode false"
-            )
-        elif not x_vector_only_mode and not ref_text:
+        if not x_vector_only_mode and not ref_text:
             raise ValueError(
                 "Qwen3-TTS Base requires non-empty ref_text unless "
                 "x_vector_only_mode is enabled"
@@ -476,10 +460,6 @@ def build_qwen3_tts_state(
             raise ValueError("Qwen3-TTS CustomVoice does not accept x_vector_only_mode")
         else:
             pass
-        if speaker_embedding is not None:
-            raise ValueError("Qwen3-TTS CustomVoice does not accept speaker_embedding")
-        else:
-            pass
         voice = voice or QWEN3_TTS_DEFAULT_CUSTOM_VOICE
         # Note (Jiaxin Deng): this is prompt-side text/codec interleaving, not output
         # transport; codec streaming is resolved independently above.
@@ -499,10 +479,6 @@ def build_qwen3_tts_state(
             pass
         if has_param(tts_params, params, "x_vector_only_mode"):
             raise ValueError("Qwen3-TTS VoiceDesign does not accept x_vector_only_mode")
-        else:
-            pass
-        if speaker_embedding is not None:
-            raise ValueError("Qwen3-TTS VoiceDesign does not accept speaker_embedding")
         else:
             pass
         if not instructions:
@@ -788,21 +764,6 @@ def normalize_language(language: object) -> str:
     return str(language)
 
 
-def resolve_speaker_embedding(
-    references: list[dict[str, object]],
-) -> list[float] | None:
-    """The precomputed speaker embedding a reference carries in place of its audio."""
-    speaker_embeddings = [
-        reference["speaker_embedding"]
-        for reference in references
-        if reference.get("speaker_embedding") is not None
-    ]
-    if not speaker_embeddings:
-        return None
-    else:
-        return [float(value) for value in speaker_embeddings[0]]
-
-
 def resolve_x_vector_only_mode(
     *,
     params: dict[str, object],
@@ -980,36 +941,6 @@ def qwen3_tts_voice_prompt_from_cache(
         pass
     ref_text = artifact.get("ref_text")
     return prompt, str(ref_text) if ref_text is not None else None
-
-
-def qwen3_tts_voice_prompt_from_speaker_embedding(
-    speaker_embedding: list[float],
-    *,
-    embedding_size: int,
-    talker_dtype: torch.dtype,
-) -> VoicePrompt:
-    """The x-vector prompt of a precomputed speaker embedding as a CPU float32 tensor,
-    which the talker places on its device and dtype as it does an encoded reference's.
-    """
-    embedding = torch.tensor(speaker_embedding, dtype=torch.float32)
-    if embedding.numel() != embedding_size:
-        raise ValueError(
-            "Qwen3-TTS Base does not accept a speaker_embedding of length "
-            f"{embedding.numel()}; this checkpoint's speaker encoder emits "
-            f"{embedding_size} values"
-        )
-    elif not bool(torch.isfinite(embedding.to(talker_dtype)).all()):
-        raise ValueError(
-            "Qwen3-TTS Base does not accept a speaker_embedding with values that "
-            f"are not finite in the talker's {talker_dtype}"
-        )
-    else:
-        pass
-    return {
-        "ref_spk_embedding": [embedding],
-        "ref_code": [None],
-        "icl_mode": [False],
-    }
 
 
 @dataclass(frozen=True)
@@ -1534,11 +1465,13 @@ def prepare_qwen3_tts_base_request(
         else None
     )
     if state.speaker_embedding is not None:
-        voice_clone_prompt = qwen3_tts_voice_prompt_from_speaker_embedding(
-            state.speaker_embedding,
-            embedding_size=model.root_config.speaker_encoder_config.enc_dim,
-            talker_dtype=model.dtype,
-        )
+        voice_clone_prompt = {
+            "ref_spk_embedding": [
+                torch.tensor(state.speaker_embedding, dtype=torch.float32)
+            ],
+            "ref_code": [None],
+            "icl_mode": [False],
+        }
         ref_text = state.ref_text
     elif cached_prompt is not None:
         voice_clone_prompt, ref_text = cached_prompt

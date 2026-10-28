@@ -1233,65 +1233,6 @@ def test_qwen3_tts_embedding_reference_infers_base_x_vector(reference: dict) -> 
     assert state.x_vector_only_mode is True
 
 
-@pytest.mark.parametrize(
-    ("references", "inputs", "tts_params", "match"),
-    [
-        (
-            [EMBEDDING_REFERENCE],
-            {},
-            {"task_type": "CustomVoice"},
-            "CustomVoice does not accept speaker_embedding",
-        ),
-        (
-            [EMBEDDING_REFERENCE],
-            {"instructions": "warm voice"},
-            {"task_type": "VoiceDesign"},
-            "VoiceDesign does not accept speaker_embedding",
-        ),
-        (
-            [EMBEDDING_REFERENCE],
-            {},
-            {"ref_audio": "/tmp/reference.wav"},
-            "Base does not accept speaker_embedding with reference audio",
-        ),
-        (
-            [{**EMBEDDING_REFERENCE, "audio_path": "/tmp/reference.wav"}],
-            {},
-            {},
-            "Base does not accept speaker_embedding with reference audio",
-        ),
-        (
-            [{"audio_path": "/tmp/reference.wav"}, EMBEDDING_REFERENCE],
-            {},
-            {},
-            "Base does not accept speaker_embedding with reference audio",
-        ),
-        (
-            [EMBEDDING_REFERENCE],
-            {},
-            {"x_vector_only_mode": False, "ref_text": "transcript"},
-            "Base does not accept speaker_embedding with x_vector_only_mode false",
-        ),
-    ],
-)
-def test_qwen3_tts_refuses_speaker_embedding_outside_x_vector_cloning(
-    references: list[dict],
-    inputs: dict,
-    tts_params: dict,
-    match: str,
-) -> None:
-    """A caller past the HTTP validator could send an embedding with reference audio,
-    whose prompt then silently used the embedding, or with x_vector_only_mode false and
-    a ref_text, whose state said ICL over an x-vector prompt."""
-    payload = make_payload(
-        inputs={"text": "target", "references": references, **inputs},
-        tts_params=tts_params,
-    )
-
-    with pytest.raises(ValueError, match=match):
-        build_qwen3_tts_state(payload)
-
-
 def test_qwen3_tts_preserves_explicit_default_like_sampling_values() -> None:
     """A set temperature 0.8 or top_k 30 reaches the model instead of being dropped."""
     payload = make_payload(
@@ -1605,12 +1546,8 @@ class EmbeddingPromptWrapper:
 
 class EmbeddingPromptModel:
     device = torch.device("cpu")
-    dtype = torch.bfloat16
     tts_model_type = "base"
-    root_config = SimpleNamespace(
-        tts_pad_token_id=0,
-        speaker_encoder_config=SimpleNamespace(enc_dim=2),
-    )
+    root_config = SimpleNamespace(tts_pad_token_id=0)
     model = SimpleNamespace(codec_embedding=torch.nn.Embedding(1, 4))
     speaker_encoder_sample_rate = 24000
 
@@ -1658,35 +1595,6 @@ def test_qwen3_tts_preprocessing_provided_speaker_embedding() -> None:
     assert prompt["icl_mode"] == [False]
     assert prepared.state.ref_audio is None
     assert prepared.state.speaker_embedding == [0.5, -0.25]
-
-
-@pytest.mark.parametrize(
-    ("speaker_embedding", "match"),
-    [
-        ([0.5], "length 1; this checkpoint's speaker encoder emits 2 values"),
-        ([float("nan"), 0.5], "not finite in the talker's torch.bfloat16"),
-        ([1e39, 0.5], "not finite in the talker's torch.bfloat16"),
-        ([3.4e38, 0.5], "not finite in the talker's torch.bfloat16"),
-    ],
-)
-def test_qwen3_tts_preprocessing_refuses_an_embedding_the_encoder_cannot_emit(
-    speaker_embedding: list[float], match: str
-) -> None:
-    """NaN, Infinity or a value past the talker's dtype reached the talker and produced
-    babble to the length cap with a success status."""
-    with pytest.raises(ValueError, match=match):
-        qwen3_request_builders.prepare_qwen3_tts_request(
-            make_payload(
-                inputs={
-                    "text": "target",
-                    "references": [{"speaker_embedding": speaker_embedding}],
-                }
-            ),
-            model=EmbeddingPromptModel(),
-            wrapper=EmbeddingPromptWrapper(),
-            prompt_constants=placeholder_prompt_constants(),
-            prompt_row_cache_keys=placeholder_prompt_row_cache_keys(),
-        )
 
 
 def test_qwen3_tts_uploaded_voice_clone_prompt_uses_shared_cache(
