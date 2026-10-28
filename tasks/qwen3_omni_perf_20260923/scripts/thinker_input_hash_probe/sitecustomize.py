@@ -5,6 +5,8 @@ imported, build_sglang_thinker_request is wrapped: before the build it prints on
 line to stderr with the request id, the sha256 of the prompt's input ids (the key that pairs
 a request across arms), and for every tensor in the state's thinker inputs its path, shape,
 dtype and the sha256 of its bytes, so a value that differs between arms names its field.
+build_talker_request_data is wrapped the same way: one TALKERIN line with the prompt ids' hash
+and every tensor of the payload the talker receives from the pipeline (not its thinker stream).
 """
 
 import hashlib
@@ -55,6 +57,26 @@ def patch(module):
         return build_original(state, *args, **kwargs)
 
     module.build_sglang_thinker_request = build_sglang_thinker_request
+
+    talker_build_original = module.build_talker_request_data
+
+    def build_talker_request_data(payload, *args, **kwargs):
+        found = []
+        tensors(payload.data, "data", found)
+        input_ids = (payload.data.get("prompt") or {}).get("input_ids")
+        key = digest(input_ids) if input_ids is not None else "none"
+        fields = " ".join(
+            f"{path}:{tuple(value.shape)}:{str(value.dtype).removeprefix('torch.')}:{digest(value)}"
+            for path, value in found
+        )
+        print(
+            f"TALKERIN rid={payload.request_id} key={key} {fields}",
+            file=sys.stderr,
+            flush=True,
+        )
+        return talker_build_original(payload, *args, **kwargs)
+
+    module.build_talker_request_data = build_talker_request_data
 
 
 class PatchOnImport(importlib.abc.MetaPathFinder):
