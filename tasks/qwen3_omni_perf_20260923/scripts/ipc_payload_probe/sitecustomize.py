@@ -6,14 +6,17 @@ and deserialize_direct_cuda_ipc_payload get one record per call with the wall an
 time of the whole call and of each step inside it (the request walks, extract_cuda_tensors,
 every pickle.dumps and pickle.loads, every ipc_pickle, restore_tensors), timed only at the
 outermost level so a recursive walk counts once. After the call, outside the timed region,
-the record adds the header's pickled size split by field and every tensor's shape, dtype,
-device and storage size. One JSON line per call goes to <dir>/ipc_<pid>.jsonl.
+the record adds the process name, the header's pickled size split by field, every tensor's
+shape, dtype, device and storage size, and the own bytes of the payload's CPU tensors against the
+bytes of the distinct storages they keep (the excess a header pickle writes on main). One JSON
+line per call goes to <dir>/ipc_<pid>.jsonl.
 """
 
 import functools
 import importlib.abc
 import importlib.util
 import json
+import multiprocessing
 import os
 import pickle as std_pickle
 import sys
@@ -109,12 +112,37 @@ def field_sizes(value, depth):
     return {"type": type(value).__name__, "pickled": pickled_size(value)}
 
 
+def cpu_tensor_totals(value, storages, seen):
+    """Own bytes of every CPU tensor in value, and the distinct storages they keep."""
+    import torch
+
+    if id(value) in seen:
+        return 0
+    seen.add(id(value))
+    if isinstance(value, torch.Tensor):
+        if value.is_cuda:
+            return 0
+        storage = value.untyped_storage()
+        storages[storage.data_ptr()] = storage.nbytes()
+        return int(value.numel() * value.element_size())
+    if isinstance(value, dict):
+        return sum(cpu_tensor_totals(item, storages, seen) for item in value.values())
+    if isinstance(value, (list, tuple)):
+        return sum(cpu_tensor_totals(item, storages, seen) for item in value)
+    return 0
+
+
 def describe_serialize(module, payload, result):
     data_without_tensors, tensors = module.extract_cuda_tensors_unprobed(payload.data)
     request = payload.request
+    storages = {}
+    cpu_bytes = cpu_tensor_totals(payload.data, storages, set())
     return {
+        "process": multiprocessing.current_process().name,
         "request_id": payload.request_id,
         "header_bytes": len(result["header"]),
+        "cpu_tensor_bytes": cpu_bytes,
+        "cpu_storage_bytes": sum(storages.values()),
         "tensor_entry_bytes": [len(item["tensor_bytes"]) for item in result["tensors"]],
         "request": {
             "pickled": pickled_size(request),
