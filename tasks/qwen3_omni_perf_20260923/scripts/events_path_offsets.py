@@ -1,12 +1,13 @@
 """Two arms' request paths side by side from the request event recorder.
 
 Reads every events_*.jsonl under each event dir (run_bench_boot.sh with EVENTS=1), keeps each
-request's first timestamp per (stage, event), takes the last N requests by admission (one arm
-of a boot that served several), and prints for every (stage, event) its median and p90 offset
-from admission in ms in each dir and the median's difference, ordered by the first dir's
-median, so the first event where the arms part names the stage that owns the difference.
+request's first timestamp per (stage, event), takes a slice of the requests by admission
+order (START:STOP as in Python, e.g. :20 or -20:, one arm of a boot that served several), and
+prints for every (stage, event) its median and p90 offset from admission in ms in each dir and
+the median's difference, ordered by the first dir's median, so the first event where the arms
+part names the stage that owns the difference.
 
-usage: python events_path_offsets.py EVENT_DIR_A EVENT_DIR_B LAST_N
+usage: python events_path_offsets.py EVENT_DIR_A EVENT_DIR_B START:STOP
 """
 
 from __future__ import annotations
@@ -26,7 +27,7 @@ def percentile(values: list[float], fraction: float) -> float:
     return ordered[min(len(ordered) - 1, int(fraction * len(ordered)))]
 
 
-def offsets(event_dir: str, last_n: int) -> dict[tuple[str, str], list[float]]:
+def offsets(event_dir: str, selected: slice) -> dict[tuple[str, str], list[float]]:
     first: dict[str, dict[tuple[str, str], int]] = collections.defaultdict(dict)
     for path in glob.glob(
         os.path.join(event_dir, "**", "events_*.jsonl"), recursive=True
@@ -42,7 +43,7 @@ def offsets(event_dir: str, last_n: int) -> dict[tuple[str, str], list[float]]:
         (request[ADMISSION], request_id)
         for request_id, request in first.items()
         if ADMISSION in request
-    )[-last_n:]
+    )[selected]
     result: dict[tuple[str, str], list[float]] = collections.defaultdict(list)
     for admission_ns, request_id in admitted:
         for key, timestamp_ns in first[request_id].items():
@@ -51,10 +52,11 @@ def offsets(event_dir: str, last_n: int) -> dict[tuple[str, str], list[float]]:
 
 
 def main() -> None:
-    last_n = int(sys.argv[3])
-    arm_a = offsets(sys.argv[1], last_n)
-    arm_b = offsets(sys.argv[2], last_n)
-    print(f"A {sys.argv[1]}\nB {sys.argv[2]}\nlast {last_n} requests by admission")
+    start, stop = (int(bound) if bound else None for bound in sys.argv[3].split(":"))
+    selected = slice(start, stop)
+    arm_a = offsets(sys.argv[1], selected)
+    arm_b = offsets(sys.argv[2], selected)
+    print(f"A {sys.argv[1]}\nB {sys.argv[2]}\nrequests {sys.argv[3]} by admission")
     print(
         f"{'stage:event':58s} {'n':>3s} {'A med':>9s} {'B med':>9s} {'B-A':>8s} "
         f"{'A p90':>9s} {'B p90':>9s}"
