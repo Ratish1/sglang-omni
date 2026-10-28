@@ -1,9 +1,11 @@
 """Per-process kernel table over a census window, graph node kernels included.
 
-For each process (named from the census's process line), the summed kernel time, the GPUs it
-ran on, and its largest kernels by name with call counts and mean duration. Sums are over
-kernel durations, so a process's total is its card time, not a union, and processes on
-different cards are read side by side.
+For each process (named from the census's process line), the GPUs it ran on and its largest
+kernels by name with call counts. Each kernel is charged its exclusive time on its stream:
+the part after the previous kernel of that stream ended, since a kernel launched with
+programmatic dependent launch starts early and waits inside itself for its predecessor, so
+its raw duration repeats the predecessor's. The raw sum is printed beside it. On a card that
+several processes share, both still include time the context was switched out.
 
 usage: python kernel_table.py <serve.sqlite> <window.txt> <census.txt> [top]
 """
@@ -29,37 +31,47 @@ def main() -> None:
     names = {int(pid): stage for pid, stage in re.findall(r"(\d+)=(\w+)", process_line)}
     strings = dict(database.execute("select id, value from StringIds"))
     rows = database.execute(
-        "select globalPid, deviceId, shortName, start, end from CUPTI_ACTIVITY_KIND_KERNEL"
-        " where start >= ? and end <= ?",
+        "select globalPid, deviceId, streamId, shortName, start, end"
+        " from CUPTI_ACTIVITY_KIND_KERNEL where start >= ? and end <= ?"
+        " order by globalPid, deviceId, streamId, start",
         (start, end),
     ).fetchall()
     window_ms = (end - start) / 1e6
     per_process: dict[int, dict[str, list[float]]] = {}
     devices: dict[int, set[int]] = {}
-    for global_pid, device, short_name, kernel_start, kernel_end in rows:
+    stream_end: dict[tuple[int, int, int], int] = {}
+    for global_pid, device, stream, short_name, kernel_start, kernel_end in rows:
         pid = pid_of(global_pid)
+        key = (global_pid, device, stream)
+        exclusive_start = max(kernel_start, stream_end.get(key, kernel_start))
+        stream_end[key] = max(kernel_end, stream_end.get(key, kernel_end))
         kernels = per_process.setdefault(pid, {})
-        entry = kernels.setdefault(strings.get(short_name, str(short_name)), [0.0, 0])
-        entry[0] += (kernel_end - kernel_start) / 1e6
-        entry[1] += 1
+        entry = kernels.setdefault(
+            strings.get(short_name, str(short_name)), [0.0, 0.0, 0]
+        )
+        entry[0] += max(kernel_end - exclusive_start, 0) / 1e6
+        entry[1] += (kernel_end - kernel_start) / 1e6
+        entry[2] += 1
         devices.setdefault(pid, set()).add(device)
     print(f"window {window_ms:.0f} ms")
     for pid, kernels in sorted(
         per_process.items(), key=lambda item: -sum(v[0] for v in item[1].values())
     ):
-        total = sum(value[0] for value in kernels.values())
-        count = sum(value[1] for value in kernels.values())
+        exclusive = sum(value[0] for value in kernels.values())
+        raw = sum(value[1] for value in kernels.values())
+        count = sum(value[2] for value in kernels.values())
         print(
-            f"\n{names.get(pid, pid)} pid={pid} gpu={sorted(devices[pid])} "
-            f"kernel time {total:.0f} ms ({100 * total / window_ms:.1f} % of the window), "
-            f"{count} kernels"
+            f"\n{names.get(pid, pid)} pid={pid} gpu={sorted(devices[pid])} exclusive "
+            f"{exclusive:.0f} ms ({100 * exclusive / window_ms:.1f} % of the window), "
+            f"raw {raw:.0f} ms, {count} kernels"
         )
-        for name, (milliseconds, calls) in sorted(
+        for name, (milliseconds, raw_ms, calls) in sorted(
             kernels.items(), key=lambda item: -item[1][0]
         )[:top]:
             print(
-                f"  {100 * milliseconds / total:5.1f} %  {milliseconds:8.1f} ms  "
-                f"{calls:7d} x {1e3 * milliseconds / calls:8.1f} us  {name[:90]}"
+                f"  {100 * milliseconds / exclusive:5.1f} %  {milliseconds:8.1f} ms  "
+                f"{calls:7d} x {1e3 * milliseconds / calls:8.1f} us  "
+                f"(raw {1e3 * raw_ms / calls:8.1f} us)  {name[:80]}"
             )
 
 
