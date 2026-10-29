@@ -25,6 +25,7 @@ from sglang_omni.proto import DataReadyMessage, StagePayload
 from sglang_omni.proto.messages import (
     DirectCudaIpcPayloadRef,
     DirectCudaIpcStreamChunkRef,
+    InlinePayloadRef,
     InlineStreamChunkRef,
     StageDataRef,
 )
@@ -369,7 +370,9 @@ def serialize_direct_cuda_ipc_stream_chunk(
 
 
 _INLINE_STREAM_CHUNK_TYPE = "InlineStreamChunk"
-_INLINE_STREAM_CHUNK_BYTES_LIMIT = 16 * 1024
+_INLINE_PAYLOAD_TYPE = "InlinePayload"
+# note (ratish): a stream chunk or payload of at most this many tensor bytes rides its control message, where the copies cost less than a SHM block's syscalls and acknowledgement.
+_INLINE_BYTES_LIMIT = 16 * 1024
 
 
 def serialize_inline_stream_chunk(
@@ -383,17 +386,17 @@ def serialize_inline_stream_chunk(
         return None
     else:
         pass
-    if data.element_size() * data.numel() > _INLINE_STREAM_CHUNK_BYTES_LIMIT:
+    if data.element_size() * data.numel() > _INLINE_BYTES_LIMIT:
         return None
     else:
         pass
     data = data.detach()
-    if data.untyped_storage().nbytes() > _INLINE_STREAM_CHUNK_BYTES_LIMIT:
+    if data.untyped_storage().nbytes() > _INLINE_BYTES_LIMIT:
         data = data.clone(memory_format=torch.contiguous_format)
     else:
         pass
     payload = pickle.dumps((data, metadata))
-    if len(payload) > _INLINE_STREAM_CHUNK_BYTES_LIMIT:
+    if len(payload) > _INLINE_BYTES_LIMIT:
         return None
     else:
         pass
@@ -428,10 +431,9 @@ def deserialize_inline_stream_chunk(
         )
     else:
         pass
-    if len(payload) > _INLINE_STREAM_CHUNK_BYTES_LIMIT:
+    if len(payload) > _INLINE_BYTES_LIMIT:
         raise ValueError(
-            "inline stream chunk payload exceeds "
-            f"{_INLINE_STREAM_CHUNK_BYTES_LIMIT} bytes"
+            f"inline stream chunk payload exceeds {_INLINE_BYTES_LIMIT} bytes"
         )
     else:
         pass
@@ -457,6 +459,87 @@ def deserialize_inline_stream_chunk(
     else:
         pass
     return data, metadata
+
+
+def serialize_inline_payload(payload: StagePayload) -> InlinePayloadRef | None:
+    """The payload with its tensors' packed bytes in the reference, or None above the inline bound."""
+    data_without_tensors, tensors = extract_tensors(payload.data)
+    tensor_bytes = sum(
+        tensor.numel() * tensor.element_size() for tensor in tensors.values()
+    )
+    if tensor_bytes > _INLINE_BYTES_LIMIT:
+        return None
+    else:
+        pass
+    chunks, entries = pack_tensor_chunks(tensors, device="cpu")
+    header = StagePayload(
+        request_id=payload.request_id,
+        request=payload.request,
+        data=data_without_tensors,
+    )
+    return {
+        "_type": _INLINE_PAYLOAD_TYPE,
+        "version": 1,
+        "header": pickle.dumps(header),
+        "tensors": [entry.to_dict() for entry in entries],
+        "buffer": torch.cat(chunks).numpy().tobytes(),
+    }
+
+
+def is_inline_payload_ref(value: object) -> bool:
+    return isinstance(value, dict) and value.get("_type") == _INLINE_PAYLOAD_TYPE
+
+
+def deserialize_inline_payload(
+    data_ref: dict[str, object] | StageDataRef,
+    local_device: str | None = None,
+) -> StagePayload:
+    if data_ref.get("_type") != _INLINE_PAYLOAD_TYPE:
+        raise ValueError("data_ref is not an inline payload")
+    else:
+        pass
+    if data_ref.get("version") != 1:
+        raise ValueError(
+            f"unsupported inline payload version {data_ref.get('version')!r}"
+        )
+    else:
+        pass
+    header_bytes = data_ref.get("header")
+    if not isinstance(header_bytes, bytes):
+        raise TypeError(
+            f"inline payload header must be bytes, got {type(header_bytes).__name__}"
+        )
+    else:
+        pass
+    raw_tensors = data_ref.get("tensors")
+    if not isinstance(raw_tensors, list):
+        raise TypeError(
+            f"inline payload tensors must be list, got {type(raw_tensors).__name__}"
+        )
+    else:
+        pass
+    buffer = data_ref.get("buffer")
+    if not isinstance(buffer, bytes):
+        raise TypeError(
+            f"inline payload buffer must be bytes, got {type(buffer).__name__}"
+        )
+    else:
+        pass
+    header = pickle.loads(header_bytes)
+    if not isinstance(header, StagePayload):
+        raise TypeError(
+            "inline payload header must decode to StagePayload, got "
+            f"{type(header).__name__}"
+        )
+    else:
+        pass
+    # note (ratish): the bytes are copied into a bytearray so the restored tensors are writable, as a mapped SHM block's are.
+    if buffer:
+        transfer_buffer = torch.frombuffer(bytearray(buffer), dtype=torch.uint8)
+    else:
+        transfer_buffer = torch.empty(0, dtype=torch.uint8)
+    entries = tuple(TensorMeta.from_dict(item) for item in raw_tensors)
+    return unpack_payload(header, entries, transfer_buffer, local_device)
 
 
 def is_direct_cuda_ipc_stream_chunk_ref(value: object) -> bool:
@@ -567,17 +650,28 @@ async def read_payload(
         pass
     header = pickle.loads(data_ref.header)
     transfer_buf = await read_transfer_buffer(relay, request_id, data_ref)
+    payload = unpack_payload(header, data_ref.tensors, transfer_buf, local_device)
+    relay.cleanup(request_id)
+    return payload
+
+
+def unpack_payload(
+    header: StagePayload,
+    entries: tuple[TensorMeta, ...],
+    transfer_buffer: torch.Tensor,
+    local_device: str | None,
+) -> StagePayload:
+    """The header's payload with each packed tensor restored as a view of the transfer buffer."""
     tensors = {
         entry.path: restore_tensor_device(
-            transfer_buf[entry.offset : entry.offset + entry.size]
+            transfer_buffer[entry.offset : entry.offset + entry.size]
             .view(torch_dtype(entry.dtype))
             .reshape(entry.shape),
             entry.device,
             local_device,
         )
-        for entry in data_ref.tensors
+        for entry in entries
     }
-    relay.cleanup(request_id)
     return StagePayload(
         request_id=header.request_id,
         request=header.request,
