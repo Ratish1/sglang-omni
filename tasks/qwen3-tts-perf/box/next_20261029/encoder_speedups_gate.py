@@ -14,6 +14,10 @@ Variants (each with a fresh batcher, its graphs captured after the change; dynam
                 instead of one per bucket)
   compile_dynamic_frames  compile_dynamic with the input length checked to be whole 1,920-sample frames, a fact
                 inductor can use for alignment
+  compile_regional  pads, then torch.compile(dynamic=True, fullgraph=True) on the repeated regions only, SGLang's
+                default-path form (small helpers, one dynamic program for every shape): each MimiResnetBlock and
+                MimiTransformerLayer (Module.compile), and one residual-quantizer step shared by the 16 codebooks;
+                the downsampling ELUs and convs, the transformer's mask and rope stay eager
   served      the tree exactly as loaded, nothing installed or reset (a branch that carries its own mechanisms)
 Per variant: capture wall time; codes through graphs and eager against official's float32 exact-length encode and
 against the base variant's graph codes, all clips; device time, kernel count and top kernels per encode over the
@@ -34,7 +38,12 @@ import torch
 import torch.nn.functional as F
 from torch.profiler import ProfilerActivity, profile
 from transformers.models.mimi import modeling_mimi
-from transformers.models.mimi.modeling_mimi import MimiConv1d
+from transformers.models.mimi.modeling_mimi import (
+    MimiConv1d,
+    MimiResidualVectorQuantizer,
+    MimiResnetBlock,
+    MimiTransformerLayer,
+)
 
 import sglang_omni
 from sglang_omni.models.qwen3_tts.compat import apply_qwen_tts_transformers_compatibility_patches
@@ -54,6 +63,7 @@ VARIANTS = {
     "compile_qkv": ("pads", "qkv", "compile"),
     "compile_dynamic": ("pads", "compile_dynamic"),
     "compile_dynamic_frames": ("pads", "compile_dynamic_frames"),
+    "compile_regional": ("pads", "compile_regional"),
     "served": None,
 }
 DEFAULT_VARIANTS = "base,pads,qkv,compile,compile_qkv"
@@ -129,6 +139,32 @@ def compiled_encode(encoder: torch.nn.Module, dynamic: bool, frame_multiple: int
     return runner_encode
 
 
+@torch.compile(dynamic=True, fullgraph=True)
+def codebook_step(embed: torch.Tensor, residual: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """One iteration of MimiResidualVectorQuantizer.encode (transformers 5.19.0): nearest centroid, new residual."""
+    hidden = residual.permute(0, 2, 1)
+    flat = hidden.reshape(-1, hidden.shape[-1])
+    indices = torch.cdist(flat[None].float(), embed[None].float(), p=2)[0].argmin(dim=-1).view(*hidden.shape[:-1])
+    return indices, residual - F.embedding(indices, embed).permute(0, 2, 1)
+
+
+def regional_quantizer_encode(quantizer: MimiResidualVectorQuantizer):
+    def encode(embeddings: torch.Tensor, num_quantizers: int | None = None) -> torch.Tensor:
+        if quantizer.input_proj is not None:
+            embeddings = quantizer.input_proj(embeddings)
+        else:
+            pass
+        num_quantizers = num_quantizers if num_quantizers is not None else quantizer.num_quantizers
+        residual = embeddings
+        all_indices = []
+        for layer in quantizer.layers[:num_quantizers]:
+            indices, residual = codebook_step(layer.codebook.embed, residual)
+            all_indices.append(indices)
+        return torch.stack(all_indices)
+
+    return encode
+
+
 def install(encoder: torch.nn.Module, mechanisms: tuple[str, ...]) -> None:
     torch._dynamo.reset()
     for module in encoder.modules():
@@ -136,6 +172,18 @@ def install(encoder: torch.nn.Module, mechanisms: tuple[str, ...]) -> None:
             module.__dict__.pop("forward", None)
             if "pads" in mechanisms:
                 module.forward = integer_padding_forward(module)
+            else:
+                pass
+        elif isinstance(module, (MimiResnetBlock, MimiTransformerLayer)):
+            module._compiled_call_impl = None
+            if "compile_regional" in mechanisms:
+                module.compile(dynamic=True, fullgraph=True)
+            else:
+                pass
+        elif isinstance(module, MimiResidualVectorQuantizer):
+            module.__dict__.pop("encode", None)
+            if "compile_regional" in mechanisms:
+                module.encode = regional_quantizer_encode(module)
             else:
                 pass
         else:
