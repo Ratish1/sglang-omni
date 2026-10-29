@@ -18,10 +18,19 @@ Variants (each with a fresh batcher, its graphs captured after the change; dynam
                 default-path form (small helpers, one dynamic program for every shape): each MimiResnetBlock and
                 MimiTransformerLayer (Module.compile), and one residual-quantizer step shared by the 16 codebooks;
                 the downsampling ELUs and convs, the transformer's mask and rope stay eager
+  compile_cosy  Fun-CosyVoice3's compile form on the whole encode frame: its process-wide settings
+                (set_dit_compile_config, fun_cosyvoice3/stages.py:1447-1455: the FX graph cache, a cache size limit of
+                1,024, Triton's libdevice set once so a warm boot's lookups hit), its options (packed_dit.py:35-39:
+                triton.autotune_pointwise off, emulate_precision_casts on), fullgraph, not dynamic=True, the input's
+                length dimension hinted dynamic with maybe_mark_dynamic on every call (stages.py:1533-1535), so one
+                program serves every bucket
+  compile_static_cosy  compile (static, per bucket) with compile_cosy's settings and options, no length hint
+  compile_regional_cosy  compile_regional's regions with compile_cosy's settings and options, not dynamic=True:
+                automatic dynamic, so a region's second bucket makes its length symbolic (CosyVoice's two-size warmup)
   served      the tree exactly as loaded, nothing installed or reset (a branch that carries its own mechanisms)
-Per variant: capture wall time; codes through graphs and eager against official's float32 exact-length encode and
-against the base variant's graph codes, all clips; device time, kernel count and top kernels per encode over the
-first 200 clips under the profiler.
+Per variant: capture wall time and Dynamo's per-phase compile times; codes through graphs and eager against
+official's float32 exact-length encode and against the base variant's graph codes, all clips; device time, kernel
+count and top kernels per encode over the first 200 clips under the profiler.
 
 usage: PYTHONPATH=TREE python3 encoder_speedups_gate.py WAV_DIR --model Qwen/Qwen3-TTS-12Hz-1.7B-Base [--card 0]
 """
@@ -35,7 +44,10 @@ from pathlib import Path
 import librosa
 import numpy as np
 import torch
+import torch._inductor.config as inductor_config  # noqa: leading-underscore  # upstream name
 import torch.nn.functional as F
+from torch._dynamo.utils import compile_times  # noqa: leading-underscore  # upstream name
+from torch._inductor.runtime.compile_tasks import _set_triton_libdevice_path  # noqa: leading-underscore  # upstream name
 from torch.profiler import ProfilerActivity, profile
 from transformers.models.mimi import modeling_mimi
 from transformers.models.mimi.modeling_mimi import (
@@ -64,8 +76,12 @@ VARIANTS = {
     "compile_dynamic": ("pads", "compile_dynamic"),
     "compile_dynamic_frames": ("pads", "compile_dynamic_frames"),
     "compile_regional": ("pads", "compile_regional"),
+    "compile_cosy": ("pads", "compile_cosy"),
+    "compile_static_cosy": ("pads", "compile_static_cosy"),
+    "compile_regional_cosy": ("pads", "compile_regional_cosy"),
     "served": None,
 }
+COSYVOICE_INDUCTOR_OPTIONS = {"triton.autotune_pointwise": False, "emulate_precision_casts": True}
 DEFAULT_VARIANTS = "base,pads,qkv,compile,compile_qkv"
 TIMED_CLIPS = 200
 TOP_KERNELS = 10
@@ -123,7 +139,22 @@ def merged_qkv_forward(attention: torch.nn.Module):
     return forward
 
 
-def compiled_encode(encoder: torch.nn.Module, dynamic: bool, frame_multiple: int = 0):
+def set_cosyvoice_compile_config() -> None:
+    """Fun-CosyVoice3's set_dit_compile_config (fun_cosyvoice3/stages.py:1447-1455)."""
+    inductor_config.fx_graph_cache = True
+    torch._dynamo.config.cache_size_limit = 1024
+    torch._dynamo.config.accumulated_cache_size_limit = 1024
+    with inductor_config.patch({"eager_numerics.use_pytorch_libdevice": True}):
+        _set_triton_libdevice_path()
+
+
+def compiled_encode(
+    encoder: torch.nn.Module,
+    dynamic: bool | None,
+    frame_multiple: int = 0,
+    options: dict[str, bool] | None = None,
+    is_length_hinted: bool = False,
+):
     def encode_frame(values: torch.Tensor, num_quantizers: int) -> torch.Tensor:
         if frame_multiple:
             torch._check(values.shape[-1] % frame_multiple == 0)
@@ -131,16 +162,19 @@ def compiled_encode(encoder: torch.nn.Module, dynamic: bool, frame_multiple: int
             pass
         return encoder._encode_frame(values, num_quantizers, None, use_streaming=False, return_dict=True)[0]
 
-    compiled = torch.compile(encode_frame, dynamic=dynamic, fullgraph=True)
+    compiled = torch.compile(encode_frame, dynamic=dynamic, fullgraph=True, options=options)
 
     def runner_encode(self, values: torch.Tensor) -> torch.Tensor:
+        if is_length_hinted:
+            torch._dynamo.maybe_mark_dynamic(values, 2)
+        else:
+            pass
         return compiled(values, self.num_quantizers)
 
     return runner_encode
 
 
-@torch.compile(dynamic=True, fullgraph=True)
-def codebook_step(embed: torch.Tensor, residual: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+def codebook_step_eager(embed: torch.Tensor, residual: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     """One iteration of MimiResidualVectorQuantizer.encode (transformers 5.19.0): nearest centroid, new residual."""
     hidden = residual.permute(0, 2, 1)
     flat = hidden.reshape(-1, hidden.shape[-1])
@@ -148,7 +182,11 @@ def codebook_step(embed: torch.Tensor, residual: torch.Tensor) -> tuple[torch.Te
     return indices, residual - F.embedding(indices, embed).permute(0, 2, 1)
 
 
-def regional_quantizer_encode(quantizer: MimiResidualVectorQuantizer):
+codebook_step = torch.compile(codebook_step_eager, dynamic=True, fullgraph=True)
+codebook_step_cosy = torch.compile(codebook_step_eager, fullgraph=True, options=COSYVOICE_INDUCTOR_OPTIONS)
+
+
+def regional_quantizer_encode(quantizer: MimiResidualVectorQuantizer, step):
     def encode(embeddings: torch.Tensor, num_quantizers: int | None = None) -> torch.Tensor:
         if quantizer.input_proj is not None:
             embeddings = quantizer.input_proj(embeddings)
@@ -158,7 +196,7 @@ def regional_quantizer_encode(quantizer: MimiResidualVectorQuantizer):
         residual = embeddings
         all_indices = []
         for layer in quantizer.layers[:num_quantizers]:
-            indices, residual = codebook_step(layer.codebook.embed, residual)
+            indices, residual = step(layer.codebook.embed, residual)
             all_indices.append(indices)
         return torch.stack(all_indices)
 
@@ -178,16 +216,24 @@ def install(encoder: torch.nn.Module, mechanisms: tuple[str, ...]) -> None:
             module._compiled_call_impl = None
             if "compile_regional" in mechanisms:
                 module.compile(dynamic=True, fullgraph=True)
+            elif "compile_regional_cosy" in mechanisms:
+                module.compile(fullgraph=True, options=COSYVOICE_INDUCTOR_OPTIONS)
             else:
                 pass
         elif isinstance(module, MimiResidualVectorQuantizer):
             module.__dict__.pop("encode", None)
             if "compile_regional" in mechanisms:
-                module.encode = regional_quantizer_encode(module)
+                module.encode = regional_quantizer_encode(module, codebook_step)
+            elif "compile_regional_cosy" in mechanisms:
+                module.encode = regional_quantizer_encode(module, codebook_step_cosy)
             else:
                 pass
         else:
             pass
+    if any(mechanism.endswith("_cosy") for mechanism in mechanisms):
+        set_cosyvoice_compile_config()
+    else:
+        pass
     for layer in encoder.encoder_transformer.layers:
         layer.self_attn.__dict__.pop("forward", None)
         if "qkv" in mechanisms:
@@ -200,6 +246,14 @@ def install(encoder: torch.nn.Module, mechanisms: tuple[str, ...]) -> None:
         Qwen3TTSReferenceEncoderCudaGraphRunner._encode = compiled_encode(encoder, dynamic=True)
     elif "compile_dynamic_frames" in mechanisms:
         Qwen3TTSReferenceEncoderCudaGraphRunner._encode = compiled_encode(encoder, dynamic=True, frame_multiple=1920)
+    elif "compile_cosy" in mechanisms:
+        Qwen3TTSReferenceEncoderCudaGraphRunner._encode = compiled_encode(
+            encoder, dynamic=None, options=COSYVOICE_INDUCTOR_OPTIONS, is_length_hinted=True
+        )
+    elif "compile_static_cosy" in mechanisms:
+        Qwen3TTSReferenceEncoderCudaGraphRunner._encode = compiled_encode(
+            encoder, dynamic=False, options=COSYVOICE_INDUCTOR_OPTIONS
+        )
     else:
         Qwen3TTSReferenceEncoderCudaGraphRunner._encode = ORIGINAL_ENCODE
 
@@ -263,6 +317,10 @@ def main() -> None:
             print(f"== {name}: batcher failed: {type(exc).__name__}: {str(exc)[:400]}", flush=True)
             continue
         capture_s = time.perf_counter() - began
+        if any(mechanism.startswith("compile") for mechanism in mechanisms or ()):
+            print(f"-- {name} compile phases (s):\n{compile_times(repr='str', aggregate=True)}", flush=True)
+        else:
+            pass
         stats = graphs.graph_runner.stats() if graphs.graph_runner is not None else {}
         if not stats.get("enabled"):
             print(f"== {name}: graphs disabled: {stats.get('disable_reason')}", flush=True)
