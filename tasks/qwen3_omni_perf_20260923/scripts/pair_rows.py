@@ -41,8 +41,16 @@ def arm_values(boot: Path, arm: str) -> dict[str, float]:
         return values
     else:
         pass
-    results = json.loads((boot / arm / f"{arm}_results.json").read_text())
+    (results_path,) = (boot / arm).glob("*_results.json")
+    results = json.loads(results_path.read_text())
     values = {field: results["speed"][field] for field in VIDEO_FIELDS}
+    values.update(
+        {
+            field: results["speed"][field]
+            for field in SPEECH_FIELDS[len(VIDEO_FIELDS) :]
+            if field in results["speed"]
+        }
+    )
     values["accuracy"] = results["summary"]["accuracy"]
     values["completed"] = results["speed"]["completed_requests"]
     values["max_token_hits"] = results["speed"]["max_token_hits"]
