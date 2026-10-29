@@ -773,3 +773,5 @@ The TTS CI non-streaming and streaming stages run this probe for Qwen3-TTS on fo
   on one- or two-word texts on 1.7B) can fall into a repetition loop and keep generating up to
   `max_new_tokens`. On Base checkpoints the default text-length budget stops such a loop after a few seconds with
   finish reason `length`; raising `repetition_penalty` (default `1.05`) also helps.
+  CustomVoice and VoiceDesign loop far less often (2 runaways in about 121,000 Chinese requests and none in
+  9,792 English ones) and run to the checkpoint's limit unless the request sets `max_new_tokens`.
