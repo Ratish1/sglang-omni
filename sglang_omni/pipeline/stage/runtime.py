@@ -681,9 +681,7 @@ class Stage:
                 )
             except Exception as exc:
                 logger.exception(
-                    "Stage %s: inline payload deserialize failed for %s",
-                    self.name,
-                    request_id,
+                    f"Stage {self.name}: inline payload deserialize failed for {request_id}"
                 )
                 await self.wait_for_receive_predecessor(predecessor)
                 await self.send_failure(

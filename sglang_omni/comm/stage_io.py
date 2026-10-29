@@ -534,7 +534,7 @@ def deserialize_inline_payload(
         )
     else:
         pass
-    # note (ratish): the bytes are copied into a bytearray so the restored tensors are writable, as a mapped SHM block's are.
+    # note (ratish): the bytes are copied into a bytearray so the restored tensors are writable, as a SHM read's are.
     if buffer:
         transfer_buffer = torch.frombuffer(bytearray(buffer), dtype=torch.uint8)
     else:
