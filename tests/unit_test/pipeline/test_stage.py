@@ -4,8 +4,11 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import errno
 import logging
+import os
 import pickle
+import sys
 import threading
 import time
 from unittest.mock import Mock
@@ -35,6 +38,7 @@ from sglang_omni.proto.session import (
     SessionOperation,
     TimedChunk,
 )
+from sglang_omni.relay.shm import ShmRelay
 from sglang_omni.scheduling import omni_scheduler as omni_scheduler_module
 from sglang_omni.scheduling.message import IncomingMessage
 from sglang_omni.scheduling.omni_scheduler import OmniScheduler
@@ -1591,6 +1595,34 @@ def test_stage_sends_a_host_payload_inline_up_to_sixteen_kib(
         assert target == "thinker"
         assert message.data_ref["_type"] == data_ref_type
         assert bool(relay.storage) == (data_ref_type == "DataRef")
+
+    asyncio.run(run())
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="pages are reserved on Linux")
+def test_stage_sends_a_payload_inline_when_its_shm_block_cannot_be_reserved(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def full_device(file_descriptor: int, offset: int, length: int) -> None:
+        raise OSError(errno.ENOSPC, "No space left on device")
+
+    monkeypatch.setattr(os, "posix_fallocate", full_device)
+    payload = make_payload_above_inline_bound("req-full")
+
+    async def run() -> None:
+        control_plane = RecordingStageControlPlane()
+        sender = make_stage(
+            name="preprocessing",
+            endpoints={"thinker": "inproc://thinker"},
+            relay=ShmRelay(engine_id="preprocessing", device="cpu", credits=1),
+            control_plane=control_plane,
+        )
+
+        await sender.send_to_stage("req-full", "thinker", payload)
+
+        ((_, _, message),) = control_plane.sent_to_stage
+        restored = stage_io.deserialize_inline_payload(message.data_ref)
+        assert tensor_equal(restored.data, payload.data)
 
     asyncio.run(run())
 

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import errno
 import os
 import sys
 from multiprocessing import shared_memory
@@ -90,6 +91,33 @@ def test_shm_put_chunks_that_fail_to_copy_unlink_block_and_release_credit(
             with pytest.raises(RuntimeError, match="copy failed"):
                 await relay.put_chunks_async(chunks, request_id="r0")
         assert created_names and not os.path.exists(f"/dev/shm/{created_names[0]}")
+        put_operation = await asyncio.wait_for(
+            relay.put_chunks_async(chunks, request_id="r1"), 1.0
+        )
+        with pytest.raises(TimeoutError):
+            await put_operation.wait_for_completion(timeout=0.0)
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="pages are reserved on Linux")
+def test_shm_put_that_cannot_reserve_pages_unlinks_block_and_releases_credit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    reserved_paths: list[str] = []
+
+    def full_device(file_descriptor: int, offset: int, length: int) -> None:
+        reserved_paths.append(os.readlink(f"/proc/self/fd/{file_descriptor}"))
+        raise OSError(errno.ENOSPC, "No space left on device")
+
+    async def scenario() -> None:
+        relay = ShmRelay(engine_id="sender", device="cpu", credits=1)
+        chunks = [torch.zeros(16, dtype=torch.uint8)]
+        with monkeypatch.context() as patch:
+            patch.setattr(os, "posix_fallocate", full_device)
+            with pytest.raises(OSError, match="No space left"):
+                await relay.put_chunks_async(chunks, request_id="r0")
+        assert reserved_paths and not os.path.exists(reserved_paths[0])
         put_operation = await asyncio.wait_for(
             relay.put_chunks_async(chunks, request_id="r1"), 1.0
         )
