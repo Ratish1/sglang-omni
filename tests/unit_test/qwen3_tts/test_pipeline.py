@@ -1524,8 +1524,6 @@ def test_qwen3_tts_budgets_generation_by_the_target_text(
 def test_qwen3_tts_custom_voice_and_voice_design_take_the_checkpoint_limit(
     model_type: str, tts_params: dict[str, object]
 ) -> None:
-    """The text-length budget fitted to Base clones cut slow CustomVoice and VoiceDesign speech, which never ran away."""
-
     class FakeWrapper:
         def _build_assistant_text(self, text):
             return text
