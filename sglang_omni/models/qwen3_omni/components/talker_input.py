@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import torch
+from sglang.srt.utils.common import async_h2d
 
 
 def segment_chat_template(
@@ -57,13 +58,24 @@ def build_user_part(
         device=thinker_embed.device,
         dtype=thinker_embed.dtype,
     )
-    if multimodal_mask.any():
-        result[multimodal_mask] = hidden_projection(thinker_hidden[multimodal_mask])
+    # note (ratish): the mask comes from the host token ids, so both row lists cross in one pinned copy and no boolean index reads the device back.
+    multimodal_rows = multimodal_mask.nonzero(as_tuple=True)[0].tolist()
+    text_rows = (~multimodal_mask).nonzero(as_tuple=True)[0].tolist()
+    multimodal_index, text_index = async_h2d(
+        multimodal_rows + text_rows, dtype=torch.long, device=thinker_embed.device
+    ).split([len(multimodal_rows), len(text_rows)])
+    if multimodal_rows:
+        result.index_copy_(
+            0,
+            multimodal_index,
+            hidden_projection(thinker_hidden.index_select(0, multimodal_index)),
+        )
     else:
         pass
-    text_mask = ~multimodal_mask
-    if text_mask.any():
-        result[text_mask] = text_projection(thinker_embed[text_mask])
+    if text_rows:
+        result.index_copy_(
+            0, text_index, text_projection(thinker_embed.index_select(0, text_index))
+        )
     else:
         pass
     return result
@@ -117,7 +129,7 @@ def build_assistant_part(
     )  # [9, hidden]
 
     # Codec side: [3x zeros] + [embed(6 special tokens)]
-    codec_special_ids = torch.tensor(
+    codec_special_ids = async_h2d(
         [
             codec_nothink_id,
             codec_think_bos_id,
@@ -126,8 +138,8 @@ def build_assistant_part(
             codec_pad_id,
             codec_bos_id,
         ],
-        device=device,
         dtype=torch.long,
+        device=device,
     )
     codec_embeds = codec_embed_fn(codec_special_ids)  # [6, hidden]
     codec_hidden = torch.cat(
@@ -140,11 +152,11 @@ def build_assistant_part(
 
     input_embeds = text_hidden + codec_hidden
 
+    # note (ratish): the ids join the host prompt ids, so they are built on the host and never copied back.
     input_ids = torch.full(
         (text_hidden.shape[0],),
         tts_pad_token_id,
         dtype=torch.long,
-        device=device,
     )
 
     # HF's trailing_text_hidden is a FIFO stream of future assistant text rows:
