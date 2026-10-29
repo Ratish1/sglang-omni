@@ -369,9 +369,9 @@ def serialize_direct_cuda_ipc_stream_chunk(
 
 
 _INLINE_STREAM_CHUNK_TYPE = "InlineStreamChunk"
-_INLINE_PAYLOAD_TYPE = "InlinePayload"
+INLINE_PAYLOAD_TYPE = "InlinePayload"
 # note (ratish): a stream chunk or payload of at most this many tensor bytes rides its control message, where the copies cost less than a SHM block's syscalls and acknowledgement.
-_INLINE_BYTES_LIMIT = 16 * 1024
+INLINE_BYTES_LIMIT = 16 * 1024
 
 
 def serialize_inline_stream_chunk(
@@ -385,17 +385,17 @@ def serialize_inline_stream_chunk(
         return None
     else:
         pass
-    if data.element_size() * data.numel() > _INLINE_BYTES_LIMIT:
+    if data.element_size() * data.numel() > INLINE_BYTES_LIMIT:
         return None
     else:
         pass
     data = data.detach()
-    if data.untyped_storage().nbytes() > _INLINE_BYTES_LIMIT:
+    if data.untyped_storage().nbytes() > INLINE_BYTES_LIMIT:
         data = data.clone(memory_format=torch.contiguous_format)
     else:
         pass
     payload = pickle.dumps((data, metadata))
-    if len(payload) > _INLINE_BYTES_LIMIT:
+    if len(payload) > INLINE_BYTES_LIMIT:
         return None
     else:
         pass
@@ -430,9 +430,9 @@ def deserialize_inline_stream_chunk(
         )
     else:
         pass
-    if len(payload) > _INLINE_BYTES_LIMIT:
+    if len(payload) > INLINE_BYTES_LIMIT:
         raise ValueError(
-            f"inline stream chunk payload exceeds {_INLINE_BYTES_LIMIT} bytes"
+            f"inline stream chunk payload exceeds {INLINE_BYTES_LIMIT} bytes"
         )
     else:
         pass
@@ -466,7 +466,7 @@ def payload_fits_inline(payload: StagePayload) -> bool:
     tensor_bytes = sum(
         tensor.numel() * tensor.element_size() for tensor in tensors.values()
     )
-    return tensor_bytes <= _INLINE_BYTES_LIMIT
+    return tensor_bytes <= INLINE_BYTES_LIMIT
 
 
 def serialize_inline_payload(payload: StagePayload) -> InlinePayloadRef:
@@ -479,7 +479,7 @@ def serialize_inline_payload(payload: StagePayload) -> InlinePayloadRef:
         data=data_without_tensors,
     )
     return {
-        "_type": _INLINE_PAYLOAD_TYPE,
+        "_type": INLINE_PAYLOAD_TYPE,
         "version": 1,
         "header": pickle.dumps(header),
         "tensors": [entry.to_dict() for entry in entries],
@@ -488,14 +488,14 @@ def serialize_inline_payload(payload: StagePayload) -> InlinePayloadRef:
 
 
 def is_inline_payload_ref(value: object) -> bool:
-    return isinstance(value, dict) and value.get("_type") == _INLINE_PAYLOAD_TYPE
+    return isinstance(value, dict) and value.get("_type") == INLINE_PAYLOAD_TYPE
 
 
 def deserialize_inline_payload(
     data_ref: dict[str, object] | StageDataRef,
     local_device: str | None = None,
 ) -> StagePayload:
-    if data_ref.get("_type") != _INLINE_PAYLOAD_TYPE:
+    if data_ref.get("_type") != INLINE_PAYLOAD_TYPE:
         raise ValueError("data_ref is not an inline payload")
     else:
         pass
