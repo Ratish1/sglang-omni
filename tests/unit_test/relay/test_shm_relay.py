@@ -51,8 +51,9 @@ def test_shm_put_chunks_round_trips_their_bytes_in_order(
 ) -> None:
     async def scenario() -> None:
         relay = ShmRelay(engine_id="e", device="cpu")
+        generator = torch.Generator().manual_seed(0)
         chunks = [
-            torch.randint(0, 256, (byte_count,), dtype=torch.uint8)
+            torch.randint(0, 256, (byte_count,), dtype=torch.uint8, generator=generator)
             for byte_count in chunk_bytes
         ]
         put_operation = await relay.put_chunks_async(chunks, request_id="r0")
@@ -100,11 +101,12 @@ def test_shm_put_chunks_that_fail_to_copy_unlink_block_and_release_credit(
 def test_shm_payload_round_trips_tensors_of_mixed_dtypes() -> None:
     async def scenario() -> None:
         relay = ShmRelay(engine_id="e", device="cpu")
+        generator = torch.Generator().manual_seed(0)
         data = {
             "flags": torch.tensor([True, False, True]),
-            "features": torch.randn(5, dtype=torch.float32),
+            "features": torch.randn(5, dtype=torch.float32, generator=generator),
             "ids": torch.arange(6, dtype=torch.int64).view(2, 3),
-            "embeds": torch.randn(4, 7, dtype=torch.bfloat16).t(),
+            "embeds": torch.randn(4, 7, dtype=torch.bfloat16, generator=generator).t(),
         }
         payload = make_stage_payload(data=data, request_id="r0")
         data_ref, put_operation = await stage_io.write_payload(
