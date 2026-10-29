@@ -20,7 +20,7 @@ echo "queue block12 start $(date +%T) kit $(git -C $T rev-parse HEAD)" >> $L
 git -C $REPO fetch -q origin fix/qwen3-tts-task-checkpoint-limit
 rm -rf /workspace/n29_limit
 git -C $REPO worktree prune
-git -C $REPO worktree add -q --detach /workspace/n29_limit d32f74b36
+git -C $REPO worktree add -q --detach /workspace/n29_limit 051b93a42
 echo "tree limit $(git -C /workspace/n29_limit rev-parse HEAD HEAD:sglang_omni | tr '\n' ' ')" >> $L
 if [ ! -d $D/wavs ]; then
   (cd /workspace/n29_main && PYTHONPATH=/workspace/n29_main python3 $T/tasks/qwen3-tts-perf/box/bisect_20261027/stage_seedtts_wavs.py $D/wavs >> $L 2>&1)
