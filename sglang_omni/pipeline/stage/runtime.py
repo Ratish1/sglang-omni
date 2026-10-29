@@ -78,6 +78,7 @@ logger = logging.getLogger(__name__)
 
 _SCHEDULER_THREAD_JOIN_TIMEOUT_S = 5.0
 _OUTBOX_DRAIN_BATCH_SIZE = 64
+_SHM_INLINE_FALLBACK_WARNED: set[tuple[str, str]] = set()
 
 
 GetNextFn = Callable[[str, object], str | list[str] | None]
@@ -2024,53 +2025,80 @@ class Stage:
         if transport_kind is TransportKind.SHM and stage_io.payload_fits_inline(
             projected_payload
         ):
-            inline_ref = stage_io.serialize_inline_payload(projected_payload)
-            # note (ratish): this branch skips the payload send worker, so it records the transport it chose and the bytes it sent.
-            self.comm.router.note_transport_choice("payload", target, "inline")
-            _comm_trace(
-                "comm_payload_send",
-                request_id=request_id,
-                from_stage=self.name,
-                to_stage=target,
-                transport="inline",
-                bytes=len(inline_ref["buffer"]),
-            )
-            await self.control_plane.send_to_stage(
-                target,
-                endpoint,
-                DataReadyMessage(
-                    request_id=request_id,
-                    from_stage=self.name,
-                    to_stage=target,
-                    data_ref=inline_ref,
-                    replica_bindings=self.replica_bindings.get(request_id),
-                ),
-            )
-            _emit_event(
-                request_id=request_id,
-                stage=self.name,
-                event_name="stage_hop_sent",
-                metadata={"to_stage": target, "transport": "inline"},
+            await self.send_inline_payload(
+                request_id, target, endpoint, projected_payload
             )
             return
         else:
             pass
-        await self.comm.send_payload(
-            relay=relay,
-            control_plane=self.control_plane,
-            request_id=request_id,
-            payload=projected_payload,
-            transport=transport_kind,
-            from_stage=self.name,
-            to_stage=target,
-            target_endpoint=endpoint,
-            replica_bindings=self.replica_bindings.get(request_id),
-        )
+        try:
+            await self.comm.send_payload(
+                relay=relay,
+                control_plane=self.control_plane,
+                request_id=request_id,
+                payload=projected_payload,
+                transport=transport_kind,
+                from_stage=self.name,
+                to_stage=target,
+                target_endpoint=endpoint,
+                replica_bindings=self.replica_bindings.get(request_id),
+            )
+        except OSError as error:
+            if transport_kind is not TransportKind.SHM:
+                raise
+            else:
+                pass
+            # note (ratish): a SHM block that cannot be created or reserved (a full /dev/shm) is sent inline instead.
+            if (self.name, target) not in _SHM_INLINE_FALLBACK_WARNED:
+                _SHM_INLINE_FALLBACK_WARNED.add((self.name, target))
+                logger.warning(
+                    f"Stage {self.name}: no SHM block for a payload to {target} "
+                    f"({error}); sending payloads inline. Consider a larger /dev/shm."
+                )
+            else:
+                pass
+            await self.send_inline_payload(
+                request_id, target, endpoint, projected_payload
+            )
+            return
         _emit_event(
             request_id=request_id,
             stage=self.name,
             event_name="stage_hop_sent",
             metadata={"to_stage": target, "transport": transport_kind.value},
+        )
+
+    async def send_inline_payload(
+        self, request_id: str, target: str, endpoint: str, payload: StagePayload
+    ) -> None:
+        """Send the payload with its tensors' packed bytes inside its control message."""
+        inline_ref = stage_io.serialize_inline_payload(payload)
+        # note (ratish): this path skips the payload send worker, so it records the transport it chose and the bytes it sent.
+        self.comm.router.note_transport_choice("payload", target, "inline")
+        _comm_trace(
+            "comm_payload_send",
+            request_id=request_id,
+            from_stage=self.name,
+            to_stage=target,
+            transport="inline",
+            bytes=len(inline_ref["buffer"]),
+        )
+        await self.control_plane.send_to_stage(
+            target,
+            endpoint,
+            DataReadyMessage(
+                request_id=request_id,
+                from_stage=self.name,
+                to_stage=target,
+                data_ref=inline_ref,
+                replica_bindings=self.replica_bindings.get(request_id),
+            ),
+        )
+        _emit_event(
+            request_id=request_id,
+            stage=self.name,
+            event_name="stage_hop_sent",
+            metadata={"to_stage": target, "transport": "inline"},
         )
 
     @staticmethod
