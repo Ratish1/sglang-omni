@@ -10,7 +10,9 @@ Variants (each with a fresh batcher, its graphs captured after the change; dynam
                 compiled before capture under a raised recompile limit (the incremental codec's mechanism); the eager
                 arm runs pads alone, since compiled code belongs to the bucket graphs only
   compile_qkv   compile with qkv
-  served        the tree exactly as loaded, nothing installed or reset (a branch that carries its own mechanisms)
+  compile_dynamic  pads, then one torch.compile(fullgraph=True, dynamic=True) shared by every bucket (startup: one trace
+                instead of one per bucket)
+  served       the tree exactly as loaded, nothing installed or reset (a branch that carries its own mechanisms)
 Per variant: capture wall time; codes through graphs and eager against official's float32 exact-length encode and
 against the base variant's graph codes, all clips; device time, kernel count and top kernels per encode over the
 first 200 clips under the profiler.
@@ -48,6 +50,7 @@ VARIANTS = {
     "qkv": ("qkv",),
     "compile": ("pads", "compile"),
     "compile_qkv": ("pads", "qkv", "compile"),
+    "compile_dynamic": ("pads", "compile_dynamic"),
     "served": None,
 }
 DEFAULT_VARIANTS = "base,pads,qkv,compile,compile_qkv"
@@ -107,11 +110,11 @@ def merged_qkv_forward(attention: torch.nn.Module):
     return forward
 
 
-def compiled_encode(encoder: torch.nn.Module):
+def compiled_encode(encoder: torch.nn.Module, dynamic: bool):
     def encode_frame(values: torch.Tensor, num_quantizers: int) -> torch.Tensor:
         return encoder._encode_frame(values, num_quantizers, None, use_streaming=False, return_dict=True)[0]
 
-    compiled = torch.compile(encode_frame, dynamic=False, fullgraph=True)
+    compiled = torch.compile(encode_frame, dynamic=dynamic, fullgraph=True)
 
     def runner_encode(self, values: torch.Tensor) -> torch.Tensor:
         return compiled(values, self.num_quantizers)
@@ -136,9 +139,12 @@ def install(encoder: torch.nn.Module, mechanisms: tuple[str, ...]) -> None:
             layer.self_attn.forward = merged_qkv_forward(layer.self_attn)
         else:
             pass
-    Qwen3TTSReferenceEncoderCudaGraphRunner._encode = (
-        compiled_encode(encoder) if "compile" in mechanisms else ORIGINAL_ENCODE
-    )
+    if "compile" in mechanisms:
+        Qwen3TTSReferenceEncoderCudaGraphRunner._encode = compiled_encode(encoder, dynamic=False)
+    elif "compile_dynamic" in mechanisms:
+        Qwen3TTSReferenceEncoderCudaGraphRunner._encode = compiled_encode(encoder, dynamic=True)
+    else:
+        Qwen3TTSReferenceEncoderCudaGraphRunner._encode = ORIGINAL_ENCODE
 
 
 def compare(first: list[torch.Tensor], second: list[torch.Tensor]) -> str:
@@ -182,7 +188,7 @@ def main() -> None:
     for name in args.variants.split(","):
         mechanisms = VARIANTS[name]
         if mechanisms is not None:
-            install(encoder, tuple(mechanism for mechanism in mechanisms if mechanism != "compile"))
+            install(encoder, tuple(mechanism for mechanism in mechanisms if not mechanism.startswith("compile")))
         else:
             pass
         eager = Qwen3TTSRefCodeBatcher(ours)
