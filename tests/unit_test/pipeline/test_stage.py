@@ -1537,11 +1537,15 @@ def test_direct_cuda_ipc_payload_rejects_request_tensors() -> None:
 
 
 def test_inline_payload_round_trips_through_the_control_message() -> None:
+    generator = torch.Generator().manual_seed(0)
     data = {
         "flags": torch.tensor([True, False, True]),
-        "features": torch.randn(5, dtype=torch.float32),
+        "features": torch.randn(5, dtype=torch.float32, generator=generator),
         "nested": {"ids": torch.arange(6, dtype=torch.int64).view(2, 3)},
-        "embeds": (torch.randn(4, 7, dtype=torch.bfloat16).t(), "kept"),
+        "embeds": (
+            torch.randn(4, 7, dtype=torch.bfloat16, generator=generator).t(),
+            "kept",
+        ),
         "plain": "value",
     }
     payload = make_stage_payload(request_id="req-inline", data=data)
