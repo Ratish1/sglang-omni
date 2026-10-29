@@ -36,14 +36,14 @@ class ShmPutMetadata(TypedDict):
     transfer_info: ShmTransferInfo
 
 
-def shm_create_reserved(size: int) -> _shm.SharedMemory:
+def shm_create_reserved(size_bytes: int) -> _shm.SharedMemory:
     # note (Junnan Li): SharedMemory rejects size 0, and the receiver expects a block for every tensor.
-    shm = _shm.SharedMemory(create=True, size=max(size, 1))
+    shm = _shm.SharedMemory(create=True, size=max(size_bytes, 1))
     # note (ratish): reserving the pages turns a full /dev/shm into an error instead of a SIGBUS mid-copy (posix_fallocate exists on Linux only).
-    if size > 0 and sys.platform == "linux":
+    if size_bytes > 0 and sys.platform == "linux":
         try:
             file_descriptor = shm._fd  # noqa: leading-underscore  # stdlib name
-            os.posix_fallocate(file_descriptor, 0, size)
+            os.posix_fallocate(file_descriptor, 0, size_bytes)
         except OSError:
             shm.close()
             shm.unlink()
@@ -64,10 +64,12 @@ def shm_create_from_tensor(tensor: torch.Tensor) -> _shm.SharedMemory:
 
 def shm_create_from_chunks(chunks: list[torch.Tensor]) -> _shm.SharedMemory:
     """A block holding the byte chunks in order, each copied into it once."""
-    size = sum(chunk.numel() for chunk in chunks)
-    shm = shm_create_reserved(size)
-    if size > 0:
-        torch.cat(chunks, out=torch.frombuffer(shm.buf, dtype=torch.uint8, count=size))
+    size_bytes = sum(chunk.numel() for chunk in chunks)
+    shm = shm_create_reserved(size_bytes)
+    if size_bytes > 0:
+        torch.cat(
+            chunks, out=torch.frombuffer(shm.buf, dtype=torch.uint8, count=size_bytes)
+        )
     else:
         pass
     return shm
