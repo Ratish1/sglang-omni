@@ -43,8 +43,19 @@ class InlineStreamChunkRef(TypedDict):
     payload: bytes
 
 
+class InlinePayloadRef(TypedDict):
+    _type: Literal["InlinePayload"]
+    version: Literal[1]
+    header: bytes
+    tensors: list[dict[str, str | list[int] | int]]
+    buffer: bytes
+
+
 StageDataRef: TypeAlias = (
-    DirectCudaIpcPayloadRef | DirectCudaIpcStreamChunkRef | InlineStreamChunkRef
+    DirectCudaIpcPayloadRef
+    | DirectCudaIpcStreamChunkRef
+    | InlineStreamChunkRef
+    | InlinePayloadRef
 )
 
 
