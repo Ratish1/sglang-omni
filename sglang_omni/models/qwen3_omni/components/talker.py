@@ -17,6 +17,7 @@ from sglang.srt.runtime_context import get_context, get_schedule
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import add_prefix
+from sglang.srt.utils.common import async_h2d
 from torch import nn
 
 from sglang_omni.models.qwen3_omni.components.thinker_model import (
@@ -1234,15 +1235,11 @@ class Qwen3OmniTalker(nn.Module):
             if len(suppress_rows) != batch_size
         ]
         index_lists = [rep_rows, rep_toks, rep_active_rows, *partial_suppress_rows]
-        host_indices = torch.tensor(
+        # note (ratish): every index crosses in one copy from pinned memory, so the prepare never waits on the talker's stream, which the card can share with other stages.
+        indices = async_h2d(
             [index for index_list in index_lists for index in index_list],
             dtype=torch.long,
-        )
-        # note (ratish): every index crosses in one copy from pinned memory, so the prepare never waits on the talker's stream, which the card can share with other stages.
-        indices = (
-            host_indices.pin_memory().to(device, non_blocking=True)
-            if device.type == "cuda"
-            else host_indices.to(device)
+            device=device,
         )
         (
             rep_row_index,
