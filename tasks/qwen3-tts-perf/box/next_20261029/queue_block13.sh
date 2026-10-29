@@ -3,9 +3,10 @@
 # 1. The standard SeedTTS EN A/B on Base (the branch cannot change a Base output): non-streaming c16 and streaming c16,
 #    both card orders, scored on each card.
 # 2. Where it acts: every Chinese CustomVoice case (every speaker plain, ryan and vivian slow) and every Chinese
-#    VoiceDesign case (plain, slow), seeded, non-streaming, c32, no max_new_tokens; main and the branch at once on
-#    cards 0 and 1, then swapped; every length stop and every natural stop past #3157's budget kept.
-# 3. One Qwen3-ASR server on card 0 (64 long transcriptions at once) scores the kept outputs; compare per round.
+#    VoiceDesign case (plain, slow), seeded, non-streaming, c32, no max_new_tokens; main on card 0 and the branch on
+#    card 1 at once, one round (an outputs check: block 7 measured main's cuts, and the speed pairs are part 1);
+#    every length stop and every natural stop past #3157's budget kept.
+# 3. One Qwen3-ASR server on card 0 (64 long transcriptions at once) scores the kept outputs; compare per task.
 set -u
 D=${D:?the results directory}
 T=${T:?the kit tree}
@@ -80,7 +81,7 @@ scan_lane() {
   done
 }
 
-for round in a b; do
+for round in a; do
   if [ $round = a ]; then main_card=0 limit_card=1; else main_card=1 limit_card=0; fi
   scan_lane main $main_card 15000 $round &
   first=$!
@@ -98,7 +99,7 @@ if start_server asr main 24300 --model-path Qwen/Qwen3-ASR-1.7B --asr.gpu 0 --au
     (cd $MAIN && PYTHONPATH=$MAIN python3 $K/limit_ab.py score $result --asr-port 24300 --concurrency 64 >> $L 2>&1)
   done
   stop_server asr
-  for round in a b; do
+  for round in a; do
     for task in customvoice voicedesign; do
       (cd $MAIN && PYTHONPATH=$MAIN python3 $K/limit_ab.py compare $W/scan/${task}_${round}_main.scored.jsonl \
         $W/scan/${task}_${round}_limit.scored.jsonl > $W/compare_${task}_${round}.txt 2>&1)
