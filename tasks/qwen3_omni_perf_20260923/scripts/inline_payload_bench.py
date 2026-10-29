@@ -6,11 +6,15 @@ over ipc://, msgpack messages), one payload in flight at a time, as a stage hop 
 - shm: the sender runs write_payload and sends the DataReadyMessage; the receiver reads the
   payload with read_payload and sends the DataAckMessage; the sender completes the put on it.
 - inline: the sender pickles the StagePayload into the DataReadyMessage; the receiver unpickles it.
+- packed: the sender packs the tensors as write_payload does (extract_tensors, pack_tensor_chunks,
+  the header pickled without tensors) and carries the packed bytes and the entries in the
+  DataReadyMessage; the receiver copies the bytes into a writable bytearray and restores each
+  tensor as a view by its entry, as read_payload does from a transfer buffer.
 
 For every payload size (one float32 tensor plus a small request dict) and path it prints the
 median and p90 of the sender's thread CPU, the receiver's thread CPU and the delivery time (sender
 start to the receiver holding the payload, wall clocks of one host), over ITERATIONS hops after
-WARMUP, the two paths alternating hop by hop.
+WARMUP, the paths alternating hop by hop.
 
 usage: python inline_payload_bench.py OUT_DIR [ITERATIONS] [WARMUP]
 """
@@ -29,14 +33,14 @@ import time
 import torch
 
 from sglang_omni.comm import stage_io
-from sglang_omni.comm.data_ref import DataRef, TransportKind
+from sglang_omni.comm.data_ref import DataRef, TensorMeta, TransportKind
 from sglang_omni.pipeline.control_plane import PullSocket, PushSocket
 from sglang_omni.proto import DataReadyMessage, StagePayload
 from sglang_omni.proto.messages import DataAckMessage
 from sglang_omni.relay.shm import ShmRelay
 
 SIZES = (8, 64, 1024, 4096, 16384, 65536, 262144, 1048576, 4194304, 16777216)
-PATHS = ("shm", "inline")
+PATHS = ("shm", "inline", "packed")
 
 
 def make_payload(size_bytes: int, hop: int, path: str) -> StagePayload:
@@ -71,12 +75,30 @@ async def sender_main(out_dir: str, iterations: int, warmup: int) -> None:
                         relay, payload.request_id, payload, transport=TransportKind.SHM
                     )
                     reference = data_ref.to_dict()
-                else:
+                elif path == "inline":
                     put_operation = None
                     reference = {
                         "_type": "InlinePayload",
                         "version": 1,
                         "payload": pickle.dumps(payload),
+                    }
+                else:
+                    put_operation = None
+                    data_without_tensors, tensors = stage_io.extract_tensors(
+                        payload.data
+                    )
+                    chunks, entries = stage_io.pack_tensor_chunks(tensors, device="cpu")
+                    header = StagePayload(
+                        request_id=payload.request_id,
+                        request=payload.request,
+                        data=data_without_tensors,
+                    )
+                    reference = {
+                        "_type": "InlinePackedPayload",
+                        "version": 1,
+                        "header": pickle.dumps(header),
+                        "tensors": [entry.to_dict() for entry in entries],
+                        "buffer": torch.cat(chunks).numpy().tobytes(),
                     }
                 await data_socket.send(
                     DataReadyMessage(
@@ -136,6 +158,24 @@ async def receiver_main(out_dir: str) -> None:
         elif reference["_type"] == "InlinePayload":
             payload = pickle.loads(reference["payload"])
             path = "inline"
+        elif reference["_type"] == "InlinePackedPayload":
+            header = pickle.loads(reference["header"])
+            transfer_buffer = torch.frombuffer(
+                bytearray(reference["buffer"]), dtype=torch.uint8
+            )
+            tensors = {}
+            for entry in (TensorMeta.from_dict(item) for item in reference["tensors"]):
+                tensors[entry.path] = (
+                    transfer_buffer[entry.offset : entry.offset + entry.size]
+                    .view(stage_io.torch_dtype(entry.dtype))
+                    .reshape(entry.shape)
+                )
+            payload = StagePayload(
+                request_id=header.request_id,
+                request=header.request,
+                data=stage_io.restore_tensors(header.data, tensors),
+            )
+            path = "packed"
         else:
             data_ref = DataRef.from_dict(reference)
             payload = await stage_io.read_payload(relay, message.request_id, data_ref)
