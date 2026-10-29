@@ -49,6 +49,10 @@ FREEZE_STARTUP_GC = os.environ.get("OMNI_FREEZE_STARTUP_GC") == "1"
 # generation under the GIL, so it is for a check boot and not for a measured one
 FREEZE_COUNT_PERIOD_S = float(os.environ.get("OMNI_HOP_PROBE_FREEZE_COUNT_S", "0"))
 TALKER_BATCHES = os.environ.get("OMNI_HOP_PROBE_TALKER_BATCHES") == "1"
+# OMNI_HOP_PROBE_SYNC_SITES=1 sets torch's sync debug mode to warn in every process and counts each synchronizing
+# CUDA call by thread and by its innermost sglang frames (kind "sync", the running counts once a second); a check
+# boot, not a measured one, since every count walks the Python stack
+SYNC_SITES = os.environ.get("OMNI_HOP_PROBE_SYNC_SITES") == "1"
 LAG_PERIOD_S = 0.005
 LAG_REPORT_S = 0.002
 STALL_S = 0.2
@@ -89,8 +93,51 @@ def record_queue(ns, label, op, message):
         records.append(item)
 
 
+sync_sites = {}
+sync_sites_flushed = [0]
+show_warning = None
+
+
+def count_sync_site(message, category, filename, lineno, file=None, line=None):
+    """warnings.showwarning for the sync debug warnings: counted by thread and the innermost sglang frames."""
+    if "synchronizing CUDA operation" not in str(message):
+        return show_warning(message, category, filename, lineno, file, line)
+    else:
+        pass
+    import traceback
+
+    frames = [
+        frame
+        for frame in traceback.extract_stack()[:-1]
+        if "sglang" in frame.filename and "hop_probe" not in frame.filename
+    ][-4:]
+    key = " <- ".join(
+        f"{frame.filename.rsplit('/sglang_omni/', 1)[-1].rsplit('/sglang/', 1)[-1]}:{frame.lineno} {frame.name}"
+        for frame in reversed(frames)
+    )
+    site = f"{threading.current_thread().name} | {key}"
+    with records_lock:
+        sync_sites[site] = sync_sites.get(site, 0) + 1
+
+
+def patch_torch(module):
+    import warnings
+
+    global show_warning
+    show_warning = warnings.showwarning
+    warnings.showwarning = count_sync_site
+    warnings.filterwarnings("always", message=".*synchronizing CUDA operation.*")
+    module.cuda.set_sync_debug_mode("warn")
+
+
 def flush():
     with records_lock:
+        total = sum(sync_sites.values())
+        if total != sync_sites_flushed[0]:
+            sync_sites_flushed[0] = total
+            records.append({"k": "sync", "ns": time.time_ns(), "counts": dict(sync_sites)})
+        else:
+            pass
         pending = records[:]
         records.clear()
     if pending:
@@ -418,6 +465,10 @@ PATCHES = {
     "sglang_omni.models.qwen3_omni.talker_model_runner": patch_put_messages,
     "sglang_omni.pipeline.coordinator": patch_coordinator,
 }
+if SYNC_SITES:
+    PATCHES["torch"] = patch_torch
+else:
+    pass
 if TALKER_BATCHES:
     PATCHES["sglang_omni.models.qwen3_omni.components.talker"] = patch_talker
     PATCHES["sglang_omni.models.qwen3_omni.components.preprocessor"] = (
