@@ -38,7 +38,8 @@ def integer_padding_forward(conv: MimiConv1d) -> Callable[..., torch.Tensor]:
     """The causal conv's forward with its padding as Python integers."""
     if not conv.causal or conv.pad_mode not in ("constant", "replicate"):
         raise ValueError(
-            f"Qwen3-TTS reference encoder cannot pad a {conv.pad_mode!r} conv by integers"
+            f"Qwen3-TTS reference encoder pads only causal constant or replicate convs by integers, "
+            f"not pad mode {conv.pad_mode!r} with causal={conv.causal}"
         )
     else:
         pass
