@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+from multiprocessing import shared_memory
 
 import pytest
 import torch
@@ -59,6 +60,39 @@ def test_shm_put_chunks_round_trips_their_bytes_in_order(
         get_operation = await relay.get_async(put_operation.metadata, destination)
         await get_operation.wait_for_completion(timeout=1.0)
         assert torch.equal(destination, torch.cat(chunks))
+
+    asyncio.run(scenario())
+
+
+def test_shm_put_chunks_that_fail_to_copy_unlink_block_and_release_credit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    created_names: list[str] = []
+
+    class RecordingSharedMemory(shared_memory.SharedMemory):
+        def __init__(
+            self, name: str | None = None, create: bool = False, size: int = 0
+        ) -> None:
+            super().__init__(name=name, create=create, size=size)
+            created_names.append(self.name)
+
+    def failing_cat(chunks: list[torch.Tensor], *, out: torch.Tensor) -> torch.Tensor:
+        raise RuntimeError("copy failed")
+
+    async def scenario() -> None:
+        relay = ShmRelay(engine_id="sender", device="cpu", credits=1)
+        chunks = [torch.arange(16, dtype=torch.uint8)]
+        with monkeypatch.context() as patch:
+            patch.setattr(shared_memory, "SharedMemory", RecordingSharedMemory)
+            patch.setattr(torch, "cat", failing_cat)
+            with pytest.raises(RuntimeError, match="copy failed"):
+                await relay.put_chunks_async(chunks, request_id="r0")
+        assert created_names and not os.path.exists(f"/dev/shm/{created_names[0]}")
+        put_operation = await asyncio.wait_for(
+            relay.put_chunks_async(chunks, request_id="r1"), 1.0
+        )
+        with pytest.raises(TimeoutError):
+            await put_operation.wait_for_completion(timeout=0.0)
 
     asyncio.run(scenario())
 

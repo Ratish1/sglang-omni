@@ -51,9 +51,16 @@ def shm_create_from_chunks(chunks: list[torch.Tensor]) -> _shm.SharedMemory:
     size_bytes = sum(chunk.numel() for chunk in chunks)
     shm = _shm.SharedMemory(create=True, size=max(size_bytes, 1))
     if size_bytes > 0:
-        torch.cat(
-            chunks, out=torch.frombuffer(shm.buf, dtype=torch.uint8, count=size_bytes)
-        )
+        # note (ratish): the block exists before the copy and no operation owns it yet, so a failed copy closes and unlinks it here.
+        try:
+            torch.cat(
+                chunks,
+                out=torch.frombuffer(shm.buf, dtype=torch.uint8, count=size_bytes),
+            )
+        except BaseException:
+            shm.close()
+            shm.unlink()
+            raise
     else:
         pass
     return shm
