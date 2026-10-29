@@ -1534,6 +1534,108 @@ def test_direct_cuda_ipc_payload_rejects_request_tensors() -> None:
         stage_io.serialize_direct_cuda_ipc_payload(payload)
 
 
+def test_inline_payload_round_trips_through_the_control_message() -> None:
+    data = {
+        "flags": torch.tensor([True, False, True]),
+        "features": torch.randn(5, dtype=torch.float32),
+        "nested": {"ids": torch.arange(6, dtype=torch.int64).view(2, 3)},
+        "embeds": (torch.randn(4, 7, dtype=torch.bfloat16).t(), "kept"),
+        "plain": "value",
+    }
+    payload = make_stage_payload(request_id="req-inline", data=data)
+    message = deserialize_message(
+        serialize_message(
+            DataReadyMessage(
+                request_id="req-inline",
+                from_stage="preprocessing",
+                to_stage="thinker",
+                data_ref=stage_io.serialize_inline_payload(payload),
+            )
+        )
+    )
+
+    restored = stage_io.deserialize_inline_payload(message.data_ref)
+
+    assert restored.request_id == "req-inline"
+    assert tensor_equal(restored.data, data)
+    restored.data["features"].add_(1.0)
+    assert torch.equal(restored.data["features"], data["features"] + 1.0)
+
+
+@pytest.mark.parametrize(
+    "byte_count, data_ref_type",
+    [(16 * 1024, "InlinePayload"), (16 * 1024 + 1, "DataRef")],
+)
+def test_stage_sends_a_host_payload_inline_up_to_sixteen_kib(
+    byte_count: int, data_ref_type: str
+) -> None:
+    async def run() -> None:
+        relay = FakeRelay()
+        control_plane = RecordingStageControlPlane()
+        sender = make_stage(
+            name="preprocessing",
+            endpoints={"thinker": "inproc://thinker"},
+            relay=relay,
+            control_plane=control_plane,
+        )
+        payload = make_stage_payload(
+            request_id="req-host",
+            data={"bytes": torch.zeros(byte_count, dtype=torch.uint8)},
+        )
+
+        await sender.send_to_stage("req-host", "thinker", payload)
+
+        ((target, _, message),) = control_plane.sent_to_stage
+        assert target == "thinker"
+        assert message.data_ref["_type"] == data_ref_type
+        assert bool(relay.storage) == (data_ref_type == "DataRef")
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("aborted", [False, True])
+def test_stage_receives_an_inline_payload_without_a_relay_read_or_ack(
+    aborted: bool,
+) -> None:
+    payload = make_tensor_payload(request_id="req-inline")
+
+    async def run() -> None:
+        relay = FakeRelay()
+        control_plane = RecordingStageControlPlane()
+        scheduler = FakeScheduler()
+        receiver = make_stage(
+            name="thinker",
+            endpoints={"preprocessing": "inproc://preprocessing"},
+            scheduler=scheduler,
+            relay=relay,
+            control_plane=control_plane,
+        )
+        if aborted:
+            receiver.aborted.add("req-inline")
+        else:
+            pass
+
+        await receiver.on_data_ready(
+            DataReadyMessage(
+                request_id="req-inline",
+                from_stage="preprocessing",
+                to_stage="thinker",
+                data_ref=stage_io.serialize_inline_payload(payload),
+            )
+        )
+
+        assert control_plane.sent_to_stage == []
+        assert relay.log.events == []
+        if aborted:
+            assert scheduler.inbox.empty()
+        else:
+            queued = scheduler.inbox.get_nowait()
+            assert queued.type == "new_request"
+            assert tensor_equal(queued.data.data, payload.data)
+
+    asyncio.run(run())
+
+
 def test_stage_sends_same_process_stream_done_and_final_payload_locally() -> None:
     async def run() -> None:
         dispatcher = LocalStageDispatcher()
