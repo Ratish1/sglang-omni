@@ -22,7 +22,7 @@ else
   :
 fi
 echo "queue block19 start $(date +%T) main $(git -C $MAIN rev-parse HEAD HEAD:sglang_omni | tr '\n' ' ')branch $(git -C $BRANCH rev-parse HEAD HEAD:sglang_omni | tr '\n' ' ')kit $(git -C $T rev-parse HEAD)" >> $L
-(cd $MAIN && PYTHONPATH=$MAIN python3 $HERE/duplex_ab.py cases $W/duplex --profiles examples/streaming_cascade/profiles >> $W/logs/cases.log 2>&1)
+(cd $MAIN && PYTHONPATH=$MAIN python3 $HERE/duplex_ab.py cases $W/duplex --profiles examples/streaming_cascade >> $W/logs/cases.log 2>&1)
 echo "cases $(wc -l < $CASES) $(date +%T)" >> $L
 
 start_server() {
