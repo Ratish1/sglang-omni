@@ -10,6 +10,7 @@ Variants (each with a fresh batcher, its graphs captured after the change; dynam
                 compiled before capture under a raised recompile limit (the incremental codec's mechanism); the eager
                 arm runs pads alone, since compiled code belongs to the bucket graphs only
   compile_qkv   compile with qkv
+  served        the tree exactly as loaded, nothing installed or reset (a branch that carries its own mechanisms)
 Per variant: capture wall time; codes through graphs and eager against official's float32 exact-length encode and
 against the base variant's graph codes, all clips; device time, kernel count and top kernels per encode over the
 first 200 clips under the profiler.
@@ -47,7 +48,9 @@ VARIANTS = {
     "qkv": ("qkv",),
     "compile": ("pads", "compile"),
     "compile_qkv": ("pads", "qkv", "compile"),
+    "served": None,
 }
+DEFAULT_VARIANTS = "base,pads,qkv,compile,compile_qkv"
 TIMED_CLIPS = 200
 TOP_KERNELS = 10
 RECOMPILE_LIMIT = 64
@@ -155,7 +158,7 @@ def main() -> None:
     parser.add_argument("--model", required=True)
     parser.add_argument("--card", type=int, default=0)
     parser.add_argument("--clips", type=int, default=1088)
-    parser.add_argument("--variants", default=",".join(VARIANTS))
+    parser.add_argument("--variants", default=DEFAULT_VARIANTS)
     args = parser.parse_args()
     device = f"cuda:{args.card}"
     torch.cuda.set_device(device)
@@ -177,12 +180,19 @@ def main() -> None:
     del official
     baseline: list[torch.Tensor] | None = None
     for name in args.variants.split(","):
-        install(encoder, tuple(mechanism for mechanism in VARIANTS[name] if mechanism != "compile"))
+        mechanisms = VARIANTS[name]
+        if mechanisms is not None:
+            install(encoder, tuple(mechanism for mechanism in mechanisms if mechanism != "compile"))
+        else:
+            pass
         eager = Qwen3TTSRefCodeBatcher(ours)
         with torch.inference_mode():
             eager_codes = [eager.encode_waveform(waveform, rate).cpu() for waveform, rate in clips]
         eager.close()
-        install(encoder, VARIANTS[name])
+        if mechanisms is not None:
+            install(encoder, mechanisms)
+        else:
+            pass
         began = time.perf_counter()
         try:
             graphs = Qwen3TTSRefCodeBatcher(ours, graph_bucket_frames=DEFAULT_QWEN3_TTS_REFERENCE_ENCODER_BUCKET_FRAMES)
