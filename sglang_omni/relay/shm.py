@@ -68,7 +68,10 @@ def shm_create_from_chunks(chunks: list[torch.Tensor]) -> _shm.SharedMemory:
     """A block holding the byte chunks in order, each copied into it once."""
     size = sum(chunk.numel() for chunk in chunks)
     shm = shm_create_reserved(size)
-    torch.cat(chunks, out=torch.frombuffer(shm.buf, dtype=torch.uint8, count=size))
+    if size > 0:
+        torch.cat(chunks, out=torch.frombuffer(shm.buf, dtype=torch.uint8, count=size))
+    else:
+        pass
     return shm
 
 

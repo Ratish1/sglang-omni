@@ -46,7 +46,7 @@ def test_shm_put_timeout_unlinks_block_and_releases_credit() -> None:
     asyncio.run(run())
 
 
-@pytest.mark.parametrize("chunk_bytes", [(3, 5, 1), (40000, 1, 30000)])
+@pytest.mark.parametrize("chunk_bytes", [(0,), (3, 5, 1), (40000, 1, 30000)])
 def test_shm_put_chunks_round_trips_their_bytes_in_order(
     chunk_bytes: tuple[int, ...],
 ) -> None:
