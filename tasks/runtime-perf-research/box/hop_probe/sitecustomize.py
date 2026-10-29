@@ -53,6 +53,9 @@ TALKER_BATCHES = os.environ.get("OMNI_HOP_PROBE_TALKER_BATCHES") == "1"
 # CUDA call by thread and by its innermost sglang frames (kind "sync", the running counts once a second); a check
 # boot, not a measured one, since every count walks the Python stack
 SYNC_SITES = os.environ.get("OMNI_HOP_PROBE_SYNC_SITES") == "1"
+# OMNI_HOP_PROBE_TALKER_BUILD_REFERENCE=<tree> runs that tree's Qwen3-Omni talker prompt build beside the running one on
+# every admission, on the same builder state, and records whether every output is bit identical (kind "build")
+TALKER_BUILD_REFERENCE = os.environ.get("OMNI_HOP_PROBE_TALKER_BUILD_REFERENCE", "")
 LAG_PERIOD_S = 0.005
 LAG_REPORT_S = 0.002
 STALL_S = 0.2
@@ -128,6 +131,66 @@ def patch_torch(module):
     warnings.showwarning = count_sync_site
     warnings.filterwarnings("always", message=".*synchronizing CUDA operation.*")
     module.cuda.set_sync_debug_mode("warn")
+
+
+def load_reference_builder(tree):
+    """The reference tree's TalkerPrefillBuilder class, its prompt build bound to the reference talker_input."""
+    name = "sglang_omni.models.qwen3_omni.components.talker_input"
+    components = os.path.join(tree, "sglang_omni/models/qwen3_omni/components")
+
+    def load(module_name, path):
+        spec = importlib.util.spec_from_file_location(module_name, path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+
+    reference_input = load("reference_talker_input", os.path.join(components, "talker_input.py"))
+    running_input = sys.modules[name]
+    sys.modules[name] = reference_input
+    try:
+        reference_prefill = load(
+            "reference_talker_prefill", os.path.join(components, "talker_prefill.py")
+        )
+    finally:
+        sys.modules[name] = running_input
+    return reference_prefill.TalkerPrefillBuilder
+
+
+def patch_talker_prefill(module):
+    torch = sys.modules["torch"]
+    reference_class = load_reference_builder(TALKER_BUILD_REFERENCE)
+    build = module.TalkerPrefillBuilder.build_prompt_prefill
+
+    @functools.wraps(build)
+    def build_compared(self, payload, thinker_chunks, *, thinker_done):
+        built = build(self, payload, thinker_chunks, thinker_done=thinker_done)
+        shadow = object.__new__(reference_class)
+        shadow.__dict__ = self.__dict__
+        reference = reference_class.build_prompt_prefill(
+            shadow, payload, thinker_chunks, thinker_done=thinker_done
+        )
+        built_rows, reference_rows = list(built["pending_text_queue"]), list(
+            reference["pending_text_queue"]
+        )
+        same = {
+            "input_embeds": torch.equal(built["input_embeds"], reference["input_embeds"]),
+            "input_ids": torch.equal(built["input_ids"].cpu(), reference["input_ids"].cpu()),
+            "pending_text_rows": len(built_rows) == len(reference_rows)
+            and all(torch.equal(a, b) for a, b in zip(built_rows, reference_rows)),
+            "tts_pad_embed": torch.equal(built["tts_pad_embed"], reference["tts_pad_embed"]),
+            "tts_eos_embed": torch.equal(built["tts_eos_embed"], reference["tts_eos_embed"]),
+        }
+        record(
+            {
+                "k": "build",
+                "rid": payload.request_id,
+                "same": same,
+                "devices": [str(built["input_embeds"].device), str(built["input_ids"].device)],
+            }
+        )
+        return built
+
+    module.TalkerPrefillBuilder.build_prompt_prefill = build_compared
 
 
 def flush():
@@ -467,6 +530,12 @@ PATCHES = {
 }
 if SYNC_SITES:
     PATCHES["torch"] = patch_torch
+else:
+    pass
+if TALKER_BUILD_REFERENCE:
+    PATCHES["sglang_omni.models.qwen3_omni.components.talker_prefill"] = (
+        patch_talker_prefill
+    )
 else:
     pass
 if TALKER_BATCHES:
