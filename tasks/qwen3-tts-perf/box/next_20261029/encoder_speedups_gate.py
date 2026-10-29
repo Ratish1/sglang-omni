@@ -12,7 +12,9 @@ Variants (each with a fresh batcher, its graphs captured after the change; dynam
   compile_qkv   compile with qkv
   compile_dynamic  pads, then one torch.compile(fullgraph=True, dynamic=True) shared by every bucket (startup: one trace
                 instead of one per bucket)
-  served       the tree exactly as loaded, nothing installed or reset (a branch that carries its own mechanisms)
+  compile_dynamic_frames  compile_dynamic with the input length checked to be whole 1,920-sample frames, a fact
+                inductor can use for alignment
+  served      the tree exactly as loaded, nothing installed or reset (a branch that carries its own mechanisms)
 Per variant: capture wall time; codes through graphs and eager against official's float32 exact-length encode and
 against the base variant's graph codes, all clips; device time, kernel count and top kernels per encode over the
 first 200 clips under the profiler.
@@ -51,6 +53,7 @@ VARIANTS = {
     "compile": ("pads", "compile"),
     "compile_qkv": ("pads", "qkv", "compile"),
     "compile_dynamic": ("pads", "compile_dynamic"),
+    "compile_dynamic_frames": ("pads", "compile_dynamic_frames"),
     "served": None,
 }
 DEFAULT_VARIANTS = "base,pads,qkv,compile,compile_qkv"
@@ -110,8 +113,12 @@ def merged_qkv_forward(attention: torch.nn.Module):
     return forward
 
 
-def compiled_encode(encoder: torch.nn.Module, dynamic: bool):
+def compiled_encode(encoder: torch.nn.Module, dynamic: bool, frame_multiple: int = 0):
     def encode_frame(values: torch.Tensor, num_quantizers: int) -> torch.Tensor:
+        if frame_multiple:
+            torch._check(values.shape[-1] % frame_multiple == 0)
+        else:
+            pass
         return encoder._encode_frame(values, num_quantizers, None, use_streaming=False, return_dict=True)[0]
 
     compiled = torch.compile(encode_frame, dynamic=dynamic, fullgraph=True)
@@ -143,6 +150,8 @@ def install(encoder: torch.nn.Module, mechanisms: tuple[str, ...]) -> None:
         Qwen3TTSReferenceEncoderCudaGraphRunner._encode = compiled_encode(encoder, dynamic=False)
     elif "compile_dynamic" in mechanisms:
         Qwen3TTSReferenceEncoderCudaGraphRunner._encode = compiled_encode(encoder, dynamic=True)
+    elif "compile_dynamic_frames" in mechanisms:
+        Qwen3TTSReferenceEncoderCudaGraphRunner._encode = compiled_encode(encoder, dynamic=True, frame_multiple=1920)
     else:
         Qwen3TTSReferenceEncoderCudaGraphRunner._encode = ORIGINAL_ENCODE
 
