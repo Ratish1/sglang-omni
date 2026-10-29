@@ -171,9 +171,7 @@ def test_stage_routes_results_streams_and_clears_abort_state(monkeypatch) -> Non
         decode_msg = next(
             msg for target, _, msg in control_plane.sent_to_stage if target == "decode"
         )
-        restored = await stage_io.read_payload(
-            relay, "req-1", DataRef.from_dict(decode_msg.data_ref)
-        )
+        restored = stage_io.deserialize_inline_payload(decode_msg.data_ref)
         assert restored.data == {"marker": "decode-only", "data": {"answer": 1}}
         stream_msg = next(
             msg
@@ -1021,11 +1019,10 @@ def test_stage_projected_fan_out_requires_isolated_data_container() -> None:
             make_stage_payload(request_id="req-fanout", data={"answer": 7}),
         )
 
-        assert [target for target, _, _ in control_plane.sent_to_stage] == [
-            "decode",
-            "archive",
-        ]
-        assert relay.storage
+        assert [
+            (target, message.data_ref["_type"])
+            for target, _, message in control_plane.sent_to_stage
+        ] == [("decode", "InlinePayload"), ("archive", "InlinePayload")]
 
     asyncio.run(run())
 
@@ -1071,11 +1068,10 @@ def test_stage_projected_fan_out_rejects_nested_mutable_aliases() -> None:
             ),
         )
 
-        assert [target for target, _, _ in control_plane.sent_to_stage] == [
-            "decode",
-            "archive",
-        ]
-        assert relay.storage
+        assert [
+            (target, message.data_ref["_type"])
+            for target, _, message in control_plane.sent_to_stage
+        ] == [("decode", "InlinePayload"), ("archive", "InlinePayload")]
 
     asyncio.run(run())
 
@@ -1114,11 +1110,10 @@ def test_stage_projected_fan_out_rejects_wrapped_original_data() -> None:
             make_stage_payload(request_id="req-fanout", data={"answer": 7}),
         )
 
-        assert [target for target, _, _ in control_plane.sent_to_stage] == [
-            "decode",
-            "archive",
-        ]
-        assert relay.storage
+        assert [
+            (target, message.data_ref["_type"])
+            for target, _, message in control_plane.sent_to_stage
+        ] == [("decode", "InlinePayload"), ("archive", "InlinePayload")]
 
     asyncio.run(run())
 
@@ -1311,6 +1306,13 @@ def test_stage_sends_same_gpu_stream_chunk_as_direct_cuda_ipc(monkeypatch) -> No
     asyncio.run(run())
 
 
+def make_payload_above_inline_bound(request_id: str) -> StagePayload:
+    return make_stage_payload(
+        request_id=request_id,
+        data={"bytes": torch.zeros(16 * 1024 + 1, dtype=torch.uint8)},
+    )
+
+
 def test_stage_can_disable_same_gpu_direct_cuda_payload(monkeypatch) -> None:
     monkeypatch.setattr(stage_io, "payload_has_cuda_tensor", lambda payload: True)
 
@@ -1340,7 +1342,7 @@ def test_stage_can_disable_same_gpu_direct_cuda_payload(monkeypatch) -> None:
             disable_direct_cuda_ipc_payload=True,
         )
 
-        payload = make_tensor_payload(request_id="req-direct-disabled")
+        payload = make_payload_above_inline_bound("req-direct-disabled")
         await sender.send_to_stage("req-direct-disabled", "thinker", payload)
 
         target, endpoint, msg = control_plane.sent_to_stage[0]
@@ -1378,7 +1380,7 @@ def test_stage_uses_relay_when_direct_cuda_payload_is_reexported(monkeypatch) ->
             stage_gpu_ids={"talker_ar": (0,)},
         )
 
-        payload = make_tensor_payload(request_id="req-reexport")
+        payload = make_payload_above_inline_bound("req-reexport")
         await sender.send_to_stage("req-reexport", "talker_ar", payload)
 
         target, endpoint, msg = control_plane.sent_to_stage[0]
@@ -1720,8 +1722,7 @@ def test_stage_preserves_relay_order_when_target_also_receives_stream() -> None:
         )
 
         await sender.route_result(
-            "req-streamed",
-            make_stage_payload(request_id="req-streamed", data={"answer": 7}),
+            "req-streamed", make_payload_above_inline_bound("req-streamed")
         )
 
         assert [msg.is_done for _, _, msg in control_plane.sent_to_stage] == [
