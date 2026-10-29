@@ -11,6 +11,8 @@ from __future__ import annotations
 import asyncio
 import logging
 import mmap
+import os
+import sys
 import uuid
 from collections.abc import Mapping
 from multiprocessing import shared_memory as _shm
@@ -48,9 +50,23 @@ def shm_create_from_tensor(tensor: torch.Tensor) -> _shm.SharedMemory:
 
 
 def shm_create_from_chunks(chunks: list[torch.Tensor]) -> _shm.SharedMemory:
-    """A block holding the byte chunks in order, each copied into it once."""
+    """A block holding the byte chunks in order, its pages reserved and each chunk copied into it once."""
     size_bytes = sum(chunk.numel() for chunk in chunks)
     shm = _shm.SharedMemory(create=True, size=max(size_bytes, 1))
+    # note (ratish): reserving the pages turns a full /dev/shm into an OSError the sender answers by sending inline, instead of a SIGBUS mid-copy (posix_fallocate exists on Linux only).
+    if size_bytes > 0 and sys.platform == "linux":
+        try:
+            os.posix_fallocate(
+                shm._fd,  # noqa: leading-underscore  # stdlib name
+                0,
+                size_bytes,
+            )
+        except OSError:
+            shm.close()
+            shm.unlink()
+            raise
+    else:
+        pass
     if size_bytes > 0:
         # note (ratish): the block exists before the copy and no operation owns it yet, so a failed copy closes and unlinks it here.
         try:
