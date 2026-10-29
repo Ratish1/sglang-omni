@@ -1976,13 +1976,19 @@ def apply_sglang_qwen3_tts_result(
     else:
         pass
 
+    codes_ready_event = None
     if code_parts:
         device = code_parts[0].device
-        # note(ratish): the vocoder decodes these on this default stream.
         codes = torch.cat(
             [part.to(device=device, dtype=torch.long) for part in code_parts],
             dim=0,
         )
+        # note (ratish): the vocoder reads these on its own thread's stream, so it waits on this event instead of on the talker's stream, as for streamed chunks.
+        if has_device_streams(codes.device):
+            codes_ready_event = torch.get_device_module(codes.device).Event()
+            codes_ready_event.record()
+        else:
+            pass
     else:
         codes = torch.empty((0, 0), dtype=torch.long)
 
@@ -1991,6 +1997,7 @@ def apply_sglang_qwen3_tts_result(
         request=payload.request,
         data={
             "audio_codes": codes,
+            "codes_ready_event": codes_ready_event,
             "ref_code_len": data.ref_code_len,
             "prompt_tokens": data.ref_code_len,
             "completion_tokens": len(data.output_codes),
