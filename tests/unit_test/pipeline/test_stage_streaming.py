@@ -444,7 +444,7 @@ def test_inline_stream_chunk_gate() -> None:
     assert stage_io.serialize_inline_stream_chunk(small, {"token_id": 1}) is not None
     assert stage_io.serialize_inline_stream_chunk(small, None) is not None
     big = torch.zeros(
-        stage_io._INLINE_STREAM_CHUNK_BYTES_LIMIT + 1, dtype=torch.uint8
+        stage_io._INLINE_BYTES_LIMIT + 1, dtype=torch.uint8
     )  # noqa: leading-underscore  # production name
     assert stage_io.serialize_inline_stream_chunk(big, None) is None
     assert (
@@ -456,7 +456,7 @@ def test_inline_stream_chunk_gate() -> None:
 def test_inline_stream_chunk_rejects_oversized_serialized_payload() -> None:
     token = torch.tensor([7], dtype=torch.long)
     metadata = {
-        "text": "x" * stage_io._INLINE_STREAM_CHUNK_BYTES_LIMIT
+        "text": "x" * stage_io._INLINE_BYTES_LIMIT
     }  # noqa: leading-underscore  # production name
 
     data_ref = stage_io.serialize_inline_stream_chunk(token, metadata)
@@ -489,7 +489,7 @@ def test_inline_stream_chunk_rejects_oversized_received_payload() -> None:
         "version": 1,
         "payload": b"x"
         * (
-            stage_io._INLINE_STREAM_CHUNK_BYTES_LIMIT + 1
+            stage_io._INLINE_BYTES_LIMIT + 1
         ),  # noqa: leading-underscore  # production name
     }
 

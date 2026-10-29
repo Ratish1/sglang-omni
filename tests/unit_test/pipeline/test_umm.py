@@ -13,7 +13,6 @@ from unittest.mock import AsyncMock
 import pytest
 
 from sglang_omni.admission import QueueFullError
-from sglang_omni.comm.data_ref import DataRef
 from sglang_omni.config.schema import FactoryArgs
 from sglang_omni.pipeline.control_plane import deserialize_message, serialize_message
 from sglang_omni.pipeline.local_dispatch import LocalStageDispatcher
@@ -667,9 +666,7 @@ def real_stages(controller, relay, *, reasoner_script, generator_script):
                 return
             else:
                 assert isinstance(received_message, DataReadyMessage)
-            ref = DataRef.from_dict(received_message.data_ref)
-            assert ref.header is not None
-            header = pickle.loads(ref.header)
+            header = pickle.loads(received_message.data_ref["header"])
             token = header.request.metadata.get(CONTINUATION_METADATA_KEY)
             crossed.append((msg.from_stage, target, isinstance(token, Continuation)))
             await stages[target].on_data_ready(received_message)
