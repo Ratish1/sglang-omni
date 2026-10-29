@@ -57,6 +57,11 @@ MODELS = {
         "config": "",
         "placement": "",
     },
+    "minicpmo_text": {
+        "path": "openbmb/MiniCPM-o-4_5",
+        "config": "",
+        "placement": "",
+    },
 }
 
 
