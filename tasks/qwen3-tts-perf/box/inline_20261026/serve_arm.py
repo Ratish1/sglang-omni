@@ -27,7 +27,27 @@ from pair import BENCH_TIMEOUT_S, MODEL, audio_hashes, score, stop_group, wait_h
 
 ROOT = Path(os.environ.get("ARM_ROOT", "/data/inline_20261026/arms"))
 SAMPLE_INTERVAL_MS = 100
+BARRIER_TIMEOUT_S = 1800.0
 FAILURE_PATTERN = re.compile(r"CUBLAS_STATUS_ALLOC_FAILED|OutOfMemoryError|out of memory|Traceback")
+
+
+def wait_at_barrier(barrier: Path | None, parties: int, label: str, stage: str) -> None:
+    """With --barrier, a pair's arms start each stage together: a server that boots later (a cold compile) would
+    otherwise load the host while its partner benches, and an arm that scores early would load it during the other's
+    bench. Gives up after BARRIER_TIMEOUT_S, when the partner failed, and says so."""
+    if barrier is None:
+        return
+    else:
+        pass
+    barrier.mkdir(parents=True, exist_ok=True)
+    (barrier / f"{label}.{stage}").write_text("", encoding="utf-8")
+    deadline = time.monotonic() + BARRIER_TIMEOUT_S
+    while len(list(barrier.glob(f"*.{stage}"))) < parties:
+        if time.monotonic() > deadline:
+            print(f"{label}: barrier {stage} timed out, the pair is not simultaneous", flush=True)
+            return
+        else:
+            time.sleep(0.5)
 
 
 def main() -> None:
@@ -44,6 +64,8 @@ def main() -> None:
     parser.add_argument("--bench-args", default="")
     parser.add_argument("--score", action="store_true")
     parser.add_argument("--compare", nargs=2)
+    parser.add_argument("--barrier", type=Path, default=None)
+    parser.add_argument("--parties", type=int, default=2)
     args = parser.parse_args()
     if args.compare:
         first, second = (audio_hashes(ROOT / label) for label in args.compare)
@@ -78,6 +100,7 @@ def main() -> None:
     try:
         wait_healthy(args.port, server)
         (out / "startup.txt").write_text(f"{time.monotonic() - spawned:.1f}\n", encoding="utf-8")
+        wait_at_barrier(args.barrier, args.parties, args.label, "healthy")
         with open(out / "memory_trace.csv", "w", encoding="utf-8") as trace:
             sampler = subprocess.Popen(
                 ["nvidia-smi", "-i", str(args.card), "--query-gpu=timestamp,memory.used", "--format=csv,noheader,nounits",
@@ -125,6 +148,7 @@ def main() -> None:
         flush=True,
     )
     if args.score:
+        wait_at_barrier(args.barrier, args.parties, args.label, "benched")
         score(out, args.card, args.port + 400, args.tree, args.meta, 64)
         print(f"{args.label} scored", flush=True)
     else:
