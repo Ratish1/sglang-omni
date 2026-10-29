@@ -42,10 +42,8 @@ def shm_create_reserved(size: int) -> _shm.SharedMemory:
     # note (ratish): reserving the pages turns a full /dev/shm into an error instead of a SIGBUS mid-copy (posix_fallocate exists on Linux only).
     if size > 0 and sys.platform == "linux":
         try:
-            shm_file_descriptor = (
-                shm._fd
-            )  # noqa: leading-underscore  # upstream spelling, or the public name is already taken
-            os.posix_fallocate(shm_file_descriptor, 0, size)
+            file_descriptor = shm._fd  # noqa: leading-underscore  # stdlib name
+            os.posix_fallocate(file_descriptor, 0, size)
         except OSError:
             shm.close()
             shm.unlink()
