@@ -10,8 +10,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import os
-import sys
 import uuid
 from collections.abc import Mapping
 from multiprocessing import shared_memory as _shm
@@ -36,26 +34,12 @@ class ShmPutMetadata(TypedDict):
     transfer_info: ShmTransferInfo
 
 
-def shm_create_reserved(size_bytes: int) -> _shm.SharedMemory:
-    # note (Junnan Li): SharedMemory rejects size 0, and the receiver expects a block for every tensor.
-    shm = _shm.SharedMemory(create=True, size=max(size_bytes, 1))
-    # note (ratish): reserving the pages turns a full /dev/shm into an error instead of a SIGBUS mid-copy (posix_fallocate exists on Linux only).
-    if size_bytes > 0 and sys.platform == "linux":
-        try:
-            file_descriptor = shm._fd  # noqa: leading-underscore  # stdlib name
-            os.posix_fallocate(file_descriptor, 0, size_bytes)
-        except OSError:
-            shm.close()
-            shm.unlink()
-            raise
-    else:
-        pass
-    return shm
-
-
 def shm_create_from_tensor(tensor: torch.Tensor) -> _shm.SharedMemory:
     t_np = tensor.numpy().reshape(-1)
-    shm = shm_create_reserved(t_np.nbytes)
+    size = t_np.nbytes
+
+    # note (Junnan Li): SharedMemory rejects size 0, and the receiver expects a block for every tensor.
+    shm = _shm.SharedMemory(create=True, size=max(size, 1))
     shm_view = np.ndarray(t_np.shape, dtype=t_np.dtype, buffer=shm.buf)
     shm_view[:] = t_np[:]
 
@@ -65,7 +49,7 @@ def shm_create_from_tensor(tensor: torch.Tensor) -> _shm.SharedMemory:
 def shm_create_from_chunks(chunks: list[torch.Tensor]) -> _shm.SharedMemory:
     """A block holding the byte chunks in order, each copied into it once."""
     size_bytes = sum(chunk.numel() for chunk in chunks)
-    shm = shm_create_reserved(size_bytes)
+    shm = _shm.SharedMemory(create=True, size=max(size_bytes, 1))
     if size_bytes > 0:
         torch.cat(
             chunks, out=torch.frombuffer(shm.buf, dtype=torch.uint8, count=size_bytes)
