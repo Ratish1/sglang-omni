@@ -122,7 +122,7 @@ def build_cases(out_dir: Path, profiles: Path) -> None:
 
 
 async def serve(cases_path: Path, base_url: str, model: str, label: str, shape: str, sets: list[str], out_dir: Path,
-                concurrency: int, interrupt: bool) -> None:
+                concurrency: int, interrupt: bool, seed: int | None = None) -> None:
     cases = [
         case for case in (json.loads(line) for line in cases_path.read_text(encoding="utf-8").splitlines() if line)
         if case["shape"] == shape and (not sets or case["set"] in sets)
@@ -141,6 +141,10 @@ async def serve(cases_path: Path, base_url: str, model: str, label: str, shape: 
             "model": model, "voice": "default", "input": case["input"], "response_format": "pcm", "stream": True,
             "language": case["language"], "references": [reference],
         }
+        if seed is not None:
+            body["seed"] = seed
+        else:
+            pass
         record: dict[str, object] = {
             "id": case["id"], "shape": case["shape"], "set": case["set"], "lang": case["lang"], "label": label,
             "input": case["input"], "ref_audio": case["ref_audio"], "concurrency": concurrency, "interrupt": interrupt,
@@ -362,6 +366,7 @@ def main() -> None:
     serve_parser.add_argument("--out", type=Path, required=True)
     serve_parser.add_argument("--concurrency", type=int, default=16)
     serve_parser.add_argument("--interrupt", action="store_true")
+    serve_parser.add_argument("--seed", type=int, default=None)
     score_parser = commands.add_parser("score")
     score_parser.add_argument("dirs", type=Path, nargs="+")
     score_parser.add_argument("--asr-port", type=int, required=True)
@@ -373,7 +378,7 @@ def main() -> None:
         build_cases(args.out_dir, args.profiles)
     elif args.command == "serve":
         asyncio.run(serve(args.cases, args.base_url, args.model, args.label, args.shape, args.sets, args.out,
-                          args.concurrency, args.interrupt))
+                          args.concurrency, args.interrupt, args.seed))
     elif args.command == "score":
         score(args.dirs, args.asr_port, args.sim_card)
     else:
