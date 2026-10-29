@@ -7653,6 +7653,14 @@ def test_qwen3_tts_result_adapter_leaves_device_codes_on_the_device() -> None:
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_qwen3_tts_vocoder_reads_final_codes_finished_on_the_talker_stream() -> None:
     device = torch.device("cuda", torch.cuda.current_device())
+
+    class Tokenizer(FakeQwen3TTSSpeechTokenizer):
+        def decode(self, encoded):
+            return super().decode(
+                [{"audio_codes": item["audio_codes"].cpu()} for item in encoded]
+            )
+
+    scheduler = Qwen3TTSStreamingVocoderScheduler(Tokenizer(), device=device)
     talker_stream = torch.cuda.Stream(device)
     payload = make_payload(inputs="target")
     talker_stream.wait_stream(torch.cuda.current_stream(device))
@@ -7669,14 +7677,6 @@ def test_qwen3_tts_vocoder_reads_final_codes_finished_on_the_talker_stream() -> 
                 stage_payload=payload,
             ),
         )
-
-    class Tokenizer(FakeQwen3TTSSpeechTokenizer):
-        def decode(self, encoded):
-            return super().decode(
-                [{"audio_codes": item["audio_codes"].cpu()} for item in encoded]
-            )
-
-    scheduler = Qwen3TTSStreamingVocoderScheduler(Tokenizer(), device=device)
 
     (vocoder_result,) = asyncio.run(scheduler.vocode_payloads([talker_result]))
 
