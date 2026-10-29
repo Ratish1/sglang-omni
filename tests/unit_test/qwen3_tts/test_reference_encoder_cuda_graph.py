@@ -126,7 +126,7 @@ def test_smallest_bucket_picks_the_first_bucket_that_fits() -> None:
 
 @pytest.mark.accelerator
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
-def test_reference_encoder_graph_replays_match_eager_and_miss_above_the_largest_bucket() -> (
+def test_reference_encoder_graph_replays_match_the_compiled_encode_and_miss_above_the_largest_bucket() -> (
     None
 ):
     torch.manual_seed(11)
@@ -169,9 +169,7 @@ def test_reference_encoder_graph_replays_match_eager_and_miss_above_the_largest_
         for waveform, bucket in ((short, 4), (long, 8), (long_other, 8)):
             values = torch.zeros((1, 1, bucket * hop), device=device)
             values[0, 0, : waveform.numel()].copy_(waveform)
-            codes = model.encode(
-                values, num_quantizers=quantizers, return_dict=True
-            ).audio_codes
+            codes = runner.compiled_encode(values)
             frames = -(-waveform.numel() // hop)
             eager.append(codes[0, :, :frames].transpose(0, 1))
     assert not torch.equal(eager[1], eager[2])

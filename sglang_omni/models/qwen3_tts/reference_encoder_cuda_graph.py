@@ -112,6 +112,12 @@ class Qwen3TTSReferenceEncoderCudaGraphRunner:
             current_platform.get_device_graph_backend(self.device)
         )
         self.dtype = param.dtype
+        # note (ratish): each bucket's graph captures one compiled program; the eager encode past the ladder stays uncompiled, since a new length would compile on a request's path.
+        self.compiled_encode = (
+            torch.compile(self._encode, dynamic=False, fullgraph=True)
+            if current_platform.is_cuda()
+            else self._encode
+        )
         self.graphs: dict[int, CapturedEncoderGraph] = {}
         self.pool: tuple[int, int] | None = None
         self.disable_reason: str | None = None
@@ -126,7 +132,16 @@ class Qwen3TTSReferenceEncoderCudaGraphRunner:
             pass
         graphs: dict[int, CapturedEncoderGraph] = {}
         try:
-            with device_guard(self.device):
+            # note (ratish): one trace per bucket, which a ladder longer than dynamo's default limit would exceed.
+            with (
+                device_guard(self.device),
+                torch._dynamo.config.patch(  # noqa: leading-underscore  # upstream spelling, or the public name is already taken
+                    recompile_limit=max(
+                        torch._dynamo.config.recompile_limit,  # noqa: leading-underscore  # upstream spelling, or the public name is already taken
+                        len(self.bucket_frames),
+                    )
+                ),
+            ):
                 pool = self.graph_backend.graph_pool_handle()
                 # note(ratish): largest first so the shared pool is sized once.
                 for frames in reversed(self.bucket_frames):
@@ -155,7 +170,7 @@ class Qwen3TTSReferenceEncoderCudaGraphRunner:
         self.stream.wait_stream(self.device_module.current_stream(self.device))
         with torch.inference_mode(), self.device_module.stream(self.stream):
             for _ in range(2):
-                self._encode(static_input)
+                self.compiled_encode(static_input)
         with (
             torch.inference_mode(),
             self.graph_backend.capture(
@@ -164,7 +179,7 @@ class Qwen3TTSReferenceEncoderCudaGraphRunner:
                 thread_local_errors=True,
             ) as graph,
         ):
-            static_codes = self._encode(static_input)
+            static_codes = self.compiled_encode(static_input)
         self.stream.synchronize()
         return CapturedEncoderGraph(
             graph=graph, static_input=static_input, static_codes=static_codes
