@@ -7649,6 +7649,42 @@ def test_qwen3_tts_result_adapter_leaves_device_codes_on_the_device() -> None:
     assert result.data["audio_codes"].tolist() == [[9, 9], [1, 2], [3, 4]]
 
 
+@pytest.mark.accelerator
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_qwen3_tts_vocoder_reads_final_codes_finished_on_the_talker_stream() -> None:
+    device = torch.device("cuda", torch.cuda.current_device())
+    talker_stream = torch.cuda.Stream(device)
+    payload = make_payload(inputs="target")
+    talker_stream.wait_stream(torch.cuda.current_stream(device))
+    with torch.cuda.stream(talker_stream):
+        torch.cuda._sleep(1_000_000_000)  # noqa: leading-underscore  # upstream name
+        talker_result = apply_sglang_qwen3_tts_result(
+            payload,
+            Qwen3TTSSGLangRequestData(
+                req=SimpleNamespace(output_ids=[]),
+                output_codes=[
+                    torch.full((2,), 7, dtype=torch.long, device=device)
+                    for _ in range(3)
+                ],
+                stage_payload=payload,
+            ),
+        )
+
+    class Tokenizer(FakeQwen3TTSSpeechTokenizer):
+        def decode(self, encoded):
+            return super().decode(
+                [{"audio_codes": item["audio_codes"].cpu()} for item in encoded]
+            )
+
+    scheduler = Qwen3TTSStreamingVocoderScheduler(Tokenizer(), device=device)
+
+    (vocoder_result,) = asyncio.run(scheduler.vocode_payloads([talker_result]))
+
+    waveform = np.frombuffer(vocoder_result.data["audio_waveform"], dtype=np.float32)
+    assert waveform.size > 0
+    assert set(waveform.tolist()) == {7.0}
+
+
 def test_qwen3_tts_result_adapter_preserves_length_finish_reason() -> None:
     """A length-capped generation must be distinguishable from natural EOS."""
     payload = make_payload(inputs="target")
