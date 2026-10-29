@@ -4,11 +4,12 @@
 from __future__ import annotations
 
 import logging
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from typing import TypedDict
 
 import torch
+import torch.nn.functional as F
 from transformers import MimiModel
 from transformers.models.mimi.modeling_mimi import MimiConv1d
 
@@ -33,16 +34,41 @@ class ReferenceEncoderGraphStats(TypedDict):
     misses: int
 
 
-def move_conv_padding_to_host(encoder: torch.nn.Module) -> int:
-    """Put every conv's padding integers on the CPU; returns the conv count."""
+def integer_padding_forward(conv: MimiConv1d) -> Callable[..., torch.Tensor]:
+    """The causal conv's forward with its padding as Python integers."""
+    if not conv.causal or conv.pad_mode not in ("constant", "replicate"):
+        raise ValueError(
+            f"Qwen3-TTS reference encoder cannot pad a {conv.pad_mode!r} conv by integers"
+        )
+    else:
+        pass
+    stride = int(conv.conv.stride[0])
+    kernel_size = (int(conv.conv.kernel_size[0]) - 1) * int(conv.conv.dilation[0]) + 1
+    padding_left = kernel_size - stride
+
+    def forward(
+        hidden_states: torch.Tensor, padding_cache: None = None
+    ) -> torch.Tensor:
+        # note (ratish): Mimi pads the right edge up to whole strides, and torch copies the input even for zero widths.
+        padding_right = -hidden_states.shape[-1] % stride
+        if padding_left or padding_right:
+            hidden_states = F.pad(
+                hidden_states, (padding_left, padding_right), mode=conv.pad_mode
+            )
+        else:
+            pass
+        return conv.conv(hidden_states)
+
+    return forward
+
+
+def pad_convs_by_integers(encoder: torch.nn.Module) -> int:
+    """Give every conv a forward that pads by Python integers; returns the conv count."""
+    # note (ratish): Mimi computes each conv's padding from tensor buffers, which waits on the device per conv and breaks a compiled graph.
     count = 0
     for module in encoder.modules():
         if isinstance(module, MimiConv1d):
-            module.stride = module.stride.cpu()
-            module.kernel_size = module.kernel_size.cpu()
-            module.padding_total = module.padding_total.cpu()
-            module.padding_right = module.padding_total // 2
-            module.padding_left = module.padding_total - module.padding_right
+            module.forward = integer_padding_forward(module)
             count += 1
         else:
             pass
@@ -184,6 +210,6 @@ class Qwen3TTSReferenceEncoderCudaGraphRunner:
 __all__ = [
     "DEFAULT_QWEN3_TTS_REFERENCE_ENCODER_BUCKET_FRAMES",
     "Qwen3TTSReferenceEncoderCudaGraphRunner",
-    "move_conv_padding_to_host",
+    "pad_convs_by_integers",
     "smallest_bucket",
 ]
