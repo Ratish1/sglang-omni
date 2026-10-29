@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Block 15 of 10-29, after block 14 (WAIT_PID): the reference encoder speedups branch against main.
-# perf/qwen3-tts-reference-encoder-compile 133b1e327 (main 08cecee99 plus integer conv padding and the encode compiled
+# perf/qwen3-tts-reference-encoder-compile 92025c654 (main 08cecee99 plus integer conv padding and the encode compiled
 # per graph bucket). Card 0: the qwen3_tts suite on the branch. Card 1: encoder_speedups_gate.py's served variant on the
 # branch tree (its encode as served: device per encode, codes against main's and official's). Then the standard
 # SeedTTS EN A/B (1.7B Base), same-time pairs on cards 0 and 1 then swapped, scored: non-streaming c16, streaming c16,
@@ -25,7 +25,7 @@ echo "queue block15 start $(date +%T) kit $(git -C $T rev-parse HEAD)" >> $L
 git -C $REPO fetch -q origin perf/qwen3-tts-reference-encoder-compile
 rm -rf /workspace/n29_compile
 git -C $REPO worktree prune
-git -C $REPO worktree add -q --detach /workspace/n29_compile 133b1e327
+git -C $REPO worktree add -q --detach /workspace/n29_compile 92025c654
 echo "tree compile $(git -C /workspace/n29_compile rev-parse HEAD HEAD:sglang_omni | tr '\n' ' ')" >> $L
 
 (cd /workspace/n29_compile && CUDA_VISIBLE_DEVICES=0 python3 -m pytest tests/unit_test/qwen3_tts -q -p no:cacheprovider > $W/units_compile.txt 2>&1;
