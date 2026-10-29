@@ -25,7 +25,7 @@ from typing import Awaitable, Callable, Literal, Protocol
 import torch
 
 from sglang_omni.comm import stage_io
-from sglang_omni.comm.data_ref import DataKind, DataRef
+from sglang_omni.comm.data_ref import DataKind, DataRef, TransportKind
 from sglang_omni.comm.engine import CommEngine, KVTransferCancelled, KVTransferRejected
 from sglang_omni.comm.kv_transfer import KVPageTransfer
 from sglang_omni.comm.router import CommRouter
@@ -674,6 +674,28 @@ class Stage:
         else:
             pass
 
+        if stage_io.is_inline_payload_ref(msg.data_ref):
+            try:
+                payload = stage_io.deserialize_inline_payload(
+                    msg.data_ref, self.comm.local_payload_device
+                )
+            except Exception as exc:
+                logger.exception(
+                    "Stage %s: inline payload deserialize failed for %s",
+                    self.name,
+                    request_id,
+                )
+                await self.wait_for_receive_predecessor(predecessor)
+                await self.send_failure(
+                    request_id, f"inline payload deserialize failed: {exc}"
+                )
+                return
+            await self.wait_for_receive_predecessor(predecessor)
+            await self.receive_payload_from_stage(request_id, msg.from_stage, payload)
+            return
+        else:
+            pass
+
         data_ref = self.data_ref_from_message(msg)
         relay = self.comm.relay(data_ref.transport)
         try:
@@ -1032,6 +1054,10 @@ class Stage:
         if stage_io.is_direct_cuda_ipc_payload_ref(msg.data_ref):
             imported = stage_io.deserialize_direct_cuda_ipc_payload(msg.data_ref)
             del imported
+            return
+        else:
+            pass
+        if stage_io.is_inline_payload_ref(msg.data_ref):
             return
         else:
             pass
@@ -1995,6 +2021,41 @@ class Stage:
         transport_kind, relay = self.comm.router.relay_for_payload(
             target, projected_payload
         )
+        if transport_kind is TransportKind.SHM:
+            inline_ref = stage_io.serialize_inline_payload(projected_payload)
+        else:
+            inline_ref = None
+        if inline_ref is not None:
+            # note (ratish): this branch skips the payload send worker, so it records the transport it chose and the bytes it sent.
+            self.comm.router.note_transport_choice("payload", target, "inline")
+            _comm_trace(
+                "comm_payload_send",
+                request_id=request_id,
+                from_stage=self.name,
+                to_stage=target,
+                transport="inline",
+                bytes=len(inline_ref["buffer"]),
+            )
+            await self.control_plane.send_to_stage(
+                target,
+                endpoint,
+                DataReadyMessage(
+                    request_id=request_id,
+                    from_stage=self.name,
+                    to_stage=target,
+                    data_ref=inline_ref,
+                    replica_bindings=self.replica_bindings.get(request_id),
+                ),
+            )
+            _emit_event(
+                request_id=request_id,
+                stage=self.name,
+                event_name="stage_hop_sent",
+                metadata={"to_stage": target, "transport": "inline"},
+            )
+            return
+        else:
+            pass
         await self.comm.send_payload(
             relay=relay,
             control_plane=self.control_plane,
