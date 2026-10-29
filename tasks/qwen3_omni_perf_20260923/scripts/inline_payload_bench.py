@@ -39,9 +39,9 @@ SIZES = (8, 64, 1024, 4096, 16384, 65536, 262144, 1048576, 4194304, 16777216)
 PATHS = ("shm", "inline")
 
 
-def make_payload(size_bytes: int, hop: int) -> StagePayload:
+def make_payload(size_bytes: int, hop: int, path: str) -> StagePayload:
     return StagePayload(
-        request_id=f"r{hop}",
+        request_id=f"{size_bytes}-{hop}-{path}",
         request={"prompt_tokens": 128, "stage": "bench"},
         data={"features": torch.randn(max(size_bytes // 4, 1), dtype=torch.float32)},
     )
@@ -63,7 +63,7 @@ async def sender_main(out_dir: str, iterations: int, warmup: int) -> None:
     for size_bytes in SIZES:
         for hop in range(warmup + iterations):
             for path in PATHS:
-                payload = make_payload(size_bytes, hop)
+                payload = make_payload(size_bytes, hop, path)
                 start_ns = time.time_ns()
                 cpu_start = time.thread_time_ns()
                 if path == "shm":
@@ -100,6 +100,7 @@ async def sender_main(out_dir: str, iterations: int, warmup: int) -> None:
                         {
                             "size": size_bytes,
                             "path": path,
+                            "request_id": payload.request_id,
                             "start_ns": start_ns,
                             "sender_cpu_us": send_cpu_ns / 1000,
                             "ack_object_id": ack.object_id,
@@ -157,7 +158,7 @@ async def receiver_main(out_dir: str) -> None:
         records.append(
             {
                 "path": path,
-                "bytes": int(payload.data["features"].numel() * 4),
+                "request_id": message.request_id,
                 "ready_ns": ready_ns,
                 "receiver_cpu_us": receive_cpu_ns / 1000,
             }
@@ -185,23 +186,17 @@ def main() -> None:
     asyncio.run(sender_main(out_dir, iterations, warmup))
     receiver.join()
     sent = json.load(open(f"{out_dir}/sender.json"))
-    received = [
-        record
+    received = {
+        record["request_id"]: record
         for record in json.load(open(f"{out_dir}/receiver.json"))
-        if record["path"] in PATHS
-    ]
-    warm = len(received) - len(sent)
-    received = received[warm:] if warm > 0 else received
+    }
     print(f"torch {torch.__version__}, {iterations} hops a size and path after {warmup}")
     print(
         f"{'bytes':>10} {'path':>7}  {'sender cpu us':>20}  {'receiver cpu us':>20}  {'delivery us':>20}"
     )
     rows: dict[tuple[int, str], dict[str, list[float]]] = {}
-    for sent_record, received_record in zip(sent, received):
-        if sent_record["path"] != received_record["path"]:
-            raise RuntimeError("sender and receiver records are out of step")
-        else:
-            pass
+    for sent_record in sent:
+        received_record = received[sent_record["request_id"]]
         key = (sent_record["size"], sent_record["path"])
         row = rows.setdefault(key, {"sender": [], "receiver": [], "delivery": []})
         row["sender"].append(sent_record["sender_cpu_us"])
