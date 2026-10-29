@@ -546,7 +546,7 @@ class Qwen3TtsEngineBuilder(TtsEngineBuilder[Qwen3TTSSGLangRequestData]):
     def extra_scheduler_kwargs(self) -> SchedulerExtras[Qwen3TTSSGLangRequestData]:
         # note (ratish): requests build on the scheduler thread: preprocessing already did the
         # model work, and a pooled build that misses the pass waits a whole engine step for admission.
-        # note (ratish): the reference encode and the vocoder share this process and card on their own streams, and at equal priority a talker step waits behind their kernels.
+        # note (ratish): on the default stream the talker's steps run in order with the vocoder's whole-utterance decodes, so the talker takes a stream of its own, above the vocoder's.
         return {
             "stream_output_builder": self.stream_output_builder,
             "prefill_coalesce_requests": self.prefill_coalesce_requests,
