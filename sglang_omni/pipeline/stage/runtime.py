@@ -2021,11 +2021,10 @@ class Stage:
         transport_kind, relay = self.comm.router.relay_for_payload(
             target, projected_payload
         )
-        if transport_kind is TransportKind.SHM:
+        if transport_kind is TransportKind.SHM and stage_io.payload_fits_inline(
+            projected_payload
+        ):
             inline_ref = stage_io.serialize_inline_payload(projected_payload)
-        else:
-            inline_ref = None
-        if inline_ref is not None:
             # note (ratish): this branch skips the payload send worker, so it records the transport it chose and the bytes it sent.
             self.comm.router.note_transport_choice("payload", target, "inline")
             _comm_trace(

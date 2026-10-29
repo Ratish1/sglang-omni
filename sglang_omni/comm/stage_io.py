@@ -460,16 +460,18 @@ def deserialize_inline_stream_chunk(
     return data, metadata
 
 
-def serialize_inline_payload(payload: StagePayload) -> InlinePayloadRef | None:
-    """The payload with its tensors' packed bytes in the reference, or None above the inline bound."""
-    data_without_tensors, tensors = extract_tensors(payload.data)
+def payload_fits_inline(payload: StagePayload) -> bool:
+    """Whether the payload's tensors hold at most the inline bound of bytes."""
+    _, tensors = extract_tensors(payload.data)
     tensor_bytes = sum(
         tensor.numel() * tensor.element_size() for tensor in tensors.values()
     )
-    if tensor_bytes > _INLINE_BYTES_LIMIT:
-        return None
-    else:
-        pass
+    return tensor_bytes <= _INLINE_BYTES_LIMIT
+
+
+def serialize_inline_payload(payload: StagePayload) -> InlinePayloadRef:
+    """The payload with its tensors' packed bytes in the reference."""
+    data_without_tensors, tensors = extract_tensors(payload.data)
     chunks, entries = pack_tensor_chunks(tensors, device="cpu")
     header = StagePayload(
         request_id=payload.request_id,
