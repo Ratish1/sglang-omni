@@ -7665,6 +7665,10 @@ def test_qwen3_tts_vocoder_reads_final_codes_finished_on_the_talker_stream() -> 
     payload = make_payload(inputs="target")
     talker_stream.wait_stream(torch.cuda.current_stream(device))
     with torch.cuda.stream(talker_stream):
+        cached_blocks = [
+            torch.empty(64, dtype=torch.long, device=device) for _ in range(8)
+        ]
+        del cached_blocks
         torch.cuda._sleep(1_000_000_000)  # noqa: leading-underscore  # upstream name
         talker_result = apply_sglang_qwen3_tts_result(
             payload,
