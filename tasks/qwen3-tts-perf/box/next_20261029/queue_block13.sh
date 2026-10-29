@@ -20,7 +20,7 @@ L=$W/queue.log
 export ARM_ROOT=$W/arms
 mkdir -p $ARM_ROOT $W/logs $W/scan
 if [ -n "${WAIT_PID:-}" ]; then
-  while kill -0 $WAIT_PID 2> /dev/null; do sleep 30; done
+  while [ -n "$(ps -o stat= -p $WAIT_PID 2> /dev/null | grep -v Z)" ]; do sleep 30; done
 else
   :
 fi

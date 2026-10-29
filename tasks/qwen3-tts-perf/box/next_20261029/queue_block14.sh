@@ -14,7 +14,7 @@ W=$D/block14
 L=$W/queue.log
 mkdir -p $W
 if [ -n "${WAIT_PID:-}" ]; then
-  while kill -0 $WAIT_PID 2> /dev/null; do sleep 30; done
+  while [ -n "$(ps -o stat= -p $WAIT_PID 2> /dev/null | grep -v Z)" ]; do sleep 30; done
 else
   :
 fi
