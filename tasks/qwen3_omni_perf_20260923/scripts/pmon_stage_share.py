@@ -30,17 +30,11 @@ def stage_by_pid(boot_dir: str) -> dict[str, str]:
 
 
 def benchmark_window(boot_dir: str) -> tuple[str, str]:
-    starts = []
-    ends = []
+    # a gen line can follow the profiler's reply on the same line, so the pattern is searched anywhere
     with open(f"{boot_dir}/progress.txt") as progress_file:
-        for line in progress_file:
-            words = line.split()
-            if len(words) >= 4 and words[0] == "gen" and words[2] == "start":
-                starts.append(words[3])
-            elif len(words) >= 5 and words[0] == "gen" and words[2] == "rc":
-                ends.append(words[4])
-            else:
-                pass
+        progress = progress_file.read()
+    starts = re.findall(r"gen \S+ start (\d\d:\d\d:\d\d)", progress)
+    ends = re.findall(r"gen \S+ rc \d+ (\d\d:\d\d:\d\d)", progress)
     return min(starts), max(ends)
 
 
