@@ -7743,18 +7743,14 @@ def test_qwen3_tts_vocoder_reads_final_codes_finished_on_the_talker_stream() -> 
 
 @pytest.mark.accelerator
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-def test_qwen3_tts_default_stream_reads_stream_codes_finished_on_the_talker_stream() -> (
-    None
-):
-    from sglang_omni.models.qwen3_tts.request_builders import (
-        make_qwen3_tts_scheduler_adapters,
-    )
-
+def test_qwen3_tts_default_stream_reads_complete_stream_codes() -> None:
     device = torch.device("cuda", torch.cuda.current_device())
     payload = make_payload(inputs="target", params={"stream": True})
-    _, _, stream_output_builder = make_qwen3_tts_scheduler_adapters(
-        model=None,
-        wrapper=None,
+    _, _, stream_output_builder = (
+        qwen3_request_builders.make_qwen3_tts_scheduler_adapters(
+            model=None,
+            wrapper=None,
+        )
     )
     talker_stream = torch.cuda.Stream(device)
     talker_stream.wait_stream(torch.cuda.current_stream(device))
