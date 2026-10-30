@@ -30,6 +30,9 @@ Names (rid = request id; the first word is the kind the census groups by):
                                              calling thread
   sched.chunk rid=R, sched.done rid=R        a stream chunk or the stream's end taken in on
                                              an engine's scheduler thread
+  io.ser serialize_message, io.deser deserialize_message
+                                             every control message's msgpack encode and decode
+  io.sched rid=R A->B                        a received data message's receive task scheduled
   coord.submit rid=R                         mark, a request enters the coordinator
   coord.recv rid=R from=S n=N                mark, a stream chunk reaches the coordinator
                                              (n = audio samples, - for text)
@@ -331,6 +334,11 @@ def patch_stage(module):
         return await start(self)
 
     stage.start = start_marked
+    # a received data message's receive task is created here, one per message
+    stage.schedule_receive_task = ranged(
+        stage.schedule_receive_task,
+        lambda self, msg: f"io.sched rid={msg.request_id} {msg.from_stage}->{self.name}",
+    )
     stage.on_data_ready = bracketed_async(
         stage.on_data_ready,
         lambda self, msg, *args, **kwargs: (
@@ -435,6 +443,12 @@ def patch_shm(module):
     range_present(
         module, ("shm_create_from_tensor", "shm_create_from_chunks"), "io.ser"
     )
+
+
+def patch_control_plane(module):
+    """Every control message's msgpack encode and decode, on the sending and receiving thread."""
+    range_present(module, ("serialize_message",), "io.ser")
+    range_present(module, ("deserialize_message",), "io.deser")
 
 
 def coordinator_recv_label(self, msg):
@@ -765,6 +779,7 @@ PATCHES = {
     "sglang_omni.pipeline.stage.runtime": patch_stage,
     "sglang_omni.comm.stage_io": patch_stage_io,
     "sglang_omni.relay.shm": patch_shm,
+    "sglang_omni.pipeline.control_plane": patch_control_plane,
     "sglang_omni.scheduling.message": patch_message,
     "sglang.srt.managers.schedule_batch": patch_schedule_batch,
     "sglang_omni.models.qwen3_omni.talker_scheduler": patch_talker_scheduler,
