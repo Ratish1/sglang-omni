@@ -25,7 +25,11 @@ Names (rid = request id; the first word is the kind the census groups by):
                                              coroutines (receive a payload, receive a
                                              stream chunk, send a payload, send a stream
                                              item, send to the coordinator, route a result)
-  io.ser <fn>, io.deser <fn>                 relay serialization on the calling thread
+  io.ser <fn>, io.deser <fn>                 payload serialization, packing, the SHM block
+                                             creation and copy, and their inverses, on the
+                                             calling thread
+  sched.chunk rid=R, sched.done rid=R        a stream chunk or the stream's end taken in on
+                                             an engine's scheduler thread
   coord.submit rid=R                         mark, a request enters the coordinator
   coord.recv rid=R from=S n=N                mark, a stream chunk reaches the coordinator
                                              (n = audio samples, - for text)
@@ -382,21 +386,55 @@ def patch_stage(module):
     )
 
 
+def range_present(module, names, kind):
+    """Range every named function the tree has; name the ones it lacks instead of failing,
+    so one renamed function cannot drop the module's other ranges."""
+    for name in names:
+        function = getattr(module, name, None)
+        if function is None:
+            print(
+                f"omni_pipeline_nvtx {module.__name__} has no {name}",
+                file=sys.stderr,
+                flush=True,
+            )
+            continue
+        setattr(module, name, ranged(function, fixed(f"{kind} {name}")))
+
+
 def patch_stage_io(module):
-    for name in (
-        "serialize_direct_cuda_ipc_payload",
-        "serialize_direct_cuda_ipc_stream_chunk",
-        "serialize_inline_stream_chunk",
-        "pack_tensors",
-        "ipc_pickle",
-    ):
-        setattr(module, name, ranged(getattr(module, name), fixed(f"io.ser {name}")))
-    for name in (
-        "deserialize_direct_cuda_ipc_payload",
-        "deserialize_direct_cuda_ipc_stream_chunk",
-        "deserialize_inline_stream_chunk",
-    ):
-        setattr(module, name, ranged(getattr(module, name), fixed(f"io.deser {name}")))
+    # a tree has the packer under one of two names (pack_tensor_chunks since the one-copy
+    # put); the inline payload functions exist only on trees that carry payloads inline
+    range_present(
+        module,
+        (
+            "serialize_direct_cuda_ipc_payload",
+            "serialize_direct_cuda_ipc_stream_chunk",
+            "serialize_inline_stream_chunk",
+            "serialize_inline_payload",
+            "pack_tensor_chunks",
+            "pack_tensors",
+            "ipc_pickle",
+        ),
+        "io.ser",
+    )
+    range_present(
+        module,
+        (
+            "deserialize_direct_cuda_ipc_payload",
+            "deserialize_direct_cuda_ipc_stream_chunk",
+            "deserialize_inline_stream_chunk",
+            "deserialize_inline_payload",
+            "unpack_payload",
+        ),
+        "io.deser",
+    )
+
+
+def patch_shm(module):
+    """The SHM put's block creation and copy, on the sending thread."""
+    range_present(
+        module, ("shm_create_from_tensor", "shm_create_from_chunks"), "io.ser"
+    )
 
 
 def coordinator_recv_label(self, msg):
@@ -527,6 +565,15 @@ def patch_scheduler(module):
     )
     scheduler.emit_stream_output = ranged(
         scheduler.emit_stream_output, fixed("sched.emit")
+    )
+    # a stream chunk or the stream's end taken in on the scheduler thread, inside sched.input
+    scheduler.on_stream_chunk = ranged(
+        scheduler.on_stream_chunk,
+        lambda self, request_id, chunk: f"sched.chunk rid={request_id}",
+    )
+    scheduler.on_stream_done = ranged(
+        scheduler.on_stream_done,
+        lambda self, request_id: f"sched.done rid={request_id}",
     )
     enqueue = scheduler.enqueue_built_request
 
@@ -717,6 +764,7 @@ PATCHES = {
     "torch.cuda.graphs": patch_graphs,
     "sglang_omni.pipeline.stage.runtime": patch_stage,
     "sglang_omni.comm.stage_io": patch_stage_io,
+    "sglang_omni.relay.shm": patch_shm,
     "sglang_omni.scheduling.message": patch_message,
     "sglang.srt.managers.schedule_batch": patch_schedule_batch,
     "sglang_omni.models.qwen3_omni.talker_scheduler": patch_talker_scheduler,
