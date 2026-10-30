@@ -15,7 +15,7 @@ from sglang_omni.comm.data_ref import DataKind, DataRef, TransportKind
 from sglang_omni.comm.engine import CommEngine
 from sglang_omni.pipeline.control_plane import deserialize_message, serialize_message
 from sglang_omni.pipeline.local_dispatch import LocalStageDispatcher, LocalStreamChunk
-from sglang_omni.pipeline.stage.runtime import Stage
+from sglang_omni.pipeline.stage.runtime import BATCHED_STREAM_CHUNK_BYTES_LIMIT, Stage
 from sglang_omni.pipeline.stage.stream_queue import StreamItem, StreamQueue
 from sglang_omni.proto import DataReadyMessage, OmniRequest, StagePayload
 from sglang_omni.proto.messages import StreamChunkBatchMessage
@@ -405,7 +405,7 @@ def test_remote_stream_run_packs_each_target_around_a_relay_chunk(
         stage.active_requests.update({"req-a", "req-b"})
         stage.replica_bindings["req-b"] = {"decode": 1}
         hidden = torch.zeros(
-            stage_io.BATCHED_STREAM_CHUNK_BYTES_LIMIT // 4 + 1, dtype=torch.float32
+            BATCHED_STREAM_CHUNK_BYTES_LIMIT // 4 + 1, dtype=torch.float32
         )
         put_messages(
             scheduler.outbox,

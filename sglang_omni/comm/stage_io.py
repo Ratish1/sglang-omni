@@ -367,9 +367,6 @@ def serialize_direct_cuda_ipc_stream_chunk(
     return ref
 
 
-BATCHED_STREAM_CHUNK_BYTES_LIMIT = 16 * 1024
-
-
 @dataclass(frozen=True, kw_only=True)
 class BatchedStreamChunk:
     """One small CPU stream chunk carried in its target's packed batch."""
@@ -378,16 +375,6 @@ class BatchedStreamChunk:
     chunk_id: int
     data: torch.Tensor
     metadata: dict[str, object] | None
-
-
-def can_batch_stream_chunk(data: object, metadata: dict[str, object] | None) -> bool:
-    return (
-        isinstance(data, torch.Tensor)
-        and data.device.type == "cpu"
-        and data.nbytes <= BATCHED_STREAM_CHUNK_BYTES_LIMIT
-        and not contains_cuda_tensor(metadata)
-        and not contains_cpu_tensor(metadata)
-    )
 
 
 def pack_stream_chunk_batch(

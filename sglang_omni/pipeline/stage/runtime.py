@@ -80,6 +80,7 @@ logger = logging.getLogger(__name__)
 
 _SCHEDULER_THREAD_JOIN_TIMEOUT_S = 5.0
 _OUTBOX_DRAIN_BATCH_SIZE = 64
+BATCHED_STREAM_CHUNK_BYTES_LIMIT = 16 * 1024
 
 
 GetNextFn = Callable[[str, object], str | list[str] | None]
@@ -2288,7 +2289,13 @@ class Stage:
     ) -> stage_io.BatchedStreamChunk | None:
         """Number a small CPU chunk for its target's packed batch, or None when it needs IPC or the relay."""
         metadata = stage_io.strip_process_local_metadata(metadata)
-        if not stage_io.can_batch_stream_chunk(data, metadata):
+        if (
+            not isinstance(data, torch.Tensor)
+            or data.device.type != "cpu"
+            or data.nbytes > BATCHED_STREAM_CHUNK_BYTES_LIMIT
+            or stage_io.contains_cuda_tensor(metadata)
+            or stage_io.contains_cpu_tensor(metadata)
+        ):
             return None
         else:
             pass
