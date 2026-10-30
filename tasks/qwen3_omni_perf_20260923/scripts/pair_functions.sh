@@ -36,8 +36,11 @@ probe() {
   local p0 p1
   p0=$(python3 /data/ab/pick_port.py $USED) && p1=$(python3 /data/ab/pick_port.py $USED) || { log "probe $round no free port"; return 1; }
   log "probe $round start ($arms c$conc, card0 $tree0 port $p0, card1 $tree1 port $p1)"
-  OMNI_SHM_PUT_PROBE=/data/sizes/$round/card0_$tree0/records SERVER_PYTHONPATH=$S/shm_put_size_probe MAX_SAMPLES=$samples PIN_CPUS=0-27,112-139 PIN_NODE=0 bash $S/run_bench_boot.sh /data/ab/$tree0 /data/sizes/$round/card0_$tree0/run 0 $p0 h200 $conc "$arms" &
-  OMNI_SHM_PUT_PROBE=/data/sizes/$round/card1_$tree1/records SERVER_PYTHONPATH=$S/shm_put_size_probe MAX_SAMPLES=$samples PIN_CPUS=28-55,140-167 PIN_NODE=0 bash $S/run_bench_boot.sh /data/ab/$tree1 /data/sizes/$round/card1_$tree1/run 1 $p1 h200 $conc "$arms" &
+  local x0 x1
+  x0=$(cat /data/ab/$tree0.args 2>/dev/null)
+  x1=$(cat /data/ab/$tree1.args 2>/dev/null)
+  EXTRA_SERVE_ARGS="$x0" OMNI_SHM_PUT_PROBE=/data/sizes/$round/card0_$tree0/records SERVER_PYTHONPATH=$S/shm_put_size_probe MAX_SAMPLES=$samples PIN_CPUS=${PIN0:-0-27,112-139} PIN_NODE=${PAIR_NODE:-0} bash $S/run_bench_boot.sh /data/ab/$tree0 /data/sizes/$round/card0_$tree0/run 0 $p0 ${PAIR_DTYPE:-h200} $conc "$arms" &
+  EXTRA_SERVE_ARGS="$x1" OMNI_SHM_PUT_PROBE=/data/sizes/$round/card1_$tree1/records SERVER_PYTHONPATH=$S/shm_put_size_probe MAX_SAMPLES=$samples PIN_CPUS=${PIN1:-28-55,140-167} PIN_NODE=${PAIR_NODE:-0} bash $S/run_bench_boot.sh /data/ab/$tree1 /data/sizes/$round/card1_$tree1/run 1 $p1 ${PAIR_DTYPE:-h200} $conc "$arms" &
   wait
   for boot in card0_$tree0 card1_$tree1; do
     taskset -c 0-3 python3 $S/shm_put_sizes.py /data/sizes/$round/$boot/records > /data/sizes/$round/$boot/sizes.txt 2>&1

@@ -35,6 +35,15 @@ def payload_bytes(value):
     return sum(payload_bytes(chunk) for chunk in value)
 
 
+def cuda_inputs(value):
+    """How many tensors handed to a pack function live on an accelerator (a device copy happens inside)."""
+    if isinstance(value, dict):
+        return sum(cuda_inputs(item) for item in value.values())
+    if isinstance(value, (list, tuple)):
+        return sum(cuda_inputs(item) for item in value)
+    return int(bool(getattr(value, "is_cuda", False)))
+
+
 def wrap(fn, packs):
     @functools.wraps(fn)
     def wrapped(*args, **kwargs):
@@ -47,6 +56,7 @@ def wrap(fn, packs):
                 "process": multiprocessing.current_process().name,
                 "function": fn.__name__,
                 "bytes": payload_bytes(result if packs else args[0]),
+                "cuda_inputs": cuda_inputs(args[0]) if packs else 0,
                 "start_ns": start_ns,
                 "wall_us": (time.perf_counter() - wall) * 1e6,
                 "cpu_us": (time.thread_time() - cpu) * 1e6,
