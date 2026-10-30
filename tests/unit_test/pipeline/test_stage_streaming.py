@@ -1311,6 +1311,65 @@ def test_stream_run_rejects_only_the_request_without_its_payload() -> None:
     asyncio.run(run())
 
 
+def test_stream_run_dispatches_the_same_process_run_before_an_awaited_remote_send(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        platforms.current_platform, "device_type", "cuda", raising=False
+    )
+
+    async def run() -> None:
+        sends: list[str] = []
+
+        class OrderedDispatcher(LocalStageDispatcher):
+            async def send_stream_chunks(
+                self, *, from_stage: str, to_stage: str, chunks: list[LocalStreamChunk]
+            ) -> None:
+                sends.append(to_stage)
+                await super().send_stream_chunks(
+                    from_stage=from_stage, to_stage=to_stage, chunks=chunks
+                )
+
+        class OrderedControlPlane(FakeControlPlane):
+            async def send_to_stage(self, target, endpoint, msg) -> None:
+                sends.append(target)
+                await super().send_to_stage(target, endpoint, msg)
+
+        dispatcher = OrderedDispatcher()
+        relay = FakeRelay()
+        sender = make_stage(
+            name="talker_ar",
+            endpoints={"code2wav": "inproc://code2wav", "monitor": "inproc://monitor"},
+            control_plane=OrderedControlPlane(),
+            relay=relay,
+            same_process_targets={"code2wav"},
+            local_dispatcher=dispatcher,
+        )
+        receiver = make_stage(name="code2wav", can_accept_stream_before_payload=True)
+        receiver.stream_queue = StreamQueue()
+        dispatcher.register_many([sender, receiver])
+        sender.active_requests.add("req-a")
+        hidden = torch.zeros(
+            BATCHED_STREAM_CHUNK_BYTES_LIMIT // 4 + 1, dtype=torch.float32
+        )
+        put_messages(
+            sender.scheduler.outbox,
+            [
+                frame_message("req-a", 0, "code2wav"),
+                OutgoingMessage("req-a", "stream", hidden, "monitor"),
+            ],
+        )
+
+        sender.end_outbox_drain()
+        await sender.drain_outbox_external()
+
+        assert sends == ["code2wav", "monitor"]
+        assert len(relay.puts) == 1
+        assert receiver.scheduler.inbox.qsize() == 1
+
+    asyncio.run(run())
+
+
 def test_stream_run_keeps_the_order_across_alternating_targets() -> None:
     async def run() -> None:
         dispatcher, sender, receivers = make_local_stream_pair(
