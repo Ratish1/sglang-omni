@@ -42,6 +42,7 @@ from sglang.srt.model_executor.forward_context import ForwardContext, forward_co
 from sglang.srt.runtime_context import get_context, override_platform
 from sglang.srt.server_args import ServerArgs
 
+from sglang_omni.comm import stage_io
 from sglang_omni.config.manager import ConfigManager
 from sglang_omni.config.runtime import resolve_stage_factory_kwargs
 from sglang_omni.model_runner.prefill_inputs import get_omni_prefill_inputs
@@ -7738,6 +7739,73 @@ def test_qwen3_tts_vocoder_reads_final_codes_finished_on_the_talker_stream() -> 
     waveform = np.frombuffer(vocoder_result.data["audio_waveform"], dtype=np.float32)
     assert waveform.size > 0
     assert set(waveform.tolist()) == {7.0}
+
+
+@pytest.mark.accelerator
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_qwen3_tts_default_stream_reads_stream_codes_finished_on_the_talker_stream() -> (
+    None
+):
+    from sglang_omni.models.qwen3_tts.request_builders import (
+        make_qwen3_tts_scheduler_adapters,
+    )
+
+    device = torch.device("cuda", torch.cuda.current_device())
+    payload = make_payload(inputs="target", params={"stream": True})
+    _, _, stream_output_builder = make_qwen3_tts_scheduler_adapters(
+        model=None,
+        wrapper=None,
+    )
+    talker_stream = torch.cuda.Stream(device)
+    talker_stream.wait_stream(torch.cuda.current_stream(device))
+    with torch.cuda.stream(talker_stream):
+        torch.ones((2, 2), dtype=torch.long, device=device)
+        torch.cuda.synchronize(device)
+        torch.cuda._sleep(1_000_000_000)  # noqa: leading-underscore  # upstream name
+        step_codes = torch.full((2, 2), 7, dtype=torch.long, device=device)
+        codes_ready = torch.cuda.Event()
+        codes_ready.record()
+        messages = [
+            stream_output_builder(
+                payload.request_id,
+                Qwen3TTSSGLangRequestData(
+                    latest_stream_code_chunk=step_codes[row],
+                    codes_ready_event=codes_ready,
+                    stream_codec_output=True,
+                    stream_ref_sent=True,
+                    stage_payload=payload,
+                ),
+                None,
+            )[0]
+            for row in range(2)
+        ]
+
+    assert [message.data.cpu().tolist() for message in messages] == [
+        [[7, 7]],
+        [[7, 7]],
+    ]
+
+
+@pytest.mark.accelerator
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_qwen3_tts_final_codes_payload_serializes_for_another_process() -> None:
+    device = torch.device("cuda", torch.cuda.current_device())
+    payload = make_payload(inputs="target")
+    talker_stream = torch.cuda.Stream(device)
+    talker_stream.wait_stream(torch.cuda.current_stream(device))
+    with torch.cuda.stream(talker_stream):
+        result = apply_sglang_qwen3_tts_result(
+            payload,
+            Qwen3TTSSGLangRequestData(
+                req=SimpleNamespace(output_ids=[]),
+                output_codes=[torch.tensor([1, 2], device=device)],
+                stage_payload=payload,
+            ),
+        )
+
+    serialized = stage_io.serialize_direct_cuda_ipc_payload(result)
+
+    assert stage_io.is_direct_cuda_ipc_payload_ref(serialized)
 
 
 def test_qwen3_tts_result_adapter_preserves_length_finish_reason() -> None:
