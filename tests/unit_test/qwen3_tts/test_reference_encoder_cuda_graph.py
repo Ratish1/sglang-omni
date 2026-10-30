@@ -133,7 +133,6 @@ def exact_length_codes(model: MimiModel, waveform: np.ndarray) -> torch.Tensor:
 
 
 def test_reference_codes_match_the_exact_length_encode() -> None:
-    """A reference padded to whole frames encoded its last frame from the padding's conv outputs, so its codes left the exact-length encode's and a voice clone lost its speaker several times as often."""
     torch.manual_seed(7)
     model = MimiModel(small_mimi_config())
     for module in model.modules():
@@ -168,7 +167,6 @@ def test_reference_codes_match_the_exact_length_encode() -> None:
 
 
 def test_reference_code_batcher_refuses_an_empty_reference() -> None:
-    """An empty reference reached the encoder graphs, whose tail padding read the clip's last step at index -1 and asserted on the device, failing every later request."""
     batcher = qwen3_request_builders.Qwen3TTSRefCodeBatcher(
         fake_speech_tokenizer(MimiModel(small_mimi_config()).eval(), quantizers=4),
         max_batch_wait_ms=0,
@@ -194,7 +192,6 @@ def test_speech_tokenizer_loader_gives_the_encoder_its_float32_checkpoint_weight
     model_type: str,
     encoder_dtype: torch.dtype,
 ) -> None:
-    """A bf16 server encoded references with bf16-rounded weights, which flipped most residual codes against the float32 checkpoint."""
     torch.manual_seed(5)
     config = small_mimi_config()
     checkpoint_encoder = MimiModel(config)
