@@ -3,6 +3,7 @@ single card, where pair.py's two arms at once do not fit; two arms' seeded runs 
 
 usage: python3 serve_arm.py --label c1s_pr --tree /workspace/pr_52983c59d --card 0 --port 4400 --concurrency 1
        [--seed 1234] [--no-stream] [--meta LIST] [--model PATH] [--bench-args "--no-ref-text"] [--score]
+       [--serve-args "--vocoder.process vocoder"]
        python3 serve_arm.py --compare c1s_pr c1s_inline
 
 The server takes its card from the stage gpu flags and binds 127.0.0.1 with SGLANG_OMNI_STRICT_PORT; the bench is
@@ -62,6 +63,7 @@ def main() -> None:
     parser.add_argument("--meta", default="")
     parser.add_argument("--model", default=MODEL)
     parser.add_argument("--bench-args", default="")
+    parser.add_argument("--serve-args", default="")
     parser.add_argument("--score", action="store_true")
     parser.add_argument("--compare", nargs=2)
     parser.add_argument("--barrier", type=Path, default=None)
@@ -88,7 +90,8 @@ def main() -> None:
     ).stdout
     (out / "tree.txt").write_text(f"{args.tree} card {args.card}\n{identity}imports {imported}", encoding="utf-8")
     command = [sys.executable, "-m", "sglang_omni.cli", "serve", "--model-path", args.model, "--host", "127.0.0.1",
-               "--port", str(args.port), "--tts_engine.gpu", str(args.card), "--vocoder.gpu", str(args.card)]
+               "--port", str(args.port), "--tts_engine.gpu", str(args.card), "--vocoder.gpu", str(args.card),
+               *shlex.split(args.serve_args)]
     with open(out / "serve.log", "w", encoding="utf-8") as serve_log:
         spawned = time.monotonic()
         server = subprocess.Popen(
