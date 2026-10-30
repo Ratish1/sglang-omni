@@ -343,15 +343,16 @@ def adopt_prepared_tensors(prepared: Qwen3TTSPreparedRequest) -> None:
             pass
 
 
-def hand_off_to_default_stream(codes: torch.Tensor, ready_event: torch.Event) -> None:
-    """Order the default stream after codes made on the talker's stream and keep them alive there."""
+def hand_off_to_default_stream(codes: torch.Tensor) -> None:
+    """Order the default stream after the talker's stream and keep codes the talker made alive there."""
     if not codes.is_cuda:
         return
     else:
         pass
+    talker_stream = torch.cuda.current_stream(codes.device)
     default_stream = torch.cuda.default_stream(codes.device)
-    if torch.cuda.current_stream(codes.device) != default_stream:
-        default_stream.wait_event(ready_event)
+    if talker_stream != default_stream:
+        default_stream.wait_stream(talker_stream)
         codes.record_stream(default_stream)
     else:
         pass
@@ -2001,12 +2002,7 @@ def apply_sglang_qwen3_tts_result(
             dim=0,
         )
         # note (ratish): the vocoder's decode and a cross-process send read these on the default stream, which waits for them as when the talker ran there.
-        if has_device_streams(codes.device):
-            codes_ready_event = torch.get_device_module(codes.device).Event()
-            codes_ready_event.record()
-            hand_off_to_default_stream(codes, codes_ready_event)
-        else:
-            pass
+        hand_off_to_default_stream(codes)
     else:
         codes = torch.empty((0, 0), dtype=torch.long)
 
@@ -2132,7 +2128,7 @@ def make_qwen3_tts_scheduler_adapters(
             metadata["codes_ready_event"] = data.codes_ready_event
             # note (ratish): a step's chunks share its event and snapshot, so a cross-process send's default stream waits once a step.
             if data.codes_ready_event is not handed_off_event:
-                hand_off_to_default_stream(codes, data.codes_ready_event)
+                hand_off_to_default_stream(codes)
                 handed_off_event = data.codes_ready_event
             else:
                 pass
