@@ -3,7 +3,7 @@
 # standard SeedTTS EN A/B on 1.7B Base with serve_arm.py at its barrier, scored on each arm's card. First the layout the
 # hand-off is for, the vocoder in its own process (the cookbook's --vocoder.process vocoder with its fractions),
 # non-streaming and streaming c16 in both card orders; then the one-process default, where the hand-off replaced the
-# vocoder's event wait: non-streaming c64 (the gain's load) and c16, streaming c16, both orders.
+# vocoder's event wait: non-streaming c64 (the gain's load) and c16, streaming c16 and c64, both orders.
 # usage: D=... T=... BR=<commit> bash queue_block34.sh
 set -u
 D=${D:?the results directory}
@@ -37,6 +37,7 @@ pair() {
 N16="--concurrency 16 --no-stream --score"
 S16="--concurrency 16 --score"
 N64="--concurrency 64 --no-stream --score"
+S64="--concurrency 64 --score"
 SERVE_ARGS="--vocoder.process vocoder --tts_engine.gpu_memory_fraction 0.85 --vocoder.gpu_memory_fraction 0.10"
 pair sp_n16_a "sp_n16_a_main $MAIN 0 40000 $N16" "sp_n16_a_prio $BRANCH 1 41000 $N16"
 pair sp_n16_b "sp_n16_b_prio $BRANCH 0 42000 $N16" "sp_n16_b_main $MAIN 1 43000 $N16"
@@ -50,4 +51,6 @@ pair op_n16_a "op_n16_a_main $MAIN 0 52000 $N16" "op_n16_a_prio $BRANCH 1 53000 
 pair op_n16_b "op_n16_b_prio $BRANCH 0 54000 $N16" "op_n16_b_main $MAIN 1 55000 $N16"
 pair op_s16_a "op_s16_a_main $MAIN 0 56000 $S16" "op_s16_a_prio $BRANCH 1 57000 $S16"
 pair op_s16_b "op_s16_b_prio $BRANCH 0 58000 $S16" "op_s16_b_main $MAIN 1 59000 $S16"
+pair op_s64_a "op_s64_a_main $MAIN 0 60000 $S64" "op_s64_a_prio $BRANCH 1 61000 $S64"
+pair op_s64_b "op_s64_b_prio $BRANCH 0 62000 $S64" "op_s64_b_main $MAIN 1 63000 $S64"
 echo "queue block34 done $(date +%T)" >> $L
