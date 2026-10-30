@@ -3,9 +3,13 @@ attempt() {
   local p0 p1 o0=/data/ab/$round/card0_$tree0 o1=/data/ab/$round/card1_$tree1
   p0=$(python3 /data/ab/pick_port.py $USED) && p1=$(python3 /data/ab/pick_port.py $USED) || { log "round $round no free port"; return 1; }
   log "round $round start ($arms c$conc, card0 $tree0 port $p0, card1 $tree1 port $p1)"
-  env $extra PIN_CPUS=0-27,112-139 PIN_NODE=0 bash $S/run_bench_boot.sh /data/ab/$tree0 $o0 0 $p0 h200 $conc "$arms" &
+  # an arm's /data/ab/<arm>.args holds its extra server arguments (an arm that is a tree plus a server option)
+  local x0 x1
+  x0=$(cat /data/ab/$tree0.args 2>/dev/null)
+  x1=$(cat /data/ab/$tree1.args 2>/dev/null)
+  env $extra EXTRA_SERVE_ARGS="$x0" PIN_CPUS=${PIN0:-0-27,112-139} PIN_NODE=${PAIR_NODE:-0} bash $S/run_bench_boot.sh /data/ab/$tree0 $o0 0 $p0 ${PAIR_DTYPE:-h200} $conc "$arms" &
   local b0=$!
-  env $extra PIN_CPUS=28-55,140-167 PIN_NODE=0 bash $S/run_bench_boot.sh /data/ab/$tree1 $o1 1 $p1 h200 $conc "$arms" &
+  env $extra EXTRA_SERVE_ARGS="$x1" PIN_CPUS=${PIN1:-28-55,140-167} PIN_NODE=${PAIR_NODE:-0} bash $S/run_bench_boot.sh /data/ab/$tree1 $o1 1 $p1 ${PAIR_DTYPE:-h200} $conc "$arms" &
   local b1=$!
   while kill -0 $b0 2>/dev/null || kill -0 $b1 2>/dev/null; do
     if [ -f $o0/FAILED ] && [ ! -f $o1/DONE ] && [ -f $o1/serve.pgid ]; then kill -TERM -- -$(cat $o1/serve.pgid) 2>/dev/null; fi

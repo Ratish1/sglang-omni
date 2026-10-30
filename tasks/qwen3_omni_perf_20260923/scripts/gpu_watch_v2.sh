@@ -6,6 +6,10 @@ while true; do
   foreign=""
   for line in $(nvidia-smi --query-compute-apps=pid,used_memory,gpu_bus_id --format=csv,noheader,nounits | tr -d " "); do
     pid=${line%%,*}
+    # OUR_BUS (space separated bus ids) limits the watch to our cards on a host shared with other tenants' GPUs
+    if [ -n "${OUR_BUS:-}" ] && ! echo " $OUR_BUS " | grep -qi " ${line##*,} "; then
+      continue
+    fi
     cgroup=$(tail -1 /proc/$pid/cgroup 2>/dev/null)
     if [ -z "$cgroup" ]; then
       continue
