@@ -380,6 +380,32 @@ def patch_stage(module):
             f"io.stream rid={request_id} {self.name}->{target}"
         ),
     )
+    # note: a tree that packs a run's small remote chunks into one batch per target sends them
+    # outside send_stream_to_target, so the whole run is bracketed on every tree and the batch
+    # send and receive where the tree has them
+    stage.route_stream_run = bracketed_async(
+        stage.route_stream_run,
+        lambda self, messages, *args, **kwargs: (
+            f"io.run rid={messages[0].request_id if messages else None} "
+            f"{self.name} n={len(messages)}"
+        ),
+    )
+    if hasattr(stage, "send_stream_chunk_batch"):
+        stage.send_stream_chunk_batch = bracketed_async(
+            stage.send_stream_chunk_batch,
+            lambda self, target, chunks, *args, **kwargs: (
+                f"io.stream rid={chunks[0].request_id if chunks else None} "
+                f"{self.name}->{target} n={len(chunks)}"
+            ),
+        )
+    if hasattr(stage, "schedule_stream_chunk_batch"):
+        stage.schedule_stream_chunk_batch = ranged(
+            stage.schedule_stream_chunk_batch,
+            lambda self, msg: (
+                f"io.sched rid={msg.request_ids[0] if msg.request_ids else None} "
+                f"{msg.from_stage}->{self.name} n={len(msg.request_ids)}"
+            ),
+        )
     stage.send_stream_to_coordinator = bracketed_async(
         stage.send_stream_to_coordinator,
         lambda self, request_id, *args, **kwargs: (
@@ -411,7 +437,8 @@ def range_present(module, names, kind):
 
 def patch_stage_io(module):
     # a tree has the packer under one of two names (pack_tensor_chunks since the one-copy
-    # put); the inline payload functions exist only on trees that carry payloads inline
+    # put); the inline payload functions exist only on trees that carry payloads inline, and
+    # a tree that packs small stream chunks per target has no per-chunk inline pickle
     range_present(
         module,
         (
@@ -419,6 +446,7 @@ def patch_stage_io(module):
             "serialize_direct_cuda_ipc_stream_chunk",
             "serialize_inline_stream_chunk",
             "serialize_inline_payload",
+            "pack_stream_chunk_batch",
             "pack_tensor_chunks",
             "pack_tensors",
             "ipc_pickle",
@@ -432,6 +460,7 @@ def patch_stage_io(module):
             "deserialize_direct_cuda_ipc_stream_chunk",
             "deserialize_inline_stream_chunk",
             "deserialize_inline_payload",
+            "unpack_stream_chunk_batch",
             "unpack_payload",
         ),
         "io.deser",
