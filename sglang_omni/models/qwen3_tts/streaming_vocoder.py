@@ -3566,14 +3566,6 @@ class Qwen3TTSStreamingVocoderScheduler(
             else:
                 pass
             codes.append(torch.as_tensor(state.audio_codes, dtype=torch.long))
-        for payload, audio_codes in zip(payloads, codes):
-            codes_ready_event = payload.data.get("codes_ready_event")
-            if codes_ready_event is not None and audio_codes.device == self.device:
-                current_stream = self.device_module.current_stream(self.device)
-                current_stream.wait_event(codes_ready_event)
-                audio_codes.record_stream(current_stream)
-            else:
-                pass
         if self.deterministic_inference:
             wavs = []
             for item in codes:

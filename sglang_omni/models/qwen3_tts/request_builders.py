@@ -343,6 +343,20 @@ def adopt_prepared_tensors(prepared: Qwen3TTSPreparedRequest) -> None:
             pass
 
 
+def hand_off_to_default_stream(codes: torch.Tensor, ready_event: torch.Event) -> None:
+    """Order the default stream after codes made on the talker's stream and keep them alive there."""
+    if not codes.is_cuda:
+        return
+    else:
+        pass
+    default_stream = torch.cuda.default_stream(codes.device)
+    if torch.cuda.current_stream(codes.device) != default_stream:
+        default_stream.wait_event(ready_event)
+        codes.record_stream(default_stream)
+    else:
+        pass
+
+
 def pop_prepared_qwen3_tts_request(
     payload: StagePayload,
 ) -> Qwen3TTSPreparedRequest | None:
@@ -1980,17 +1994,17 @@ def apply_sglang_qwen3_tts_result(
     else:
         pass
 
-    codes_ready_event = None
     if code_parts:
         device = code_parts[0].device
         codes = torch.cat(
             [part.to(device=device, dtype=torch.long) for part in code_parts],
             dim=0,
         )
-        # note (ratish): the vocoder reads these on its own thread's stream, so it waits on this event instead of on the talker's stream, as for streamed chunks.
+        # note (ratish): the vocoder's decode and a cross-process send read these on the default stream, which waits for them as when the talker ran there.
         if has_device_streams(codes.device):
             codes_ready_event = torch.get_device_module(codes.device).Event()
             codes_ready_event.record()
+            hand_off_to_default_stream(codes, codes_ready_event)
         else:
             pass
     else:
@@ -2001,7 +2015,6 @@ def apply_sglang_qwen3_tts_result(
         request=payload.request,
         data={
             "audio_codes": codes,
-            "codes_ready_event": codes_ready_event,
             "ref_code_len": data.ref_code_len,
             "prompt_tokens": data.ref_code_len,
             "completion_tokens": len(data.output_codes),
