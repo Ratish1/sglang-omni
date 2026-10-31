@@ -282,7 +282,7 @@ def test_smallest_bucket_picks_the_first_bucket_that_fits() -> None:
 
 @pytest.mark.accelerator
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
-def test_reference_encoder_graph_replays_match_eager_and_miss_above_the_largest_bucket() -> (
+def test_reference_encoder_graph_replays_match_the_compiled_encode_and_miss_above_the_largest_bucket() -> (
     None
 ):
     torch.manual_seed(11)
@@ -300,9 +300,22 @@ def test_reference_encoder_graph_replays_match_eager_and_miss_above_the_largest_
     runner = Qwen3TTSReferenceEncoderCudaGraphRunner(
         model, hop=hop, num_quantizers=quantizers, bucket_frames=(4, 8), stream=stream
     )
+    graphs_before = torch._dynamo.utils.counters[
+        "stats"
+    ][  # noqa: leading-underscore  # upstream name
+        "unique_graphs"
+    ]
     runner.capture()
     assert runner.stats()["enabled"]
     assert runner.stats()["captured"] == [4, 8]
+    assert (
+        torch._dynamo.utils.counters[
+            "stats"
+        ][  # noqa: leading-underscore  # upstream name
+            "unique_graphs"
+        ]
+        == graphs_before + 1
+    )
 
     short = torch.randn(3 * hop + 5, device=device)
     long = torch.randn(7 * hop, device=device)
@@ -320,22 +333,20 @@ def test_reference_encoder_graph_replays_match_eager_and_miss_above_the_largest_
     assert first.shape == (4, quantizers)
     assert second.shape == (7, quantizers)
     assert third.shape == (7, quantizers)
-    eager = []
+    compiled = []
     with torch.inference_mode():
         for waveform, bucket in ((short, 4), (long, 8), (long_other, 8)):
             values = torch.zeros((1, 1, bucket * hop), device=device)
             values[0, 0, : waveform.numel()].copy_(waveform)
             clip_samples = torch.tensor(waveform.numel(), device=device)
             with exact_length_encode(model, clip_samples):
-                codes = model.encode(
-                    values, num_quantizers=quantizers, return_dict=True
-                ).audio_codes
+                codes = runner.compiled_encode(values)
             frames = -(-waveform.numel() // hop)
-            eager.append(codes[0, :, :frames].transpose(0, 1))
-    assert not torch.equal(eager[1], eager[2])
-    assert torch.equal(first, eager[0])
-    assert torch.equal(second, eager[1])
-    assert torch.equal(third, eager[2])
+            compiled.append(codes[0, :, :frames].transpose(0, 1))
+    assert not torch.equal(compiled[1], compiled[2])
+    assert torch.equal(first, compiled[0])
+    assert torch.equal(second, compiled[1])
+    assert torch.equal(third, compiled[2])
 
 
 @pytest.mark.accelerator
