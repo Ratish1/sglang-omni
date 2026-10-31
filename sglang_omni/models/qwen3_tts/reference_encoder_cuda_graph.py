@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from typing import Protocol, TypedDict
 
 import torch
+import torch._dynamo as dynamo
 import torch.nn.functional as F
 from torch.utils.hooks import RemovableHandle
 from transformers import MimiModel
@@ -26,6 +27,10 @@ logger = logging.getLogger(__name__)
 # 32 MiB, so keys below 32 frames save nothing measurable; the step keeps the padding
 # under half a clip, and clips past 256 frames run eager.
 DEFAULT_QWEN3_TTS_REFERENCE_ENCODER_BUCKET_FRAMES = (32, 48, 64, 96, 128, 192, 256)
+# note (ratish): a kernel with several configs benchmarks them on its first call, at one bucket's shape, so its pick can change between boots; this gives pointwise kernels one heuristic config instead.
+REFERENCE_ENCODER_INDUCTOR_OPTIONS: dict[str, bool] = {
+    "triton.autotune_pointwise": False
+}
 
 
 class ReferenceEncoderGraphStats(TypedDict):
@@ -162,6 +167,16 @@ class Qwen3TTSReferenceEncoderCudaGraphRunner:
             current_platform.get_device_graph_backend(self.device)
         )
         self.dtype = param.dtype
+        # note (ratish): one program serves every bucket, so a boot compiles once; it keeps the exact-length hooks it was traced with, since module hooks are not guarded, so it runs only inside exact_length_encode, and the eager encode past the ladder stays uncompiled.
+        self.compiled_encode = (
+            torch.compile(
+                self._encode,
+                fullgraph=True,
+                options=dict(REFERENCE_ENCODER_INDUCTOR_OPTIONS),
+            )
+            if current_platform.is_cuda()
+            else self._encode
+        )
         # note (ratish): every bucket's graph reads the clip's samples from here, set before each replay.
         self.clip_samples = torch.zeros((), dtype=torch.long, device=self.device)
         self.graphs: dict[int, CapturedEncoderGraph] = {}
@@ -204,12 +219,14 @@ class Qwen3TTSReferenceEncoderCudaGraphRunner:
         static_input = torch.zeros(
             (1, 1, frames * self.hop), device=self.device, dtype=self.dtype
         )
+        # note (ratish): a hint, so the length starts symbolic and every bucket reuses the first bucket's program.
+        dynamo.maybe_mark_dynamic(static_input, 2)
         self.clip_samples.fill_(frames * self.hop)
         self.stream.wait_stream(self.device_module.current_stream(self.device))
         with exact_length_encode(self.encoder, self.clip_samples):
             with torch.inference_mode(), self.device_module.stream(self.stream):
                 for _ in range(2):
-                    self._encode(static_input)
+                    self.compiled_encode(static_input)
             with (
                 torch.inference_mode(),
                 self.graph_backend.capture(
@@ -218,7 +235,7 @@ class Qwen3TTSReferenceEncoderCudaGraphRunner:
                     thread_local_errors=True,
                 ) as graph,
             ):
-                static_codes = self._encode(static_input)
+                static_codes = self.compiled_encode(static_input)
         self.stream.synchronize()
         return CapturedEncoderGraph(
             graph=graph, static_input=static_input, static_codes=static_codes
