@@ -23,6 +23,13 @@ first.
 | `mlx-community/parakeet-tdt-0.6b-v3` | `parakeet_server` | Final as Voxt's Swift path decodes it: 5 s chunks overlapping by 1 s for a whole-recording request (at least 0.5 s otherwise), their tokens merged on the overlap, and timed sentence segments; live text uses batch preview |
 | `mlx-community/SenseVoiceSmall` | `sensevoice_server` | Final with Voxt's language hint and ITN setting, the language, emotion and event of each pass in Voxt's SenseVoice metadata; past 30 s, Silero VAD speech cut into 24 s chunks overlapping by 0.35 s whose texts merge as Voxt merges them; live text uses batch preview |
 
+The runtime also builds the standalone `music3_server` and `music3_synthesize`
+for MiniMax Music3. They reuse the native lifecycle, checkpoint operations and
+byte-level tokenizer. Music generation is served through `/v1/audio/speech`;
+see the [Music3 cookbook](../../docs/cookbook/minimax_music3.md#apple-silicon-native-mlx)
+for checkpoint provisioning, request fields, reference parity and waveform
+goldens. Voxt's ASR model selection is unchanged.
+
 ## Build and run
 
 Requirements: an Apple Silicon Mac, Xcode and [uv](https://docs.astral.sh/uv/).
@@ -39,7 +46,8 @@ Voxt/backend/run_omni_dev.sh run
 `moss_transcribe_diarize_server`, `moss_transcribe`, `nemotron_asr_server`,
 `nemotron_transcribe`, `parakeet_server`, `parakeet_transcribe`,
 `sensevoice_server`, `sensevoice_transcribe`, `voxtral_tts_server`,
-`voxtral_tts_synthesize`, and the pinned MLX library
+`voxtral_tts_synthesize`, `qwen3_tts_server`, `qwen3_tts_synthesize`, and the
+pinned MLX library
 and Metal kernels next to them.
 
 "Voxt Omni Dev" has its own bundle identifier. It runs without the sandbox so it
