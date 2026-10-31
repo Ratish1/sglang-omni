@@ -462,7 +462,7 @@ def create_vocoder_executor(
     suppress_bootstrap_silence: bool = True,
     suppress_bootstrap_max_streams: int = 24,
     running_stream_count: int | None = None,
-    reference_encoder_in_process: bool = True,
+    reference_encoder_in_process: bool,
 ) -> Qwen3TTSStreamingVocoderScheduler:
     device = str(resolve_concrete_device(device, gpu_id))
     # note (luojiaxuan): the graph and compile switches follow the decoder
