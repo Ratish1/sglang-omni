@@ -149,7 +149,7 @@ class Qwen3TTSPipelineConfig(PipelineConfig):
                 and vocoder_stage.gpu == engine_stage.gpu
                 and all(
                     vocoder_settings.get(name) == engine_settings.get(name)
-                    for name in ("dtype", "attn_implementation")
+                    for name in ("device", "dtype", "attn_implementation")
                 )
             )
             if vocoder_process == engine_process:
