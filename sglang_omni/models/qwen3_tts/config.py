@@ -143,10 +143,9 @@ class Qwen3TTSPipelineConfig(PipelineConfig):
             vocoder_process = stage_process_name(vocoder_stage)
             vocoder_settings = resolve_stage_typed_kwargs(vocoder_stage)
             engine_settings = resolve_stage_typed_kwargs(engine_stage)
-            # note (ratish): the tokenizer loader keeps one copy per process, device, dtype and attention implementation, and a separate frontend loads its own copy before a vocoder in its process, so only the engine's copy is one the vocoder loads first.
+            # note (ratish): a process's stages share one GPU, and the tokenizer loader keeps one copy per device, dtype and attention implementation there; a separate frontend loads its own copy before a vocoder in its process, so only the engine's copy is one the vocoder loads first.
             kwargs["shares_engine_speech_tokenizer"] = (
                 vocoder_process == engine_process
-                and vocoder_stage.gpu == engine_stage.gpu
                 and all(
                     vocoder_settings.get(name) == engine_settings.get(name)
                     for name in ("device", "dtype", "attn_implementation")
