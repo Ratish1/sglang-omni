@@ -21,10 +21,10 @@ def main():
     reference_warm = load(directory, reference, "warm")
     reference_ms = {(item["runner"], item["frames"], item["batch"]): item["ms"] for item in reference_warm["replays"]}
     reference_waves = torch.load(f"{directory}/{reference}_warm.pt")
-    print("arm | cold build s | cold precompile s | warm build s | warm precompile s | programs | replay sum ms (ref) | worst key ratio | bit-equal keys | max abs diff")
+    print("arm | cold build s | cold precompile s | warm build s | warm precompile s | programs | replay sum ms (ref) | worst key ratio | bit-equal keys | worst relative L2")
     for arm in arms:
         cold, warm = load(directory, arm, "cold"), load(directory, arm, "warm")
-        if cold is None or warm is None:
+        if warm is None:
             print(f"{arm} | missing")
             continue
         else:
@@ -34,15 +34,17 @@ def main():
         ratios = {key: ms[key] / reference_ms[key] for key in shared}
         worst = max(ratios, key=ratios.get)
         waves = torch.load(f"{directory}/{arm}_warm.pt")
-        equal = sum(torch.equal(waves[label], reference_waves[label]) for label in reference_waves if label in waves)
-        difference = max(
-            (float((waves[label] - reference_waves[label]).abs().max()) for label in reference_waves if label in waves),
+        labels = [label for label in reference_waves if label in waves]
+        equal = sum(torch.equal(waves[label], reference_waves[label]) for label in labels)
+        relative = max(
+            (float((waves[label] - reference_waves[label]).norm() / reference_waves[label].norm()) for label in labels),
             default=float("nan"),
         )
+        cold_build, cold_precompile = (cold["build_s"], cold["precompile_total_s"]) if cold else ("-", "-")
         print(
-            f"{arm} | {cold['build_s']} | {cold['precompile_total_s']} | {warm['build_s']} | {warm['precompile_total_s']} | "
-            f"{cold['unique_graphs']} | {sum(ms[key] for key in shared):.3f} ({sum(reference_ms[key] for key in shared):.3f}) | "
-            f"{worst} {ratios[worst]:.3f} | {equal}/{len(reference_waves)} | {difference:.3g}"
+            f"{arm} | {cold_build} | {cold_precompile} | {warm['build_s']} | {warm['precompile_total_s']} | "
+            f"{warm['unique_graphs']} | {sum(ms[key] for key in shared):.3f} ({sum(reference_ms[key] for key in shared):.3f}) | "
+            f"{worst} {ratios[worst]:.3f} | {equal}/{len(labels)} | {relative:.2e}"
         )
     for arm in arms:
         warm = load(directory, arm, "warm")
@@ -52,10 +54,13 @@ def main():
             pass
         print(f"\n== {arm} per key ms (warm run): " + " ".join(f"{item['runner']}:{item['frames']}x{item['batch']}={item['ms']}" for item in warm["replays"]))
         cold = load(directory, arm, "cold")
-        print(f"== {arm} cold precompiles: " + " ".join(f"{item['shape']}={item['seconds']}s+{item['new_graphs']}" for item in cold["precompiles"]))
-        print(f"== {arm} warm precompiles: " + " ".join(f"{item['shape']}={item['seconds']}s+{item['new_graphs']}" for item in warm["precompiles"]))
-        print(f"== {arm} cold captures: " + " ".join(f"{item['mode']}={item['seconds']}s/{item['graphs']}" for item in cold["captures"]))
-        print(f"== {arm} warm captures: " + " ".join(f"{item['mode']}={item['seconds']}s/{item['graphs']}" for item in warm["captures"]))
+        for phase, run in (("cold", cold), ("warm", warm)):
+            if run is None:
+                continue
+            else:
+                pass
+            print(f"== {arm} {phase} precompiles: " + " ".join(f"{item['shape']}={item['seconds']}s+{item['new_graphs']}" for item in run["precompiles"]))
+            print(f"== {arm} {phase} captures: " + " ".join(f"{item['mode']}={item['seconds']}s/{item['graphs']}" for item in run["captures"]))
 
 
 if __name__ == "__main__":

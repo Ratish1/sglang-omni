@@ -2,7 +2,8 @@
 # Builds the vocoder exactly as serving does (create_vocoder_executor, which captures every runner), with the form
 # chosen by SGLANG_OMNI_CODEC_COMPILE_FORM on the forms branch (main ignores it), then per compiled graph key:
 # the device time per replay (CUDA events over --replays replays, best of two passes) and the waveform of one replay
-# from a zeroed arena on seeded codes, saved for the identity check against main. Writes one JSON and one .pt.
+# from a zeroed arena on seeded codes, one arena slot per row, saved for the identity check against main. Writes one
+# JSON and one .pt.
 # usage: python3 codec_forms.py --model M --out PREFIX [--no-autotune-pointwise]
 import argparse
 import json
@@ -114,6 +115,8 @@ def main():
             codes = torch.randint(0, 1000, tuple(entry.static_codes.shape), generator=generator)
             zero_arena(scheduler.codec_arena)
             entry.static_codes.copy_(codes)
+            # note (ratish): one slot per row, as decode_slots fills it; rows sharing the scratch slot race on its ring rows.
+            entry.static_index.copy_(torch.arange(key.batch_bucket))
             entry.graph.replay()
             torch.cuda.synchronize()
             label = f"{name}:{key.fresh_frames}x{key.batch_bucket}"
