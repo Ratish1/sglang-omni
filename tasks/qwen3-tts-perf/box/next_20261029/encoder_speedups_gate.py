@@ -323,7 +323,7 @@ def main() -> None:
             print(f"== {name}: batcher failed: {type(exc).__name__}: {str(exc)[:400]}", flush=True)
             continue
         capture_s = time.perf_counter() - began
-        if any(mechanism.startswith("compile") for mechanism in mechanisms or ()):
+        if mechanisms is None or any(mechanism.startswith("compile") for mechanism in mechanisms):
             print(f"-- {name} compile phases (s):\n{compile_times(repr='str', aggregate=True)}", flush=True)
         else:
             pass
