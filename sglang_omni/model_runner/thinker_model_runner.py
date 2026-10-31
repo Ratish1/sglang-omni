@@ -30,6 +30,8 @@ logger = logging.getLogger(__name__)
 
 
 class ThinkerModelRunner(ModelRunner):
+    speech_lookahead: bool = False
+
     def __init__(
         self,
         tp_worker: ModelWorker,
@@ -582,7 +584,10 @@ class ThinkerModelRunner(ModelRunner):
                 )  # noqa: leading-underscore  # upstream spelling, or the public name is already taken
             except AttributeError:
                 data = None
-            if data is None or should_generate_audio_output(data.stage_payload):
+            if data is None or (
+                should_generate_audio_output(data.stage_payload)
+                and not self.speech_lookahead
+            ):
                 return False
             else:
                 pass
