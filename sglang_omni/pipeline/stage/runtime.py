@@ -1621,10 +1621,12 @@ class Stage:
                 if batched is not None:
                     batches.setdefault(target, []).append(batched)
                 else:
-                    # note (ratish): the same-process run must not wait behind an awaited send, and the target's pending batch goes first so each request's chunks reach it in order.
+                    # note (ratish): nothing the run emitted before an awaited send may wait behind it, so the same-process run and every pending batch go first, which also keeps each request's chunks in order at their target.
                     await self.send_local_stream_chunks(local_target, local_chunks)
                     local_target, local_chunks = None, []
-                    await self.send_stream_chunk_batch(target, batches.pop(target, []))
+                    for pending_target, chunks in batches.items():
+                        await self.send_stream_chunk_batch(pending_target, chunks)
+                    batches.clear()
                     await self.send_stream_to_target(
                         out.request_id, out.data, out.target, out.metadata
                     )

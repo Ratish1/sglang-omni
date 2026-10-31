@@ -453,13 +453,14 @@ def test_remote_stream_run_packs_each_target_around_a_relay_chunk(
             (target, describe(message))
             for target, _, message in control_plane.stage_messages
         ] == [
+            ("decode", [("req-a", 0, 1, 1)]),
             ("talker_ar", [("req-a", 0, 1, 1), ("req-b", 0, 2, 2)]),
             ("talker_ar", [("req-b", 1, 3, 0)]),
-            ("decode", [("req-a", 0, 1, 1), ("req-b", 0, 4, 4)]),
+            ("decode", [("req-b", 0, 4, 4)]),
             ("talker_ar", [("req-a", 1, 5, 5)]),
         ]
         assert len(relay.puts) == 1
-        assert control_plane.stage_messages[2][2].replica_bindings == {
+        assert control_plane.stage_messages[1][2].replica_bindings == {
             "req-b": {"decode": 1}
         }
 
