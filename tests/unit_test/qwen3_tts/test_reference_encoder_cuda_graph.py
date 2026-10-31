@@ -12,6 +12,7 @@ import numpy as np
 import pytest
 import torch
 from safetensors.torch import save_file
+from torch._dynamo.utils import counters
 from transformers import MimiConfig, MimiModel
 from transformers.models.mimi.modeling_mimi import (
     MimiConv1d,
@@ -77,12 +78,12 @@ def test_integer_padding_keeps_the_conv_output(
         dilation=dilation,
         pad_mode=pad_mode,
     )
-    tensor_padded = copy.deepcopy(conv)
+    tensor_padded_conv = copy.deepcopy(conv)
 
     assert pad_convs_by_integers(conv) == 1
     for length in (1, 5, 21, 32):
         values = torch.randn(1, 4, length)
-        assert torch.equal(conv(values), tensor_padded(values))
+        assert torch.equal(conv(values), tensor_padded_conv(values))
 
 
 def test_speech_tokenizer_loader_pads_the_encoder_convs_by_integers(
@@ -114,7 +115,7 @@ def test_speech_tokenizer_loader_pads_the_encoder_convs_by_integers(
         float32_encoder=False,
     )
 
-    def tensor_padding(self, hidden_states):
+    def tensor_padding(self: MimiConv1d, hidden_states: torch.Tensor) -> torch.Tensor:
         raise AssertionError("a conv padded from its tensor buffers")
 
     monkeypatch.setattr(MimiConv1d, "_get_extra_padding_for_conv1d", tensor_padding)
@@ -293,6 +294,11 @@ def test_reference_encoder_graph_replays_match_the_compiled_encode_and_miss_abov
         if isinstance(module, MimiEuclideanCodebook):
             module.embed_sum.normal_()
     model = model.to(device).eval()
+    for module in model.modules():
+        if isinstance(module, MimiEuclideanCodebook):
+            module.embed
+        else:
+            pass
     pad_convs_by_integers(model)
     hop = HOP
     quantizers = 2
@@ -300,22 +306,11 @@ def test_reference_encoder_graph_replays_match_the_compiled_encode_and_miss_abov
     runner = Qwen3TTSReferenceEncoderCudaGraphRunner(
         model, hop=hop, num_quantizers=quantizers, bucket_frames=(4, 8), stream=stream
     )
-    graphs_before = torch._dynamo.utils.counters[
-        "stats"
-    ][  # noqa: leading-underscore  # upstream name
-        "unique_graphs"
-    ]
+    torch.compiler.reset()
+    graphs_before = counters["stats"]["unique_graphs"]
     runner.capture()
     assert runner.stats()["enabled"]
     assert runner.stats()["captured"] == [4, 8]
-    assert (
-        torch._dynamo.utils.counters[
-            "stats"
-        ][  # noqa: leading-underscore  # upstream name
-            "unique_graphs"
-        ]
-        == graphs_before + 1
-    )
 
     short = torch.randn(3 * hop + 5, device=device)
     long = torch.randn(7 * hop, device=device)
@@ -333,20 +328,20 @@ def test_reference_encoder_graph_replays_match_the_compiled_encode_and_miss_abov
     assert first.shape == (4, quantizers)
     assert second.shape == (7, quantizers)
     assert third.shape == (7, quantizers)
-    compiled = []
-    with torch.inference_mode():
-        for waveform, bucket in ((short, 4), (long, 8), (long_other, 8)):
-            values = torch.zeros((1, 1, bucket * hop), device=device)
-            values[0, 0, : waveform.numel()].copy_(waveform)
-            clip_samples = torch.tensor(waveform.numel(), device=device)
-            with exact_length_encode(model, clip_samples):
-                codes = runner.compiled_encode(values)
-            frames = -(-waveform.numel() // hop)
-            compiled.append(codes[0, :, :frames].transpose(0, 1))
-    assert not torch.equal(compiled[1], compiled[2])
-    assert torch.equal(first, compiled[0])
-    assert torch.equal(second, compiled[1])
-    assert torch.equal(third, compiled[2])
+    compiled_codes = []
+    for waveform, bucket in ((short, 4), (long, 8), (long_other, 8)):
+        values = torch.zeros((1, 1, bucket * hop), device=device)
+        values[0, 0, : waveform.numel()].copy_(waveform)
+        clip_samples = torch.tensor(waveform.numel(), device=device)
+        with torch.inference_mode(), exact_length_encode(model, clip_samples):
+            codes = runner.compiled_encode(values)
+        frames = -(-waveform.numel() // hop)
+        compiled_codes.append(codes[0, :, :frames].transpose(0, 1))
+    assert not torch.equal(compiled_codes[1], compiled_codes[2])
+    assert torch.equal(first, compiled_codes[0])
+    assert torch.equal(second, compiled_codes[1])
+    assert torch.equal(third, compiled_codes[2])
+    assert counters["stats"]["unique_graphs"] == graphs_before + 1
 
 
 @pytest.mark.accelerator
