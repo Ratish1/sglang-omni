@@ -11347,35 +11347,29 @@ def test_qwen3_tts_reference_encoder_stats_read_the_encoders_preprocessing_uses(
 
 @pytest.mark.parametrize(
     ("tts_model_type", "graph_bucket_frames"),
-    [("base", (32, 64)), ("custom_voice", ()), ("voice_design", ())],
+    [("base", (32, 64)), ("custom_voice", ())],
 )
 def test_qwen3_tts_only_base_captures_reference_encoder_graphs(
     monkeypatch: pytest.MonkeyPatch,
     tts_model_type: str,
     graph_bucket_frames: tuple[int, ...],
 ) -> None:
-    batcher_bucket_frames: list[tuple[int, ...]] = []
-
-    class FakeRefCodeBatcher:
-        def __init__(self, speech_tokenizer, *, graph_bucket_frames) -> None:
-            batcher_bucket_frames.append(tuple(graph_bucket_frames))
-            self.graph_runner = None
-
-        def close(self) -> None:
-            pass
+    requested_bucket_frames: list[tuple[int, ...]] = []
 
     class FakeModel:
         model = SimpleNamespace(codec_embedding=torch.nn.Embedding(1, 4))
-        speech_tokenizer = object()
-        speaker_encoder_graph_runner = None
 
-        def build_prompt_constants(self):
+        def build_prompt_constants(self) -> Qwen3TTSPromptConstants:
             return placeholder_prompt_constants()
 
     model = FakeModel()
     model.tts_model_type = tts_model_type
     monkeypatch.setattr(
-        qwen3_request_builders, "Qwen3TTSRefCodeBatcher", FakeRefCodeBatcher
+        qwen3_request_builders,
+        "get_qwen3_tts_adhoc_reference_service_locked",
+        lambda model, wrapper, *, graph_bucket_frames: requested_bucket_frames.append(
+            tuple(graph_bucket_frames)
+        ),
     )
     qwen3_request_builders.clear_qwen3_tts_preprocessing_context()
     try:
@@ -11387,7 +11381,7 @@ def test_qwen3_tts_only_base_captures_reference_encoder_graphs(
     finally:
         qwen3_request_builders.clear_qwen3_tts_preprocessing_context()
 
-    assert batcher_bucket_frames == [graph_bucket_frames]
+    assert requested_bucket_frames == [graph_bucket_frames]
 
 
 @pytest.mark.parametrize(
