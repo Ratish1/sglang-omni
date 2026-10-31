@@ -2293,9 +2293,11 @@ class Stage:
     ) -> stage_io.BatchedStreamChunk | None:
         """Number a small CPU chunk for its target's packed batch, or None when it needs IPC or the relay."""
         metadata = stage_io.strip_process_local_metadata(metadata)
+        # note (ratish): a dtype the receiver cannot restore takes the relay, where it fails its own request rather than every request in its batch.
         if (
             not isinstance(data, torch.Tensor)
             or data.device.type != "cpu"
+            or data.dtype not in stage_io.RESTORABLE_TENSOR_DTYPES
             or data.nbytes > BATCHED_STREAM_CHUNK_BYTES_LIMIT
             or stage_io.contains_cuda_tensor(metadata)
             or stage_io.contains_cpu_tensor(metadata)

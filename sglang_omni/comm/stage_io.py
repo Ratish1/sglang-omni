@@ -57,6 +57,7 @@ _TORCH_DTYPES: dict[str, torch.dtype] = {
     "torch.complex64": torch.complex64,
     "torch.complex128": torch.complex128,
 }
+RESTORABLE_TENSOR_DTYPES = frozenset(_TORCH_DTYPES.values())
 
 _DIRECT_CUDA_IPC_STREAM_CHUNK_TYPE = "TorchCudaIpcStreamChunk"
 _DIRECT_CUDA_IPC_PAYLOAD_TYPE = "TorchCudaIpcPayload"

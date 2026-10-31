@@ -480,6 +480,55 @@ def test_remote_stream_run_packs_each_target_around_a_relay_chunk(
     ]
 
 
+def test_stream_chunk_the_receiver_cannot_restore_takes_the_relay(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        platforms.current_platform, "device_type", "cuda", raising=False
+    )
+
+    async def run() -> None:
+        control_plane = FakeControlPlane()
+        scheduler = SimpleNamespace(outbox=queue.Queue())
+        stage = Stage(
+            name="thinker",
+            role="single",
+            get_next=lambda request_id, output: None,
+            gpu_id=None,
+            endpoints={"talker_ar": "inproc://talker_ar"},
+            control_plane=control_plane,
+            relay=FakeRelay(),
+            scheduler=scheduler,
+        )
+        stage.active_requests.update({"req-a", "req-b"})
+        put_messages(
+            scheduler.outbox,
+            [
+                OutgoingMessage(
+                    "req-a",
+                    "stream",
+                    torch.tensor([1], dtype=torch.uint16),
+                    "talker_ar",
+                ),
+                OutgoingMessage("req-b", "stream", torch.tensor([2]), "talker_ar"),
+            ],
+        )
+
+        stage.end_outbox_drain()
+        await stage.drain_outbox_external()
+
+        assert [
+            (
+                (message.request_ids, message.dtypes)
+                if isinstance(message, StreamChunkBatchMessage)
+                else (message.request_id, DataRef.from_dict(message.data_ref).dtype)
+            )
+            for _, _, message in control_plane.stage_messages
+        ] == [("req-a", "torch.uint16"), (["req-b"], ["torch.int64"])]
+
+    asyncio.run(run())
+
+
 def test_stream_chunk_batch_round_trips_through_the_control_plane() -> None:
     tensors = [
         torch.tensor([7], dtype=torch.long),
