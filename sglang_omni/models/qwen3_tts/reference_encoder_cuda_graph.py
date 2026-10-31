@@ -84,19 +84,15 @@ def exact_length_encode(
     samples_per_step = 1
     try:
         for conv in encoder.modules():
-            if not isinstance(conv, MimiConv1d) or int(conv.stride) == 1:
-                continue
-            elif conv.pad_mode not in ("constant", "replicate"):
-                raise ValueError(
-                    f"Qwen3-TTS reference encoder cannot pad a {conv.pad_mode!r} conv's tail"
-                )
-            else:
+            if isinstance(conv, MimiConv1d) and int(conv.stride) > 1:
                 hook_handles.append(
                     conv.register_forward_pre_hook(
                         functools.partial(pad_tail, clip_samples, samples_per_step)
                     )
                 )
                 samples_per_step *= int(conv.stride)
+            else:
+                pass
         yield
     finally:
         for hook_handle in hook_handles:
