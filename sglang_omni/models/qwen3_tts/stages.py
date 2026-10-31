@@ -462,7 +462,7 @@ def create_vocoder_executor(
     suppress_bootstrap_silence: bool = True,
     suppress_bootstrap_max_streams: int = 24,
     running_stream_count: int | None = None,
-    reference_encoder_in_process: bool,
+    shares_engine_speech_tokenizer: bool,
 ) -> Qwen3TTSStreamingVocoderScheduler:
     device = str(resolve_concrete_device(device, gpu_id))
     # note (luojiaxuan): the graph and compile switches follow the decoder
@@ -480,13 +480,13 @@ def create_vocoder_executor(
         pass
     checkpoint_config = load_qwen3_tts_checkpoint_config(model_path)
     model_type = normalize_qwen3_tts_model_type(checkpoint_config.get("tts_model_type"))
-    # note (ratish): the vocoder only decodes, so its tokenizer's encoder takes float32 only when this process also encodes references.
+    # note (ratish): the vocoder only decodes, so its tokenizer's encoder takes float32 only on the copy the engine will share and encode with.
     tokenizer = load_qwen3_tts_tokenizer(
         model_path,
         device=device,
         dtype=dtype,
         attn_implementation=attn_implementation,
-        float32_encoder=reference_encoder_in_process and model_type == "base",
+        float32_encoder=shares_engine_speech_tokenizer and model_type == "base",
     )
     configured_model_size = checkpoint_config.get("tts_model_size")
     tts_model_size: Literal["0b6", "1b7"] | None = None
