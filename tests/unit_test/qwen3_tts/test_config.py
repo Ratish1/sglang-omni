@@ -24,6 +24,7 @@ def test_vocoder_platform_default_keeps_npu_opt_in(
 
     expected = {"async_decode": False} if use_npu else {}
     expected["running_stream_count"] = 64
+    expected["reference_encoder_in_process"] = True
     assert config.stage_factory_kwargs("vocoder") == expected
 
 

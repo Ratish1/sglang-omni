@@ -3221,6 +3221,7 @@ def test_qwen3_tts_config_starts_a_declining_platform_decoding_synchronously(
         "running_stream_count": config.generation_admission_defaults()[
             "max_running_requests"
         ],
+        "reference_encoder_in_process": True,
     }
     assert config.stage_factory_kwargs("tts_engine") == {}
 
@@ -3239,7 +3240,8 @@ def test_qwen3_tts_config_leaves_a_measured_platform_alone(
     assert config.stage_factory_kwargs("vocoder") == {
         "running_stream_count": config.generation_admission_defaults()[
             "max_running_requests"
-        ]
+        ],
+        "reference_encoder_in_process": True,
     }
     assert config.stage_factory_kwargs("tts_engine") == {}
 
