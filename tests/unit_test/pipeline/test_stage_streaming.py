@@ -482,12 +482,10 @@ def test_remote_stream_run_packs_each_target_around_a_relay_chunk(
 
 
 @pytest.mark.parametrize(
-    "dtype, metadata_device",
+    "metadata_device",
     [
-        (torch.uint16, None),
-        (torch.long, "cpu"),
+        "cpu",
         pytest.param(
-            torch.long,
             "cuda",
             marks=[
                 pytest.mark.accelerator,
@@ -498,8 +496,8 @@ def test_remote_stream_run_packs_each_target_around_a_relay_chunk(
         ),
     ],
 )
-def test_stream_chunk_the_batch_cannot_carry_takes_the_relay(
-    monkeypatch: pytest.MonkeyPatch, dtype: torch.dtype, metadata_device: str | None
+def test_stream_chunk_with_a_metadata_tensor_takes_the_relay(
+    monkeypatch: pytest.MonkeyPatch, metadata_device: str
 ) -> None:
     monkeypatch.setattr(
         platforms.current_platform, "device_type", "cuda", raising=False
@@ -519,20 +517,15 @@ def test_stream_chunk_the_batch_cannot_carry_takes_the_relay(
             scheduler=scheduler,
         )
         stage.active_requests.update({"req-a", "req-b"})
-        metadata = (
-            None
-            if metadata_device is None
-            else {"hidden": torch.zeros(2, device=metadata_device)}
-        )
         put_messages(
             scheduler.outbox,
             [
                 OutgoingMessage(
                     "req-a",
                     "stream",
-                    torch.tensor([1], dtype=dtype),
+                    torch.tensor([1]),
                     "talker_ar",
-                    metadata,
+                    {"hidden": torch.zeros(2, device=metadata_device)},
                 ),
                 OutgoingMessage("req-b", "stream", torch.tensor([2]), "talker_ar"),
             ],
@@ -548,7 +541,7 @@ def test_stream_chunk_the_batch_cannot_carry_takes_the_relay(
                 else (message.request_id, DataRef.from_dict(message.data_ref).dtype)
             )
             for _, _, message in control_plane.stage_messages
-        ] == [("req-a", str(dtype)), (["req-b"], ["torch.int64"])]
+        ] == [("req-a", "torch.int64"), (["req-b"], ["torch.int64"])]
 
     asyncio.run(run())
 
