@@ -155,6 +155,18 @@ def load_qwen3_tts_tokenizer(
             logger.info(
                 f"Reusing the Qwen3-TTS speech tokenizer from {tokenizer_path} on {device}"
             )
+            # note (ratish): a stage that only decodes may have loaded this copy first, so a caller that encodes still gets the float32 encoder.
+            if (
+                float32_encoder
+                and next(tokenizer.model.encoder.parameters()).dtype != torch.float32
+            ):
+                logger.info(
+                    "Giving the reused Qwen3-TTS speech tokenizer's encoder its "
+                    f"float32 weights on {device}"
+                )
+                load_float32_encoder_weights(tokenizer, checkpoint_dir)
+            else:
+                pass
             return tokenizer
         else:
             pass
