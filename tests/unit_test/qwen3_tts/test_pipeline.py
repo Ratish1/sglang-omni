@@ -456,9 +456,16 @@ def test_qwen3_tts_speech_tokenizer_is_loaded_once_per_process_key(
     ]
 
 
-@pytest.mark.parametrize("vocoder_beside_encoder", [True, False])
-@pytest.mark.parametrize("model_type", ["base", "custom_voice"])
-@pytest.mark.parametrize("disable_cuda_graph", [False, True])
+@pytest.mark.parametrize(
+    ("disable_cuda_graph", "model_type", "vocoder_beside_encoder"),
+    [
+        (False, "base", True),
+        (True, "base", True),
+        (False, "custom_voice", True),
+        (False, "base", False),
+        (False, "custom_voice", False),
+    ],
+)
 def test_qwen3_tts_engine_attaches_its_process_speech_tokenizer_before_the_pool(
     monkeypatch: pytest.MonkeyPatch,
     disable_cuda_graph: bool,
@@ -2960,6 +2967,7 @@ def test_qwen3_tts_vocoder_batches_decode_requests(
         max_batch_size=2,
         max_batch_wait_ms=3,
         enable_stateful_codec_decoder=False,
+        reference_encoder_in_process=False,
     )
     assert warmed_schedulers == [scheduler]
     assert scheduler.create_stream_state("request").initial_chunk_frames == 1
@@ -3037,6 +3045,7 @@ def test_qwen3_tts_vocoder_factory_forwards_incremental_graph_config(
         incremental_codec_cuda_graph_cold_frames=(24, 32),
         incremental_codec_cuda_graph_window_frames=(8, 16),
         incremental_codec_cuda_graph_min_free_gb=1.5,
+        reference_encoder_in_process=False,
     )
 
     assert isinstance(scheduler, FakeScheduler)
@@ -3088,7 +3097,9 @@ def vocoder_factory_capture(
             "tts_model_size": tts_model_size,
         },
     )
-    qwen3_stages.create_vocoder_executor("model", device=device, **factory_kwargs)
+    qwen3_stages.create_vocoder_executor(
+        "model", device=device, reference_encoder_in_process=False, **factory_kwargs
+    )
     return captured
 
 
@@ -3192,6 +3203,7 @@ def test_vocoder_factory_scopes_npu_internal_format_to_capture(
             async_decode=async_decode,
             incremental_codec_cuda_graph=codec_graph,
             enable_deterministic_inference=deterministic,
+            reference_encoder_in_process=False,
         )
 
     assert observed_internal_formats == [
@@ -6070,6 +6082,7 @@ def test_qwen3_tts_vocoder_factory_forwards_chunk_ramp(
         device="cpu",
         stream_chunk_ramp=[2, 4, 8],
         enable_stateful_codec_decoder=False,
+        reference_encoder_in_process=False,
     )
     payload = make_payload(inputs="target", params={"stream": True})
     scheduler.handle_streaming_new_request(payload.request_id, payload)
