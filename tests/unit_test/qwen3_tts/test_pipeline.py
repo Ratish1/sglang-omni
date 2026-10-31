@@ -457,7 +457,7 @@ def test_qwen3_tts_speech_tokenizer_is_loaded_once_per_process_key(
 
 
 @pytest.mark.parametrize(
-    ("disable_cuda_graph", "model_type", "vocoder_beside_encoder"),
+    ("disable_cuda_graph", "model_type", "vocoder_shares_engine_tokenizer"),
     [
         (False, "base", True),
         (True, "base", True),
@@ -470,7 +470,7 @@ def test_qwen3_tts_engine_attaches_its_process_speech_tokenizer_before_the_pool(
     monkeypatch: pytest.MonkeyPatch,
     disable_cuda_graph: bool,
     model_type: str,
-    vocoder_beside_encoder: bool,
+    vocoder_shares_engine_tokenizer: bool,
 ) -> None:
     from transformers import AutoProcessor
 
@@ -565,12 +565,11 @@ def test_qwen3_tts_engine_attaches_its_process_speech_tokenizer_before_the_pool(
     qwen3_request_builders.clear_qwen3_tts_preprocessing_context()
 
     vocoder = qwen3_stages.create_vocoder_executor(
-        "/ckpt", device="cpu", reference_encoder_in_process=vocoder_beside_encoder
+        "/ckpt",
+        device="cpu",
+        attn_implementation=None if vocoder_shares_engine_tokenizer else "eager",
+        shares_engine_speech_tokenizer=vocoder_shares_engine_tokenizer,
     )
-    if vocoder_beside_encoder:
-        pass
-    else:
-        monkeypatch.setattr(qwen3_stages, "_SPEECH_TOKENIZERS", {})
     talker = FakeTalker()
     builder = Qwen3TtsEngineBuilder(leading_silence_mask_frames=0)
     builder.dtype = "bfloat16"
@@ -585,8 +584,12 @@ def test_qwen3_tts_engine_attaches_its_process_speech_tokenizer_before_the_pool(
     finally:
         qwen3_request_builders.clear_qwen3_tts_preprocessing_context()
 
-    assert (talker.speech_tokenizer is vocoder.tokenizer) is vocoder_beside_encoder
-    assert loads == ["/ckpt/speech_tokenizer"] * (1 if vocoder_beside_encoder else 2)
+    assert (
+        talker.speech_tokenizer is vocoder.tokenizer
+    ) is vocoder_shares_engine_tokenizer
+    assert loads == ["/ckpt/speech_tokenizer"] * (
+        1 if vocoder_shares_engine_tokenizer else 2
+    )
     assert float32_encoders == (
         [(talker.speech_tokenizer, "/ckpt")] if model_type == "base" else []
     )
@@ -2967,7 +2970,7 @@ def test_qwen3_tts_vocoder_batches_decode_requests(
         max_batch_size=2,
         max_batch_wait_ms=3,
         enable_stateful_codec_decoder=False,
-        reference_encoder_in_process=False,
+        shares_engine_speech_tokenizer=False,
     )
     assert warmed_schedulers == [scheduler]
     assert scheduler.create_stream_state("request").initial_chunk_frames == 1
@@ -3045,7 +3048,7 @@ def test_qwen3_tts_vocoder_factory_forwards_incremental_graph_config(
         incremental_codec_cuda_graph_cold_frames=(24, 32),
         incremental_codec_cuda_graph_window_frames=(8, 16),
         incremental_codec_cuda_graph_min_free_gb=1.5,
-        reference_encoder_in_process=False,
+        shares_engine_speech_tokenizer=False,
     )
 
     assert isinstance(scheduler, FakeScheduler)
@@ -3098,7 +3101,7 @@ def vocoder_factory_capture(
         },
     )
     qwen3_stages.create_vocoder_executor(
-        "model", device=device, reference_encoder_in_process=False, **factory_kwargs
+        "model", device=device, shares_engine_speech_tokenizer=False, **factory_kwargs
     )
     return captured
 
@@ -3203,7 +3206,7 @@ def test_vocoder_factory_scopes_npu_internal_format_to_capture(
             async_decode=async_decode,
             incremental_codec_cuda_graph=codec_graph,
             enable_deterministic_inference=deterministic,
-            reference_encoder_in_process=False,
+            shares_engine_speech_tokenizer=False,
         )
 
     assert observed_internal_formats == [
@@ -3233,7 +3236,7 @@ def test_qwen3_tts_config_starts_a_declining_platform_decoding_synchronously(
         "running_stream_count": config.generation_admission_defaults()[
             "max_running_requests"
         ],
-        "reference_encoder_in_process": True,
+        "shares_engine_speech_tokenizer": True,
     }
     assert config.stage_factory_kwargs("tts_engine") == {}
 
@@ -3253,7 +3256,7 @@ def test_qwen3_tts_config_leaves_a_measured_platform_alone(
         "running_stream_count": config.generation_admission_defaults()[
             "max_running_requests"
         ],
-        "reference_encoder_in_process": True,
+        "shares_engine_speech_tokenizer": True,
     }
     assert config.stage_factory_kwargs("tts_engine") == {}
 
@@ -6082,7 +6085,7 @@ def test_qwen3_tts_vocoder_factory_forwards_chunk_ramp(
         device="cpu",
         stream_chunk_ramp=[2, 4, 8],
         enable_stateful_codec_decoder=False,
-        reference_encoder_in_process=False,
+        shares_engine_speech_tokenizer=False,
     )
     payload = make_payload(inputs="target", params={"stream": True})
     scheduler.handle_streaming_new_request(payload.request_id, payload)

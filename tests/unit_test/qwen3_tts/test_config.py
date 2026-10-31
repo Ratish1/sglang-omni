@@ -24,7 +24,7 @@ def test_vocoder_platform_default_keeps_npu_opt_in(
 
     expected = {"async_decode": False} if use_npu else {}
     expected["running_stream_count"] = 64
-    expected["reference_encoder_in_process"] = True
+    expected["shares_engine_speech_tokenizer"] = True
     assert config.stage_factory_kwargs("vocoder") == expected
 
 
@@ -279,24 +279,44 @@ def test_vocoder_receives_the_streams_one_replica_may_hold(
 
 
 @pytest.mark.parametrize(
-    ("preprocessing_process", "vocoder_process", "reference_encoder_in_process"),
+    (
+        "preprocessing_process",
+        "vocoder_process",
+        "vocoder_gpu",
+        "vocoder_attn_implementation",
+        "shares_engine_speech_tokenizer",
+    ),
     [
-        ("pipeline", "pipeline", True),
-        ("pipeline", "vocoder", False),
-        ("tts_frontend", "pipeline", True),
-        ("tts_frontend", "tts_frontend", True),
-        ("tts_frontend", "vocoder", False),
+        ("pipeline", "pipeline", 0, None, True),
+        ("pipeline", "vocoder", 0, None, False),
+        ("pipeline", "pipeline", 1, None, False),
+        ("pipeline", "pipeline", 0, "eager", False),
+        ("tts_frontend", "pipeline", 0, None, True),
+        ("tts_frontend", "tts_frontend", 0, None, False),
     ],
 )
-def test_vocoder_knows_whether_its_process_encodes_references(
-    preprocessing_process: str, vocoder_process: str, reference_encoder_in_process: bool
+def test_vocoder_shares_the_engine_speech_tokenizer_only_on_its_cache_entry(
+    preprocessing_process: str,
+    vocoder_process: str,
+    vocoder_gpu: int,
+    vocoder_attn_implementation: str | None,
+    shares_engine_speech_tokenizer: bool,
 ) -> None:
     config = Qwen3TTSPipelineConfig(model_path="org/model")
     config.stage_named("preprocessing").process = preprocessing_process
-    config.stage_named("vocoder").process = vocoder_process
+    vocoder_stage = config.stage_named("vocoder")
+    vocoder_stage.process = vocoder_process
+    vocoder_stage.gpu = vocoder_gpu
+    if vocoder_attn_implementation is None:
+        pass
+    else:
+        vocoder_stage.factory = FactoryArgs(
+            dtype="bfloat16", attn_implementation=vocoder_attn_implementation
+        )
 
     factory_kwargs = config.stage_factory_kwargs("vocoder")
 
     assert (
-        factory_kwargs["reference_encoder_in_process"] is reference_encoder_in_process
+        factory_kwargs["shares_engine_speech_tokenizer"]
+        is shares_engine_speech_tokenizer
     )
