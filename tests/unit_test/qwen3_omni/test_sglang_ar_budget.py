@@ -722,8 +722,10 @@ def test_qwen_talker_ar_threads_explicit_generation_batch_policy(monkeypatch) ->
     )
     if current_platform.is_cuda() and current_platform.enable_talker_graph():
         prefill_backend = "breakable"
+        prefill_budget = {"max_prefill_tokens": max(prefill_ladder)}
     else:
         prefill_backend = "disabled"
+        prefill_budget = {}
     assert build_calls == [
         {
             "cuda_graph_bs": [1, 2, 4, 8, 12, 16, 24, 32],
@@ -738,6 +740,7 @@ def test_qwen_talker_ar_threads_explicit_generation_batch_policy(monkeypatch) ->
             "cuda_graph_backend_prefill": prefill_backend,
             "cuda_graph_bs_prefill": prefill_ladder,
             "cuda_graph_max_bs_prefill": max(prefill_ladder),
+            **prefill_budget,
         }
     ]
     assert scheduler_calls == [
@@ -922,6 +925,28 @@ def test_the_talker_runs_its_cap_unless_the_engine_overrides_it(
     )
 
     assert overrides["max_running_requests"] == expected
+
+
+@pytest.mark.parametrize(
+    ("allows", "server_args_overrides", "expected"),
+    [
+        (True, None, qwen_stages.TALKER_PREFILL_CUDA_GRAPH_MAX_TOKENS),
+        (True, {"max_prefill_tokens": 4096}, 4096),
+        (False, None, None),
+    ],
+)
+def test_the_talker_prefill_budget_is_its_prefill_graphs_top(
+    monkeypatch,
+    allows: bool,
+    server_args_overrides: dict[str, int] | None,
+    expected: int | None,
+) -> None:
+    monkeypatch.setattr(current_platform, "is_cuda", lambda: True)
+    overrides = talker_overrides(
+        monkeypatch, allows=allows, server_args_overrides=server_args_overrides
+    )
+
+    assert overrides.get("max_prefill_tokens") == expected
 
 
 def test_talker_graph_stays_available_to_an_explicit_override(monkeypatch) -> None:

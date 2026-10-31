@@ -1458,8 +1458,8 @@ def create_sglang_thinker_executor_from_config(
     return scheduler
 
 
-# note (ratish): the talker prefills unchunked, so no chunk bounds the capture;
-# forwards above this many tokens run eager.
+# note (ratish): the talker prefills unchunked, so no chunk bounds a forward; its
+# prefill budget is set to the captured graphs' top so a batch of admissions replays.
 TALKER_PREFILL_CUDA_GRAPH_MAX_TOKENS = 2048
 
 
@@ -1527,6 +1527,16 @@ def create_talker_ar_executor_from_config(
     stated_disable = "disable_cuda_graph" in (server_args_overrides or {})
     if not stated_disable and not current_platform.enable_talker_graph():
         overrides["disable_cuda_graph"] = True
+    else:
+        pass
+    if (
+        overrides.get("cuda_graph_backend_prefill") == CudaGraphBackend.BREAKABLE
+        and not overrides.get("disable_cuda_graph")
+        and "max_prefill_tokens" not in (server_args_overrides or {})
+    ):
+        overrides["max_prefill_tokens"] = max(
+            int(size) for size in overrides["cuda_graph_bs_prefill"]
+        )
     else:
         pass
     overrides["tp_size"] = tp_size
