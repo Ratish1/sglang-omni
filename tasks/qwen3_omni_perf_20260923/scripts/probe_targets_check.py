@@ -83,7 +83,7 @@ for module_name, owner, attribute, call in (
         "sglang_omni.scheduling.omni_scheduler",
         "OmniScheduler",
         "enqueue_built_request",
-        ("self", "payload"),
+        ("self", "payload", "pending_stream_done", "req_data"),
     ),
     (
         "sglang_omni.models.qwen3_omni.talker_scheduler",

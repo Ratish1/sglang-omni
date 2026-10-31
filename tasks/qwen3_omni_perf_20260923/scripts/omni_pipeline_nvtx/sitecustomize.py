@@ -436,19 +436,15 @@ def range_present(module, names, kind):
 
 
 def patch_stage_io(module):
-    # a tree has the packer under one of two names (pack_tensor_chunks since the one-copy
-    # put); the inline payload functions exist only on trees that carry payloads inline, and
-    # a tree that packs small stream chunks per target has no per-chunk inline pickle
+    # main's names since #3355 (74003d00f): small stream chunks packed per target, payloads
+    # through SHM or direct CUDA IPC; probe_targets_check.py names any a tree lacks
     range_present(
         module,
         (
             "serialize_direct_cuda_ipc_payload",
             "serialize_direct_cuda_ipc_stream_chunk",
-            "serialize_inline_stream_chunk",
-            "serialize_inline_payload",
             "pack_stream_chunk_batch",
             "pack_tensor_chunks",
-            "pack_tensors",
             "ipc_pickle",
         ),
         "io.ser",
@@ -458,10 +454,7 @@ def patch_stage_io(module):
         (
             "deserialize_direct_cuda_ipc_payload",
             "deserialize_direct_cuda_ipc_stream_chunk",
-            "deserialize_inline_stream_chunk",
-            "deserialize_inline_payload",
             "unpack_stream_chunk_batch",
-            "unpack_payload",
         ),
         "io.deser",
     )
