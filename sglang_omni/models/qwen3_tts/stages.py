@@ -107,13 +107,17 @@ def resolve_qwen3_tts_attn_implementation(
 
 
 def load_float32_encoder_weights(
-    tokenizer: "Qwen3TTSTokenizer", tokenizer_path: str
+    tokenizer: "Qwen3TTSTokenizer", checkpoint_dir: str
 ) -> None:
     """Give the codec encoder its float32 checkpoint weights and build its codebook tables from them; the decoder is untouched."""
     # note (ratish): the encoder's quantizers pick each codeword by nearest distance, which bf16 rounding flips, so the encoder keeps the checkpoint's float32.
     encoder = tokenizer.model.encoder
     encoder.to(torch.float32)
-    encoder.load_state_dict(load_weights_by_prefix(tokenizer_path, prefix="encoder."))
+    encoder.load_state_dict(
+        load_weights_by_prefix(
+            os.path.join(checkpoint_dir, "speech_tokenizer"), prefix="encoder."
+        )
+    )
     # note (ratish): a table built lazily by the first encode sits inside that encode's float32 activations and keeps them reserved when the KV pool is sized.
     for module in encoder.modules():
         if isinstance(module, MimiEuclideanCodebook):
@@ -170,14 +174,6 @@ def load_qwen3_tts_tokenizer(
             attn_implementation or "upstream-default",
         )
         tokenizer = Qwen3TTSTokenizer.from_pretrained(tokenizer_path, **kwargs)
-        model_type = normalize_qwen3_tts_model_type(
-            load_qwen3_tts_checkpoint_config(checkpoint_dir).get("tts_model_type")
-        )
-        # note (ratish): only Base checkpoints encode references, so other tasks keep main's encoder and its memory.
-        if model_type == "base":
-            load_float32_encoder_weights(tokenizer, tokenizer_path)
-        else:
-            pass
         move_conv_padding_to_host(tokenizer.model.encoder)
         _SPEECH_TOKENIZERS[key] = tokenizer
         return tokenizer
@@ -368,6 +364,11 @@ def load_standalone_preprocessing_context(
         dtype=dtype,
         attn_implementation=attn_implementation,
     )
+    # note (ratish): this frontend encodes the references, so its encoder takes float32 as the engine's does when it encodes them itself.
+    if frontend.tts_model_type == "base":
+        load_float32_encoder_weights(speech_tokenizer, checkpoint_dir)
+    else:
+        pass
     frontend.load_speech_tokenizer(speech_tokenizer)
     if frontend.speaker_encoder_graph_runner is not None:
         frontend.speaker_encoder_graph_runner.capture(
