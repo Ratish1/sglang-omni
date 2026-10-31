@@ -2383,6 +2383,7 @@ def test_qwen3_tts_preprocessing_pool_thread_stays_on_the_stream_card(
 
     class FakeModel:
         model = SimpleNamespace(codec_embedding=torch.nn.Embedding(1, 4))
+        tts_model_type = "base"
 
         def build_prompt_constants(self) -> Qwen3TTSPromptConstants:
             return placeholder_prompt_constants()
@@ -11342,6 +11343,51 @@ def test_qwen3_tts_reference_encoder_stats_read_the_encoders_preprocessing_uses(
         assert qwen3_request_builders.qwen3_tts_reference_encoder_stats() is None
     finally:
         qwen3_request_builders.clear_qwen3_tts_preprocessing_context()
+
+
+@pytest.mark.parametrize(
+    ("tts_model_type", "graph_bucket_frames"),
+    [("base", (32, 64)), ("custom_voice", ()), ("voice_design", ())],
+)
+def test_qwen3_tts_only_base_captures_reference_encoder_graphs(
+    monkeypatch: pytest.MonkeyPatch,
+    tts_model_type: str,
+    graph_bucket_frames: tuple[int, ...],
+) -> None:
+    batcher_bucket_frames: list[tuple[int, ...]] = []
+
+    class FakeRefCodeBatcher:
+        def __init__(self, speech_tokenizer, *, graph_bucket_frames) -> None:
+            batcher_bucket_frames.append(tuple(graph_bucket_frames))
+            self.graph_runner = None
+
+        def close(self) -> None:
+            pass
+
+    class FakeModel:
+        model = SimpleNamespace(codec_embedding=torch.nn.Embedding(1, 4))
+        speech_tokenizer = object()
+        speaker_encoder_graph_runner = None
+
+        def build_prompt_constants(self):
+            return placeholder_prompt_constants()
+
+    model = FakeModel()
+    model.tts_model_type = tts_model_type
+    monkeypatch.setattr(
+        qwen3_request_builders, "Qwen3TTSRefCodeBatcher", FakeRefCodeBatcher
+    )
+    qwen3_request_builders.clear_qwen3_tts_preprocessing_context()
+    try:
+        qwen3_request_builders.set_qwen3_tts_preprocessing_context(
+            model=model,
+            wrapper=SimpleNamespace(),
+            reference_encoder_graph_bucket_frames=(32, 64),
+        )
+    finally:
+        qwen3_request_builders.clear_qwen3_tts_preprocessing_context()
+
+    assert batcher_bucket_frames == [graph_bucket_frames]
 
 
 @pytest.mark.parametrize(
