@@ -132,6 +132,7 @@ def load_qwen3_tts_tokenizer(
     device: str,
     dtype: str,
     attn_implementation: str | None,
+    float32_encoder: bool,
 ) -> "Qwen3TTSTokenizer":
     apply_qwen_tts_transformers_compatibility_patches()
     try:
@@ -174,6 +175,11 @@ def load_qwen3_tts_tokenizer(
             attn_implementation or "upstream-default",
         )
         tokenizer = Qwen3TTSTokenizer.from_pretrained(tokenizer_path, **kwargs)
+        # note (ratish): converted right after the load, so the process's later allocations reuse the bf16 weights it frees; converted later, they sit between the decoder's weights and shrink the KV pool.
+        if float32_encoder:
+            load_float32_encoder_weights(tokenizer, checkpoint_dir)
+        else:
+            pass
         move_conv_padding_to_host(tokenizer.model.encoder)
         _SPEECH_TOKENIZERS[key] = tokenizer
         return tokenizer
@@ -363,12 +369,8 @@ def load_standalone_preprocessing_context(
         device=device,
         dtype=dtype,
         attn_implementation=attn_implementation,
+        float32_encoder=frontend.tts_model_type == "base",
     )
-    # note (ratish): this frontend encodes the references, so its encoder takes float32 as the engine's does when it encodes them itself.
-    if frontend.tts_model_type == "base":
-        load_float32_encoder_weights(speech_tokenizer, checkpoint_dir)
-    else:
-        pass
     frontend.load_speech_tokenizer(speech_tokenizer)
     if frontend.speaker_encoder_graph_runner is not None:
         frontend.speaker_encoder_graph_runner.capture(
@@ -460,6 +462,7 @@ def create_vocoder_executor(
     suppress_bootstrap_silence: bool = True,
     suppress_bootstrap_max_streams: int = 24,
     running_stream_count: int | None = None,
+    reference_encoder_in_process: bool = True,
 ) -> Qwen3TTSStreamingVocoderScheduler:
     device = str(resolve_concrete_device(device, gpu_id))
     # note (luojiaxuan): the graph and compile switches follow the decoder
@@ -475,15 +478,16 @@ def create_vocoder_executor(
         )
     else:
         pass
+    checkpoint_config = load_qwen3_tts_checkpoint_config(model_path)
+    model_type = normalize_qwen3_tts_model_type(checkpoint_config.get("tts_model_type"))
+    # note (ratish): the vocoder only decodes, so its tokenizer's encoder takes float32 only when this process also encodes references.
     tokenizer = load_qwen3_tts_tokenizer(
         model_path,
         device=device,
         dtype=dtype,
         attn_implementation=attn_implementation,
+        float32_encoder=reference_encoder_in_process and model_type == "base",
     )
-
-    checkpoint_config = load_qwen3_tts_checkpoint_config(model_path)
-    model_type = normalize_qwen3_tts_model_type(checkpoint_config.get("tts_model_type"))
     configured_model_size = checkpoint_config.get("tts_model_size")
     tts_model_size: Literal["0b6", "1b7"] | None = None
     if model_type == "base" and configured_model_size in {"0b6", "1b7"}:

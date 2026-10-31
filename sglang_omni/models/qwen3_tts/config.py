@@ -45,6 +45,7 @@ class Qwen3TTSStageFactoryKwargs(TypedDict, total=False):
     followup_cuda_graph: bool
     async_decode: bool
     running_stream_count: int
+    reference_encoder_in_process: bool
 
 
 class Qwen3TTSPipelineConfig(PipelineConfig):
@@ -138,7 +139,12 @@ class Qwen3TTSPipelineConfig(PipelineConfig):
                     "max_running_requests"
                 ]
             engine_process = stage_process_name(engine_stage)
-            if stage_process_name(self.stage_named(stage_name)) == engine_process:
+            vocoder_process = stage_process_name(self.stage_named(stage_name))
+            kwargs["reference_encoder_in_process"] = vocoder_process in {
+                engine_process,
+                stage_process_name(self.stage_named("preprocessing")),
+            }
+            if vocoder_process == engine_process:
                 # note (Haoling Pu): each replica of a shared process decodes the
                 # streams its own engine runs.
                 kwargs["running_stream_count"] = running_request_count

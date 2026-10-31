@@ -383,12 +383,8 @@ class Qwen3TtsEngineBuilder(TtsEngineBuilder[Qwen3TTSSGLangRequestData]):
             device=device,
             dtype=self.dtype,
             attn_implementation=self.attn_implementation,
+            float32_encoder=model.tts_model_type == "base",
         )
-        # note (ratish): only Base checkpoints encode references, and a vocoder that loaded this tokenizer only decodes, so the encoder takes float32 here, where it encodes.
-        if model.tts_model_type == "base":
-            qwen3_stages.load_float32_encoder_weights(speech_tokenizer, checkpoint_dir)
-        else:
-            pass
         model.load_speech_tokenizer(speech_tokenizer)
         # note (luojiaxuan): only Base checkpoints serve x-vector clones, so the
         # other variants skip the probe and the per-step mask.
