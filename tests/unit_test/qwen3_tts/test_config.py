@@ -282,23 +282,20 @@ def test_vocoder_receives_the_streams_one_replica_may_hold(
     (
         "preprocessing_process",
         "vocoder_process",
-        "vocoder_gpu",
         "vocoder_attn_implementation",
         "shares_engine_speech_tokenizer",
     ),
     [
-        ("pipeline", "pipeline", 0, None, True),
-        ("pipeline", "vocoder", 0, None, False),
-        ("pipeline", "pipeline", 1, None, False),
-        ("pipeline", "pipeline", 0, "eager", False),
-        ("tts_frontend", "pipeline", 0, None, True),
-        ("tts_frontend", "tts_frontend", 0, None, False),
+        ("pipeline", "pipeline", None, True),
+        ("pipeline", "vocoder", None, False),
+        ("pipeline", "pipeline", "eager", False),
+        ("tts_frontend", "pipeline", None, True),
+        ("tts_frontend", "tts_frontend", None, False),
     ],
 )
 def test_vocoder_shares_the_engine_speech_tokenizer_only_on_its_cache_entry(
     preprocessing_process: str,
     vocoder_process: str,
-    vocoder_gpu: int,
     vocoder_attn_implementation: str | None,
     shares_engine_speech_tokenizer: bool,
 ) -> None:
@@ -306,7 +303,6 @@ def test_vocoder_shares_the_engine_speech_tokenizer_only_on_its_cache_entry(
     config.stage_named("preprocessing").process = preprocessing_process
     vocoder_stage = config.stage_named("vocoder")
     vocoder_stage.process = vocoder_process
-    vocoder_stage.gpu = vocoder_gpu
     if vocoder_attn_implementation is None:
         pass
     else:
