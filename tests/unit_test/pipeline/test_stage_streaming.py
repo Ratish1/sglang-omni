@@ -481,8 +481,25 @@ def test_remote_stream_run_packs_each_target_around_a_relay_chunk(
     ]
 
 
-def test_stream_chunk_the_receiver_cannot_restore_takes_the_relay(
-    monkeypatch: pytest.MonkeyPatch,
+@pytest.mark.parametrize(
+    "dtype, metadata_device",
+    [
+        (torch.uint16, None),
+        (torch.long, "cpu"),
+        pytest.param(
+            torch.long,
+            "cuda",
+            marks=[
+                pytest.mark.accelerator,
+                pytest.mark.skipif(
+                    not torch.cuda.is_available(), reason="requires CUDA"
+                ),
+            ],
+        ),
+    ],
+)
+def test_stream_chunk_the_batch_cannot_carry_takes_the_relay(
+    monkeypatch: pytest.MonkeyPatch, dtype: torch.dtype, metadata_device: str | None
 ) -> None:
     monkeypatch.setattr(
         platforms.current_platform, "device_type", "cuda", raising=False
@@ -502,14 +519,20 @@ def test_stream_chunk_the_receiver_cannot_restore_takes_the_relay(
             scheduler=scheduler,
         )
         stage.active_requests.update({"req-a", "req-b"})
+        metadata = (
+            None
+            if metadata_device is None
+            else {"hidden": torch.zeros(2, device=metadata_device)}
+        )
         put_messages(
             scheduler.outbox,
             [
                 OutgoingMessage(
                     "req-a",
                     "stream",
-                    torch.tensor([1], dtype=torch.uint16),
+                    torch.tensor([1], dtype=dtype),
                     "talker_ar",
+                    metadata,
                 ),
                 OutgoingMessage("req-b", "stream", torch.tensor([2]), "talker_ar"),
             ],
@@ -525,12 +548,14 @@ def test_stream_chunk_the_receiver_cannot_restore_takes_the_relay(
                 else (message.request_id, DataRef.from_dict(message.data_ref).dtype)
             )
             for _, _, message in control_plane.stage_messages
-        ] == [("req-a", "torch.uint16"), (["req-b"], ["torch.int64"])]
+        ] == [("req-a", str(dtype)), (["req-b"], ["torch.int64"])]
 
     asyncio.run(run())
 
 
-def test_stream_chunk_batch_round_trips_through_the_control_plane() -> None:
+def test_stream_chunk_batch_round_trips_through_the_control_plane(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     tensors = [
         torch.tensor([7], dtype=torch.long),
         torch.arange(6, dtype=torch.bfloat16).reshape(2, 3),
@@ -550,6 +575,14 @@ def test_stream_chunk_batch_round_trips_through_the_control_plane() -> None:
         )
         for index, tensor in enumerate(tensors)
     ]
+    clone = torch.Tensor.clone
+    cloned_shapes = []
+
+    def counting_clone(tensor, *args, **kwargs):
+        cloned_shapes.append(tuple(tensor.shape))
+        return clone(tensor, *args, **kwargs)
+
+    monkeypatch.setattr(torch.Tensor, "clone", counting_clone)
 
     message = deserialize_message(
         serialize_message(
@@ -563,6 +596,7 @@ def test_stream_chunk_batch_round_trips_through_the_control_plane() -> None:
     )
     restored = stage_io.unpack_stream_chunk_batch(message)
 
+    assert cloned_shapes == [(1,), (2,), (1,)]
     assert message.replica_bindings == {"req-1": {"talker_ar": 1}}
     assert [
         (chunk.request_id, chunk.chunk_id, chunk.metadata) for chunk in restored
