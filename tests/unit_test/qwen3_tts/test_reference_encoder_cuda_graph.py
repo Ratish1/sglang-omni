@@ -24,7 +24,7 @@ from sglang_omni.models.qwen3_tts import stages as qwen3_stages
 from sglang_omni.models.qwen3_tts.reference_encoder_cuda_graph import (
     Qwen3TTSReferenceEncoderCudaGraphRunner,
     exact_length_encode,
-    move_conv_padding_to_host,
+    pad_convs_by_integers,
     smallest_bucket,
 )
 
@@ -53,22 +53,39 @@ def small_mimi_config() -> MimiConfig:
     )
 
 
-def test_move_conv_padding_to_host_keeps_the_conv_arithmetic() -> None:
+@pytest.mark.parametrize(
+    ("kernel_size", "stride", "dilation", "pad_mode"),
+    [
+        (7, 1, 1, "constant"),
+        (3, 1, 2, "constant"),
+        (1, 1, 1, "constant"),
+        (8, 4, 1, "constant"),
+        (4, 2, 1, "replicate"),
+    ],
+)
+def test_integer_padding_keeps_the_conv_output(
+    kernel_size: int, stride: int, dilation: int, pad_mode: str
+) -> None:
     torch.manual_seed(3)
     config = small_mimi_config()
-    conv = MimiConv1d(config, 4, 4, kernel_size=7, stride=2)
-    values = torch.randn(1, 4, 21)
-    before = conv(values)
+    conv = MimiConv1d(
+        config,
+        4,
+        4,
+        kernel_size=kernel_size,
+        stride=stride,
+        dilation=dilation,
+        pad_mode=pad_mode,
+    )
+    tensor_padded = copy.deepcopy(conv)
 
-    assert move_conv_padding_to_host(conv) == 1
-    assert conv.stride.device.type == "cpu"
-    assert conv.kernel_size.device.type == "cpu"
-    assert conv.padding_total.device.type == "cpu"
-    assert conv.padding_left.device.type == "cpu"
-    assert torch.equal(conv(values), before)
+    assert pad_convs_by_integers(conv) == 1
+    for length in (1, 5, 21, 32):
+        values = torch.randn(1, 4, length)
+        assert torch.equal(conv(values), tensor_padded(values))
 
 
-def test_speech_tokenizer_loader_moves_the_encoder_padding_to_host(
+def test_speech_tokenizer_loader_pads_the_encoder_convs_by_integers(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     config = small_mimi_config()
@@ -97,9 +114,13 @@ def test_speech_tokenizer_loader_moves_the_encoder_padding_to_host(
         float32_encoder=False,
     )
 
+    def tensor_padding(self, hidden_states):
+        raise AssertionError("a conv padded from its tensor buffers")
+
+    monkeypatch.setattr(MimiConv1d, "_get_extra_padding_for_conv1d", tensor_padding)
     convs = [m for m in tokenizer.model.encoder.modules() if isinstance(m, MimiConv1d)]
     assert len(convs) == 1 + 2 * (2 + 1) + 1
-    assert all(conv.padding_total.device.type == "cpu" for conv in convs)
+    assert tokenizer.model.encoder(torch.randn(1, 1, 3 * HOP + 5)).shape[-1] > 0
 
 
 def fake_speech_tokenizer(encoder: MimiModel, quantizers: int) -> SimpleNamespace:
@@ -272,7 +293,7 @@ def test_reference_encoder_graph_replays_match_eager_and_miss_above_the_largest_
         if isinstance(module, MimiEuclideanCodebook):
             module.embed_sum.normal_()
     model = model.to(device).eval()
-    move_conv_padding_to_host(model)
+    pad_convs_by_integers(model)
     hop = HOP
     quantizers = 2
     stream = torch.cuda.Stream(device)
@@ -330,7 +351,7 @@ def test_reference_code_batcher_replays_captured_buckets_and_encodes_the_rest(
         if isinstance(module, MimiEuclideanCodebook):
             module.embed_sum.normal_()
     model = model.to(device).eval()
-    move_conv_padding_to_host(model)
+    pad_convs_by_integers(model)
     batcher = qwen3_request_builders.Qwen3TTSRefCodeBatcher(
         fake_speech_tokenizer(model, quantizers=2),
         max_batch_wait_ms=0,
