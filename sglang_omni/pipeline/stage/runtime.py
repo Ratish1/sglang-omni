@@ -2335,10 +2335,6 @@ class Stage:
     async def send_stream_chunk_batch(
         self, target: str, chunks: list[stage_io.BatchedStreamChunk]
     ) -> None:
-        if not chunks:
-            return
-        else:
-            pass
         await self.control_plane.send_to_stage(
             target,
             self.endpoints[target],
