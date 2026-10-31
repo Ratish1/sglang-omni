@@ -1008,6 +1008,7 @@ def test_a_declared_disable_also_drops_the_reference_encoder_buckets(
 
     class FakeTalker:
         device = torch.device("cpu")
+        tts_model_type = "base"
 
         def load_speech_tokenizer(self, tokenizer) -> None:
             del tokenizer
@@ -1023,6 +1024,11 @@ def test_a_declared_disable_also_drops_the_reference_encoder_buckets(
     monkeypatch.setitem(sys.modules, "qwen_tts", qwen_tts_module)
     monkeypatch.setattr(
         qwen3_stages, "load_qwen3_tts_tokenizer", lambda *a, **k: object()
+    )
+    monkeypatch.setattr(
+        qwen3_stages,
+        "load_float32_encoder_weights",
+        lambda tokenizer, checkpoint_dir: None,
     )
     monkeypatch.setattr(
         qwen3_stages, "load_qwen3_tts_generate_defaults", lambda path: {}
