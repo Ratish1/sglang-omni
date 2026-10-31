@@ -421,10 +421,8 @@ def padded_input(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     batch_size, length, channels = frames_like.shape
     history_samples = int(module.padding)
-    dilation = int(module.conv.dilation[0])
-    # note (ratish): the tail completes the last dilation phase of the conv's folded input, by a
-    # ceil division, since a modulo of a symbolic length slows Inductor's compile several times.
-    tail_samples = -(-length // dilation) * dilation - length
+    # note (ratish): the tail completes the last dilation phase of the conv's folded input.
+    tail_samples = (-length) % int(module.conv.dilation[0])
     padded = frames_like.new_empty(
         batch_size, history_samples + length + tail_samples, channels
     )
