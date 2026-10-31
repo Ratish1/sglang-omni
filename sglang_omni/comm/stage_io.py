@@ -384,6 +384,15 @@ def pack_stream_chunk_batch(
     to_stage: str,
     replica_bindings: dict[str, dict[str, int]],
 ) -> StreamChunkBatchMessage:
+    tensor_bytes: list[bytes] = []
+    for chunk in chunks:
+        # note (ratish): flattening first lets a 0-dim tensor take the byte view, which needs stride 1 and no lazy conjugate or negative bit, and contiguous() keeps both bits and any stride on a tensor of at most one element.
+        flat = chunk.data.contiguous().reshape(-1)
+        if flat.stride(0) != 1 or flat.is_conj() or flat.is_neg():
+            flat = flat.clone(memory_format=torch.contiguous_format)
+        else:
+            pass
+        tensor_bytes.append(flat.view(torch.uint8).numpy().tobytes())
     return StreamChunkBatchMessage(
         from_stage=from_stage,
         to_stage=to_stage,
@@ -391,11 +400,7 @@ def pack_stream_chunk_batch(
         chunk_ids=[chunk.chunk_id for chunk in chunks],
         dtypes=[str(chunk.data.dtype) for chunk in chunks],
         shapes=[list(chunk.data.shape) for chunk in chunks],
-        # note (ratish): flattening first lets a 0-dim tensor take the byte view.
-        tensor_bytes=[
-            chunk.data.contiguous().reshape(-1).view(torch.uint8).numpy().tobytes()
-            for chunk in chunks
-        ],
+        tensor_bytes=tensor_bytes,
         pickled_metadata=pickle.dumps([chunk.metadata for chunk in chunks]),
         replica_bindings=replica_bindings,
     )

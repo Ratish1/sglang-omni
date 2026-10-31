@@ -487,6 +487,9 @@ def test_stream_chunk_batch_round_trips_through_the_control_plane() -> None:
         torch.tensor(5, dtype=torch.long),
         torch.empty(0, dtype=torch.long),
         torch.arange(10, dtype=torch.long)[1::3],
+        torch.arange(8, dtype=torch.long)[::3][:1],
+        torch.tensor([1 + 2j, 3 + 4j]).conj(),
+        torch.tensor(1 + 2j).conj().imag,
     ]
     chunks = [
         stage_io.BatchedStreamChunk(
