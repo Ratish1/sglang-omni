@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import pickle
 import queue
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -680,7 +681,12 @@ def test_stream_chunk_batch_waits_only_behind_its_own_request_lane() -> None:
     asyncio.run(run())
 
 
-def test_unreadable_stream_chunk_batch_fails_each_request_it_carries() -> None:
+@pytest.mark.parametrize(
+    "corruption", ["unknown dtype", "tensor bytes not bytes", "metadata not a dict"]
+)
+def test_unreadable_stream_chunk_batch_fails_each_request_it_carries(
+    corruption: str,
+) -> None:
     async def run() -> None:
         control_plane = FakeControlPlane()
         scheduler = SimpleNamespace(
@@ -714,7 +720,12 @@ def test_unreadable_stream_chunk_batch_fails_each_request_it_carries() -> None:
             to_stage="decode",
             replica_bindings={},
         )
-        message.dtypes[1] = "torch.float8_e4m3fn"
+        if corruption == "unknown dtype":
+            message.dtypes[1] = "torch.float8_e4m3fn"
+        elif corruption == "tensor bytes not bytes":
+            message.tensor_bytes[1] = 8
+        else:
+            message.pickled_metadata = pickle.dumps([None, ["invalid"], None])
 
         stage.schedule_stream_chunk_batch(message)
         await asyncio.gather(*stage.receive_tasks)

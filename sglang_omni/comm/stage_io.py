@@ -420,6 +420,16 @@ def unpack_stream_chunk_batch(
         pickle.loads(message.pickled_metadata),
         strict=True,
     ):
+        if type(chunk_bytes) is not bytes:
+            raise TypeError(
+                f"stream chunk batch tensor bytes must be bytes, got {type(chunk_bytes).__name__}"
+            )
+        elif metadata is not None and not isinstance(metadata, dict):
+            raise TypeError(
+                f"stream chunk batch metadata must be dict or None, got {type(metadata).__name__}"
+            )
+        else:
+            pass
         dtype = torch_dtype(dtype_name)
         if chunk_bytes:
             data = torch.frombuffer(bytearray(chunk_bytes), dtype=dtype).reshape(shape)
