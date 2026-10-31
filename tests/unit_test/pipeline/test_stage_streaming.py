@@ -576,9 +576,11 @@ class GatedRelay(FakeRelay):
     def __init__(self, gate: asyncio.Event) -> None:
         super().__init__()
         self.gate = gate
+        self.entered = asyncio.Event()
 
     async def get_async(self, metadata, dest_tensor, request_id):
         del metadata, dest_tensor, request_id
+        self.entered.set()
         await self.gate.wait()
         return DoneOp()
 
@@ -646,21 +648,25 @@ def test_stream_chunk_batch_waits_only_behind_its_own_request_lane() -> None:
                 is_done=True,
             )
         )
+
+        def delivered() -> list[tuple[str, str, int | None]]:
+            messages = []
+            while not scheduler.inbox.empty():
+                message = scheduler.inbox.get_nowait()
+                messages.append(
+                    (
+                        message.request_id,
+                        message.type,
+                        None if message.data is None else message.data.chunk_id,
+                    )
+                )
+            return messages
+
+        await relay.entered.wait()
+        assert delivered() == [("req-b", "stream_chunk", 0)]
         gate.set()
         await asyncio.gather(*stage.receive_tasks)
-
-        delivered = []
-        while not scheduler.inbox.empty():
-            message = scheduler.inbox.get_nowait()
-            delivered.append(
-                (
-                    message.request_id,
-                    message.type,
-                    None if message.data is None else message.data.chunk_id,
-                )
-            )
-        assert delivered == [
-            ("req-b", "stream_chunk", 0),
+        assert delivered() == [
             ("req-a", "stream_chunk", 0),
             ("req-a", "stream_chunk", 1),
             ("req-a", "stream_done", None),
