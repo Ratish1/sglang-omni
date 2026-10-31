@@ -740,6 +740,8 @@ def test_unreadable_stream_chunk_batch_fails_each_request_it_carries(
             scheduler=scheduler,
         )
         stage.stream_queue = StreamQueue()
+        stage.stream_queue.open("req-a")
+        stage.stream_queue.open("req-b")
         message = stage_io.pack_stream_chunk_batch(
             [
                 stage_io.BatchedStreamChunk(
