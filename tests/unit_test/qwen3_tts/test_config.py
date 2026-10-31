@@ -275,3 +275,27 @@ def test_vocoder_receives_the_streams_one_replica_may_hold(
     factory_kwargs = config.stage_factory_kwargs("vocoder")
 
     assert factory_kwargs["running_stream_count"] == running_stream_count
+
+
+@pytest.mark.parametrize(
+    ("preprocessing_process", "vocoder_process", "reference_encoder_in_process"),
+    [
+        ("pipeline", "pipeline", True),
+        ("pipeline", "vocoder", False),
+        ("tts_frontend", "pipeline", True),
+        ("tts_frontend", "tts_frontend", True),
+        ("tts_frontend", "vocoder", False),
+    ],
+)
+def test_vocoder_knows_whether_its_process_encodes_references(
+    preprocessing_process: str, vocoder_process: str, reference_encoder_in_process: bool
+) -> None:
+    config = Qwen3TTSPipelineConfig(model_path="org/model")
+    config.stage_named("preprocessing").process = preprocessing_process
+    config.stage_named("vocoder").process = vocoder_process
+
+    factory_kwargs = config.stage_factory_kwargs("vocoder")
+
+    assert (
+        factory_kwargs["reference_encoder_in_process"] is reference_encoder_in_process
+    )

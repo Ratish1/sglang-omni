@@ -1026,11 +1026,6 @@ def test_a_declared_disable_also_drops_the_reference_encoder_buckets(
         qwen3_stages, "load_qwen3_tts_tokenizer", lambda *a, **k: object()
     )
     monkeypatch.setattr(
-        qwen3_stages,
-        "load_float32_encoder_weights",
-        lambda tokenizer, checkpoint_dir: None,
-    )
-    monkeypatch.setattr(
         qwen3_stages, "load_qwen3_tts_generate_defaults", lambda path: {}
     )
     monkeypatch.setattr(
