@@ -56,9 +56,14 @@ def main():
     parser.add_argument("--out", required=True)
     parser.add_argument("--replays", type=int, default=200)
     parser.add_argument("--no-autotune-pointwise", action="store_true")
+    parser.add_argument("--warmups", type=int, default=None)
     args = parser.parse_args()
     if args.no_autotune_pointwise:
         torch._inductor.config.triton.autotune_pointwise = False
+    else:
+        pass
+    if args.warmups is not None:
+        Qwen3TTSIncrementalCodecCudaGraphRunner.WARMUP_ITERATIONS = args.warmups
     else:
         pass
     imported = time.perf_counter()
