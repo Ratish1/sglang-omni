@@ -858,6 +858,10 @@ def run_process(
     try:
         prewarm_cuda_ipc_export(spec, log)
         for stage_spec in spec.stage_specs:
+            # note (ratish): a graph capture's collection walks the whole heap, and the imports
+            # and stages built so far live for the process, so each walk sees only the new.
+            gc.collect()
+            gc.freeze()
             stages.append(
                 construct_stage(
                     stage_spec,
