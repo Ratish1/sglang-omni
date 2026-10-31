@@ -7819,9 +7819,7 @@ def test_qwen3_tts_another_process_reads_complete_final_codes() -> None:
             ]
             torch.cat([torch.stack(warm_codes, dim=0)], dim=0)
             torch.cuda.synchronize(device)
-            torch.cuda._sleep(
-                1_000_000_000
-            )  # noqa: leading-underscore  # upstream name
+            torch.cuda._sleep(10**9)  # noqa: leading-underscore  # upstream name
             result = apply_sglang_qwen3_tts_result(
                 payload,
                 Qwen3TTSSGLangRequestData(
