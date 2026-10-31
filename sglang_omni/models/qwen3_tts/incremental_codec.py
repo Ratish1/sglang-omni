@@ -3,11 +3,15 @@
 
 from __future__ import annotations
 
+import os
+import types
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
 import torch
+import torch._dynamo as dynamo
+import torch.fx.experimental._config
 import torch.nn.functional as F
 from sglang.kernels.ops.activation import silu_and_mul
 from sglang.kernels.ops.attention.rope import (
@@ -38,6 +42,11 @@ if current_platform.is_cuda():
     from sglang_omni.kernels.single_output_conv import clamped_single_output_conv
 else:
     pass
+
+# note (ratish): measurement switch: static (main), ops (the four Triton kernels as opaque ops),
+# batch (ops, batch dynamic), all (ops, batch and width dynamic).
+CODEC_COMPILE_FORM = os.environ.get("SGLANG_OMNI_CODEC_COMPILE_FORM", "static")
+CODEC_OBLIVIOUS = os.environ.get("SGLANG_OMNI_CODEC_OBLIVIOUS", "0") == "1"
 
 if TYPE_CHECKING:
     from qwen_tts.core.tokenizer_12hz.modeling_qwen3_tts_tokenizer_v2 import (
@@ -136,7 +145,7 @@ class Qwen3TTSIncrementalCodecState:
             )
         else:
             pass
-        if int(self.frame_positions.shape[0]) != batch_size:
+        if self.frame_positions.shape[0] != batch_size:
             raise ValueError(
                 "Qwen3-TTS incremental codec state carries "
                 f"{int(self.frame_positions.shape[0])} row positions for a batch "
@@ -290,13 +299,236 @@ def add_into(out: torch.Tensor, first: torch.Tensor, second: torch.Tensor) -> No
         torch.add(first, second, out=out)
 
 
+def history_exchange_op(
+    padded: torch.Tensor,
+    history_pool: torch.Tensor,
+    slot_index: torch.Tensor,
+    new_samples: int,
+    pad_slot: int,
+) -> None:
+    history_exchange(
+        padded,
+        history_pool,
+        slot_index,
+        new_samples=new_samples,
+        is_cold=False,
+        pad_slot=pad_slot,
+    )
+
+
+def overlap_exchange_op(
+    output: torch.Tensor,
+    overlap_pool: torch.Tensor,
+    slot_index: torch.Tensor,
+    emitted_samples: int,
+    pad_slot: int,
+) -> None:
+    overlap_exchange(
+        output,
+        overlap_pool,
+        slot_index,
+        emitted_samples=emitted_samples,
+        is_cold=False,
+        pad_slot=pad_slot,
+    )
+
+
+def bias_snake_beta_op(
+    conv_output: torch.Tensor,
+    bias: torch.Tensor,
+    alpha_scale: torch.Tensor,
+    inverse_beta: torch.Tensor,
+    out: torch.Tensor,
+    residual: torch.Tensor | None,
+) -> None:
+    fused_bias_snake_beta(
+        conv_output,
+        bias,
+        SnakeBetaCoefficients(alpha_scale=alpha_scale, inverse_beta=inverse_beta),
+        out,
+        residual=residual,
+        should_round_like_eager=False,
+    )
+
+
+def bias_snake_beta_sum_op(
+    conv_output: torch.Tensor,
+    bias: torch.Tensor,
+    alpha_scale: torch.Tensor,
+    inverse_beta: torch.Tensor,
+    out: torch.Tensor,
+    sum_out: torch.Tensor,
+    has_residual: bool,
+) -> None:
+    fused_bias_snake_beta(
+        conv_output,
+        bias,
+        SnakeBetaCoefficients(alpha_scale=alpha_scale, inverse_beta=inverse_beta),
+        out,
+        residual=sum_out if has_residual else None,
+        sum_out=sum_out,
+        should_round_like_eager=False,
+    )
+
+
+def single_output_conv_op(
+    padded: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor, length: int
+) -> torch.Tensor:
+    conv = types.SimpleNamespace(
+        kernel_size=(int(weight.shape[2]),),
+        out_channels=1,
+        stride=(1,),
+        dilation=(1,),
+        groups=1,
+        weight=weight,
+        bias=bias,
+    )
+    return clamped_single_output_conv(padded, conv, length)
+
+
+def single_output_conv_fake(
+    padded: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor, length: int
+) -> torch.Tensor:
+    return padded.new_empty(padded.shape[0], 1, length)
+
+
+if current_platform.is_cuda():
+    compiled_history_exchange = register_custom_op(
+        history_exchange_op,
+        op_name="qwen3_tts_codec_history_exchange",
+        mutates_args=["padded", "history_pool"],
+    )
+    compiled_overlap_exchange = register_custom_op(
+        overlap_exchange_op,
+        op_name="qwen3_tts_codec_overlap_exchange",
+        mutates_args=["output", "overlap_pool"],
+    )
+    compiled_bias_snake_beta = register_custom_op(
+        bias_snake_beta_op,
+        op_name="qwen3_tts_codec_bias_snake_beta",
+        mutates_args=["out"],
+    )
+    compiled_bias_snake_beta_sum = register_custom_op(
+        bias_snake_beta_sum_op,
+        op_name="qwen3_tts_codec_bias_snake_beta_sum",
+        mutates_args=["out", "sum_out"],
+    )
+    compiled_single_output_conv = register_custom_op(
+        single_output_conv_op,
+        op_name="qwen3_tts_codec_single_output_conv",
+        mutates_args=[],
+        fake_impl=single_output_conv_fake,
+    )
+else:
+    pass
+
+
+def is_opaque_kernel_trace() -> bool:
+    return CODEC_COMPILE_FORM != "static" and torch.compiler.is_dynamo_compiling()
+
+
+def exchange_history(
+    padded: torch.Tensor,
+    history_pool: torch.Tensor,
+    slot_index: torch.Tensor,
+    new_samples: int,
+    pad_slot: int,
+) -> None:
+    if is_opaque_kernel_trace():
+        compiled_history_exchange(
+            padded, history_pool, slot_index, new_samples, pad_slot
+        )
+    else:
+        history_exchange(
+            padded,
+            history_pool,
+            slot_index,
+            new_samples=new_samples,
+            is_cold=False,
+            pad_slot=pad_slot,
+        )
+
+
+def exchange_overlap(
+    output: torch.Tensor,
+    overlap_pool: torch.Tensor,
+    slot_index: torch.Tensor,
+    emitted_samples: int,
+    pad_slot: int,
+) -> None:
+    if is_opaque_kernel_trace():
+        compiled_overlap_exchange(
+            output, overlap_pool, slot_index, emitted_samples, pad_slot
+        )
+    else:
+        overlap_exchange(
+            output,
+            overlap_pool,
+            slot_index,
+            emitted_samples=emitted_samples,
+            is_cold=False,
+            pad_slot=pad_slot,
+        )
+
+
+def bias_snake_beta(
+    conv_output: torch.Tensor,
+    bias: torch.Tensor,
+    coefficients: SnakeBetaCoefficients,
+    out: torch.Tensor,
+    *,
+    residual: torch.Tensor | None = None,
+    sum_out: torch.Tensor | None = None,
+) -> None:
+    if not is_opaque_kernel_trace():
+        fused_bias_snake_beta(
+            conv_output,
+            bias,
+            coefficients,
+            out,
+            residual=residual,
+            sum_out=sum_out,
+            should_round_like_eager=False,
+        )
+    elif sum_out is None:
+        compiled_bias_snake_beta(
+            conv_output,
+            bias,
+            coefficients.alpha_scale,
+            coefficients.inverse_beta,
+            out,
+            residual,
+        )
+    else:
+        assert residual is None or residual is sum_out, "the sum is the residual"
+        compiled_bias_snake_beta_sum(
+            conv_output,
+            bias,
+            coefficients.alpha_scale,
+            coefficients.inverse_beta,
+            out,
+            sum_out,
+            residual is not None,
+        )
+
+
+def single_output_conv(
+    padded: torch.Tensor, conv: torch.nn.Conv1d, length: int
+) -> torch.Tensor:
+    if is_opaque_kernel_trace():
+        return compiled_single_output_conv(padded, conv.weight, conv.bias, length)
+    else:
+        return clamped_single_output_conv(padded, conv, length)
+
+
 def padded_input(
     module: "Qwen3TTSTokenizerV2CausalConvNet", frames_like: torch.Tensor
 ) -> tuple[torch.Tensor, torch.Tensor]:
     batch_size, length, channels = frames_like.shape
     history_samples = int(module.padding)
+    dilation = int(module.conv.dilation[0])
     # note (ratish): the tail completes the last dilation phase of the conv's folded input.
-    tail_samples = (-length) % int(module.conv.dilation[0])
+    tail_samples = -(-length // dilation) * dilation - length
     padded = frames_like.new_empty(
         batch_size, history_samples + length + tail_samples, channels
     )
@@ -313,14 +545,7 @@ def slot_causal_conv(
     length: int,
 ) -> torch.Tensor:
     if history_pool.shape[1] > 0:
-        history_exchange(
-            padded,
-            history_pool,
-            slot_index,
-            new_samples=length,
-            is_cold=False,
-            pad_slot=pad_slot,
-        )
+        exchange_history(padded, history_pool, slot_index, length, pad_slot)
     else:
         pass
     # note (ratish): the consumer adds the bias, fused into its activation.
@@ -338,16 +563,9 @@ def slot_causal_transconv(
     conv = module.conv
     # note (ratish): the consumer adds the bias after the overlap, so overlaps carry it once.
     output = channels_last_conv_transpose1d(frames, conv, weight, None)
-    emitted_samples = int(frames.shape[1]) * int(conv.stride[0])
+    emitted_samples = frames.shape[1] * int(conv.stride[0])
     if overlap_pool.shape[1] > 0:
-        overlap_exchange(
-            output,
-            overlap_pool,
-            slot_index,
-            emitted_samples=emitted_samples,
-            is_cold=False,
-            pad_slot=pad_slot,
-        )
+        exchange_overlap(output, overlap_pool, slot_index, emitted_samples, pad_slot)
     else:
         pass
     return output[:, :emitted_samples]
@@ -675,7 +893,7 @@ class FusedIncrementalTransformer:
         kv_heads * head_dim) value, from one qkv GEMM on the normed rows."""
         attention = layer.self_attn
         head_dim = int(attention.head_dim)
-        rows = int(hidden_states.shape[0])
+        rows = hidden_states.shape[0]
         normalized = self.normalize(hidden_states, layer.input_layernorm)
         query, key, value = F.linear(normalized, attention.qkv_weight).split(
             [
@@ -816,8 +1034,8 @@ class FusedIncrementalTransformer:
         transformer = self.transformer
         rings = state.kv_rings
         hidden_states = transformer.input_proj(hidden_states)
-        batch_size = int(hidden_states.shape[0])
-        fresh_frames = int(hidden_states.shape[1])
+        batch_size = hidden_states.shape[0]
+        fresh_frames = hidden_states.shape[1]
         hidden_size = int(hidden_states.shape[2])
         rows = batch_size * fresh_frames
         device = hidden_states.device
@@ -1498,14 +1716,7 @@ class Qwen3TTSIncrementalDecoder:
         padded, padded_frames = padded_input(module, frames)
         padded_frames.copy_(frames)
         if valid_frames is None:
-            history_exchange(
-                padded,
-                history_pool,
-                slot_index,
-                new_samples=length,
-                is_cold=False,
-                pad_slot=state.pad_slot,
-            )
+            exchange_history(padded, history_pool, slot_index, length, state.pad_slot)
         else:
             history_samples = int(module.padding)
             padded[:, :history_samples].copy_(history_pool.index_select(0, slot_index))
@@ -1572,7 +1783,7 @@ class Qwen3TTSIncrementalDecoder:
     ) -> torch.Tensor:
         decoder = self.decoder
         coefficients = self.snake_coefficients
-        slot_index = state.conv_slots(int(hidden_states.shape[0]), hidden_states.device)
+        slot_index = state.conv_slots(hidden_states.shape[0], hidden_states.device)
         padded, length = self.slot_upsample(hidden_states, state, slot_index)
         decoder_output = slot_causal_conv(
             decoder.decoder[0],
@@ -1586,12 +1797,11 @@ class Qwen3TTSIncrementalDecoder:
         decoder_blocks = decoder.decoder[1:-2]
         activated = decoder_output.new_empty(decoder_output.shape)
         # note (ratish): eager rounding would land further from fp32 than main's compiled adds.
-        fused_bias_snake_beta(
+        bias_snake_beta(
             decoder_output,
             decoder.decoder[0].conv.bias,
             coefficients[decoder_blocks[0].block[0]],
             activated,
-            should_round_like_eager=False,
         )
         for block_index, decoder_block in enumerate(decoder_blocks, start=1):
             conv_output, residual = self.slot_decoder_block(
@@ -1600,35 +1810,32 @@ class Qwen3TTSIncrementalDecoder:
             bias = decoder_block.block[-1].conv2.conv.bias
             if block_index < len(decoder_blocks):
                 activated = conv_output.new_empty(conv_output.shape)
-                fused_bias_snake_beta(
+                bias_snake_beta(
                     conv_output,
                     bias,
                     coefficients[decoder_blocks[block_index].block[0]],
                     activated,
                     residual=residual,
-                    should_round_like_eager=False,
                 )
             else:
                 padded, padded_frames = padded_input(decoder.decoder[-1], conv_output)
-                fused_bias_snake_beta(
+                bias_snake_beta(
                     conv_output,
                     bias,
                     coefficients[decoder.decoder[-2]],
                     padded_frames,
                     residual=residual,
-                    should_round_like_eager=False,
                 )
-        length = int(conv_output.shape[1])
-        history_exchange(
+        length = conv_output.shape[1]
+        exchange_history(
             padded,
             state.conv_histories["decoder.final"],
             slot_index,
-            new_samples=length,
-            is_cold=False,
-            pad_slot=state.pad_slot,
+            length,
+            state.pad_slot,
         )
         # note (ratish): cuDNN has no tensor-core engine for one output channel.
-        return clamped_single_output_conv(padded, decoder.decoder[-1].conv, length)
+        return single_output_conv(padded, decoder.decoder[-1].conv, length)
 
     def slot_upsample(
         self,
@@ -1659,13 +1866,12 @@ class Qwen3TTSIncrementalDecoder:
             )
             residual = depthwise_input[:, :, history_samples:].transpose(1, 2)
             add_into(residual, frames, transconv.conv.bias)
-            history_exchange(
+            exchange_history(
                 depthwise_input.transpose(1, 2),
                 state.conv_histories[f"{key}.convnext.dwconv"],
                 slot_index,
-                new_samples=length,
-                is_cold=False,
-                pad_slot=state.pad_slot,
+                length,
+                state.pad_slot,
             )
             normed = convnext.norm(
                 convnext.dwconv.conv(depthwise_input).transpose(1, 2)
@@ -1701,16 +1907,15 @@ class Qwen3TTSIncrementalDecoder:
             state.pad_slot,
         )
         residual_units = decoder_block.block[2:]
-        length = int(frames.shape[1])
+        length = frames.shape[1]
         residual = frames.new_empty(frames.shape)
         padded, padded_frames = padded_input(residual_units[0].conv1, frames)
-        fused_bias_snake_beta(
+        bias_snake_beta(
             frames,
             transconv.conv.bias,
             coefficients[residual_units[0].act1],
             padded_frames,
             sum_out=residual,
-            should_round_like_eager=False,
         )
         for residual_index, unit in enumerate(residual_units):
             unit_key = f"{key}.residual.{residual_index}"
@@ -1724,12 +1929,11 @@ class Qwen3TTSIncrementalDecoder:
                 length,
             )
             padded, padded_frames = padded_input(unit.conv2, frames)
-            fused_bias_snake_beta(
+            bias_snake_beta(
                 conv1_output,
                 unit.conv1.conv.bias,
                 coefficients[unit.act2],
                 padded_frames,
-                should_round_like_eager=False,
             )
             conv2_output = slot_causal_conv(
                 unit.conv2,
@@ -1743,14 +1947,13 @@ class Qwen3TTSIncrementalDecoder:
             if residual_index + 1 < len(residual_units):
                 next_unit = residual_units[residual_index + 1]
                 padded, padded_frames = padded_input(next_unit.conv1, frames)
-                fused_bias_snake_beta(
+                bias_snake_beta(
                     conv2_output,
                     unit.conv2.conv.bias,
                     coefficients[next_unit.act1],
                     padded_frames,
                     residual=residual,
                     sum_out=residual,
-                    should_round_like_eager=False,
                 )
             else:
                 pass
@@ -1779,12 +1982,29 @@ class Qwen3TTSIncrementalDecoder:
             return
         else:
             pass
+        if CODEC_COMPILE_FORM in ("batch", "all"):
+            batch_tensors = [codes, state.frame_positions, state.slot_index]
+            if state.kv_rings is not None:
+                batch_tensors.append(state.kv_rings.slot_rows)
+            else:
+                pass
+            for tensor in batch_tensors:
+                dynamo.maybe_mark_dynamic(tensor, 0)
+        else:
+            pass
+        if CODEC_COMPILE_FORM == "all":
+            dynamo.maybe_mark_dynamic(codes, 2)
+        else:
+            pass
         # note (luojiaxuan): one trace per (batch, width) pair, past the default
         # 8; ``decode`` never compiles a new shape, so the limit only matters here.
-        with torch._dynamo.config.patch(  # noqa: leading-underscore  # upstream spelling, or the public name is already taken
-            recompile_limit=max(
-                torch._dynamo.config.recompile_limit, 64
-            )  # noqa: leading-underscore  # upstream spelling, or the public name is already taken
+        with (
+            torch._dynamo.config.patch(  # noqa: leading-underscore  # upstream spelling, or the public name is already taken
+                recompile_limit=max(
+                    torch._dynamo.config.recompile_limit, 64
+                )  # noqa: leading-underscore  # upstream spelling, or the public name is already taken
+            ),
+            torch.fx.experimental._config.patch(backed_size_oblivious=CODEC_OBLIVIOUS),
         ):
             self.compiled_kernel(codes, state)
         self.compiled_shapes.add(shape)
