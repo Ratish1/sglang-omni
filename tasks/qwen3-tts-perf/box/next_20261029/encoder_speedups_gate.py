@@ -36,6 +36,7 @@ usage: PYTHONPATH=TREE python3 encoder_speedups_gate.py WAV_DIR --model Qwen/Qwe
 """
 
 import argparse
+import inspect
 import os
 import time
 from collections import defaultdict
@@ -285,7 +286,12 @@ def main() -> None:
     from qwen_tts import Qwen3TTSTokenizer
 
     clips = [librosa.load(str(path), sr=None, mono=True) for path in sorted(args.wavs.glob("*.wav"))[: args.clips]]
-    ours = load_qwen3_tts_tokenizer(args.model, device=device, dtype="bfloat16", attn_implementation=None)
+    loader_kwargs = (
+        {"float32_encoder": True} if "float32_encoder" in inspect.signature(load_qwen3_tts_tokenizer).parameters else {}
+    )
+    ours = load_qwen3_tts_tokenizer(
+        args.model, device=device, dtype="bfloat16", attn_implementation=None, **loader_kwargs
+    )
     official = Qwen3TTSTokenizer.from_pretrained(
         os.path.join(resolve_checkpoint(args.model), "speech_tokenizer"), device_map=device, dtype=torch.float32
     )

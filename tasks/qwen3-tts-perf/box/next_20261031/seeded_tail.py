@@ -57,12 +57,12 @@ def start(tree: str, card: int, port: int, log: Path) -> subprocess.Popen:
                                 start_new_session=True)
 
 
-def bench(tree: str, port: int, out: Path, concurrency: int, seed: int, stream: bool) -> str:
+def bench(tree: str, port: int, out: Path, concurrency: int, seed: int | None, stream: bool) -> str:
     out.mkdir(parents=True, exist_ok=True)
     command = [sys.executable, "-m", "benchmarks.eval.benchmark_tts_seedtts", "--model", MODEL, "--use-existing-server",
                "--host", "127.0.0.1", "--port", str(port), "--generate-only", *(["--stream"] if stream else []),
-               "--lang", "en", "--warmup", "1", "--max-concurrency", str(concurrency), "--seed", str(seed),
-               "--output-dir", str(out / "bench")]
+               "--lang", "en", "--warmup", "1", "--max-concurrency", str(concurrency),
+               *([] if seed is None else ["--seed", str(seed)]), "--output-dir", str(out / "bench")]
     with open(out / "bench.log", "w", encoding="utf-8") as log:
         subprocess.run(command, cwd=tree, env=dict(os.environ, CUDA_VISIBLE_DEVICES="", PYTHONPATH=tree),
                        stdout=log, stderr=subprocess.STDOUT, timeout=BENCH_TIMEOUT_S, check=False)
