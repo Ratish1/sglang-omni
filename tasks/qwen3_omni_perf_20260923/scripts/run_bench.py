@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextvars
 import dataclasses
 import functools
 import inspect
@@ -219,6 +220,52 @@ def install_sample_skip(skip: int) -> None:
     skip_first_samples(seedtts_benchmark, "load_seedtts_samples", skip)
     skip_first_samples(mmsu_benchmark, "load_mmsu_samples", skip)
     skip_first_samples(mmmu_benchmark, "load_mmmu_samples", skip)
+
+
+REPLY_TEXT_PARTS: contextvars.ContextVar = contextvars.ContextVar(
+    "reply_text_parts", default=None
+)
+
+
+def install_reply_text_capture(texts: dict) -> None:
+    """Record each streamed SeedTTS request's text deltas (the thinker's reply) into texts by
+    sample id, so a bad output can be read against what the talker was asked to speak.
+    """
+    import benchmarks.tasks.tts as tts_module
+
+    generate_original = tts_module.VoiceCloneOmni.generate_speech
+    collect_original = tts_module._collect_chat_streaming_audio
+
+    @functools.wraps(generate_original)
+    async def generate_speech(
+        self, session, api_url, model_name, sample, *args, **kwargs
+    ):
+        parts: list[str] = []
+        REPLY_TEXT_PARTS.set(parts)
+        try:
+            return await generate_original(
+                self, session, api_url, model_name, sample, *args, **kwargs
+            )
+        finally:
+            texts[sample.sample_id] = "".join(parts)
+
+    @functools.wraps(collect_original)
+    def collect_chat_streaming_audio(line, *args, **kwargs):
+        parts = REPLY_TEXT_PARTS.get()
+        event = tts_module.parse_sse_event(line) if parts is not None else None
+        if event is not None:
+            for choice in event.get("choices", []):
+                content = (choice.get("delta") or {}).get("content")
+                if isinstance(content, str):
+                    parts.append(content)
+                else:
+                    pass
+        else:
+            pass
+        return collect_original(line, *args, **kwargs)
+
+    tts_module.VoiceCloneOmni.generate_speech = generate_speech
+    tts_module._collect_chat_streaming_audio = collect_chat_streaming_audio
 
 
 async def transcribe_seedtts_references(
@@ -720,6 +767,11 @@ def main() -> None:
             install_arrival_seed(ARRIVAL_SEED)
         else:
             pass
+        reply_texts: dict[str, str] = {}
+        if args.arm.startswith("seedtts_"):
+            install_reply_text_capture(reply_texts)
+        else:
+            pass
         asyncio.run(
             generate(
                 args.arm,
@@ -730,6 +782,12 @@ def main() -> None:
                 args.request_rate,
             )
         )
+        if reply_texts:
+            (Path(out) / "reply_text.json").write_text(
+                json.dumps(reply_texts, indent=1, ensure_ascii=False)
+            )
+        else:
+            pass
     else:
         result = score(args.arm, args.asr_port, out, args.device, args.mode == "sim")
         name = "sim_summary.json" if args.mode == "sim" else "score_summary.json"
