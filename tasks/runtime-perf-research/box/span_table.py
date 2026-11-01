@@ -127,9 +127,12 @@ def main() -> None:
     parser.add_argument("--top", type=int, default=40)
     parser.add_argument("--labels", action="store_true")
     parser.add_argument("--calls", default="", help="comma list of span names: CUDA calls inside them by time")
+    parser.add_argument("--kernels", default="", help="comma list of span names: kernels they launched, by name")
     args = parser.parse_args()
     call_spans = set(filter(None, args.calls.split(",")))
+    kernel_spans = set(filter(None, args.kernels.split(",")))
     calls_inside = defaultdict(lambda: defaultdict(list))
+    kernels_inside = defaultdict(lambda: defaultdict(list))
 
     stages = {}
     with open(args.serve_log, encoding="utf-8", errors="replace") as log:
@@ -147,6 +150,14 @@ def main() -> None:
 
     device_by_corr = {}
     device_by_pid = defaultdict(list)
+    kernel_name = {}
+    if kernel_spans:
+        for corr, gpid, name_id, start, end in db.execute(
+            "SELECT correlationId, globalPid, shortName, start, end FROM CUPTI_ACTIVITY_KIND_KERNEL"
+        ):
+            kernel_name[(pid_of(gpid), corr)] = (strings.get(name_id, str(name_id)), end - start)
+    else:
+        pass
     for corr, gpid, start, end in device_records(db, names, session[0], session[1]):
         pid = pid_of(gpid)
         device_by_corr[(pid, corr)] = device_by_corr.get((pid, corr), []) + [(start, end)]
@@ -210,6 +221,11 @@ def main() -> None:
                 break
             else:
                 launched.extend(device_by_corr.get((pid, corr), ()))
+                if text in kernel_spans and (pid, corr) in kernel_name:
+                    name, duration = kernel_name[(pid, corr)]
+                    kernels_inside[(stages.get(pid, pid), text)][name].append(duration)
+                else:
+                    pass
                 cuda += min(call_end, end) - call_start
                 if text in call_spans:
                     calls_inside[(stages.get(pid, pid), text)][call_name].append(min(call_end, end) - call_start)
@@ -275,6 +291,13 @@ def main() -> None:
                       f" other {statistics.median(r[4] / 1e6 for r in records):7.3f}")
     else:
         pass
+
+    for (stage, text), by_kernel in sorted(kernels_inside.items(), key=str):
+        total = sum(len(durations) for durations in by_kernel.values())
+        print(f"\nF. kernels launched inside {text} [{stage}]: {total} launches; name, count, device total ms, p50 us")
+        for name, durations in sorted(by_kernel.items(), key=lambda item: -len(item[1]))[:25]:
+            print(f"    {name[:60]:60s} n {len(durations):7d} total {sum(durations) / 1e6:8.1f} "
+                  f"p50 {statistics.median(durations) / 1e3:8.1f}")
 
     for (stage, text), by_call in sorted(calls_inside.items(), key=str):
         print(f"\nE. CUDA calls inside {text} [{stage}]: call, count, total ms, p50 ms, max ms")
