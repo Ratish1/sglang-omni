@@ -41,8 +41,13 @@ def patch(module):
     from sglang_omni.models.qwen3_omni.talker_model_runner import QwenTalkerModelRunner
 
     scheduler_cls = module.QwenTalkerScheduler
-    ready_original = scheduler_cls.is_batch_ready_to_run
     state = GateState()
+    if "update_running_batch" in scheduler_cls.__dict__:
+        patch_per_row(scheduler_cls, state)
+        return
+    else:
+        pass
+    ready_original = scheduler_cls.is_batch_ready_to_run
 
     def is_batch_ready_to_run(self, batch):
         ready = ready_original(self, batch)
@@ -92,6 +97,56 @@ def patch(module):
         return ready
 
     scheduler_cls.is_batch_ready_to_run = is_batch_ready_to_run
+
+
+def print_state(state, now):
+    if now - state.last_print >= PRINT_INTERVAL_S:
+        state.last_print = now
+        values = " ".join(f"{field}={state.counts[field]:.6g}" for field in FIELDS)
+        print(
+            f"GATEPROBE wall={time.time():.3f} pid={os.getpid()} {values}",
+            file=sys.stderr,
+            flush=True,
+        )
+    else:
+        pass
+
+
+def patch_per_row(scheduler_cls, state):
+    """The per-row branch: update_running_batch returns the ready rows (the rest held) or None when every row
+    waits. A None is a deferred iteration over all its rows; a step that held rows counts them as unready rows.
+    """
+    update_original = scheduler_cls.update_running_batch
+
+    def update_running_batch(self, batch):
+        rows = len(batch.reqs)
+        result = update_original(self, batch)
+        now = time.perf_counter()
+        counts = state.counts
+        if result is None or result.is_empty():
+            counts["deferred"] += 1
+            counts["rows_deferred"] += rows
+            counts["unready_rows"] += rows
+            if state.gate_started is None:
+                state.gate_started = now
+                counts["episodes"] += 1
+                counts["episode_rows"] += rows
+                counts["episode_unready"] += rows
+            else:
+                pass
+        else:
+            counts["decode_steps"] += 1
+            counts["rows_run"] += len(result.reqs)
+            counts["unready_rows"] += rows - len(result.reqs)
+            if state.gate_started is not None:
+                counts["gated_s"] += now - state.gate_started
+                state.gate_started = None
+            else:
+                pass
+        print_state(state, now)
+        return result
+
+    scheduler_cls.update_running_batch = update_running_batch
 
 
 class PatchOnImport(importlib.abc.MetaPathFinder):
