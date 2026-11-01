@@ -8,7 +8,8 @@ start of the next. Per interval:
   rows     the first step's batch size
   ext      EXTEND steps (talker prefill) inside the interval, and their forward wall
   fwd      the decode forward's own wall
-  sched    the talker scheduler thread's top-level scheduler.* spans inside the interval, by name
+  sched    the talker scheduler thread's top-level scheduler.* spans inside the interval, by name, and inside them
+           omni.sample, omni.finalize and omni.before_decode (run_batch holds these)
   talker   the talker process's device busy inside the interval (code2wav included, it shares the process)
   thinker  the other processes' device busy inside the interval
   free     the card idle inside the interval
@@ -34,6 +35,7 @@ from span_table import (
     tables,
 )
 
+INNER = ("omni.sample", "omni.finalize", "omni.before_decode")
 STEP = re.compile(r"omni\.forward step\[(\w+) bs=(\d+)")
 
 
@@ -85,11 +87,20 @@ def main() -> None:
             continue
         elif match := STEP.match(text):
             steps.append((start, end, match[1], int(match[2])))
-        elif text.startswith("scheduler."):
+        elif text.startswith("scheduler.") or text in INNER:
             sched[text].append((start, end))
         else:
             pass
     steps.sort()
+    # note (ratish): a step opens omni.forward around the custom forward and again around the standard forward
+    # when the custom one returns nothing, so back-to-back spans of one mode are one step
+    joined = []
+    for step in steps:
+        if joined and joined[-1][2] == step[2] and step[0] - joined[-1][1] < 1_000_000:
+            joined[-1] = (joined[-1][0], step[1], step[2], max(joined[-1][3], step[3]))
+        else:
+            joined.append(step)
+    steps = joined
     sched = {name: sorted(spans) for name, spans in sched.items()}
     # note (ratish): scheduler.run_batch nests run_batch_launch and the rest, so only spans no other span holds count
     outer = {
@@ -103,6 +114,7 @@ def main() -> None:
             "scheduler.run_batch",
             "scheduler.process_batch_result",
             "scheduler.sleep_during_idle",
+            *INNER,
         )
     }
 
