@@ -333,15 +333,18 @@ class QwenTalkerModelRunner(ModelRunner["SGLangARRequestData"]):
         return False
 
     def unready_decode_rows(self, schedule_batch: ScheduleBatch) -> list[int]:
-        """Rows whose next decode input has not arrived; none while feedback is off."""
+        """Unfinished rows whose next decode input has not arrived; none while feedback is off."""
         if not self.feedback_enabled:
             return []
         else:
             pass
+        # note (ratish): a finished row has released its request data and leaves through
+        # the decode update's own filter, so it never waits.
         return [
             row
             for row, request in enumerate(schedule_batch.reqs)
-            if not self.data_has_next_decode_input(
+            if not request.finished()
+            and not self.data_has_next_decode_input(
                 getattr(request, "omni_data", None)
             )  # noqa: leading-underscore  # upstream spelling, or the public name is already taken
         ]

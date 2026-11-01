@@ -1206,10 +1206,11 @@ def make_talker_decode_batch(next_input_ready: list[bool]) -> ScheduleBatch:
 def test_talker_decodes_ready_rows_and_holds_rows_waiting_for_text(
     monkeypatch,
 ) -> None:
-    """A row waiting for its next thinker text row held every other row's decode step."""
+    """A row waiting for its next thinker text row held every other row's decode step, and a finished row must never wait."""
     decoded_rows: list[list[str]] = []
 
     def prepare_decode(scheduler, batch):
+        batch.filter_batch()
         decoded_rows.append([request.rid for request in batch.reqs])
         batch.prepare_for_decode()
         return batch
@@ -1228,17 +1229,25 @@ def test_talker_decodes_ready_rows_and_holds_rows_waiting_for_text(
     scheduler = object.__new__(QwenTalkerScheduler)
     scheduler.model_runner = runner
 
+    finishing = make_talker_decode_batch([True, False])
+    finishing.reqs[1].finished = lambda: True
+    finishing.reqs[1].omni_data = None
     waiting = make_talker_decode_batch([False, False])
-    scheduler.running_batch = waiting
     with get_context().override_server_args():
+        scheduler.running_batch = finishing
+        scheduler.update_running_batch(finishing)
+        assert decoded_rows == [["request-0"]]
+        assert scheduler.held_decode_batch is None
+
+        scheduler.running_batch = waiting
         assert scheduler.update_running_batch(waiting) is None
-        assert decoded_rows == []
+        assert decoded_rows == [["request-0"]]
         assert torch.equal(waiting.seq_lens, torch.tensor([4, 4]))
 
         batch = make_talker_decode_batch([True, False, True])
         scheduler.running_batch = batch
         decode_batch = scheduler.update_running_batch(batch)
-        assert decoded_rows == [["request-0", "request-2"]]
+        assert decoded_rows[-1] == ["request-0", "request-2"]
         assert [request.rid for request in decode_batch.reqs] == [
             "request-0",
             "request-2",
