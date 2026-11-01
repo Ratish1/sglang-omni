@@ -23,6 +23,7 @@ from sglang_omni.model_runner.prefill_inputs import (
 )
 from sglang_omni.model_runner.sglang_execution import SGLangExecutionBridge
 from sglang_omni.platforms import current_platform
+from sglang_omni.profiler.spans import span, step_span
 from sglang_omni.sampling.seed import (
     SAMPLING_SEED_MASK,
     derive_sampling_seed,
@@ -426,7 +427,8 @@ class ModelRunner(Generic[RequestDataInput]):
         else:
             pass
         with self.execution_context(schedule_batch, isolate_sampling=True):
-            built = self.build_forward_batch(scheduler_output)
+            with span("omni.build_forward_batch"):
+                built = self.build_forward_batch(scheduler_output)
             if built is None:
                 return ModelRunnerOutput(outputs={}, req_ids=[], req_id_to_index={})
             else:
@@ -436,37 +438,41 @@ class ModelRunner(Generic[RequestDataInput]):
                 forward_batch, schedule_batch, scheduler_output.requests, is_prefill
             )
             if is_prefill:
-                self.post_prefill(
-                    batch_result,
-                    forward_batch,
-                    schedule_batch,
-                    scheduler_output.requests,
-                )
+                with span("omni.post_prefill"):
+                    self.post_prefill(
+                        batch_result,
+                        forward_batch,
+                        schedule_batch,
+                        scheduler_output.requests,
+                    )
             else:
-                self.post_decode(
+                with span("omni.post_decode"):
+                    self.post_decode(
+                        batch_result,
+                        forward_batch,
+                        schedule_batch,
+                        scheduler_output.requests,
+                    )
+            with span("omni.publish_next_tokens"):
+                self.ensure_next_token_ids(
+                    batch_result,
+                    forward_batch,
+                    schedule_batch,
+                    scheduler_output,
+                )
+                self.publish_next_tokens(
                     batch_result,
                     forward_batch,
                     schedule_batch,
                     scheduler_output.requests,
                 )
-            self.ensure_next_token_ids(
+        with span("omni.finalize"):
+            return self.finalize(
                 batch_result,
                 forward_batch,
                 schedule_batch,
                 scheduler_output,
             )
-            self.publish_next_tokens(
-                batch_result,
-                forward_batch,
-                schedule_batch,
-                scheduler_output.requests,
-            )
-        return self.finalize(
-            batch_result,
-            forward_batch,
-            schedule_batch,
-            scheduler_output,
-        )
 
     def execute_launch(self, scheduler_output: SchedulerOutput) -> "PendingStep | None":
         """Enqueue a decode or supported whole-prompt prefill step, call
@@ -490,7 +496,8 @@ class ModelRunner(Generic[RequestDataInput]):
         else:
             pass
         with self.execution_context(schedule_batch, isolate_sampling=True):
-            built = self.build_forward_batch(scheduler_output)
+            with span("omni.build_forward_batch"):
+                built = self.build_forward_batch(scheduler_output)
             if built is None:
                 return None
             else:
@@ -504,29 +511,32 @@ class ModelRunner(Generic[RequestDataInput]):
                 is_lookahead=True,
             )
             if is_prefill:
-                self.post_prefill(
+                with span("omni.post_prefill"):
+                    self.post_prefill(
+                        batch_result,
+                        forward_batch,
+                        schedule_batch,
+                        scheduler_output.requests,
+                    )
+            else:
+                pass
+            with span("omni.post_decode_launch"):
+                launch_buf = self.post_decode_launch(
+                    batch_result, forward_batch, scheduler_output.requests
+                )
+            with span("omni.publish_next_tokens"):
+                self.ensure_next_token_ids(
+                    batch_result,
+                    forward_batch,
+                    schedule_batch,
+                    scheduler_output,
+                )
+                self.publish_next_tokens(
                     batch_result,
                     forward_batch,
                     schedule_batch,
                     scheduler_output.requests,
                 )
-            else:
-                pass
-            launch_buf = self.post_decode_launch(
-                batch_result, forward_batch, scheduler_output.requests
-            )
-            self.ensure_next_token_ids(
-                batch_result,
-                forward_batch,
-                schedule_batch,
-                scheduler_output,
-            )
-            self.publish_next_tokens(
-                batch_result,
-                forward_batch,
-                schedule_batch,
-                scheduler_output.requests,
-            )
             event = self.execution_bridge.record_completion()
             # Never retain the mutable live ScheduleBatch across a lookahead
             # iteration. The upstream overlap loop likewise queues batch.copy().
@@ -560,7 +570,8 @@ class ModelRunner(Generic[RequestDataInput]):
         if pending.event.query():
             self.async_query_hit += 1
         else:
-            pending.event.synchronize()
+            with span("omni.resolve_synchronize"):
+                pending.event.synchronize()
             self.async_query_miss += 1
         # Skip reqs finished or retracted in a prior (lagged) step so _finalize
         # neither re-emits nor re-frees their KV (mirrors _resolve_and_process).
@@ -569,20 +580,22 @@ class ModelRunner(Generic[RequestDataInput]):
             for req in pending.scheduler_output.requests
             if req.data.req.finished() or self.req_is_retracted(req.data.req)
         }
-        self.post_decode_resolve(
-            pending.launch_buf,
-            pending.batch_result,
-            pending.forward_batch,
-            pending.schedule_batch,
-            pending.scheduler_output.requests,
-        )
-        return self.finalize(
-            pending.batch_result,
-            pending.forward_batch,
-            pending.schedule_batch,
-            pending.scheduler_output,
-            skip_rids=skip_rids,
-        )
+        with span("omni.post_decode_resolve"):
+            self.post_decode_resolve(
+                pending.launch_buf,
+                pending.batch_result,
+                pending.forward_batch,
+                pending.schedule_batch,
+                pending.scheduler_output.requests,
+            )
+        with span("omni.finalize"):
+            return self.finalize(
+                pending.batch_result,
+                pending.forward_batch,
+                pending.schedule_batch,
+                pending.scheduler_output,
+                skip_rids=skip_rids,
+            )
 
     def build_forward_batch(
         self, scheduler_output: SchedulerOutput
@@ -646,22 +659,29 @@ class ModelRunner(Generic[RequestDataInput]):
         try:
             if is_prefill:
                 self.retained_prefill_input_embeds = None
-                self.before_prefill(forward_batch, schedule_batch, requests)
-                batch_result = self.custom_prefill_forward(
-                    forward_batch, schedule_batch, requests
-                )
+                with span("omni.before_prefill"):
+                    self.before_prefill(forward_batch, schedule_batch, requests)
+                with step_span("omni.forward", forward_batch):
+                    batch_result = self.custom_prefill_forward(
+                        forward_batch, schedule_batch, requests
+                    )
             else:
-                self.before_decode(
-                    forward_batch,
-                    schedule_batch,
-                    requests,
-                    is_lookahead=is_lookahead,
-                )
-                batch_result = self.custom_decode_forward(
-                    forward_batch, schedule_batch, requests
-                )
+                with span("omni.before_decode"):
+                    self.before_decode(
+                        forward_batch,
+                        schedule_batch,
+                        requests,
+                        is_lookahead=is_lookahead,
+                    )
+                with step_span("omni.forward", forward_batch):
+                    batch_result = self.custom_decode_forward(
+                        forward_batch, schedule_batch, requests
+                    )
             if batch_result is None:
-                batch_result = self.tp_worker.forward_batch_generation(forward_batch)
+                with step_span("omni.forward", forward_batch):
+                    batch_result = self.tp_worker.forward_batch_generation(
+                        forward_batch
+                    )
             else:
                 pass
 
@@ -678,12 +698,13 @@ class ModelRunner(Generic[RequestDataInput]):
                     )
                 )
             ):
-                batch_result.next_token_ids = self.sample_next_token_ids(
-                    batch_result.logits_output,
-                    forward_batch,
-                    schedule_batch,
-                    requests,
-                )
+                with span("omni.sample"):
+                    batch_result.next_token_ids = self.sample_next_token_ids(
+                        batch_result.logits_output,
+                        forward_batch,
+                        schedule_batch,
+                        requests,
+                    )
             else:
                 pass
             # The sidecar stays attached until cleanup, so a prefill that got this far
