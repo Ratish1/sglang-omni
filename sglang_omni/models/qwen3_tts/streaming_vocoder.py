@@ -16,6 +16,7 @@ from typing import TYPE_CHECKING, Literal, Mapping, TypedDict, TypeVar, overload
 
 import numpy as np
 import torch
+from sglang.srt.model_executor.runner.base_cuda_graph_runner import freeze_gc
 
 from sglang_omni.models.qwen3_tts.codec_state_arena import (
     CodecStateStats,
@@ -1339,24 +1340,27 @@ class Qwen3TTSStreamingVocoderScheduler(
             return
         else:
             pass
-        self.initial_decode_graphs.capture()
-        for holder in self.followup_graph_holders:
-            holder.capture()
-        for holder in self.followup_incremental_graph_holders:
-            holder.capture()
-        if self.initial_incremental_decode_graphs is not None:
-            self.initial_incremental_decode_graphs.capture()
-        else:
-            pass
-        if self.initial_window_decode_graphs is not None:
-            self.initial_window_decode_graphs.capture()
-        else:
-            pass
-        if self.initial_tail_decode_graphs is not None:
-            self.initial_tail_decode_graphs.capture()
-        else:
-            pass
-        self.full_decode_graphs.capture()
+        # note (ratish): one collection before and one after every capture, as SGLang's graph
+        # runners take them, so the per-runner and compile-time collections walk only new objects.
+        with freeze_gc(enable_cudagraph_gc=False):
+            self.initial_decode_graphs.capture()
+            for holder in self.followup_graph_holders:
+                holder.capture()
+            for holder in self.followup_incremental_graph_holders:
+                holder.capture()
+            if self.initial_incremental_decode_graphs is not None:
+                self.initial_incremental_decode_graphs.capture()
+            else:
+                pass
+            if self.initial_window_decode_graphs is not None:
+                self.initial_window_decode_graphs.capture()
+            else:
+                pass
+            if self.initial_tail_decode_graphs is not None:
+                self.initial_tail_decode_graphs.capture()
+            else:
+                pass
+            self.full_decode_graphs.capture()
 
     def on_serving_start(self) -> None:
         # note (Haoling Pu): decode workers are plain threads without the stage binding.
