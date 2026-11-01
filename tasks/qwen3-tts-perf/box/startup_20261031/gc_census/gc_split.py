@@ -35,8 +35,11 @@ def read(path):
         if line.startswith("#"):
             header = line[2:]
         else:
-            moment, generation, seconds, collected, young_count, young_seconds = line.split("\t")
-            rows.append((float(moment), int(generation), float(seconds), int(collected), int(young_count), float(young_seconds)))
+            fields = line.split("\t")
+            moment, generation, seconds, collected, young_count, young_seconds = fields[:6]
+            trigger = fields[6] if len(fields) > 6 else ""
+            rows.append((float(moment), int(generation), float(seconds), int(collected), int(young_count),
+                         float(young_seconds), trigger))
     return header, rows
 
 
@@ -57,6 +60,9 @@ def summarize(name, rows, bounds):
     old = [row for row in rows if row[1] == 2]
     print(f"total | {len(old)} | {sum(row[2] for row in old):.2f} | | {sum(row[1] == 1 for row in rows)} | "
           f"{sum(row[2] for row in rows if row[1] == 1):.2f} | {max((row[5] for row in rows), default=0):.2f}")
+    for row in old:
+        phase = next((name for (_, began), (name, ended) in zip(bounds, bounds[1:]) if began <= row[0] < ended), "after")
+        print(f"  gen2 {phase} {row[2]:.2f} s: {row[6][:400]}")
 
 
 def main():
