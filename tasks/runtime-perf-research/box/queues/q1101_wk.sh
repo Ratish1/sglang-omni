@@ -42,12 +42,11 @@ pair() {
   boot $b $tb 1 $p1 omni_colocated "$@" &
   wait
 }
-SPEECH="--loads 64,16 --passes warm,clean"
-VIDEO="--bench videomme --loads 16 --passes clean"
-pair wk_m1 $MAIN wk_w1 $WK $SPEECH
-pair wk_w2 $WK wk_m2 $MAIN $SPEECH
-pair wv_m1 $MAIN wv_w1 $WK $VIDEO
-pair wv_w2 $WK wv_m2 $MAIN $VIDEO
+CONTEXT_32K="--preprocessing.factory.max_seq_len 32768 --thinker.factory.max_seq_len 32768"
+pair wk_m1 $MAIN wk_w1 $WK --loads 64,16 --passes warm,clean
+pair wk_w2 $WK wk_m2 $MAIN --loads 64,16 --passes warm,clean
+pair wv_m1 $MAIN wv_w1 $WK --bench videomme --loads 16 --passes clean --serve-extra "$CONTEXT_32K"
+pair wv_w2 $WK wv_m2 $MAIN --bench videomme --loads 16 --passes clean --serve-extra "$CONTEXT_32K"
 for arm in sd_m1:$MAIN sd_p1:$P3 sd_p2:$P3 sd_m2:$MAIN; do
   rm -rf $O/${arm%%:*}
   boot ${arm%%:*} ${arm#*:} 0 $(freeport 24000) omni_speech --loads 64,16 --passes warm,clean
