@@ -17,6 +17,7 @@ from sglang.srt.runtime_context import get_context, get_schedule
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import add_prefix
+from sglang.srt.utils.common import async_h2d
 from torch import nn
 
 from sglang_omni.models.qwen3_omni.components.thinker_model import (
@@ -1062,7 +1063,13 @@ class Qwen3OmniTalker(nn.Module):
 
         rep_rows = self.decode_prep_rep_rows
         if rep_rows is not None:
-            self.repetition_mask[rep_rows, self.sampled_token_ids[rep_rows]] = True
+            # note (ratish): index_fill_ takes its value as a kernel argument, where an indexed assignment of a Python scalar copies it to the device and waits.
+            self.repetition_mask.view(-1).index_fill_(
+                0,
+                rep_rows * self.repetition_mask.shape[1]
+                + self.sampled_token_ids[rep_rows],
+                True,
+            )
         else:
             pass
         for row_idx in range(len(prev_lens)):
@@ -1219,22 +1226,48 @@ class Qwen3OmniTalker(nn.Module):
         self.sampling_top_ks[:batch_size].copy_(staging_gpu[4, :batch_size])
         self.sampling_seeds[:batch_size].copy_(staging_gpu[5, :batch_size])
 
+        rep_active_rows = [
+            row_idx for row_idx, penalty in enumerate(rep_penalties) if penalty != 1.0
+        ]
+        partial_suppress_rows = [
+            suppress_rows
+            for _, suppress_rows in suppress_groups.values()
+            if len(suppress_rows) != batch_size
+        ]
+        index_lists = [rep_rows, rep_toks, rep_active_rows, *partial_suppress_rows]
+        # note (ratish): every index crosses in one copy from pinned memory, so the prepare never waits on the talker's stream, which the card can share with other stages.
+        indices = async_h2d(
+            [index for index_list in index_lists for index in index_list],
+            dtype=torch.long,
+            device=device,
+        )
+        (
+            rep_row_index,
+            rep_token_index,
+            rep_active_index,
+            *partial_suppress_index,
+        ) = indices.split([len(index_list) for index_list in index_lists])
+
         if rep_rows:
-            rep_pairs = torch.tensor(
-                rep_rows + rep_toks, dtype=torch.long, device=device
+            self.repetition_mask.view(-1).index_fill_(
+                0, rep_row_index * rep_vocab + rep_token_index, True
             )
-            self.repetition_mask[
-                rep_pairs[: len(rep_rows)], rep_pairs[len(rep_rows) :]
-            ] = True
         else:
             pass
 
+        partial_suppress_indices = iter(partial_suppress_index)
         for suppress_token_ids, suppress_rows in suppress_groups.values():
             if len(suppress_rows) == batch_size:
                 self.suppress_mask[:batch_size].index_fill_(1, suppress_token_ids, True)
             else:
-                row_ids = torch.tensor(suppress_rows, dtype=torch.long, device=device)
-                self.suppress_mask[row_ids[:, None], suppress_token_ids[None, :]] = True
+                row_ids = next(partial_suppress_indices)
+                self.suppress_mask.view(-1).index_fill_(
+                    0,
+                    (row_ids[:, None] * sup_vocab + suppress_token_ids[None, :]).view(
+                        -1
+                    ),
+                    True,
+                )
         self.suppress_token_ids_by_request = suppress_token_ids_by_request
 
         self.decode_prep_rids = [sched_req.data.req.rid for sched_req in requests]
@@ -1242,14 +1275,7 @@ class Qwen3OmniTalker(nn.Module):
             len(sched_req.data.req.output_ids) if sched_req.data.req.output_ids else 0
             for sched_req in requests
         ]
-        rep_active_rows = [
-            row_idx for row_idx, penalty in enumerate(rep_penalties) if penalty != 1.0
-        ]
-        self.decode_prep_rep_rows = (
-            torch.tensor(rep_active_rows, dtype=torch.long, device=device)
-            if rep_active_rows
-            else None
-        )
+        self.decode_prep_rep_rows = rep_active_index if rep_active_rows else None
 
     def prepare_input_embeds(
         self,
@@ -1800,6 +1826,27 @@ class Qwen3OmniTalker(nn.Module):
                 positions=positions,
                 k_cache=self.predictor_k_cache,
                 v_cache=self.predictor_v_cache,
+            )
+        elif fused is not None:
+            # note (ratish): a pass past the fused rows runs fused over row groups, so a
+            # row's values do not depend on how many requests share its talker step.
+            group_size = fused.max_rows // seq_len
+            return torch.cat(
+                [
+                    fused.forward(
+                        layers=self.code_predictor.model.layers,
+                        final_norm=self.code_predictor.model.norm,
+                        token_embeds=token_embeds[start : start + group_size],
+                        batch_size=min(group_size, batch_size - start),
+                        cache_len=cache_len,
+                        positions=positions[
+                            start * seq_len : (start + group_size) * seq_len
+                        ],
+                        k_cache=self.predictor_k_cache[:, start:],
+                        v_cache=self.predictor_v_cache[:, start:],
+                    )
+                    for start in range(0, batch_size, group_size)
+                ]
             )
         else:
             pass

@@ -17,6 +17,7 @@ from torch import nn
 from torch._dynamo.utils import counters
 
 import sglang_omni.models.qwen3_omni.components.talker as talker_module
+import sglang_omni.models.qwen3_omni.components.talker_prefill as talker_prefill_module
 from sglang_omni.model_runner.prefill_inputs import get_omni_prefill_inputs
 from sglang_omni.model_runner.thinker_model_runner import ThinkerModelRunner
 from sglang_omni.models.qwen3_omni.components.talker import (
@@ -34,6 +35,7 @@ from sglang_omni.models.qwen3_omni.talker_scheduler import (
     QwenTalkerScheduler,
     configure_talker_server_args,
 )
+from sglang_omni.pipeline.stage.stream_queue import StreamItem
 from sglang_omni.proto.request import OmniRequest, StagePayload
 from sglang_omni.scheduling.message import IncomingMessage
 from sglang_omni.scheduling.omni_scheduler import OmniScheduler
@@ -509,6 +511,100 @@ def test_qwen_talker_projects_each_assistant_token_id_once() -> None:
     assert len(projected_rows) == 3
 
 
+def prompt_prefill_builder(device: torch.device) -> TalkerPrefillBuilder:
+    builder = object.__new__(TalkerPrefillBuilder)
+    builder.model = SimpleNamespace(
+        text_projection=lambda rows: rows * 2.0 + 1.0,
+        hidden_projection=lambda rows: rows * 3.0,
+        get_input_embeddings=lambda: (
+            lambda token_ids: token_ids.to(torch.float32)[:, None].expand(-1, 4)
+        ),
+    )
+    builder.model_path = "model"
+    builder.audio_token_id, builder.image_token_id, builder.video_token_id = (
+        6,
+        None,
+        None,
+    )
+    builder.tts_bos_token_id, builder.tts_eos_token_id = 7, 8
+    builder.tts_pad_token_id = 9
+    builder.im_start_token_id, builder.im_end_token_id = 1, 5
+    builder.system_token_id, builder.user_token_id = 2, 3
+    builder.assistant_token_id = 4
+    builder.codec_nothink_id, builder.codec_think_bos_id = 10, 11
+    builder.codec_think_eos_id, builder.codec_pad_id = 12, 13
+    builder.codec_bos_id = 14
+    builder.speaker_map = {"ethan": 15}
+    builder.device = device
+    builder.dtype = torch.float32
+    builder.thinker_embed_cache = {}
+    builder.projected_text_cache = {}
+    builder.tts_special_cache = None
+    return builder
+
+
+def prompt_prefill_chunks(token_ids: list[int]) -> list[StreamItem]:
+    return [
+        StreamItem(
+            chunk_id=index,
+            data=torch.arange(12, dtype=torch.float32).reshape(3, 4) + token_id,
+            from_stage="thinker",
+            metadata={"token_id": token_id, "prompt_hidden_positions": [8, 9, 10]},
+        )
+        for index, token_id in enumerate(token_ids)
+    ]
+
+
+@pytest.mark.accelerator
+@pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="stream synchronization requires CUDA"
+)
+def test_talker_prompt_prefill_build_does_not_synchronize(monkeypatch) -> None:
+    """Building a talker request waited for the talker's stream at every host read and blocking copy."""
+    monkeypatch.setattr(
+        talker_prefill_module,
+        "load_thinker_embedding_rows",
+        lambda model_path, row_ids: torch.tensor(row_ids, dtype=torch.float32)[
+            :, None
+        ].repeat(1, 4),
+    )
+    payload = StagePayload(
+        request_id="request",
+        request=OmniRequest(inputs="hi"),
+        data={
+            "prompt": {
+                "input_ids": torch.tensor(
+                    [1, 2, 20, 21, 5, 1, 3, 22, 6, 6, 6, 23, 5, 1, 4]
+                )
+            },
+            "thinker_inputs": {},
+        },
+    )
+    expected = prompt_prefill_builder(torch.device("cpu")).build_prompt_prefill(
+        payload, prompt_prefill_chunks([24, 25, 26, 27]), thinker_done=True
+    )
+    builder = prompt_prefill_builder(torch.device("cuda"))
+    builder.build_prompt_prefill(
+        payload, prompt_prefill_chunks([30, 31, 32]), thinker_done=True
+    )
+    torch.cuda.synchronize()
+
+    torch.cuda.set_sync_debug_mode("error")
+    try:
+        built = builder.build_prompt_prefill(
+            payload, prompt_prefill_chunks([24, 25, 26, 27]), thinker_done=True
+        )
+    finally:
+        torch.cuda.set_sync_debug_mode("default")
+
+    assert torch.equal(built["input_embeds"].cpu(), expected["input_embeds"])
+    assert torch.equal(built["input_ids"], expected["input_ids"])
+    assert torch.equal(
+        torch.stack(list(built["pending_text_queue"])).cpu(),
+        torch.stack(list(expected["pending_text_queue"])),
+    )
+
+
 def test_qwen_code_predictor_keeps_4d_logits_token_shape() -> None:
     """Preserves 4D code-predictor logits as a two-dimensional token tensor."""
     logits = torch.tensor(
@@ -967,6 +1063,55 @@ def test_a_finished_reply_without_spoken_tokens_is_not_generated() -> None:
     assert scheduler.complete_without_generation(one_token, None) is None
     unfinished = make_payload(prefetched_chunks=[thinker_token(5)])
     assert scheduler.complete_without_generation(unfinished, None) is None
+
+
+@pytest.mark.parametrize(
+    ("waiting_queue", "row_states", "mixes"),
+    [
+        (["new"], [(True, True, False)], True),
+        (["new"], [(True, True, False), (True, False, False)], False),
+        (["new"], [(True, True, False), (False, False, True)], True),
+        (["new"], [], False),
+        ([], [(True, True, False)], False),
+    ],
+)
+def test_an_admission_mixes_running_rows_only_when_each_live_row_has_its_next_input(
+    monkeypatch: pytest.MonkeyPatch,
+    waiting_queue: list[str],
+    row_states: list[tuple[bool, bool, bool]],
+    mixes: bool,
+) -> None:
+    seen_mix_settings: list[bool] = []
+    monkeypatch.setattr(
+        OmniScheduler,
+        "get_new_batch_prefill",
+        lambda self, running_batch: seen_mix_settings.append(self.is_mixed_chunk),
+    )
+    runner = object.__new__(QwenTalkerModelRunner)
+    runner.feedback_enabled = True
+    scheduler = object.__new__(QwenTalkerScheduler)
+    scheduler.is_mixed_chunk = False
+    scheduler.waiting_queue = waiting_queue
+    scheduler.model_runner = runner
+    rows = [
+        SimpleNamespace(
+            finished=lambda finished=finished: finished,
+            omni_data=SimpleNamespace(
+                pending_feedback_queue=deque([torch.zeros(2)] if has_feedback else []),
+                pending_text_queue=deque([torch.zeros(2)] if has_text else []),
+                thinker_chunks_done=False,
+                tts_pad_embed=None,
+            ),
+        )
+        for has_feedback, has_text, finished in row_states
+    ]
+
+    scheduler.get_new_batch_prefill(
+        SimpleNamespace(reqs=rows, is_empty=lambda: not rows)
+    )
+
+    assert seen_mix_settings == [mixes]
+    assert scheduler.is_mixed_chunk is False
 
 
 def test_partial_disabled_preserves_legacy_path() -> None:
@@ -2605,6 +2750,39 @@ def test_talker_prepare_decode_buffers_cuda_matches_fresh_rebuild() -> None:
         "suppress_mask",
     ):
         torch.testing.assert_close(getattr(fake, name), getattr(fresh, name))
+
+
+@pytest.mark.accelerator
+@pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="stream synchronization requires CUDA"
+)
+def test_talker_prepare_decode_buffers_does_not_synchronize() -> None:
+    device = torch.device("cuda")
+    fake = talker_seed_self(device=device)
+    requests = [
+        talker_prep_req(request_id, penalty=1.5, output_ids=[2], suppress=[3])
+        for request_id in ("a", "b", "c")
+    ]
+    Qwen3OmniTalker.prepare_decode_buffers(fake, requests)
+    fake.sampled_token_ids[:3] = torch.tensor([4, 5, 6], device=device)
+    for sched_req, token_id in zip(requests, (4, 5, 6)):
+        sched_req.data.req.output_ids.append(token_id)
+    torch.cuda.synchronize(device)
+
+    torch.cuda.set_sync_debug_mode("error")
+    try:
+        Qwen3OmniTalker.prepare_decode_buffers(fake, requests)
+        for sched_req in requests:
+            sched_req.data.req.output_ids.append(7)
+        Qwen3OmniTalker.prepare_decode_buffers(fake, [requests[0], requests[2]])
+    finally:
+        torch.cuda.set_sync_debug_mode("default")
+
+    fresh = talker_seed_self(device=device)
+    Qwen3OmniTalker.prepare_decode_buffers(fresh, [requests[0], requests[2]])
+    torch.cuda.synchronize(device)
+    for name in ("repetition_mask", "suppress_mask", "sampling_seeds"):
+        assert torch.equal(getattr(fake, name)[:2], getattr(fresh, name)[:2]), name
 
 
 def test_talker_prepare_decode_buffers_rebuild_triggers() -> None:
