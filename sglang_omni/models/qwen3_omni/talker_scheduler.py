@@ -8,6 +8,10 @@ from collections import deque
 from dataclasses import replace
 
 from sglang.srt.managers.schedule_batch import ScheduleBatch
+from sglang.srt.observability.scheduler_stage_metrics import (
+    SCHEDULER_STAGE_GET_NEXT_BATCH,
+    scheduler_stage_method,
+)
 from sglang.srt.server_args import ServerArgs
 from typing_extensions import Unpack
 
@@ -186,6 +190,7 @@ class QwenTalkerScheduler(OmniScheduler[SGLangARRequestData]):
             len(getattr(batch, "reqs", ()) or ()),
         )
 
+    @scheduler_stage_method(SCHEDULER_STAGE_GET_NEXT_BATCH)
     def get_next_batch_to_run(self) -> ScheduleBatch | None:
         batch = super().get_next_batch_to_run()
         if batch is not None and (not self.is_batch_ready_to_run(batch)):

@@ -57,6 +57,15 @@ from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.mem_cache.common import release_kv_cache
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool, ReqToTokenPool
+from sglang.srt.observability.scheduler_stage_metrics import (
+    SCHEDULER_STAGE_GET_NEXT_BATCH,
+    SCHEDULER_STAGE_IDLE,
+    SCHEDULER_STAGE_PROCESS_BATCH_RESULT,
+    SCHEDULER_STAGE_PROCESS_REQUESTS,
+    SCHEDULER_STAGE_RECV_REQUESTS,
+    SCHEDULER_STAGE_RUN_BATCH,
+    scheduler_stage_method,
+)
 from sglang.srt.runtime_context import get_model, get_parallel, get_serving, get_spec
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.session.session_controller import SessionController
@@ -84,6 +93,7 @@ from sglang_omni.profiler.event_recorder import (
     emit_model_path_start as _emit_model_path_start,
 )
 from sglang_omni.profiler.event_recorder import get_active_stage as _get_active_stage
+from sglang_omni.profiler.spans import span
 from sglang_omni.proto.admin import (
     ADMIN_CONTINUE_GENERATION,
     ADMIN_DESTROY_WEIGHTS_UPDATE_GROUP,
@@ -1085,6 +1095,7 @@ class OmniScheduler(Generic[RequestDataT]):
             pass
         return tuple(timeout_aborts)
 
+    @scheduler_stage_method(SCHEDULER_STAGE_RECV_REQUESTS)
     def recv_requests(self) -> list[StagePayload]:
         """Drain inbox on rank 0 and broadcast scheduler inputs to TP followers."""
         if self.is_entry_rank:
@@ -1261,6 +1272,7 @@ class OmniScheduler(Generic[RequestDataT]):
                     )
                     return False
 
+    @scheduler_stage_method(SCHEDULER_STAGE_PROCESS_REQUESTS)
     def process_input_requests(self, recv_reqs: list[StagePayload]) -> None:
         """Convert incoming payloads to SGLang Reqs and enqueue."""
         ordinary_payloads: list[StagePayload] = []
@@ -1436,6 +1448,7 @@ class OmniScheduler(Generic[RequestDataT]):
         )
         return req_data
 
+    @scheduler_stage_method(SCHEDULER_STAGE_IDLE)
     def sleep_during_idle(self) -> None:
         with self.request_admission_lock:
             request_admission_pending = bool(
@@ -2048,6 +2061,7 @@ class OmniScheduler(Generic[RequestDataT]):
             )
         )
 
+    @scheduler_stage_method(SCHEDULER_STAGE_GET_NEXT_BATCH)
     def get_next_batch_to_run(self):
         """Bridge Omni's batch-owning loops to the upstream scheduler contract.
 
@@ -2246,6 +2260,7 @@ class OmniScheduler(Generic[RequestDataT]):
         self.drain_request_build_results()
         self.drain_request_admission_results()
 
+    @scheduler_stage_method(SCHEDULER_STAGE_RUN_BATCH)
     def run_batch(self, batch, pp_proxy_tensors=None):
         try:
             return self._run_batch(batch, pp_proxy_tensors)
@@ -2257,6 +2272,7 @@ class OmniScheduler(Generic[RequestDataT]):
                 self.handle_batch_failure(batch, exc)
                 return _FAILED_BATCH_RESULT
 
+    @scheduler_stage_method(SCHEDULER_STAGE_PROCESS_BATCH_RESULT)
     def process_batch_result(self, batch, result) -> None:
         if self.enable_overlap and batch.forward_mode.is_extend():
             result.copy_done.synchronize()
@@ -2522,6 +2538,7 @@ class OmniScheduler(Generic[RequestDataT]):
             can_run_cuda_graph=mr_output.can_run_cuda_graph,
         )
 
+    @scheduler_stage_method(SCHEDULER_STAGE_RUN_BATCH)
     def run_batch_launch(self, batch):
         """Async: build SchedulerOutput and launch the decode step on the GPU
         (forward + sample, then ``post_decode_launch`` publishes the resolve
@@ -2533,6 +2550,7 @@ class OmniScheduler(Generic[RequestDataT]):
         pending_step = self.model_runner.execute_launch(sched_output)
         return sched_output, pending_step
 
+    @scheduler_stage_method(SCHEDULER_STAGE_PROCESS_BATCH_RESULT)
     def run_batch_resolve(self, batch, sched_output, pending_step, skip_rids=()):
         """Async: resolve the given launched step (wait event, host collect),
         emit its stream chunks (except overrun reqs in ``skip_rids``), and
@@ -3987,8 +4005,9 @@ class OmniScheduler(Generic[RequestDataT]):
             device_steps.append(pending_decode.device_step)
         else:
             pass
-        for launched_step in device_steps:
-            launched_step.event.synchronize()
+        with span("omni.wait_async_device"):
+            for launched_step in device_steps:
+                launched_step.event.synchronize()
 
     def resolve_and_process(
         self, batch, sched_output, pending_step, *, is_device_ready: bool = False
