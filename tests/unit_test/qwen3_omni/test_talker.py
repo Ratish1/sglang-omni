@@ -9,9 +9,22 @@ from typing import Any
 from unittest.mock import Mock
 
 import pytest
+import sglang.srt.managers.schedule_batch as schedule_batch_module
 import torch
-from sglang.srt.managers.schedule_batch import ReqKvInfo
+from sglang.srt.managers.schedule_batch import ReqKvInfo, ScheduleBatch
+from sglang.srt.managers.scheduler import Scheduler
+from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
+from sglang.srt.runtime_context import get_context
+from sglang.srt.sampling.penaltylib import (
+    BatchedFrequencyPenalizer,
+    BatchedMinNewTokensPenalizer,
+    BatchedPenalizerOrchestrator,
+    BatchedPresencePenalizer,
+    BatchedRepetitionPenalizer,
+)
 from sglang.srt.sampling.penaltylib.repetition_penalty import apply_scaling_penalties
+from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
+from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.utils import DynamicGradMode
 from torch import nn
 from torch._dynamo.utils import counters
@@ -1127,64 +1140,124 @@ def test_process_input_requests_builds_at_one_chunk_under_topology() -> None:
     assert "rid-topo" not in scheduler.deferred_request_payloads
 
 
-def chunk_gate_scheduler(*, decode_ready: bool) -> QwenTalkerScheduler:
+def make_talker_decode_batch(next_input_ready: list[bool]) -> ScheduleBatch:
+    batch = ScheduleBatch.__new__(ScheduleBatch)
+    batch.reqs = [
+        SimpleNamespace(
+            rid=f"request-{row}",
+            omni_data=SimpleNamespace(
+                pending_feedback_queue=deque([torch.zeros(1)]),
+                pending_text_queue=deque([torch.zeros(1)] if ready else []),
+                thinker_chunks_done=False,
+                tts_pad_embed=None,
+            ),
+            sampling_params=SamplingParams(repetition_penalty=1.05),
+            output_ids=[row + 1],
+            origin_input_ids=[0],
+            decode_batch_idx=0,
+            kv=ReqKvInfo(kv_committed_len=4, kv_allocated_len=4),
+            beam_group=None,
+            return_logprob=False,
+            grammar=None,
+            return_hidden_states_mode=CaptureHiddenMode.NULL,
+            finished=lambda: False,
+        )
+        for row, ready in enumerate(next_input_ready)
+    ]
+    rows = len(batch.reqs)
+    batch.model_config = SimpleNamespace(is_encoder_decoder=False)
+    batch.multimodal_inputs = None
+    batch.req_pool_indices = torch.arange(rows) + 1
+    batch.req_pool_indices_cpu = batch.req_pool_indices.clone()
+    batch.seq_lens = torch.full((rows,), 4)
+    batch.seq_lens_cpu = batch.seq_lens.clone()
+    batch.orig_seq_lens = batch.seq_lens.clone()
+    batch.input_ids = torch.tensor([request.output_ids[-1] for request in batch.reqs])
+    batch.device = "cpu"
+    batch.enable_overlap = False
+    batch.spec_algorithm = SimpleNamespace(is_none=lambda: True)
+    batch.spec_info = None
+    batch.sampling_info = SamplingBatchInfo(
+        temperatures=torch.ones(rows, 1),
+        top_ps=torch.ones(rows),
+        top_ks=torch.ones(rows, dtype=torch.int32),
+        min_ps=torch.zeros(rows),
+        is_all_greedy=False,
+        is_any_greedy=False,
+        need_top_p_sampling=True,
+        need_top_k_sampling=True,
+        need_min_p_sampling=False,
+        vocab_size=8,
+        device="cpu",
+        penalizer_orchestrator=BatchedPenalizerOrchestrator(
+            vocab_size=8,
+            batch=batch,
+            penalizers={
+                BatchedFrequencyPenalizer,
+                BatchedMinNewTokensPenalizer,
+                BatchedPresencePenalizer,
+                BatchedRepetitionPenalizer,
+            },
+        ),
+    )
+    return batch
+
+
+def test_talker_decodes_ready_rows_and_holds_rows_waiting_for_text(
+    monkeypatch,
+) -> None:
+    """A row waiting for its next thinker text row held every other row's decode step."""
+    decoded_rows: list[list[str]] = []
+
+    def prepare_decode(scheduler, batch):
+        decoded_rows.append([request.rid for request in batch.reqs])
+        batch.prepare_for_decode()
+        return batch
+
+    monkeypatch.setattr(Scheduler, "update_running_batch", prepare_decode)
+    monkeypatch.setattr(
+        OmniScheduler, "process_batch_result", lambda scheduler, batch, result: None
+    )
+    monkeypatch.setattr(
+        schedule_batch_module,
+        "alloc_for_decode",
+        lambda batch, token_per_req: torch.arange(len(batch.reqs)),
+    )
+    runner = object.__new__(QwenTalkerModelRunner)
+    runner.feedback_enabled = True
     scheduler = object.__new__(QwenTalkerScheduler)
-    scheduler.model_runner = SimpleNamespace(
-        is_decode_batch_ready=lambda batch: decode_ready
-    )
-    scheduler.chunk_wait_steps = 0
-    scheduler.chunk_wait_last_log_s = 0.0
-    return scheduler
+    scheduler.model_runner = runner
 
+    waiting = make_talker_decode_batch([False, False])
+    scheduler.running_batch = waiting
+    with get_context().override_server_args():
+        assert scheduler.update_running_batch(waiting) is None
+        assert decoded_rows == []
+        assert torch.equal(waiting.seq_lens, torch.tensor([4, 4]))
 
-def make_decode_batch(rows: int = 2) -> SimpleNamespace:
-    return SimpleNamespace(
-        forward_mode=SimpleNamespace(is_decode=lambda: True),
-        reqs=[SimpleNamespace() for _ in range(rows)],
-    )
+        batch = make_talker_decode_batch([True, False, True])
+        scheduler.running_batch = batch
+        decode_batch = scheduler.update_running_batch(batch)
+        assert decoded_rows == [["request-0", "request-2"]]
+        assert [request.rid for request in decode_batch.reqs] == [
+            "request-0",
+            "request-2",
+        ]
 
+        scheduler.process_batch_result(decode_batch, SimpleNamespace())
+        merged = scheduler.running_batch
+        assert [request.rid for request in merged.reqs] == [
+            "request-0",
+            "request-2",
+            "request-1",
+        ]
+        assert torch.equal(merged.req_pool_indices, torch.tensor([1, 3, 2]))
+        assert torch.equal(merged.seq_lens, torch.tensor([5, 5, 4]))
 
-def test_chunk_gate_holds_the_decode_step_until_the_next_chunk_lands() -> None:
-    waiting = chunk_gate_scheduler(decode_ready=False)
-    batch = make_decode_batch()
-
-    assert not waiting.is_batch_ready_to_run(batch)
-    assert not waiting.is_batch_ready_to_run(batch)
-    assert waiting.chunk_wait_steps == 2
-
-    ready = chunk_gate_scheduler(decode_ready=True)
-    assert ready.is_batch_ready_to_run(batch)
-    assert ready.chunk_wait_steps == 0
-
-
-def test_skipped_decode_step_frees_only_the_pages_it_opened() -> None:
-    freed: list[list[int]] = []
-    scheduler = object.__new__(QwenTalkerScheduler)
-    scheduler.token_to_kv_pool_allocator = SimpleNamespace(
-        page_size=4, free=lambda indices: freed.append(indices.tolist())
-    )
-    batch = make_decode_batch(rows=0)
-    batch.out_cache_loc = torch.tensor([16, 22])
-    batch.seq_lens = torch.tensor([5, 7])
-    batch.seq_lens_cpu = torch.tensor([5, 7])
-    batch.orig_seq_lens = torch.tensor([5, 7])
-    batch.req_pool_indices = torch.tensor([0, 1])
-    batch.req_to_token_pool = SimpleNamespace(req_to_token=torch.ones(2, 8))
-
-    scheduler.rollback_decode_prep_after_skip(batch)
-
-    assert freed == [[16]]
-
-
-def test_chunk_gate_ignores_prefill_batches() -> None:
-    scheduler = chunk_gate_scheduler(decode_ready=False)
-    prefill = SimpleNamespace(
-        forward_mode=SimpleNamespace(is_decode=lambda: False),
-        reqs=[SimpleNamespace()],
-    )
-
-    assert scheduler.is_batch_ready_to_run(prefill)
-    assert scheduler.chunk_wait_steps == 0
+        merged.reqs[2].omni_data.pending_text_queue.append(torch.zeros(1))
+        scheduler.update_running_batch(merged)
+        assert decoded_rows[-1] == ["request-0", "request-2", "request-1"]
+        assert torch.equal(merged.seq_lens, torch.tensor([6, 6, 5]))
 
 
 def test_no_op_initialize_request_stream_state_prevents_replay() -> None:
@@ -1643,207 +1716,6 @@ def test_abort_filters_subsequent_stream_messages_via_recv_requests() -> None:
 
     assert stream_chunk_calls == []
     assert stream_done_calls == []
-
-
-def test_rollback_decode_prep_after_skip_is_idempotent_across_repeated_stalls() -> None:
-    """Repeated stalls must leave talker scheduler state identical to pre-prepare_for_decode.
-
-    Reviewer flagged that an incomplete rollback in shared OmniScheduler could
-    leak state across the side-effect set that ``prepare_for_decode`` writes
-    (out_cache_loc, seq_lens, decode_batch_idx, kv_committed_len,
-    kv_allocated_len, plus the req_to_token_pool cell that ``alloc_for_decode``
-    writes for the new KV slot). Under talker server_args (overlap disabled,
-    no Mamba) those are the only writes; assert that rolling back twice leaves
-    every one of them where it started.
-    """
-    freed: list[Any] = []
-
-    class FakeAllocator:
-        page_size = 1
-
-        def free(self, slot: Any) -> None:
-            freed.append(slot)
-
-    class FakeForwardMode:
-        @staticmethod
-        def is_decode() -> bool:
-            return True
-
-    pre_seq_lens = torch.tensor([12, 12])
-    pre_seq_lens_cpu = torch.tensor([12, 12])
-    pre_orig_seq_lens = torch.tensor([10, 11])
-
-    reqs = [
-        SimpleNamespace(
-            decode_batch_idx=5,
-            kv=ReqKvInfo(kv_committed_len=12, kv_allocated_len=13),
-        ),
-        SimpleNamespace(
-            decode_batch_idx=7,
-            kv=ReqKvInfo(kv_committed_len=12, kv_allocated_len=13),
-        ),
-    ]
-    req_pool_indices = torch.tensor([3, 4])
-    req_to_token = torch.zeros((8, 16), dtype=torch.int32)
-    req_to_token[req_pool_indices, pre_seq_lens] = torch.tensor(
-        [777, 888], dtype=torch.int32
-    )
-    batch = SimpleNamespace(
-        forward_mode=FakeForwardMode(),
-        out_cache_loc=object(),
-        reqs=reqs,
-        seq_lens=pre_seq_lens.clone() + 1,
-        seq_lens_cpu=pre_seq_lens_cpu.clone() + 1,
-        orig_seq_lens=pre_orig_seq_lens.clone() + 1,
-        seq_lens_sum=None,
-        req_pool_indices=req_pool_indices,
-        req_to_token_pool=SimpleNamespace(req_to_token=req_to_token),
-    )
-
-    scheduler = object.__new__(QwenTalkerScheduler)
-    scheduler.token_to_kv_pool_allocator = FakeAllocator()
-
-    # Simulate one prepare_for_decode round: counters already incremented +
-    # an out_cache_loc allocation handed in. One stall -> one rollback.
-    scheduler.rollback_decode_prep_after_skip(batch)
-    assert batch.out_cache_loc is None
-    for req in reqs:
-        assert req.decode_batch_idx == [5, 7][reqs.index(req)] - 1
-        assert req.kv.kv_committed_len == 11
-        assert req.kv.kv_allocated_len == 12
-    assert torch.equal(batch.seq_lens, pre_seq_lens)
-    assert torch.equal(batch.seq_lens_cpu, pre_seq_lens_cpu)
-    assert torch.equal(batch.orig_seq_lens, pre_orig_seq_lens)
-    assert batch.seq_lens_sum is None
-    assert len(freed) == 1
-    assert torch.equal(
-        req_to_token[req_pool_indices, pre_seq_lens],
-        torch.zeros(len(reqs), dtype=torch.int32),
-    )
-
-    # A second stall on the next iteration must roll back again without
-    # accumulating state — the contract is "leaves no residue per stall".
-    # Re-simulate prepare_for_decode having run: counters re-incremented,
-    # a fresh out_cache_loc was allocated, and the new KV slot was written.
-    batch.out_cache_loc = object()
-    for req in reqs:
-        req.decode_batch_idx += 1
-        req.kv.kv_committed_len += 1
-        req.kv.kv_allocated_len += 1
-    batch.seq_lens.add_(1)
-    batch.seq_lens_cpu.add_(1)
-    batch.orig_seq_lens.add_(1)
-    req_to_token[req_pool_indices, pre_seq_lens] = torch.tensor(
-        [333, 444], dtype=torch.int32
-    )
-
-    scheduler.rollback_decode_prep_after_skip(batch)
-    assert batch.out_cache_loc is None
-    for req in reqs:
-        assert req.decode_batch_idx == [5, 7][reqs.index(req)] - 1
-        assert req.kv.kv_committed_len == 11
-        assert req.kv.kv_allocated_len == 12
-    assert batch.seq_lens_sum is None
-    assert len(freed) == 2
-    assert torch.equal(req_to_token, torch.zeros_like(req_to_token))
-
-
-def test_rollback_decode_prep_after_skip_is_noop_for_prefill_batches() -> None:
-    """Rollback must not fire for prefill batches — those have no decode prep to undo."""
-
-    class FakeForwardMode:
-        @staticmethod
-        def is_decode() -> bool:
-            return False
-
-    freed: list[Any] = []
-    batch = SimpleNamespace(
-        forward_mode=FakeForwardMode(),
-        out_cache_loc=object(),
-        seq_lens_sum=99,
-    )
-    scheduler = object.__new__(QwenTalkerScheduler)
-    scheduler.token_to_kv_pool_allocator = SimpleNamespace(free=freed.append)
-
-    scheduler.rollback_decode_prep_after_skip(batch)
-    assert batch.out_cache_loc is not None
-    assert batch.seq_lens_sum == 99
-    assert freed == []
-
-
-def test_prepare_for_decode_rollback_type_contract_with_upstream(monkeypatch) -> None:
-    schedule_batch_mod = pytest.importorskip("sglang.srt.managers.schedule_batch")
-    ScheduleBatch = schedule_batch_mod.ScheduleBatch
-    from sglang.srt.runtime_context import get_context
-
-    batch = ScheduleBatch.__new__(ScheduleBatch)
-    reqs = [
-        SimpleNamespace(
-            decode_batch_idx=0,
-            kv=ReqKvInfo(kv_committed_len=10, kv_allocated_len=11),
-            output_ids=[6],
-            origin_input_ids=[5],
-            beam_group=None,
-        )
-    ]
-    batch.reqs = reqs
-    batch.enable_overlap = False
-    batch.spec_algorithm = SimpleNamespace(is_none=lambda: True)
-    batch.sampling_info = SimpleNamespace(
-        penalizer_orchestrator=SimpleNamespace(is_required=False)
-    )
-    batch.model_config = SimpleNamespace(is_encoder_decoder=False)
-    batch.output_ids = torch.tensor([6], dtype=torch.long)
-    batch.input_ids = torch.tensor([5], dtype=torch.long)
-    batch.seq_lens = torch.tensor([10], dtype=torch.long)
-    batch.seq_lens_cpu = torch.tensor([10], dtype=torch.long)
-    batch.orig_seq_lens = torch.tensor([10], dtype=torch.long)
-    batch.seq_lens_sum = 10
-    batch.device = torch.device("cpu")
-    batch.spec_info = None
-    batch.req_pool_indices = torch.tensor([2], dtype=torch.long)
-    req_to_token = torch.zeros((4, 16), dtype=torch.int32)
-    batch.req_to_token_pool = SimpleNamespace(req_to_token=req_to_token)
-
-    def fake_alloc_for_decode(b, token_per_req):
-        out = torch.tensor([123], dtype=torch.long)
-        locs = b.seq_lens.clone()
-        b.req_to_token_pool.req_to_token[b.req_pool_indices, locs] = out.to(torch.int32)
-        for req in b.reqs:
-            req.kv.kv_allocated_len += token_per_req
-            req.kv.kv_committed_len += token_per_req
-        return out
-
-    monkeypatch.setattr(
-        schedule_batch_mod,
-        "alloc_for_decode",
-        fake_alloc_for_decode,
-    )
-
-    with get_context().override_server_args():
-        ScheduleBatch.prepare_for_decode(batch)
-    assert batch.seq_lens_sum is None
-    assert reqs[0].kv.kv_allocated_len == 12
-    assert reqs[0].kv.kv_committed_len == 11
-    assert int(req_to_token[2, 10]) == 123
-
-    allocated = batch.out_cache_loc
-    freed: list[Any] = []
-    scheduler = object.__new__(QwenTalkerScheduler)
-    scheduler.token_to_kv_pool_allocator = SimpleNamespace(
-        page_size=1, free=freed.append
-    )
-    scheduler.rollback_decode_prep_after_skip(batch)
-
-    assert batch.seq_lens_sum is None
-    assert torch.equal(batch.seq_lens, torch.tensor([10], dtype=torch.long))
-    assert reqs[0].decode_batch_idx == 0
-    assert reqs[0].kv.kv_committed_len == 10
-    assert reqs[0].kv.kv_allocated_len == 11
-    assert batch.out_cache_loc is None
-    assert len(freed) == 1
-    assert torch.equal(freed[0], allocated)
-    assert int(req_to_token[2, 10]) == 0
 
 
 def test_qwen_model_runner_and_code_predictor_tensor_contracts() -> None:

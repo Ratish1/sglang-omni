@@ -2,12 +2,16 @@
 
 from __future__ import annotations
 
+import copy
 import logging
 import time
 from collections import deque
 from dataclasses import replace
 
 from sglang.srt.managers.schedule_batch import ScheduleBatch
+from sglang.srt.managers.scheduler import Scheduler
+from sglang.srt.managers.utils import GenerationBatchResult
+from sglang.srt.sampling.penaltylib import BatchedPenalizerOrchestrator
 from sglang.srt.server_args import ServerArgs
 from typing_extensions import Unpack
 
@@ -60,6 +64,7 @@ class QwenTalkerScheduler(OmniScheduler[SGLangARRequestData]):
     talker_start_topology: bool = ENABLE_TALKER_START_TOPOLOGY
     chunk_wait_steps: int = 0
     chunk_wait_last_log_s: float = 0.0
+    held_decode_batch: ScheduleBatch | None = None
 
     def __init__(
         self,
@@ -157,19 +162,54 @@ class QwenTalkerScheduler(OmniScheduler[SGLangARRequestData]):
         del request_id, chunk
         return self.enable_partial_start
 
-    def is_batch_ready_to_run(self, batch: ScheduleBatch | None) -> bool:
-        if (
-            batch is not None
-            and batch.forward_mode.is_decode()
-            and (self.model_runner is not None)
-            and hasattr(self.model_runner, "is_decode_batch_ready")
-            and (not self.model_runner.is_decode_batch_ready(batch))
-        ):
+    def update_running_batch(self, batch: ScheduleBatch) -> ScheduleBatch | None:
+        """Decode the rows whose next input arrived; hold the others with their KV until the step's result is processed."""
+        unready_rows = self.model_runner.unready_decode_rows(batch)
+        if not unready_rows:
+            return Scheduler.update_running_batch(self, batch)
+        elif len(unready_rows) == len(batch.reqs):
             self.note_chunk_wait(batch)
-            return False
+            return None
         else:
-            pass
-        return True
+            self.hold_decode_rows(batch, unready_rows)
+            return Scheduler.update_running_batch(self, batch)
+
+    def hold_decode_rows(self, batch: ScheduleBatch, unready_rows: list[int]) -> None:
+        held_batch = copy.copy(batch)
+        held_batch.sampling_info = copy.copy(batch.sampling_info)
+        # note (ratish): the talker's decode samples through its own repetition mask, so held
+        # rows may restart the batch penalizers; merging back needs only matching rows.
+        held_batch.sampling_info.penalizer_orchestrator = BatchedPenalizerOrchestrator(
+            vocab_size=batch.sampling_info.vocab_size,
+            batch=held_batch,
+            penalizers=set(batch.sampling_info.penalizer_orchestrator.penalizers),
+        )
+        held_batch.filter_batch(keep_indices=unready_rows)
+        held_rows = set(unready_rows)
+        batch.filter_batch(
+            keep_indices=[row for row in range(len(batch.reqs)) if row not in held_rows]
+        )
+        self.held_decode_batch = held_batch
+
+    def merge_held_decode_rows(self) -> None:
+        held_batch = self.held_decode_batch
+        if held_batch is None:
+            return
+        elif self.running_batch.is_empty():
+            self.running_batch = held_batch
+        else:
+            self.running_batch.merge_batch(held_batch)
+        self.held_decode_batch = None
+
+    def process_batch_result(
+        self, batch: ScheduleBatch, result: GenerationBatchResult
+    ) -> None:
+        super().process_batch_result(batch, result)
+        self.merge_held_decode_rows()
+
+    def handle_batch_failure(self, batch: ScheduleBatch, error: Exception) -> None:
+        super().handle_batch_failure(batch, error)
+        self.merge_held_decode_rows()
 
     def note_chunk_wait(self, batch: ScheduleBatch) -> None:
         self.chunk_wait_steps += 1
@@ -188,41 +228,11 @@ class QwenTalkerScheduler(OmniScheduler[SGLangARRequestData]):
 
     def get_next_batch_to_run(self) -> ScheduleBatch | None:
         batch = super().get_next_batch_to_run()
-        if batch is not None and (not self.is_batch_ready_to_run(batch)):
-            self.rollback_decode_prep_after_skip(batch)
-            return None
+        if batch is None:
+            self.merge_held_decode_rows()
         else:
             pass
         return batch
-
-    def rollback_decode_prep_after_skip(self, batch: ScheduleBatch) -> None:
-        if not batch.forward_mode.is_decode():
-            return
-        else:
-            pass
-        if batch.out_cache_loc is not None:
-            allocator = self.token_to_kv_pool_allocator
-            if allocator.page_size > 1:
-                # note (Richard Wang): a paged allocator frees whole pages, so only
-                # release the pages this step opened, since the rest hold earlier KV.
-                new_pages = (batch.seq_lens_cpu - 1) % allocator.page_size == 0
-                if new_pages.any():
-                    allocator.free(batch.out_cache_loc[new_pages])
-                else:
-                    pass
-            else:
-                allocator.free(batch.out_cache_loc)
-            batch.out_cache_loc = None
-        else:
-            pass
-        for req in batch.reqs:
-            req.decode_batch_idx -= 1
-            req.kv.kv_committed_len -= 1
-            req.kv.kv_allocated_len -= 1
-        batch.seq_lens.sub_(1)
-        batch.seq_lens_cpu.sub_(1)
-        batch.orig_seq_lens.sub_(1)
-        batch.req_to_token_pool.req_to_token[batch.req_pool_indices, batch.seq_lens] = 0
 
     def self_check_during_idle(self) -> None:
         if self.running_batch is not None and (not self.running_batch.is_empty()):

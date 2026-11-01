@@ -332,17 +332,19 @@ class QwenTalkerModelRunner(ModelRunner["SGLangARRequestData"]):
         del forward_batch, schedule_batch, requests
         return False
 
-    def is_decode_batch_ready(self, schedule_batch: ScheduleBatch) -> bool:
-        if not self.feedback_enabled or not schedule_batch.forward_mode.is_decode():
-            return True
+    def unready_decode_rows(self, schedule_batch: ScheduleBatch) -> list[int]:
+        """Rows whose next decode input has not arrived; none while feedback is off."""
+        if not self.feedback_enabled:
+            return []
         else:
             pass
-        return all(
-            self.data_has_next_decode_input(
-                getattr(req, "omni_data", None)
+        return [
+            row
+            for row, request in enumerate(schedule_batch.reqs)
+            if not self.data_has_next_decode_input(
+                getattr(request, "omni_data", None)
             )  # noqa: leading-underscore  # upstream spelling, or the public name is already taken
-            for req in schedule_batch.reqs
-        )
+        ]
 
     def compose_prefill_embeds(
         self,
