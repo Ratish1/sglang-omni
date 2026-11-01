@@ -49,7 +49,20 @@ boot() {
   local label=$1 tree=$2 out=$Q/$1
   mkdir -p $out
   log "$label start: tree $(git -C $tree rev-parse --short HEAD) $(git -C $tree rev-parse HEAD:sglang_omni | cut -c1-8); apps [$(nvidia-smi --query-compute-apps=gpu_bus_id,pid --format=csv,noheader | tr '\n' ';')]"
-  if serve $out/serve.log $tree $MODEL $PORT $P/talker_gate_probe:; then
+  # note (ratish): the two-card thinker sizes its KV pool from the card memory free when its load begins, which the
+  # other card 0 stages' startup races; a boot that loses the race fails, so each boot gets three attempts.
+  local healthy=1
+  for attempt in 1 2 3; do
+    if serve $out/serve.log $tree $MODEL $PORT $P/talker_gate_probe:; then
+      healthy=0
+      break
+    else
+      log "$label attempt $attempt not healthy: $(grep -o 'minimum viable[^.]*' $out/serve.log | head -1); thinker load began at $(grep -o 'Load weight begin. avail mem=[0-9.]* GB' $out/serve.log | tail -1)"
+      cp $out/serve.log $out/serve_attempt$attempt.log
+      stop
+    fi
+  done
+  if [ $healthy = 0 ]; then
     log "$label healthy"
     PYTHONPATH=$tree taskset -c $PIN python3 $S/run_bench.py gen --arm seedtts_en --port $PORT --concurrency 16 \
       --out $out/warm --max-samples 64 > $out/warm.log 2>&1
