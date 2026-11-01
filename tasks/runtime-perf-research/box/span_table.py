@@ -74,16 +74,48 @@ def tables(db):
     return {row[0] for row in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
 
 
-def device_records(db, names):
-    """(correlationId, globalPid, start, end) for kernels, graph launches and memory work."""
+def device_records(db, names, lo, hi):
+    """(correlationId, globalPid, start, end) for kernels, graph launches and memory work inside [lo, hi]; graph
+    trace rows can carry a corrupt start (negative), so rows outside the session are dropped."""
     rows = []
     for table in ("CUPTI_ACTIVITY_KIND_KERNEL", "CUPTI_ACTIVITY_KIND_GRAPH_TRACE", "CUPTI_ACTIVITY_KIND_MEMCPY",
                   "CUPTI_ACTIVITY_KIND_MEMSET"):
         if table in names:
-            rows.extend(db.execute(f"SELECT correlationId, globalPid, start, end FROM {table}"))
+            rows.extend(db.execute(
+                f"SELECT correlationId, globalPid, start, end FROM {table} WHERE start >= ? AND end <= ? AND end >= start",
+                (lo, hi),
+            ))
         else:
             pass
     return rows
+
+
+def context_slices(db, names, lo, hi):
+    """Per process, the intervals its context held the card: GPU_CONTEXT_SWITCH_EVENTS pairs one tag with the next
+    event of the same context; which tag opens a slice is chosen as the one whose intervals hold the process's own
+    kernels (both readings printed)."""
+    if "GPU_CONTEXT_SWITCH_EVENTS" not in names:
+        return {}, {}
+    else:
+        pass
+    events = defaultdict(list)
+    for tag, context, stamp, gpid in db.execute(
+        "SELECT tag, contextId, timestamp, globalPid FROM GPU_CONTEXT_SWITCH_EVENTS WHERE timestamp BETWEEN ? AND ? "
+        "ORDER BY timestamp", (lo, hi),
+    ):
+        events[(pid_of(gpid), context)].append((stamp, tag))
+    tags = sorted({tag for rows in events.values() for _, tag in rows})
+    by_tag = {}
+    for opening in tags:
+        slices = defaultdict(list)
+        for (pid, _), rows in events.items():
+            for (stamp, tag), (next_stamp, _) in zip(rows, rows[1:]):
+                if tag == opening:
+                    slices[pid].append((stamp, next_stamp))
+                else:
+                    pass
+        by_tag[opening] = {pid: merged(spans) for pid, spans in slices.items()}
+    return by_tag, tags
 
 
 def main() -> None:
@@ -110,7 +142,7 @@ def main() -> None:
 
     device_by_corr = {}
     device_by_pid = defaultdict(list)
-    for corr, gpid, start, end in device_records(db, names):
+    for corr, gpid, start, end in device_records(db, names, session[0], session[1]):
         pid = pid_of(gpid)
         device_by_corr[(pid, corr)] = device_by_corr.get((pid, corr), []) + [(start, end)]
         device_by_pid[pid].append((start, end))
@@ -123,6 +155,17 @@ def main() -> None:
         calls_by_tid[gtid].append((start, end, strings.get(name_id, ""), corr))
     for calls in calls_by_tid.values():
         calls.sort()
+    os_by_tid = defaultdict(list)
+    if "OSRT_API" in names:
+        for start, end, gtid in db.execute(
+            "SELECT start, end, globalTid FROM OSRT_API WHERE nestingLevel = 0 AND end > ? AND start < ?",
+            (session[0], session[1]),
+        ):
+            os_by_tid[gtid].append((start, end))
+    else:
+        pass
+    for spans in os_by_tid.values():
+        spans.sort()
 
     ranges = []
     text_column = "coalesce(text, (SELECT value FROM StringIds WHERE id = textId))"
@@ -175,7 +218,9 @@ def main() -> None:
                 other += covered(spans, start, end, first_at(spans, start))
             else:
                 pass
-        record = (end - start, dev, lag, sync, other)
+        os_spans = os_by_tid.get(gtid, [])
+        os_time = covered(os_spans, start, end, first_at(os_spans, start)) if os_spans else 0
+        record = (end - start, dev, lag, sync, other, os_time)
         stats[stages[pid]][NUMBERS.sub(r"\1=N", text)].append(record)
         if args.labels and text.startswith("omni.forward"):
             labels[stages[pid]][text].append(record)
@@ -189,7 +234,7 @@ def main() -> None:
         print(f"  {stages.get(pid, f'pid{pid}'):16s} pid {pid:7d} {total / 1e6:10.1f} ms {100 * total / window_ns:6.1f} %")
 
     print("\nB. spans per stage: n, wall sum ms and % of window, wall p50/p90/p99 ms, dev p50 ms, lag p50 ms, "
-          "sync p50 ms, other p50 ms")
+          "sync p50 ms, other p50 ms, os (OS runtime calls on the thread: locks, the GIL, sleeps) p50 ms")
     for stage, by_name in sorted(stats.items()):
         print(f"\n  [{stage}]")
         rows = sorted(by_name.items(), key=lambda item: -sum(r[0] for r in item[1]))[: args.top]
@@ -201,7 +246,8 @@ def main() -> None:
                   f" dev {statistics.median(r[1] / 1e6 for r in records):7.3f}"
                   f" lag {statistics.median(lags) if lags else 0:7.3f}"
                   f" sync {statistics.median(r[3] / 1e6 for r in records):7.3f}"
-                  f" other {statistics.median(r[4] / 1e6 for r in records):7.3f}")
+                  f" other {statistics.median(r[4] / 1e6 for r in records):7.3f}"
+                  f" os {statistics.median(r[5] / 1e6 for r in records):7.3f}")
 
     if args.labels:
         print("\nC. omni.forward by exact label: n, wall p50/p90 ms, dev p50 ms, lag p50 ms, other p50 ms")
@@ -217,10 +263,20 @@ def main() -> None:
     else:
         pass
 
-    switch_tables = sorted(name for name in names if "CONTEXT_SWITCH" in name or "CTXSW" in name.upper())
-    print(f"\nD. context switch tables: {', '.join(switch_tables) or 'none'}")
-    for table in switch_tables:
-        print(f"  {table}: {db.execute(f'SELECT count(*) FROM {table}').fetchone()[0]} rows")
+    by_tag, tags = context_slices(db, names, session[0], session[1])
+    print(f"\nD. card time slices per process (GPU_CONTEXT_SWITCH_EVENTS tags {tags}); own = share of the process's "
+          "device work inside its slices under that reading")
+    for opening, slices in by_tag.items():
+        print(f"\n  slice opens at tag {opening}")
+        for pid, spans in sorted(slices.items(), key=lambda item: -sum(b - a for a, b in item[1])):
+            lengths = [(b - a) / 1e6 for a, b in spans]
+            held = sum(lengths)
+            own = busy.get(pid, [])
+            inside = sum(covered(spans, a, b, first_at(spans, a)) for a, b in own)
+            total = sum(b - a for a, b in own) or 1
+            print(f"    {stages.get(pid, f'pid{pid}'):16s} slices {len(spans):6d} held {held:8.1f} ms "
+                  f"{100 * held * 1e6 / window_ns:5.1f} % p50 {statistics.median(lengths) if lengths else 0:7.3f} "
+                  f"p90 {pct(lengths, 0.9):7.3f} ms, own work inside {100 * inside / total:5.1f} %")
 
 
 if __name__ == "__main__":
