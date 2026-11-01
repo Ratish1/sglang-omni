@@ -32,7 +32,7 @@ def parse_option(text: str) -> tuple[str, bool | int]:
 
 def encode_all(
     gpu: int, eager: bool, deterministic: bool, options: list[str]
-) -> tuple[dict[str, torch.Tensor], float, float]:
+) -> tuple[dict[str, torch.Tensor], float, float, dict[int, float]]:
     from benchmarks.dataset.seedtts import SEEDTTS_DATASET_ID, load_seedtts_samples
     from sglang_omni.models.qwen3_tts import reference_encoder_cuda_graph, stages
     from sglang_omni.models.qwen3_tts.reference_encoder_cuda_graph import (
@@ -67,7 +67,23 @@ def encode_all(
         batcher.encode(audio, rate)
     encode_ms = (time.perf_counter() - began) * 1000 / len(audios)
     batcher.close()
-    return codes, built, encode_ms
+    replay_ms = {}
+    runner = batcher.graph_runner
+    if runner is not None:
+        for frames, captured in sorted(runner.graphs.items()):
+            with torch.cuda.stream(runner.stream):
+                for _ in range(10):
+                    captured.graph.replay()
+                start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+                start.record(runner.stream)
+                for _ in range(200):
+                    captured.graph.replay()
+                end.record(runner.stream)
+            end.synchronize()
+            replay_ms[frames] = round(start.elapsed_time(end) / 200, 4)
+    else:
+        pass
+    return codes, built, encode_ms, replay_ms
 
 
 def picks(cache: str) -> list[str]:
@@ -117,12 +133,13 @@ def main() -> None:
         return
     else:
         pass
-    codes, built, encode_ms = encode_all(args.gpu, args.eager, args.deterministic, args.option)
+    codes, built, encode_ms, replay_ms = encode_all(args.gpu, args.eager, args.deterministic, args.option)
     torch.save(codes, f"{args.out}.pt")
     cache = os.environ.get("TORCHINDUCTOR_CACHE_DIR", "")
     found = picks(cache) if cache else []
     summary = (f"gpu {args.gpu} eager {args.eager} deterministic {args.deterministic} options {args.option} "
-               f"clips {len(codes)} build {built:.1f} s encode {encode_ms:.3f} ms best_config files {len(found)}")
+               f"clips {len(codes)} build {built:.1f} s encode {encode_ms:.3f} ms replay ms {replay_ms} "
+               f"best_config files {len(found)}")
     with open(f"{args.out}.txt", "w") as handle:
         handle.write(f"{summary} cache {cache}\n")
         handle.writelines(line + "\n" for line in found)
