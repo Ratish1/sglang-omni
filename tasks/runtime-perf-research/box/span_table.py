@@ -101,10 +101,12 @@ def context_slices(db, names, lo, hi, busy):
         return {}
     else:
         pass
+    # note (ratish): the switch table covers every GPU of the host, so only the traced card's switches are kept
+    devices = [row[0] for row in db.execute("SELECT DISTINCT deviceId FROM CUPTI_ACTIVITY_KIND_KERNEL")]
     events = defaultdict(list)
     for tag, context, stamp in db.execute(
-        "SELECT tag, contextId, timestamp FROM GPU_CONTEXT_SWITCH_EVENTS WHERE timestamp BETWEEN ? AND ? "
-        "ORDER BY timestamp", (lo, hi),
+        f"SELECT tag, contextId, timestamp FROM GPU_CONTEXT_SWITCH_EVENTS WHERE timestamp BETWEEN ? AND ? "
+        f"AND gpuId IN ({','.join('?' * len(devices))}) ORDER BY timestamp", (lo, hi, *devices),
     ):
         events[context].append((stamp, tag))
     contexts = {}
@@ -235,7 +237,8 @@ def main() -> None:
         else:
             pass
 
-    print(f"window {window_ns / 1e9:.2f} s from the first to the last CUDA call")
+    print(f"window {window_ns / 1e9:.2f} s from the first to the last CUDA call"
+          f"{'  WARNING: longer than a 10 s collection, the session stop was late' if window_ns > 10e9 else ''}")
     print("\nA. device busy per process (union, ms) and share of the window")
     for pid, spans in sorted(busy.items(), key=lambda item: -sum(b - a for a, b in item[1])):
         total = sum(b - a for a, b in spans)
