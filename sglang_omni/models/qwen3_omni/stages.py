@@ -1548,6 +1548,7 @@ def create_talker_ar_executor_from_config(
     validate_generation_batch_policy(
         model_name="Qwen3-Omni talker_ar",
         server_args=server_args,
+        allowed_prefill_backends=(CudaGraphBackend.BREAKABLE, CudaGraphBackend.FULL),
     )
     from sglang.srt.arg_groups.model_override_base import resolved_view
 
