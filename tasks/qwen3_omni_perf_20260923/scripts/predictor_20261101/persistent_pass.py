@@ -52,17 +52,47 @@ LINE_BLOCK = 1024
 
 
 @triton.jit
-def grid_barrier(BARRIERS, index, barrier_count, program, programs):
+def global_ns(program):
+    """The GPU's global nanosecond timer; program is an unused operand that gives the asm its scalar shape."""
+    return tl.inline_asm_elementwise(
+        "mov.u64 $0, %globaltimer;",
+        "=l,r",
+        [program],
+        dtype=tl.int64,
+        is_pure=False,
+        pack=1,
+    )
+
+
+@triton.jit
+def grid_barrier(
+    BARRIERS, index, barrier_count, program, programs, TIMES, TIMELINE: tl.constexpr
+):
     """Every program arrives at counter index (release), spins until all arrived, then acquires. Program 0 resets the
-    previous barrier's counter, which every program has left; the last one is reset at the next call's first.
+    previous barrier's counter, which every program has left; the last one is reset at the next call's first. With
+    TIMELINE, each program stores its arrival and departure times at TIMES[program, 1 + 2 * index + (0, 1)].
     """
     tl.debug_barrier()
+    if TIMELINE:
+        tl.store(
+            TIMES + program * (2 * barrier_count + 2) + 1 + 2 * index,
+            global_ns(program),
+        )
+    else:
+        pass
     tl.atomic_add(BARRIERS + index, 1, sem="release", scope="gpu")
     arrived = tl.load(BARRIERS + index, volatile=True)
     while arrived < programs:
         arrived = tl.load(BARRIERS + index, volatile=True)
     tl.atomic_add(BARRIERS + index, 0, sem="acquire", scope="gpu")
     tl.debug_barrier()
+    if TIMELINE:
+        tl.store(
+            TIMES + program * (2 * barrier_count + 2) + 2 + 2 * index,
+            global_ns(program),
+        )
+    else:
+        pass
     if program == 0:
         tl.store(BARRIERS + (index + barrier_count - 1) % barrier_count, 0)
     else:
@@ -520,6 +550,7 @@ def predictor_pass_kernel(
     SUM_SQ_PARTIALS,
     COUNTERS,
     BARRIERS,
+    TIMES,
     T: tl.constexpr,
     LAYERS: tl.constexpr,
     HIDDEN: tl.constexpr,
@@ -540,9 +571,14 @@ def predictor_pass_kernel(
     PREFETCH: tl.constexpr,
     LINE_BLOCK: tl.constexpr,
     LINE_ELEMENTS: tl.constexpr,
+    TIMELINE: tl.constexpr,
 ):
     program = tl.program_id(0)
     programs = tl.num_programs(0)
+    if TIMELINE:
+        tl.store(TIMES + program * (2 * LAYERS * 5 + 2), global_ns(program))
+    else:
+        pass
     HEADS: tl.constexpr = NUM_Q_HEADS + 2 * NUM_KV_HEADS
     Q_WIDTH: tl.constexpr = NUM_Q_HEADS * HEAD_DIM
     QKV_NUMEL: tl.constexpr = HEADS * HEAD_DIM * HIDDEN
@@ -604,7 +640,9 @@ def predictor_pass_kernel(
                 BLOCK_M,
                 BLOCK_K,
             )
-        barrier = grid_barrier(BARRIERS, barrier, BARRIER_COUNT, program, programs)
+        barrier = grid_barrier(
+            BARRIERS, barrier, BARRIER_COUNT, program, programs, TIMES, TIMELINE
+        )
         for tile in range(program, rows // T * NUM_KV_HEADS, programs):
             attention_tile(
                 Q_BUF,
@@ -626,7 +664,9 @@ def predictor_pass_kernel(
                 BLOCK_Q,
                 BLOCK_S,
             )
-        barrier = grid_barrier(BARRIERS, barrier, BARRIER_COUNT, program, programs)
+        barrier = grid_barrier(
+            BARRIERS, barrier, BARRIER_COUNT, program, programs, TIMES, TIMELINE
+        )
         if PREFETCH:
             prefetch_l2(
                 W_GATE_UP + layer * GATE_UP_NUMEL,
@@ -662,7 +702,9 @@ def predictor_pass_kernel(
                 BLOCK_N,
                 BLOCK_K,
             )
-        barrier = grid_barrier(BARRIERS, barrier, BARRIER_COUNT, program, programs)
+        barrier = grid_barrier(
+            BARRIERS, barrier, BARRIER_COUNT, program, programs, TIMES, TIMELINE
+        )
         if PREFETCH:
             prefetch_l2(
                 W_DOWN + layer * DOWN_NUMEL,
@@ -692,7 +734,9 @@ def predictor_pass_kernel(
                 BLOCK_N,
                 MLP_BLOCK_K,
             )
-        barrier = grid_barrier(BARRIERS, barrier, BARRIER_COUNT, program, programs)
+        barrier = grid_barrier(
+            BARRIERS, barrier, BARRIER_COUNT, program, programs, TIMES, TIMELINE
+        )
         if PREFETCH:
             prefetch_l2(
                 W_QKV + (layer + 1) % LAYERS * QKV_NUMEL,
@@ -728,7 +772,9 @@ def predictor_pass_kernel(
                 BLOCK_N,
                 BLOCK_K,
             )
-        barrier = grid_barrier(BARRIERS, barrier, BARRIER_COUNT, program, programs)
+        barrier = grid_barrier(
+            BARRIERS, barrier, BARRIER_COUNT, program, programs, TIMES, TIMELINE
+        )
     for row in range(program, rows, programs):
         norm_row(
             RESIDUAL,
@@ -740,6 +786,14 @@ def predictor_pass_kernel(
             HIDDEN // (LANES * VEC),
             VEC,
         )
+    if TIMELINE:
+        tl.debug_barrier()
+        tl.store(
+            TIMES + program * (2 * BARRIER_COUNT + 2) + 2 * BARRIER_COUNT + 1,
+            global_ns(program),
+        )
+    else:
+        pass
 
 
 class PersistentPredictorPass:
@@ -753,11 +807,22 @@ class PersistentPredictorPass:
         max_rows: int,
         device: torch.device,
         prefetch: bool,
+        timeline_calls: int = 0,
     ) -> None:
         self.shape = shape
         self.max_rows = max_rows
         self.prefetch = prefetch
         self.programs = torch.cuda.get_device_properties(device).multi_processor_count
+        # note (ratish): with timeline_calls, call i stores its programs' barrier times in times[i % timeline_calls].
+        self.timeline_calls = timeline_calls
+        self.calls = 0
+        self.times = torch.zeros(
+            max(timeline_calls, 1),
+            self.programs,
+            2 * PHASES_PER_LAYER * len(layers) + 2,
+            device=device,
+            dtype=torch.int64,
+        )
         attention = [layer.self_attn for layer in layers]
         self.w_qkv = torch.stack([a.qkv_proj.weight for a in attention]).contiguous()
         self.w_o = torch.stack([a.o_proj.weight for a in attention]).contiguous()
@@ -812,6 +877,8 @@ class PersistentPredictorPass:
         else:
             pass
         block_m = block_rows(rows)
+        times = self.times[self.calls % max(self.timeline_calls, 1)]
+        self.calls += 1
         while True:
             stages = self.num_stages.get(block_m, NUM_STAGES)
             try:
@@ -849,6 +916,7 @@ class PersistentPredictorPass:
                     self.sum_sq_partials,
                     self.counters,
                     self.barriers,
+                    times,
                     T=num_tokens,
                     LAYERS=self.num_layers,
                     HIDDEN=hidden_size,
@@ -869,6 +937,7 @@ class PersistentPredictorPass:
                     PREFETCH=self.prefetch,
                     LINE_BLOCK=LINE_BLOCK,
                     LINE_ELEMENTS=LINE_ELEMENTS,
+                    TIMELINE=self.timeline_calls > 0,
                     num_warps=NUM_WARPS,
                     num_stages=stages,
                     launch_cooperative_grid=True,
