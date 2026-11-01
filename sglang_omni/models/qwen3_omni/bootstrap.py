@@ -275,7 +275,8 @@ def create_talker_scheduler(
         weight_prefix=weight_prefix,
         total_gpu_memory_fraction=total_gpu_memory_fraction,
         defer_cuda_graph_capture=want_cuda_graph,
-        enable_prefill_input_embeds=prefill_graph_backend == CudaGraphBackend.BREAKABLE,
+        # note (ratish): the talker's prefill reads composed prompt embeddings, so every captured backend needs the slot.
+        enable_prefill_input_embeds=prefill_graph_backend != CudaGraphBackend.DISABLED,
     )
     # Note:(Chenchen Hong) align the talker vocab to the codec vocab: post1 sizes
     # the repetition-penalty orchestrator from model_config.vocab_size (the
@@ -291,7 +292,7 @@ def create_talker_scheduler(
     if want_cuda_graph:
         # note (ratish): capture after binding the sampler so decode graphs record it.
         init_sglang_cuda_graphs(model_worker)
-        if prefill_graph_backend == CudaGraphBackend.BREAKABLE:
+        if prefill_graph_backend != CudaGraphBackend.DISABLED:
             cuda_graph_batch_validator.attest_prefill_cuda_graphs(
                 model_worker.model_runner,
                 operator_selected=operator_selected_prefill_backend,
