@@ -15,7 +15,7 @@ cards() { nvidia-smi --query-compute-apps=gpu_bus_id,pid,used_memory --format=cs
 log "check2 start: tools $(git -C /data/tools rev-parse --short HEAD); tree $(git -C $TREE rev-parse --short HEAD) $(git -C $TREE rev-parse HEAD:sglang_omni | cut -c1-8) $(git -C $TREE status --porcelain -- sglang_omni | wc -l) dirty; apps [$(cards)]"
 cd $TREE || exit 1
 env PYTHONPATH=$TREE setsid taskset -c $PIN nsys launch --session-new=$SESSION --trace=cuda,nvtx \
-  --cuda-graph-trace=node --sample=none --cpuctxsw=none \
+  --cuda-graph-trace=node \
   python3 -u -m sglang_omni.cli serve --model-path Qwen/Qwen3-Omni-30B-A3B-Instruct --host 127.0.0.1 --port $PORT \
   > $Q/serve.log 2>&1 &
 WRAP=$!
@@ -39,7 +39,7 @@ log "warm rc $?"
 offset=64
 for conc in 16 64; do
   samples=$((conc * 6))
-  nsys start --session=$SESSION -o $Q/c$conc --force-overwrite=true >> $Q/nsys_ctl.log 2>&1
+  nsys start --session=$SESSION --sample=none --cpuctxsw=none -o $Q/c$conc --force-overwrite=true >> $Q/nsys_ctl.log 2>&1
   log "c$conc window open"
   PYTHONPATH=$TREE taskset -c $PIN python3 $S/run_bench.py gen --arm seedtts_en --port $PORT --concurrency $conc \
     --out $Q/run_c$conc --max-samples $((offset + samples)) --skip-samples $offset > $Q/gen_c$conc.log 2>&1
