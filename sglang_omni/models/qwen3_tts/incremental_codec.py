@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import os
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
@@ -1266,6 +1267,13 @@ class Qwen3TTSIncrementalDecoder:
         ) = None
         self.compiled_shapes: set[tuple[int, int]] = set()
         self.first_chunk_reach: dict[int, int] = {}
+        # note (ratish): scratch switch for the compile-form probe; "regions" compiles
+        # frame_tensors, slot_upsample and slot_decoder_block, the rest of the step stays eager.
+        self.compile_form = os.environ.get("SGLANG_OMNI_CODEC_COMPILE_FORM", "step")
+        region_dynamic = os.environ.get("SGLANG_OMNI_CODEC_REGION_DYNAMIC", "none")
+        self.region_dynamic = None if region_dynamic == "none" else True
+        self.region_kernels: dict[str, Callable] = {}
+        self.is_region_call = False
 
     @staticmethod
     def require_attrs(module: object, path: str, *names: str) -> None:
@@ -1442,8 +1450,11 @@ class Qwen3TTSIncrementalDecoder:
             )
         else:
             pass
-        kernel = self.compiled_kernel if compiled else self.decode_tensors
-        waveform = kernel(codes, state)
+        if compiled and self.compile_form == "regions":
+            waveform = self.region_decode(codes, state)
+        else:
+            kernel = self.compiled_kernel if compiled else self.decode_tensors
+            waveform = kernel(codes, state)
         expected_samples = fresh_frames * self.total_upsample
         if int(waveform.shape[-1]) != expected_samples:
             raise RuntimeError(
@@ -1556,7 +1567,35 @@ class Qwen3TTSIncrementalDecoder:
                     )
         else:
             pass
-        return self.conv_stack_tensors(self.frame_tensors(codes, state), state)
+        frame_tensors = self.region("frame_tensors", self.frame_tensors)
+        return self.conv_stack_tensors(frame_tensors(codes, state), state)
+
+    def region(self, name: str, function: Callable) -> Callable:
+        if not self.is_region_call:
+            return function
+        else:
+            pass
+        if name not in self.region_kernels:
+            self.region_kernels[name] = torch.compile(
+                function, dynamic=self.region_dynamic, fullgraph=True
+            )
+        else:
+            pass
+        return self.region_kernels[name]
+
+    def region_decode(
+        self, codes: torch.Tensor, state: Qwen3TTSIncrementalCodecState
+    ) -> torch.Tensor:
+        self.is_region_call = True
+        try:
+            with torch._dynamo.config.patch(  # noqa: leading-underscore  # upstream spelling, or the public name is already taken
+                recompile_limit=max(
+                    torch._dynamo.config.recompile_limit, 64
+                )  # noqa: leading-underscore  # upstream spelling, or the public name is already taken
+            ):
+                return self.decode_tensors(codes, state)
+        finally:
+            self.is_region_call = False
 
     def frame_tensors(
         self,
@@ -1684,7 +1723,9 @@ class Qwen3TTSIncrementalDecoder:
         decoder = self.decoder
         coefficients = self.snake_coefficients
         slot_index = state.conv_slots(int(hidden_states.shape[0]), hidden_states.device)
-        padded, length = self.slot_upsample(hidden_states, state, slot_index)
+        padded, length = self.region("slot_upsample", self.slot_upsample)(
+            hidden_states, state, slot_index
+        )
         decoder_output = slot_causal_conv(
             decoder.decoder[0],
             self.channels_last_weights["decoder.0"],
@@ -1702,8 +1743,9 @@ class Qwen3TTSIncrementalDecoder:
             coefficients[decoder_blocks[0].block[0]],
             activated,
         )
+        decoder_block_step = self.region("slot_decoder_block", self.slot_decoder_block)
         for block_index, decoder_block in enumerate(decoder_blocks, start=1):
-            conv_output, residual = self.slot_decoder_block(
+            conv_output, residual = decoder_block_step(
                 decoder_block, f"decoder.{block_index}", activated, state, slot_index
             )
             bias = decoder_block.block[-1].conv2.conv.bias
@@ -1870,15 +1912,21 @@ class Qwen3TTSIncrementalDecoder:
         Pass the codes and state of a real decode, in its grad-disabling
         context: Dynamo guards on both, and the step advances the state.
         """
+        shape = (int(codes.shape[0]), int(codes.shape[-1]))
+        if shape in self.compiled_shapes:
+            return
+        else:
+            pass
+        if self.compile_form == "regions":
+            self.region_decode(codes, state)
+            self.compiled_shapes.add(shape)
+            return
+        else:
+            pass
         if self.compiled_kernel is None:
             self.compiled_kernel = torch.compile(
                 self.decode_tensors, dynamic=False, fullgraph=True
             )
-        else:
-            pass
-        shape = (int(codes.shape[0]), int(codes.shape[-1]))
-        if shape in self.compiled_shapes:
-            return
         else:
             pass
         # note (luojiaxuan): one trace per (batch, width) pair, past the default
