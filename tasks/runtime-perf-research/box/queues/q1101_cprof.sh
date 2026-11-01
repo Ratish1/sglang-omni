@@ -37,13 +37,34 @@ pair_boot() {
     --loads 64,16 --passes warm,clean > $O/$name.driver.log 2>&1
   log "boot $name rc $?"
 }
+R="taskset -c 0-55 python3"
 events_boot ce_m1 $MAIN 0 24000 & events_boot ce_c1 $CAP 1 24400 & wait
+{
+  echo "== stalls (underrun), c64 events pass"
+  $R $K/underrun.py main "$O/ce_m1/c64_events/bench/rep*/speed_results.json" cap "$O/ce_c1/c64_events/bench/rep*/speed_results.json"
+  echo "== admission trains"
+  $R $K/admission_trains.py --cell c64_events --arm main=$O/ce_m1 --arm cap=$O/ce_c1
+  echo "== talker cadence"
+  $R $K/talker_cadence.py --cell c64_events $O/ce_m1 $O/ce_c1
+  echo "== first audio states"
+  $R $K/first_audio_states.py --cell c64_events --main $O/ce_m1 --branch $O/ce_c1
+} > $O/cprof_read_ce.txt 2>&1
+log "cprof read ce done"
 trace_boot tc_c1 --nsys-gpuctxsw
 if grep -rqs "took too long" $O/tc_c1; then
   mv $O/tc_c1 $O/tc_c1_void_nsys_stall
   log "tc_c1 void (nsys start stalled), again without context switches"
   trace_boot tc_c1 ""
 fi
+{
+  for run in t2_m1 tc_c1; do
+    echo "== $run c64 talker decode intervals"
+    (cd $K && $R talker_intervals.py $O/$run/c64_nsys/trace.sqlite $O/$run/serve.log)
+  done
+  echo "== tc_c1 c64 spans"
+  $R $K/span_table.py $O/tc_c1/c64_nsys/trace.sqlite $O/tc_c1/serve.log --top 40
+} > $O/cprof_read_tc.txt 2>&1
+log "cprof read tc done"
 pair_boot cs_m1 $MAIN 0 24000 & pair_boot cs_s1 $STACK 1 24400 & wait
 pair_boot cs_s2 $STACK 0 24000 & pair_boot cs_m2 $MAIN 1 24400 & wait
 log "q1101_cprof done"
