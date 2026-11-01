@@ -89,7 +89,7 @@ boot() {
   stop
   for name in $PASSES; do
     local pass_dir=$out/$name/seedtts_en
-    (cd $TREE && python3 $C/bad_output_census.py en $pass_dir > $out/census_$name.txt 2>&1)
+    (cd $TREE && PYTHONPATH=$TREE python3 $C/bad_output_census.py en $pass_dir > $out/census_$name.txt 2>&1)
     head -3 $out/census_$name.txt | while read -r line; do log "  $label $name $line"; done
     mkdir -p $out/keep/$name
     python3 -c "

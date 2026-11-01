@@ -222,6 +222,22 @@ def install_sample_skip(skip: int) -> None:
     skip_first_samples(mmmu_benchmark, "load_mmmu_samples", skip)
 
 
+def install_seedtts_sample_ids(sample_ids: list[str]) -> None:
+    """Load only the named SeedTTS samples, in the given order."""
+    import benchmarks.eval.benchmark_omni_seedtts as seedtts_benchmark
+
+    load = seedtts_benchmark.load_seedtts_samples
+
+    @functools.wraps(load)
+    def load_named(meta, max_samples, *args, **kwargs):
+        by_id = {
+            sample.sample_id: sample for sample in load(meta, None, *args, **kwargs)
+        }
+        return [by_id[sample_id] for sample_id in sample_ids]
+
+    seedtts_benchmark.load_seedtts_samples = load_named
+
+
 REPLY_TEXT_PARTS: contextvars.ContextVar = contextvars.ContextVar(
     "reply_text_parts", default=None
 )
@@ -754,6 +770,10 @@ def main() -> None:
         default=0,
         help="gen: drop the corpus's first K samples before taking --max-samples",
     )
+    parser.add_argument(
+        "--sample-ids",
+        help="gen, SeedTTS arms: a file of sample ids, whitespace separated; only those run",
+    )
     args = parser.parse_args()
     out = str(Path(args.out) / args.arm)
     Path(out).mkdir(parents=True, exist_ok=True)
@@ -761,6 +781,10 @@ def main() -> None:
     if args.mode == "gen":
         if args.skip_samples:
             install_sample_skip(args.skip_samples)
+        else:
+            pass
+        if args.sample_ids:
+            install_seedtts_sample_ids(Path(args.sample_ids).read_text().split())
         else:
             pass
         if args.request_rate != float("inf"):

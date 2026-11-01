@@ -1,6 +1,7 @@
 set -u
 # 11-01 correctness plan row 10: our talker prefill rows against HF's. One colocated boot of the capture branch
-# (main f4fbb735d plus the talker capture), the first 48 SeedTTS EN samples at c16 captured, the server stopped, then
+# (main f4fbb735d plus the talker capture), the census's and the pair's bad SeedTTS EN samples plus 24 controls captured
+# at c16, the server stopped, then
 # prompt_rows_parity.py builds HF's rows in bfloat16 (floor) and float32 (truth) across cards 0 and 1 and compares.
 Q=/data/rows_1101
 S=/data/tools/tasks/qwen3_omni_perf_20260923/scripts
@@ -38,9 +39,20 @@ for _ in $(seq 360); do
     sleep 5
   fi
 done
+# note (ratish): every sample above 50 % WER in the census and the per-row pair, then the corpus's first 24 as controls.
+python3 -c "
+import glob, json
+bad, controls = [], []
+for path in sorted(glob.glob('/data/census_1101/*/c*/seedtts_en/wer_results.json') + glob.glob('/data/pp_1101/*/c*/seedtts_en/wer_results.json')):
+    rows = json.load(open(path))['per_sample']
+    bad += [row['id'] for row in rows if row['wer'] > 0.5 and row['id'] not in bad]
+    controls = controls or [row['id'] for row in rows[:24]]
+print(' '.join(bad + [sample_id for sample_id in controls if sample_id not in bad]))
+" > $Q/sample_ids.txt
+log "samples: $(wc -w < $Q/sample_ids.txt)"
 if [ $healthy = 0 ]; then
   PYTHONPATH=$TREE taskset -c $PIN python3 $S/run_bench.py gen --arm seedtts_en --port $PORT --concurrency 16 \
-    --out $Q/gen --max-samples 48 > $Q/gen.log 2>&1
+    --out $Q/gen --sample-ids $Q/sample_ids.txt > $Q/gen.log 2>&1
   log "gen rc $?; captures $(ls $Q/captures | wc -l)"
 else
   log "server not healthy: $(tail -2 $Q/serve.log | tr '\n' ' ')"
