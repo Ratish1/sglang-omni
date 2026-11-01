@@ -57,6 +57,7 @@ def main():
     parser.add_argument("--replays", type=int, default=200)
     parser.add_argument("--no-autotune-pointwise", action="store_true")
     parser.add_argument("--warmups", type=int, default=None)
+    parser.add_argument("--all-keys", action="store_true", help="every key of the cold, window, tail and warm0 runners")
     args = parser.parse_args()
     if args.no_autotune_pointwise:
         torch._inductor.config.triton.autotune_pointwise = False
@@ -107,12 +108,23 @@ def main():
         ("cold", scheduler.initial_incremental_decode_graphs),
         ("warm0", scheduler.followup_incremental_graph_holders[0]),
     ]
+    if args.all_keys:
+        runners += [
+            (name, runner)
+            for name, runner in (
+                ("window", scheduler.initial_window_decode_graphs),
+                ("tail", scheduler.initial_tail_decode_graphs),
+            )
+            if runner is not None
+        ]
+    else:
+        pass
     generator = torch.Generator(device="cpu").manual_seed(20261031)
     timings = []
     waveforms = {}
     for name, runner in runners:
         for key in sorted(runner.graphs, key=lambda item: (item.fresh_frames, item.batch_bucket)):
-            if key.fresh_frames not in compiled_widths:
+            if key.fresh_frames not in compiled_widths and not args.all_keys:
                 continue
             else:
                 pass
@@ -132,6 +144,8 @@ def main():
     result = {
         "form": os.environ.get("SGLANG_OMNI_CODEC_COMPILE_FORM", "main"),
         "oblivious": os.environ.get("SGLANG_OMNI_CODEC_OBLIVIOUS", "0"),
+        "region_dynamic": os.environ.get("SGLANG_OMNI_CODEC_REGION_DYNAMIC", "none"),
+        "all_widths": os.environ.get("SGLANG_OMNI_CODEC_COMPILE_ALL_WIDTHS", "0"),
         "autotune_pointwise": not args.no_autotune_pointwise,
         "import_s": round(imported - began, 2),
         "build_s": round(built - build_start, 2),
