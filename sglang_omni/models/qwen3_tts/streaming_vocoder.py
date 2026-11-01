@@ -6,6 +6,7 @@ import asyncio
 import contextlib
 import inspect
 import logging
+import os
 import queue
 import threading
 import time
@@ -1100,6 +1101,11 @@ class Qwen3TTSStreamingVocoderScheduler(
         graph_batch_sizes = self.resolve_incremental_warm_graph_batch_sizes(
             max_batch_size=min(self.followup_max_batch_size, codec_state_slots)
         )
+        # note (ratish): scratch switch for the compile-form probe; every cold, window and warm
+        # width compiled instead of the cold widths and the steady stride.
+        is_every_width_compiled = (
+            os.environ.get("SGLANG_OMNI_CODEC_COMPILE_ALL_WIDTHS") == "1"
+        )
         # note (ratish): the initial worker replays its cold, window and tail graphs one at a
         # time on its stream and copies each output out before the next, so they share a pool.
         initial_graph_pool = IncrementalCodecGraphPool(
@@ -1132,7 +1138,13 @@ class Qwen3TTSStreamingVocoderScheduler(
                 min_free_gb=min_free_gb,
                 enabled=graph_enabled,
                 compile_fresh_frames=(
-                    (self.stream_followup_stride,) if compile_kernels else ()
+                    (
+                        tuple(window_frames)
+                        if is_every_width_compiled
+                        else (self.stream_followup_stride,)
+                    )
+                    if compile_kernels
+                    else ()
                 ),
                 arena=self.codec_arena,
                 graph_pool=initial_graph_pool,
@@ -1196,7 +1208,13 @@ class Qwen3TTSStreamingVocoderScheduler(
                     min_free_gb=min_free_gb,
                     enabled=graph_enabled,
                     compile_fresh_frames=(
-                        (self.stream_followup_stride,) if compile_kernels else ()
+                        (
+                            warm_fresh_frames
+                            if is_every_width_compiled
+                            else (self.stream_followup_stride,)
+                        )
+                        if compile_kernels
+                        else ()
                     ),
                     arena=self.codec_arena,
                     graph_pool=IncrementalCodecGraphPool(
