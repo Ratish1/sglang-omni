@@ -47,7 +47,7 @@ module.relative_error = recording_error
 worst_wave, worst_state = 0.0, 0.0
 for seed in range(first, first + count):
     outcome, pairs = run(seed)
-    ratios = [compiled / eager for compiled, eager in pairs]
+    ratios = [compiled / eager if eager > 0 else (1.0 if compiled == 0 else float("inf")) for compiled, eager in pairs]
     state_keys = (len(pairs) - 2) // 2
     wave_indices = {0, 1 + state_keys}
     wave_ratios = [ratios[index] for index in sorted(wave_indices) if index < len(ratios)]
