@@ -1289,9 +1289,13 @@ class ModelRunner(Generic[RequestDataInput]):
                 row_groups[key] = (toks_t, [row_idx])
             else:
                 group[1].append(row_idx)
+        # note (ratish): an indexed assignment of a Python scalar copies it to the device and waits for the stream, here the whole prefill forward; index_fill_ takes it as a kernel argument.
         for toks_t, rows in row_groups.values():
             if len(rows) == logits.shape[0]:
-                logits[:, toks_t] = float("-inf")
+                logits.index_fill_(1, toks_t, float("-inf"))
             else:
-                rows_t = torch.tensor(rows, dtype=torch.long, device=device)
-                logits[rows_t[:, None], toks_t[None, :]] = float("-inf")
+                rows_t = async_h2d(rows, dtype=torch.long, device=device)
+                logits.index_put_(
+                    (rows_t[:, None], toks_t[None, :]),
+                    torch.full((), float("-inf"), dtype=logits.dtype, device=device),
+                )
