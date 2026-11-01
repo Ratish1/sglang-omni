@@ -157,6 +157,14 @@ def main() -> None:
             "SELECT correlationId, globalPid, shortName, start, end FROM CUPTI_ACTIVITY_KIND_KERNEL"
         ):
             kernel_name[(pid_of(gpid), corr)] = (strings.get(name_id, str(name_id)), end - start)
+        if "CUPTI_ACTIVITY_KIND_GRAPH_TRACE" in names:
+            for corr, gpid, graph_id, start, end in db.execute(
+                "SELECT correlationId, globalPid, graphId, start, end FROM CUPTI_ACTIVITY_KIND_GRAPH_TRACE "
+                "WHERE start > 0 AND end >= start"
+            ):
+                kernel_name[(pid_of(gpid), corr)] = (f"cuda graph {graph_id}", end - start)
+        else:
+            pass
     else:
         pass
     for corr, gpid, start, end in device_records(db, names, session[0], session[1]):
@@ -222,9 +230,9 @@ def main() -> None:
                 break
             else:
                 launched.extend(device_by_corr.get((pid, corr), ()))
-                if text in kernel_spans and (pid, corr) in kernel_name:
+                if (text in kernel_spans or NUMBERS.sub(r"\1=N", text) in kernel_spans) and (pid, corr) in kernel_name:
                     name, duration = kernel_name[(pid, corr)]
-                    kernels_inside[(stages.get(pid, pid), text)][name].append(duration)
+                    kernels_inside[(stages.get(pid, pid), NUMBERS.sub(r"\1=N", text))][name].append(duration)
                 else:
                     pass
                 cuda += min(call_end, end) - call_start
