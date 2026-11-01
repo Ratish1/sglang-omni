@@ -123,7 +123,11 @@ def patch_per_row(scheduler_cls, state):
         result = update_original(self, batch)
         now = time.perf_counter()
         counts = state.counts
-        if result is None or result.is_empty():
+        if result is not None and result.is_empty():
+            # note (ratish): only finished rows were left; the decode update dropped them,
+            # which main's gate never sees, so it is neither a deferral nor a decode step.
+            pass
+        elif result is None:
             counts["deferred"] += 1
             counts["rows_deferred"] += rows
             counts["unready_rows"] += rows
