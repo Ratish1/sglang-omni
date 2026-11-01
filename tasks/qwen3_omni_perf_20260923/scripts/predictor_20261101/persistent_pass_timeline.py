@@ -6,9 +6,10 @@ kernel's earliest start for b = 0), barrier latency = the first departure from b
 departure spread = the last departure minus the first. Per phase kind (qkv, attention, o_proj, gate_up, down, then
 the final norm from the last departure to the last program's end) the means over layers, passes and replays. Per
 step: the replay time, the kernels' spans summed, and the gaps between consecutive launches (one launch's last end to
-the next one's first start). The timer's smallest nonzero step is printed, as it bounds the resolution.
+the next one's first start). The timer's smallest nonzero step is printed, as it bounds the resolution. Each variant
+(VARIANTS) is its own runner and graph in the same process.
 
-usage: PYTHONPATH=<main tree> python3 persistent_pass_timeline.py [--card 0] [--batch 1 12 31 64] [--prefetch 0 1]
+usage: PYTHONPATH=<main tree> python3 persistent_pass_timeline.py [--card 0] [--batch 1 12 31 64] [--variant ...]
 """
 
 from __future__ import annotations
@@ -35,6 +36,16 @@ from sglang_omni.utils.predictor_layers import MAX_FUSED_ROWS
 
 KINDS = ("qkv", "attention", "o_proj", "gate_up", "down")
 REPLAYS = 20
+# note (ratish): (prefetch placement, weight layer step, weights loaded). "weights in L2" has every layer read layer 0's
+# 31 MB, which stays in L2: the best any L2 prefetch could give. "no weight loads" multiplies by zeros instead: what
+# is left with the weights already on chip. Both are timing only, their outputs are not the model's.
+VARIANTS = {
+    "no prefetch": (0, 1, True),
+    "prefetch at phase start": (1, 1, True),
+    "prefetch at phase end": (2, 1, True),
+    "weights in L2": (0, 0, True),
+    "no weight loads": (0, 1, False),
+}
 
 
 def read(
@@ -67,7 +78,8 @@ def read(
     )
 
 
-def timeline(batch_size: int, prefetch: bool, device: torch.device) -> None:
+def timeline(batch_size: int, variant: str, device: torch.device) -> None:
+    prefetch, weight_layer_step, load_weights = VARIANTS[variant]
     torch.manual_seed(batch_size)
     layers = make_layers(device)
     shape = make_shape(device)
@@ -79,7 +91,15 @@ def timeline(batch_size: int, prefetch: bool, device: torch.device) -> None:
     has_pair = 2 * batch_size <= max_rows
     passes = SLOTS - 3 + has_pair
     runner = PersistentPredictorPass(
-        layers, final_norm, shape, max_rows, device, prefetch, timeline_calls=passes
+        layers,
+        final_norm,
+        shape,
+        max_rows,
+        device,
+        prefetch,
+        timeline_calls=passes,
+        weight_layer_step=weight_layer_step,
+        load_weights=load_weights,
     )
     inputs = (
         torch.randn(batch_size, 2, HIDDEN, device=device).to(torch.bfloat16),
@@ -125,7 +145,7 @@ def timeline(batch_size: int, prefetch: bool, device: torch.device) -> None:
         smallest = int(nonzero.min()) if nonzero.numel() else 0
         resolution = smallest if resolution is None else min(resolution, smallest)
     print(
-        f"bs {batch_size} prefetch {int(prefetch)}: {passes} passes, step replay {replay_ms:.3f} ms; first start to "
+        f"bs {batch_size} {variant}: {passes} passes, step replay {replay_ms:.3f} ms; first start to "
         f"last end {statistics.median(spans):.1f} us, kernel spans summed {statistics.median(steps):.1f} us, gap "
         f"between launches mean {statistics.mean(gaps):.2f} us; timer step {resolution} ns"
     )
@@ -152,14 +172,14 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--card", type=int, default=0)
     parser.add_argument("--batch", type=int, nargs="+", default=[1, 12, 31, 64])
-    parser.add_argument("--prefetch", type=int, nargs="+", default=[0, 1])
+    parser.add_argument("--variant", nargs="+", default=list(VARIANTS))
     args = parser.parse_args()
     device = torch.device("cuda", args.card)
     torch.cuda.set_device(device)
     with torch.inference_mode():
         for batch_size in args.batch:
-            for prefetch in args.prefetch:
-                timeline(batch_size, bool(prefetch), device)
+            for variant in args.variant:
+                timeline(batch_size, variant, device)
 
 
 if __name__ == "__main__":

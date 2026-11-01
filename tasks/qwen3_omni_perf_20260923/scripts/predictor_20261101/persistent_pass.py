@@ -10,7 +10,7 @@ strided loop over the phase's tiles instead of the program id, and data written 
 kernel's reduction tree without the add, with explicit round-to-nearest products and sums, since this kernel compiles
 with fp fusion on (main's norm kernel compiles with it off).
 
-PREFETCH asks L2 for the next weight phase's lines at the start of each phase (o_proj during qkv and attention,
+PREFETCH 1 (2) asks L2 for the next weight phase's lines at the start (end) of each phase (o_proj during qkv and attention,
 gate_up during o_proj, down during gate_up, the next layer's qkv during down; the last down asks for layer 0's qkv,
 which the next pass reads first), each program a contiguous 1/programs share, so the HBM stream runs under the
 current phase's compute and the barriers.
@@ -122,6 +122,35 @@ def prefetch_l2(
 
 
 @triton.jit
+def prefetch_at(
+    W,
+    numel,
+    program,
+    programs,
+    PREFETCH: tl.constexpr,
+    AT: tl.constexpr,
+    LINE_BLOCK: tl.constexpr,
+    LINE_ELEMENTS: tl.constexpr,
+):
+    """prefetch_l2 where this call site's placement (1 phase start, 2 phase end) is the chosen one."""
+    if PREFETCH == AT:
+        prefetch_l2(W, numel, program, programs, LINE_BLOCK, LINE_ELEMENTS)
+    else:
+        pass
+
+
+@triton.jit
+def tile_weights(
+    W, cols, k0, K: tl.constexpr, BLOCK_K: tl.constexpr, LOAD: tl.constexpr
+):
+    """weight_tile, or (timing only) zeros in its place, so the phase runs without its weight stream."""
+    if LOAD:
+        return weight_tile(W, cols, k0, K, BLOCK_K)
+    else:
+        return tl.zeros([cols.shape[0], BLOCK_K], dtype=tl.bfloat16)
+
+
+@triton.jit
 def qkv_tile(
     X,
     x_stride_row,
@@ -154,6 +183,7 @@ def qkv_tile(
     SPLIT: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_K: tl.constexpr,
+    LOAD: tl.constexpr,
 ):
     """norm_qkv_rope_store_kernel's body for one (head, K split)."""
     HALF: tl.constexpr = HEAD_DIM // 2
@@ -180,10 +210,10 @@ def qkv_tile(
         square = tl.dot(x, tl.trans(x), square)
         scaled = scaled_tile(x, NORM_W, k0, BLOCK_K)
         acc_lo = tl.dot(
-            scaled, tl.trans(weight_tile(W, lo_cols, k0, K, BLOCK_K)), acc_lo
+            scaled, tl.trans(tile_weights(W, lo_cols, k0, K, BLOCK_K, LOAD)), acc_lo
         )
         acc_hi = tl.dot(
-            scaled, tl.trans(weight_tile(W, hi_cols, k0, K, BLOCK_K)), acc_hi
+            scaled, tl.trans(tile_weights(W, hi_cols, k0, K, BLOCK_K, LOAD)), acc_hi
         )
     sum_sq = diagonal(square)
     if SPLIT > 1:
@@ -366,6 +396,7 @@ def gemv_add_tile(
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
+    LOAD: tl.constexpr,
 ):
     """gemv_add_kernel's body for one (output tile, K split)."""
     HEADS_PER_SPLIT: tl.constexpr = K // D // SPLIT
@@ -384,7 +415,7 @@ def gemv_add_tile(
                 other=0.0,
                 cache_modifier=".cg",
             )
-            acc = tl.dot(x, tl.trans(weight_tile(W, cols, k0, K, BLOCK_K)), acc)
+            acc = tl.dot(x, tl.trans(tile_weights(W, cols, k0, K, BLOCK_K, LOAD)), acc)
     if SPLIT > 1:
         partial_offsets = (pid_s * BLOCK_M + rm)[:, None] * N + cols[None, :]
         tl.store(PARTIALS + partial_offsets, acc)
@@ -437,6 +468,7 @@ def gate_up_tile(
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
+    LOAD: tl.constexpr,
 ):
     """norm_gate_up_silu_kernel's body for one activation tile."""
     rm = tl.arange(0, BLOCK_M)
@@ -461,7 +493,7 @@ def gate_up_tile(
         square = tl.dot(x, tl.trans(x), square)
         scaled = scaled_tile(x, NORM_W, k0, BLOCK_K)
         acc = tl.dot(
-            scaled, tl.trans(weight_tile(W, stacked_cols, k0, K, BLOCK_K)), acc
+            scaled, tl.trans(tile_weights(W, stacked_cols, k0, K, BLOCK_K, LOAD)), acc
         )
     rstd = libdevice.rsqrt(diagonal(square) / K + norm_eps)
     products = (acc * rstd[:, None]).to(tl.bfloat16).to(tl.float32)
@@ -572,6 +604,8 @@ def predictor_pass_kernel(
     LINE_BLOCK: tl.constexpr,
     LINE_ELEMENTS: tl.constexpr,
     TIMELINE: tl.constexpr,
+    WEIGHT_LAYER_STEP: tl.constexpr,
+    LOAD_WEIGHTS: tl.constexpr,
 ):
     program = tl.program_id(0)
     programs = tl.num_programs(0)
@@ -595,17 +629,18 @@ def predictor_pass_kernel(
             x_in = RESIDUAL
         layer_k = K_CACHE + layer * cache_stride_layer
         layer_v = V_CACHE + layer * cache_stride_layer
-        if PREFETCH:
-            prefetch_l2(
-                W_O + layer * O_NUMEL,
-                O_NUMEL,
-                program,
-                programs,
-                LINE_BLOCK,
-                LINE_ELEMENTS,
-            )
-        else:
-            pass
+        weights = layer * WEIGHT_LAYER_STEP
+        next_weights = (layer + 1) % LAYERS * WEIGHT_LAYER_STEP
+        prefetch_at(
+            W_O + weights * O_NUMEL,
+            O_NUMEL,
+            program,
+            programs,
+            PREFETCH,
+            1,
+            LINE_BLOCK,
+            LINE_ELEMENTS,
+        )
         for tile in range(program, HEADS * SPLIT_QKV, programs):
             qkv_tile(
                 x_in,
@@ -614,7 +649,7 @@ def predictor_pass_kernel(
                 rows,
                 IN_NORM + layer * HIDDEN,
                 norm_eps,
-                W_QKV + layer * QKV_NUMEL,
+                W_QKV + weights * QKV_NUMEL,
                 Q_BUF,
                 Q_NORM + layer * HEAD_DIM,
                 K_NORM + layer * HEAD_DIM,
@@ -639,7 +674,18 @@ def predictor_pass_kernel(
                 SPLIT_QKV,
                 BLOCK_M,
                 BLOCK_K,
+                LOAD_WEIGHTS,
             )
+        prefetch_at(
+            W_O + weights * O_NUMEL,
+            O_NUMEL,
+            program,
+            programs,
+            PREFETCH,
+            2,
+            LINE_BLOCK,
+            LINE_ELEMENTS,
+        )
         barrier = grid_barrier(
             BARRIERS, barrier, BARRIER_COUNT, program, programs, TIMES, TIMELINE
         )
@@ -667,17 +713,16 @@ def predictor_pass_kernel(
         barrier = grid_barrier(
             BARRIERS, barrier, BARRIER_COUNT, program, programs, TIMES, TIMELINE
         )
-        if PREFETCH:
-            prefetch_l2(
-                W_GATE_UP + layer * GATE_UP_NUMEL,
-                GATE_UP_NUMEL,
-                program,
-                programs,
-                LINE_BLOCK,
-                LINE_ELEMENTS,
-            )
-        else:
-            pass
+        prefetch_at(
+            W_GATE_UP + weights * GATE_UP_NUMEL,
+            GATE_UP_NUMEL,
+            program,
+            programs,
+            PREFETCH,
+            1,
+            LINE_BLOCK,
+            LINE_ELEMENTS,
+        )
         for tile in range(program, HIDDEN_TILES * SPLIT_HIDDEN, programs):
             gemv_add_tile(
                 ATTN_OUT,
@@ -685,7 +730,7 @@ def predictor_pass_kernel(
                 Q_WIDTH,
                 HEAD_DIM,
                 rows,
-                W_O + layer * O_NUMEL,
+                W_O + weights * O_NUMEL,
                 x_in,
                 HIDDEN,
                 RESIDUAL,
@@ -701,21 +746,31 @@ def predictor_pass_kernel(
                 BLOCK_M,
                 BLOCK_N,
                 BLOCK_K,
+                LOAD_WEIGHTS,
             )
+        prefetch_at(
+            W_GATE_UP + weights * GATE_UP_NUMEL,
+            GATE_UP_NUMEL,
+            program,
+            programs,
+            PREFETCH,
+            2,
+            LINE_BLOCK,
+            LINE_ELEMENTS,
+        )
         barrier = grid_barrier(
             BARRIERS, barrier, BARRIER_COUNT, program, programs, TIMES, TIMELINE
         )
-        if PREFETCH:
-            prefetch_l2(
-                W_DOWN + layer * DOWN_NUMEL,
-                DOWN_NUMEL,
-                program,
-                programs,
-                LINE_BLOCK,
-                LINE_ELEMENTS,
-            )
-        else:
-            pass
+        prefetch_at(
+            W_DOWN + weights * DOWN_NUMEL,
+            DOWN_NUMEL,
+            program,
+            programs,
+            PREFETCH,
+            1,
+            LINE_BLOCK,
+            LINE_ELEMENTS,
+        )
         for tile in range(program, INTERMEDIATE // BLOCK_N, programs):
             gate_up_tile(
                 RESIDUAL,
@@ -724,7 +779,7 @@ def predictor_pass_kernel(
                 rows,
                 POST_NORM + layer * HIDDEN,
                 norm_eps,
-                W_GATE_UP + layer * GATE_UP_NUMEL,
+                W_GATE_UP + weights * GATE_UP_NUMEL,
                 ACTIVATED,
                 tile,
                 1,
@@ -733,21 +788,31 @@ def predictor_pass_kernel(
                 BLOCK_M,
                 BLOCK_N,
                 MLP_BLOCK_K,
+                LOAD_WEIGHTS,
             )
+        prefetch_at(
+            W_DOWN + weights * DOWN_NUMEL,
+            DOWN_NUMEL,
+            program,
+            programs,
+            PREFETCH,
+            2,
+            LINE_BLOCK,
+            LINE_ELEMENTS,
+        )
         barrier = grid_barrier(
             BARRIERS, barrier, BARRIER_COUNT, program, programs, TIMES, TIMELINE
         )
-        if PREFETCH:
-            prefetch_l2(
-                W_QKV + (layer + 1) % LAYERS * QKV_NUMEL,
-                QKV_NUMEL,
-                program,
-                programs,
-                LINE_BLOCK,
-                LINE_ELEMENTS,
-            )
-        else:
-            pass
+        prefetch_at(
+            W_QKV + next_weights * QKV_NUMEL,
+            QKV_NUMEL,
+            program,
+            programs,
+            PREFETCH,
+            1,
+            LINE_BLOCK,
+            LINE_ELEMENTS,
+        )
         for tile in range(program, HIDDEN_TILES * SPLIT_HIDDEN, programs):
             gemv_add_tile(
                 ACTIVATED,
@@ -755,7 +820,7 @@ def predictor_pass_kernel(
                 INTERMEDIATE,
                 BLOCK_K,
                 rows,
-                W_DOWN + layer * DOWN_NUMEL,
+                W_DOWN + weights * DOWN_NUMEL,
                 RESIDUAL,
                 HIDDEN,
                 RESIDUAL,
@@ -771,7 +836,18 @@ def predictor_pass_kernel(
                 BLOCK_M,
                 BLOCK_N,
                 BLOCK_K,
+                LOAD_WEIGHTS,
             )
+        prefetch_at(
+            W_QKV + next_weights * QKV_NUMEL,
+            QKV_NUMEL,
+            program,
+            programs,
+            PREFETCH,
+            2,
+            LINE_BLOCK,
+            LINE_ELEMENTS,
+        )
         barrier = grid_barrier(
             BARRIERS, barrier, BARRIER_COUNT, program, programs, TIMES, TIMELINE
         )
@@ -806,12 +882,18 @@ class PersistentPredictorPass:
         shape,
         max_rows: int,
         device: torch.device,
-        prefetch: bool,
+        prefetch: int,
         timeline_calls: int = 0,
+        weight_layer_step: int = 1,
+        load_weights: bool = True,
     ) -> None:
         self.shape = shape
         self.max_rows = max_rows
-        self.prefetch = prefetch
+        # note (ratish): prefetch 0 none, 1 at each phase's start, 2 at its end; weight_layer_step 0 (every layer
+        # reads layer 0's weights, which stay in L2) and load_weights False (zeros) are timing-only variants.
+        self.prefetch = int(prefetch)
+        self.weight_layer_step = weight_layer_step
+        self.load_weights = load_weights
         self.programs = torch.cuda.get_device_properties(device).multi_processor_count
         # note (ratish): with timeline_calls, call i stores its programs' barrier times in times[i % timeline_calls].
         self.timeline_calls = timeline_calls
@@ -938,6 +1020,8 @@ class PersistentPredictorPass:
                     LINE_BLOCK=LINE_BLOCK,
                     LINE_ELEMENTS=LINE_ELEMENTS,
                     TIMELINE=self.timeline_calls > 0,
+                    WEIGHT_LAYER_STEP=self.weight_layer_step,
+                    LOAD_WEIGHTS=self.load_weights,
                     num_warps=NUM_WARPS,
                     num_stages=stages,
                     launch_cooperative_grid=True,
