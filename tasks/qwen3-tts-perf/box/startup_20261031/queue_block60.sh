@@ -4,7 +4,7 @@
 # built (collect and freeze before each stage's construction); both. Default 1.7B Base on card 0, one boot at a time:
 # each tree cold into its own cache, then three rounds of warm boots (order reversed in the second) with
 # gc_census/sitecustomize.py on the path; gc_split.py per boot (GC seconds by phase), boot_split.py over all of them.
-# Waits for block 59b first.
+# Waits for block 59c first.
 # usage: D=... T=<kit tree> MAIN=<tree> VFREEZE=<tree> STAGE=<tree> BOTH=<tree> bash queue_block60.sh
 set -u
 D=${D:?the results directory}
@@ -18,7 +18,7 @@ M17=Qwen/Qwen3-TTS-12Hz-1.7B-Base
 W=$D/block60
 L=$W/queue.log
 mkdir -p $W/logs
-until grep -q "queue block59b done" $D/block59b/queue.log 2> /dev/null; do sleep 20; done
+until grep -q "queue block59c done" $D/block59c/queue.log 2> /dev/null; do sleep 20; done
 for arm in MAIN VFREEZE STAGE BOTH; do
   tree=${!arm}
   echo "tree $arm $tree $(git -C $tree rev-parse HEAD HEAD:sglang_omni | tr '\n' ' ')$(git -C $tree diff --quiet HEAD -- sglang_omni || echo DIRTY)" >> $L
