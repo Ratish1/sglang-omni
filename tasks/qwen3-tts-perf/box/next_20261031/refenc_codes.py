@@ -71,6 +71,8 @@ def encode_all(
     runner = batcher.graph_runner
     if runner is not None:
         for frames, captured in sorted(runner.graphs.items()):
+            # note (ratish): every bucket's graph pads past clip_samples, so a timed replay reads its own full length.
+            runner.clip_samples.fill_(frames * runner.hop)
             with torch.cuda.stream(runner.stream):
                 for _ in range(10):
                     captured.graph.replay()
