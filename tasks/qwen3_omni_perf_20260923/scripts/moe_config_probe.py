@@ -29,6 +29,7 @@ from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe_triton_config impor
 )
 from sglang.srt.layers.moe.topk import StandardTopKOutput
 from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
+from sglang.test.test_utils import publish_build_topology
 
 EXPERTS = 128
 TOP_K = 8
@@ -85,12 +86,8 @@ def main() -> None:
     os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
     os.environ.setdefault("MASTER_PORT", "29652")
     init_distributed_environment(world_size=1, rank=0, local_rank=0, backend="gloo")
-    initialize_model_parallel(
-        tensor_model_parallel_size=1,
-        expert_model_parallel_size=1,
-        pipeline_model_parallel_size=1,
-        backend="gloo",
-    )
+    publish_build_topology()
+    initialize_model_parallel(backend="gloo")
     device = torch.device("cuda")
     print(
         f"{args.label}: {torch.cuda.get_device_name()}, config dir "
