@@ -320,32 +320,59 @@ def main() -> None:
     print(f"  card held by some context {sum(b - a for a, b in held) / 1e6:8.1f} ms of {window_ns / 1e6:.1f}; "
           f"switches {sum(len(spans) for _, _, spans in contexts.values())}")
 
-    # note (ratish): a slice opens when the card turns to a context with queued work, so the span its process was in
-    # at that moment names the host phase that brought the work
-    by_pid = defaultdict(list)
+    # note (ratish): a slice runs the device work its context had queued, so the first work item inside it, traced
+    # back through its correlation id to the CUDA call that launched it, names the thread and span that brought it
+    by_tid = defaultdict(list)
     for start, end, text, gtid in ranges:
-        by_pid[pid_of(gtid)].append((start, end, NUMBERS.sub(r"\1=N", text)))
-    for spans in by_pid.values():
+        by_tid[gtid].append((start, end, NUMBERS.sub(r"\1=N", text)))
+    for spans in by_tid.values():
         spans.sort()
-    print("\nG. card slices by the span their process was in when the slice opened: span, slices, held ms, slice p50 ms")
+    thread_family = {gtid: max({t.split(" ")[0].split("[")[0] for _, _, t in spans},
+                               key=lambda f: sum(1 for _, _, t in spans if t.startswith(f)))
+                     for gtid, spans in by_tid.items()}
+    launch_of = {}
+    for gtid, calls in calls_by_tid.items():
+        for call_start, _, _, corr in calls:
+            launch_of[(pid_of(gtid), corr)] = (gtid, call_start)
+    work_by_pid = defaultdict(list)
+    for (pid, corr), intervals in device_by_corr.items():
+        for start, _ in intervals:
+            work_by_pid[pid].append((start, corr))
+    for work in work_by_pid.values():
+        work.sort()
+
+    def enclosing(gtid, moment):
+        spans = by_tid.get(gtid, [])
+        k = bisect.bisect_right(spans, (moment, float("inf"), "")) - 1
+        best = None
+        for j in range(k, max(-1, k - 400), -1):
+            start, end, text = spans[j]
+            if end >= moment and (best is None or end - start < best[1] - best[0]):
+                best = (start, end, text)
+            else:
+                pass
+        return best[2] if best else None
+
+    print("\nG. card slices by the launching thread and span of the first work they ran: span, slices, held ms, "
+          "slice p50 ms")
     for context, (owner, inside, spans) in sorted(contexts.items(), key=lambda item: -len(item[1][2])):
-        if inside < 0.4 or owner not in by_pid:
+        if inside < 0.4 or owner not in work_by_pid:
             continue
         else:
             pass
-        own_ranges = by_pid[owner]
-        starts = [r[0] for r in own_ranges]
+        work = work_by_pid[owner]
+        work_starts = [w[0] for w in work]
         attributed = defaultdict(list)
         for slice_start, slice_end in spans:
-            k = bisect.bisect_right(starts, slice_start) - 1
-            best = None
-            for j in range(k, max(-1, k - 400), -1):
-                start, end, text = own_ranges[j]
-                if end >= slice_start and (best is None or end - start < best[1] - best[0]):
-                    best = (start, end, text)
-                else:
-                    pass
-            attributed[best[2] if best else "(outside spans)"].append(slice_end - slice_start)
+            k = bisect.bisect_left(work_starts, slice_start)
+            if k >= len(work) or work[k][0] >= slice_end:
+                label = "(no work started inside)"
+            elif (owner, work[k][1]) not in launch_of:
+                label = "(launch not traced)"
+            else:
+                gtid, moment = launch_of[(owner, work[k][1])]
+                label = f"{thread_family.get(gtid, 'thread')}: {enclosing(gtid, moment) or '(outside spans)'}"
+            attributed[label].append(slice_end - slice_start)
         total = sum(len(v) for v in attributed.values())
         print(f"\n  [{stages.get(owner, owner)}] ctx {context}: {total} slices")
         for text, lengths in sorted(attributed.items(), key=lambda item: -len(item[1]))[:14]:
