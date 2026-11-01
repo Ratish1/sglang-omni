@@ -68,13 +68,22 @@ def build(dtype_name: str, out: str, paths: list[str]) -> None:
     with torch.inference_mode():
         for path in paths:
             record = torch.load(path, map_location="cpu")
-            sample = prompts[record["request_text"][-1]]
+            # note (ratish): the capture's request_text is empty on this tree; the talker's prompt ids hold the user turn.
+            user_turn = processor.tokenizer.decode(record["prefill_input_ids"])
+            matches = [prompt for prompt in prompts if prompt in user_turn]
+            if len(matches) != 1:
+                print(f"skip {record['request_id']}: {len(matches)} prompt matches")
+                continue
+            else:
+                pass
+            prompt_text = matches[0]
+            sample = prompts[prompt_text]
             messages = [
                 {
                     "role": "user",
                     "content": [
                         {"type": "audio", "audio": sample.ref_audio},
-                        {"type": "text", "text": record["request_text"][-1]},
+                        {"type": "text", "text": prompt_text},
                     ],
                 }
             ]
@@ -178,6 +187,7 @@ def build(dtype_name: str, out: str, paths: list[str]) -> None:
                 "user_rows": user_embeds.shape[1],
                 "user_multimodal": user_multimodal.cpu(),
                 "trailing": trailing[0].float().cpu(),
+                "sample_id": sample.sample_id,
             }
             print(f"built {record['request_id']} {dtype_name}", flush=True)
     torch.save(rows, out)
@@ -195,6 +205,11 @@ def compare(truth_path: str, floor_path: str, paths: list[str]) -> None:
     for path in paths:
         record = torch.load(path, map_location="cpu")
         request_id = record["request_id"]
+        if request_id not in truth_rows or request_id not in floor_rows:
+            print(f"skip {request_id}: not built")
+            continue
+        else:
+            pass
         truth = truth_rows[request_id]
         floor = floor_rows[request_id]
         ours = record["prefill_input_embeds"].float()
@@ -224,7 +239,7 @@ def compare(truth_path: str, floor_path: str, paths: list[str]) -> None:
             ),
             "assistant": torch.arange(ours.shape[0]) >= user_rows,
         }
-        line = [request_id]
+        line = [truth["sample_id"]]
         for name, mask in groups.items():
             if not mask.any():
                 continue
