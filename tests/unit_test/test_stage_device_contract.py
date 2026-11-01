@@ -436,6 +436,9 @@ SELF_BUILT_SERVER_ARGS_FACTORIES = [
     "sglang_omni.models.qwen3_omni.stages.create_talker_ar_executor_from_config",
 ]
 REQUIRED_FACTORY_KWARGS = {
+    "sglang_omni.models.qwen3_omni.stages.create_sglang_thinker_executor_from_config": {
+        "max_running_requests": 64
+    },
     "sglang_omni.models.qwen3_omni.stages.create_talker_ar_executor_from_config": {
         "max_running_requests": 32
     },
