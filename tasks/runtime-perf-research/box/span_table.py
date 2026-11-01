@@ -90,36 +90,32 @@ def device_records(db, names, lo, hi):
     return rows
 
 
-def context_slices(db, names, lo, hi):
-    """Per process, the intervals its context held the card: GPU_CONTEXT_SWITCH_EVENTS pairs one tag with the next
-    event of the same context; which tag opens a slice is chosen as the one whose intervals hold the process's own
-    kernels (both readings printed)."""
+RESTORE_START, SAVE_END = 8, 7
+
+
+def context_slices(db, names, lo, hi, busy):
+    """Per switch context, the intervals it held the card (RESTORE_START to the next SAVE_END, ENUM_GPU_CTX_SWITCH),
+    and the process it belongs to: the switch table carries host pids and its own context ids, so a context is
+    given to the process whose device work lies most inside its slices."""
     if "GPU_CONTEXT_SWITCH_EVENTS" not in names:
-        return {}, {}
+        return {}
     else:
         pass
-    # note (ratish): the switch table carries host pids, so a context is named by the pid its kernels carry
-    pid_by_context = dict(db.execute(
-        "SELECT contextId, (globalPid >> 24) & 16777215 FROM CUPTI_ACTIVITY_KIND_KERNEL GROUP BY contextId"
-    ))
     events = defaultdict(list)
     for tag, context, stamp in db.execute(
         "SELECT tag, contextId, timestamp FROM GPU_CONTEXT_SWITCH_EVENTS WHERE timestamp BETWEEN ? AND ? "
         "ORDER BY timestamp", (lo, hi),
     ):
-        events[(pid_by_context.get(context, -context), context)].append((stamp, tag))
-    tags = sorted({tag for rows in events.values() for _, tag in rows})
-    by_tag = {}
-    for opening in tags:
-        slices = defaultdict(list)
-        for (pid, _), rows in events.items():
-            for (stamp, tag), (next_stamp, _) in zip(rows, rows[1:]):
-                if tag == opening:
-                    slices[pid].append((stamp, next_stamp))
-                else:
-                    pass
-        by_tag[opening] = {pid: merged(spans) for pid, spans in slices.items()}
-    return by_tag, tags
+        events[context].append((stamp, tag))
+    contexts = {}
+    for context, rows in events.items():
+        spans = merged([(stamp, next_stamp) for (stamp, tag), (next_stamp, next_tag) in zip(rows, rows[1:])
+                        if tag == RESTORE_START and next_tag == SAVE_END])
+        inside = {pid: sum(covered(spans, a, b, first_at(spans, a)) for a, b in own) / max(1, sum(b - a for a, b in own))
+                  for pid, own in busy.items()}
+        owner = max(inside, key=inside.get) if inside else None
+        contexts[context] = (owner, inside.get(owner, 0.0), spans)
+    return contexts
 
 
 def main() -> None:
@@ -270,20 +266,19 @@ def main() -> None:
     else:
         pass
 
-    by_tag, tags = context_slices(db, names, session[0], session[1])
-    print(f"\nD. card time slices per process (GPU_CONTEXT_SWITCH_EVENTS tags {tags}); own = share of the process's "
-          "device work inside its slices under that reading")
-    for opening, slices in by_tag.items():
-        print(f"\n  slice opens at tag {opening}")
-        for pid, spans in sorted(slices.items(), key=lambda item: -sum(b - a for a, b in item[1])):
-            lengths = [(b - a) / 1e6 for a, b in spans]
-            held = sum(lengths)
-            own = busy.get(pid, [])
-            inside = sum(covered(spans, a, b, first_at(spans, a)) for a, b in own)
-            total = sum(b - a for a, b in own) or 1
-            print(f"    {stages.get(pid, f'pid{pid}'):16s} slices {len(spans):6d} held {held:8.1f} ms "
-                  f"{100 * held * 1e6 / window_ns:5.1f} % p50 {statistics.median(lengths) if lengths else 0:7.3f} "
-                  f"p90 {pct(lengths, 0.9):7.3f} ms, own work inside {100 * inside / total:5.1f} %")
+    contexts = context_slices(db, names, session[0], session[1], busy)
+    print("\nD. card time slices per switch context (RESTORE_START to SAVE_END): owner process, share of the owner's "
+          "device work inside the slices, slices, time held, slice p50/p90 ms")
+    all_slices = []
+    for context, (owner, inside, spans) in sorted(contexts.items(), key=lambda item: -sum(b - a for a, b in item[1][2])):
+        lengths = [(b - a) / 1e6 for a, b in spans]
+        all_slices.extend(spans)
+        print(f"  ctx {context:9d} {stages.get(owner, f'pid{owner}'):16s} own work inside {100 * inside:5.1f} % "
+              f"slices {len(spans):6d} held {sum(lengths):8.1f} ms {100 * sum(lengths) * 1e6 / window_ns:5.1f} % "
+              f"p50 {statistics.median(lengths) if lengths else 0:7.3f} p90 {pct(lengths, 0.9):7.3f}")
+    held = merged(all_slices)
+    print(f"  card held by some context {sum(b - a for a, b in held) / 1e6:8.1f} ms of {window_ns / 1e6:.1f}; "
+          f"switches {sum(len(spans) for _, _, spans in contexts.values())}")
 
 
 if __name__ == "__main__":
