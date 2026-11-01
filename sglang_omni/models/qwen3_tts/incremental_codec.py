@@ -351,7 +351,7 @@ if current_platform.is_cuda():
     compiled_bias_snake_beta_sum = register_custom_op(
         bias_snake_beta_sum_tensors,
         op_name="qwen3_tts_codec_bias_snake_beta_sum",
-        mutates_args=["out", "sum_out"],
+        mutates_args=[],
     )
 else:
     pass
