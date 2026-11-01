@@ -49,6 +49,8 @@ class Qwen3OmniThinkerModelRunner(ThinkerModelRunner):
     eager multimodal path.
     """
 
+    speech_lookahead = True
+
     @staticmethod
     def origin_num_tokens(value: object) -> int | None:
         if isinstance(value, torch.Tensor):
