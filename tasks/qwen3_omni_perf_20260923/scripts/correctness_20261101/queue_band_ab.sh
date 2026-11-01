@@ -10,8 +10,8 @@ C=$S/correctness_20261101
 PIN=0-31,64-95
 MODEL=Qwen/Qwen3-Omni-30B-A3B-Instruct
 ASR_MODEL=Qwen/Qwen3-ASR-1.7B
-PORT=35000
-ASR_PORT=35200
+PORT=36400
+ASR_PORT=36600
 PASSES=${PASSES:-10}
 IDS=$Q/sample_ids.txt
 mkdir -p $Q
