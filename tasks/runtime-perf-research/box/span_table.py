@@ -124,7 +124,10 @@ def main() -> None:
     parser.add_argument("serve_log")
     parser.add_argument("--top", type=int, default=40)
     parser.add_argument("--labels", action="store_true")
+    parser.add_argument("--calls", default="", help="comma list of span names: CUDA calls inside them by time")
     args = parser.parse_args()
+    call_spans = set(filter(None, args.calls.split(",")))
+    calls_inside = defaultdict(lambda: defaultdict(list))
 
     stages = {}
     with open(args.serve_log, encoding="utf-8", errors="replace") as log:
@@ -206,6 +209,10 @@ def main() -> None:
             else:
                 launched.extend(device_by_corr.get((pid, corr), ()))
                 cuda += min(call_end, end) - call_start
+                if text in call_spans:
+                    calls_inside[(stages.get(pid, pid), text)][call_name].append(min(call_end, end) - call_start)
+                else:
+                    pass
                 if call_name.startswith(SYNC_CALLS):
                     sync += call_end - call_start
                 else:
@@ -265,6 +272,12 @@ def main() -> None:
                       f" other {statistics.median(r[4] / 1e6 for r in records):7.3f}")
     else:
         pass
+
+    for (stage, text), by_call in sorted(calls_inside.items(), key=str):
+        print(f"\nE. CUDA calls inside {text} [{stage}]: call, count, total ms, p50 ms, max ms")
+        for call, durations in sorted(by_call.items(), key=lambda item: -sum(item[1]))[:12]:
+            print(f"    {call[:48]:48s} n {len(durations):7d} total {sum(durations) / 1e6:9.1f} "
+                  f"p50 {statistics.median(durations) / 1e6:8.3f} max {max(durations) / 1e6:8.3f}")
 
     contexts = context_slices(db, names, session[0], session[1], busy)
     print("\nD. card time slices per switch context (RESTORE_START to SAVE_END): owner process, share of the owner's "
