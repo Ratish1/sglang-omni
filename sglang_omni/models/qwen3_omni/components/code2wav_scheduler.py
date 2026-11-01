@@ -36,6 +36,7 @@ from sglang_omni.models.qwen3_omni.payload_types import NO_SPEECH, UNIT_FORMAT
 from sglang_omni.platforms import current_platform
 from sglang_omni.profiler.event_recorder import emit as _emit_event
 from sglang_omni.profiler.event_recorder import get_recorder as _get_event_recorder
+from sglang_omni.profiler.spans import rows_span, span
 from sglang_omni.proto import StagePayload
 from sglang_omni.scheduling.message import IncomingMessage, OutgoingMessage
 from sglang_omni.scheduling.streaming_vocoder import (
@@ -1082,12 +1083,14 @@ class Code2WavScheduler(StreamingVocoderBase[Code2WavStreamState, "list[int]"]):
         """One replay over the ready windows of one length, once the inbox holds nothing more."""
         failed: list[str] = []
         with self.state_lock:
-            self.reap_retired()
-            failed.extend(self.emit_completed_windows())
+            with span("omni.code2wav_emit_completed"):
+                self.reap_retired()
+                failed.extend(self.emit_completed_windows())
             participants = self.ready_window_group()
             if participants:
                 try:
-                    messages = self.decode_windows(participants)
+                    with rows_span("omni.code2wav_decode", len(participants)):
+                        messages = self.decode_windows(participants)
                 except Exception as exc:
                     failed.extend(self.on_step_failure(participants, exc))
                 else:

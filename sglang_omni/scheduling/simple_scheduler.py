@@ -21,6 +21,7 @@ from collections.abc import Coroutine, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from typing import Awaitable, Callable, Generic, Protocol
 
+from sglang_omni.profiler.spans import rows_span
 from sglang_omni.proto.request import StagePayload
 from sglang_omni.scheduling.message import IncomingMessage, OutgoingMessage
 from sglang_omni.scheduling.threaded_simple_scheduler import ComputeInput, ComputeResult
@@ -252,17 +253,19 @@ class SimpleScheduler(Generic[ComputeInput, ComputeResult]):
     ) -> None:
         if self.batch_fn is None or len(batch) <= 1:
             for msg in batch:
-                self.run_single(msg, loop)
+                with rows_span("omni.simple_run", 1):
+                    self.run_single(msg, loop)
             return
         else:
             pass
 
         payloads = [msg.data for msg in batch]
-        results = self.batch_fn(payloads)
-        if asyncio.iscoroutine(results):
-            results = loop.run_until_complete(results)
-        else:
-            pass
+        with rows_span("omni.simple_run", len(payloads)):
+            results = self.batch_fn(payloads)
+            if asyncio.iscoroutine(results):
+                results = loop.run_until_complete(results)
+            else:
+                pass
         if len(results) != len(batch):
             raise ValueError(
                 f"batch_compute_fn returned {len(results)} results for {len(batch)} requests"

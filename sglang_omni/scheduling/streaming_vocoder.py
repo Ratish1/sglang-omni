@@ -40,6 +40,7 @@ import torch
 from typing_extensions import Generic, TypeVar
 
 from sglang_omni.pipeline.stage.stream_queue import StreamItem
+from sglang_omni.profiler.spans import rows_span, span
 from sglang_omni.proto import StagePayload
 from sglang_omni.proto.session import (
     SessionOperation,
@@ -348,7 +349,7 @@ class StreamingVocoderBase(
         external abort callbacks for failed requests run after the lock is
         released, matching the serving loop."""
         failed: list[str] = []
-        with self.state_lock:
+        with self.state_lock, rows_span("omni.vocoder_ingest", len(items)):
             for request_id, item in items:
                 if self.is_aborted(request_id):
                     continue
@@ -780,18 +781,20 @@ class StreamingVocoderBase(
             return None
         else:
             pass
-        plan = self.build_step_plan(participants)
-        try:
-            decoded = self.run_step(participants, plan)
-        except Exception as exc:
-            return list(self.on_step_failure(participants, exc))
-        for request_id, _ in participants:
-            waveform = decoded.get(request_id)
-            if waveform is not None and not self.is_aborted(request_id):
-                self.mark_stream_emitted(request_id)
-                self.outbox.put(self.stream_chunk_message(request_id, waveform))
-            else:
-                pass
+        with rows_span("omni.vocoder_step", len(participants)):
+            plan = self.build_step_plan(participants)
+            try:
+                decoded = self.run_step(participants, plan)
+            except Exception as exc:
+                return list(self.on_step_failure(participants, exc))
+            with span("omni.vocoder_emit"):
+                for request_id, _ in participants:
+                    waveform = decoded.get(request_id)
+                    if waveform is not None and not self.is_aborted(request_id):
+                        self.mark_stream_emitted(request_id)
+                        self.outbox.put(self.stream_chunk_message(request_id, waveform))
+                    else:
+                        pass
         return []
 
     def pump_streams(self) -> list[str]:

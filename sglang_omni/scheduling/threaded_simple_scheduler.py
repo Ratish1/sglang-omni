@@ -12,6 +12,7 @@ from collections.abc import Coroutine
 from concurrent.futures import Future, ThreadPoolExecutor
 from typing import Callable, Generic, Protocol, TypeVar
 
+from sglang_omni.profiler.spans import span
 from sglang_omni.scheduling.message import IncomingMessage, OutgoingMessage
 
 logger = logging.getLogger(__name__)
@@ -275,11 +276,12 @@ class ThreadedSimpleScheduler(Generic[ComputeInput, ComputeResult]):
             )
 
     def run_one(self, payload: ComputeInput) -> ComputeResult:
-        result = self.fn(payload)
-        if inspect.isawaitable(result):
-            result = asyncio.run(result)
-        else:
-            pass
+        with span("omni.threaded_run"):
+            result = self.fn(payload)
+            if inspect.isawaitable(result):
+                result = asyncio.run(result)
+            else:
+                pass
         return result
 
     def log_failure(self, request_id: str, exc: BaseException) -> None:
