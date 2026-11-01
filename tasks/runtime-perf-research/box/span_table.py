@@ -98,12 +98,16 @@ def context_slices(db, names, lo, hi):
         return {}, {}
     else:
         pass
+    # note (ratish): the switch table carries host pids, so a context is named by the pid its kernels carry
+    pid_by_context = dict(db.execute(
+        "SELECT contextId, (globalPid >> 24) & 16777215 FROM CUPTI_ACTIVITY_KIND_KERNEL GROUP BY contextId"
+    ))
     events = defaultdict(list)
-    for tag, context, stamp, gpid in db.execute(
-        "SELECT tag, contextId, timestamp, globalPid FROM GPU_CONTEXT_SWITCH_EVENTS WHERE timestamp BETWEEN ? AND ? "
+    for tag, context, stamp in db.execute(
+        "SELECT tag, contextId, timestamp FROM GPU_CONTEXT_SWITCH_EVENTS WHERE timestamp BETWEEN ? AND ? "
         "ORDER BY timestamp", (lo, hi),
     ):
-        events[(pid_of(gpid), context)].append((stamp, tag))
+        events[(pid_by_context.get(context, -context), context)].append((stamp, tag))
     tags = sorted({tag for rows in events.values() for _, tag in rows})
     by_tag = {}
     for opening in tags:
@@ -199,12 +203,13 @@ def main() -> None:
                 lo = mid + 1
             else:
                 hi = mid
-        launched, sync = [], 0
+        launched, sync, cuda = [], 0, 0
         for call_start, call_end, call_name, corr in calls[lo:]:
             if call_start >= end:
                 break
             else:
                 launched.extend(device_by_corr.get((pid, corr), ()))
+                cuda += min(call_end, end) - call_start
                 if call_name.startswith(SYNC_CALLS):
                     sync += call_end - call_start
                 else:
@@ -220,7 +225,7 @@ def main() -> None:
                 pass
         os_spans = os_by_tid.get(gtid, [])
         os_time = covered(os_spans, start, end, first_at(os_spans, start)) if os_spans else 0
-        record = (end - start, dev, lag, sync, other, os_time)
+        record = (end - start, dev, lag, sync, other, os_time, cuda)
         stats[stages[pid]][NUMBERS.sub(r"\1=N", text)].append(record)
         if args.labels and text.startswith("omni.forward"):
             labels[stages[pid]][text].append(record)
@@ -234,7 +239,8 @@ def main() -> None:
         print(f"  {stages.get(pid, f'pid{pid}'):16s} pid {pid:7d} {total / 1e6:10.1f} ms {100 * total / window_ns:6.1f} %")
 
     print("\nB. spans per stage: n, wall sum ms and % of window, wall p50/p90/p99 ms, dev p50 ms, lag p50 ms, "
-          "sync p50 ms, other p50 ms, os (OS runtime calls on the thread: locks, the GIL, sleeps) p50 ms")
+          "sync p50 ms, other p50 ms, os (OS runtime calls on the thread: locks, the GIL, sleeps) p50 ms, cuda (every "
+          "CUDA runtime call on the thread, blocking copies included) p50 ms")
     for stage, by_name in sorted(stats.items()):
         print(f"\n  [{stage}]")
         rows = sorted(by_name.items(), key=lambda item: -sum(r[0] for r in item[1]))[: args.top]
@@ -247,7 +253,8 @@ def main() -> None:
                   f" lag {statistics.median(lags) if lags else 0:7.3f}"
                   f" sync {statistics.median(r[3] / 1e6 for r in records):7.3f}"
                   f" other {statistics.median(r[4] / 1e6 for r in records):7.3f}"
-                  f" os {statistics.median(r[5] / 1e6 for r in records):7.3f}")
+                  f" os {statistics.median(r[5] / 1e6 for r in records):7.3f}"
+                  f" cuda {statistics.median(r[6] / 1e6 for r in records):7.3f}")
 
     if args.labels:
         print("\nC. omni.forward by exact label: n, wall p50/p90 ms, dev p50 ms, lag p50 ms, other p50 ms")
