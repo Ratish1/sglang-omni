@@ -20,7 +20,7 @@ from sglang_omni.models.qwen3_tts import incremental_codec
 from sglang_omni.models.qwen3_tts.incremental_codec_cuda_graph import (
     Qwen3TTSIncrementalCodecCudaGraphRunner,
 )
-from sglang_omni.models.qwen3_tts.stages import create_vocoder_executor
+from sglang_omni.models.qwen3_tts.stages import create_vocoder_executor, load_qwen3_tts_tokenizer
 
 
 def zero_arena(arena):
@@ -58,6 +58,11 @@ def main():
     parser.add_argument("--no-autotune-pointwise", action="store_true")
     parser.add_argument("--warmups", type=int, default=None)
     parser.add_argument("--all-keys", action="store_true", help="every key of the cold, window, tail and warm0 runners")
+    parser.add_argument("--no-compile", action="store_true", help="the vocoder built with incremental_codec_compile off")
+    parser.add_argument(
+        "--fp32-reference", action="store_true",
+        help="also decode every non-tail key's codes whole with a float32 copy of the speech tokenizer (OUT_ref.pt)",
+    )
     args = parser.parse_args()
     if args.no_autotune_pointwise:
         torch._inductor.config.triton.autotune_pointwise = False
@@ -99,7 +104,11 @@ def main():
     incremental_codec.Qwen3TTSIncrementalDecoder.precompile = timed_precompile
     build_start = time.perf_counter()
     scheduler = create_vocoder_executor(
-        args.model, gpu_id=0, dtype="bfloat16", shares_engine_speech_tokenizer=True
+        args.model,
+        gpu_id=0,
+        dtype="bfloat16",
+        shares_engine_speech_tokenizer=True,
+        incremental_codec_compile=False if args.no_compile else None,
     )
     built = time.perf_counter()
     decoder = scheduler.incremental_decoder
@@ -122,6 +131,7 @@ def main():
     generator = torch.Generator(device="cpu").manual_seed(20261031)
     timings = []
     waveforms = {}
+    codes_by_label = {}
     for name, runner in runners:
         for key in sorted(runner.graphs, key=lambda item: (item.fresh_frames, item.batch_bucket)):
             if key.fresh_frames not in compiled_widths and not args.all_keys:
@@ -138,6 +148,10 @@ def main():
             torch.cuda.synchronize()
             label = f"{name}:{key.fresh_frames}x{key.batch_bucket}"
             waveforms[label] = entry.waveform.detach().float().cpu().clone()
+            if name != "tail":
+                codes_by_label[label] = codes
+            else:
+                pass
             timings.append(
                 {"runner": name, "frames": key.fresh_frames, "batch": key.batch_bucket, "ms": round(replay_ms(entry.graph, args.replays), 4)}
             )
@@ -160,6 +174,20 @@ def main():
     with open(f"{args.out}.json", "w") as handle:
         json.dump(result, handle, indent=1)
     torch.save(waveforms, f"{args.out}.pt")
+    if args.fp32_reference:
+        reference_tokenizer = load_qwen3_tts_tokenizer(
+            args.model, device="cuda:0", dtype="float32", attn_implementation=None, float32_encoder=False
+        )
+        reference_decoder = reference_tokenizer.model.decoder
+        references = {}
+        with torch.inference_mode():
+            for label, codes in codes_by_label.items():
+                samples = waveforms[label].shape[-1]
+                whole = reference_decoder(codes.cuda())
+                references[label] = whole[..., :samples].float().cpu().reshape(waveforms[label].shape)
+        torch.save(references, f"{args.out}_ref.pt")
+    else:
+        pass
     print(json.dumps({key: result[key] for key in ("form", "oblivious", "build_s", "precompile_total_s", "unique_graphs")}))
     os._exit(0)
 
