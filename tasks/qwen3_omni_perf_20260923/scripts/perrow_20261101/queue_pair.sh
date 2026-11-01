@@ -16,12 +16,21 @@ log() { echo "$(date -u +%T) $*" >> $Q/queue.log; }
 
 serve() {
   local out=$1 tree=$2 model=$3 port=$4 prefix=$5
+  # note (ratish): a card another process still holds memory on leaves the thinker short of its KV pool.
+  for _ in $(seq 120); do
+    used=$(nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits -i 0,1 | sort -n | tail -1)
+    [ "$used" -lt 100 ] && break
+    sleep 2
+  done
+  log "  cards before $(basename $out): $(nvidia-smi --query-gpu=index,memory.used --format=csv,noheader | tr '\n' ';')"
   (cd $tree && exec setsid env PYTHONPATH=$prefix$tree taskset -c $PIN python3 -u -m sglang_omni.cli serve \
     --model-path $model --host 127.0.0.1 --port $port) > $out 2>&1 &
   SERVE_PID=$!
   for _ in $(seq 360); do
     if [ "$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:$port/health)" = 200 ]; then
       return 0
+    elif ! ps -o stat= -g $SERVE_PID 2>/dev/null | grep -qv '^Z'; then
+      return 1
     else
       sleep 5
     fi
@@ -56,6 +65,8 @@ boot() {
     done
   else
     log "$label not healthy; tail: $(tail -3 $out/serve.log | tr '\n' ' ')"
+    stop
+    return 1
   fi
   stop
   log "$label stopped; failures: stage $(grep -c 'Stage process failure' $out/serve.log), stuck $(grep -c 'Terminating stuck process' $out/serve.log)"
@@ -78,9 +89,11 @@ boot() {
   while read -r line; do log "  $line"; done < $out/gate.txt
 }
 
-log "pair start: tools $(git -C /data/tools rev-parse --short HEAD)"
-boot main_a /data/ab/main
-boot perrow_a /data/ab/perrow
-boot perrow_b /data/ab/perrow
-boot main_b /data/ab/main
+log "pair start: tools $(git -C /data/tools rev-parse --short HEAD); boots ${BOOTS:-main_a perrow_a perrow_b main_b}"
+for label in ${BOOTS:-main_a perrow_a perrow_b main_b}; do
+  case $label in
+    main_*) boot $label /data/ab/main ;;
+    *) boot $label /data/ab/perrow ;;
+  esac
+done
 log "pair done"
