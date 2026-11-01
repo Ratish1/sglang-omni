@@ -367,6 +367,7 @@ class StartReq(BaseModel):
     config: dict[str, object] | None = None
     event_dir: str | None = None
     enable_torch: bool = True
+    cuda_profiler: bool = False
 
 
 class StopReq(BaseModel):
@@ -439,12 +440,14 @@ def mount_profiler_routes(
             config=req.config,
             event_dir=event_dir,
             enable_torch=req.enable_torch,
+            cuda_profiler=req.cuda_profiler,
         )
         return {
             "run_id": run_id,
             "trace_path_template": tpl,
             "event_dir": event_dir,
             "enable_torch": req.enable_torch,
+            "cuda_profiler": req.cuda_profiler,
         }
 
     @router.post("/start_request_profile")

@@ -46,6 +46,7 @@ class ProfilerControlClient:
         stages: list[str] | None = None,
         event_dir: str | None = None,
         enable_torch: bool = True,
+        cuda_profiler: bool = False,
     ) -> None:
         await self.start()
         assert self.socks is not None
@@ -55,6 +56,7 @@ class ProfilerControlClient:
             trace_path_template=trace_path_template,
             event_dir=event_dir,
             enable_torch=enable_torch,
+            cuda_profiler=cuda_profiler,
         )
         for s in targets:
             sock = self.socks.get(s)

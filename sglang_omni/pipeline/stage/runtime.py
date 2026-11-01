@@ -163,6 +163,7 @@ class Stage:
         # The host of a native engine that owns subprocesses never computes on
         # the device itself, so its threads do not pin a CUDA device either.
         self.allow_child_processes = allow_child_processes
+        self.cuda_profiler_active = False
         self.endpoints = endpoints
         self.control_plane = control_plane
         self.input_handler = input_handler or DirectInput()
@@ -2697,6 +2698,11 @@ class Stage:
             TorchProfiler.start(template, run_id=run_id)
         else:
             pass
+        if msg.cuda_profiler and self.can_drive_cuda_profiler():
+            torch.cuda.cudart().cudaProfilerStart()
+            self.cuda_profiler_active = True
+        else:
+            pass
         if msg.event_dir is not None:
             try:
                 _get_recorder().start(
@@ -2711,12 +2717,29 @@ class Stage:
         else:
             pass
 
+    def can_drive_cuda_profiler(self) -> bool:
+        """Bind this thread to the stage's CUDA device; False for host-only stages."""
+        if (
+            self.gpu_id is None
+            or self.allow_child_processes
+            or current_platform.device_type != "cuda"
+        ):
+            return False
+        else:
+            current_platform.set_device(current_platform.get_device(int(self.gpu_id)))
+            return True
+
     def on_profiler_stop(self, msg: ProfilerStopMessage) -> None:
         # run_id=None is a wildcard (stop whatever's active).
         if TorchProfiler.is_active() and (
             msg.run_id is None or TorchProfiler.get_active_run_id() == msg.run_id
         ):
             TorchProfiler.stop(run_id=msg.run_id)
+        else:
+            pass
+        if self.cuda_profiler_active:
+            torch.cuda.cudart().cudaProfilerStop()
+            self.cuda_profiler_active = False
         else:
             pass
         recorder = _get_recorder()
