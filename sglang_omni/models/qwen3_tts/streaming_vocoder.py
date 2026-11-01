@@ -1103,9 +1103,20 @@ class Qwen3TTSStreamingVocoderScheduler(
         )
         # note (ratish): scratch switch for the compile-form probe; every cold, window and warm
         # width compiled instead of the cold widths and the steady stride.
-        is_every_width_compiled = (
-            os.environ.get("SGLANG_OMNI_CODEC_COMPILE_ALL_WIDTHS") == "1"
+        width_switch = os.environ.get("SGLANG_OMNI_CODEC_COMPILE_ALL_WIDTHS", "0")
+        is_every_width_compiled = width_switch == "1"
+        # note (ratish): "inplace" compiles every width that attends in place, up to the ring's
+        # in-place width; wider window decodes stay eager.
+        in_place_frames = (
+            self.codec_arena.ring_frames
+            - self.incremental_decoder.state_spec().retained_context
+            if self.codec_arena is not None and self.codec_arena.ring_frames
+            else 0
         )
+        in_place_window_frames = tuple(
+            int(frames) for frames in window_frames if int(frames) <= in_place_frames
+        )
+        is_in_place_width_compiled = width_switch == "inplace"
         # note (ratish): the initial worker replays its cold, window and tail graphs one at a
         # time on its stream and copies each output out before the next, so they share a pool.
         initial_graph_pool = IncrementalCodecGraphPool(
@@ -1141,7 +1152,11 @@ class Qwen3TTSStreamingVocoderScheduler(
                     (
                         tuple(window_frames)
                         if is_every_width_compiled
-                        else (self.stream_followup_stride,)
+                        else (
+                            in_place_window_frames
+                            if is_in_place_width_compiled
+                            else (self.stream_followup_stride,)
+                        )
                     )
                     if compile_kernels
                     else ()
@@ -1211,7 +1226,15 @@ class Qwen3TTSStreamingVocoderScheduler(
                         (
                             warm_fresh_frames
                             if is_every_width_compiled
-                            else (self.stream_followup_stride,)
+                            else (
+                                tuple(
+                                    frames
+                                    for frames in warm_fresh_frames
+                                    if frames <= in_place_frames
+                                )
+                                if is_in_place_width_compiled
+                                else (self.stream_followup_stride,)
+                            )
                         )
                         if compile_kernels
                         else ()
