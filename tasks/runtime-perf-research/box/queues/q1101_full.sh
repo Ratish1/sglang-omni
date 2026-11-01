@@ -7,7 +7,7 @@
 set -u
 O=/data/rp1101
 K=/workspace/kit/tasks/runtime-perf-research/box
-MAIN=/workspace/main_e354 FULL=/workspace/full_e9b428f85 P3=/workspace/p3_fa091db9e
+MAIN=/workspace/main_e354 FULL=/workspace/full_b5431862c P3=/workspace/p3_fa091db9e
 FULL_ARGS="--talker_ar.engine.cuda_graph_backend_prefill full"
 log() { echo "$* $(date -u +%T)" >> $O/queue.log; }
 until grep -q "boot rs_s2 rc" $O/queue.log 2>/dev/null && grep -q "boot rs_b2 rc" $O/queue.log 2>/dev/null; do sleep 10; done
