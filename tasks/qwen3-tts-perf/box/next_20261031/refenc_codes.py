@@ -22,7 +22,17 @@ import torch
 MODEL = "Qwen/Qwen3-TTS-12Hz-1.7B-Base"
 
 
-def encode_all(gpu: int, eager: bool, deterministic: bool) -> tuple[dict[str, torch.Tensor], float, float]:
+def parse_option(text: str) -> tuple[str, bool | int]:
+    key, value = text.split("=", 1)
+    if value in ("True", "False"):
+        return key, value == "True"
+    else:
+        return key, int(value)
+
+
+def encode_all(
+    gpu: int, eager: bool, deterministic: bool, options: list[str]
+) -> tuple[dict[str, torch.Tensor], float, float]:
     from benchmarks.dataset.seedtts import SEEDTTS_DATASET_ID, load_seedtts_samples
     from sglang_omni.models.qwen3_tts import reference_encoder_cuda_graph, stages
     from sglang_omni.models.qwen3_tts.reference_encoder_cuda_graph import (
@@ -34,6 +44,9 @@ def encode_all(gpu: int, eager: bool, deterministic: bool) -> tuple[dict[str, to
         reference_encoder_cuda_graph.REFERENCE_ENCODER_INDUCTOR_OPTIONS["deterministic"] = True
     else:
         pass
+    for option in options:
+        key, value = parse_option(option)
+        reference_encoder_cuda_graph.REFERENCE_ENCODER_INDUCTOR_OPTIONS[key] = value
     torch.cuda.set_device(gpu)
     tokenizer = stages.load_qwen3_tts_tokenizer(
         MODEL, device=f"cuda:{gpu}", dtype="bfloat16", attn_implementation=None, float32_encoder=True
@@ -95,6 +108,7 @@ def main() -> None:
     parser.add_argument("--out")
     parser.add_argument("--eager", action="store_true")
     parser.add_argument("--deterministic", action="store_true")
+    parser.add_argument("--option", action="append", default=[], help="an Inductor option for the encoder, KEY=VALUE")
     parser.add_argument("--compare", nargs="+")
     parser.add_argument("--identity", type=Path)
     args = parser.parse_args()
@@ -103,12 +117,12 @@ def main() -> None:
         return
     else:
         pass
-    codes, built, encode_ms = encode_all(args.gpu, args.eager, args.deterministic)
+    codes, built, encode_ms = encode_all(args.gpu, args.eager, args.deterministic, args.option)
     torch.save(codes, f"{args.out}.pt")
     cache = os.environ.get("TORCHINDUCTOR_CACHE_DIR", "")
     found = picks(cache) if cache else []
-    summary = (f"gpu {args.gpu} eager {args.eager} deterministic {args.deterministic} clips {len(codes)} "
-               f"build {built:.1f} s encode {encode_ms:.3f} ms best_config files {len(found)}")
+    summary = (f"gpu {args.gpu} eager {args.eager} deterministic {args.deterministic} options {args.option} "
+               f"clips {len(codes)} build {built:.1f} s encode {encode_ms:.3f} ms best_config files {len(found)}")
     with open(f"{args.out}.txt", "w") as handle:
         handle.write(f"{summary} cache {cache}\n")
         handle.writelines(line + "\n" for line in found)
