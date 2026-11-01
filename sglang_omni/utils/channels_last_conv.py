@@ -48,11 +48,14 @@ def channels_last_conv1d(
     weight: torch.Tensor,
     bias: torch.Tensor | None,
     length: int,
+    *,
+    contiguous: bool = True,
 ) -> torch.Tensor:
     """The conv of a (B, L, C) activation that carries its left context: a stride-one
     conv returns every output row, a dilated one the first length rows of an input
     divisible by the dilation, and a strided one, given its folded weight and an input
-    divisible by the stride, the first length rows over the input's phases."""
+    divisible by the stride, the first length rows over the input's phases. With
+    contiguous False, those first rows come as a view, each row one contiguous span."""
     dilation = conv.dilation[0]
     stride = conv.stride[0]
     assert stride == 1 or (
@@ -90,11 +93,13 @@ def channels_last_conv1d(
             bias,
             groups=conv.groups,
         )
-        return (
-            output.permute(0, 2, 3, 1)
-            .reshape(batch_size, -1, output.shape[1])[:, :length]
-            .contiguous()
-        )
+        rows = output.permute(0, 2, 3, 1).reshape(batch_size, -1, output.shape[1])[
+            :, :length
+        ]
+        if contiguous:
+            return rows.contiguous()
+        else:
+            return rows
 
 
 def channels_last_conv_transpose1d(

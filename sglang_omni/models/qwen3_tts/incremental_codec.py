@@ -461,8 +461,11 @@ def slot_causal_conv(
         slot_history_exchange(padded, history_pool, slot_index, length, pad_slot)
     else:
         pass
-    # note (ratish): the consumer adds the bias, fused into its activation.
-    return channels_last_conv1d(padded, module.conv, weight, None, length)
+    # note (ratish): the consumer adds the bias, fused into its activation, and reads each row
+    # as one span; a copy here would make a traced width's divisibility by the dilation a guard.
+    return channels_last_conv1d(
+        padded, module.conv, weight, None, length, contiguous=False
+    )
 
 
 def slot_causal_transconv(
