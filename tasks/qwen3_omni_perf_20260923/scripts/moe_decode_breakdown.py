@@ -22,6 +22,7 @@ from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
 from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe import fused_experts
 from sglang.srt.layers.moe.topk import StandardTopKOutput, fused_topk
 from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
+from sglang.test.test_utils import publish_build_topology
 
 EXPERTS = 128
 TOP_K = 8
@@ -60,6 +61,7 @@ def main() -> None:
     os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
     os.environ.setdefault("MASTER_PORT", "29655")
     init_distributed_environment(world_size=1, rank=0, local_rank=0, backend="gloo")
+    publish_build_topology()
     initialize_model_parallel(backend="gloo")
     device = torch.device("cuda")
     print(torch.cuda.get_device_name())
