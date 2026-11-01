@@ -16,6 +16,7 @@ usage: python3 prompt_rows_parity.py build float32|bfloat16 OUT.pt CAPTURE.pt [C
        python3 prompt_rows_parity.py compare TRUTH.pt FLOOR.pt CAPTURE.pt [CAPTURE.pt ...]
 """
 
+import os
 import sys
 
 import librosa
@@ -29,6 +30,17 @@ MODEL = "Qwen/Qwen3-Omni-30B-A3B-Instruct"
 SEEDTTS_META = "zhaochenyang20/seed-tts-eval-arrow"
 SPEAKER = "ethan"
 PASS_MULTIPLE = 1.25
+# note (ratish): AUDIO_LOADER=omni feeds HF the waveform our server's loader produces, to isolate the loader.
+AUDIO_LOADER = os.environ.get("AUDIO_LOADER", "librosa")
+
+
+def load_reference(path: str):
+    if AUDIO_LOADER == "omni":
+        from sglang_omni.preprocessing.audio import load_audio_path
+
+        return load_audio_path(path, target_sr=16000)
+    else:
+        return librosa.load(path, sr=16000)[0]
 
 
 def voice_clone_prompt(sample) -> str:
@@ -90,7 +102,7 @@ def build(dtype_name: str, out: str, paths: list[str]) -> None:
             text = processor.apply_chat_template(
                 messages, add_generation_prompt=True, tokenize=False
             )
-            audio, _ = librosa.load(sample.ref_audio, sr=16000)
+            audio = load_reference(sample.ref_audio)
             inputs = processor(
                 text=text, audio=[audio], return_tensors="pt", padding=True
             )
