@@ -35,7 +35,7 @@ boot() {
     --loads 16,64 --passes warm,nsys --nsys-session $name $NSYS --serve-env "$MARKS_ENV" "$@" > $O/$name.driver.log 2>&1
   log "boot $name rc $?"
 }
-log "q1101_tr start"
+log "q1101_tr start (cpus $(taskset -cp $$ | sed 's/.*: //'))"
 pair() {
   local a=$1 ta=$2 b=$3 tb=$4
   local p0=$(freeport 23000); local p1=$(freeport $((p0 + 400)))
