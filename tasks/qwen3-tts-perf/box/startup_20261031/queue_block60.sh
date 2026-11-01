@@ -55,7 +55,7 @@ boot() {
   kill -KILL -$pgid 2> /dev/null
 }
 
-port=36000
+port=24000
 for arm in MAIN VFREEZE STAGE BOTH; do
   boot cold_${arm,,} $arm $port ""
   port=$((port + 200))

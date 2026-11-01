@@ -34,7 +34,7 @@ probe card1_eager 1 cacheE --eager
   $W/card0_cacheA_again.pt $W/card0_cacheB.pt $W/card1_cacheC.pt $W/card1_cacheA.pt $W/card0_eager.pt $W/card1_eager.pt \
   --identity $D/block59/identity_codec > $W/compare.txt 2>&1)
 grep -vE "INFO|WARN|Using the latest|Found the latest" $W/compare.txt >> $L
-(cd $K/next_20261031 && python3 seeded_identity.py --main $MAIN --branch $MAIN --root $W/identity_aa --port 40000 > $W/identity_aa.txt 2>&1)
+(cd $K/next_20261031 && python3 seeded_identity.py --main $MAIN --branch $MAIN --root $W/identity_aa --port 20000 > $W/identity_aa.txt 2>&1)
 echo "aa: $(grep -E 'byte identical|error lines' $W/identity_aa.txt | cut -c1-200 | tr '\n' '#')" >> $L
 (cd $MAIN && HF_HUB_OFFLINE=1 PYTHONPATH=$MAIN python3 $K/next_20261031/identity_by_bucket.py --root $W/identity_aa 2>&1 | grep -vE "INFO|Using the latest|Found the latest" | head -n 3 >> $L)
 echo "queue block59b done $(date +%T)" >> $L
