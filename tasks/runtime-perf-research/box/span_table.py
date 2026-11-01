@@ -18,6 +18,7 @@ Names are grouped with the batch numbers dropped (bs, toks, rows); --labels adds
 """
 
 import argparse
+import bisect
 import re
 import sqlite3
 import statistics
@@ -318,6 +319,38 @@ def main() -> None:
     held = merged(all_slices)
     print(f"  card held by some context {sum(b - a for a, b in held) / 1e6:8.1f} ms of {window_ns / 1e6:.1f}; "
           f"switches {sum(len(spans) for _, _, spans in contexts.values())}")
+
+    # note (ratish): a slice opens when the card turns to a context with queued work, so the span its process was in
+    # at that moment names the host phase that brought the work
+    by_pid = defaultdict(list)
+    for start, end, text, gtid in ranges:
+        by_pid[pid_of(gtid)].append((start, end, NUMBERS.sub(r"\1=N", text)))
+    for spans in by_pid.values():
+        spans.sort()
+    print("\nG. card slices by the span their process was in when the slice opened: span, slices, held ms, slice p50 ms")
+    for context, (owner, inside, spans) in sorted(contexts.items(), key=lambda item: -len(item[1][2])):
+        if inside < 0.4 or owner not in by_pid:
+            continue
+        else:
+            pass
+        own_ranges = by_pid[owner]
+        starts = [r[0] for r in own_ranges]
+        attributed = defaultdict(list)
+        for slice_start, slice_end in spans:
+            k = bisect.bisect_right(starts, slice_start) - 1
+            best = None
+            for j in range(k, max(-1, k - 400), -1):
+                start, end, text = own_ranges[j]
+                if end >= slice_start and (best is None or end - start < best[1] - best[0]):
+                    best = (start, end, text)
+                else:
+                    pass
+            attributed[best[2] if best else "(outside spans)"].append(slice_end - slice_start)
+        total = sum(len(v) for v in attributed.values())
+        print(f"\n  [{stages.get(owner, owner)}] ctx {context}: {total} slices")
+        for text, lengths in sorted(attributed.items(), key=lambda item: -len(item[1]))[:14]:
+            print(f"    {text[:56]:56s} slices {len(lengths):6d} ({100 * len(lengths) / total:4.1f} %) held "
+                  f"{sum(lengths) / 1e6:8.1f} ms p50 {statistics.median(lengths) / 1e6:6.3f}")
 
 
 if __name__ == "__main__":
