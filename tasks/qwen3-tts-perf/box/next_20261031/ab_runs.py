@@ -4,6 +4,7 @@ similarity on that card; then the table: RTF, throughput, first chunk, WER and S
 with its tails.
 
 usage: python3 ab_runs.py --a LABEL=TREE --b LABEL=TREE --root /data/next_20261031/<block> [--port 11000] [--table-only]
+       [--score-cards 0 1]   (score the runs already served on those cards, then the table)
 """
 
 import argparse
@@ -56,6 +57,7 @@ def main() -> None:
     parser.add_argument("--root", type=Path, required=True)
     parser.add_argument("--port", type=int, default=11000)
     parser.add_argument("--table-only", action="store_true")
+    parser.add_argument("--score-cards", type=int, nargs="+", help="score the served runs of these cards, no serving")
     args = parser.parse_args()
     (first, first_tree), (second, second_tree) = (arm.split("=", 1) for arm in (args.a, args.b))
     root = args.root
@@ -66,14 +68,18 @@ def main() -> None:
                   ("o2", ((second, second_tree, 0), (first, first_tree, 1))))
         for index, (order, arms) in enumerate(orders):
             ports = (args.port + 1000 * index, args.port + 1000 * index + 200)
-            serve_phase(order, [(label, tree, card, port) for (label, tree, card), port in zip(arms, ports)],
-                        [(f"{name}_{order}", concurrency, seed, stream) for name, concurrency, seed, stream in RUNS],
-                        root)
+            if args.score_cards is None:
+                serve_phase(order, [(label, tree, card, port) for (label, tree, card), port in zip(arms, ports)],
+                            [(f"{name}_{order}", concurrency, seed, stream) for name, concurrency, seed, stream in RUNS],
+                            root)
+            else:
+                pass
             for label, _, card in arms:
                 by_card[card] += [root / f"{name}_{order}" / label for name, _, _, _ in RUNS]
+        cards = tuple(args.score_cards) if args.score_cards is not None else (0, 1)
         with concurrent.futures.ThreadPoolExecutor(2) as pool:
             list(pool.map(lambda card: score_card(card, args.port + 2400 + 200 * card, first_tree, by_card[card], root),
-                          (0, 1)))
+                          cards))
     else:
         pass
     table(root, first, second)
