@@ -1,7 +1,8 @@
 # Block 75: the size-class test's fp32 bound across seeds, then the review's mutation. Runs
 # test_compiled_decode_shares_a_program_per_size_class_and_tracks_fp32 from the tree on PYTHONPATH with torch.manual_seed
-# pinned to each seed, recording each (compiled, eager) error pair the test compares; then once with the final conv
-# zeroed only while Dynamo traces, which the test must reject.
+# pinned to each seed. In the sweep every (compiled, eager) error pair the test compares is recorded and the compiled
+# value handed back as zero, so no assertion stops the record: per cohort the waveform pair, then the retained-state pair.
+# Then the real test at seed 33 and with the final conv zeroed only while Dynamo traces, which the test must reject.
 # usage: python3 size_class_test_seeds.py <tree> <first seed> <seed count>
 import sys
 import traceback
@@ -24,42 +25,40 @@ recorded = []
 def recording_error(actual, expected):
     value = original_error(actual, expected)
     recorded.append(value)
-    return value
+    return 0.0 if len(recorded) % 2 == 1 else value
 
 
-def run(seed):
+def run(seed, measure):
     recorded.clear()
+    module.relative_error = recording_error if measure else original_error
     torch.manual_seed = lambda _: original_seed(seed)
     monkeypatch = pytest.MonkeyPatch()
     try:
         module.test_compiled_decode_shares_a_program_per_size_class_and_tracks_fp32(monkeypatch)
         outcome = "passed"
-    except AssertionError as error:
-        outcome = f"FAILED {str(error).splitlines()[0][:120] if str(error) else traceback.format_exc().splitlines()[-2][:120]}"
+    except AssertionError:
+        outcome = "FAILED " + " | ".join(line.strip() for line in traceback.format_exc().splitlines()[-3:])[:300]
     finally:
         monkeypatch.undo()
         torch.manual_seed = original_seed
-    pairs = list(zip(recorded[0::2], recorded[1::2]))
-    return outcome, pairs
+        module.relative_error = original_error
+    return outcome, list(zip(recorded[0::2], recorded[1::2]))
 
 
-module.relative_error = recording_error
-worst_wave, worst_state = 0.0, 0.0
+labels = ("cohort 2x(8,4,3,8,4) waveform", "cohort 2x(8,4,3,8,4) state", "cohort 1x(3,3,3) waveform", "cohort 1x(3,3,3) state")
+worst = {label: 0.0 for label in labels}
 for seed in range(first, first + count):
-    outcome, pairs = run(seed)
-    ratios = [compiled / eager if eager > 0 else (1.0 if compiled == 0 else float("inf")) for compiled, eager in pairs]
-    state_keys = (len(pairs) - 2) // 2
-    wave_indices = {0, 1 + state_keys}
-    wave_ratios = [ratios[index] for index in sorted(wave_indices) if index < len(ratios)]
-    state_ratios = [ratio for index, ratio in enumerate(ratios) if index not in wave_indices]
-    worst_wave = max([worst_wave, *wave_ratios])
-    worst_state = max([worst_state, *state_ratios])
-    print(f"seed {seed}: {outcome}; waveform ratios {' '.join(f'{ratio:.3f}' for ratio in wave_ratios)} "
-          f"(errors {' '.join(f'{pairs[index][0]:.2e}/{pairs[index][1]:.2e}' for index in sorted(wave_indices) if index < len(pairs))}); "
-          f"state ratios over {len(state_ratios)} keys max {max(state_ratios, default=0.0):.3f} "
-          f"median {sorted(state_ratios)[len(state_ratios) // 2] if state_ratios else 0.0:.3f}", flush=True)
-print(f"seeds {first} to {first + count - 1}: worst ratio, waveforms {worst_wave:.3f}, state rows {worst_state:.3f}")
+    outcome, pairs = run(seed, measure=True)
+    cells = []
+    for label, (compiled, eager) in zip(labels, pairs):
+        ratio = compiled / eager
+        worst[label] = max(worst[label], ratio)
+        cells.append(f"{label} {compiled:.2e}/{eager:.2e} = {ratio:.3f}")
+    print(f"seed {seed}: {outcome}; " + "; ".join(cells), flush=True)
+print(f"seeds {first} to {first + count - 1}, worst compiled/eager ratio: " + "; ".join(f"{label} {value:.3f}" for label, value in worst.items()))
 
+outcome, pairs = run(33, measure=False)
+print(f"real test, seed 33: {outcome}")
 direct_conv = incremental_codec.clamped_single_output_conv
 
 
@@ -72,5 +71,5 @@ def silent_when_traced(padded, conv, length):
 
 
 incremental_codec.clamped_single_output_conv = silent_when_traced
-outcome, pairs = run(33)
-print(f"mutation, final conv zeroed only in the trace: {outcome}; first pair {pairs[0] if pairs else None}")
+outcome, pairs = run(33, measure=False)
+print(f"mutation, final conv zeroed only in the trace: {outcome}; pairs {pairs}")
