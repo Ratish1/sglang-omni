@@ -271,6 +271,7 @@ def run_pass(args, server: subprocess.Popen, load: int, kind: str, warmup: bool)
             time.sleep(args.nsys_delay)
             with open(out / "nsys.log", "w", encoding="utf-8") as nsys_log:
                 subprocess.run(["nsys", "start", f"--session={args.nsys_session}", "--sample=none", "--cpuctxsw=none",
+                                *(["--gpuctxsw=true"] if args.nsys_gpuctxsw else []),
                                 f"--output={out / 'trace'}", "--force-overwrite=true"],
                                stdout=nsys_log, stderr=subprocess.STDOUT, check=False)
                 nsys_start = time.time()
@@ -331,6 +332,9 @@ def main() -> None:
     parser.add_argument("--pyspy-seconds", type=float, default=15.0)
     parser.add_argument("--nsys-session", default="",
                         help="launch the server under this nsys session (needed by nsys passes)")
+    parser.add_argument("--nsys-trace", default="cuda", help="nsys launch --trace (cuda,nvtx,osrt for the span marks)")
+    parser.add_argument("--nsys-graph-trace", default="graph", choices=("graph", "node"))
+    parser.add_argument("--nsys-gpuctxsw", action="store_true", help="trace GPU context switches in the window")
     parser.add_argument("--nsys-delay", type=float, default=10.0)
     parser.add_argument("--nsys-seconds", type=float, default=10.0)
     parser.add_argument("--serve-extra", default="")
@@ -375,8 +379,8 @@ def main() -> None:
         *shlex.split(spec["placement"].format(card=args.card)), *shlex.split(args.serve_extra),
     ]
     if args.nsys_session:
-        serve = ["nsys", "launch", f"--session-new={args.nsys_session}", "--trace=cuda", "--cuda-graph-trace=graph",
-                 *serve]
+        serve = ["nsys", "launch", f"--session-new={args.nsys_session}", f"--trace={args.nsys_trace}",
+                 f"--cuda-graph-trace={args.nsys_graph_trace}", *serve]
     else:
         pass
     (out / "identity.txt").write_text(
