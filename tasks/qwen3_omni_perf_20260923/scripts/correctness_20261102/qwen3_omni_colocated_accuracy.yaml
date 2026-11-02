@@ -1,0 +1,16 @@
+# The colocated H200 profile with smaller budgets, so HF's FP32 and BF16 talker fit on the card beside the server.
+config_cls: Qwen3OmniSpeechColocatedPipelineConfig
+name: qwen3-omni-colocated-accuracy
+model_path: Qwen/Qwen3-Omni-30B-A3B-Instruct
+
+stages:
+  image_encoder:
+    gpu_memory_fraction: 0.017
+  audio_encoder:
+    gpu_memory_fraction: 0.017
+  thinker:
+    gpu_memory_fraction: 0.50
+  talker_ar:
+    gpu_memory_fraction: 0.09
+  code2wav:
+    gpu_memory_fraction: 0.014
