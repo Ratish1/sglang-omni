@@ -331,6 +331,8 @@ class OmniScheduler(Generic[RequestDataT]):
     session_bridge: ARSessionBridge | None = None
     scheduler_thread_id: int | None = None
     stream_step_runner: ModelRunner | None = None
+    joined_prefill: ScheduleBatch | None = None
+    joined_prefill_result: GenerationBatchResult | None = None
     previous_pending_decode: PendingDecode | None = None
     async_decode_resolve_before_prefill: bool = False
     draft_worker: BaseSpecWorker | None = None
@@ -2272,7 +2274,62 @@ class OmniScheduler(Generic[RequestDataT]):
                 raise
             else:
                 self.handle_batch_failure(batch, exc)
+                self.fail_joined_prefill(exc)
                 return _FAILED_BATCH_RESULT
+
+    def launch_joined_prefill(self) -> SchedulerOutput | None:
+        """Admit what waits now, in a decode step, so its rows share that step's predictor pass.
+
+        The decode talker is still running, so this host work overlaps it.
+        """
+        recv_reqs = self.recv_requests()
+        recv_reqs.extend(self.take_deferred_request_payloads())
+        self.process_input_requests(recv_reqs)
+        if not self.waiting_queue or self.chunked_req is not None:
+            return None
+        else:
+            pass
+        plan = self.get_new_batch_prefill(self.running_batch)
+        self.running_batch = plan.running_batch
+        if plan.batch_to_run is None:
+            return None
+        else:
+            pass
+        self.joined_prefill = plan.batch_to_run
+        self.emit_prefill_start_for_batch(self.joined_prefill)
+        self.stamp_batch_launch(self.joined_prefill)
+        return self.build_sched_output(self.joined_prefill)
+
+    def fail_joined_prefill(self, error: Exception) -> None:
+        """A joined prefill fails its own requests alone; the decode step it rode continues."""
+        joined = self.joined_prefill
+        self.joined_prefill = None
+        self.joined_prefill_result = None
+        if joined is not None:
+            self.handle_batch_failure(joined, error)
+        else:
+            pass
+
+    def finish_joined_prefill(self) -> None:
+        """Keep the joined prefill's result for the loop, once the decode step's own is done."""
+        if self.joined_prefill is None:
+            return
+        else:
+            pass
+        self.joined_prefill_result = self.make_batch_result(
+            self.stream_step_runner.take_joined_output()
+        )
+        self.emit_prefill_end_for_batch(self.joined_prefill)
+
+    def process_joined_prefill(self) -> ScheduleBatch:
+        """Process the joined prefill as the batch the loop ran last, which merges it next pass."""
+        joined = self.joined_prefill
+        result = self.joined_prefill_result
+        self.joined_prefill = None
+        self.joined_prefill_result = None
+        self.cur_batch = joined
+        self.process_batch_result(joined, result)
+        return joined
 
     def process_batch_result(self, batch, result) -> None:
         if self.enable_overlap and batch.forward_mode.is_extend():
@@ -2326,6 +2383,7 @@ class OmniScheduler(Generic[RequestDataT]):
         sched_output = self.build_sched_output(batch)
         mr_output = self.model_runner.execute(sched_output)
         self.emit_prefill_end_for_batch(batch)
+        self.finish_joined_prefill()
         self.emit_stream_output(sched_output, mr_output)
         return self.make_batch_result(mr_output)
 
@@ -2484,6 +2542,17 @@ class OmniScheduler(Generic[RequestDataT]):
         """The stage found a same-process target taking one message a step; the runner opts in."""
         if self.model_runner.enable_stream_steps(target):
             self.stream_step_runner = self.model_runner
+            # note (ratish): a joined prefill runs inside a decode step, on the one loop that
+            # processes each step before the next and with no session or draft state to keep in step.
+            if (
+                not self.enable_overlap
+                and self.tp_size == 1
+                and self.session_bridge is None
+                and self.draft_worker is None
+            ):
+                self.model_runner.prefill_joiner = self
+            else:
+                pass
         else:
             pass
 
@@ -3871,6 +3940,10 @@ class OmniScheduler(Generic[RequestDataT]):
                     self.process_batch_result(batch, result)
                 else:
                     pass
+                if self.joined_prefill is not None:
+                    batch = self.process_joined_prefill()
+                else:
+                    pass
             else:
                 self._sched_idled = True  # noqa: leading-underscore
                 self.self_check_during_idle()
@@ -4003,6 +4076,10 @@ class OmniScheduler(Generic[RequestDataT]):
 
     def pending_batches(self) -> Iterable[ScheduleBatch]:
         """Expose submitted batches to request lookup and cancellation."""
+        if self.joined_prefill is not None:
+            yield self.joined_prefill
+        else:
+            pass
         for pending_decode in (self.previous_pending_decode, self.async_pending):
             if pending_decode is not None:
                 yield pending_decode.batch

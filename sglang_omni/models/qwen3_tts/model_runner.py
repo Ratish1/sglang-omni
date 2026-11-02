@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+import logging
+from dataclasses import dataclass
 from types import ModuleType
 from typing import TYPE_CHECKING, TypedDict
 
@@ -38,11 +40,14 @@ if TYPE_CHECKING:
         PredictorGraphStats,
         Qwen3TTSTalker,
     )
+    from sglang_omni.scheduling.omni_scheduler import OmniScheduler
     from sglang_omni.scheduling.sglang_backend.output_processor import (
         SGLangOutputProcessor,
     )
 else:
     pass
+
+logger = logging.getLogger(__name__)
 
 # note (ratish): official qwen-tts generates the talker with min_new_tokens=2; an EOS on the first frame ended a request with no audio.
 QWEN3_TTS_MIN_NEW_FRAMES = 2
@@ -50,6 +55,17 @@ QWEN3_TTS_MIN_NEW_FRAMES = 2
 
 class Qwen3TTSModelInfo(TypedDict):
     predictor_cuda_graph: PredictorGraphStats
+
+
+@dataclass(eq=False, frozen=True, kw_only=True)
+class JoinedPrefill:
+    """A prefill launched inside a decode step, waiting for the predictor they share."""
+
+    scheduler_output: SchedulerOutput
+    forward_batch: ForwardBatch
+    result: GenerationBatchResult
+    decode_hidden: torch.Tensor
+    decode_positions: torch.Tensor
 
 
 def stage_host_ints(values: list[int], device: torch.device) -> torch.Tensor:
@@ -82,6 +98,9 @@ class Qwen3TTSModelRunner(ModelRunner):
     # decode step, and the device cannot change under the runner.
     codes_event_module: ModuleType | None = None
     code_step_index: int = 0
+    prefill_joiner: OmniScheduler | None = None
+    joined: JoinedPrefill | None = None
+    joined_output: ModelRunnerOutput | None = None
 
     def __init__(
         self,
@@ -451,18 +470,134 @@ class Qwen3TTSModelRunner(ModelRunner):
         else:
             pass
         semantic_positions = self.sample_positions(forward_batch, layer0_codes.device)
+        joined = (
+            self.launch_joined_prefill(hidden, semantic_positions)
+            if self.prefill_joiner is not None
+            and forward_batch.forward_mode.is_decode()
+            else None
+        )
+        if joined is None:
+            self.model.code_predictor_forward(
+                layer0_codes,
+                hidden,
+                semantic_positions=semantic_positions,
+            )
+            self.feedback_pool.index_copy_(
+                0,
+                forward_batch.req_pool_indices[: len(requests)],
+                self.model.output_embeds[: len(requests)],
+            )
+            self.write_step_frames(forward_batch, requests, semantic_positions)
+        else:
+            self.predict_joined_rows(forward_batch, requests, layer0_codes, joined)
+        self.has_pending_code_step = True
+
+    def launch_joined_prefill(
+        self, decode_hidden: torch.Tensor, decode_positions: torch.Tensor
+    ) -> JoinedPrefill | None:
+        """Launch a waiting prefill's talker and sample behind this decode step's, or nothing.
+
+        The decode step's hidden rows and positions are copied first, since a prefill replay may
+        write memory the decode graph's outputs share.
+        """
+        scheduler_output = self.prefill_joiner.launch_joined_prefill()
+        if scheduler_output is None:
+            return None
+        else:
+            pass
+        kept_hidden = decode_hidden.clone()
+        kept_positions = decode_positions.clone()
+        try:
+            schedule_batch = scheduler_output.batch_data
+            with self.execution_context(schedule_batch, isolate_sampling=True):
+                forward_batch, schedule_batch, _ = self.build_forward_batch(
+                    scheduler_output
+                )
+                result = self.prepare_and_forward(
+                    forward_batch, schedule_batch, scheduler_output.requests, True
+                )
+                self.stage_token_ids(result, result.next_token_ids)
+                self.ensure_next_token_ids(
+                    result, forward_batch, schedule_batch, scheduler_output
+                )
+                self.publish_next_tokens(
+                    result, forward_batch, schedule_batch, scheduler_output.requests
+                )
+        except Exception as exc:
+            logger.exception(
+                "Qwen3-TTS joined prefill failed; the decode step continues"
+            )
+            self.prefill_joiner.fail_joined_prefill(exc)
+            return None
+        self.joined = JoinedPrefill(
+            scheduler_output=scheduler_output,
+            forward_batch=forward_batch,
+            result=result,
+            decode_hidden=kept_hidden,
+            decode_positions=kept_positions,
+        )
+        return self.joined
+
+    def predict_joined_rows(
+        self,
+        forward_batch: ForwardBatch,
+        requests: list[SchedulerRequest],
+        layer0_codes: torch.Tensor,
+        joined: JoinedPrefill,
+    ) -> None:
+        """One predictor pass over the decode rows then the prefill's, each row's frame and
+        feedback written by its own slot and position, as two passes would have."""
+        joined_requests = joined.scheduler_output.requests
+        decode_rows = len(requests)
+        joined_rows = len(joined_requests)
+        rows = decode_rows + joined_rows
+        joined_tokens = joined.result.next_token_ids.reshape(joined_rows, 1)
+        joined_hidden = joined.result.logits_output.hidden_states
+        if joined_hidden.ndim == 2:
+            joined_hidden = joined_hidden.unsqueeze(1)
+        else:
+            pass
+        joined_positions = self.sample_positions(
+            joined.forward_batch, layer0_codes.device
+        )
+        positions = torch.cat(
+            (joined.decode_positions[:decode_rows], joined_positions[:joined_rows])
+        )
+        self.model.prepare_decode_buffers([*requests, *joined_requests])
         self.model.code_predictor_forward(
-            layer0_codes,
-            hidden,
-            semantic_positions=semantic_positions,
+            torch.cat((layer0_codes[:decode_rows], joined_tokens)),
+            torch.cat(
+                (joined.decode_hidden[:decode_rows], joined_hidden[:joined_rows])
+            ),
+            semantic_positions=positions,
         )
         self.feedback_pool.index_copy_(
             0,
-            forward_batch.req_pool_indices[: len(requests)],
-            self.model.output_embeds[: len(requests)],
+            torch.cat(
+                (
+                    forward_batch.req_pool_indices[:decode_rows],
+                    joined.forward_batch.req_pool_indices[:joined_rows],
+                )
+            ),
+            self.model.output_embeds[:rows],
         )
-        self.write_step_frames(forward_batch, requests, semantic_positions)
-        self.has_pending_code_step = True
+        self.code_table.frames.index_copy_(
+            0,
+            positions
+            + torch.cat(
+                (
+                    self.decode_frame_index_bases,
+                    self.frame_index_bases(joined_requests),
+                )
+            ),
+            self.model.output_codes[:rows],
+        )
+        self.record_codes_ready()
+
+    def take_joined_output(self) -> ModelRunnerOutput:
+        output = self.joined_output
+        self.joined_output = None
+        return output
 
     def frame_index_bases(self, requests: list[SchedulerRequest]) -> torch.Tensor:
         """What each request adds to a sampled position for its frame's index in the table's flat rows.
@@ -517,6 +652,9 @@ class Qwen3TTSModelRunner(ModelRunner):
                 semantic_positions[:batch_size] + self.decode_frame_index_bases,
                 output_codes[:batch_size],
             )
+        self.record_codes_ready()
+
+    def record_codes_ready(self) -> None:
         self.code_step_index += 1
         if self.codes_event_module is not None:
             self.step_codes_ready = self.next_codes_ready_event()
@@ -562,6 +700,22 @@ class Qwen3TTSModelRunner(ModelRunner):
             self.collect_step_frames(scheduler_output, host_token_ids.tolist())
         else:
             pass
+        joined = self.joined
+        if joined is not None:
+            self.joined = None
+            self.joined_output = self.finish_joined_rows(joined)
+        else:
+            pass
+        return self.host_token_output(batch_result, host_token_ids)
+
+    def finish_joined_rows(self, joined: JoinedPrefill) -> ModelRunnerOutput:
+        host_token_ids = self.resolve_host_token_ids(joined.result)
+        self.collect_step_frames(joined.scheduler_output, host_token_ids.tolist())
+        return self.host_token_output(joined.result, host_token_ids)
+
+    def host_token_output(
+        self, batch_result: GenerationBatchResult, host_token_ids: torch.Tensor
+    ) -> ModelRunnerOutput:
         return ModelRunnerOutput(
             outputs={},
             req_ids=[],
