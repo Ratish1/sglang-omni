@@ -267,19 +267,19 @@ def test_talker_follows_reference(
 
             spoken = codes[codes[:, 0] != codec_eos].T[None]
             truth_walk = window_walk(truth_code2wav, spoken, chunk, context, upsample)
-            floor_walk = window_walk(floor_code2wav, spoken, chunk, context, upsample)
+            whole = truth_code2wav(spoken)
+            floor_whole = floor_code2wav(spoken)
             served = served_audio.to(component_device)
-            shared = min(served.numel(), truth_walk.numel())
+            shared = min(served.numel(), whole.numel())
             case_records.append(
                 CaseRecord(
                     case=f"{sample_id}/served_audio",
-                    omni=deviation(served[:shared], truth_walk.flatten()[:shared]),
+                    omni=deviation(served[:shared], whole.flatten()[:shared]),
                     floor=deviation(
-                        floor_walk.flatten()[:shared], truth_walk.flatten()[:shared]
+                        floor_whole.flatten()[:shared], whole.flatten()[:shared]
                     ),
                 )
             )
-            whole = truth_code2wav(spoken)
             trim = spoken.shape[-1] * upsample - whole.shape[-1]
             reports.append(
                 {

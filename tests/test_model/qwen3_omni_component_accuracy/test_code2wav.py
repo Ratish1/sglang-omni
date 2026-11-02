@@ -56,6 +56,25 @@ def window_walk(
     return torch.cat(pieces, dim=-1)
 
 
+def incremental_walk(scheduler, codes: torch.Tensor, chunk: int) -> torch.Tensor:
+    """The served stream: each window decodes its new frames from the stream's slot in the codec state pool."""
+    slot = scheduler.codec_pool.acquire()
+    frames = codes.shape[-1]
+    pieces = []
+    emitted = 0
+    while emitted < frames:
+        new_frames = min(chunk, frames - emitted)
+        wav, _ = scheduler.decode_incremental(
+            codes[..., emitted : emitted + new_frames],
+            [slot],
+            first_decode=emitted == 0,
+        )
+        pieces.append(wav.clone())
+        emitted += new_frames
+    scheduler.codec_pool.release(slot)
+    return torch.cat(pieces, dim=-1)
+
+
 def best_alignment(
     longer: torch.Tensor, shorter: torch.Tensor, *, expected: int, radius: int
 ) -> tuple[int, float]:
@@ -96,8 +115,10 @@ def test_code2wav_follows_reference(
         gpu_id=card.index,
         enable_cuda_graph=True,
         total_gpu_memory_fraction=CODE2WAV_MEMORY_FRACTION,
+        codec_state_slots=2,
     )
     assert scheduler.cuda_graph_runner is not None
+    assert scheduler.incremental_codec is not None
     served_state = {
         name.replace("pre_transformer.transformer.", "pre_transformer."): tensor
         for name, tensor in scheduler.model.state_dict().items()
@@ -129,6 +150,15 @@ def test_code2wav_follows_reference(
                     omni=deviation(
                         scheduler.forward_codes(codes, graph_eligible=False)[0],
                         whole_truth,
+                    ),
+                    floor=deviation(floor(codes), whole_truth),
+                )
+            )
+            records.append(
+                CaseRecord(
+                    case=f"incremental/{frames}",
+                    omni=deviation(
+                        incremental_walk(scheduler, codes, chunk), whole_truth
                     ),
                     floor=deviation(floor(codes), whole_truth),
                 )
