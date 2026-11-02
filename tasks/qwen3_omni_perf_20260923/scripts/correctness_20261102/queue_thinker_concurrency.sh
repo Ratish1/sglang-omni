@@ -4,11 +4,12 @@ set -u
 OUT=$1
 TREE=$2
 MODEL=Qwen/Qwen3-Omni-30B-A3B-Instruct
-PORT=37700
+# note (ratish): below the host's ephemeral range, where another process can hold a port a server asks for.
+PORT=${SERVE_PORT:-27700}
 mkdir -p $OUT/report
 log() { echo "$(date -u +%T) $*" >> $OUT/queue.log; }
 log "thinker check start: tree $(git -C $TREE rev-parse --short HEAD) $(git -C $TREE rev-parse HEAD:sglang_omni | cut -c1-8); cards $(nvidia-smi --query-gpu=memory.used --format=csv,noheader | tr '\n' ' ')"
-(cd $TREE && exec setsid env PYTHONPATH=$TREE python3 -u -m sglang_omni.cli serve --host 127.0.0.1 --port $PORT \
+(cd $TREE && exec setsid env SGLANG_OMNI_STRICT_PORT=1 CUDA_VISIBLE_DEVICES=0 PYTHONPATH=$TREE python3 -u -m sglang_omni.cli serve --host 127.0.0.1 --port $PORT \
   --model-path $MODEL --config examples/configs/qwen3_omni_colocated_h200.yaml --colocate \
   --preprocessing.factory.max_seq_len 32768 --thinker.factory.max_seq_len 32768 ${SERVE_EXTRA:-}) > $OUT/serve.log 2>&1 &
 SERVE_PID=$!

@@ -10,16 +10,21 @@ WAIT_SERVER_LOG=$5
 WAIT_SERVER_TEXT=$6
 C=/data/tools/tasks/qwen3_omni_perf_20260923/scripts/correctness_20261102
 MODEL=Qwen/Qwen3-Omni-30B-A3B-Instruct
-PORT=38200
+# note (ratish): below the host's ephemeral range, where another process can hold a port a server asks for.
+PORT=28200
 mkdir -p $OUT
 log() { echo "$(date -u +%T) $*" >> $OUT/queue.log; }
 until grep -q "$WAIT_HF_TEXT" "$WAIT_HF_LOG" 2>/dev/null; do sleep 10; done
-log "hf start: tree $(git -C $TREE rev-parse --short HEAD) $(git -C $TREE rev-parse HEAD:sglang_omni | cut -c1-8); tools $(git -C /data/tools rev-parse --short HEAD)"
-(cd $TREE && PYTHONPATH=$TREE python3 -u $C/thinker_media_rows.py hf $OUT cuda:1) > $OUT/hf.log 2>&1
-log "hf rc $?: $(tail -1 $OUT/hf.log | cut -c1-120)"
+if grep -q 'hf done' $OUT/hf.log 2>/dev/null; then
+  log "hf rows kept from an earlier run"
+else
+  log "hf start: tree $(git -C $TREE rev-parse --short HEAD) $(git -C $TREE rev-parse HEAD:sglang_omni | cut -c1-8); tools $(git -C /data/tools rev-parse --short HEAD)"
+  (cd $TREE && PYTHONPATH=$TREE python3 -u $C/thinker_media_rows.py hf $OUT cuda:1) > $OUT/hf.log 2>&1
+  log "hf rc $?: $(tail -1 $OUT/hf.log | cut -c1-120)"
+fi
 until grep -q "$WAIT_SERVER_TEXT" "$WAIT_SERVER_LOG" 2>/dev/null; do sleep 10; done
 log "server start"
-(cd $TREE && exec setsid env CUDA_VISIBLE_DEVICES=0 PYTHONPATH=$C/dump_env:$TREE DUMPER_BASE=$OUT/dumps DUMPER_ENABLE=1 \
+(cd $TREE && exec setsid env SGLANG_OMNI_STRICT_PORT=1 CUDA_VISIBLE_DEVICES=0 PYTHONPATH=$C/dump_env:$TREE DUMPER_BASE=$OUT/dumps DUMPER_ENABLE=1 \
   DUMPER_ENABLE_OUTPUT_CONSOLE=0 DUMPER_NON_INTRUSIVE_MODE=all DUMPER_EXP_NAME=thinker \
   DUMPER_FILTER="match(r'^non_intrusive__model\.layers\.(0|1|2|3|12|23|24|47)\.(self_attn\.inputs\.hidden_states|mlp\.inputs\.0)$', name)" \
   python3 -u -m sglang_omni.cli serve --host 127.0.0.1 --port $PORT --model-path $MODEL \
