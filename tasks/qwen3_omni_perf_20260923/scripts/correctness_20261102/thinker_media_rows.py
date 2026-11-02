@@ -127,12 +127,28 @@ def match(left: torch.Tensor, right: torch.Tensor) -> float:
     return 1 - float((left - right).norm() / right.norm().clamp_min(1e-20))
 
 
+def request_chunks(counts: list[int], cursor: int, prompt_rows: int) -> list[tuple[int, int]]:
+    """The consecutive forwards from cursor on whose rows add up to the prompt: warmups come first."""
+    for start in range(cursor, len(counts)):
+        total = 0
+        for end in range(start, len(counts)):
+            total += counts[end]
+            if total == prompt_rows:
+                return [(index, counts[index]) for index in range(start, end + 1)]
+            elif total > prompt_rows:
+                break
+            else:
+                pass
+    raise RuntimeError(f"no forwards from {cursor} add up to {prompt_rows} rows: {counts}")
+
+
 def compare(out: Path, dump_dir: Path) -> None:
     processor = Qwen3OmniMoeProcessor.from_pretrained(MODEL)
     requests = selected_requests(processor)
     config = load_config_ids()
     probe = f"model.layers.{LAYERS[0]}.{POINTS['input_layernorm']}"
     forwards = [forward for forward in load_forwards(dump_dir) if probe in forward]
+    counts = [value_of(forward[probe]).shape[0] for forward in forwards]
     cursor = 0
     report = []
     for request in requests:
@@ -140,17 +156,8 @@ def compare(out: Path, dump_dir: Path) -> None:
         prompt_rows = ids.shape[0]
         truth = torch.load(out / f"{request.sample_id}.fp32.pt", map_location="cpu", weights_only=False)
         floor = torch.load(out / f"{request.sample_id}.bf16.pt", map_location="cpu", weights_only=False)
-        # note (ratish): warmup forwards come first, and a request's chunks add up to its prompt.
-        chunks = []
-        while sum(chunk[1] for chunk in chunks) != prompt_rows:
-            count = value_of(forwards[cursor][probe]).shape[0]
-            if not chunks and count > prompt_rows:
-                raise RuntimeError(f"{request.sample_id}: forward of {count} rows is past the prompt's {prompt_rows}")
-            elif sum(chunk[1] for chunk in chunks) + count > prompt_rows:
-                chunks = []
-            else:
-                chunks.append((cursor, count))
-            cursor += 1
+        chunks = request_chunks(counts, cursor, prompt_rows)
+        cursor = chunks[-1][0] + 1
         media = (ids == config["image"]) | (ids == config["video"])
         offset = 0
         groups: dict[str, torch.Tensor] = {
