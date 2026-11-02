@@ -1208,7 +1208,9 @@ class ModelRunner(Generic[RequestDataInput]):
             pass
         for row_idx, sched_req in enumerate(requests):
             data = sched_req.data
-            if data.return_logprob:
+            # note (ratish): a middle chunk of a chunked prefill samples a token the
+            # request discards, so its logprob belongs to no output token.
+            if data.return_logprob and data.req.inflight_middle_chunks <= 0:
                 data.output_token_logprobs.append(
                     [logprobs[row_idx], token_ids[row_idx]]
                 )
