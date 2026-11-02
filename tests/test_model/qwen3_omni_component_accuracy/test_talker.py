@@ -98,6 +98,13 @@ def generate_with_speech(
             "return_logprob": True,
         },
     )
+    if response.status_code != 200:
+        print(
+            f"[talker] {question.sample_id} refused {response.status_code}: {response.text[:600]}",
+            flush=True,
+        )
+    else:
+        pass
     response.raise_for_status()
     body = response.json()
     tokens = [int(pair[1]) for pair in body["meta_info"]["output_token_logprobs"]]
