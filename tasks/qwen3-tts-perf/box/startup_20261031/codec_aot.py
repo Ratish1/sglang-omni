@@ -75,7 +75,7 @@ def main():
         zero(arena)
         codes, state = inputs(arena, batch, width, 7)
         began = time.perf_counter()
-        waveform = function(codes, state)
+        waveform = function(incremental, codes, state)
         torch.cuda.synchronize()
         first = time.perf_counter() - began
         results[(batch, width)] = waveform.float().cpu().clone()
