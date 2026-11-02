@@ -1208,7 +1208,9 @@ class ModelRunner(Generic[RequestDataInput]):
             pass
         for row_idx, sched_req in enumerate(requests):
             data = sched_req.data
-            if data.return_logprob:
+            # note (ratish): test branch only. Main's rollout path counts a chunked prefill's discarded
+            # token, which refuses /generate on video; the thinker check reads logprobs there.
+            if data.return_logprob and data.req.inflight_middle_chunks <= 0:
                 data.output_token_logprobs.append(
                     [logprobs[row_idx], token_ids[row_idx]]
                 )
