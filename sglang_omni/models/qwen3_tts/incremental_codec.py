@@ -17,7 +17,6 @@ from sglang.kernels.ops.attention.rope import (
 )
 from sglang.kernels.ops.layernorm import rmsnorm
 from sglang.srt.utils.custom_op import register_custom_op
-from torch._dynamo.aot_compile import AOTCompiledFunction
 
 from sglang_omni import kernels as kernels_package
 from sglang_omni.platforms import current_platform
@@ -1268,7 +1267,6 @@ class Qwen3TTSIncrementalDecoder:
             None  # noqa: leading-underscore  # upstream spelling, or the public name is already taken
         )
         self.saved_programs: SavedPrograms | None = None
-        self.compiled_programs: dict[tuple[int, int], AOTCompiledFunction] = {}
         self.first_chunk_reach: dict[int, int] = {}
 
     @staticmethod
@@ -1440,14 +1438,14 @@ class Qwen3TTSIncrementalDecoder:
         # eager decode stays off Dynamo, whose value guards would otherwise
         # recompile once per stream position and hit the recompile limit.
         shape = (int(codes.shape[0]), fresh_frames)
-        if compiled and shape not in self.compiled_programs:
+        if not compiled:
+            waveform = self.decode_tensors(codes, state)
+        elif self.saved_programs is None or shape not in self.saved_programs.by_shape:
             raise RuntimeError(
                 f"Qwen3-TTS incremental codec shape {shape} was not precompiled"
             )
-        elif compiled:
-            waveform = self.compiled_programs[shape](self, codes, state)
         else:
-            waveform = self.decode_tensors(codes, state)
+            waveform = self.saved_programs.by_shape[shape](self, codes, state)
         expected_samples = fresh_frames * self.total_upsample
         if int(waveform.shape[-1]) != expected_samples:
             raise RuntimeError(
@@ -1874,11 +1872,6 @@ class Qwen3TTSIncrementalDecoder:
         Pass the codes and state of a real decode, in its grad-disabling
         context: Dynamo guards on both, and the step advances the state.
         """
-        shape = (int(codes.shape[0]), int(codes.shape[-1]))
-        if shape in self.compiled_programs:
-            return
-        else:
-            pass
         if self.saved_programs is None:
             self.saved_programs = SavedPrograms(
                 "qwen3_tts_codec",
@@ -1889,6 +1882,11 @@ class Qwen3TTSIncrementalDecoder:
                     str(codes.device),
                 ),
             )
+        else:
+            pass
+        shape = (int(codes.shape[0]), int(codes.shape[-1]))
+        if shape in self.saved_programs.by_shape:
+            return
         else:
             pass
         program = self.saved_programs.matching(self, codes, state)
@@ -1914,4 +1912,4 @@ class Qwen3TTSIncrementalDecoder:
         else:
             pass
         program(self, codes, state)
-        self.compiled_programs[shape] = program
+        self.saved_programs.by_shape[shape] = program

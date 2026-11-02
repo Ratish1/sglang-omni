@@ -55,6 +55,12 @@ class SavedPrograms:
             for program in map(self.load, sorted(self.directory.glob("*.program")))
             if program is not None
         ]
+        self.by_shape: dict[tuple[int, ...], AOTCompiledFunction] = {}
+
+    def __getstate__(self) -> dict[str, None]:
+        # note (ratish): a trace pickles what its function's self reaches, and a program's guard
+        # manager cannot be pickled; no guard reads these programs.
+        return {}
 
     @staticmethod
     def load(path: Path) -> AOTCompiledFunction | None:
