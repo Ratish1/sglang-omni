@@ -763,38 +763,44 @@ def section_e(r: Report):
         print("  no python-gil trace in this report")
         return
     window = r.t1 - r.t0
-    names = {}
     hold_lists = {}
     for tid, items in r.gil_hold.items():
         items.sort()
         hold_lists[tid] = (items, [s for s, _ in items])
-        names[tid] = r.tname(tid)
-    rows = []
+    # note: a globalTid holds the process id above bit 24. Each process has its own lock, so a
+    # hold in another process never makes a thread wait, and one table per process is the read.
+    tids_by_process = collections.defaultdict(set)
     for tid in set(r.gil_hold) | set(r.gil_wait):
-        hold = union_ns(r.gil_hold.get(tid, []))
-        wait = union_ns(r.gil_wait.get(tid, []))
-        rows.append((hold, wait, r.tname(tid)))
-    grouped = collections.defaultdict(lambda: [0, 0, 0])
-    for hold, wait, name in rows:
-        grouped[name][0] += hold
-        grouped[name][1] += wait
-        grouped[name][2] += 1
-    print(f"  {'thread':<36}{'n':>4}{'hold':>9}{'hold %':>8}{'wait':>9}")
-    for name, (hold, wait, n) in sorted(grouped.items(), key=lambda kv: -kv[1][0]):
-        print(
-            f"  {name[:36]:<36}{n:>4}{ms(hold):>9.0f}{100 * hold / window:>7.1f}%{ms(wait):>9.0f}"
-        )
-    matrix = collections.Counter()
-    for tid, waits in r.gil_wait.items():
-        for s, e in waits:
-            for other, (items, starts) in hold_lists.items():
-                if other == tid:
-                    continue
-                for a, b in clip(items, starts, s, e):
-                    matrix[(r.tname(tid), r.tname(other))] += b - a
-    print("  waiter <- holder (ms):")
-    for (waiter, holder), value in matrix.most_common(15):
-        print(f"    {waiter[:30]:<30} <- {holder[:30]:<30} {ms(value):8.0f}")
+        tids_by_process[(tid >> 24) & 0xFFFFFF].add(tid)
+    for process, tids in sorted(
+        tids_by_process.items(),
+        key=lambda kv: -sum(union_ns(r.gil_hold.get(t, [])) for t in kv[1]),
+    ):
+        total_hold = sum(union_ns(r.gil_hold.get(t, [])) for t in tids)
+        print(f"  process {process}: holds {ms(total_hold):.0f} ms, {100 * total_hold / window:.1f} %")
+        grouped = collections.defaultdict(lambda: [0, 0, 0])
+        for tid in tids:
+            name = r.tname(tid)
+            grouped[name][0] += union_ns(r.gil_hold.get(tid, []))
+            grouped[name][1] += union_ns(r.gil_wait.get(tid, []))
+            grouped[name][2] += 1
+        print(f"    {'thread':<36}{'n':>4}{'hold':>9}{'hold %':>8}{'wait':>9}")
+        for name, (hold, wait, n) in sorted(grouped.items(), key=lambda kv: -kv[1][0]):
+            print(
+                f"    {name[:36]:<36}{n:>4}{ms(hold):>9.0f}{100 * hold / window:>7.1f}%{ms(wait):>9.0f}"
+            )
+        matrix = collections.Counter()
+        for tid in tids:
+            for s, e in r.gil_wait.get(tid, []):
+                for other in tids:
+                    if other == tid or other not in hold_lists:
+                        continue
+                    items, starts = hold_lists[other]
+                    for a, b in clip(items, starts, s, e):
+                        matrix[(r.tname(tid), r.tname(other))] += b - a
+        print("    waiter <- holder (ms):")
+        for (waiter, holder), value in matrix.most_common(12):
+            print(f"      {waiter[:30]:<30} <- {holder[:30]:<30} {ms(value):8.0f}")
 
 
 def section_f(r: Report):
