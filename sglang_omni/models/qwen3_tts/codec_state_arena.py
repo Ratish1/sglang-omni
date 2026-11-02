@@ -106,6 +106,15 @@ class Qwen3TTSCodecStateArena:
             dtype=dtype,
             has_key_value_buffers=not self.key_rings,
         )
+        # note (ratish): a slot's buffers are fixed once allocated, so their views are made once.
+        self.slot_buffer_views: list[list[torch.Tensor]] = [
+            [buffer[slot] for buffer in self._buffers(self.storage)]
+            + [
+                ring.view(-1, self.ring_frames, ring.shape[1])[slot]
+                for ring in (*self.key_rings, *self.value_rings)
+            ]
+            for slot in range(self._num_slots)  # noqa: leading-underscore
+        ]
         self.lock = threading.Lock()
         self.staging = threading.local()
         self.release_events: dict[int, torch.Event] = {}
@@ -216,11 +225,7 @@ class Qwen3TTSCodecStateArena:
         # note (ratish): one multi-tensor launch for the slot's buffers: an initial decode resets
         # a fresh slot per row, and every row of its batch waits for all the resets before launch.
         torch._foreach_zero_(  # noqa: leading-underscore  # upstream spelling, or the public name is already taken
-            [buffer[slot] for buffer in self._buffers(self.storage)]
-            + [
-                ring.view(-1, self.ring_frames, ring.shape[1])[slot]
-                for ring in (*self.key_rings, *self.value_rings)
-            ]
+            self.slot_buffer_views[slot]
         )
         self.storage.frame_positions[slot].zero_()
 
