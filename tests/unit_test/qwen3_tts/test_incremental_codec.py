@@ -6,12 +6,12 @@ import copy
 import os
 import random
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import torch
 import torch.nn.functional as F
 from torch import nn
-from torch._dynamo.utils import counters
 
 from sglang_omni.models.qwen3_tts import incremental_codec
 from sglang_omni.models.qwen3_tts.codec_state_arena import Qwen3TTSCodecStateArena
@@ -35,7 +35,7 @@ from sglang_omni.models.qwen3_tts.incremental_codec_cuda_graph import (
     Qwen3TTSIncrementalCodecCudaGraphRunner,
 )
 from sglang_omni.platforms import current_platform
-from sglang_omni.utils import channels_last_conv, snake_beta
+from sglang_omni.utils import channels_last_conv, saved_programs, snake_beta
 from sglang_omni.utils.channels_last_conv import channels_last_weight
 
 
@@ -1618,19 +1618,30 @@ def fresh_state(rows: int) -> Qwen3TTSIncrementalCodecState:
 
 
 def test_incremental_decoder_routes_only_precompiled_shapes_to_the_kernel(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     torch.manual_seed(6)
+    monkeypatch.setenv("TORCHINDUCTOR_CACHE_DIR", str(tmp_path))
     decoder = Decoder()
     incremental = Qwen3TTSIncrementalDecoder(decoder)
     calls: list[tuple[int, int]] = []
 
-    def fake_compile(fn, **kwargs):
-        def wrapped(codes, state):
-            calls.append((int(codes.shape[0]), int(codes.shape[-1])))
-            return fn(codes, state)
+    class FakeProgram:
+        def __init__(self, function) -> None:
+            self.function = function
 
-        return wrapped
+        def guard_check(self, *args) -> bool:
+            return True
+
+        def save_compiled_function(self, path: str) -> None:
+            pass
+
+        def __call__(self, decoder, codes, state):
+            calls.append((int(codes.shape[0]), int(codes.shape[-1])))
+            return self.function(codes, state)
+
+    def fake_compile(fn, **kwargs):
+        return SimpleNamespace(aot_compile=lambda example: FakeProgram(fn))
 
     monkeypatch.setattr(torch, "compile", fake_compile)
     trace_codes = torch.randint(0, 16, (2, 2, 3))
@@ -1847,8 +1858,9 @@ def test_arena_rings_keep_each_slot_apart_across_cohorts_and_graph_replays() -> 
     not current_platform.is_cuda(), reason="channels-last convs run on NVIDIA CUDA only"
 )
 def test_compiled_decode_shares_a_program_per_size_class_and_tracks_fp32(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
+    monkeypatch.setenv("TORCHINDUCTOR_CACHE_DIR", str(tmp_path))
     monkeypatch.setattr(torch.backends.cudnn, "allow_tf32", False)
     apply_qwen_tts_transformers_compatibility_patches()
     from qwen_tts.core.tokenizer_12hz.configuration_qwen3_tts_tokenizer_v2 import (
@@ -1901,16 +1913,19 @@ def test_compiled_decode_shares_a_program_per_size_class_and_tracks_fp32(
         )
 
     shared_runner = compiled_runner((4, 8), (2, 4))
-    torch.compiler.reset()
-    programs = counters["stats"]["unique_graphs"]
     shared_runner.capture()
-    assert sorted(incremental.compiled_shapes) == [(2, 4), (2, 8), (4, 4), (4, 8)]
+    assert sorted(incremental.saved_programs.by_shape) == [
+        (2, 4),
+        (2, 8),
+        (4, 4),
+        (4, 8),
+    ]
     assert len(shared_runner.graphs) == 4
-    assert counters["stats"]["unique_graphs"] == programs + 1
+    assert len(incremental.saved_programs.programs) == 1
 
     other_runner = compiled_runner((3,), (1, 2))
     other_runner.capture()
-    assert {(1, 3), (2, 3)} <= incremental.compiled_shapes
+    assert {(1, 3), (2, 3)} <= set(incremental.saved_programs.by_shape)
     assert [arena.acquire() for _ in range(4)] == [0, 1, 2, 3]
 
     with torch.inference_mode():
@@ -1972,6 +1987,81 @@ def test_compiled_decode_shares_a_program_per_size_class_and_tracks_fp32(
         ring.view(-1, arena.ring_frames, ring.shape[1])[3].any()
         for ring in (*arena.key_rings, *arena.value_rings)
     )
+
+
+@pytest.mark.accelerator
+@pytest.mark.skipif(
+    not current_platform.is_cuda(), reason="channels-last convs run on NVIDIA CUDA only"
+)
+def test_saved_programs_serve_a_later_decoder_unless_stale_or_damaged(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("TORCHINDUCTOR_CACHE_DIR", str(tmp_path))
+    apply_qwen_tts_transformers_compatibility_patches()
+    from qwen_tts.core.tokenizer_12hz.configuration_qwen3_tts_tokenizer_v2 import (
+        Qwen3TTSTokenizerV2DecoderConfig,
+    )
+    from qwen_tts.core.tokenizer_12hz.modeling_qwen3_tts_tokenizer_v2 import (
+        Qwen3TTSTokenizerV2DecoderTransformerModel,
+    )
+
+    torch.manual_seed(35)
+    device = torch.device("cuda", torch.cuda.current_device())
+    decoder = Decoder(block_channels=(16, 8))
+    decoder.pre_transformer = Qwen3TTSTokenizerV2DecoderTransformerModel(
+        Qwen3TTSTokenizerV2DecoderConfig(
+            hidden_size=512,
+            latent_dim=2,
+            num_attention_heads=16,
+            num_key_value_heads=16,
+            head_dim=64,
+            intermediate_size=1024,
+            num_hidden_layers=2,
+        )
+    )
+    decoder = decoder.to(device).bfloat16().eval()
+    codes = torch.randint(0, 16, (2, 2, 4), device=device)
+
+    def compiled_decode() -> tuple[Qwen3TTSIncrementalDecoder, torch.Tensor]:
+        incremental = Qwen3TTSIncrementalDecoder(decoder)
+        arena = Qwen3TTSCodecStateArena(
+            incremental,
+            num_slots=3,
+            device=device,
+            dtype=torch.bfloat16,
+            in_place_frames=8,
+        )
+        index = torch.tensor([0, 1], device=device)
+        with torch.inference_mode():
+            incremental.precompile(codes, arena.gather_by_index(index))
+            for ring in (*arena.key_rings, *arena.value_rings):
+                ring.zero_()
+            state = arena.gather_by_index(index)
+            return incremental, incremental.decode(codes, state, compiled=True).clone()
+
+    traced, expected = compiled_decode()
+    assert len(traced.saved_programs.programs) == 1
+
+    def refuse_a_trace(*args, **kwargs):
+        raise AssertionError("a saved program was traced again")
+
+    with monkeypatch.context() as patched:
+        patched.setattr(torch, "compile", refuse_a_trace)
+        loaded, waveform = compiled_decode()
+    assert len(loaded.saved_programs.programs) == 1
+    assert torch.equal(waveform, expected)
+
+    with monkeypatch.context() as patched:
+        patched.setattr(saved_programs.inspect, "getsource", lambda module: "changed")
+        stale, waveform = compiled_decode()
+    assert len(stale.saved_programs.programs) == 1
+    assert torch.equal(waveform, expected)
+
+    for path in traced.saved_programs.directory.glob("*.program"):
+        path.write_bytes(b"damaged")
+    damaged, waveform = compiled_decode()
+    assert len(damaged.saved_programs.programs) == 1
+    assert torch.equal(waveform, expected)
 
 
 @pytest.mark.accelerator
