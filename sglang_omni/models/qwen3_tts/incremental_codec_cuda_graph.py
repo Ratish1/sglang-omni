@@ -396,6 +396,22 @@ class Qwen3TTSIncrementalCodecCudaGraphRunner:
         capture_stream.wait_stream(self.device_module.current_stream(self.device))
         with self.device_module.stream(capture_stream), torch.inference_mode():
             if compiled:
+                trace_first = os.environ.get("SGLANG_OMNI_CODEC_TRACE_FIRST", "")
+                if trace_first and not self.decoder.compiled_shapes:
+                    for item in trace_first.split(","):
+                        batch, width = (int(value) for value in item.split("x"))
+                        first_codes = torch.zeros(
+                            (batch, self.num_quantizers, width),
+                            dtype=torch.long,
+                            device=self.device,
+                        )
+                        first_state = self.arena.gather_by_index(
+                            self.scratch_index(batch)
+                        )
+                        resources.keepalives.append(first_state)
+                        self.decoder.precompile(first_codes, first_state)
+                else:
+                    pass
                 trace_state = self.arena.gather_by_index(static_index)
                 resources.keepalives.append(trace_state)
                 self.decoder.precompile(static_codes, trace_state)
