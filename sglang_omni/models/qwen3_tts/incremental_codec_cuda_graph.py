@@ -400,14 +400,14 @@ class Qwen3TTSIncrementalCodecCudaGraphRunner:
                 if trace_first and not self.decoder.compiled_shapes:
                     for item in trace_first.split(","):
                         batch, width = (int(value) for value in item.split("x"))
-                        first_codes = torch.zeros(
-                            (batch, self.num_quantizers, width),
-                            dtype=torch.long,
-                            device=self.device,
-                        )
-                        first_state = self.arena.gather_by_index(
-                            self.scratch_index(batch)
-                        )
+                        with torch.inference_mode(False):
+                            first_codes = torch.zeros(
+                                (batch, self.num_quantizers, width),
+                                dtype=torch.long,
+                                device=self.device,
+                            )
+                            first_index = self.scratch_index(batch)
+                        first_state = self.arena.gather_by_index(first_index)
                         resources.keepalives.append(first_state)
                         self.decoder.precompile(first_codes, first_state)
                 else:
