@@ -65,17 +65,24 @@ def reduce_records(records: list[Path]) -> None:
     threads: Counter[str] = Counter()
     inclusive: dict[str, Counter[str]] = defaultdict(Counter)
     leaf: dict[str, Counter[str]] = defaultdict(Counter)
+    other_process_samples = 0
     for record in records:
-        for line in record.read_text(errors="replace").splitlines():
+        text = record.read_text(errors="replace")
+        is_stage_process = "scheduler-tts_engine" in text
+        for line in text.splitlines():
             stack, _, count_text = line.rpartition(" ")
             if not stack or not count_text.isdigit():
                 continue
             else:
                 pass
             count = int(count_text)
+            if not is_stage_process:
+                other_process_samples += count
+                continue
+            else:
+                pass
             frames = stack.split(";")
-            thread_frames = [frame for frame in frames if frame.startswith("thread ")]
-            thread = THREAD_DIGITS.sub("N", thread_frames[0].split('"')[-2]) if thread_frames and '"' in thread_frames[0] else "unnamed"
+            thread = THREAD_DIGITS.sub("N", frames[0].split("): ", 1)[-1]) if frames[0].startswith("thread ") else "unnamed"
             body = [frame for frame in frames if not frame.startswith(("thread ", "process "))]
             threads[thread] += count
             for name in {short_frame(frame) for frame in body}:
@@ -85,16 +92,16 @@ def reduce_records(records: list[Path]) -> None:
             else:
                 pass
     total = sum(threads.values())
-    print(f"lock samples {total}")
+    print(f"stage process lock samples {total}; other processes, on their own locks, {other_process_samples}")
     for thread, count in threads.most_common(12):
         print(f"{thread}: {100 * count / total:.1f} %")
-    for thread, count in threads.most_common(5):
+    for thread, count in threads.most_common(6):
         print(f"== {thread}: {count} samples")
         print("  inclusive:")
-        for name, samples in inclusive[thread].most_common(40):
+        for name, samples in inclusive[thread].most_common(70):
             print(f"  {100 * samples / count:6.1f} %  {name[:130]}")
         print("  leaf:")
-        for name, samples in leaf[thread].most_common(25):
+        for name, samples in leaf[thread].most_common(40):
             print(f"  {100 * samples / count:6.1f} %  {name[:130]}")
 
 
@@ -107,7 +114,13 @@ def main() -> None:
     parser.add_argument("--no-stream", action="store_true")
     parser.add_argument("--warmup-s", type=float, default=6.0)
     parser.add_argument("--duration-s", type=int, default=10)
+    parser.add_argument("--reduce-glob", default=None, help="reduce existing gil_*.txt records under this glob, no run")
     args = parser.parse_args()
+    if args.reduce_glob:
+        reduce_records(sorted(Path("/").glob(args.reduce_glob.lstrip("/"))))
+        return
+    else:
+        pass
     args.root.mkdir(parents=True, exist_ok=True)
     print(f"tree {args.tree} {identity(args.tree)} card {args.card}", flush=True)
     server = start(args.tree, args.card, args.port, args.root / "serve.log")
