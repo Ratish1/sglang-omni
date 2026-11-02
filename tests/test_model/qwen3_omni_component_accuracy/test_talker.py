@@ -310,6 +310,9 @@ def test_talker_follows_reference(
     with torch.inference_mode():
         for sample_id, (tokens, served_audio) in responses.items():
             record = records[sample_id]
+            assert (
+                tokens == record["thinker_token_ids"]
+            ), f"{sample_id}: the logprobs' tokens are not the reply the talker read"
             generated = [token for token in tokens if token != config.im_end_token_id]
             codes = record["codes"].to(component_device)
             hidden = record["hidden"].to(component_device)
