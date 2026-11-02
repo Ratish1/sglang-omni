@@ -595,12 +595,24 @@ def patch_vocoder(module):
         scheduler.commit_initial,
         lambda self, request_id, state, plan, delta: f"voc.commit rid={request_id}",
     )
-    scheduler.commit_followup = ranged(
-        scheduler.commit_followup,
-        lambda self, request_id, *args, **kwargs: (
-            f"voc.commit_followup rid={request_id}"
-        ),
-    )
+    # note: the host path branch commits a cohort at once and takes one message a step; the base
+    # still has the per chunk forms, and both stay profiled for a same-head comparison.
+    if hasattr(scheduler, "commit_followup"):
+        scheduler.commit_followup = ranged(
+            scheduler.commit_followup,
+            lambda self, request_id, *args, **kwargs: (
+                f"voc.commit_followup rid={request_id}"
+            ),
+        )
+    else:
+        scheduler.commit_followups = ranged(
+            scheduler.commit_followups,
+            lambda self, group, deltas: f"voc.commit_followups rows={len(group)}",
+        )
+        scheduler.handle_stream_step = ranged(
+            scheduler.handle_stream_step,
+            lambda self, step: f"voc.ingest_step rows={len(step.request_ids)}",
+        )
     handle = module.Qwen3TTSDecodeHandle
     handle.resolve_partial = ranged(handle.resolve_partial, fixed("voc.resolve"))
 
