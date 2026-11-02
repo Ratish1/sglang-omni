@@ -1,9 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 """Omni's image and video preprocessing against Qwen's reference loader and HF's processor on CI requests.
 
-The model card prepares media with qwen_omni_utils.process_mm_info at its defaults: images and video frames are
-resized to multiples of 28 there (fetch_image, fetch_video) before the HF processor resizes them again, and video is
-sampled at the request's fps. Images come from stage 3's mmmu-ci-50 with its prompt, videos from the VideoMME stage's
+The model card prepares media with qwen_omni_utils.process_mm_info. Its image_patch_size defaults to 14, this model's
+processor uses 16, so at the default an image is resized to multiples of 28 and then resampled to multiples of 32: on
+all 900 MMMU items that loses a median 11 % of neighbouring-pixel energy, and MMMU answers lean down (607.0 to 597.5 of
+900, p 0.35). Omni resizes once in the processor, as SGLang does, so images compare at the model's own patch, where
+only the bicubic arithmetic of PIL and torchvision differs. Video compares at the loader's default, which omni and
+SGLang both follow. Images come from stage 3's mmmu-ci-50 with its prompt, videos from the VideoMME stage's
 videomme-ci-50 at its fps 2 and 128 frames. Prompt ids, grids and pixels are compared.
 """
 
@@ -37,6 +40,8 @@ IMAGE_SAMPLES = 20
 VIDEO_SAMPLES = 6
 VIDEO_FPS = 2
 VIDEO_MAX_FRAMES = 128
+# note (ratish): the 99 % the suite holds a component to; the worst of 900 MMMU items is 0.17 % apart.
+IMAGE_RELATIVE_L2_BOUND = 0.01
 
 
 def omni_inputs(
@@ -113,7 +118,9 @@ def test_vision_preprocessing_matches_reference(
             }
         ]
         _, images, _ = qwen_omni_utils.process_mm_info(
-            conversation, use_audio_in_video=False
+            conversation,
+            use_audio_in_video=False,
+            image_patch_size=processor.image_processor.patch_size,
         )
         reference = processor(
             text=processor.apply_chat_template(
@@ -197,7 +204,13 @@ def test_vision_preprocessing_matches_reference(
     different = [
         record["case"]
         for record in records
-        if not (record["input_ids_equal"] and record["pixels_max_abs"] == 0.0)
+        if not record["input_ids_equal"]
+        or record["pixels_relative_l2"] is None
+        or (
+            record["pixels_relative_l2"] > IMAGE_RELATIVE_L2_BOUND
+            if record["case"].startswith("image/")
+            else record["pixels_max_abs"] != 0.0
+        )
     ]
     assert (
         not different
