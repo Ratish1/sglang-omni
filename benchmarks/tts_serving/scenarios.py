@@ -358,6 +358,13 @@ def _target_length_text(
 
 
 def _build_stage_scenarios(spec: BenchmarkSpec, stage: LoadStage) -> list[Scenario]:
+    if stage.single_workload is not None:
+        return [
+            _scheduled_workload_scenario(stage.single_workload, index, spec, stage)
+            for index in range(stage.request_count)
+        ]
+    else:
+        pass
     rng = random.Random(f"{spec.seed}:{stage.id}")
     endpoint_set = set(stage.enabled_endpoints or spec.params.enabled_endpoints)
     required_scenarios = _required_stage_scenarios(spec, stage, endpoint_set)

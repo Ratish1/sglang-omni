@@ -25,9 +25,12 @@ SCHEDULED_WORKLOAD_ENDPOINTS = {
     "rest_stream": "speech_stream",
     "batch_32_all_valid": "batch",
     "long_prefill_decode": "speech",
-    "long_prefill_decode_stream": "speech_stream",
     "ws_normal": "websocket",
     "ws_stream_audio": "websocket",
+}
+SINGLE_WORKLOAD_ENDPOINTS = {
+    **SCHEDULED_WORKLOAD_ENDPOINTS,
+    "long_prefill_decode_stream": "speech_stream",
 }
 DEFAULT_SPEAKER_MAX_UPLOADED = 1000
 DEFAULT_SEED = 0
@@ -92,6 +95,7 @@ LOAD_STAGE_KEYS = {
     "text_corpus",
     "coverage_schedule",
     "workload_schedules",
+    "single_workload",
 }
 SCHEDULE_KEYS = {"start_s", "end_s"}
 WORKLOAD_SCHEDULE_KEYS = {
@@ -221,6 +225,8 @@ class LoadStage:
     text_corpus: str | None = None
     coverage_schedule: CoverageSchedule | None = None
     workload_schedules: tuple[WorkloadSchedule, ...] = field(default_factory=tuple)
+    # note (ratish): every request of the stage is this workload, for a load held at one shape.
+    single_workload: str | None = None
 
     @classmethod
     def from_obj(cls, obj: Any, *, index: int) -> LoadStage:
@@ -349,6 +355,15 @@ class LoadStage:
                 "params.load_stages[].text_corpus must be one of "
                 f"{sorted(VALID_TEXT_CORPORA)}"
             )
+        single_workload = _optional_str(obj, "single_workload")
+        if (
+            single_workload is not None
+            and single_workload not in SINGLE_WORKLOAD_ENDPOINTS
+        ):
+            raise SpecError(
+                "params.load_stages[].single_workload must be one of "
+                f"{sorted(SINGLE_WORKLOAD_ENDPOINTS)}"
+            )
         return cls(
             id=stage_id,
             mode=mode,
@@ -365,10 +380,12 @@ class LoadStage:
             text_corpus=text_corpus,
             coverage_schedule=coverage_schedule,
             workload_schedules=workload_schedules,
+            single_workload=single_workload,
         )
 
     def to_json(self) -> dict[str, Any]:
         return {
+            "single_workload": self.single_workload,
             "id": self.id,
             "mode": self.mode,
             "request_count": self.request_count,
