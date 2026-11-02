@@ -236,11 +236,18 @@ def residual_probs(logits: torch.Tensor) -> torch.Tensor:
     return filtered / filtered.sum(-1, keepdim=True)
 
 
-def run_decoder_chain(root, layers_name, hidden, kwargs_by_layer, truths, ledger, key, groups, on_layer=None):
+def run_decoder_chain(root, layers_name, hidden, kwargs_by_layer, truths, ledger, key, groups, on_layer=None, keep_norms=None):
     """The BF16 chain through a decoder stack, with FP32's position tables and masks, compared to FP32 per layer."""
     layers = root.get_submodule(layers_name)
     for index, layer in enumerate(layers):
         floor = bf16_copy(root, layer, torch.bfloat16)
+        if keep_norms is not None:
+            for norm_name in ("input_layernorm", "post_attention_layernorm"):
+                getattr(floor, norm_name).register_forward_hook(
+                    lambda _module, _args, output, key_name=f"{index}.{norm_name}": keep_norms.__setitem__(
+                        key_name, output.detach().float().cpu()
+                    )
+                )
         with torch.inference_mode():
             hidden = first_tensor(
                 floor(hidden, **cast(kwargs_by_layer[index], DEVICE, torch.bfloat16))
@@ -395,6 +402,12 @@ def main() -> None:
             layer_kwargs.append(kwargs)
             layer_truths.append(output)
         replay_local(thinker, recorder, ledger, "thinker")
+        truth_norms = {
+            f"{index}.{norm_name}": recorder.records[f"model.layers.{index}.{norm_name}"][0][2].float()
+            for index in range(len(thinker.model.layers))
+            for norm_name in ("input_layernorm", "post_attention_layernorm")
+        }
+        floor_norms = {}
         recorder.records.clear()
 
         embedding = bf16_copy(thinker, thinker.get_input_embeddings(), torch.bfloat16)
@@ -415,12 +428,29 @@ def main() -> None:
 
         kept["embeds"] = hidden.detach().clone()
         hidden = run_decoder_chain(
-            thinker, "model.layers", hidden, layer_kwargs, layer_truths, ledger, "thinker", groups, keep
+            thinker, "model.layers", hidden, layer_kwargs, layer_truths, ledger, "thinker", groups, keep, floor_norms
         )
         norm = bf16_copy(thinker, thinker.model.norm, torch.bfloat16)
         head = bf16_copy(thinker, thinker.lm_head, torch.bfloat16)
         with torch.inference_mode():
-            logits = head(norm(hidden))[0].float()
+            final_bf16 = norm(hidden)
+            logits = head(final_bf16)[0].float()
+        torch.save(
+            {
+                "sample_id": sample_id,
+                "input_ids": full_ids[0].cpu(),
+                "prompt_rows": prompt_len,
+                "truth_norms": truth_norms,
+                "floor_norms": floor_norms,
+                "truth_final": truth_hidden_states[-1][0].float(),
+                "floor_final": final_bf16[0].float().cpu(),
+                "truth_logits": truth_logits[prompt_len - 1 :].cpu(),
+                "floor_logits": logits[prompt_len - 1 :].cpu(),
+                "truth_audio": tower_truth.float().cpu(),
+                "floor_audio": tower_bf16.float().cpu(),
+            },
+            out.with_name(f"{out.stem}.{count}.truth.pt"),
+        )
         steps = torch.arange(prompt_len - 1, full_ids.shape[1] - 1)
         truth_step_logits = truth_logits[steps].to(DEVICE)
         step_logits = logits[steps.to(DEVICE)]
