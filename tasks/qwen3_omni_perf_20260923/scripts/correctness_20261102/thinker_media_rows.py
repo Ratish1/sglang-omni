@@ -13,7 +13,6 @@ usage: PYTHONPATH=TREE python3 thinker_media_rows.py hf OUT DEVICE
        PYTHONPATH=TREE python3 thinker_media_rows.py compare OUT DUMP_DIR
 """
 
-import collections
 import gc
 import json
 import re
@@ -100,15 +99,24 @@ def send(url: str, out: Path) -> None:
 
 
 def load_forwards(dump_dir: Path) -> list[dict[str, Path]]:
-    pattern = re.compile(r"step=(\d+).*name=(.*?)(?:___|\.pt$)")
-    grouped: dict[int, dict[str, Path]] = collections.defaultdict(dict)
+    """Each forward's dumps in the order they were written: the dumper's step does not advance on every forward."""
+    pattern = re.compile(r"dump_index=(\d+)___name=(.*?)(?:___|\.pt$)")
+    written = []
     for path in dump_dir.rglob("*.pt"):
         match = pattern.search(path.name)
         if match is not None:
-            grouped[int(match.group(1))][match.group(2).removeprefix("non_intrusive__")] = path
+            written.append((int(match.group(1)), match.group(2).removeprefix("non_intrusive__"), path))
         else:
             pass
-    return [grouped[step] for step in sorted(grouped)]
+    first_point = f"model.layers.{LAYERS[0]}.{POINTS['input_layernorm']}"
+    forwards: list[dict[str, Path]] = []
+    for _, name, path in sorted(written, key=lambda entry: entry[0]):
+        if name == first_point:
+            forwards.append({})
+        else:
+            pass
+        forwards[-1][name] = path
+    return forwards
 
 
 def value_of(path: Path) -> torch.Tensor:
