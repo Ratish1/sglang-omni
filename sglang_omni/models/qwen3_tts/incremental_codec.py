@@ -35,7 +35,11 @@ if current_platform.is_cuda():
         SnakeBetaCoefficients,
         fused_bias_snake_beta,
     )
-    from sglang_omni.kernels.codec_state import history_exchange, overlap_exchange
+    from sglang_omni.kernels.codec_state import (
+        history_exchange,
+        overlap_exchange,
+        ring_step_rows,
+    )
     from sglang_omni.kernels.single_output_conv import clamped_single_output_conv
 else:
     pass
@@ -717,6 +721,21 @@ def ring_window_attention_fake(
     return query.new_empty(query.shape)
 
 
+def ring_step_rows_fake(
+    start_positions: torch.Tensor,
+    slot_rows: torch.Tensor,
+    fresh_frames: int,
+    ring_frames: int,
+    retained_frames: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    batch_size = start_positions.shape[0]
+    return (
+        start_positions.new_empty(batch_size * fresh_frames),
+        start_positions.new_empty(batch_size, ring_frames, dtype=torch.int32),
+        start_positions.new_empty(batch_size, dtype=torch.int32),
+    )
+
+
 if current_platform.is_cuda():
     # note (ratish): FA3 has no fake implementation, so a compiled decode calls it as this op.
     compiled_ring_window_attention = register_custom_op(
@@ -724,6 +743,12 @@ if current_platform.is_cuda():
         op_name="qwen3_tts_codec_ring_window_attention",
         mutates_args=[],
         fake_impl=ring_window_attention_fake,
+    )
+    compiled_ring_step_rows = register_custom_op(
+        ring_step_rows,
+        op_name="qwen3_tts_codec_ring_step_rows",
+        mutates_args=[],
+        fake_impl=ring_step_rows_fake,
     )
 else:
     pass
@@ -953,8 +978,23 @@ class FusedIncrementalTransformer:
             valid_frames is None
             and fresh_frames <= rings.ring_frames - retained_context
         )
-        if is_in_place:
-            write_rows = frame_rows.reshape(rows).clone()
+        if is_in_place and self.is_paged_attention:
+            # note (ratish): as tensor expressions, Inductor writes these rows into a buffer per
+            # layer that reads them, sixteen launches a decode for the same values.
+            step_rows = (
+                compiled_ring_step_rows
+                if torch.compiler.is_dynamo_compiling()
+                else ring_step_rows
+            )
+            write_rows, page_table, window_lengths = step_rows(
+                start_positions,
+                rings.slot_rows,
+                fresh_frames,
+                rings.ring_frames,
+                retained_context,
+            )
+        elif is_in_place:
+            write_rows = frame_rows.reshape(rows)
             window_starts = (start_positions - retained_context).clamp(min=0)
             window_rows = (
                 slot_rows
@@ -965,19 +1005,13 @@ class FusedIncrementalTransformer:
                 % rings.ring_frames
             )
             window_lengths = start_positions - window_starts + fresh_frames
-            if self.is_paged_attention:
-                page_table = window_rows.to(torch.int32).clone()
-                window_lengths = window_lengths.to(torch.int32).clone()
-            else:
-                query_offsets = (window_lengths - fresh_frames).unsqueeze(
-                    1
-                ) + torch.arange(fresh_frames, device=device)
-                distances = query_offsets.unsqueeze(2) - torch.arange(
-                    rings.ring_frames, device=device
-                )
-                attention_mask = (
-                    (distances >= 0) & (distances < window_size)
-                ).unsqueeze(1)
+            query_offsets = (window_lengths - fresh_frames).unsqueeze(1) + torch.arange(
+                fresh_frames, device=device
+            )
+            distances = query_offsets.unsqueeze(2) - torch.arange(
+                rings.ring_frames, device=device
+            )
+            attention_mask = ((distances >= 0) & (distances < window_size)).unsqueeze(1)
         else:
             key_positions = start_positions.unsqueeze(1) + torch.arange(
                 -retained_context, fresh_frames, device=device
