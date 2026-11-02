@@ -3,9 +3,12 @@
 Each named sample goes through Qwen3OmniMoeProcessor (reference audio by librosa.load at 16 kHz) and
 Qwen3OmniMoeForConditionalGeneration.generate with the bench's request: the VoiceCloneOmni prompt, speaker Ethan,
 thinker temperature 0.7 with no top-k or top-p (the server applies only the field the bench sends), HF's talker
-defaults (sampled, top-k 50, top-p 1.0, temperature 0.9, repetition penalty 1.05). RESIDUALS=argmax makes the code
-predictor greedy, as our server is (DECISIONS 11); the default samples it, as HF does. Writes OUT/audio/<id>.wav at 24
-kHz, OUT/reply_text.json, and one timing line a sample, so a run can be sized and scored by run_bench.py's scorer.
+defaults (sampled, top-k 50, top-p 1.0, temperature 0.9, repetition penalty 1.05). The default samples the residual
+codebooks as HF does (top-k 50, top-p 0.8, mirrored from the talker's do_sample at every generate call,
+modeling_qwen3_omni_moe.py:3261-3267); RESIDUALS=argmax overrides that mirror so the code predictor is greedy, as our
+server is (DECISIONS 11). Writes OUT/audio/<id>__r<k>.wav at 24 kHz, OUT/reply_text.json, OUT/generated.json in the
+bench's record format, and one timing line a sample, so run_bench.py's scorer and bad_output_census.py read a run as
+they read a served pass. A run restarted on OUT continues after its last finished request.
 
 usage: python3 hf_reference_rate.py OUT SAMPLE_IDS_FILE [REPEATS]
 """
@@ -27,6 +30,19 @@ from benchmarks.dataset.seedtts import load_seedtts_samples
 MODEL = "Qwen/Qwen3-Omni-30B-A3B-Instruct"
 SEEDTTS_META = "zhaochenyang20/seed-tts-eval-arrow"
 RESIDUALS = os.environ.get("RESIDUALS", "sampled")
+DEVICE = os.environ.get("DEVICE", "cuda:0")
+
+
+def force_greedy_residuals(talker: torch.nn.Module) -> None:
+    """Keep the code predictor greedy after the talker's generate mirrors its do_sample onto it."""
+    prepare = talker._prepare_generation_config  # noqa: leading-underscore
+
+    def prepare_then_greedy(*args, **kwargs):
+        prepared = prepare(*args, **kwargs)
+        talker.code_predictor.generation_config.do_sample = False
+        return prepared
+
+    talker._prepare_generation_config = prepare_then_greedy  # noqa: leading-underscore
 
 
 def main() -> None:
@@ -37,23 +53,33 @@ def main() -> None:
     snapshot = snapshot_download(MODEL)
     processor = Qwen3OmniMoeProcessor.from_pretrained(snapshot)
     model = Qwen3OmniMoeForConditionalGeneration.from_pretrained(
-        snapshot, dtype=torch.bfloat16, device_map="auto", enable_audio_output=True
+        snapshot,
+        dtype=torch.bfloat16,
+        device_map={"": DEVICE},
+        enable_audio_output=True,
     ).eval()
     if RESIDUALS == "argmax":
-        model.talker.code_predictor.generation_config.do_sample = False
+        force_greedy_residuals(model.talker)
     else:
         pass
-    print(
-        f"thinker generation config: {model.thinker.generation_config}; residuals {RESIDUALS}",
-        flush=True,
-    )
+    print(f"residuals {RESIDUALS} device {DEVICE}", flush=True)
     samples = {
         sample.sample_id: sample
         for sample in load_seedtts_samples(SEEDTTS_META, None, split="en")
     }
-    replies = {}
+    generated_path = out / "generated.json"
+    replies_path = out / "reply_text.json"
+    generated = (
+        json.loads(generated_path.read_text()) if generated_path.exists() else []
+    )
+    replies = json.loads(replies_path.read_text()) if replies_path.exists() else {}
     for repeat in range(repeats):
         for sample_id in sample_ids:
+            key = f"{sample_id}__r{repeat}"
+            if key in replies:
+                continue
+            else:
+                pass
             sample = samples[sample_id]
             prompt = (
                 f'Listen to the audio above. The speaker is reading: "{sample.ref_text}". '
@@ -89,19 +115,31 @@ def main() -> None:
                     return_audio=True,
                 )
             elapsed = time.time() - began
-            key = f"{sample_id}" if repeats == 1 else f"{sample_id}__r{repeat}"
             reply = processor.batch_decode(
                 sequences[:, inputs["input_ids"].shape[1] :], skip_special_tokens=True
             )[0]
             replies[key] = reply
             waveform = wav.reshape(-1).float().cpu().numpy()
-            soundfile.write(out / "audio" / f"{key}.wav", waveform, 24000)
+            wav_path = out / "audio" / f"{key}.wav"
+            soundfile.write(wav_path, waveform, 24000)
+            audio_seconds = len(waveform) / 24000
+            generated.append(
+                {
+                    "sample_id": key,
+                    "target_text": sample.target_text,
+                    "wav_path": str(wav_path),
+                    "is_success": True,
+                    "latency_s": elapsed,
+                    "audio_duration_s": audio_seconds,
+                }
+            )
             print(
-                f"sample {key} {elapsed:.1f} s, audio {len(waveform) / 24000:.2f} s, reply {reply[:80]!r}",
+                f"sample {key} {elapsed:.1f} s, audio {audio_seconds:.2f} s, reply {reply[:80]!r}",
                 flush=True,
             )
-            (out / "reply_text.json").write_text(
-                json.dumps(replies, indent=1, ensure_ascii=False)
+            replies_path.write_text(json.dumps(replies, indent=1, ensure_ascii=False))
+            generated_path.write_text(
+                json.dumps(generated, indent=1, ensure_ascii=False)
             )
 
 
