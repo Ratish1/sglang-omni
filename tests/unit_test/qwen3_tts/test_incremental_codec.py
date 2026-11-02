@@ -2032,12 +2032,14 @@ def test_saved_programs_serve_a_later_decoder_unless_stale_or_damaged(
             in_place_frames=8,
         )
         index = torch.tensor([0, 1], device=device)
+        static_codes = codes.clone()
         with torch.inference_mode():
-            incremental.precompile(codes, arena.gather_by_index(index))
+            incremental.precompile(static_codes, arena.gather_by_index(index))
             for ring in (*arena.key_rings, *arena.value_rings):
                 ring.zero_()
             state = arena.gather_by_index(index)
-            return incremental, incremental.decode(codes, state, compiled=True).clone()
+            waveform = incremental.decode(static_codes, state, compiled=True)
+            return incremental, waveform.clone()
 
     traced, expected = compiled_decode()
     assert len(traced.saved_programs.programs) == 1
