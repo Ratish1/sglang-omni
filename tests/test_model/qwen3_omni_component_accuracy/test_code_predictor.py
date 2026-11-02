@@ -28,10 +28,15 @@ from tests.test_model.qwen3_omni_component_accuracy.comparison import (
 from tests.unit_test.qwen3_omni.test_predictor_kernels import (
     build_talker,
     fuse,
+    published_server_args,  # noqa: F401  # fixture
     reset_caches,
 )
 
-pytestmark = [pytest.mark.benchmark, pytest.mark.accelerator]
+pytestmark = [
+    pytest.mark.benchmark,
+    pytest.mark.accelerator,
+    pytest.mark.usefixtures("published_server_args"),
+]
 
 BATCH_SIZES = (1, 2, 12, 31, 32, 33, 64, 65, 128)
 FRAMES_PER_REQUEST = 40
