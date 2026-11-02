@@ -609,6 +609,7 @@ def test_qwen_preprocessor_band_limits_request_audio(monkeypatch, tmp_path) -> N
     pre.default_video_min_pixels = None
     pre.default_video_max_pixels = None
     pre.default_video_total_pixels = None
+    pre.video_decode_threads = 16
     pre.processor = FakeProcessor()
     payload = StagePayload(
         request_id="band-limited-audio",
