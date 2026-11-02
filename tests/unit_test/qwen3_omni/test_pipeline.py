@@ -3218,6 +3218,7 @@ def test_image_parts_reach_processor_in_conversation_order(
 
     loader = AsyncMock(side_effect=lambda images, **kwargs: images or [])
     monkeypatch.setattr(preprocessor_mod, "ensure_image_list_async", loader)
+    monkeypatch.setattr(preprocessor_mod, "reference_prepared_image", lambda image: image)
     monkeypatch.setattr(
         preprocessor_mod, "ensure_audio_list_async", AsyncMock(return_value=[])
     )
