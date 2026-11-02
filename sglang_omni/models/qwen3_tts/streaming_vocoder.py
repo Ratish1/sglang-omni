@@ -968,7 +968,12 @@ class Qwen3TTSStreamingVocoderScheduler(
             )
         )
         in_place_frames = max(
-            (self.stream_followup_stride, *self.followup_stride_ramp, *cold_frames)
+            (
+                self.stream_followup_stride,
+                *self.followup_stride_ramp,
+                *cold_frames,
+                *(self.whole_request_widths if self.decodes_whole_requests else ()),
+            )
         )
         self.codec_arena = self.build_codec_arena(
             # note (ratish): whole requests hold slots for one initial batch, and streams keep
