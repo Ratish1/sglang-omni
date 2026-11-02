@@ -42,6 +42,10 @@ def request_text(payload: StagePayload | None) -> list[str]:
     else:
         pass
     inputs = payload.request.inputs
+    if isinstance(inputs, dict):
+        inputs = inputs["messages"]
+    else:
+        pass
     if isinstance(inputs, str):
         return [inputs]
     elif isinstance(inputs, list):

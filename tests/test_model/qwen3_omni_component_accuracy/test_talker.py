@@ -2,8 +2,8 @@
 """Omni's served talker, code predictor and code2wav against HF's, teacher-forced on what omni computed.
 
 QWEN3_OMNI_ACCURACY_SERVER is a speech server started with SGLANG_OMNI_TALKER_CAPTURE_DIR set to the directory
-QWEN3_OMNI_ACCURACY_TALKER_CAPTURE names. Each stage 6 request goes out with text and audio, greedy thinker, the
-talker's own sampling; the capture keeps the talker's prefill and decode input rows, its final hidden state at every
+QWEN3_OMNI_ACCURACY_TALKER_CAPTURE names. Each stage 6 request goes to /v1/chat/completions as the benchmarks send it,
+with text and audio, greedy thinker, the talker's own sampling; the capture keeps the talker's prefill and decode input rows, its final hidden state at every
 step and the 16 codes of every frame. HF then runs on omni's own inputs, its FP32 copy as truth, its BF16 copy as the
 floor:
 - decode inputs: every decode row must be the codec embeddings of the previous frame's 16 codes plus the next text
@@ -84,34 +84,25 @@ def request_media(question: AudioQuestion | MediaQuestion) -> dict[str, object]:
 
 def generate_with_speech(
     server: httpx.Client, question: AudioQuestion | MediaQuestion
-) -> tuple[list[int], torch.Tensor]:
+) -> torch.Tensor:
     response = server.post(
-        "/generate",
+        "/v1/chat/completions",
         json={
             "messages": [{"role": "user", "content": question.question_text}],
-            "metadata": {
-                **request_media(question),
-                "sample_id": question.sample_id,
-            },
-            "sampling_params": {"temperature": 0.0, "max_new_tokens": MAX_TOKENS},
-            "output_modalities": ["text", "audio"],
-            "return_logprob": True,
+            **request_media(question),
+            "modalities": ["text", "audio"],
+            "audio": {"format": "wav"},
+            "max_tokens": MAX_TOKENS,
+            "temperature": 0.0,
+            "stream": False,
         },
     )
-    if response.status_code != 200:
-        print(
-            f"[talker] {question.sample_id} refused {response.status_code}: {response.text[:600]}",
-            flush=True,
-        )
-    else:
-        pass
     response.raise_for_status()
-    body = response.json()
-    tokens = [int(pair[1]) for pair in body["meta_info"]["output_token_logprobs"]]
+    message = response.json()["choices"][0]["message"]
     audio, _ = soundfile.read(
-        io.BytesIO(base64.b64decode(body["audio"]["data"])), dtype="float32"
+        io.BytesIO(base64.b64decode(message["audio"]["data"])), dtype="float32"
     )
-    return tokens, torch.from_numpy(audio)
+    return torch.from_numpy(audio)
 
 
 def selected_seedtts_questions() -> list[AudioQuestion]:
@@ -183,19 +174,20 @@ def reference_positions(
     return torch.cat([prefill, decode.expand(3, 1, -1)], dim=-1).to(device)
 
 
-def captured_records(directory: Path, sample_ids: set[str]) -> dict[str, dict]:
+def captured_records(directory: Path, sample_ids: dict[str, str]) -> dict[str, dict]:
+    """Each request's capture, found by the question text it sent: sample_ids maps that text to the sample id."""
     deadline = time.monotonic() + CAPTURE_WAIT_S
     records: dict[str, dict] = {}
     while time.monotonic() < deadline:
         records = {}
         for path in directory.glob("*.pt"):
             record = torch.load(path, map_location="cpu")
-            sample_id = record["metadata"].get("sample_id")
-            if sample_id in sample_ids:
+            sample_id = sample_ids.get("".join(record["request_text"]))
+            if sample_id is not None:
                 records[sample_id] = record
             else:
                 pass
-        if set(records) == sample_ids:
+        if len(records) == len(sample_ids):
             break
         else:
             time.sleep(2)
@@ -248,7 +240,9 @@ def test_talker_follows_reference(
             pool.map(lambda item: generate_with_speech(server, item), questions),
         ):
             responses[question.sample_id] = response
-    records = captured_records(Path(capture_dir), set(responses))
+    sample_ids = {question.question_text: question.sample_id for question in questions}
+    assert len(sample_ids) == len(questions), "two requests send the same question"
+    records = captured_records(Path(capture_dir), sample_ids)
     assert set(records) == set(
         responses
     ), f"no capture for {sorted(set(responses) - set(records))}"
@@ -308,12 +302,13 @@ def test_talker_follows_reference(
     case_records: list[CaseRecord] = []
     reports = []
     with torch.inference_mode():
-        for sample_id, (tokens, served_audio) in responses.items():
+        for sample_id, served_audio in responses.items():
             record = records[sample_id]
-            assert (
-                tokens == record["thinker_token_ids"]
-            ), f"{sample_id}: the logprobs' tokens are not the reply the talker read"
-            generated = [token for token in tokens if token != config.im_end_token_id]
+            generated = [
+                token
+                for token in record["thinker_token_ids"]
+                if token != config.im_end_token_id
+            ]
             codes = record["codes"].to(component_device)
             hidden = record["hidden"].to(component_device)
             prefill = record["prefill_input_embeds"].to(component_device)
