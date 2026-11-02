@@ -58,7 +58,11 @@ class Qwen3TTSCodeTable:
 
 @dataclass(eq=False, frozen=True, kw_only=True)
 class CodecFrameStep:
-    """A step's frames for the vocoder: where they are, and the event that marks them written."""
+    """A step's frames for the vocoder: where they are, and the event that marks them written.
+
+    step orders these on the engine's one stream, so waiting for one covers all before it.
+    """
 
     table: Qwen3TTSCodeTable
     ready: torch.Event | None
+    step: int

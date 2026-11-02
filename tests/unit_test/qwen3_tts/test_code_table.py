@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from types import SimpleNamespace
 
 import numpy as np
@@ -51,6 +52,7 @@ def make_runner(table: Qwen3TTSCodeTable, output_codes: torch.Tensor):
     runner.step_frame_request_ids = []
     runner.step_opened_streams = {}
     runner.step_codes_ready = None
+    runner.code_step_index = 0
     return runner
 
 
@@ -119,7 +121,7 @@ def frame_step(
     return StreamStep(
         request_ids=request_ids,
         opened=opened or {},
-        data=CodecFrameStep(table=table, ready=None),
+        data=CodecFrameStep(table=table, ready=None, step=0),
     )
 
 
@@ -356,6 +358,7 @@ def table_plan(
         emitted_generated_frames=0,
         frame_row=row,
         start_frame=start,
+        frames=CodecFrameStep(table=None, ready=None, step=0),
     )
 
 
@@ -383,6 +386,35 @@ def test_a_cohorts_gather_equals_each_rows_slice_as_the_decoder_reads_it() -> No
             (table.codes[0, 2:5].transpose(0, 1), table.codes[3, 5:8].transpose(0, 1))
         ),
     )
+
+
+def test_a_cohort_waits_for_its_newest_rows_step_and_no_newer_one() -> None:
+    table = make_table()
+    scheduler = scheduler_on_table(table)
+    waited: list[str] = []
+    scheduler.wait_frames_ready = lambda frames: waited.append(frames.ready)
+    older = table_plan(0, start=0, fresh=1)
+    newer = replace(
+        table_plan(1, start=0, fresh=1),
+        frames=CodecFrameStep(table=table, ready="newer", step=7),
+    )
+
+    scheduler.gather_table_codes([older, newer], 1)
+
+    assert waited == ["newer"]
+
+
+def test_a_stream_remembers_the_step_of_its_own_last_frame() -> None:
+    table = make_table()
+    scheduler = make_scheduler(async_decode=False)
+    row = table.acquire()
+    first = frame_step(table, ["req"], {"req": opening(row)})
+    second = frame_step(table, ["other"])
+
+    scheduler.handle_stream_step(first)
+    scheduler.handle_stream_step(second)
+
+    assert scheduler.stream_states["req"].last_frames is first.data
 
 
 def test_a_cohort_of_different_widths_pads_the_short_rows_with_zeros() -> None:
@@ -422,7 +454,9 @@ def test_a_streams_own_frames_are_a_copy_the_screen_can_clamp() -> None:
     table = make_table()
     table.codes.fill_(7)
     scheduler = scheduler_on_table(table)
-    state = SimpleNamespace(frame_row=1)
+    state = SimpleNamespace(
+        frame_row=1, last_frames=CodecFrameStep(table=table, ready=None, step=0)
+    )
 
     codes = scheduler.table_codes(state, 0, 2)
     codes.fill_(0)

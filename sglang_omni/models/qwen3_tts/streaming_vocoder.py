@@ -171,9 +171,14 @@ class Qwen3TTSStreamState:
     # note (ratish): a same-process stream's frames are this row of the engine's code table,
     # and code_chunks stays empty; other sources keep their chunks.
     frame_row: int | None = None
+    last_frames: CodecFrameStep | None = None
     # note (ratish): a non-streaming request's audio collects here instead of being emitted.
     whole_audio: list[torch.Tensor] | None = None
     whole_generated_frames: int = 0
+
+
+def frame_step_index(frames: CodecFrameStep) -> int:
+    return frames.step
 
 
 def decode_event_snapshots(
@@ -225,6 +230,7 @@ class IncrementalDecodePlan:
     chunks: tuple[torch.Tensor, ...] = ()
     frame_row: int | None = None
     start_frame: int = 0
+    frames: CodecFrameStep | None = None
 
     @property
     def input_frames(self) -> int:
@@ -905,7 +911,6 @@ class Qwen3TTSStreamingVocoderScheduler(
             )
         )
         self.code_table: Qwen3TTSCodeTable | None = None
-        self.frames_ready: torch.Event | None = None
         self.table_frame_offsets = torch.empty(0, dtype=torch.long, device=self.device)
         self.whole_request_widths = tuple(
             sorted(
@@ -1496,7 +1501,6 @@ class Qwen3TTSStreamingVocoderScheduler(
         failed: list[str] = []
         with self.state_lock:
             self.code_table = frames.table
-            self.frames_ready = frames.ready
             stream_states = self.stream_states
             for request_id in step.request_ids:
                 state = stream_states.get(request_id)
@@ -1517,6 +1521,7 @@ class Qwen3TTSStreamingVocoderScheduler(
                 else:
                     pass
                 state.total_frames += 1
+                state.last_frames = frames
                 if state.total_frames - state.ref_frames >= (
                     state.next_decode_generated_frames
                     or state.initial_chunk_frames
@@ -1557,7 +1562,7 @@ class Qwen3TTSStreamingVocoderScheduler(
         self, state: Qwen3TTSStreamState, start_frame: int, end_frame: int
     ) -> torch.Tensor:
         """One stream's frames as [1, Q, T], a copy because the screen clamps in place."""
-        self.wait_frames_ready()
+        self.wait_frames_ready(state.last_frames)
         return (
             self.code_table.codes[state.frame_row, start_frame:end_frame]
             .clone()
@@ -1565,19 +1570,21 @@ class Qwen3TTSStreamingVocoderScheduler(
             .unsqueeze(0)
         )
 
-    def wait_frames_ready(self) -> None:
-        """Order this thread's stream after the newest engine step's frames."""
-        if self.frames_ready is None:
+    def wait_frames_ready(self, frames: CodecFrameStep) -> None:
+        """Order this thread's stream after that engine step, not after a newer one still running."""
+        if frames.ready is None:
             return
         else:
             pass
-        self.device_module.current_stream(self.device).wait_event(self.frames_ready)
+        self.device_module.current_stream(self.device).wait_event(frames.ready)
 
     def gather_table_codes(
         self, plans: Sequence[IncrementalDecodePlan], width: int
     ) -> torch.Tensor:
         """A cohort's frames as [N, Q, width] in one read; rows short of width stay zero as a pad would."""
-        self.wait_frames_ready()
+        self.wait_frames_ready(
+            max((plan.frames for plan in plans), key=frame_step_index)
+        )
         table = self.code_table
         offsets = self.table_frame_offsets
         if offsets.shape[0] < width:
@@ -2058,6 +2065,7 @@ class Qwen3TTSStreamingVocoderScheduler(
             chunks=tuple(state.code_chunks),
             frame_row=state.frame_row,
             start_frame=consumed_frames,
+            frames=state.last_frames,
         )
 
     def extract_incremental_delta(

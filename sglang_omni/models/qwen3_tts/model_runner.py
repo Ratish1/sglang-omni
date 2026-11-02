@@ -118,6 +118,7 @@ class Qwen3TTSModelRunner(ModelRunner):
         self.step_frame_request_ids: list[str] = []
         self.step_opened_streams: dict[str, dict[str, object]] = {}
         self.step_codes_ready: torch.Event | None = None
+        self.code_step_index = 0
 
     def admission_capacity(self) -> int | None:
         return self.code_table.free_rows()
@@ -154,7 +155,11 @@ class Qwen3TTSModelRunner(ModelRunner):
             data=StreamStep(
                 request_ids=request_ids,
                 opened=opened,
-                data=CodecFrameStep(table=self.code_table, ready=self.step_codes_ready),
+                data=CodecFrameStep(
+                    table=self.code_table,
+                    ready=self.step_codes_ready,
+                    step=self.code_step_index,
+                ),
             ),
         )
 
@@ -495,6 +500,7 @@ class Qwen3TTSModelRunner(ModelRunner):
                 semantic_positions[:batch_size] + self.decode_frame_index_bases,
                 output_codes[:batch_size],
             )
+        self.code_step_index += 1
         if self.codes_event_module is not None:
             self.step_codes_ready = self.next_codes_ready_event()
             self.step_codes_ready.record()
