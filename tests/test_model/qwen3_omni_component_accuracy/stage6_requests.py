@@ -7,6 +7,7 @@ from dataclasses import dataclass
 
 from benchmarks.dataset.mmsu import load_mmsu_samples
 from benchmarks.dataset.prepare import DATASETS
+from benchmarks.dataset.seedtts import load_seedtts_samples
 from benchmarks.tasks.audio_understanding import _build_question_text
 from tests.test_model.test_qwen3_omni_mmsu_talker_ci import MAX_SAMPLES, MMSU_TTS_PROMPT
 
@@ -18,6 +19,24 @@ class AudioQuestion:
     sample_id: str
     audio_path: str
     question_text: str
+
+
+def load_seedtts_questions() -> list[AudioQuestion]:
+    """Every SeedTTS EN voice-clone request as the benchmark builds it (benchmarks/tasks/tts.py)."""
+    return [
+        AudioQuestion(
+            sample_id=sample.sample_id,
+            audio_path=sample.ref_audio,
+            question_text=(
+                f'Listen to the audio above. The speaker is reading: "{sample.ref_text}". '
+                f"Now please read the following text out loud in the same voice and style: "
+                f"{sample.target_text}"
+            ),
+        )
+        for sample in load_seedtts_samples(
+            "zhaochenyang20/seed-tts-eval-arrow", None, split="en"
+        )
+    ]
 
 
 def load_audio_questions() -> list[AudioQuestion]:

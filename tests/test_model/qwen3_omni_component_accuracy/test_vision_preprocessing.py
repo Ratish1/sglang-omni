@@ -24,6 +24,7 @@ from benchmarks.dataset.prepare import DATASETS
 from benchmarks.dataset.videomme import load_videomme_samples
 from sglang_omni.models.qwen3_omni.components.preprocessor import Qwen3OmniPreprocessor
 from sglang_omni.proto.request import OmniRequest, StagePayload
+from sglang_omni.utils.cpu import automatic_video_decode_threads
 from tests.test_model.qwen3_omni_component_accuracy.mmmu_requests import (
     load_image_questions,
     reference_inputs,
@@ -81,7 +82,9 @@ def test_vision_preprocessing_matches_reference(
     model_path: str, report_dir: Path | None
 ) -> None:
     qwen_omni_utils = pytest.importorskip("qwen_omni_utils")
-    preprocessor = Qwen3OmniPreprocessor(model_path)
+    preprocessor = Qwen3OmniPreprocessor(
+        model_path, video_decode_threads=automatic_video_decode_threads(1)
+    )
     processor = Qwen3OmniMoeProcessor.from_pretrained(model_path)
     records = []
     for sample in load_mmmu_samples(
@@ -202,7 +205,9 @@ def test_vision_preprocessing_matches_reference(
 
 
 def test_image_inputs_match_processor(model_path: str, report_dir: Path | None) -> None:
-    preprocessor = Qwen3OmniPreprocessor(model_path)
+    preprocessor = Qwen3OmniPreprocessor(
+        model_path, video_decode_threads=automatic_video_decode_threads(1)
+    )
     processor = Qwen3OmniMoeProcessor.from_pretrained(model_path)
     records = []
     for sample in load_image_questions():

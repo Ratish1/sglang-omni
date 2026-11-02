@@ -21,7 +21,11 @@ from transformers.models.qwen3_omni_moe.processing_qwen3_omni_moe import (
 
 from sglang_omni.models.qwen3_omni.components.preprocessor import Qwen3OmniPreprocessor
 from sglang_omni.proto.request import OmniRequest, StagePayload
-from tests.test_model.qwen3_omni_component_accuracy.stage6_requests import AudioQuestion
+from sglang_omni.utils.cpu import automatic_video_decode_threads
+from tests.test_model.qwen3_omni_component_accuracy.stage6_requests import (
+    AudioQuestion,
+    load_seedtts_questions,
+)
 from tests.test_model.test_qwen3_omni_mmsu_talker_ci import MAX_TOKENS
 
 pytestmark = pytest.mark.benchmark
@@ -35,10 +39,12 @@ def test_preprocessing_matches_reference(
     audio_questions: list[AudioQuestion],
     report_dir: Path | None,
 ) -> None:
-    preprocessor = Qwen3OmniPreprocessor(model_path)
+    preprocessor = Qwen3OmniPreprocessor(
+        model_path, video_decode_threads=automatic_video_decode_threads(1)
+    )
     reference_processor = Qwen3OmniMoeProcessor.from_pretrained(model_path)
     records = []
-    for question in audio_questions:
+    for question in [*audio_questions, *load_seedtts_questions()]:
         payload = StagePayload(
             request_id=question.sample_id,
             request=OmniRequest(
