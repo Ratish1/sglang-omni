@@ -680,6 +680,7 @@ def prefill_on_decode(
         result=SimpleNamespace(
             next_token_ids=torch.tensor([9]),
             logits_output=SimpleNamespace(hidden_states=torch.ones(1, 2)),
+            can_run_cuda_graph=False,
         ),
         decode_hidden=torch.ones(1, 1, 2),
         decode_positions=decode_batch.positions.clone(),
