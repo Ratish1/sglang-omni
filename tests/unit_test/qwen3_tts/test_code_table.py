@@ -231,6 +231,7 @@ def test_a_prefills_frames_write_without_waiting_for_the_predictor() -> None:
         forward_mode=SimpleNamespace(is_extend=lambda: True)
     )
     positions = torch.tensor([5, 5], dtype=torch.long, device=device)
+    runner.write_step_frames(forward_batch, requests, positions)
     torch.cuda.synchronize()
     torch.cuda._sleep(1_000_000_000)  # noqa: leading-underscore  # upstream name
     stream = torch.cuda.current_stream(device)

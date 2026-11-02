@@ -1972,16 +1972,15 @@ def build_sglang_qwen3_tts_request(
         and isinstance(params, dict)
         and bool(params.get("stream"))
     )
-    num_code_groups = int(model.config.num_code_groups)
-    if (
-        data.ref_code is not None
-        and data.ref_code_len
-        and (data.ref_code.ndim != 2 or data.ref_code.shape[-1] != num_code_groups)
-    ):
-        raise ValueError(
-            "Qwen3-TTS reference codes must have shape [T, Q] matching "
-            f"{num_code_groups} codebooks, got {tuple(data.ref_code.shape)}"
-        )
+    if data.ref_code is not None and data.ref_code_len:
+        num_code_groups = int(model.config.num_code_groups)
+        if data.ref_code.ndim != 2 or data.ref_code.shape[-1] != num_code_groups:
+            raise ValueError(
+                "Qwen3-TTS reference codes must have shape [T, Q] matching "
+                f"{num_code_groups} codebooks, got {tuple(data.ref_code.shape)}"
+            )
+        else:
+            pass
     else:
         pass
     data.input_embeds_are_projected = True

@@ -187,7 +187,9 @@ def compact_decode_input_history(data: ARRequestData) -> None:
 
 def detach_request_data(req: Req) -> None:
     """Break Req -> data; async snapshots retain the one-way data -> Req edge."""
-    if req.omni_data is not None:  # noqa: leading-underscore  # upstream spelling
+    if isinstance(
+        req.omni_data, ARRequestData
+    ):  # noqa: leading-underscore  # upstream spelling
         req.omni_data.on_detached()
     else:
         pass

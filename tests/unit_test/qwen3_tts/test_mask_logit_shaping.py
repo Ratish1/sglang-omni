@@ -9,6 +9,7 @@ import pytest
 import torch
 from sglang.srt.sampling.penaltylib.repetition_penalty import apply_scaling_penalties
 
+from sglang_omni.models.qwen3_tts.code_table import Qwen3TTSCodeTable
 from sglang_omni.models.qwen3_tts.model_runner import Qwen3TTSModelRunner
 from sglang_omni.models.qwen3_tts.request_builders import Qwen3TTSSGLangRequestData
 
@@ -167,6 +168,9 @@ def test_qwen3_tts_scales_each_step_by_the_ids_its_request_generated() -> None:
     runner.device = device
     runner.repetition_scales = torch.ones(8, vocab_size, device=device)
     runner.repetition_penalties = torch.ones(8, device=device)
+    runner.code_table = Qwen3TTSCodeTable(
+        num_rows=8, max_frames=8, num_codebooks=2, device=device
+    )
     runner.model.prepare_decode_buffers = lambda requests: None
     runner.build_prefill_input_embeds = lambda forward_batch, requests: torch.zeros(
         len(forward_batch.input_ids), 4, device=device

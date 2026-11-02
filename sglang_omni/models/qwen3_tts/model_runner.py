@@ -81,6 +81,7 @@ class Qwen3TTSModelRunner(ModelRunner):
     # Resolved in __init__: post_process_outputs records a readiness event per
     # decode step, and the device cannot change under the runner.
     codes_event_module: ModuleType | None = None
+    code_step_index: int = 0
 
     def __init__(
         self,
@@ -139,7 +140,6 @@ class Qwen3TTSModelRunner(ModelRunner):
         self.step_frame_request_ids: list[str] = []
         self.step_opened_streams: dict[str, dict[str, object]] = {}
         self.step_codes_ready: torch.Event | None = None
-        self.code_step_index = 0
 
     def admission_capacity(self) -> int | None:
         return self.code_table.free_rows()

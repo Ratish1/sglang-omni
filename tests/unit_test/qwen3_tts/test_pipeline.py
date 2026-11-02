@@ -8848,7 +8848,9 @@ def test_qwen3_tts_prefill_attaches_runner_composed_embeddings_to_sidecar(
         req_pool_indices=torch.tensor([1]),
     )
     request = SimpleNamespace(
-        data=SimpleNamespace(repetition_penalty=1.0, req=SimpleNamespace(output_ids=[]))
+        data=SimpleNamespace(
+            repetition_penalty=1.0, req=SimpleNamespace(output_ids=[]), code_row=0
+        )
     )
 
     runner.before_prefill(forward_batch, object(), [request])
@@ -8913,7 +8915,7 @@ def test_qwen3_tts_prefill_uses_shared_late_bound_forward_transport(
         SimpleNamespace(
             request_id="request-a",
             data=SimpleNamespace(
-                repetition_penalty=1.0, req=SimpleNamespace(output_ids=[])
+                repetition_penalty=1.0, req=SimpleNamespace(output_ids=[]), code_row=0
             ),
         )
     ]
@@ -9170,6 +9172,10 @@ def test_qwen3_tts_steady_decode_reports_cuda_graph_ready(
     runner.model = runner.tp_worker.model_runner.model
     runner.feedback_pool = torch.zeros(2, 4)
     runner.feedback_pool[1] = torch.ones(4)
+    runner.decode_batch_reqs = None
+    runner.code_table = Qwen3TTSCodeTable(
+        num_rows=1, max_frames=8, num_codebooks=2, device="cpu"
+    )
     runner.bind_execution_bridge(FakeExecutionBridge())
 
     data = SimpleNamespace(
@@ -9178,8 +9184,11 @@ def test_qwen3_tts_steady_decode_reports_cuda_graph_ready(
             inflight_middle_chunks=0,
             origin_input_ids=[0, 0, 0, 0],
         ),
-        output_codes=[],
-        text_rows=torch.zeros(2, 4),
+        code_row=runner.code_table.acquire(),
+        ref_code_len=0,
+        frame_count=1,
+        text_row_views=torch.zeros(2, 4).unbind(0),
+        streams_frames=False,
         generation_steps=0,
         extra_model_outputs={},
     )
@@ -9187,6 +9196,7 @@ def test_qwen3_tts_steady_decode_reports_cuda_graph_ready(
     schedule_batch = SimpleNamespace(
         forward_mode=SimpleNamespace(is_extend=lambda: False),
         is_prefill_only=False,
+        reqs=[data.req],
     )
 
     output = runner.execute(
