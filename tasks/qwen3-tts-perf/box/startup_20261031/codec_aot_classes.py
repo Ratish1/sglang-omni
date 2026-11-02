@@ -67,8 +67,12 @@ def main():
         index = next((position for position, program in enumerate(programs) if program.guard_check(incremental, codes, state)), None)
         routed = time.perf_counter() - began
         traced = 0.0
-        if index is None:
-            assert args.phase == "save", (batch, width, "no saved program's guards pass")
+        if index is None and args.phase == "load":
+            for position, program in enumerate(programs):
+                f_locals = program.prepare_f_locals(incremental, codes, state)
+                print(f"({batch}, {width}) program {position}: {program._artifacts.guard_manager.check_verbose(f_locals)}", flush=True)
+            raise SystemExit("no saved program's guards pass")
+        elif index is None:
             began = time.perf_counter()
             program = torch.compile(incremental.decode_tensors, dynamic=False, fullgraph=True).aot_compile(((codes, state), {}))
             traced = time.perf_counter() - began
