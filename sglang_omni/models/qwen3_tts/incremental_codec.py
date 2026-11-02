@@ -727,9 +727,10 @@ def ring_step_rows_fake(
     fresh_frames: int,
     ring_frames: int,
     retained_frames: int,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     batch_size = start_positions.shape[0]
     return (
+        start_positions.new_empty(batch_size * fresh_frames),
         start_positions.new_empty(batch_size * fresh_frames),
         start_positions.new_empty(batch_size, ring_frames, dtype=torch.int32),
         start_positions.new_empty(batch_size, dtype=torch.int32),
@@ -797,18 +798,15 @@ class FusedIncrementalTransformer:
         else:
             return rmsnorm(hidden_states, norm.weight, norm.variance_epsilon)
 
-    def cos_sin_rows(
-        self, query_positions: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """The rope kernels' cos/sin table, one row per query, and each query's row."""
+    def cos_sin(self, query_positions: torch.Tensor) -> torch.Tensor:
+        """The rope kernels' cos/sin table, one row per query."""
         # note (ratish): one cos/sin row per query, from its absolute frame position,
         # which a stream's reference prefix can carry past max_position_embeddings.
         rows = query_positions.numel()
         angles = query_positions.reshape(rows, 1).float() * self.inverse_frequencies
-        cos_sin = torch.cat((angles.cos(), angles.sin()), dim=-1) * (
+        return torch.cat((angles.cos(), angles.sin()), dim=-1) * (
             self.attention_scaling
         )
-        return cos_sin, torch.arange(rows, device=query_positions.device)
 
     def projected_qkv(
         self,
@@ -904,7 +902,8 @@ class FusedIncrementalTransformer:
         attention_mask = allowed_keys(
             key_positions, query_positions, int(transformer.window_size)
         ).unsqueeze(1)
-        cos_sin, rotary_rows = self.cos_sin_rows(query_positions)
+        cos_sin = self.cos_sin(query_positions)
+        rotary_rows = torch.arange(rows, device=device)
         hidden_states = hidden_states.reshape(rows, hidden_size)
         next_keys: dict[int, torch.Tensor] = {}
         next_values: dict[int, torch.Tensor] = {}
@@ -972,8 +971,7 @@ class FusedIncrementalTransformer:
             fresh_frames, device=device
         )
         slot_rows = rings.slot_rows.unsqueeze(1)
-        frame_rows = slot_rows + query_positions % rings.ring_frames
-        cos_sin, rotary_rows = self.cos_sin_rows(query_positions)
+        cos_sin = self.cos_sin(query_positions)
         is_in_place = (
             valid_frames is None
             and fresh_frames <= rings.ring_frames - retained_context
@@ -986,7 +984,7 @@ class FusedIncrementalTransformer:
                 if torch.compiler.is_dynamo_compiling()
                 else ring_step_rows
             )
-            write_rows, page_table, window_lengths = step_rows(
+            write_rows, rotary_rows, page_table, window_lengths = step_rows(
                 start_positions,
                 rings.slot_rows,
                 fresh_frames,
@@ -994,7 +992,8 @@ class FusedIncrementalTransformer:
                 retained_context,
             )
         elif is_in_place:
-            write_rows = frame_rows.reshape(rows)
+            rotary_rows = torch.arange(rows, device=device)
+            write_rows = (slot_rows + query_positions % rings.ring_frames).reshape(rows)
             window_starts = (start_positions - retained_context).clamp(min=0)
             window_rows = (
                 slot_rows
@@ -1013,6 +1012,8 @@ class FusedIncrementalTransformer:
             )
             attention_mask = ((distances >= 0) & (distances < window_size)).unsqueeze(1)
         else:
+            rotary_rows = torch.arange(rows, device=device)
+            frame_rows = slot_rows + query_positions % rings.ring_frames
             key_positions = start_positions.unsqueeze(1) + torch.arange(
                 -retained_context, fresh_frames, device=device
             )

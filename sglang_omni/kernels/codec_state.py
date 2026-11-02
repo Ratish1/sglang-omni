@@ -157,6 +157,7 @@ def ring_step_rows_kernel(
     start_position_ptr,
     slot_row_ptr,
     write_row_ptr,
+    rotary_row_ptr,
     page_table_ptr,
     window_length_ptr,
     fresh_frames,
@@ -168,10 +169,16 @@ def ring_step_rows_kernel(
     start_position = tl.load(start_position_ptr + row)
     slot_row = tl.load(slot_row_ptr + row)
     frame = tl.arange(0, FRAME_BLOCK)
+    is_fresh = frame < fresh_frames
     tl.store(
         write_row_ptr + row * fresh_frames + frame,
         slot_row + (start_position + frame) % ring_frames,
-        mask=frame < fresh_frames,
+        mask=is_fresh,
+    )
+    tl.store(
+        rotary_row_ptr + row * fresh_frames + frame,
+        (row * fresh_frames + frame).to(tl.int64),
+        mask=is_fresh,
     )
     window_start = tl.maximum(start_position - retained_frames, 0)
     tl.store(
@@ -191,11 +198,13 @@ def ring_step_rows(
     fresh_frames: int,
     ring_frames: int,
     retained_frames: int,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """The ring rows an in-place step writes its (B * fresh_frames) frames to, its int32 (B,
-    ring_frames) page table in window order, and its int32 (B,) window lengths, in one launch."""
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """The ring rows an in-place step writes its (B * fresh_frames) frames to, those frames'
+    rotary rows, its int32 (B, ring_frames) page table in window order, and its int32 (B,) window
+    lengths, in one launch."""
     batch_size = start_positions.shape[0]
     write_rows = start_positions.new_empty(batch_size * fresh_frames)
+    rotary_rows = start_positions.new_empty(batch_size * fresh_frames)
     page_table = start_positions.new_empty(
         batch_size, ring_frames, dtype=torch.int32
     )
@@ -204,6 +213,7 @@ def ring_step_rows(
         start_positions,
         slot_rows,
         write_rows,
+        rotary_rows,
         page_table,
         window_lengths,
         fresh_frames,
@@ -211,7 +221,7 @@ def ring_step_rows(
         retained_frames,
         FRAME_BLOCK=triton.next_power_of_2(ring_frames),
     )
-    return write_rows, page_table, window_lengths
+    return write_rows, rotary_rows, page_table, window_lengths
 
 
 def history_exchange(
