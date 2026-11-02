@@ -29,14 +29,17 @@ def zero(arena):
         ring.zero_()
 
 
-def inputs(arena, batch, width):
+def inputs(arena, batch, width, mark):
     zero(arena)
     generator = torch.Generator().manual_seed(batch * 100 + width)
     codes = torch.randint(0, 1000, (batch, 16, width), generator=generator).cuda()
     state = arena.gather_by_index(torch.arange(batch, device="cuda:0"))
-    for tensor in (codes, state.frame_positions, state.slot_index, state.kv_rings.slot_rows):
-        dynamo.maybe_mark_dynamic(tensor, 0)
-    dynamo.maybe_mark_dynamic(codes, 2)
+    if mark:
+        for tensor in (codes, state.frame_positions, state.slot_index, state.kv_rings.slot_rows):
+            dynamo.maybe_mark_dynamic(tensor, 0)
+        dynamo.maybe_mark_dynamic(codes, 2)
+    else:
+        pass
     return codes, state
 
 
@@ -62,7 +65,7 @@ def main():
         pass
     aot_waves = {}
     for batch, width in SHAPES:
-        codes, state = inputs(arena, batch, width)
+        codes, state = inputs(arena, batch, width, args.phase == "save")
         began = time.perf_counter()
         index = next((position for position, program in enumerate(programs) if program.guard_check(incremental, codes, state)), None)
         routed = time.perf_counter() - began
@@ -93,7 +96,7 @@ def main():
         compiled = torch.compile(incremental.decode_tensors, dynamic=False, fullgraph=True)
         ordinary = {}
         for batch, width in SHAPES:
-            codes, state = inputs(arena, batch, width)
+            codes, state = inputs(arena, batch, width, True)
             ordinary[(batch, width)] = compiled(codes, state).float().cpu().clone()
         torch.cuda.synchronize()
         torch.save(ordinary, f"{args.directory}/ordinary.waves")
