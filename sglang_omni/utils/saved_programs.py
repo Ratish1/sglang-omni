@@ -19,27 +19,14 @@ from torch._inductor.runtime.cache_dir_utils import cache_dir
 logger = logging.getLogger(__name__)
 
 
-def source_tree_digest(directories: Iterable[Path]) -> str:
-    """A digest of every Python source under the directories."""
-    digest = hashlib.sha256()
-    for directory in directories:
-        for path in sorted(directory.rglob("*.py")):
-            digest.update(path.read_bytes())
-    return digest.hexdigest()
-
-
-def has_current_sources(program: AOTCompiledFunction) -> bool:
-    """Whether every module this program's trace inlined still reads as it did."""
-    return all(
-        inspect.getsource(importlib.import_module(source.module)) == source.content
-        for source in program.source_info().inlined_sources
-    )
-
-
 class SavedPrograms:
-    """The programs of one traced function, under the Inductor cache directory."""
+    """The programs of one traced function, under the Inductor cache directory, keyed on what
+    a program's guards do not see: versions, the GPU, the kernels' sources and the caller's parts.
+    """
 
-    def __init__(self, name: str, key_parts: Iterable[str]) -> None:
+    def __init__(
+        self, name: str, kernel_sources: Iterable[Path], key_parts: Iterable[str]
+    ) -> None:
         digest = hashlib.sha256()
         for part in (
             torch.__version__,
@@ -49,6 +36,9 @@ class SavedPrograms:
             *key_parts,
         ):
             digest.update(part.encode())
+        for directory in kernel_sources:
+            for path in sorted(directory.rglob("*.py")):
+                digest.update(path.read_bytes())
         self.directory = Path(cache_dir()) / name / digest.hexdigest()
         self.programs = [
             program
@@ -64,15 +54,19 @@ class SavedPrograms:
 
     @staticmethod
     def load(path: Path) -> AOTCompiledFunction | None:
+        """The program at this path, unless it cannot load or a module its trace inlined changed."""
         # note (ratish): a cache must never stop a boot; a program it cannot load is traced again.
         try:
             with path.open("rb") as handle:
                 program = torch.compiler.load_compiled_function(handle)
-            if has_current_sources(program):
-                return program
-            else:
-                logger.warning(f"Saved program {path} was traced from other sources")
-                return None
+            for source in program.source_info().inlined_sources:
+                module = importlib.import_module(source.module)
+                if inspect.getsource(module) != source.content:
+                    logger.warning(f"{path} was traced from another {source.module}")
+                    return None
+                else:
+                    pass
+            return program
         except Exception as error:
             logger.warning(f"Could not load the saved program {path}: {error}")
             return None

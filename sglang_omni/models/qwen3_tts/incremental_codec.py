@@ -27,7 +27,7 @@ from sglang_omni.utils.channels_last_conv import (
     is_channels_last_conv_device,
 )
 from sglang_omni.utils.merged_projections import merge_projection_weights
-from sglang_omni.utils.saved_programs import SavedPrograms, source_tree_digest
+from sglang_omni.utils.saved_programs import SavedPrograms
 
 if current_platform.is_cuda():
     from sglang.kernels.ops.attention.flash_attention import flash_attn_with_kvcache
@@ -1910,8 +1910,8 @@ class Qwen3TTSIncrementalDecoder:
         if self.saved_programs is None:
             self.saved_programs = SavedPrograms(
                 "qwen3_tts_codec",
+                (Path(kernels_package.__file__).parent,),
                 (
-                    source_tree_digest((Path(kernels_package.__file__).parent,)),
                     repr(self.decoder),
                     str(self.decoder.pre_conv.conv.weight.dtype),
                     str(codes.device),
