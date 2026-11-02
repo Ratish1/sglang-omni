@@ -60,6 +60,19 @@ def stage_host_ints(values: list[int], device: torch.device) -> torch.Tensor:
     ).to(device, non_blocking=True)
 
 
+def rows_with_a_frame(requests: list[SchedulerRequest]) -> list[int] | None:
+    """A prefill's rows that sample a frame, or None for all of them.
+
+    A middle prefill chunk samples at a prompt row and SGLang drops that token.
+    """
+    rows = [
+        row_index
+        for row_index, sched_req in enumerate(requests)
+        if sched_req.data.req.inflight_middle_chunks <= 0
+    ]
+    return None if len(rows) == len(requests) else rows
+
+
 class Qwen3TTSModelRunner(ModelRunner):
     """Runs Qwen3-TTS AR steps and stores generated codec frames per request."""
 
@@ -393,22 +406,18 @@ class Qwen3TTSModelRunner(ModelRunner):
         next_token_ids = super().sample_next_token_ids(
             logits_output, forward_batch, schedule_batch, requests
         )
-        if forward_batch.forward_mode.is_extend():
-            # note (ratish): a middle prefill chunk's token is dropped, so it never counts as
-            # generated.
-            recorded_row_indices = stage_host_ints(
-                [
-                    row_index
-                    for row_index, sched_req in enumerate(requests)
-                    if sched_req.data.req.inflight_middle_chunks <= 0
-                ],
-                request_slots.device,
-            )
-            recorded_slots = request_slots[recorded_row_indices]
-            recorded_token_ids = next_token_ids[recorded_row_indices]
-        else:
+        recorded_rows = (
+            rows_with_a_frame(requests)
+            if forward_batch.forward_mode.is_extend()
+            else None
+        )
+        if recorded_rows is None:
             recorded_slots = request_slots
             recorded_token_ids = next_token_ids
+        else:
+            recorded_row_indices = stage_host_ints(recorded_rows, request_slots.device)
+            recorded_slots = request_slots[recorded_row_indices]
+            recorded_token_ids = next_token_ids[recorded_row_indices]
         self.repetition_scales.index_put_(
             (recorded_slots, recorded_token_ids),
             self.repetition_penalties[recorded_slots],
@@ -481,13 +490,12 @@ class Qwen3TTSModelRunner(ModelRunner):
         write stays past the request's counted frames."""
         output_codes = self.model.output_codes
         batch_size = len(requests)
-        if forward_batch.forward_mode.is_extend():
-            # note (ratish): a middle prefill chunk samples at a prompt row, so it has no frame.
-            recorded_rows = [
-                row_index
-                for row_index, sched_req in enumerate(requests)
-                if sched_req.data.req.inflight_middle_chunks <= 0
-            ]
+        recorded_rows = (
+            rows_with_a_frame(requests)
+            if forward_batch.forward_mode.is_extend()
+            else None
+        )
+        if recorded_rows is not None:
             if not recorded_rows:
                 return
             else:
@@ -497,6 +505,12 @@ class Qwen3TTSModelRunner(ModelRunner):
                 [requests[row_index] for row_index in recorded_rows]
             )
             self.code_table.frames.index_copy_(0, frame_indices, output_codes[recorded])
+        elif forward_batch.forward_mode.is_extend():
+            self.code_table.frames.index_copy_(
+                0,
+                semantic_positions[:batch_size] + self.frame_index_bases(requests),
+                output_codes[:batch_size],
+            )
         else:
             self.code_table.frames.index_copy_(
                 0,
