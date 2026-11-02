@@ -154,6 +154,12 @@ def compare(out: str, replies_path: str, dump_dir: str, ledger_prefix: str) -> N
         while shared < min(len(target), len(reply["tokens"])) and target[shared] == reply["tokens"][shared]:
             shared += 1
         audio_rows = truth["input_ids"] == audio_token_id
+        # note (ratish): warmup forwards come first, so a request starts at its whole prompt's prefill.
+        while (
+            value_of(forwards[cursor]["model.layers.0.self_attn.inputs.hidden_states"]).shape[0]
+            != prompt_rows
+        ):
+            cursor += 1
         steps = forwards[cursor : cursor + len(reply["tokens"])]
         cursor += len(reply["tokens"])
         for step_index, forward in enumerate(steps):
