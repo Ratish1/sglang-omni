@@ -3,6 +3,7 @@
 
 import asyncio
 import base64
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -50,7 +51,9 @@ def test_band_limited_resampling_passes_empty_and_same_rate_audio_through() -> N
 
 
 @pytest.mark.parametrize("band_limited", [False, True])
-def test_every_audio_loader_band_limits_only_when_asked(tmp_path, band_limited) -> None:
+def test_every_audio_loader_band_limits_only_when_asked(
+    tmp_path: Path, band_limited: bool
+) -> None:
     path = tmp_path / "tone.wav"
     wavfile.write(path, SOURCE_RATE, tone(10000))
     data_url = "data:audio/wav;base64," + base64.b64encode(path.read_bytes()).decode()

@@ -227,7 +227,7 @@ def resample_linear(
 
 
 def resample_band_limited(
-    audio: np.ndarray, orig_sr: int, target_sr: int
+    audio: npt.NDArray[np.float32], orig_sr: int, target_sr: int
 ) -> npt.NDArray[np.float32]:
     """Resample through soxr's high quality anti-aliasing filter, as librosa.load does."""
     if orig_sr == target_sr or audio.size == 0:
@@ -269,11 +269,13 @@ class AudioMediaIO(MediaIO[tuple[npt.NDArray[np.float32], float]]):
         self.band_limited = band_limited
         self.kwargs = kwargs
 
-    def resample(self, audio: np.ndarray, sr: int) -> npt.NDArray[np.float32]:
+    def resample(
+        self, audio: npt.NDArray[np.float32], sample_rate: int
+    ) -> npt.NDArray[np.float32]:
         if self.band_limited:
-            return resample_band_limited(audio, sr, self.target_sr)
+            return resample_band_limited(audio, sample_rate, self.target_sr)
         else:
-            return resample_linear(audio, sr, self.target_sr)
+            return resample_linear(audio, sample_rate, self.target_sr)
 
     def load_bytes(self, data: bytes) -> tuple[npt.NDArray[np.float32], float]:
         """Load audio from raw bytes (WAV, WebM/Opus, MP3, OGG, FLAC, etc.)."""

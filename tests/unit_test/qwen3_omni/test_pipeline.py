@@ -10,6 +10,7 @@ from collections.abc import Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from copy import deepcopy
 from io import BytesIO
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Protocol
 from unittest.mock import AsyncMock, Mock
@@ -19,6 +20,7 @@ import pytest
 import torch
 import typer
 from PIL import Image
+from scipy.io import wavfile
 from sglang.srt.arg_groups.overrides import resolution_result
 from sglang.srt.layers.rotary_embedding.mrope_rope_index import (
     get_rope_index_qwen3_omni,
@@ -567,14 +569,10 @@ def test_qwen_preprocessor_passes_embedded_video_audio_to_processor(
     assert state.mm_inputs["video"].get("use_audio_in_video") is expected_video_audio
 
 
-def test_qwen_preprocessor_band_limits_request_audio(monkeypatch, tmp_path) -> None:
+def test_qwen_preprocessor_band_limits_request_audio(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
     """Request audio reaches the HF processor at 16 kHz with nothing folded down from above 8 kHz."""
-    from scipy.io import wavfile
-
-    from sglang_omni.models.qwen3_omni.components import (
-        preprocessor as preprocessor_mod,
-    )
-
     path = tmp_path / "reference.wav"
     times = np.arange(24000) / 24000
     wavfile.write(
