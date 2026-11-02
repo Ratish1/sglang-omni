@@ -113,7 +113,7 @@ def overlap(p: torch.Tensor, q: torch.Tensor) -> torch.Tensor:
 
 def load_forwards(dump_dir: Path) -> list[dict]:
     """The dumps by forward, in order: {name: tensor} for each forward that dumped a layer."""
-    pattern = re.compile(r"step=(\d+).*dump_index=(\d+).*name=(.*)\.pt$")
+    pattern = re.compile(r"step=(\d+).*dump_index=(\d+).*name=(.*?)(?:___|\.pt$)")
     grouped = collections.defaultdict(dict)
     for path in dump_dir.rglob("*.pt"):
         match = pattern.search(path.name)
