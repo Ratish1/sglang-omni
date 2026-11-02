@@ -314,8 +314,8 @@ def main() -> None:
         r"|model\.norm|lm_head\.\d+"
     )
     code2wav_targets = (
-        r"pre_transformer|pre_transformer\.layers\.\d+|upsample\.\d+|upsample\.\d+\.\d+|decoder\.\d+|decoder\.\d+\.\d+"
-        r"|quantizer|code_embedding|fc_post_a|pre_conv"
+        r"code_embedding|pre_transformer|pre_transformer\.layers\.\d+|pre_transformer\.norm|upsample\.\d+\.\d+"
+        r"|decoder\.\d+|decoder\.\d+\.block\.\d+"
     )
 
     for count, sample_id in enumerate(sample_ids):
@@ -454,7 +454,9 @@ def main() -> None:
             hidden_projection = owner.hidden_projection
             with torch.inference_mode():
                 user_mask = multimodal[0, :user_end]
-                user = torch.empty(user_end, thinker_embed.shape[-1] if False else owner.config.text_config.hidden_size, device=DEVICE, dtype=dtype)
+                user = torch.empty(
+                    user_end, owner.config.text_config.hidden_size, device=DEVICE, dtype=dtype
+                )
                 if user_mask.any():
                     user[user_mask] = hidden_projection(hidden_mm[0, :user_end][user_mask])
                 user[~user_mask] = text_projection(thinker_embed[0, :user_end][~user_mask])
