@@ -25,6 +25,7 @@ SCHEDULED_WORKLOAD_ENDPOINTS = {
     "rest_stream": "speech_stream",
     "batch_32_all_valid": "batch",
     "long_prefill_decode": "speech",
+    "long_prefill_decode_stream": "speech_stream",
     "ws_normal": "websocket",
     "ws_stream_audio": "websocket",
 }
@@ -66,6 +67,7 @@ PARAM_KEYS = {
     "seedtts_ref_text",
     "file_ref_audio",
     "file_ref_text",
+    "reference_every_request",
     "voice_cache_pressure_voice_count",
     "voice_speaker_cap_count",
     "speaker_max_uploaded",
@@ -416,6 +418,8 @@ class BenchmarkParams:
     seedtts_ref_text: str | None = None
     file_ref_audio: str | None = None
     file_ref_text: str | None = None
+    # note (ratish): a Base checkpoint has no default voice, so each request carries the file reference.
+    reference_every_request: bool = False
     voice_cache_pressure_voice_count: int = 0
     voice_speaker_cap_count: int = 0
     speaker_max_uploaded: int = DEFAULT_SPEAKER_MAX_UPLOADED
@@ -492,6 +496,7 @@ class BenchmarkParams:
             seedtts_ref_text=_optional_str(obj, "seedtts_ref_text"),
             file_ref_audio=_optional_file_uri(obj, "file_ref_audio"),
             file_ref_text=_optional_str(obj, "file_ref_text"),
+            reference_every_request=bool(obj.get("reference_every_request", False)),
             voice_cache_pressure_voice_count=voice_cache_pressure_voice_count,
             voice_speaker_cap_count=voice_speaker_cap_count,
             speaker_max_uploaded=speaker_max_uploaded,

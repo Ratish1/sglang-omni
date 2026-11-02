@@ -525,6 +525,8 @@ def _scheduled_workload_scenario(
         return _batch_request(index, spec, stage, batch_size=32)
     if workload == "long_prefill_decode":
         return _speech_long_prefill_decode(index, spec, stage)
+    if workload == "long_prefill_decode_stream":
+        return _speech_long_prefill_decode_stream(index, spec, stage)
     if workload == "ws_normal":
         return _websocket_normal(index, spec, stage)
     if workload == "ws_stream_audio":
@@ -904,13 +906,20 @@ def _scenario_type_enabled(scenario_type: str, endpoint_set: set[str]) -> bool:
 
 
 def _base_payload(spec: BenchmarkSpec, text: str) -> dict[str, Any]:
-    return {
+    payload: dict[str, Any] = {
         "model": spec.model_name,
         "input": text,
         "voice": "default",
         "response_format": "wav",
         "speed": 1.0,
     }
+    if spec.params.reference_every_request:
+        payload["task_type"] = "Base"
+        payload["ref_audio"] = spec.params.file_ref_audio
+        payload["ref_text"] = spec.params.file_ref_text
+    else:
+        pass
+    return payload
 
 
 def _scenario_id(stage: LoadStage, category: str, index: int) -> str:
@@ -1203,6 +1212,42 @@ def _speech_long_prefill_decode(
         description="max-valid input with high decode budget",
         planned_metadata={
             "stress_case": "long_prefill_decode",
+            "input_chars": len(text),
+            "max_new_tokens": LONG_PREFILL_DECODE_MAX_NEW_TOKENS,
+        },
+    )
+
+
+def _speech_long_prefill_decode_stream(
+    index: int, spec: BenchmarkSpec, stage: LoadStage
+) -> Scenario:
+    text = _long_stress_text(
+        spec,
+        stage,
+        index,
+        target_chars=MAX_SPEECH_INPUT_CHARS,
+        label="speech long prefill decode stream",
+    )
+    payload = _base_payload(spec, text)
+    payload.update(
+        {
+            "stream": True,
+            "response_format": "pcm",
+            "max_new_tokens": LONG_PREFILL_DECODE_MAX_NEW_TOKENS,
+            "seed": spec.seed + index,
+        }
+    )
+    return Scenario(
+        id=_scenario_id(stage, "speech_long_prefill_decode_stream", index),
+        endpoint="speech_stream",
+        category="speech_long_prefill_decode_stream",
+        stage_id=stage.id,
+        capability_key="speech.stream",
+        workload="long_prefill_decode_stream",
+        payload=payload,
+        description="max-valid input streamed with high decode budget",
+        planned_metadata={
+            "stress_case": "long_prefill_decode_stream",
             "input_chars": len(text),
             "max_new_tokens": LONG_PREFILL_DECODE_MAX_NEW_TOKENS,
         },

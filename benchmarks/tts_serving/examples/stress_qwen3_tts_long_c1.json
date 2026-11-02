@@ -1,0 +1,43 @@
+{
+  "base_url": "http://127.0.0.1:8000",
+  "model_name": "Qwen/Qwen3-TTS-12Hz-1.7B-Base",
+  "test_type": "engine",
+  "seed": 0,
+  "params": {
+    "profile": "stress",
+    "timeout_s": 1200,
+    "enabled_endpoints": [
+      "speech_stream"
+    ],
+    "reference_every_request": true,
+    "file_ref_audio": "file:docs/_static/audio/male-voice.wav",
+    "file_ref_text": "Hey, Adam here. Let's create something that feels real, sounds human, and connects every time.",
+    "load_stages": [
+      {
+        "id": "long-stream-c1",
+        "mode": "scheduled",
+        "max_concurrency": 1,
+        "coverage_schedule": {
+          "start_s": 0.0,
+          "end_s": 0.35
+        },
+        "workload_schedules": [
+          {
+            "workload": "long_prefill_decode_stream",
+            "background_offsets_s": [
+              0.0,
+              0.05,
+              0.1,
+              0.15,
+              0.2,
+              0.25,
+              0.3,
+              0.35
+            ],
+            "collision_offsets_s": []
+          }
+        ]
+      }
+    ]
+  }
+}
