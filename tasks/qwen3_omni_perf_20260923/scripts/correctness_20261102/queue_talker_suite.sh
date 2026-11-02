@@ -33,6 +33,7 @@ if [ $healthy = 0 ]; then
   log "healthy; gpu $(nvidia-smi --query-gpu=memory.used --format=csv,noheader)"
   (cd $TREE && QWEN3_OMNI_ACCURACY_MODEL=$MODEL QWEN3_OMNI_ACCURACY_REPORT_DIR=$OUT/report \
     QWEN3_OMNI_ACCURACY_SERVER=http://127.0.0.1:$PORT QWEN3_OMNI_ACCURACY_TALKER_CAPTURE=$OUT/capture \
+    QWEN3_OMNI_ACCURACY_SEEDTTS_IDS=/data/sample_ids_60.txt QWEN3_OMNI_ACCURACY_CONCURRENCY=${CONCURRENCY:-64} \
     PYTHONPATH=$TREE python3 -m pytest -s -q -x -p no:cacheprovider \
     tests/test_model/qwen3_omni_component_accuracy/test_talker.py) > $OUT/test_talker.log 2>&1
   log "test_talker rc $?: $(grep -E '^\[talker\]' $OUT/test_talker.log | cut -c1-500)"
