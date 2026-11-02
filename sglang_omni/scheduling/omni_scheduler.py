@@ -84,6 +84,7 @@ from sglang_omni.profiler.event_recorder import (
     emit_model_path_start as _emit_model_path_start,
 )
 from sglang_omni.profiler.event_recorder import get_active_stage as _get_active_stage
+from sglang_omni.profiler.event_recorder import get_recorder as _get_recorder
 from sglang_omni.proto.admin import (
     ADMIN_CONTINUE_GENERATION,
     ADMIN_DESTROY_WEIGHTS_UPDATE_GROUP,
@@ -186,6 +187,10 @@ def compact_decode_input_history(data: ARRequestData) -> None:
 
 def detach_request_data(req: Req) -> None:
     """Break Req -> data; async snapshots retain the one-way data -> Req edge."""
+    if req.omni_data is not None:  # noqa: leading-underscore  # upstream spelling
+        req.omni_data.on_detached()
+    else:
+        pass
     req.omni_data = None  # noqa: leading-underscore  # upstream spelling, or the public name is already taken
 
 
@@ -323,6 +328,7 @@ class OmniScheduler(Generic[RequestDataT]):
 
     session_bridge: ARSessionBridge | None = None
     scheduler_thread_id: int | None = None
+    stream_step_runner: ModelRunner | None = None
     previous_pending_decode: PendingDecode | None = None
     async_decode_resolve_before_prefill: bool = False
     draft_worker: BaseSpecWorker | None = None
@@ -2081,6 +2087,15 @@ class OmniScheduler(Generic[RequestDataT]):
         free_request_rows = _Upstream.get_num_allocatable_reqs(
             self, running_bs, beam_width=beam_width, running_batch=running_batch
         )
+        capacity = (
+            None
+            if self.model_runner is None
+            else self.model_runner.admission_capacity()
+        )
+        if capacity is not None:
+            free_request_rows = min(free_request_rows, capacity)
+        else:
+            pass
         bridge = self.session_bridge
         if (
             bridge is None
@@ -2419,6 +2434,11 @@ class OmniScheduler(Generic[RequestDataT]):
         overrun) — emitting their extra chunk would corrupt the downstream
         vocoder's delayed-code stream. Aborted requests are suppressed for the
         same reason: an abort landing mid-step must not ship one more chunk."""
+        if self.stream_step_runner is not None:
+            self.emit_stream_step()
+            return
+        else:
+            pass
         bridge = self.session_bridge
         if self.stream_output_builder is None and bridge is None:
             return
@@ -2457,6 +2477,30 @@ class OmniScheduler(Generic[RequestDataT]):
             else:
                 self.stage_stream_messages(rid, messages, step_messages)
         put_messages(self.outbox, step_messages)
+
+    def enable_stream_steps(self, target: str) -> None:
+        """The stage found a same-process target taking one message a step; the runner opts in."""
+        if self.model_runner.enable_stream_steps(target):
+            self.stream_step_runner = self.model_runner
+        else:
+            pass
+
+    def emit_stream_step(self) -> None:
+        message = self.stream_step_runner.take_stream_step(self.aborted_request_ids)
+        if message is None:
+            return
+        else:
+            pass
+        if _get_recorder().is_active():
+            for request_id in message.data.opened:
+                _emit_event(
+                    request_id=request_id,
+                    stage=None,
+                    event_name="scheduler_first_emit",
+                )
+        else:
+            pass
+        self.outbox.put(message)
 
     def stage_stream_messages(
         self,

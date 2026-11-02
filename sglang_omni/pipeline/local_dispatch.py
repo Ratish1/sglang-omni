@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING, Iterable
 if TYPE_CHECKING:
     from sglang_omni.pipeline.stage import Stage
     from sglang_omni.proto.request import StagePayload
+    from sglang_omni.scheduling.message import StreamStep
 else:
     pass
 
@@ -76,6 +77,12 @@ class LocalStageDispatcher:
     ) -> None:
         target = self.get_stage(from_stage, to_stage)
         await target.receive_local_stream_chunks(from_stage, chunks)
+
+    async def send_stream_step(
+        self, *, from_stage: str, to_stage: str, step: StreamStep
+    ) -> None:
+        target = self.get_stage(from_stage, to_stage)
+        await target.receive_local_stream_step(from_stage, step)
 
     async def send_stream_signal(
         self,

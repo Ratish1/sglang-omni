@@ -71,7 +71,10 @@ from sglang_omni.scheduling.message import (
     OutgoingMessage,
     ResultOwningScheduler,
     StageScheduler,
+    StreamStep,
+    StreamStepEmitter,
 )
+from sglang_omni.scheduling.streaming_simple_scheduler import StreamingSimpleScheduler
 from sglang_omni.serve.stage_routes import StageHttpServer, StageRoutesError
 
 TorchProfiler = current_platform.get_torch_profiler()
@@ -848,6 +851,26 @@ class Stage:
             )
             await self.route_stream_item_or_fail(request_id, item)
 
+    async def receive_local_stream_step(
+        self, from_stage: str, step: StreamStep
+    ) -> None:
+        for request_id in step.opened:
+            if request_id not in self.aborted:
+                self.active_requests.add(request_id)
+                self.open_pre_payload_stream_if_allowed(request_id)
+            else:
+                pass
+        if _get_recorder().is_active():
+            for request_id in step.request_ids:
+                self.emit_stream_chunk_received(
+                    request_id=request_id, from_stage=from_stage, chunk_id=None
+                )
+        else:
+            pass
+        self.scheduler.inbox.put(
+            IncomingMessage(request_id="", type="stream_step", data=step)
+        )
+
     async def receive_local_stream_signal(
         self,
         request_id: str,
@@ -1526,7 +1549,9 @@ class Stage:
                         stream_run = []
                     else:
                         pass
-                    if out.type == "admitted":
+                    if out.type == "stream_step":
+                        await self.route_stream_step(out)
+                    elif out.type == "admitted":
                         if out.request_id not in self.aborted:
                             self.record_replica_bindings(
                                 out.request_id,
@@ -1596,6 +1621,55 @@ class Stage:
                         pass
                     break
 
+    def bind_stream_steps(self) -> None:
+        """Let this stage's scheduler send one message a step to the one target that takes them.
+
+        The target must share this process and device memory, resolve to one instance and accept a
+        stream before its payload; any other edge stays on per-chunk messages.
+        """
+        if (
+            self.role != "single"
+            or len(self.stream_targets) != 1
+            or self.local_dispatcher is None
+        ):
+            return
+        else:
+            pass
+        target = self.stream_targets[0]
+        if (
+            target not in self.same_process_targets
+            or self.replica_topology.is_replicated(target)
+            or not isinstance(self.scheduler, StreamStepEmitter)
+        ):
+            return
+        else:
+            pass
+        receiver = self.local_dispatcher.get_stage(self.name, target)
+        if (
+            receiver.can_accept_stream_before_payload
+            and receiver.stream_queue is not None
+            and isinstance(receiver.scheduler, StreamingSimpleScheduler)
+            and receiver.scheduler.accepts_stream_steps()
+        ):
+            self.scheduler.enable_stream_steps(target)
+        else:
+            pass
+
+    async def route_stream_step(self, out: OutgoingMessage) -> None:
+        step: StreamStep = out.data
+        target = out.target
+        if _get_recorder().is_active():
+            for request_id in step.request_ids:
+                self.local_stream_chunk(
+                    request_id, target, None, {"modality": "audio_codes"}
+                )
+        else:
+            for request_id in step.opened:
+                self.record_local_stream_target(request_id, target)
+        await self.local_dispatcher.send_stream_step(
+            from_stage=self.name, to_stage=target, step=step
+        )
+
     async def route_stream_run(self, messages: list[OutgoingMessage]) -> None:
         """Route targeted stream messages in order, one dispatch per same-process run and one packed batch per remote target."""
         local_target: str | None = None
@@ -1651,7 +1725,7 @@ class Stage:
                 else:
                     pass
                 self.clear_request_state(out.request_id)
-            elif out.type == "stream":
+            elif out.type == "stream" or out.type == "stream_step":
                 continue
             elif out.type == "admitted":
                 self.active_requests.add(out.request_id)

@@ -16,7 +16,11 @@ from sglang_omni.model_runner.prefill_inputs import (
     OmniPrefillInputs,
     attach_omni_prefill_inputs,
 )
+from sglang_omni.models.qwen3_tts.code_table import CodecFrameStep, Qwen3TTSCodeTable
+from sglang_omni.models.qwen3_tts.request_builders import first_stream_metadata
+from sglang_omni.scheduling.message import OutgoingMessage, StreamStep
 from sglang_omni.scheduling.types import (
+    ModelRunnerOutput,
     RequestOutput,
     SchedulerOutput,
     SchedulerRequest,
@@ -25,7 +29,7 @@ from sglang_omni.utils.device import has_device_streams
 
 if TYPE_CHECKING:
     from sglang.srt.layers.logits_processor import LogitsProcessorOutput
-    from sglang.srt.managers.schedule_batch import ScheduleBatch
+    from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
     from sglang.srt.managers.scheduler import GenerationBatchResult
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
@@ -95,6 +99,64 @@ class Qwen3TTSModelRunner(ModelRunner):
             dtype=self.model.decode_feedback_embedding.weight.dtype,
             device=self.device,
         )
+        # note (ratish): a position stays under the token pool's row length, which bounds a
+        # request's frames too. Twice the slots: the engine's rows, then as many streams the
+        # vocoder is still finishing; past that a new request waits for one to end.
+        self.code_table = Qwen3TTSCodeTable(
+            num_rows=2 * request_slot_count,
+            max_frames=int(
+                tp_worker.model_runner.req_to_token_pool.req_to_token.shape[1]
+            ),
+            num_codebooks=int(self.model.config.num_code_groups),
+            device=self.device,
+        )
+        self.decode_batch_reqs: list[Req] | None = None
+        self.decode_frame_index_bases: torch.Tensor | None = None
+        self.codes_ready_events: list[torch.Event] = []
+        self.codes_ready_turn = 0
+        self.stream_step_target: str | None = None
+        self.step_frame_request_ids: list[str] = []
+        self.step_opened_streams: dict[str, dict[str, object]] = {}
+        self.step_codes_ready: torch.Event | None = None
+
+    def admission_capacity(self) -> int | None:
+        return self.code_table.free_rows()
+
+    def enable_stream_steps(self, target: str) -> bool:
+        self.stream_step_target = target
+        return True
+
+    def take_stream_step(self, aborted_request_ids: set[str]) -> OutgoingMessage | None:
+        request_ids = self.step_frame_request_ids
+        opened = self.step_opened_streams
+        self.step_frame_request_ids = []
+        self.step_opened_streams = {}
+        if aborted_request_ids:
+            request_ids = [rid for rid in request_ids if rid not in aborted_request_ids]
+            opened = {
+                rid: metadata
+                for rid, metadata in opened.items()
+                if rid not in aborted_request_ids
+            }
+        else:
+            pass
+        if not request_ids:
+            return None
+        else:
+            pass
+        # note (ratish): the vocoder holds an opened stream's row from here until the stream ends.
+        for metadata in opened.values():
+            self.code_table.hold(metadata["code_row"])
+        return OutgoingMessage(
+            request_id="",
+            type="stream_step",
+            target=self.stream_step_target,
+            data=StreamStep(
+                request_ids=request_ids,
+                opened=opened,
+                data=CodecFrameStep(table=self.code_table, ready=self.step_codes_ready),
+            ),
+        )
 
     def model_info(self) -> Qwen3TTSModelInfo:
         return {"predictor_cuda_graph": self.model.predictor_graph_stats()}
@@ -107,6 +169,13 @@ class Qwen3TTSModelRunner(ModelRunner):
     ) -> None:
         del schedule_batch
         self.model.prepare_decode_buffers(requests)
+        self.decode_batch_reqs = None
+        for sched_req in requests:
+            data: Qwen3TTSSGLangRequestData = sched_req.data
+            if data.code_row is None:
+                self.open_code_row(data)
+            else:
+                pass
         # note (ratish): a prefilled slot restarts from its committed ids, which a retracted
         # request carries into its re-prefill.
         request_slots = forward_batch.req_pool_indices[: len(requests)]
@@ -149,6 +218,16 @@ class Qwen3TTSModelRunner(ModelRunner):
             ),
         )
 
+    def open_code_row(self, data: Qwen3TTSSGLangRequestData) -> None:
+        """Give a request its table row, the reference frames first; a retracted request keeps its row."""
+        row = self.code_table.acquire()
+        data.code_table = self.code_table
+        data.code_row = row
+        if data.ref_code_len:
+            self.code_table.codes[row, : data.ref_code_len].copy_(data.ref_code)
+        else:
+            pass
+
     def before_decode(
         self,
         forward_batch: ForwardBatch | None,
@@ -158,8 +237,13 @@ class Qwen3TTSModelRunner(ModelRunner):
         is_lookahead: bool = False,
     ) -> None:
         del is_lookahead
-        del schedule_batch
-        self.model.prepare_decode_buffers(requests)
+        # note (ratish): what is staged per request only changes when a row joins or leaves.
+        if schedule_batch.reqs != self.decode_batch_reqs:
+            self.model.prepare_decode_buffers(requests)
+            self.decode_frame_index_bases = self.frame_index_bases(requests)
+            self.decode_batch_reqs = list(schedule_batch.reqs)
+        else:
+            pass
         self.write_feedback_buffers(forward_batch, requests)
 
     def post_prefill(
@@ -235,7 +319,7 @@ class Qwen3TTSModelRunner(ModelRunner):
         else:
             active_logits[:, suppress_start:suppress_stop] = float("-inf")
         for row_index, scheduled_request in enumerate(requests):
-            if len(scheduled_request.data.output_codes) < QWEN3_TTS_MIN_NEW_FRAMES:
+            if scheduled_request.data.frame_count < QWEN3_TTS_MIN_NEW_FRAMES:
                 # note (ratish): a slice fills on the device; assigning one element copies a host scalar and waits for the stream.
                 active_logits[row_index, codec_eos : codec_eos + 1] = float("-inf")
             else:
@@ -248,7 +332,7 @@ class Qwen3TTSModelRunner(ModelRunner):
             for row_index, scheduled_request in enumerate(requests):
                 if (
                     scheduled_request.data.mask_leading_silence
-                    and len(scheduled_request.data.output_codes)
+                    and scheduled_request.data.frame_count
                     < self.leading_silence_mask_frames
                 ):
                     active_logits[row_index].index_fill_(
@@ -356,7 +440,141 @@ class Qwen3TTSModelRunner(ModelRunner):
             forward_batch.req_pool_indices[: len(requests)],
             self.model.output_embeds[: len(requests)],
         )
+        self.write_step_frames(forward_batch, requests, semantic_positions)
         self.has_pending_code_step = True
+
+    def frame_index_bases(self, requests: list[SchedulerRequest]) -> torch.Tensor:
+        """What each request adds to a sampled position for its frame's index in the table's flat rows.
+
+        A prompt's last position samples generated frame zero, stored after the reference frames.
+        """
+        max_frames = self.code_table.max_frames
+        return torch.tensor(
+            [
+                sched_req.data.code_row * max_frames
+                + sched_req.data.ref_code_len
+                - (len(sched_req.data.req.origin_input_ids) - 1)
+                for sched_req in requests
+            ],
+            dtype=torch.long,
+            pin_memory=is_pin_memory_available(self.device),
+        ).to(self.device, non_blocking=True)
+
+    def write_step_frames(
+        self,
+        forward_batch: ForwardBatch,
+        requests: list[SchedulerRequest],
+        semantic_positions: torch.Tensor,
+    ) -> None:
+        """One launch for the step's frames, which takes the place of a snapshot; an EOS row's
+        write stays past the request's counted frames."""
+        output_codes = self.model.output_codes
+        batch_size = len(requests)
+        if forward_batch.forward_mode.is_extend():
+            # note (ratish): a middle prefill chunk samples at a prompt row, so it has no frame.
+            recorded_rows = [
+                row_index
+                for row_index, sched_req in enumerate(requests)
+                if sched_req.data.req.inflight_middle_chunks <= 0
+            ]
+            if not recorded_rows:
+                return
+            else:
+                pass
+            recorded = torch.tensor(
+                recorded_rows, dtype=torch.long, device=output_codes.device
+            )
+            frame_indices = semantic_positions[recorded] + self.frame_index_bases(
+                [requests[row_index] for row_index in recorded_rows]
+            )
+            self.code_table.frames.index_copy_(0, frame_indices, output_codes[recorded])
+        else:
+            self.code_table.frames.index_copy_(
+                0,
+                semantic_positions[:batch_size] + self.decode_frame_index_bases,
+                output_codes[:batch_size],
+            )
+        if self.codes_event_module is not None:
+            self.step_codes_ready = self.next_codes_ready_event()
+            self.step_codes_ready.record()
+        else:
+            pass
+
+    def next_codes_ready_event(self) -> torch.Event:
+        # note (ratish): a new event's first record waits while another thread is inside the CUDA
+        # runtime. A late reader of a recycled event waits for a newer step, which only adds that step.
+        if not self.codes_ready_events:
+            self.codes_ready_events = [
+                self.codes_event_module.Event() for _ in range(4)
+            ]
+        else:
+            pass
+        self.codes_ready_turn = (self.codes_ready_turn + 1) % len(
+            self.codes_ready_events
+        )
+        return self.codes_ready_events[self.codes_ready_turn]
+
+    def finalize(
+        self,
+        batch_result: GenerationBatchResult,
+        forward_batch: ForwardBatch | None,
+        schedule_batch: ScheduleBatch,
+        scheduler_output: SchedulerOutput,
+        skip_rids: set[str] | None = None,
+    ) -> ModelRunnerOutput:
+        if self.stream_step_target is None:
+            return super().finalize(
+                batch_result,
+                forward_batch,
+                schedule_batch,
+                scheduler_output,
+                skip_rids,
+            )
+        else:
+            pass
+        host_token_ids = self.resolve_host_token_ids(batch_result)
+        if self.has_pending_code_step:
+            self.has_pending_code_step = False
+            self.collect_step_frames(scheduler_output, host_token_ids.tolist())
+        else:
+            pass
+        return ModelRunnerOutput(
+            outputs={},
+            req_ids=[],
+            req_id_to_index={},
+            can_run_cuda_graph=bool(batch_result.can_run_cuda_graph),
+            next_token_ids=batch_result.next_token_ids,
+            host_token_ids=host_token_ids,
+        )
+
+    def collect_step_frames(
+        self, scheduler_output: SchedulerOutput, token_ids: list[int]
+    ) -> None:
+        """Count the step's frames; nothing here makes a tensor, the frames are already in the table."""
+        eos_id = int(self.model.config.codec_eos_token_id)
+        for sched_req, token_id in zip(
+            scheduler_output.requests, token_ids, strict=True
+        ):
+            data = sched_req.data
+            if token_id == eos_id or data.req.inflight_middle_chunks > 0:
+                continue
+            else:
+                pass
+            data.frame_count += 1
+            if data.streams_frames:
+                self.step_frame_request_ids.append(sched_req.request_id)
+                if not data.stream_ref_sent:
+                    data.stream_ref_sent = True
+                    self.step_opened_streams[sched_req.request_id] = (
+                        first_stream_metadata(
+                            data, int(self.model.config.num_code_groups)
+                        )
+                        | {"code_row": data.code_row}
+                    )
+                else:
+                    pass
+            else:
+                pass
 
     def post_process_outputs(
         self,
@@ -393,9 +611,8 @@ class Qwen3TTSModelRunner(ModelRunner):
                 continue
             else:
                 pass
-            code_chunk = codes_snap[row_idx]
-            sched_req.data.output_codes.append(code_chunk)
-            sched_req.data.latest_stream_code_chunk = code_chunk
+            sched_req.data.frame_count += 1
+            sched_req.data.latest_stream_code_chunk = codes_snap[row_idx]
             sched_req.data.codes_ready_event = codes_ready
 
     def finalize_skip_rids(self, scheduler_output: SchedulerOutput) -> set[str]:
@@ -437,16 +654,13 @@ class Qwen3TTSModelRunner(ModelRunner):
         else:
             pass
         row_ids = self.decode_row_ids(batch_size, input_ids)
-        # note (ratish): the text row follows from the position, so the first decode after
+        # note (ratish): the text row follows from the frames so far, so the first decode after
         # the prompt reads the first trailing text row and every decode past them the pad.
         text_rows: list[torch.Tensor] = []
-        for sched_req, sequence_length in zip(
-            requests, forward_batch.seq_lens_cpu[:batch_size].tolist(), strict=True
-        ):
+        for sched_req in requests:
             data: Qwen3TTSSGLangRequestData = sched_req.data
-            text_index = sequence_length - len(data.req.origin_input_ids) - 1
             text_rows.append(
-                data.text_rows[min(text_index, data.text_rows.shape[0] - 1)]
+                data.text_row_views[min(data.frame_count, len(data.text_row_views)) - 1]
             )
         with torch.no_grad():
             target = decode_feedback_embedding.weight[:batch_size]
@@ -513,9 +727,12 @@ class Qwen3TTSModelRunner(ModelRunner):
                 # committed frames, each row the feedback and text row its decode consumed.
                 generated_start = max(prefix_len, prompt_length) - prompt_length
                 generated_stop = extend_end - prompt_length
-                frame_codes = torch.stack(
-                    data.output_codes[generated_start:generated_stop]
-                )
+                frame_codes = data.code_table.codes[
+                    data.code_row,
+                    data.ref_code_len
+                    + generated_start : data.ref_code_len
+                    + min(generated_stop, data.frame_count),
+                ]
                 text_indices = torch.arange(
                     generated_start,
                     generated_start + frame_codes.shape[0],

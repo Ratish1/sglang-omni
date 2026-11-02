@@ -872,6 +872,8 @@ def run_process(
             )
             report_startup_progress(spec)
         local_dispatcher.register_many(stages)
+        for stage in stages:
+            stage.bind_stream_steps()
         asyncio.run(_start_and_run())
     except BaseException as exc:
         report_failure(exc)

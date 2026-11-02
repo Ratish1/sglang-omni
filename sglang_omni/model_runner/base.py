@@ -49,6 +49,7 @@ if TYPE_CHECKING:
 
     from sglang_omni.models.dots_tts.model_runner import DotsFlowLaunchBuf
     from sglang_omni.models.personaplex.model_runner import PersonaPlexFrameBatch
+    from sglang_omni.scheduling.message import OutgoingMessage
     from sglang_omni.scheduling.sglang_backend.output_processor import (
         SGLangOutputProcessor,
     )
@@ -972,6 +973,19 @@ class ModelRunner(Generic[RequestDataInput]):
     def model_info(self) -> Mapping[str, object]:
         """Model-specific entries the model_info admin action adds to the worker's."""
         return {}
+
+    def admission_capacity(self) -> int | None:
+        """How many more requests the runner's own per-request state can take, or None for no limit."""
+        return None
+
+    def enable_stream_steps(self, target: str) -> bool:
+        """Emit one message a step to this same-process target, if the runner can."""
+        del target
+        return False
+
+    def take_stream_step(self, aborted_request_ids: set[str]) -> OutgoingMessage | None:
+        """The step's one stream message, for a runner that enabled stream steps."""
+        raise NotImplementedError
 
     def on_request_finished(self, request_id: str, req_data: RequestDataInput) -> None:
         """Drain per-request state on any non-abort finish.
