@@ -202,8 +202,8 @@ def compare(out: str, replies_path: str, dump_dir: str, ledger_prefix: str) -> N
                         )
                     else:
                         pass
-            final_name = next((key for key in forward if key.startswith("logits_processor.inputs")), None)
-            if final_name is not None and step_index < len(reply["tokens"]):
+            final_name = "logits_processor.inputs.1"
+            if final_name in forward and step_index < len(reply["tokens"]):
                 ours_final = value_of(forward[final_name])[-1:]
                 position = step_index
                 if position < truth["truth_logits"].shape[0]:
