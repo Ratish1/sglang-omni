@@ -88,6 +88,7 @@ def generate_with_speech(
     response = server.post(
         "/v1/chat/completions",
         json={
+            "request_id": question.sample_id,
             "messages": [{"role": "user", "content": question.question_text}],
             **request_media(question),
             "modalities": ["text", "audio"],
@@ -174,20 +175,19 @@ def reference_positions(
     return torch.cat([prefill, decode.expand(3, 1, -1)], dim=-1).to(device)
 
 
-def captured_records(directory: Path, sample_ids: dict[str, str]) -> dict[str, dict]:
-    """Each request's capture, found by the question text it sent: sample_ids maps that text to the sample id."""
+def captured_records(directory: Path, sample_ids: set[str]) -> dict[str, dict]:
+    """Each request's capture: a request's id is its sample id."""
     deadline = time.monotonic() + CAPTURE_WAIT_S
     records: dict[str, dict] = {}
     while time.monotonic() < deadline:
         records = {}
         for path in directory.glob("*.pt"):
             record = torch.load(path, map_location="cpu")
-            sample_id = sample_ids.get("".join(record["request_text"]))
-            if sample_id is not None:
-                records[sample_id] = record
+            if record["request_id"] in sample_ids:
+                records[record["request_id"]] = record
             else:
                 pass
-        if len(records) == len(sample_ids):
+        if set(records) == sample_ids:
             break
         else:
             time.sleep(2)
@@ -240,9 +240,7 @@ def test_talker_follows_reference(
             pool.map(lambda item: generate_with_speech(server, item), questions),
         ):
             responses[question.sample_id] = response
-    sample_ids = {question.question_text: question.sample_id for question in questions}
-    assert len(sample_ids) == len(questions), "two requests send the same question"
-    records = captured_records(Path(capture_dir), sample_ids)
+    records = captured_records(Path(capture_dir), set(responses))
     assert set(records) == set(
         responses
     ), f"no capture for {sorted(set(responses) - set(records))}"

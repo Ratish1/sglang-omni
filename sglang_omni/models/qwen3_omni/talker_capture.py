@@ -5,8 +5,8 @@ With SGLANG_OMNI_TALKER_CAPTURE_DIR naming a directory, every finished talker re
 the prefill rows and ids the talker started from, the input row of every decode step, and for every step the
 talker's final hidden state (codec_head's input, whose logits the first code is sampled from), the frame's 16 codes
 and the batch size the step ran at. Those are the inputs and outputs a reference talker and code predictor need to be
-teacher-forced on the same steps. The request's text, the thinker's reply token ids, the finish reason and the
-finish time let a caller match a file to its client request and its benchmark pass.
+teacher-forced on the same steps. The request id, the thinker's reply token ids, the finish reason and the finish
+time let a caller match a file to its client request and its benchmark pass.
 """
 
 from __future__ import annotations
@@ -33,29 +33,6 @@ class TalkerSteps:
     hidden: list[torch.Tensor] = field(default_factory=list)
     codes: list[torch.Tensor] = field(default_factory=list)
     batch_sizes: list[int] = field(default_factory=list)
-
-
-def request_text(payload: StagePayload | None) -> list[str]:
-    """The text of every message the client sent, in order."""
-    if payload is None:
-        return []
-    else:
-        pass
-    inputs = payload.request.inputs
-    if isinstance(inputs, dict):
-        inputs = inputs["messages"]
-    else:
-        pass
-    if isinstance(inputs, str):
-        return [inputs]
-    elif isinstance(inputs, list):
-        return [
-            str(message.get("content"))
-            for message in inputs
-            if isinstance(message, dict)
-        ]
-    else:
-        return []
 
 
 def thinker_token_ids(payload: StagePayload | None) -> list[int]:
@@ -115,7 +92,6 @@ class TalkerCapture:
         record = {
             "request_id": request_id,
             "metadata": dict(payload.request.metadata) if payload is not None else {},
-            "request_text": request_text(payload),
             "thinker_token_ids": thinker_token_ids(payload),
             "finished_reason": str(data.req.finished_reason),
             "finished_at": time.time(),
