@@ -3,8 +3,8 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 import torch
@@ -17,7 +17,9 @@ from sglang.kernels.ops.attention.rope import (
 )
 from sglang.kernels.ops.layernorm import rmsnorm
 from sglang.srt.utils.custom_op import register_custom_op
+from torch._dynamo.aot_compile import AOTCompiledFunction
 
+from sglang_omni import kernels as kernels_package
 from sglang_omni.platforms import current_platform
 from sglang_omni.utils.channels_last_conv import (
     channels_last_conv1d,
@@ -26,6 +28,7 @@ from sglang_omni.utils.channels_last_conv import (
     is_channels_last_conv_device,
 )
 from sglang_omni.utils.merged_projections import merge_projection_weights
+from sglang_omni.utils.saved_programs import SavedPrograms, source_tree_digest
 
 if current_platform.is_cuda():
     from sglang.kernels.ops.attention.flash_attention import flash_attn_with_kvcache
@@ -1264,10 +1267,8 @@ class Qwen3TTSIncrementalDecoder:
         self._state_spec: Qwen3TTSIncrementalCodecStateSpec | None = (
             None  # noqa: leading-underscore  # upstream spelling, or the public name is already taken
         )
-        self.compiled_kernel: (
-            Callable[[torch.Tensor, Qwen3TTSIncrementalCodecState], torch.Tensor] | None
-        ) = None
-        self.compiled_shapes: set[tuple[int, int]] = set()
+        self.saved_programs: SavedPrograms | None = None
+        self.compiled_programs: dict[tuple[int, int], AOTCompiledFunction] = {}
         self.first_chunk_reach: dict[int, int] = {}
 
     @staticmethod
@@ -1439,14 +1440,14 @@ class Qwen3TTSIncrementalDecoder:
         # eager decode stays off Dynamo, whose value guards would otherwise
         # recompile once per stream position and hit the recompile limit.
         shape = (int(codes.shape[0]), fresh_frames)
-        if compiled and shape not in self.compiled_shapes:
+        if compiled and shape not in self.compiled_programs:
             raise RuntimeError(
                 f"Qwen3-TTS incremental codec shape {shape} was not precompiled"
             )
+        elif compiled:
+            waveform = self.compiled_programs[shape](self, codes, state)
         else:
-            pass
-        kernel = self.compiled_kernel if compiled else self.decode_tensors
-        waveform = kernel(codes, state)
+            waveform = self.decode_tensors(codes, state)
         expected_samples = fresh_frames * self.total_upsample
         if int(waveform.shape[-1]) != expected_samples:
             raise RuntimeError(
@@ -1873,30 +1874,44 @@ class Qwen3TTSIncrementalDecoder:
         Pass the codes and state of a real decode, in its grad-disabling
         context: Dynamo guards on both, and the step advances the state.
         """
-        if self.compiled_kernel is None:
-            self.compiled_kernel = torch.compile(
-                self.decode_tensors, dynamic=False, fullgraph=True
-            )
-        else:
-            pass
         shape = (int(codes.shape[0]), int(codes.shape[-1]))
-        if shape in self.compiled_shapes:
+        if shape in self.compiled_programs:
             return
         else:
             pass
-        # note (ratish): batch and width stay symbolic, so sizes share programs; Dynamo keeps a size
-        # of one apart, and a width divisible by a dilated conv's 3 splits once more: five in all.
-        batch_tensors = (
-            codes,
-            state.frame_positions,
-            state.slot_index,
-            None if state.kv_rings is None else state.kv_rings.slot_rows,
-        )
-        for tensor in batch_tensors:
-            if tensor is not None:
-                dynamo.maybe_mark_dynamic(tensor, 0)
-            else:
-                pass
-        dynamo.maybe_mark_dynamic(codes, 2)
-        self.compiled_kernel(codes, state)
-        self.compiled_shapes.add(shape)
+        if self.saved_programs is None:
+            self.saved_programs = SavedPrograms(
+                "qwen3_tts_codec",
+                (
+                    source_tree_digest((Path(kernels_package.__file__).parent,)),
+                    repr(self.decoder),
+                    str(self.decoder.pre_conv.conv.weight.dtype),
+                    str(codes.device),
+                ),
+            )
+        else:
+            pass
+        program = self.saved_programs.matching(self, codes, state)
+        if program is None:
+            # note (ratish): batch and width stay symbolic, so sizes share programs; Dynamo keeps a size
+            # of one apart, and a width divisible by a dilated conv's 3 splits once more: five in all.
+            batch_tensors = (
+                codes,
+                state.frame_positions,
+                state.slot_index,
+                None if state.kv_rings is None else state.kv_rings.slot_rows,
+            )
+            for tensor in batch_tensors:
+                if tensor is not None:
+                    dynamo.maybe_mark_dynamic(tensor, 0)
+                else:
+                    pass
+            dynamo.maybe_mark_dynamic(codes, 2)
+            program = torch.compile(
+                self.decode_tensors, dynamic=False, fullgraph=True
+            ).aot_compile(((codes, state), {}))
+            self.saved_programs.add(program, f"{shape[0]}x{shape[1]}")
+        else:
+            pass
+        program(self, codes, state)
+        self.compiled_programs[shape] = program
