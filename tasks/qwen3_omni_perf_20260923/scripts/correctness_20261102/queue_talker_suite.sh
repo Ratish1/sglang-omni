@@ -4,7 +4,7 @@ set -u
 # SeedTTS EN at c16 captured, then talker_draw_calibration.py over those captures.
 # Usage: queue_talker_suite.sh OUT TREE PASSES [media]
 # With media, test_talker.py runs the image and video CI requests in place of stage 6's and the SeedTTS 60; HF's whole
-# decodes of their 256-token replies need a second card, ACCURACY_DEVICE=cuda:1, and the server keeps the default profile.
+# decodes of their 256-token replies need a second card, ACCURACY_DEVICE=cuda:1, and the server keeps the repo's H200 profile.
 OUT=$1
 TREE=$2
 PASSES=$3
@@ -12,7 +12,7 @@ S=/data/tools/tasks/qwen3_omni_perf_20260923/scripts
 C=$S/correctness_20261102
 if [ "${4:-}" = media ]; then
   REQUESTS=QWEN3_OMNI_ACCURACY_TALKER_MEDIA=1
-  PROFILE=""
+  PROFILE="--config examples/configs/qwen3_omni_colocated_h200.yaml"
 else
   REQUESTS=QWEN3_OMNI_ACCURACY_SEEDTTS_IDS=/data/sample_ids_60.txt
   PROFILE="--config $C/qwen3_omni_colocated_accuracy.yaml"
