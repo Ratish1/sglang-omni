@@ -6,9 +6,17 @@ OUT=$1
 TREE=$2
 S=/data/tools/tasks/qwen3_omni_perf_20260923/scripts
 ARM_ARGS="--talker_ar.factory.enable_partial_start true"
-PORT=16000
+PORT=21000
 mkdir -p $OUT
 log() { echo "$(date -u +%T) $*" >> $OUT/queue.log; }
+# note (ratish): the node's network is shared with other tenants, and a server also binds its port plus 100.
+free_port() {
+  local port=$1
+  while ss -tan | awk '{print $4}' | grep -qE ":($port|$((port + 100))|$((port + 300))|$((port + 400)))$"; do
+    port=$((port + 1000))
+  done
+  echo $port
+}
 boot() {
   local dir=$1 card=$2 port=$3 conc=$4 extra=$5 cpus
   # note (ratish): both cards sit on NUMA node 1; each arm gets the same number of its CPUs, none shared.
@@ -24,7 +32,8 @@ for conc in 16 64 1; do
     mkdir -p $OUT/$round
     main_card=$order
     arm_card=$((1 - order))
-    log "$round start: main card $main_card, partial start card $arm_card"
+    PORT=$(free_port $PORT)
+    log "$round start: main card $main_card port $PORT, partial start card $arm_card port $((PORT + 300))"
     boot $OUT/$round/main $main_card $PORT $conc "" > /dev/null
     boot $OUT/$round/partial $arm_card $((PORT + 300)) $conc "$ARM_ARGS" > /dev/null
     until grep -q '^done ' $OUT/$round/main/progress.txt 2>/dev/null && grep -q '^done ' $OUT/$round/partial/progress.txt 2>/dev/null; do
