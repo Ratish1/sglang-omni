@@ -477,20 +477,64 @@ class Qwen3TTSModelRunner(ModelRunner):
             else None
         )
         if joined is None:
-            self.model.code_predictor_forward(
+            self.predict_rows(
+                forward_batch, requests, layer0_codes, hidden, semantic_positions
+            )
+        elif rows_with_a_frame(joined.scheduler_output.requests) is not None:
+            # note (ratish): a middle chunk samples at a prompt row, whose index lies below the
+            # request's table row, so a chunked prefill keeps a pass of its own.
+            joined_requests = joined.scheduler_output.requests
+            self.model.prepare_decode_buffers(requests)
+            self.predict_rows(
+                forward_batch,
+                requests,
                 layer0_codes,
-                hidden,
-                semantic_positions=semantic_positions,
+                joined.decode_hidden,
+                joined.decode_positions,
             )
-            self.feedback_pool.index_copy_(
-                0,
-                forward_batch.req_pool_indices[: len(requests)],
-                self.model.output_embeds[: len(requests)],
+            self.model.prepare_decode_buffers(joined_requests)
+            self.predict_rows(
+                joined.forward_batch, joined_requests, *self.joined_inputs(joined)
             )
-            self.write_step_frames(forward_batch, requests, semantic_positions)
         else:
             self.predict_joined_rows(forward_batch, requests, layer0_codes, joined)
         self.has_pending_code_step = True
+
+    def predict_rows(
+        self,
+        forward_batch: ForwardBatch,
+        requests: list[SchedulerRequest],
+        layer0_codes: torch.Tensor,
+        hidden: torch.Tensor,
+        semantic_positions: torch.Tensor,
+    ) -> None:
+        self.model.code_predictor_forward(
+            layer0_codes,
+            hidden,
+            semantic_positions=semantic_positions,
+        )
+        self.feedback_pool.index_copy_(
+            0,
+            forward_batch.req_pool_indices[: len(requests)],
+            self.model.output_embeds[: len(requests)],
+        )
+        self.write_step_frames(forward_batch, requests, semantic_positions)
+
+    def joined_inputs(
+        self, joined: JoinedPrefill
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """The prefill's sampled ids, last-row hidden and sampled positions, shaped as a pass takes them."""
+        rows = len(joined.scheduler_output.requests)
+        hidden = joined.result.logits_output.hidden_states
+        if hidden.ndim == 2:
+            hidden = hidden.unsqueeze(1)
+        else:
+            pass
+        return (
+            joined.result.next_token_ids.reshape(rows, 1),
+            hidden[:rows],
+            self.sample_positions(joined.forward_batch, hidden.device)[:rows],
+        )
 
     def launch_joined_prefill(
         self, decode_hidden: torch.Tensor, decode_positions: torch.Tensor
@@ -551,18 +595,8 @@ class Qwen3TTSModelRunner(ModelRunner):
         decode_rows = len(requests)
         joined_rows = len(joined_requests)
         rows = decode_rows + joined_rows
-        joined_tokens = joined.result.next_token_ids.reshape(joined_rows, 1)
-        joined_hidden = joined.result.logits_output.hidden_states
-        if joined_hidden.ndim == 2:
-            joined_hidden = joined_hidden.unsqueeze(1)
-        else:
-            pass
-        joined_positions = self.sample_positions(
-            joined.forward_batch, layer0_codes.device
-        )
-        positions = torch.cat(
-            (joined.decode_positions[:decode_rows], joined_positions[:joined_rows])
-        )
+        joined_tokens, joined_hidden, joined_positions = self.joined_inputs(joined)
+        positions = torch.cat((joined.decode_positions[:decode_rows], joined_positions))
         self.model.prepare_decode_buffers([*requests, *joined_requests])
         self.model.code_predictor_forward(
             torch.cat((layer0_codes[:decode_rows], joined_tokens)),

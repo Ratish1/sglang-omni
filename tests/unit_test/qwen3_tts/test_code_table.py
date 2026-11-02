@@ -11,7 +11,7 @@ import pytest
 import torch
 
 from sglang_omni.models.qwen3_tts.code_table import CodecFrameStep, Qwen3TTSCodeTable
-from sglang_omni.models.qwen3_tts.model_runner import Qwen3TTSModelRunner
+from sglang_omni.models.qwen3_tts.model_runner import JoinedPrefill, Qwen3TTSModelRunner
 from sglang_omni.models.qwen3_tts.request_builders import (
     Qwen3TTSSGLangRequestData,
     apply_sglang_qwen3_tts_result,
@@ -613,3 +613,240 @@ def test_only_a_same_process_edge_taking_steps_binds(
     Stage.bind_stream_steps(stage)
 
     assert stage.scheduler.bound == bound
+
+
+class JoinedPredictor:
+    def __init__(self, num_rows: int) -> None:
+        self.config = SimpleNamespace(codec_eos_token_id=99, num_code_groups=CODEBOOKS)
+        self.output_codes = torch.zeros(num_rows, CODEBOOKS, dtype=torch.long)
+        self.output_embeds = torch.zeros(num_rows, 2)
+        self.prepared: list[list[str]] = []
+        self.passes: list[list[int]] = []
+
+    def prepare_decode_buffers(self, requests: list[SimpleNamespace]) -> None:
+        self.prepared.append([request.request_id for request in requests])
+
+    def code_predictor_forward(
+        self,
+        layer0_codes: torch.Tensor,
+        hidden: torch.Tensor,
+        semantic_positions: torch.Tensor,
+    ) -> None:
+        rows = int(layer0_codes.shape[0])
+        assert hidden.shape == (rows, 1, 2)
+        assert semantic_positions.shape == (rows,)
+        self.passes.append(layer0_codes.flatten().tolist())
+        self.output_codes[:rows] = layer0_codes.repeat(1, CODEBOOKS)
+        self.output_embeds[:rows] = layer0_codes.to(torch.float32).repeat(1, 2)
+
+
+def joined_runner(table: Qwen3TTSCodeTable) -> Qwen3TTSModelRunner:
+    runner = Qwen3TTSModelRunner.__new__(Qwen3TTSModelRunner)
+    runner.code_table = table
+    runner.model = JoinedPredictor(num_rows=4)
+    runner.feedback_pool = torch.zeros(8, 2)
+    runner.step_frame_request_ids = []
+    runner.step_opened_streams = {}
+    runner.step_codes_ready = None
+    return runner
+
+
+def forward_on(
+    slots: list[int], *, extend: bool, seq_lens: list[int]
+) -> SimpleNamespace:
+    return SimpleNamespace(
+        forward_mode=SimpleNamespace(
+            is_extend=lambda: extend, is_decode=lambda: not extend
+        ),
+        req_pool_indices=torch.tensor(slots),
+        seq_lens=torch.tensor(seq_lens),
+        positions=torch.tensor(seq_lens) - 1,
+    )
+
+
+def prefill_on_decode(
+    table: Qwen3TTSCodeTable, *, joined_middle_chunks: int = 0
+) -> tuple[Qwen3TTSModelRunner, SimpleNamespace, JoinedPrefill, SimpleNamespace]:
+    runner = joined_runner(table)
+    decoding = make_request(table, "decoding", prompt_rows=6)
+    arriving = make_request(
+        table, "arriving", prompt_rows=4, middle_chunks=joined_middle_chunks
+    )
+    decode_batch = forward_on([5], extend=False, seq_lens=[8])
+    runner.decode_frame_index_bases = runner.frame_index_bases([decoding])
+    joined = JoinedPrefill(
+        scheduler_output=SimpleNamespace(requests=[arriving]),
+        forward_batch=forward_on([2], extend=True, seq_lens=[4]),
+        result=SimpleNamespace(
+            next_token_ids=torch.tensor([9]),
+            logits_output=SimpleNamespace(hidden_states=torch.ones(1, 2)),
+        ),
+        decode_hidden=torch.ones(1, 1, 2),
+        decode_positions=decode_batch.positions.clone(),
+    )
+    return (
+        runner,
+        decode_batch,
+        joined,
+        SimpleNamespace(decoding=decoding, arriving=arriving),
+    )
+
+
+def test_a_joined_prefill_shares_one_pass_and_each_row_keeps_its_own_frame() -> None:
+    table = make_table()
+    runner, decode_batch, joined, requests = prefill_on_decode(table)
+
+    runner.predict_joined_rows(
+        decode_batch, [requests.decoding], torch.tensor([[7]]), joined
+    )
+
+    assert runner.model.passes == [[7, 9]]
+    assert runner.model.prepared == [["decoding", "arriving"]]
+    assert table.codes[requests.decoding.data.code_row, 2].tolist() == [7, 7, 7]
+    assert table.codes[requests.arriving.data.code_row, 0].tolist() == [9, 9, 9]
+    assert runner.feedback_pool[5].tolist() == [7.0, 7.0]
+    assert runner.feedback_pool[2].tolist() == [9.0, 9.0]
+
+
+def test_a_chunked_prefill_keeps_a_pass_and_writes_no_frame_for_its_middle_row() -> (
+    None
+):
+    table = make_table()
+    runner, decode_batch, joined, requests = prefill_on_decode(
+        table, joined_middle_chunks=1
+    )
+    runner.prefill_joiner = SimpleNamespace()
+    runner.launch_joined_prefill = lambda hidden, positions: joined
+    runner.stage_token_ids = lambda result, ids: None
+    neighbour_row = table.codes[requests.decoding.data.code_row].clone()
+
+    runner.collect_codes(
+        SimpleNamespace(
+            next_token_ids=torch.tensor([7]),
+            logits_output=SimpleNamespace(hidden_states=torch.ones(1, 2)),
+        ),
+        decode_batch,
+        object(),
+        [requests.decoding],
+    )
+
+    assert runner.model.passes == [[7], [9]]
+    assert runner.model.prepared == [["decoding"], ["arriving"]]
+    neighbour_row[2] = torch.tensor([7, 7, 7])
+    assert torch.equal(table.codes[requests.decoding.data.code_row], neighbour_row)
+    assert table.codes[requests.arriving.data.code_row].eq(0).all()
+
+
+def test_no_waiting_prefill_leaves_the_decode_step_alone() -> None:
+    table = make_table()
+    runner, decode_batch, _, requests = prefill_on_decode(table)
+    runner.prefill_joiner = SimpleNamespace(launch_joined_prefill=lambda: None)
+    runner.stage_token_ids = lambda result, ids: None
+
+    runner.collect_codes(
+        SimpleNamespace(
+            next_token_ids=torch.tensor([7]),
+            logits_output=SimpleNamespace(hidden_states=torch.ones(1, 2)),
+        ),
+        decode_batch,
+        object(),
+        [requests.decoding],
+    )
+
+    assert runner.model.passes == [[7]]
+    assert runner.model.prepared == []
+    assert runner.joined is None
+
+
+def test_a_prefill_that_fails_mid_step_fails_alone_and_the_decode_step_continues() -> (
+    None
+):
+    table = make_table()
+    runner, decode_batch, _, requests = prefill_on_decode(table)
+    failed: list[Exception] = []
+    arriving_output = SimpleNamespace(
+        batch_data=SimpleNamespace(), requests=[requests.arriving]
+    )
+    runner.prefill_joiner = SimpleNamespace(
+        launch_joined_prefill=lambda: arriving_output,
+        fail_joined_prefill=failed.append,
+    )
+    runner.stage_token_ids = lambda result, ids: None
+    error = RuntimeError("prefill forward failed")
+
+    def raise_error(*args: object, **kwargs: object) -> None:
+        raise error
+
+    runner.execution_context = raise_error
+
+    runner.collect_codes(
+        SimpleNamespace(
+            next_token_ids=torch.tensor([7]),
+            logits_output=SimpleNamespace(hidden_states=torch.ones(1, 2)),
+        ),
+        decode_batch,
+        object(),
+        [requests.decoding],
+    )
+
+    assert failed == [error]
+    assert runner.model.passes == [[7]]
+    assert table.codes[requests.decoding.data.code_row, 2].tolist() == [7, 7, 7]
+
+
+def test_both_batches_finalize_and_share_one_stream_message() -> None:
+    table = make_table()
+    runner, _, joined, requests = prefill_on_decode(table)
+    runner.stream_step_target = "vocoder"
+    runner.joined = joined
+    runner.has_pending_code_step = True
+    runner.resolve_host_token_ids = lambda result: (
+        torch.tensor([9]) if result is joined.result else torch.tensor([7])
+    )
+
+    runner.finalize(
+        SimpleNamespace(can_run_cuda_graph=True, next_token_ids=torch.tensor([7])),
+        None,
+        object(),
+        SimpleNamespace(requests=[requests.decoding]),
+    )
+    message = runner.take_stream_step(set())
+    joined_output = runner.take_joined_output()
+
+    assert message.data.request_ids == ["decoding", "arriving"]
+    assert set(message.data.opened) == {"decoding", "arriving"}
+    assert joined_output.host_token_ids.tolist() == [9]
+    assert runner.joined is None
+    assert runner.take_joined_output() is None
+
+
+class FailingScheduler(OmniScheduler):
+    def __init__(self) -> None:
+        self.enable_overlap = False
+        self.failed: list[tuple[object, Exception]] = []
+
+    def _run_batch(self, batch, pp_proxy_tensors=None):  # noqa: leading-underscore
+        self.joined_prefill = "joined"
+        raise RuntimeError("decode step failed")
+
+    def handle_batch_failure(self, batch, error) -> None:
+        self.failed.append((batch, error))
+
+
+def test_a_failed_decode_step_fails_the_prefill_it_carried() -> None:
+    scheduler = FailingScheduler()
+
+    scheduler.run_batch("decode")
+
+    assert [batch for batch, _ in scheduler.failed] == ["decode", "joined"]
+    assert scheduler.joined_prefill is None
+
+
+def test_a_joined_prefill_stays_discoverable_for_an_abort() -> None:
+    scheduler = OmniScheduler.__new__(OmniScheduler)
+    scheduler.joined_prefill = "joined"
+    scheduler.previous_pending_decode = None
+    scheduler.async_pending = None
+    scheduler.result_queue = ()
+
+    assert list(scheduler.pending_batches()) == ["joined"]
