@@ -17,7 +17,7 @@ log "dump start: tree $(git -C $TREE rev-parse --short HEAD) $(git -C $TREE rev-
   DUMPER_ENABLE_OUTPUT_CONSOLE=0 DUMPER_NON_INTRUSIVE_MODE=all DUMPER_EXP_NAME=thinker \
   DUMPER_FILTER="match(r'^non_intrusive__(model\.layers\.\d+\.(self_attn\.inputs\.hidden_states|mlp\.inputs\.0)|logits_processor\.inputs\.\d+)$', name)" \
   python3 -u -m sglang_omni.cli serve --host 127.0.0.1 --port $PORT --model-path $MODEL \
-  --config examples/configs/qwen3_omni_colocated_h200.yaml --colocate \
+  --config $C/qwen3_omni_colocated_accuracy.yaml --colocate \
   --preprocessing.factory.max_seq_len 32768 --thinker.factory.max_seq_len 32768 \
   --thinker.engine.disable_cuda_graph true --thinker.engine.disable_radix_cache true) > $OUT/serve.log 2>&1 &
 SERVE_PID=$!
