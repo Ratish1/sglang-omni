@@ -93,12 +93,14 @@ def main():
         ("window", scheduler.initial_window_decode_graphs, only),
     ]
     generator = torch.Generator(device="cpu").manual_seed(20261102)
-    result = {
-        "build_s": round(build_s, 2),
-        "programs": counters["stats"]["unique_graphs"],
-        "compiled_shapes": sorted(scheduler.incremental_decoder.compiled_shapes),
-        "keys": {},
-    }
+    decoder = scheduler.incremental_decoder
+    if hasattr(decoder, "saved_programs"):
+        programs = len(decoder.saved_programs.programs)
+        shapes = sorted(decoder.saved_programs.by_shape)
+    else:
+        programs = counters["stats"]["unique_graphs"]
+        shapes = sorted(decoder.compiled_shapes)
+    result = {"build_s": round(build_s, 2), "programs": programs, "compiled_shapes": shapes, "keys": {}}
     waveforms = {}
     for name, runner, only_width in runners:
         for key in sorted(runner.graphs, key=lambda item: (item.fresh_frames, item.batch_bucket)):
