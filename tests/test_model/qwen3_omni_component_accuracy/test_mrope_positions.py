@@ -19,6 +19,7 @@ from transformers.models.qwen3_omni_moe.processing_qwen3_omni_moe import (
     Qwen3OmniMoeProcessor,
 )
 
+from sglang_omni.models.qwen3_omni.mrope_positions import talker_can_use_linear_mrope
 from sglang_omni.models.qwen3_omni.request_builders import compute_mrope_positions
 
 pytestmark = pytest.mark.benchmark
@@ -141,48 +142,59 @@ def test_mrope_positions_match_reference(
             thinker_config,
         )
         talker_ids = talker_input_ids(inputs["input_ids"][0], reference_model.config)
-        talker_reference, talker_reference_delta = (
-            reference_model.talker.get_rope_index(
-                talker_ids[None],
-                inputs.get("image_grid_thw"),
-                inputs.get("video_grid_thw"),
-                torch.ones_like(talker_ids)[None],
-                use_audio_in_video,
-                audio_lengths,
-                inputs.get("video_second_per_grid"),
-            )
+        has_grid = (
+            inputs.get("image_grid_thw") is not None
+            or inputs.get("video_grid_thw") is not None
         )
-        talker_omni, talker_omni_delta = compute_mrope_positions(
-            talker_ids,
-            {
-                "image_grid_thw": inputs.get("image_grid_thw"),
-                "video_grid_thw": inputs.get("video_grid_thw"),
-                "video_second_per_grid": inputs.get("video_second_per_grid"),
-                "use_audio_in_video": use_audio_in_video,
-                "audio_feature_lengths": audio_lengths,
-            },
-            thinker_config,
-        )
-        reference_positions = reference_positions[:, 0, :]
-        records.append(
-            {
-                "case": f"talker/{case}",
-                "tokens": int(talker_ids.shape[0]),
-                "positions_equal": torch.equal(
-                    talker_omni.float(), talker_reference[:, 0, :].float()
-                ),
-                "positions_max_abs": (
-                    talker_omni.float() - talker_reference[:, 0, :].float()
+        talker_inputs = {
+            "image_grid_thw": inputs.get("image_grid_thw"),
+            "video_grid_thw": inputs.get("video_grid_thw"),
+            "video_second_per_grid": inputs.get("video_second_per_grid"),
+            "use_audio_in_video": use_audio_in_video,
+            "audio_feature_lengths": audio_lengths,
+        }
+        # note (ratish): HF's talker reads audio_config, which its config lacks, on a prompt with a grid and audio.
+        if has_grid and audio_lengths is None:
+            talker_reference, talker_reference_delta = (
+                reference_model.talker.get_rope_index(
+                    talker_ids[None],
+                    inputs.get("image_grid_thw"),
+                    inputs.get("video_grid_thw"),
+                    torch.ones_like(talker_ids)[None],
+                    use_audio_in_video,
+                    audio_lengths,
+                    inputs.get("video_second_per_grid"),
                 )
-                .abs()
-                .max()
-                .item(),
-                "delta": [
-                    int(talker_omni_delta.flatten()[0]),
-                    int(talker_reference_delta.flatten()[0]),
-                ],
-            }
-        )
+            )
+            talker_omni, talker_omni_delta = compute_mrope_positions(
+                talker_ids, talker_inputs, thinker_config
+            )
+            records.append(
+                {
+                    "case": f"talker/{case}",
+                    "tokens": int(talker_ids.shape[0]),
+                    "positions_equal": torch.equal(
+                        talker_omni.float(), talker_reference[:, 0, :].float()
+                    ),
+                    "positions_max_abs": (
+                        talker_omni.float() - talker_reference[:, 0, :].float()
+                    )
+                    .abs()
+                    .max()
+                    .item(),
+                    "delta": [
+                        int(talker_omni_delta.flatten()[0]),
+                        int(talker_reference_delta.flatten()[0]),
+                    ],
+                }
+            )
+        elif not has_grid:
+            assert talker_can_use_linear_mrope(
+                talker_ids, talker_inputs, thinker_config
+            ), f"{case}: HF's talker uses linear positions without a grid"
+        else:
+            pass
+        reference_positions = reference_positions[:, 0, :]
         records.append(
             {
                 "case": case,
