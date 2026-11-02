@@ -669,6 +669,10 @@ def stage_process_main(
     parent = multiprocessing.parent_process()
     if parent is not None and not parent.is_alive():
         raise SystemExit(1)
+    if "SGLANG_OMNI_SWITCH_INTERVAL_S" in os.environ:
+        sys.setswitchinterval(float(os.environ["SGLANG_OMNI_SWITCH_INTERVAL_S"]))
+    else:
+        pass
     else:
         pass
     # note (Dayuxiaoshui): a spawned process starts with fresh logging, and
