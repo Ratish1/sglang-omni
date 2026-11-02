@@ -954,7 +954,7 @@ class FusedIncrementalTransformer:
             and fresh_frames <= rings.ring_frames - retained_context
         )
         if is_in_place:
-            write_rows = frame_rows.reshape(rows)
+            write_rows = frame_rows.reshape(rows).clone()
             window_starts = (start_positions - retained_context).clamp(min=0)
             window_rows = (
                 slot_rows
@@ -966,8 +966,8 @@ class FusedIncrementalTransformer:
             )
             window_lengths = start_positions - window_starts + fresh_frames
             if self.is_paged_attention:
-                page_table = window_rows.to(torch.int32)
-                window_lengths = window_lengths.to(torch.int32)
+                page_table = window_rows.to(torch.int32).clone()
+                window_lengths = window_lengths.to(torch.int32).clone()
             else:
                 query_offsets = (window_lengths - fresh_frames).unsqueeze(
                     1
