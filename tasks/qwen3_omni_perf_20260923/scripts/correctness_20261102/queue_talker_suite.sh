@@ -2,10 +2,16 @@ set -u
 # 11-02 the served talker against HF on one H200: one colocated boot of TREE with the talker capture, smaller budgets so
 # HF's talker fits beside the server. test_talker.py (stage 6's requests teacher-forced through HF FP32 and BF16), then
 # SeedTTS EN at c16 captured, then talker_draw_calibration.py over those captures.
-# Usage: queue_talker_suite.sh OUT TREE PASSES
+# Usage: queue_talker_suite.sh OUT TREE PASSES [media]
+# With media, test_talker.py runs the image and video stages' requests in place of stage 6's and the SeedTTS 60.
 OUT=$1
 TREE=$2
 PASSES=$3
+if [ "${4:-}" = media ]; then
+  REQUESTS=QWEN3_OMNI_ACCURACY_TALKER_MEDIA=1
+else
+  REQUESTS=QWEN3_OMNI_ACCURACY_SEEDTTS_IDS=/data/sample_ids_60.txt
+fi
 S=/data/tools/tasks/qwen3_omni_perf_20260923/scripts
 C=$S/correctness_20261102
 MODEL=Qwen/Qwen3-Omni-30B-A3B-Instruct
@@ -33,7 +39,7 @@ if [ $healthy = 0 ]; then
   log "healthy; gpu $(nvidia-smi --query-gpu=memory.used --format=csv,noheader)"
   (cd $TREE && QWEN3_OMNI_ACCURACY_MODEL=$MODEL QWEN3_OMNI_ACCURACY_REPORT_DIR=$OUT/report \
     QWEN3_OMNI_ACCURACY_SERVER=http://127.0.0.1:$PORT QWEN3_OMNI_ACCURACY_TALKER_CAPTURE=$OUT/capture \
-    QWEN3_OMNI_ACCURACY_SEEDTTS_IDS=/data/sample_ids_60.txt QWEN3_OMNI_ACCURACY_CONCURRENCY=${CONCURRENCY:-64} \
+    env $REQUESTS QWEN3_OMNI_ACCURACY_CONCURRENCY=${CONCURRENCY:-64} \
     PYTHONPATH=$TREE python3 -m pytest -s -q -x -p no:cacheprovider \
     tests/test_model/qwen3_omni_component_accuracy/test_talker.py) > $OUT/test_talker.log 2>&1
   log "test_talker rc $?: $(grep -E '^\[talker\]' $OUT/test_talker.log | cut -c1-500)"
