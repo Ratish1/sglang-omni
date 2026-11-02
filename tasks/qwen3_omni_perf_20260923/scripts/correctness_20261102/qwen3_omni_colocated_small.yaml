@@ -10,7 +10,7 @@ stages:
   audio_encoder:
     gpu_memory_fraction: 0.015
   thinker:
-    gpu_memory_fraction: 0.44
+    gpu_memory_fraction: 0.60
   talker_ar:
     gpu_memory_fraction: 0.07
   code2wav:

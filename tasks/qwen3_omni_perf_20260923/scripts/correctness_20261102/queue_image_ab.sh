@@ -9,13 +9,15 @@ MODEL=Qwen/Qwen3-Omni-30B-A3B-Instruct
 PORT=37600
 mkdir -p $Q
 log() { echo "$(date -u +%T) $*" >> $Q/queue.log; }
+# note (ratish): the full-corpus cells' rows take the card's room while they build; the pair then runs beside the cells.
+until [ -f /data/cells_1102/full_rows.done ]; do sleep 10; done
 
 boot() {
   local label=$1 tree=$2 out=$Q/$1
   mkdir -p $out
   log "$label start: tree $(git -C $tree rev-parse --short HEAD) $(git -C $tree rev-parse HEAD:sglang_omni | cut -c1-8); gpu $(nvidia-smi --query-gpu=memory.used --format=csv,noheader)"
   (cd $tree && exec setsid env PYTHONPATH=$tree python3 -u -m sglang_omni.cli serve --host 127.0.0.1 --port $PORT \
-    --model-path $MODEL --config examples/configs/qwen3_omni_colocated_h200.yaml --colocate \
+    --model-path $MODEL --config $C/qwen3_omni_colocated_small.yaml --colocate \
     --preprocessing.factory.max_seq_len 32768 --thinker.factory.max_seq_len 32768) > $out/serve.log 2>&1 &
   local pid=$!
   local healthy=1
