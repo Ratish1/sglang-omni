@@ -165,7 +165,7 @@ if HAS_TRITON:
     @triton.jit
     def weight_tile(W, cols, k0, K: tl.constexpr, BLOCK_K: tl.constexpr):
         rk = tl.arange(0, BLOCK_K)
-        return tl.load(W + cols[:, None] * K + (k0 + rk)[None, :])
+        return tl.load(W + cols[:, None] * K + (k0 + rk)[None, :], cache_modifier=".cs")
 
     @triton.jit
     def norm_qkv_rope_store_kernel(
