@@ -26,7 +26,11 @@ from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.model_executor.runner.prefill_cuda_graph_runner import (
     PrefillCudaGraphRunner,
 )
-from sglang.srt.models.qwen3_moe import Qwen3MoeDecoderLayer, Qwen3MoeSparseMoeBlock
+from sglang.srt.models.qwen3_moe import (
+    Qwen3MoeAttention,
+    Qwen3MoeDecoderLayer,
+    Qwen3MoeSparseMoeBlock,
+)
 from sglang.srt.models.qwen3_vl_moe import Qwen3MoeLLMModel
 from sglang.srt.runtime_context import get_context
 
@@ -37,6 +41,7 @@ from sglang_omni.models.qwen3_omni.components.sglang_thinker import (
     DecodeLiveRows,
     PaddedRowsTopK,
     Qwen3OmniThinkerForCausalLM,
+    ThinkerDecodeAttention,
     config_uses_mrope,
 )
 from sglang_omni.models.qwen3_omni.hf_config import (
@@ -424,6 +429,67 @@ def test_decode_mask_is_cleared_when_the_model_call_fails() -> None:
     assert wrapper.decode_live_rows.is_live_row is None
 
 
+@pytest.mark.parametrize(
+    ("forward_mode", "fused_store_allowed", "runs_kernel"),
+    [
+        (ForwardMode.DECODE, True, True),
+        (ForwardMode.DECODE, False, False),
+        (ForwardMode.EXTEND, True, False),
+        (ForwardMode.TARGET_VERIFY, True, False),
+    ],
+)
+def test_decode_attention_runs_its_kernel_only_where_sglang_would_fuse_the_store(
+    monkeypatch: pytest.MonkeyPatch,
+    forward_mode: ForwardMode,
+    fused_store_allowed: bool,
+    runs_kernel: bool,
+) -> None:
+    monkeypatch.setattr(
+        sglang_thinker_module,
+        "enable_fused_set_kv_buffer",
+        lambda forward_batch: fused_store_allowed,
+    )
+    monkeypatch.setattr(
+        sglang_thinker_module,
+        "create_fused_set_kv_buffer_arg",
+        lambda value, layer, forward_batch: "kv store",
+    )
+    monkeypatch.setattr(
+        sglang_thinker_module,
+        "norm_rope_store",
+        lambda qkv, positions, attention, kv_store: ("kernel", kv_store),
+    )
+    monkeypatch.setattr(
+        Qwen3MoeAttention,
+        "apply_qk_norm_rope",
+        lambda self, qkv, positions, forward_batch: ("parent", None),
+    )
+    attention_calls: list[bool] = []
+    attention = object.__new__(ThinkerDecodeAttention)
+    torch.nn.Module.__init__(attention)
+    attention.q_size = 4
+    attention.kv_size = 2
+    attention.rotary_emb = SimpleNamespace(
+        _match_cos_sin_cache_dtype=lambda query: None
+    )
+    attention.attn = SimpleNamespace()
+    forward_batch = SimpleNamespace(forward_mode=forward_mode)
+    qkv = torch.zeros(1, 8, dtype=torch.bfloat16)
+
+    applied = attention.apply_qk_norm_rope(qkv, torch.zeros(3, 1), forward_batch)
+
+    assert applied == (("kernel", "kv store") if runs_kernel else ("parent", None))
+    if runs_kernel:
+        attention.attn = lambda q, k, v, batch, save_kv_cache: attention_calls.append(
+            save_kv_cache
+        )
+        attention.o_proj = lambda attention_output: (attention_output, None)
+        attention.forward_core((None, forward_batch, (qkv, qkv, qkv, forward_batch)))
+        assert attention_calls == [False]
+    else:
+        pass
+
+
 @pytest.mark.parametrize("quant_config", [None, Fp8Config()])
 def test_thinker_routes_every_unquantized_moe_layer_through_the_shared_decode_mask(
     monkeypatch: pytest.MonkeyPatch, quant_config: Fp8Config | None
@@ -432,8 +498,12 @@ def test_thinker_routes_every_unquantized_moe_layer_through_the_shared_decode_ma
         layer = object.__new__(Qwen3MoeDecoderLayer)
         torch.nn.Module.__init__(layer)
         layer.mlp = mlp
+        layer.self_attn = torch.nn.Identity()
         return layer
 
+    monkeypatch.setattr(
+        sglang_thinker_module, "supports_norm_rope_store", lambda attention: False
+    )
     moe_block = object.__new__(Qwen3MoeSparseMoeBlock)
     torch.nn.Module.__init__(moe_block)
     moe_topk = torch.nn.Identity()
