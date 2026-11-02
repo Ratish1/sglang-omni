@@ -36,8 +36,18 @@ kill -TERM -- -$SERVE_PID 2>/dev/null
 for _ in $(seq 40); do kill -0 $SERVE_PID 2>/dev/null || break; sleep 3; done
 kill -KILL -- -$SERVE_PID 2>/dev/null
 for run in "$@"; do
-  PYTHONPATH=$TREE python3 $S/run_bench.py sim --arm seedtts_en --out $run > $run/sim.log 2>&1
-  log "$run sim rc $?"
+  # note (ratish): a repeated sample's id carries its pass; the scorer looks its reference up by the bare id.
+  mkdir -p $run/sim/seedtts_en
+  python3 - "$run" <<'PY'
+import json, sys
+run = sys.argv[1]
+rows = json.load(open(f"{run}/seedtts_en/generated.json"))
+for row in rows:
+    row["sample_id"] = row["sample_id"].split("__r")[0]
+json.dump(rows, open(f"{run}/sim/seedtts_en/generated.json", "w"))
+PY
+  PYTHONPATH=$TREE python3 $S/run_bench.py sim --arm seedtts_en --out $run/sim > $run/sim.log 2>&1
+  log "$run sim rc $?: $(python3 -c "import json;d=json.load(open('$run/sim/seedtts_en/sim_summary.json'));print(d)" 2>/dev/null | cut -c1-260)"
   (cd $TREE && PYTHONPATH=$TREE python3 $C/bad_output_census.py en $run/seedtts_en > $run/census.txt 2>&1)
   log "$run: $(head -3 $run/census.txt | cut -c1-200 | tr '\n' ' ')"
   python3 - "$run" <<'PY'
