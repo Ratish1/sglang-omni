@@ -51,9 +51,15 @@ for _ in $(seq 180); do
 done
 if [ $healthy = 1 ]; then
   echo "healthy $(date +%T)" >> "$OUT/progress.txt"
-  PYTHONPATH=$TREE $PY -m benchmarks.eval.benchmark_tts_seedtts --model $MODEL --lang en --meta "$META" \
-    --use-existing-server --host 127.0.0.1 --port $PORT --warmup 1 ${BENCH_STREAM---stream} --generate-only \
-    --concurrency "$CONC" --max-samples "$SAMPLES" --output-dir "$OUT/bench" > "$OUT/bench.log" 2>&1
+  #LOAD_SCRIPT replaces the seed-tts benchmark: a python file taking --port --concurrency
+  # --requests --out plus LOAD_ARGS, which writes bench.log's two window lines to stdout
+  if [ -n "${LOAD_SCRIPT:-}" ]; then
+    $PY "$LOAD_SCRIPT" ${LOAD_ARGS:-} --port $PORT --concurrency "$CONC" --requests "$SAMPLES" --out "$OUT/load" > "$OUT/bench.log" 2>&1
+  else
+    PYTHONPATH=$TREE $PY -m benchmarks.eval.benchmark_tts_seedtts --model $MODEL --lang en --meta "$META" \
+      --use-existing-server --host 127.0.0.1 --port $PORT --warmup 1 ${BENCH_STREAM---stream} --generate-only \
+      --concurrency "$CONC" --max-samples "$SAMPLES" --output-dir "$OUT/bench" > "$OUT/bench.log" 2>&1
+  fi
   echo "bench rc $? $(date +%T)" >> "$OUT/progress.txt"
 else
   echo "server not healthy" > "$OUT/FAILED"
