@@ -10,9 +10,12 @@ PORT=21000
 mkdir -p $OUT
 log() { echo "$(date -u +%T) $*" >> $OUT/queue.log; }
 # note (ratish): the node's network is shared with other tenants, and a server also binds its port plus 100.
+listening() {
+  (exec 3<>/dev/tcp/127.0.0.1/$1) 2>/dev/null
+}
 free_port() {
   local port=$1
-  while ss -tan | awk '{print $4}' | grep -qE ":($port|$((port + 100))|$((port + 300))|$((port + 400)))$"; do
+  while listening $port || listening $((port + 100)) || listening $((port + 300)) || listening $((port + 400)); do
     port=$((port + 1000))
   done
   echo $port
