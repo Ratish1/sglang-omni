@@ -1,0 +1,17 @@
+# The colocated profile at about the H100 BF16 profile's absolute budgets, so the factorial cells keep their room on the
+# H200's card. Budgets set KV capacity, not arithmetic, so answers do not depend on them.
+config_cls: Qwen3OmniSpeechColocatedPipelineConfig
+name: qwen3-omni-colocated-small
+model_path: Qwen/Qwen3-Omni-30B-A3B-Instruct
+
+stages:
+  image_encoder:
+    gpu_memory_fraction: 0.015
+  audio_encoder:
+    gpu_memory_fraction: 0.015
+  thinker:
+    gpu_memory_fraction: 0.44
+  talker_ar:
+    gpu_memory_fraction: 0.07
+  code2wav:
+    gpu_memory_fraction: 0.012
