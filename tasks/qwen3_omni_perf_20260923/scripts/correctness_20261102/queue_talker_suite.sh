@@ -3,18 +3,20 @@ set -u
 # HF's talker fits beside the server. test_talker.py (stage 6's requests teacher-forced through HF FP32 and BF16), then
 # SeedTTS EN at c16 captured, then talker_draw_calibration.py over those captures.
 # Usage: queue_talker_suite.sh OUT TREE PASSES [media]
-# With media, test_talker.py runs the image and video stages' requests in place of stage 6's and the SeedTTS 60; HF's
-# whole decodes of their 256-token replies need a second card, ACCURACY_DEVICE=cuda:1.
+# With media, test_talker.py runs the image and video CI requests in place of stage 6's and the SeedTTS 60; HF's whole
+# decodes of their 256-token replies need a second card, ACCURACY_DEVICE=cuda:1, and the server keeps the default profile.
 OUT=$1
 TREE=$2
 PASSES=$3
-if [ "${4:-}" = media ]; then
-  REQUESTS=QWEN3_OMNI_ACCURACY_TALKER_MEDIA=1
-else
-  REQUESTS=QWEN3_OMNI_ACCURACY_SEEDTTS_IDS=/data/sample_ids_60.txt
-fi
 S=/data/tools/tasks/qwen3_omni_perf_20260923/scripts
 C=$S/correctness_20261102
+if [ "${4:-}" = media ]; then
+  REQUESTS=QWEN3_OMNI_ACCURACY_TALKER_MEDIA=1
+  PROFILE=""
+else
+  REQUESTS=QWEN3_OMNI_ACCURACY_SEEDTTS_IDS=/data/sample_ids_60.txt
+  PROFILE="--config $C/qwen3_omni_colocated_accuracy.yaml"
+fi
 MODEL=Qwen/Qwen3-Omni-30B-A3B-Instruct
 PORT=37200
 mkdir -p $OUT/capture $OUT/capture_seedtts $OUT/report
@@ -22,7 +24,7 @@ log() { echo "$(date -u +%T) $*" >> $OUT/queue.log; }
 log "talker suite start: tree $(git -C $TREE rev-parse --short HEAD) $(git -C $TREE rev-parse HEAD:sglang_omni | cut -c1-8); tools $(git -C /data/tools rev-parse --short HEAD); gpu $(nvidia-smi --query-gpu=memory.used --format=csv,noheader)"
 (cd $TREE && exec setsid env PYTHONPATH=$TREE SGLANG_OMNI_TALKER_CAPTURE_DIR=$OUT/capture \
   python3 -u -m sglang_omni.cli serve --host 127.0.0.1 --port $PORT --model-path $MODEL \
-  --config $C/qwen3_omni_colocated_accuracy.yaml --colocate \
+  $PROFILE --colocate \
   --preprocessing.factory.max_seq_len 32768 --thinker.factory.max_seq_len 32768) > $OUT/serve.log 2>&1 &
 SERVE_PID=$!
 healthy=1
