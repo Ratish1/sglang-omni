@@ -15,10 +15,13 @@ floor:
   largest margin HF BF16 departs at;
 - code2wav: the audio omni served for its own codes against HF FP32 decoding the same codes in the same windows
   (floor: HF BF16 the same way), and that window walk against HF's whole-sequence decode, a reported semantic gap.
+QWEN3_OMNI_ACCURACY_TALKER_MEDIA replaces stage 6's requests with the image and video talker stages', where HF's
+get_rope_index gives the talker's positions. Audio inside a video has no such reference: it raises on the talker there.
 """
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import io
 import json
@@ -36,6 +39,9 @@ from transformers import Qwen3OmniMoeForConditionalGeneration
 from sglang_omni.models.qwen3_omni.components.code2wav_scheduler import (
     create_code2wav_scheduler,
 )
+from sglang_omni.models.qwen3_omni.components.preprocessor import Qwen3OmniPreprocessor
+from sglang_omni.proto.request import OmniRequest, StagePayload
+from sglang_omni.utils.cpu import automatic_video_decode_threads
 from tests.test_model.qwen3_omni_component_accuracy.comparison import (
     GEOMETRIC_MEAN_BOUND,
     CaseRecord,
@@ -43,6 +49,11 @@ from tests.test_model.qwen3_omni_component_accuracy.comparison import (
     floor_violations,
     geometric_mean_ratio,
     reference_copy,
+)
+from tests.test_model.qwen3_omni_component_accuracy.media_requests import (
+    MediaQuestion,
+    load_image_media_questions,
+    load_video_media_questions,
 )
 from tests.test_model.qwen3_omni_component_accuracy.stage6_requests import (
     AudioQuestion,
@@ -64,15 +75,22 @@ CAPTURE_WAIT_S = 120
 CONFIDENT_MARGIN_FACTOR = 2.0
 
 
+def request_media(question: AudioQuestion | MediaQuestion) -> dict[str, object]:
+    if isinstance(question, MediaQuestion):
+        return question.media
+    else:
+        return {"audios": [question.audio_path]}
+
+
 def generate_with_speech(
-    server: httpx.Client, question: AudioQuestion
+    server: httpx.Client, question: AudioQuestion | MediaQuestion
 ) -> tuple[list[int], torch.Tensor]:
     response = server.post(
         "/generate",
         json={
             "messages": [{"role": "user", "content": question.question_text}],
             "metadata": {
-                "audios": [question.audio_path],
+                **request_media(question),
                 "sample_id": question.sample_id,
             },
             "sampling_params": {"temperature": 0.0, "max_new_tokens": MAX_TOKENS},
@@ -102,6 +120,60 @@ def selected_seedtts_questions() -> list[AudioQuestion]:
         for question in load_seedtts_questions()
         if question.sample_id in wanted
     ]
+
+
+def selected_media_questions() -> list[MediaQuestion]:
+    """The image and video stages' requests, when QWEN3_OMNI_ACCURACY_TALKER_MEDIA is set."""
+    if os.environ.get("QWEN3_OMNI_ACCURACY_TALKER_MEDIA") is None:
+        return []
+    else:
+        return [*load_image_media_questions(), *load_video_media_questions()]
+
+
+def media_grids(
+    preprocessor: Qwen3OmniPreprocessor, question: MediaQuestion
+) -> dict[str, torch.Tensor | None]:
+    """The grids of the request as omni's preprocessing gives them, which equal HF's (test_vision_preprocessing.py)."""
+    payload = StagePayload(
+        request_id=question.sample_id,
+        request=OmniRequest(
+            inputs={
+                "messages": [{"role": "user", "content": question.question_text}],
+                **question.media,
+            },
+            params={"max_new_tokens": MAX_TOKENS},
+        ),
+        data=None,
+    )
+    media = asyncio.run(preprocessor(payload)).data["encoder_inputs"]["image_encoder"]
+    return {
+        name: media.get(name)
+        for name in ("image_grid_thw", "video_grid_thw", "video_second_per_grid")
+    }
+
+
+def reference_positions(
+    talker: torch.nn.Module,
+    prefill_ids: torch.Tensor,
+    decode_rows: int,
+    grids: dict[str, torch.Tensor | None],
+    device: str,
+) -> torch.Tensor:
+    """HF's positions over the prefill and decode rows (modeling_qwen3_omni_moe.py compute_3d_position_ids)."""
+    prefill, delta = talker.get_rope_index(
+        prefill_ids[None],
+        grids["image_grid_thw"],
+        grids["video_grid_thw"],
+        torch.ones_like(prefill_ids)[None],
+        False,
+        None,
+        grids["video_second_per_grid"],
+    )
+    decode = (
+        torch.arange(prefill_ids.shape[0], prefill_ids.shape[0] + decode_rows)
+        + delta.flatten()[0]
+    )
+    return torch.cat([prefill, decode.expand(3, 1, -1)], dim=-1).to(device)
 
 
 def captured_records(directory: Path, sample_ids: set[str]) -> dict[str, dict]:
@@ -140,7 +212,23 @@ def test_talker_follows_reference(
     else:
         pass
     responses = {}
-    questions = [*audio_questions, *selected_seedtts_questions()]
+    media_questions = selected_media_questions()
+    questions = [
+        *([] if media_questions else audio_questions),
+        *selected_seedtts_questions(),
+        *media_questions,
+    ]
+    media_inputs = {}
+    if media_questions:
+        preprocessor = Qwen3OmniPreprocessor(
+            checkpoint_dir, video_decode_threads=automatic_video_decode_threads(1)
+        )
+        media_inputs = {
+            question.sample_id: media_grids(preprocessor, question)
+            for question in media_questions
+        }
+    else:
+        pass
     concurrency = int(os.environ.get("QWEN3_OMNI_ACCURACY_CONCURRENCY", 1))
     with (
         httpx.Client(
@@ -260,11 +348,22 @@ def test_talker_follows_reference(
                 prefill.shape[0] - 1 + frames,
                 device=component_device,
             )
+            positions = None
+            if sample_id in media_inputs:
+                positions = reference_positions(
+                    truth,
+                    record["prefill_input_ids"],
+                    decode.shape[0],
+                    media_inputs[sample_id],
+                    component_device,
+                )
+            else:
+                pass
             truth_hidden = truth.model(
-                inputs_embeds=sequence[None].float()
+                inputs_embeds=sequence[None].float(), position_ids=positions
             ).last_hidden_state[0, steps]
             floor_hidden = floor.model(
-                inputs_embeds=sequence[None].bfloat16()
+                inputs_embeds=sequence[None].bfloat16(), position_ids=positions
             ).last_hidden_state[0, steps]
             case_records.append(
                 CaseRecord(
