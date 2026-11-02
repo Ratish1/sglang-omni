@@ -11,7 +11,7 @@ WAIT_SERVER_TEXT=$6
 C=/data/tools/tasks/qwen3_omni_perf_20260923/scripts/correctness_20261102
 MODEL=Qwen/Qwen3-Omni-30B-A3B-Instruct
 # note (ratish): below the host's ephemeral range, where another process can hold a port a server asks for.
-PORT=28200
+PORT=${SERVE_PORT:-28200}
 mkdir -p $OUT
 log() { echo "$(date -u +%T) $*" >> $OUT/queue.log; }
 until grep -q "$WAIT_HF_TEXT" "$WAIT_HF_LOG" 2>/dev/null; do sleep 10; done
