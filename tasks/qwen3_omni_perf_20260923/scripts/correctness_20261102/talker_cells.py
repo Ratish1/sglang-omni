@@ -13,6 +13,7 @@ usage: python3 talker_cells.py rows ROWS.pt float32|bfloat16 SAMPLE_IDS_FILE
 """
 
 import json
+import os
 import sys
 import time
 from pathlib import Path
@@ -27,7 +28,7 @@ from benchmarks.dataset.seedtts import load_seedtts_samples
 
 MODEL = "Qwen/Qwen3-Omni-30B-A3B-Instruct"
 SEEDTTS_META = "zhaochenyang20/seed-tts-eval-arrow"
-DEVICE = "cuda:0"
+DEVICE = os.environ.get("TALKER_CELLS_DEVICE", "cuda:0")
 SPEAKER = "ethan"
 
 torch.backends.cuda.matmul.allow_tf32 = False
