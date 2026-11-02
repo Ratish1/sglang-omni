@@ -2109,9 +2109,8 @@ def test_windowed_replays_match_one_eager_decode_and_its_arena_state(
         ),
     ]
     batch = IncrementalDecodeBatch(decoder=incremental, arena=arena, slots=slots)
-    deltas, waveform = scheduler.decode_incremental_windows(
-        codes, plans, batch, runner, split
-    )
+    waveform = scheduler.decode_incremental_windows(codes, plans, batch, runner, split)
+    deltas = scheduler.incremental_row_deltas(plans, waveform, batch)
     torch.cuda.synchronize(device)
 
     assert runner.stats()["runtime"]["replays"] == 4

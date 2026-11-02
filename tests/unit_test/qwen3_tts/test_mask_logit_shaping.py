@@ -38,7 +38,7 @@ def make_scheduled_request(
     return types.SimpleNamespace(
         data=types.SimpleNamespace(
             mask_leading_silence=mask_leading_silence,
-            output_codes=[torch.zeros(16)] * generated_frames,
+            frame_count=generated_frames,
         )
     )
 

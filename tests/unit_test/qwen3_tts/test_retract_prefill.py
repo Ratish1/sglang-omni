@@ -24,6 +24,7 @@ from sglang.srt.runtime_context import get_context
 from sglang.srt.sampling.penaltylib import BatchedRepetitionPenalizer
 from sglang.srt.sampling.sampling_params import SamplingParams
 
+from sglang_omni.models.qwen3_tts.code_table import Qwen3TTSCodeTable
 from sglang_omni.models.qwen3_tts.model_runner import Qwen3TTSModelRunner
 from sglang_omni.platforms import current_platform
 from sglang_omni.scheduling.omni_scheduler import OmniScheduler
@@ -147,6 +148,15 @@ def make_sched_req(
     text_rows: torch.Tensor | None = None,
     rid: str = "req",
 ) -> SimpleNamespace:
+    rows = torch.zeros(1, prompt.shape[-1]) if text_rows is None else text_rows
+    table = Qwen3TTSCodeTable(
+        num_rows=1, max_frames=256, num_codebooks=CODEBOOKS, device="cpu"
+    )
+    row = table.acquire()
+    if frame_codes:
+        table.codes[row, : len(frame_codes)] = torch.tensor(frame_codes)
+    else:
+        pass
     return SimpleNamespace(
         request_id=rid,
         data=SimpleNamespace(
@@ -158,10 +168,12 @@ def make_sched_req(
             ),
             prompt_input_embeds=prompt,
             prefill_input_embeds=prompt,
-            output_codes=[torch.tensor(codes) for codes in frame_codes or []],
-            text_rows=(
-                torch.zeros(1, prompt.shape[-1]) if text_rows is None else text_rows
-            ),
+            code_table=table,
+            code_row=row,
+            ref_code_len=0,
+            frame_count=len(frame_codes or []),
+            text_rows=rows,
+            text_row_views=rows.unbind(0),
         ),
     )
 
@@ -174,13 +186,14 @@ def test_decode_rows_add_each_slot_feedback_to_the_text_row_of_its_position() ->
     in_text = make_sched_req(
         prompt=torch.zeros(4, HIDDEN), extend_len=0, text_rows=text_rows
     )
+    in_text.data.frame_count = 2
     past_text = make_sched_req(
         prompt=torch.zeros(6, HIDDEN), extend_len=0, text_rows=text_rows, rid="late"
     )
+    past_text.data.frame_count = 7
     forward_batch = SimpleNamespace(
         input_ids=torch.tensor([9, 9], dtype=torch.long),
         req_pool_indices=torch.tensor([2, 5]),
-        seq_lens_cpu=torch.tensor([4 + 2, 6 + 7]),
     )
 
     runner.write_feedback_buffers(forward_batch, [in_text, past_text])
@@ -342,14 +355,16 @@ def test_a_replayed_row_equals_the_row_its_decode_staged() -> None:
     )
     staged_rows = []
     for step, codes in enumerate(frame_codes):
-        sched_req.data.output_codes.append(torch.tensor(codes))
+        sched_req.data.code_table.codes[sched_req.data.code_row, step] = torch.tensor(
+            codes
+        )
+        sched_req.data.frame_count = step + 1
         runner.feedback_pool[3] = runner.model.feedback_rows_from_codes(
             torch.tensor([codes])
         )[0]
         decode_batch = SimpleNamespace(
             input_ids=torch.zeros(1, dtype=torch.long),
             req_pool_indices=torch.tensor([3]),
-            seq_lens_cpu=torch.tensor([prompt_len + step + 1]),
         )
         runner.write_feedback_buffers(decode_batch, [sched_req])
         staged_rows.append(runner.model.decode_feedback_embedding.weight[0].clone())

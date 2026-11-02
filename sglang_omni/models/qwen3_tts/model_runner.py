@@ -449,6 +449,7 @@ class Qwen3TTSModelRunner(ModelRunner):
         A prompt's last position samples generated frame zero, stored after the reference frames.
         """
         max_frames = self.code_table.max_frames
+        device = self.code_table.frames.device
         return torch.tensor(
             [
                 sched_req.data.code_row * max_frames
@@ -457,8 +458,8 @@ class Qwen3TTSModelRunner(ModelRunner):
                 for sched_req in requests
             ],
             dtype=torch.long,
-            pin_memory=is_pin_memory_available(self.device),
-        ).to(self.device, non_blocking=True)
+            pin_memory=is_pin_memory_available(device),
+        ).to(device, non_blocking=True)
 
     def write_step_frames(
         self,

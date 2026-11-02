@@ -56,6 +56,7 @@ from sglang_omni.models.qwen3_tts import engine_builder as qwen3_engine_builder
 from sglang_omni.models.qwen3_tts import request_builders as qwen3_request_builders
 from sglang_omni.models.qwen3_tts import stages as qwen3_stages
 from sglang_omni.models.qwen3_tts import streaming_vocoder as qwen3_streaming_vocoder
+from sglang_omni.models.qwen3_tts.code_table import Qwen3TTSCodeTable
 from sglang_omni.models.qwen3_tts.config import Qwen3TTSPipelineConfig
 from sglang_omni.models.qwen3_tts.engine_builder import Qwen3TtsEngineBuilder
 from sglang_omni.models.qwen3_tts.incremental_codec import (
@@ -7886,7 +7887,7 @@ def test_qwen3_tts_async_commit_propagates_process_exit(
         if commit == "initial":
             scheduler.commit_initial("request", state, plan, torch.ones(4))
         else:
-            scheduler.commit_followup("request", state, plan, torch.ones(4))
+            scheduler.commit_followups([("request", state, plan)], [torch.ones(4)])
 
 
 def test_qwen3_tts_async_followup_drops_late_audio_after_abort() -> None:
@@ -7987,16 +7988,38 @@ def test_qwen3_tts_async_initial_drops_late_audio_after_abort() -> None:
     assert payload.request_id not in scheduler.stream_states
 
 
+def request_data_with_frames(
+    payload: StagePayload,
+    frames: list[list[int]],
+    *,
+    ref_frames: list[list[int]] | None = None,
+    device: torch.device | str = "cpu",
+    **fields: object,
+) -> Qwen3TTSSGLangRequestData:
+    reference = ref_frames or []
+    table = Qwen3TTSCodeTable(
+        num_rows=1, max_frames=16, num_codebooks=len(frames[0]), device=device
+    )
+    row = table.acquire()
+    table.codes[row, : len(reference) + len(frames)] = torch.tensor(
+        reference + frames, device=device
+    )
+    return Qwen3TTSSGLangRequestData(
+        req=SimpleNamespace(output_ids=[]),
+        code_table=table,
+        code_row=row,
+        frame_count=len(frames),
+        ref_code=torch.tensor(reference, device=device) if reference else None,
+        ref_code_len=len(reference),
+        stage_payload=payload,
+        **fields,
+    )
+
+
 def test_qwen3_tts_result_adapter_keeps_code_handoff_tensor_native() -> None:
     """Avoids list serialization between the AR stage and vocoder stage."""
     payload = make_payload(inputs="target")
-    data = Qwen3TTSSGLangRequestData(
-        req=SimpleNamespace(output_ids=[]),
-        output_codes=[torch.tensor([1, 2]), torch.tensor([3, 4])],
-        ref_code=torch.tensor([[9, 9]]),
-        ref_code_len=1,
-        stage_payload=payload,
-    )
+    data = request_data_with_frames(payload, [[1, 2], [3, 4]], ref_frames=[[9, 9]])
 
     result = apply_sglang_qwen3_tts_result(payload, data)
 
@@ -8011,15 +8034,8 @@ def test_qwen3_tts_result_adapter_keeps_code_handoff_tensor_native() -> None:
 def test_qwen3_tts_result_adapter_leaves_device_codes_on_the_device() -> None:
     device = torch.device("cuda", torch.cuda.current_device())
     payload = make_payload(inputs="target")
-    data = Qwen3TTSSGLangRequestData(
-        req=SimpleNamespace(output_ids=[]),
-        output_codes=[
-            torch.tensor([1, 2], device=device),
-            torch.tensor([3, 4], device=device),
-        ],
-        ref_code=torch.tensor([[9, 9]], device=device),
-        ref_code_len=1,
-        stage_payload=payload,
+    data = request_data_with_frames(
+        payload, [[1, 2], [3, 4]], ref_frames=[[9, 9]], device=device
     )
 
     result = apply_sglang_qwen3_tts_result(payload, data)
@@ -8050,14 +8066,7 @@ def test_qwen3_tts_vocoder_reads_final_codes_finished_on_the_talker_stream() -> 
         torch.cuda._sleep(1_000_000_000)  # noqa: leading-underscore  # upstream name
         talker_result = apply_sglang_qwen3_tts_result(
             payload,
-            Qwen3TTSSGLangRequestData(
-                req=SimpleNamespace(output_ids=[]),
-                output_codes=[
-                    torch.full((2,), 7, dtype=torch.long, device=device)
-                    for _ in range(3)
-                ],
-                stage_payload=payload,
-            ),
+            request_data_with_frames(payload, [[7, 7]] * 3, device=device),
         )
 
     (vocoder_result,) = asyncio.run(scheduler.vocode_payloads([talker_result]))
@@ -8146,14 +8155,7 @@ def test_qwen3_tts_another_process_reads_complete_final_codes() -> None:
             torch.cuda._sleep(10**9)  # noqa: leading-underscore  # upstream name
             result = apply_sglang_qwen3_tts_result(
                 payload,
-                Qwen3TTSSGLangRequestData(
-                    req=SimpleNamespace(output_ids=[]),
-                    output_codes=[
-                        torch.full((2,), 7, dtype=torch.long, device=device)
-                        for _ in range(3)
-                    ],
-                    stage_payload=payload,
-                ),
+                request_data_with_frames(payload, [[7, 7]] * 3, device=device),
             )
         connection.send(stage_io.serialize_direct_cuda_ipc_payload(result))
         assert connection.poll(120)
@@ -8174,12 +8176,7 @@ def test_qwen3_tts_another_process_reads_complete_final_codes() -> None:
 def test_qwen3_tts_result_adapter_preserves_length_finish_reason() -> None:
     """A length-capped generation must be distinguishable from natural EOS."""
     payload = make_payload(inputs="target")
-    data = Qwen3TTSSGLangRequestData(
-        req=SimpleNamespace(output_ids=[]),
-        output_codes=[torch.tensor([1, 2])],
-        stage_payload=payload,
-        finish_reason="length",
-    )
+    data = request_data_with_frames(payload, [[1, 2]], finish_reason="length")
 
     result = apply_sglang_qwen3_tts_result(payload, data)
 
@@ -8188,15 +8185,12 @@ def test_qwen3_tts_result_adapter_preserves_length_finish_reason() -> None:
 
 def test_qwen3_tts_result_adapter_normalizes_scheduler_stop_reason() -> None:
     payload = make_payload(inputs="target")
-    data = Qwen3TTSSGLangRequestData(
-        req=SimpleNamespace(
-            output_ids=[],
-            finished_reason=SimpleNamespace(
-                to_json=lambda: {"type": "stop", "matched": 2150}
-            ),
+    data = request_data_with_frames(payload, [[1, 2]])
+    data.req = SimpleNamespace(
+        output_ids=[],
+        finished_reason=SimpleNamespace(
+            to_json=lambda: {"type": "stop", "matched": 2150}
         ),
-        output_codes=[torch.tensor([1, 2])],
-        stage_payload=payload,
     )
 
     result = apply_sglang_qwen3_tts_result(payload, data)
@@ -8207,12 +8201,7 @@ def test_qwen3_tts_result_adapter_normalizes_scheduler_stop_reason() -> None:
 def test_qwen3_tts_result_adapter_infers_length_at_generation_budget() -> None:
     """Without a scheduler reason, reaching the budget is still a length stop."""
     payload = make_payload(inputs="target")
-    data = Qwen3TTSSGLangRequestData(
-        req=SimpleNamespace(output_ids=[]),
-        output_codes=[torch.tensor([1, 2]), torch.tensor([3, 4])],
-        stage_payload=payload,
-        max_new_tokens=2,
-    )
+    data = request_data_with_frames(payload, [[1, 2], [3, 4]], max_new_tokens=2)
 
     result = apply_sglang_qwen3_tts_result(payload, data)
 
@@ -8232,12 +8221,7 @@ def test_qwen3_tts_vocoder_result_keeps_the_talker_finish_reason() -> None:
     payload = make_payload(inputs="target")
     talker_result = apply_sglang_qwen3_tts_result(
         payload,
-        Qwen3TTSSGLangRequestData(
-            req=SimpleNamespace(output_ids=[]),
-            output_codes=[torch.tensor([1, 2]), torch.tensor([3, 4])],
-            stage_payload=payload,
-            finish_reason="length",
-        ),
+        request_data_with_frames(payload, [[1, 2], [3, 4]], finish_reason="length"),
     )
     scheduler = Qwen3TTSStreamingVocoderScheduler(
         FakeQwen3TTSSpeechTokenizer(), device="cpu"
@@ -8253,12 +8237,7 @@ def test_qwen3_tts_streaming_vocoder_result_keeps_the_talker_finish_reason() -> 
     payload = make_payload(inputs="target", params={"stream": True})
     talker_result = apply_sglang_qwen3_tts_result(
         payload,
-        Qwen3TTSSGLangRequestData(
-            req=SimpleNamespace(output_ids=[]),
-            output_codes=[torch.tensor([1, 2]), torch.tensor([3, 4])],
-            stage_payload=payload,
-            finish_reason="length",
-        ),
+        request_data_with_frames(payload, [[1, 2], [3, 4]], finish_reason="length"),
     )
     scheduler = Qwen3TTSStreamingVocoderScheduler(
         FakeQwen3TTSSpeechTokenizer(), device="cpu", initial_chunk_frames=8
@@ -9057,13 +9036,16 @@ def test_qwen3_tts_collect_codes_excludes_semantic_eos(
         output_embeds=torch.tensor([[0.1, 0.2], [0.3, 0.4]]),
     )
     runner.feedback_pool = torch.zeros(4, 2)
+    runner.code_table = Qwen3TTSCodeTable(
+        num_rows=2, max_frames=8, num_codebooks=2, device="cpu"
+    )
     result = SimpleNamespace(
         next_token_ids=torch.tensor([7, 42], dtype=torch.long),
         logits_output=SimpleNamespace(hidden_states=torch.ones((2, 4))),
     )
     schedule_batch = SimpleNamespace(output_ids=None)
     forward_batch = SimpleNamespace(
-        forward_mode=SimpleNamespace(is_decode=lambda: True),
+        forward_mode=SimpleNamespace(is_decode=lambda: True, is_extend=lambda: False),
         positions=torch.tensor([3, 3], dtype=torch.long),
         req_pool_indices=torch.tensor([1, 2]),
     )
@@ -9071,21 +9053,29 @@ def test_qwen3_tts_collect_codes_excludes_semantic_eos(
         SimpleNamespace(
             request_id="active",
             data=Qwen3TTSSGLangRequestData(
-                req=SimpleNamespace(inflight_middle_chunks=0)
+                req=SimpleNamespace(
+                    inflight_middle_chunks=0, origin_input_ids=[0, 0, 0, 0]
+                ),
+                code_row=runner.code_table.acquire(),
             ),
         ),
         SimpleNamespace(
             request_id="eos",
             data=Qwen3TTSSGLangRequestData(
-                req=SimpleNamespace(inflight_middle_chunks=0)
+                req=SimpleNamespace(
+                    inflight_middle_chunks=0, origin_input_ids=[0, 0, 0, 0]
+                ),
+                code_row=runner.code_table.acquire(),
             ),
         ),
     ]
+    runner.decode_frame_index_bases = runner.frame_index_bases(requests)
 
     runner.collect_codes(result, forward_batch, schedule_batch, requests)
 
-    assert requests[0].data.output_codes == []
-    assert requests[1].data.output_codes == []
+    assert requests[0].data.frame_count == 0
+    assert requests[1].data.frame_count == 0
+    assert runner.code_table.codes[requests[0].data.code_row, 0].tolist() == [1, 2]
 
     runner.post_process_outputs(
         result,
@@ -9096,12 +9086,12 @@ def test_qwen3_tts_collect_codes_excludes_semantic_eos(
         },
     )
 
-    assert [chunk.tolist() for chunk in requests[0].data.output_codes] == [[1, 2]]
+    assert requests[0].data.frame_count == 1
     assert requests[0].data.latest_stream_code_chunk.tolist() == [1, 2]
-    assert requests[1].data.output_codes == []
+    assert requests[1].data.frame_count == 0
 
     runner.post_process_outputs(result, SimpleNamespace(requests=requests), {})
-    assert len(requests[0].data.output_codes) == 1
+    assert requests[0].data.frame_count == 1
 
 
 def test_qwen3_tts_steady_decode_reports_cuda_graph_ready(
