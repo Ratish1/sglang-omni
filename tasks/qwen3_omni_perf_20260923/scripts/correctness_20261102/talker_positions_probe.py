@@ -36,10 +36,9 @@ def recorded(*args, **kwargs):
 
 
 talker.get_rope_index = recorded
-original_forward = talker.forward
 
 
-def forward(*args, **kwargs):
+def before_forward(_module, _args, kwargs):
     positions = kwargs.get("position_ids")
     print(
         "talker forward: position_ids",
@@ -48,10 +47,9 @@ def forward(*args, **kwargs):
         sorted(key for key in kwargs if key in ("talker_input_ids", "audio_feature_lengths", "attention_mask")),
         flush=True,
     )
-    return original_forward(*args, **kwargs)
 
 
-talker.forward = forward
+talker.register_forward_pre_hook(before_forward, with_kwargs=True)
 sample = load_seedtts_samples("zhaochenyang20/seed-tts-eval-arrow", 1, split="en")[0]
 prompt = f'Listen to the audio above. The speaker is reading: "{sample.ref_text}". Now please read: {sample.target_text}'
 text = processor.apply_chat_template(
