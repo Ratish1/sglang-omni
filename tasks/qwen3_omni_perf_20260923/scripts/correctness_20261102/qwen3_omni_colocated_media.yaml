@@ -1,0 +1,17 @@
+# The colocated profile with room on one H200 for HF's FP32 and BF16 code2wav whole decodes of 256-token replies beside
+# the factorial cells. Budgets set KV capacity, not arithmetic, so answers do not depend on them.
+config_cls: Qwen3OmniSpeechColocatedPipelineConfig
+name: qwen3-omni-colocated-media
+model_path: Qwen/Qwen3-Omni-30B-A3B-Instruct
+
+stages:
+  image_encoder:
+    gpu_memory_fraction: 0.017
+  audio_encoder:
+    gpu_memory_fraction: 0.017
+  thinker:
+    gpu_memory_fraction: 0.30
+  talker_ar:
+    gpu_memory_fraction: 0.09
+  code2wav:
+    gpu_memory_fraction: 0.014
