@@ -216,6 +216,33 @@ def test_a_middle_prefill_chunk_writes_no_frame_even_at_a_generated_position() -
     assert table.codes[last.data.code_row, 0].tolist() == [4, 5, 6]
 
 
+@pytest.mark.accelerator
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_a_prefills_frames_write_without_waiting_for_the_predictor() -> None:
+    device = torch.device("cuda")
+    table = Qwen3TTSCodeTable(
+        num_rows=2, max_frames=MAX_FRAMES, num_codebooks=CODEBOOKS, device=device
+    )
+    runner = make_runner(
+        table, torch.ones(2, CODEBOOKS, dtype=torch.long, device=device)
+    )
+    requests = [make_request(table, "first"), make_request(table, "second")]
+    forward_batch = SimpleNamespace(
+        forward_mode=SimpleNamespace(is_extend=lambda: True)
+    )
+    positions = torch.tensor([5, 5], dtype=torch.long, device=device)
+    torch.cuda.synchronize()
+    torch.cuda._sleep(1_000_000_000)  # noqa: leading-underscore  # upstream name
+    stream = torch.cuda.current_stream(device)
+
+    runner.write_step_frames(forward_batch, requests, positions)
+    still_running = stream.query()
+    torch.cuda.synchronize()
+
+    assert still_running is False
+    assert table.codes[requests[0].data.code_row, 0].tolist() == [1, 1, 1]
+
+
 def test_a_step_counts_only_real_frames_and_opens_each_stream_once() -> None:
     table = make_table()
     runner = make_runner(table, torch.zeros(3, CODEBOOKS, dtype=torch.long))

@@ -52,6 +52,14 @@ class Qwen3TTSModelInfo(TypedDict):
     predictor_cuda_graph: PredictorGraphStats
 
 
+def stage_host_ints(values: list[int], device: torch.device) -> torch.Tensor:
+    # note (ratish): a pageable source makes the copy wait for everything queued on the
+    # stream, which here is the step's forward or predictor.
+    return torch.tensor(
+        values, dtype=torch.long, pin_memory=is_pin_memory_available(device)
+    ).to(device, non_blocking=True)
+
+
 class Qwen3TTSModelRunner(ModelRunner):
     """Runs Qwen3-TTS AR steps and stores generated codec frames per request."""
 
@@ -202,12 +210,12 @@ class Qwen3TTSModelRunner(ModelRunner):
             committed_token_ids.extend(output_ids)
         if committed_row_indices:
             committed_slots = request_slots[
-                torch.tensor(committed_row_indices, device=request_slots.device)
+                stage_host_ints(committed_row_indices, request_slots.device)
             ]
             self.repetition_scales.index_put_(
                 (
                     committed_slots,
-                    torch.tensor(committed_token_ids, device=request_slots.device),
+                    stage_host_ints(committed_token_ids, request_slots.device),
                 ),
                 self.repetition_penalties[committed_slots],
             )
@@ -388,14 +396,13 @@ class Qwen3TTSModelRunner(ModelRunner):
         if forward_batch.forward_mode.is_extend():
             # note (ratish): a middle prefill chunk's token is dropped, so it never counts as
             # generated.
-            recorded_row_indices = torch.tensor(
+            recorded_row_indices = stage_host_ints(
                 [
                     row_index
                     for row_index, sched_req in enumerate(requests)
                     if sched_req.data.req.inflight_middle_chunks <= 0
                 ],
-                dtype=torch.long,
-                device=request_slots.device,
+                request_slots.device,
             )
             recorded_slots = request_slots[recorded_row_indices]
             recorded_token_ids = next_token_ids[recorded_row_indices]
@@ -454,17 +461,15 @@ class Qwen3TTSModelRunner(ModelRunner):
         A prompt's last position samples generated frame zero, stored after the reference frames.
         """
         max_frames = self.code_table.max_frames
-        device = self.code_table.frames.device
-        return torch.tensor(
+        return stage_host_ints(
             [
                 sched_req.data.code_row * max_frames
                 + sched_req.data.ref_code_len
                 - (len(sched_req.data.req.origin_input_ids) - 1)
                 for sched_req in requests
             ],
-            dtype=torch.long,
-            pin_memory=is_pin_memory_available(device),
-        ).to(device, non_blocking=True)
+            self.code_table.frames.device,
+        )
 
     def write_step_frames(
         self,
@@ -487,9 +492,7 @@ class Qwen3TTSModelRunner(ModelRunner):
                 return
             else:
                 pass
-            recorded = torch.tensor(
-                recorded_rows, dtype=torch.long, device=output_codes.device
-            )
+            recorded = stage_host_ints(recorded_rows, output_codes.device)
             frame_indices = semantic_positions[recorded] + self.frame_index_bases(
                 [requests[row_index] for row_index in recorded_rows]
             )
