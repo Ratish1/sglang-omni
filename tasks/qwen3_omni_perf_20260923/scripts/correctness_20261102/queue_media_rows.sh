@@ -53,7 +53,8 @@ kill -TERM -- -$SERVE_PID 2>/dev/null
 for _ in $(seq 60); do kill -0 $SERVE_PID 2>/dev/null || break; sleep 5; done
 kill -KILL -- -$SERVE_PID 2>/dev/null
 log "stopped; dump dirs: $(for d in $OUT/dumps/*; do echo "$(basename $d)=$(find $d -name '*.pt' | wc -l)"; done | tr '\n' ' ')"
-BIGGEST=$(for d in $OUT/dumps/*; do echo "$(find $d -name '*.pt' | wc -l) $d"; done | sort -n | tail -1 | cut -d' ' -f2)
+# note (ratish): the talker's warmups dump more files, the thinker's long prompts more bytes.
+BIGGEST=$(du -s $OUT/dumps/* | sort -n | tail -1 | cut -f2)
 (cd $TREE && PYTHONPATH=$TREE python3 -u $C/thinker_media_rows.py compare $OUT $BIGGEST) > $OUT/compare.log 2>&1
 log "compare rc $?"
 log "media rows done"
