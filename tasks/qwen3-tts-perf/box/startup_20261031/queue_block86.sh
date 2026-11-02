@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Block 86 of 11-02: what follow-up cohort size buys streaming. Waits for block 85. #3418's final head, SeedTTS EN 1.7B
+# Block 86 of 11-02: what follow-up cohort size buys streaming. Waits for block 87. #3418's final head, SeedTTS EN 1.7B
 # Base streaming at concurrency 64, every prompt, the default server against one flag change at the same time on the
 # other card, each in both card orders: the follow-up gather window 12 and 24 ms (default 4), and the 24 ms window with
 # bucket 16 (default 8). Speed only; rows get one frame per engine step, so a longer window lines their decodes up.
@@ -12,7 +12,7 @@ K=$T/tasks/qwen3-tts-perf/box
 W=$D/block86
 L=$W/queue.log
 mkdir -p $W
-until grep -q "queue block85 done" $D/block85/queue.log; do sleep 5; done
+until grep -q "queue block87 done" $D/block87/queue.log 2> /dev/null; do sleep 5; done
 echo "tree $PR $(git -C $PR rev-parse HEAD HEAD:sglang_omni | tr '\n' ' ')" >> $L
 echo "queue block86 start $(date +%T) kit $(git -C $T rev-parse HEAD)" >> $L
 
