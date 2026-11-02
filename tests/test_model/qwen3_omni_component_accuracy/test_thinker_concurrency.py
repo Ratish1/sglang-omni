@@ -541,7 +541,8 @@ def test_thinker_follows_reference_under_load(
         f"omni departures HF BF16 shares {json.dumps(report['omni_departures_hf_bf16_shares'])}"
     )
     floor_margin = report["all"]["floor"]["departure_margin_max"]
-    # note (ratish): FP32's cached and uncached forwards round differently: 8 of 9,278 steps depart, up to margin 0.095.
+    # note (ratish): FP32 repeats a forward bit for bit but its rows change with the forward's length, from layer 0, and
+    # MoE top-k flips amplify that (fp32_shape_bisect.py): 8 of 9,278 cached steps depart from uncached, up to margin 0.095.
     assert (
         report["all"]["truth"]["departure_margin_max"] <= floor_margin
     ), "the reference's own teacher forcing departs as widely as its BF16 copy"
