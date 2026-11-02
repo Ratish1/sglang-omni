@@ -24,6 +24,7 @@ import io
 import json
 import os
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import httpx
@@ -43,7 +44,10 @@ from tests.test_model.qwen3_omni_component_accuracy.comparison import (
     geometric_mean_ratio,
     reference_copy,
 )
-from tests.test_model.qwen3_omni_component_accuracy.stage6_requests import AudioQuestion
+from tests.test_model.qwen3_omni_component_accuracy.stage6_requests import (
+    AudioQuestion,
+    load_seedtts_questions,
+)
 from tests.test_model.qwen3_omni_component_accuracy.test_code2wav import (
     best_alignment,
     window_walk,
@@ -85,6 +89,21 @@ def generate_with_speech(
     return tokens, torch.from_numpy(audio)
 
 
+def selected_seedtts_questions() -> list[AudioQuestion]:
+    """The voice-clone requests QWEN3_OMNI_ACCURACY_SEEDTTS_IDS names, a file of sample ids, if it is set."""
+    ids_path = os.environ.get("QWEN3_OMNI_ACCURACY_SEEDTTS_IDS")
+    if ids_path is None:
+        return []
+    else:
+        pass
+    wanted = set(Path(ids_path).read_text().split())
+    return [
+        question
+        for question in load_seedtts_questions()
+        if question.sample_id in wanted
+    ]
+
+
 def captured_records(directory: Path, sample_ids: set[str]) -> dict[str, dict]:
     deadline = time.monotonic() + CAPTURE_WAIT_S
     records: dict[str, dict] = {}
@@ -121,11 +140,19 @@ def test_talker_follows_reference(
     else:
         pass
     responses = {}
-    with httpx.Client(
-        base_url=server_url, timeout=REQUEST_TIMEOUT_S, trust_env=False
-    ) as server:
-        for question in audio_questions:
-            responses[question.sample_id] = generate_with_speech(server, question)
+    questions = [*audio_questions, *selected_seedtts_questions()]
+    concurrency = int(os.environ.get("QWEN3_OMNI_ACCURACY_CONCURRENCY", 1))
+    with (
+        httpx.Client(
+            base_url=server_url, timeout=REQUEST_TIMEOUT_S, trust_env=False
+        ) as server,
+        ThreadPoolExecutor(max_workers=concurrency) as pool,
+    ):
+        for question, response in zip(
+            questions,
+            pool.map(lambda item: generate_with_speech(server, item), questions),
+        ):
+            responses[question.sample_id] = response
     records = captured_records(Path(capture_dir), set(responses))
     assert set(records) == set(
         responses
