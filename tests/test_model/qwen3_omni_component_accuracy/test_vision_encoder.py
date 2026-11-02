@@ -131,6 +131,17 @@ def test_vision_encoder_follows_reference(
         .eval()
     )
     legacy_interpolation.load_state_dict(truth.state_dict())
+    legacy_interpolation_bf16 = (
+        Qwen3OmniMoeVisionEncoderCompat._from_config(  # noqa: leading-underscore  # Transformers construction API
+            truth.config
+        )
+        .to(device=component_device, dtype=torch.bfloat16)
+        .eval()
+    )
+    legacy_interpolation_bf16.load_state_dict(floor.state_dict())
+    legacy_interpolation_bf16.rotary_pos_emb = type(floor.rotary_pos_emb)(
+        truth.config
+    ).to(component_device)
     served = Qwen3OmniImageEncoder(checkpoint_dir, device=component_device)
 
     served_state = dict(served.visual.state_dict())
@@ -151,6 +162,7 @@ def test_vision_encoder_follows_reference(
         reference = visual_outputs(truth, pixels, grid)
         floor_outputs = visual_outputs(floor, pixels, grid)
         legacy_outputs = visual_outputs(legacy_interpolation, pixels, grid)
+        legacy_bf16_outputs = visual_outputs(legacy_interpolation_bf16, pixels, grid)
         with torch.inference_mode():
             if modality == "image":
                 encoded = served(pixel_values=pixels, image_grid_thw=grid)
@@ -164,8 +176,20 @@ def test_vision_encoder_follows_reference(
                     encoded["video_embeds"],
                     *encoded["deepstack_visual_embeds_video"],
                 ]
-        for name, omni_output, floor_output, legacy_output, truth_output in zip(
-            output_names, omni_outputs, floor_outputs, legacy_outputs, reference
+        for (
+            name,
+            omni_output,
+            floor_output,
+            legacy_output,
+            legacy_bf16_output,
+            truth_output,
+        ) in zip(
+            output_names,
+            omni_outputs,
+            floor_outputs,
+            legacy_outputs,
+            legacy_bf16_outputs,
+            reference,
         ):
             records.append(
                 CaseRecord(
@@ -179,6 +203,12 @@ def test_vision_encoder_follows_reference(
                     "case": f"{case}/{name}",
                     "legacy_interpolation_fp32_relative_l2": deviation(
                         legacy_output, truth_output
+                    ).relative_l2,
+                    "legacy_interpolation_bf16_relative_l2": deviation(
+                        legacy_bf16_output, truth_output
+                    ).relative_l2,
+                    "omni_against_legacy_interpolation_bf16_relative_l2": deviation(
+                        omni_output, legacy_bf16_output
                     ).relative_l2,
                 }
             )
