@@ -9,8 +9,10 @@ import json
 import os
 import statistics
 import tempfile
+import time
 
 import torch
+from torch._dynamo.utils import counters
 from torch.profiler import ProfilerActivity, profile
 
 from sglang_omni.models.qwen3_tts.stages import create_vocoder_executor
@@ -79,15 +81,25 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", default="Qwen/Qwen3-TTS-12Hz-1.7B-Base")
     parser.add_argument("--out", required=True)
+    parser.add_argument("--all-widths", action="store_true", help="every width of warm0 and window, not only 8")
     args = parser.parse_args()
+    built_from = time.perf_counter()
     scheduler = create_vocoder_executor(args.model, gpu_id=0, dtype="bfloat16", shares_engine_speech_tokenizer=True)
+    build_s = time.perf_counter() - built_from
+    only = None if args.all_widths else 8
     runners = [
         ("cold", scheduler.initial_incremental_decode_graphs, None),
-        ("warm0", scheduler.followup_incremental_graph_holders[0], 8),
-        ("window", scheduler.initial_window_decode_graphs, 8),
+        ("warm0", scheduler.followup_incremental_graph_holders[0], only),
+        ("window", scheduler.initial_window_decode_graphs, only),
     ]
     generator = torch.Generator(device="cpu").manual_seed(20261102)
-    result = {"compiled_shapes": sorted(scheduler.incremental_decoder.compiled_shapes), "keys": {}}
+    result = {
+        "build_s": round(build_s, 2),
+        "programs": counters["stats"]["unique_graphs"],
+        "compiled_shapes": sorted(scheduler.incremental_decoder.compiled_shapes),
+        "keys": {},
+    }
+    waveforms = {}
     for name, runner, only_width in runners:
         for key in sorted(runner.graphs, key=lambda item: (item.fresh_frames, item.batch_bucket)):
             if only_width is not None and key.fresh_frames != only_width:
@@ -98,15 +110,20 @@ def main():
             entry.static_codes.copy_(torch.randint(0, 1000, tuple(entry.static_codes.shape), generator=generator))
             entry.static_index.copy_(torch.arange(key.batch_bucket))
             zero_arena(scheduler.codec_arena)
+            entry.graph.replay()
+            torch.cuda.synchronize()
+            label = f"{name}:{key.fresh_frames}x{key.batch_bucket}"
+            waveforms[label] = entry.waveform.detach().float().cpu().clone()
             milliseconds = replay_ms(entry.graph, 200)
             zero_arena(scheduler.codec_arena)
-            result["keys"][f"{name}:{key.fresh_frames}x{key.batch_bucket}"] = {
+            result["keys"][label] = {
                 "ms": round(milliseconds, 4),
                 "kernels": kernel_table(entry.graph),
             }
-            print(f"{name}:{key.fresh_frames}x{key.batch_bucket} {milliseconds:.4f} ms", flush=True)
+            print(f"{label} {milliseconds:.4f} ms", flush=True)
     with open(f"{args.out}.json", "w") as handle:
         json.dump(result, handle)
+    torch.save(waveforms, f"{args.out}.pt")
     os._exit(0)
 
 
