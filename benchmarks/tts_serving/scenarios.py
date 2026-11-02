@@ -913,20 +913,14 @@ def _scenario_type_enabled(scenario_type: str, endpoint_set: set[str]) -> bool:
 
 
 def _base_payload(spec: BenchmarkSpec, text: str) -> dict[str, Any]:
-    payload: dict[str, Any] = {
+    return {
+        **spec.params.reference_fields(),
         "model": spec.model_name,
         "input": text,
         "voice": "default",
         "response_format": "wav",
         "speed": 1.0,
     }
-    if spec.params.reference_every_request:
-        payload["task_type"] = "Base"
-        payload["ref_audio"] = spec.params.file_ref_audio
-        payload["ref_text"] = spec.params.file_ref_text
-    else:
-        pass
-    return payload
 
 
 def _scenario_id(stage: LoadStage, category: str, index: int) -> str:
@@ -1680,6 +1674,7 @@ def _batch_request(
             item = {"input": "", "response_format": "bogus"}
         items.append(item)
     payload = {
+        **spec.params.reference_fields(),
         "model": spec.model_name,
         "voice": "default",
         "response_format": "wav",
@@ -2356,6 +2351,7 @@ def _websocket_normal(index: int, spec: BenchmarkSpec, stage: LoadStage) -> Scen
                 "action": "send_json",
                 "payload": {
                     "type": "session.config",
+                    **spec.params.reference_fields(),
                     "model": spec.model_name,
                     "voice": "default",
                     "response_format": "pcm",
@@ -2390,6 +2386,7 @@ def _websocket_multi_sentence(
                 "action": "send_json",
                 "payload": {
                     "type": "session.config",
+                    **spec.params.reference_fields(),
                     "model": spec.model_name,
                     "voice": "default",
                     "response_format": "pcm",
@@ -2432,6 +2429,7 @@ def _websocket_stream_audio(
                 "action": "send_json",
                 "payload": {
                     "type": "session.config",
+                    **spec.params.reference_fields(),
                     "model": spec.model_name,
                     "voice": "default",
                     "response_format": "pcm",
@@ -2475,6 +2473,7 @@ def _websocket_clause_split(
                 "action": "send_json",
                 "payload": {
                     "type": "session.config",
+                    **spec.params.reference_fields(),
                     "model": spec.model_name,
                     "voice": "default",
                     "response_format": "pcm",
@@ -2575,6 +2574,7 @@ def _websocket_disconnect(
                 "action": "send_json",
                 "payload": {
                     "type": "session.config",
+                    **spec.params.reference_fields(),
                     "model": spec.model_name,
                     "voice": "default",
                     "response_format": "pcm",

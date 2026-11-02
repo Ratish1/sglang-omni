@@ -140,13 +140,23 @@ def _run_openai_speech_create(
 
 
 def _sdk_request(payload: dict[str, Any], model_name: str) -> dict[str, Any]:
-    return {
+    request: dict[str, Any] = {
         "model": str(payload.get("model") or model_name),
         "input": str(payload.get("input") or ""),
         "voice": str(payload.get("voice") or "default"),
         "response_format": str(payload.get("response_format") or "wav"),
         "speed": float(payload.get("speed") or 1.0),
     }
+    reference = {
+        key: payload[key]
+        for key in ("task_type", "ref_audio", "ref_text")
+        if key in payload
+    }
+    if reference:
+        request["extra_body"] = reference
+    else:
+        pass
+    return request
 
 
 def _scenario_response_format(scenario: Scenario) -> str:

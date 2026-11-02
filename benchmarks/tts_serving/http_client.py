@@ -293,6 +293,7 @@ async def _run_speech_liveness_probe(
     result: ScenarioResult,
 ) -> None:
     payload = {
+        **spec.params.reference_fields(),
         "model": spec.model_name,
         "input": "Post-disconnect liveness probe.",
         "voice": "default",

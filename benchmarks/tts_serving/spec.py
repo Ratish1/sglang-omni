@@ -443,6 +443,18 @@ class BenchmarkParams:
     provider_label: str | None = None
     implementation_label: str | None = None
 
+    def reference_fields(self) -> dict[str, str]:
+        """What a request carries for a checkpoint with no default voice, else nothing."""
+        if not self.reference_every_request:
+            return {}
+        else:
+            pass
+        return {
+            "task_type": "Base",
+            "ref_audio": self.file_ref_audio,
+            "ref_text": self.file_ref_text,
+        }
+
     @classmethod
     def from_obj(cls, obj: Any) -> BenchmarkParams:
         if obj is None:

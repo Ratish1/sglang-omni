@@ -714,6 +714,7 @@ def _default_script(spec: BenchmarkSpec) -> list[dict]:
             "action": "send_json",
             "payload": {
                 "type": "session.config",
+                **spec.params.reference_fields(),
                 "model": spec.model_name,
                 "voice": "default",
                 "response_format": "pcm",
