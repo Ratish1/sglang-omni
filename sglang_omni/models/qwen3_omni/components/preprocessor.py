@@ -19,6 +19,8 @@ import torch
 import xxhash
 from sglang.srt.utils.hf_transformers.common import get_context_length
 from tokenizers.normalizers import NFC
+from PIL import Image
+from qwen_vl_utils import vision_process as qwen_vision
 from transformers import AutoConfig, BatchFeature, PreTrainedTokenizerBase
 from transformers.models.qwen3_omni_moe.processing_qwen3_omni_moe import (
     Qwen3OmniMoeProcessor,
@@ -82,6 +84,18 @@ _TRAIN_INPUT_TENSOR_NAMES = frozenset(
         **build_video_mm_inputs({}),
     }
 )
+
+
+def reference_prepared_image(image: Image.Image) -> Image.Image:
+    """The image the model card's loader gives the HF processor, whose own resize then runs on it:
+    alpha composited over white, resized to multiples of the loader's merged 14-pixel patch."""
+    if image.mode == "RGBA":
+        prepared = Image.new("RGB", image.size, (255, 255, 255))
+        prepared.paste(image, mask=image.getchannel("A"))
+    else:
+        prepared = image.convert("RGB")
+    height, width = qwen_vision.smart_resize(prepared.height, prepared.width)
+    return prepared.resize((width, height))
 
 
 def resolve_local_model_dir(model_path: str) -> str:
@@ -824,7 +838,9 @@ class Qwen3OmniPreprocessor:
             connection = ResourceHTTPConnection()
             connector = MultiModalResourceConnector(connection=connection)
             loaders = [
-                ensure_image_list_async(request_images, media_connector=connector),
+                ensure_image_list_async(
+                    request_images, image_mode=None, media_connector=connector
+                ),
                 ensure_video_list_async(
                     request_videos,
                     fps=resolved_video_fps,
@@ -860,6 +876,9 @@ class Qwen3OmniPreprocessor:
                 images, videos_result, audios_result = await asyncio.gather(*tasks)
             finally:
                 await await_media_cleanup(cleanup())
+            images = await asyncio.to_thread(
+                lambda: [reference_prepared_image(image) for image in images]
+            )
             videos, sampled_video_fps, extracted_audio_from_video = videos_result
 
             audios, audio_from_video = merge_extracted_video_audio(

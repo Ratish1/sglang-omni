@@ -671,14 +671,14 @@ class MultiModalResourceConnector:
         self,
         image_url: str,
         *,
-        image_mode: str = "RGB",
+        image_mode: str | None = "RGB",
         timeout: float = 30.0,
     ) -> Image.Image:
         """Asynchronously load image from a URL.
 
         Args:
             image_url: URL to the image file.
-            image_mode: Target image mode (default: "RGB").
+            image_mode: Target image mode (default: "RGB"); None keeps the stored mode.
             timeout: Timeout for HTTP requests in seconds.
 
         Returns:

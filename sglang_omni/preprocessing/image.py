@@ -19,19 +19,29 @@ from .cache_key import compute_media_cache_key
 from .resource_connector import await_media_cleanup
 
 
-def load_image_path(path: str | Path) -> Image.Image:
-    """Load an image from disk as RGB."""
-    return Image.open(path).convert("RGB")
+def open_image(source: str | Path | BytesIO, image_mode: str | None) -> Image.Image:
+    """Decode an image into image_mode, or into the mode it was stored in when image_mode is None."""
+    image = Image.open(source)
+    if image_mode is None:
+        image.load()
+        return image
+    else:
+        return image.convert(image_mode)
+
+
+def load_image_path(path: str | Path, image_mode: str | None = "RGB") -> Image.Image:
+    """Load an image from disk, as RGB by default."""
+    return open_image(path, image_mode)
 
 
 class ImageMediaIO(MediaIO[Image.Image]):
     """MediaIO implementation for image files."""
 
-    def __init__(self, *, image_mode: str = "RGB", **kwargs) -> None:
+    def __init__(self, *, image_mode: str | None = "RGB", **kwargs) -> None:
         """Initialize ImageMediaIO.
 
         Args:
-            image_mode: Target image mode (default: "RGB").
+            image_mode: Target image mode (default: "RGB"); None keeps the stored mode.
             **kwargs: Additional arguments (for compatibility with MultiModalResourceConnector).
         """
         super().__init__()
@@ -41,7 +51,7 @@ class ImageMediaIO(MediaIO[Image.Image]):
     def load_bytes(self, data: bytes) -> Image.Image:
         """Load image from raw bytes."""
         try:
-            return Image.open(BytesIO(data)).convert(self.image_mode)
+            return open_image(BytesIO(data), self.image_mode)
         except UnidentifiedImageError as e:
             raise ValueError(f"Failed to identify image: {e}") from e
 
@@ -56,7 +66,7 @@ class ImageMediaIO(MediaIO[Image.Image]):
     def load_file(self, filepath: Path) -> Image.Image:
         """Load image from a local file path."""
         try:
-            return Image.open(filepath).convert(self.image_mode)
+            return open_image(filepath, self.image_mode)
         except UnidentifiedImageError as e:
             raise ValueError(f"Failed to identify image: {e}") from e
 
@@ -73,14 +83,14 @@ def compute_image_cache_key(images: object) -> str | None:
 async def ensure_image_list_async(
     images: object,
     *,
-    image_mode: str = "RGB",
+    image_mode: str | None = "RGB",
     media_connector: MultiModalResourceConnector | None = None,
 ) -> list[object]:
     """Asynchronously normalize image inputs into a list.
 
     Args:
         images: Image input(s) - can be a path, URL, PIL Image, or list.
-        image_mode: Target image mode (default: "RGB").
+        image_mode: Target image mode (default: "RGB"); None keeps the stored mode.
         media_connector: Optional MultiModalResourceConnector instance. If None, uses
                         the global connector.
 
@@ -121,7 +131,7 @@ async def ensure_image_list_async(
                     normalized.append(None)  # note (Teery): Placeholder
                 else:
                     path = media_connector.local_media_path(item)
-                    normalized.append(load_image_path(path))
+                    normalized.append(load_image_path(path, image_mode))
             else:
                 # note (Teery): Already processed (PIL Image, etc.)
                 normalized.append(item)

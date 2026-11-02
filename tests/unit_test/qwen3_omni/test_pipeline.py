@@ -567,6 +567,46 @@ def test_qwen_preprocessor_passes_embedded_video_audio_to_processor(
     assert state.mm_inputs["video"].get("use_audio_in_video") is expected_video_audio
 
 
+def test_reference_prepared_image_composites_alpha_over_white() -> None:
+    from sglang_omni.models.qwen3_omni.components.preprocessor import (
+        reference_prepared_image,
+    )
+
+    transparent = Image.new("RGBA", (56, 56), (10, 20, 30, 0))
+    opaque = Image.new("RGBA", (56, 56), (10, 20, 30, 255))
+
+    assert reference_prepared_image(transparent).getpixel((0, 0)) == (255, 255, 255)
+    assert reference_prepared_image(opaque).getpixel((0, 0)) == (10, 20, 30)
+    assert reference_prepared_image(opaque).mode == "RGB"
+
+
+@pytest.mark.parametrize(
+    ("size", "expected"),
+    [((750, 1000), (756, 1008)), ((56, 56), (56, 56)), ((10, 10), (56, 56))],
+)
+def test_reference_prepared_image_resizes_to_multiples_of_the_merged_patch(
+    size, expected
+) -> None:
+    from sglang_omni.models.qwen3_omni.components.preprocessor import (
+        reference_prepared_image,
+    )
+
+    assert reference_prepared_image(Image.new("RGB", size)).size == expected
+
+
+def test_stored_mode_survives_only_when_the_loader_is_asked(tmp_path) -> None:
+    from sglang_omni.preprocessing.image import ImageMediaIO, load_image_path
+
+    path = tmp_path / "alpha.png"
+    Image.new("RGBA", (4, 4), (1, 2, 3, 4)).save(path)
+
+    assert load_image_path(path).mode == "RGB"
+    assert load_image_path(path, None).mode == "RGBA"
+    assert ImageMediaIO().load_file(path).mode == "RGB"
+    assert ImageMediaIO(image_mode=None).load_file(path).mode == "RGBA"
+    assert ImageMediaIO(image_mode=None).load_bytes(path.read_bytes()).mode == "RGBA"
+
+
 def test_qwen_accepts_miles_audio_video_processor_tensors() -> None:
     from sglang_omni.client import Client
     from sglang_omni.models.qwen3_omni.components import (
