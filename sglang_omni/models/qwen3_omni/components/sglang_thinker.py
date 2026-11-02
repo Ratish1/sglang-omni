@@ -31,7 +31,11 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader.weight_utils import default_weight_loader
-from sglang.srt.models.qwen3_moe import Qwen3MoeDecoderLayer, Qwen3MoeSparseMoeBlock
+from sglang.srt.models.qwen3_moe import (
+    Qwen3MoeAttention,
+    Qwen3MoeDecoderLayer,
+    Qwen3MoeSparseMoeBlock,
+)
 from sglang.srt.models.qwen3_vl_moe import Qwen3MoeLLMModel, load_fused_expert_weights
 from sglang.srt.runtime_context import get_exec, max_prefill_buffer_tokens
 from sglang.srt.utils import add_prefix, logger
@@ -40,10 +44,18 @@ from transformers import PretrainedConfig
 from sglang_omni.models.qwen3_omni.components.thinker_fused_rope import (
     install_thinker_fused_rope,
 )
+from sglang_omni.models.qwen3_omni.components.thinker_kernels import (
+    norm_rope_store,
+    supports_norm_rope_store,
+)
 from sglang_omni.quantization import get_weight_preprocessor
 from sglang_omni.sampling.sampler_compile import (
     SamplerCompileForms,
     compile_sampler_functions,
+)
+from sglang_omni.vendor.sglang.models import (
+    create_fused_set_kv_buffer_arg,
+    enable_fused_set_kv_buffer,
 )
 
 
@@ -98,6 +110,58 @@ class PaddedRowsTopK(nn.Module):
         return self.topk.empty_topk_output(device, layer_id=layer_id)
 
 
+class ThinkerDecodeAttention(Qwen3MoeAttention):
+    """Qwen3-MoE attention whose decode q and k norm, rotation and KV store are one kernel."""
+
+    def runs_decode_kernel(
+        self, forward_batch: ForwardBatch, dtype: torch.dtype
+    ) -> bool:
+        return (
+            forward_batch.forward_mode.is_decode()
+            and dtype == torch.bfloat16
+            and enable_fused_set_kv_buffer(forward_batch)
+        )
+
+    def apply_qk_norm_rope(
+        self, qkv: torch.Tensor, positions: torch.Tensor, forward_batch: ForwardBatch
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        if not self.runs_decode_kernel(forward_batch, qkv.dtype):
+            return super().apply_qk_norm_rope(qkv, positions, forward_batch)
+        else:
+            pass
+        # note (ratish): the rotary rewrites its table to the query dtype on first use;
+        # the kernel reads the same bf16 table the MRoPE kernel would.
+        self.rotary_emb._match_cos_sin_cache_dtype(qkv)  # noqa: leading-underscore
+        kv_store = create_fused_set_kv_buffer_arg(
+            value=qkv[:, self.q_size + self.kv_size :],
+            layer=self.attn,
+            forward_batch=forward_batch,
+        )
+        return norm_rope_store(qkv, positions, self, kv_store)
+
+    def forward_core(
+        self,
+        intermediate_state: tuple[
+            torch.Tensor,
+            ForwardBatch,
+            tuple[torch.Tensor, torch.Tensor, torch.Tensor, ForwardBatch] | None,
+        ],
+    ) -> torch.Tensor:
+        hidden_states, _, inner_state = intermediate_state
+        if inner_state is None:
+            return hidden_states
+        else:
+            pass
+        q, k, v, forward_batch = inner_state
+        if not self.runs_decode_kernel(forward_batch, q.dtype):
+            return super().forward_core(intermediate_state)
+        else:
+            pass
+        attention_output = self.attn(q, k, v, forward_batch, save_kv_cache=False)
+        output, _ = self.o_proj(attention_output)
+        return output
+
+
 class Qwen3OmniThinkerForCausalLM(nn.Module):
     """Qwen3-Omni thinker text model without duplicated audio/vision towers."""
 
@@ -135,6 +199,13 @@ class Qwen3OmniThinkerForCausalLM(nn.Module):
             )
         self.logits_processor = LogitsProcessor(self.config)
         self.fused_rope_gate = install_thinker_fused_rope(self.model)
+        for layer in self.model.layers:
+            if supports_norm_rope_store(layer.self_attn):
+                # note (ratish): a method-only subclass, so the built modules, their
+                # weight names and loading stay as sglang made them.
+                layer.self_attn.__class__ = ThinkerDecodeAttention
+            else:
+                pass
         # note (ratish): a quantized MoE can share one activation scale across rows,
         # so a padded row's experts could change the live rows' rounding.
         self.decode_live_rows: DecodeLiveRows | None = None
