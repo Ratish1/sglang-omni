@@ -41,11 +41,21 @@ def spatial_positions(position_ids: torch.Tensor) -> torch.Tensor:
 
 def check(thinker: torch.nn.Module, request, eos_token_id: int) -> dict:
     positions: list[torch.Tensor] = []
+    layer_rows: list[list[torch.Tensor]] = [[] for _ in thinker.model.layers]
+    kept_rows = [slice(-1, None)]
 
     def record(_module, _args, kwargs) -> None:
         positions.append(spatial_positions(kwargs["position_ids"]))
 
-    hook = thinker.model.register_forward_pre_hook(record, with_kwargs=True)
+    def keep_layer_rows(index: int):
+        def keep(_module, _args, output) -> None:
+            hidden = output if isinstance(output, torch.Tensor) else output[0]
+            layer_rows[index].append(hidden[0, kept_rows[0]].float().cpu())
+
+        return keep
+
+    hooks = [thinker.model.register_forward_pre_hook(record, with_kwargs=True)]
+    hooks += [layer.register_forward_hook(keep_layer_rows(index)) for index, layer in enumerate(thinker.model.layers)]
     inputs = request.inputs
     prompt_length = inputs["input_ids"].shape[1]
     with torch.inference_mode():
@@ -57,36 +67,39 @@ def check(thinker: torch.nn.Module, request, eos_token_id: int) -> dict:
             eos_token_id=eos_token_id,
             do_sample=False,
             output_logits=True,
-            output_hidden_states=True,
             return_dict_in_generate=True,
         )
         tokens = cached.sequences[0, prompt_length:]
         cached_positions = positions[:]
         positions.clear()
+        cached_layers = [rows[:] for rows in layer_rows]
+        for rows in layer_rows:
+            rows.clear()
+        start = prompt_length - 1
+        kept_rows[0] = slice(start, start + tokens.shape[0])
         full_ids = torch.cat([inputs["input_ids"][0].to(thinker.device), tokens])
         uncached = thinker(
             input_ids=full_ids[None],
             attention_mask=torch.ones_like(full_ids)[None],
             **device_media(inputs, thinker),
             use_cache=False,
-            output_hidden_states=True,
         )
-    hook.remove()
+    for hook in hooks:
+        hook.remove()
     uncached_positions = positions[0]
     position_steps = []
     for step, step_positions in enumerate(cached_positions):
         row_start = 0 if step == 0 else prompt_length + step - 1
         rows = step_positions.shape[-1]
         position_steps.append(bool(torch.equal(step_positions, uncached_positions[..., row_start : row_start + rows])))
-    start = prompt_length - 1
     cached_logits = torch.stack([step[0].float() for step in cached.logits])
     uncached_logits = uncached.logits[0, start : start + tokens.shape[0]].float()
     steps = [match(cached_logits[step], uncached_logits[step]) for step in range(tokens.shape[0])]
     departures = (uncached_logits.argmax(dim=-1) != tokens).nonzero().flatten().tolist()
     worst = departures[0] if departures else min(range(len(steps)), key=steps.__getitem__)
     layers = [
-        match(cached_layer[0, -1], uncached_layer[0, start + worst])
-        for cached_layer, uncached_layer in zip(cached.hidden_states[worst], uncached.hidden_states)
+        match(cached_rows[worst][0], uncached_rows[0][worst])
+        for cached_rows, uncached_rows in zip(cached_layers, layer_rows)
     ]
     top2 = uncached_logits.topk(2, dim=-1).values
     return {
@@ -133,7 +146,8 @@ def main() -> None:
             f"{record['positions_equal_all_steps']}, logits match mean {record['logits_match_mean']:.5f} min {record['logits_match_min']:.5f} "
             f"first {record['logits_match_first_step']:.5f}, departures {record['departures']} margins "
             f"{[round(margin, 3) for margin in record['departure_margins']]}, at step {record['worst_step']} layers "
-            f"0 {layers[0]:.5f} 12 {layers[12]:.5f} 24 {layers[24]:.5f} 36 {layers[36]:.5f} last {layers[-1]:.5f}",
+            f"0 {layers[0]:.5f} 12 {layers[12]:.5f} 24 {layers[24]:.5f} 36 {layers[36]:.5f} last {layers[-1]:.5f}, "
+            f"lowest {min(layers):.5f} at {layers.index(min(layers))}",
             flush=True,
         )
         Path(sys.argv[2]).write_text(json.dumps(records, indent=1))
