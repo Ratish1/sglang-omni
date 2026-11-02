@@ -24,7 +24,6 @@ def rms(samples: np.ndarray) -> float:
 
 
 def test_band_limited_resampling_drops_a_tone_above_the_target_nyquist() -> None:
-    # 10 kHz is above 16 kHz's 8 kHz Nyquist; without a filter it folds to 6 kHz.
     above = tone(10000)
 
     assert rms(audio.resample_linear(above, SOURCE_RATE, TARGET_RATE)) > 0.1
