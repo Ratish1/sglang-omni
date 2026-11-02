@@ -2,12 +2,13 @@ set -u
 # 11-02 a branch against its base: one server per arm from its own tree, same time on cards 0 and 1, then swapped, on the
 # streamed full SeedTTS EN corpus at each load, request events on, each boot scored on its card; then the seeded corpus at
 # c1, same time, for byte identity. Usage: queue_tree_pair.sh OUT BASE_TREE ARM_TREE "16 64 1"
+# ORDERS picks the card orders ("0 1" by default), SEEDED=0 skips the identity pass, PORT sets the first port.
 OUT=$1
 BASE_TREE=$2
 ARM_TREE=$3
 LOADS=$4
 S=/data/tools/tasks/qwen3_omni_perf_20260923/scripts
-PORT=17000
+PORT=${PORT:-17000}
 mkdir -p $OUT
 log() { echo "$(date -u +%T) $*" >> $OUT/queue.log; }
 listening() {
@@ -35,7 +36,7 @@ wait_round() {
 }
 log "pair start: base $(git -C $BASE_TREE rev-parse --short HEAD) $(git -C $BASE_TREE rev-parse HEAD:sglang_omni | cut -c1-8); arm $(git -C $ARM_TREE rev-parse --short HEAD) $(git -C $ARM_TREE rev-parse HEAD:sglang_omni | cut -c1-8); tools $(git -C /data/tools rev-parse --short HEAD)"
 for conc in $LOADS; do
-  for order in 0 1; do
+  for order in ${ORDERS:-0 1}; do
     round=c${conc}_o${order}
     mkdir -p $OUT/$round
     PORT=$(free_port $PORT)
@@ -49,6 +50,12 @@ for conc in $LOADS; do
     PORT=$((PORT + 1000))
   done
 done
+if [ "${SEEDED:-1}" = 0 ]; then
+  log "pair done"
+  exit 0
+else
+  :
+fi
 round=seeded
 mkdir -p $OUT/$round
 PORT=$(free_port $PORT)
