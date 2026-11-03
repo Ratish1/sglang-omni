@@ -12,6 +12,7 @@ from typing import Callable, Iterator
 
 import pytest
 
+from sglang_omni.profiler.event_recorder import get_active_stage, set_active_stage
 from sglang_omni.scheduling.message import IncomingMessage
 from sglang_omni.scheduling.threaded_simple_scheduler import (
     _ABORTED_REQUEST_ID_LIMIT,
@@ -44,6 +45,36 @@ def wait_until(predicate: Callable[[], bool], timeout: float = 5.0) -> None:
         if time.monotonic() >= deadline:
             pytest.fail("condition was not met before timeout")
         time.sleep(0.01)
+
+
+def test_overlapping_requests_see_the_stage_bound_to_the_scheduler_thread() -> None:
+    both_running = threading.Barrier(2, timeout=3)
+
+    async def compute(payload: str) -> str | None:
+        del payload
+        both_running.wait()
+        return get_active_stage()
+
+    scheduler = ThreadedSimpleScheduler(compute, max_concurrency=2)
+
+    def start_on_bound_thread() -> None:
+        set_active_stage("preprocessing")
+        scheduler.start()
+
+    thread = threading.Thread(target=start_on_bound_thread, daemon=True)
+    thread.start()
+    try:
+        scheduler.inbox.put(request("first", "first"))
+        scheduler.inbox.put(request("second", "second"))
+        results = [scheduler.outbox.get(timeout=5.0) for _ in range(2)]
+    finally:
+        scheduler.stop()
+        thread.join(timeout=5.0)
+
+    assert [(result.type, result.data) for result in results] == [
+        ("result", "preprocessing"),
+        ("result", "preprocessing"),
+    ]
 
 
 @pytest.mark.parametrize("abort_before_enqueue", [True, False])

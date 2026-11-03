@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import inspect
 import logging
 import queue as _queue_mod
@@ -172,7 +173,9 @@ class ThreadedSimpleScheduler(Generic[ComputeInput, ComputeResult]):
                         if self.dispatch_fn is not None:
                             future = self.dispatch_fn(msg.data)
                         else:
-                            future = self.executor.submit(self.run_one, msg.data)
+                            future = self.executor.submit(
+                                contextvars.copy_context().run, self.run_one, msg.data
+                            )
                         self.pending[request_id] = future
                     finally:
                         self.inbox.release_claim(request_id)
