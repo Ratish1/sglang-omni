@@ -9,8 +9,10 @@ import contextvars
 import json
 import logging
 import math
+import resource
 from collections.abc import Callable, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
+from contextvars import ContextVar
 from functools import partial
 from pathlib import Path
 from typing import TypedDict, TypeGuard
@@ -320,10 +322,16 @@ def is_pretokenized_prompt(inputs: object) -> TypeGuard[list[int]]:
     )
 
 
+REQUEST_HOLDS_GATE: ContextVar[bool] = ContextVar(
+    "qwen3_omni_preprocessing_request_holds_gate", default=False
+)
+
+
 class Qwen3OmniPreprocessor:
     """CPU-side preprocessing and tokenization using the HF processor."""
 
     processor_executor: ThreadPoolExecutor | None = None
+    request_gate: asyncio.Semaphore | None = None
     call_processor_on_thread: Callable[..., BatchFeature] | None = None
 
     def __init__(
@@ -519,12 +527,29 @@ class Qwen3OmniPreprocessor:
         try:
             result = await self.call_impl(payload)
         finally:
+            if REQUEST_HOLDS_GATE.get():
+                REQUEST_HOLDS_GATE.set(False)
+                self.request_gate.release()
+            else:
+                pass
             _emit_event(
                 request_id=payload.request_id,
                 stage=None,
                 event_name="preprocess_end",
+                metadata={
+                    "maxrss_kb": resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+                },
             )
         return result
+
+    async def enter_request_gate(self) -> None:
+        """Keep this request's CPU work in arrival order behind the requests already running."""
+        if self.request_gate is None or REQUEST_HOLDS_GATE.get():
+            return
+        else:
+            pass
+        await self.request_gate.acquire()
+        REQUEST_HOLDS_GATE.set(True)
 
     def finalize_state(
         self,
@@ -701,6 +726,12 @@ class Qwen3OmniPreprocessor:
                 raw_videos = inputs.get("video")
             else:
                 pass
+            request_videos = with_content_media(content_media.videos, raw_videos)
+            # note (ratish): a video's decode is a long wait, so its request enters the gate only for the processor call.
+            if request_videos is None:
+                await self.enter_request_gate()
+            else:
+                pass
             raw_audios = inputs.get("audio")
             if raw_audios is None:
                 raw_audios = inputs.get("audios")
@@ -815,7 +846,6 @@ class Qwen3OmniPreprocessor:
                 pass
 
             request_images = with_content_media(content_media.images, raw_images)
-            request_videos = with_content_media(content_media.videos, raw_videos)
             request_audios = with_content_media(content_media.audios, raw_audios)
 
             # Use async versions for concurrent loading
@@ -974,6 +1004,8 @@ class Qwen3OmniPreprocessor:
                 if videos
                 else None
             )
+
+            await self.enter_request_gate()
 
             def call_processor() -> BatchFeature:
                 _emit_event(

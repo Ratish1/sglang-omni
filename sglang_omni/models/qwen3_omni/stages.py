@@ -1055,6 +1055,7 @@ def create_preprocessing_executor(
         return thread_state.processor(**processor_arguments)
 
     request_preprocessor.call_processor_on_thread = call_processor_on_thread
+    request_preprocessor.request_gate = asyncio.Semaphore(max_concurrency)
     request_preprocessor.processor_executor = ThreadPoolExecutor(
         max_workers=max_concurrency,
         initializer=bind_thread_processor,
