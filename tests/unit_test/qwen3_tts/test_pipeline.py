@@ -8293,7 +8293,9 @@ def test_qwen3_tts_request_data_keeps_decode_tensors_on_prepared_device(
     data = build_sglang_qwen3_tts_request(
         payload,
         model=SimpleNamespace(
-            config=SimpleNamespace(codec_eos_token_id=42, vocab_size=1200)
+            config=SimpleNamespace(
+                codec_eos_token_id=42, vocab_size=1200, num_code_groups=2
+            )
         ),
         wrapper=object(),
     )
@@ -9107,7 +9109,7 @@ def test_qwen3_tts_steady_decode_reports_cuda_graph_ready(
 
     fake_forward_batch = SimpleNamespace(
         input_ids=torch.tensor([1]),
-        forward_mode=SimpleNamespace(is_decode=lambda: True),
+        forward_mode=SimpleNamespace(is_decode=lambda: True, is_extend=lambda: False),
         positions=torch.tensor([0]),
         mrope_positions=None,
         req_pool_indices=torch.tensor([1]),

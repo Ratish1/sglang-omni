@@ -16,6 +16,7 @@ from sglang_omni.scheduling.sglang_backend.ar_session import SessionUnit
 
 def scheduler_with_unit(stages: tuple[str, ...]):
     scheduler = Mock(spec=OmniScheduler)
+    scheduler.stream_step_runner = None
     scheduler.aborted_request_ids = set()
     scheduler.outbox = queue.Queue()
     scheduler.first_emit_done = set()
