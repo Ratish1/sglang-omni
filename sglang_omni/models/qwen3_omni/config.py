@@ -44,7 +44,7 @@ TALKER_MAX_RUNNING_REQUESTS = 32
 # note (ratish): two workers overlap one request's media decode and HF processor call with the next one's.
 PREPROCESSING_WORKERS = 2
 
-# note (ratish): a torch op past the 32k-element grain wakes its thread's whole OpenMP team, so each worker's team stops at 16.
+# note (ratish): a torch op past its parallel grain wakes its thread's OpenMP team, so each worker's team is capped.
 PREPROCESSING_MAX_INTRAOP_THREADS = 16
 
 # SGLang reads this when DeepGEMM compile utilities are imported. Qwen AR
