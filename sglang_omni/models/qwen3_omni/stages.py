@@ -8,11 +8,13 @@ Each factory returns either:
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import queue
 import threading
 from collections.abc import Callable, Mapping
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Literal, TypedDict
 
@@ -20,7 +22,7 @@ import torch
 import torch.nn.functional as F
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
-from transformers import AutoConfig
+from transformers import AutoConfig, BatchFeature
 
 from sglang_omni.models.qwen3_omni.bootstrap import create_thinker_scheduler
 from sglang_omni.models.qwen3_omni.components.audio_encoder import Qwen3OmniAudioEncoder
@@ -28,7 +30,10 @@ from sglang_omni.models.qwen3_omni.components.image_encoder import (
     ImageEncoderOutput,
     Qwen3OmniImageEncoder,
 )
-from sglang_omni.models.qwen3_omni.components.preprocessor import Qwen3OmniPreprocessor
+from sglang_omni.models.qwen3_omni.components.preprocessor import (
+    PreprocessingRequestLimits,
+    Qwen3OmniPreprocessor,
+)
 from sglang_omni.models.qwen3_omni.components.streaming_detokenizer import (
     StreamingDetokenizeScheduler,
     create_streaming_detokenize_scheduler,
@@ -39,6 +44,7 @@ from sglang_omni.models.qwen3_omni.request_builders import (
     apply_encoder_result,
     build_encoder_request,
 )
+from sglang_omni.preprocessing.resource_connector import MEDIA_WORKERS
 from sglang_omni.profiler.event_recorder import emit as _emit_event
 from sglang_omni.proto import StagePayload
 from sglang_omni.scheduling.generation_batch_policy import (
@@ -1002,6 +1008,35 @@ def batch_audio_encoder_payloads(
 # ---------------------------------------------------------------------------
 
 
+class PreprocessingLoopScheduler(ThreadedSimpleScheduler[StagePayload, StagePayload]):
+    """Run every request's logic on one event loop, so a waiting request holds no thread."""
+
+    def __init__(
+        self,
+        preprocessor: Qwen3OmniPreprocessor,
+        processor_executor: ThreadPoolExecutor,
+    ) -> None:
+        super().__init__(None, max_concurrency=None, dispatch_fn=self.dispatch_request)
+        self.preprocessor = preprocessor
+        self.processor_executor = processor_executor
+        self.request_loop = asyncio.new_event_loop()
+        threading.Thread(
+            target=self.request_loop.run_forever,
+            name="preprocessing-requests",
+            daemon=True,
+        ).start()
+
+    def dispatch_request(self, payload: StagePayload) -> Future[StagePayload]:
+        return asyncio.run_coroutine_threadsafe(
+            self.preprocessor(payload), self.request_loop
+        )
+
+    def stop(self) -> None:
+        super().stop()
+        self.request_loop.call_soon_threadsafe(self.request_loop.stop)
+        self.processor_executor.shutdown(wait=False, cancel_futures=True)
+
+
 def create_preprocessing_executor(
     model_path: str,
     *,
@@ -1018,11 +1053,15 @@ def create_preprocessing_executor(
     | ThreadedSimpleScheduler[StagePayload, StagePayload]
 ):
     if video_decode_threads is None:
-        video_decode_threads = automatic_video_decode_threads(max(max_concurrency, 1))
+        video_decode_threads = automatic_video_decode_threads(
+            1 if max_concurrency <= 1 else MEDIA_WORKERS
+        )
     else:
         pass
 
-    def build_preprocessor() -> Qwen3OmniPreprocessor:
+    def build_preprocessor(
+        request_limits: PreprocessingRequestLimits | None = None,
+    ) -> Qwen3OmniPreprocessor:
         return Qwen3OmniPreprocessor(
             model_path=model_path,
             max_seq_len=max_seq_len,
@@ -1032,6 +1071,7 @@ def create_preprocessing_executor(
             video_max_pixels=video_max_pixels,
             video_total_pixels=video_total_pixels,
             video_decode_threads=video_decode_threads,
+            request_limits=request_limits,
         )
 
     if max_concurrency <= 1:
@@ -1044,7 +1084,7 @@ def create_preprocessing_executor(
     else:
         pass
 
-    # note (ratish): every pool thread runs its own preprocessor and so its own HF processor, which is not promised to be thread safe.
+    # note (ratish): every pool thread calls its own HF processor, which is not promised to be thread safe.
     idle_preprocessors: queue.SimpleQueue[Qwen3OmniPreprocessor] = queue.SimpleQueue()
     for _ in range(max_concurrency):
         idle_preprocessors.put(build_preprocessor())
@@ -1053,13 +1093,24 @@ def create_preprocessing_executor(
     def bind_thread_preprocessor() -> None:
         thread_state.preprocessor = idle_preprocessors.get_nowait()
 
-    async def preprocess_on_thread(payload: StagePayload) -> StagePayload:
-        return await thread_state.preprocessor(payload)
+    def call_processor_on_thread(**processor_arguments: object) -> BatchFeature:
+        return thread_state.preprocessor.processor(**processor_arguments)
 
-    return ThreadedSimpleScheduler[StagePayload, StagePayload](
-        preprocess_on_thread,
-        max_concurrency=max_concurrency,
-        thread_initializer=bind_thread_preprocessor,
+    processor_executor = ThreadPoolExecutor(
+        max_workers=max_concurrency,
+        initializer=bind_thread_preprocessor,
+        thread_name_prefix="preprocessing-processor",
+    )
+    return PreprocessingLoopScheduler(
+        build_preprocessor(
+            PreprocessingRequestLimits(
+                running_slots=asyncio.BoundedSemaphore(max_concurrency),
+                video_slots=asyncio.BoundedSemaphore(MEDIA_WORKERS),
+                processor_executor=processor_executor,
+                call_processor_on_thread=call_processor_on_thread,
+            )
+        ),
+        processor_executor,
     )
 
 

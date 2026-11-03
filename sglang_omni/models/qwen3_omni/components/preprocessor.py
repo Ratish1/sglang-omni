@@ -8,8 +8,11 @@ import base64
 import json
 import logging
 import math
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
+from contextvars import ContextVar, copy_context
+from dataclasses import dataclass
+from functools import partial
 from pathlib import Path
 from typing import TypedDict, TypeGuard
 
@@ -318,8 +321,28 @@ def is_pretokenized_prompt(inputs: object) -> TypeGuard[list[int]]:
     )
 
 
+@dataclass(frozen=True)
+class PreprocessingRequestLimits:
+    """What the requests on one preprocessing event loop share."""
+
+    running_slots: asyncio.Semaphore
+    video_slots: asyncio.Semaphore
+    processor_executor: ThreadPoolExecutor
+    call_processor_on_thread: Callable[..., BatchFeature]
+
+
+REQUEST_HOLDS_RUNNING_SLOT: ContextVar[bool] = ContextVar(
+    "qwen3_omni_request_holds_running_slot", default=False
+)
+REQUEST_HOLDS_VIDEO_SLOT: ContextVar[bool] = ContextVar(
+    "qwen3_omni_request_holds_video_slot", default=False
+)
+
+
 class Qwen3OmniPreprocessor:
     """CPU-side preprocessing and tokenization using the HF processor."""
+
+    request_limits: PreprocessingRequestLimits | None = None
 
     def __init__(
         self,
@@ -332,9 +355,11 @@ class Qwen3OmniPreprocessor:
         video_max_pixels: int | None = None,
         video_total_pixels: int | None = None,
         video_decode_threads: int,
+        request_limits: PreprocessingRequestLimits | None = None,
     ) -> None:
         self.model_path = model_path
         self.video_decode_threads = video_decode_threads
+        self.request_limits = request_limits
         self.default_video_fps = float(video_fps) if video_fps is not None else None
         self.default_video_max_frames = (
             int(video_max_frames) if video_max_frames is not None else None
@@ -514,12 +539,31 @@ class Qwen3OmniPreprocessor:
         try:
             result = await self.call_impl(payload)
         finally:
+            if REQUEST_HOLDS_RUNNING_SLOT.get():
+                REQUEST_HOLDS_RUNNING_SLOT.set(False)
+                self.request_limits.running_slots.release()
+            else:
+                pass
+            if REQUEST_HOLDS_VIDEO_SLOT.get():
+                REQUEST_HOLDS_VIDEO_SLOT.set(False)
+                self.request_limits.video_slots.release()
+            else:
+                pass
             _emit_event(
                 request_id=payload.request_id,
                 stage=None,
                 event_name="preprocess_end",
             )
         return result
+
+    async def take_running_slot(self) -> None:
+        """Keep this request's CPU work in arrival order behind the requests running."""
+        if self.request_limits is None or REQUEST_HOLDS_RUNNING_SLOT.get():
+            return
+        else:
+            pass
+        await self.request_limits.running_slots.acquire()
+        REQUEST_HOLDS_RUNNING_SLOT.set(True)
 
     def finalize_state(
         self,
@@ -696,6 +740,15 @@ class Qwen3OmniPreprocessor:
                 raw_videos = inputs.get("video")
             else:
                 pass
+            request_videos = with_content_media(content_media.videos, raw_videos)
+            # note (ratish): a video's decode is a long wait and its frames are the stage's largest memory, so it takes a video slot, and a running slot only for the processor call.
+            if request_videos is None:
+                await self.take_running_slot()
+            elif self.request_limits is not None:
+                await self.request_limits.video_slots.acquire()
+                REQUEST_HOLDS_VIDEO_SLOT.set(True)
+            else:
+                pass
             raw_audios = inputs.get("audio")
             if raw_audios is None:
                 raw_audios = inputs.get("audios")
@@ -810,7 +863,6 @@ class Qwen3OmniPreprocessor:
                 pass
 
             request_images = with_content_media(content_media.images, raw_images)
-            request_videos = with_content_media(content_media.videos, raw_videos)
             request_audios = with_content_media(content_media.audios, raw_audios)
 
             # Use async versions for concurrent loading
@@ -959,7 +1011,13 @@ class Qwen3OmniPreprocessor:
                 if videos
                 else None
             )
-            hf_inputs: BatchFeature = self.processor(
+            await self.take_running_slot()
+            call_processor = partial(
+                (
+                    self.processor
+                    if self.request_limits is None
+                    else self.request_limits.call_processor_on_thread
+                ),
                 text=prompt_text,
                 images=images or None,
                 videos=videos or None,
@@ -968,6 +1026,13 @@ class Qwen3OmniPreprocessor:
                 return_tensors="pt",
                 **processor_kwargs,
             )
+            if self.request_limits is None:
+                hf_inputs: BatchFeature = call_processor()
+            else:
+                hf_inputs = await asyncio.get_running_loop().run_in_executor(
+                    self.request_limits.processor_executor,
+                    partial(copy_context().run, call_processor),
+                )
         video_cache_key = (
             video_cache_key_future.result()
             if video_cache_key_future is not None

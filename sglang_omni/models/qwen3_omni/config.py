@@ -41,7 +41,7 @@ ENABLE_TALKER_START_TOPOLOGY = False
 
 TALKER_MAX_RUNNING_REQUESTS = 32
 
-# note (ratish): two workers overlap one request's media decode and HF processor call with the next one's.
+# note (ratish): two HF processor calls at once carry more video requests than the thinker takes; one limits it, and more cost CPU per video.
 PREPROCESSING_WORKERS = 2
 
 # note (ratish): a torch op past the 32k-element grain wakes its thread's whole OpenMP team, so each worker's team stops at 16.
