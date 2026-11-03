@@ -43,7 +43,8 @@ def main() -> None:
     parser.add_argument("--long-requests", type=int, default=32)
     args = parser.parse_args()
     arms = [tuple(value.split("=", 1)) for value in (args.a, args.b)]
-    media_root = Path(args.harness) / "docs/_static/audio"
+    # note: SeedTTS's references sit in a temporary directory and the long requests' in the harness tree
+    media_root = Path("/")
     port = args.port
     for order, cards in (("o1", (0, 1)), ("o2", (1, 0))):
         root = args.root / order
