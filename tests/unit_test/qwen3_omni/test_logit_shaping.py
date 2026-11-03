@@ -8,6 +8,7 @@ import pytest
 import torch
 
 from sglang_omni.model_runner.base import ModelRunner
+from tests.unit_test.fixtures.accelerator import require_cuda
 
 
 def make_suppress_requests(suppress_per_row):
@@ -56,12 +57,10 @@ def test_codec_suppress_tokens_matches_reference(share_rows):
 
 
 @pytest.mark.accelerator
-@pytest.mark.skipif(
-    not torch.cuda.is_available(), reason="stream synchronization requires CUDA"
-)
 @pytest.mark.parametrize("share_rows", [True, False])
-def test_codec_suppress_tokens_do_not_synchronize(share_rows):
+def test_codec_suppress_tokens_do_not_synchronize(share_rows: bool) -> None:
     """Suppressing codec tokens waited for every queued kernel of the step to finish."""
+    require_cuda()
     shared = [5, 90, 95]
     suppress_per_row = [shared] * 4 if share_rows else [shared, [1, 2], None, shared]
     requests = make_suppress_requests(suppress_per_row)
