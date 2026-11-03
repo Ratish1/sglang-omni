@@ -856,10 +856,20 @@ class Qwen3OmniPreprocessor:
                 finally:
                     await connection.close()
 
+            _emit_event(
+                request_id=payload.request_id,
+                stage=None,
+                event_name="preprocess_media_start",
+            )
             try:
                 images, videos_result, audios_result = await asyncio.gather(*tasks)
             finally:
                 await await_media_cleanup(cleanup())
+            _emit_event(
+                request_id=payload.request_id,
+                stage=None,
+                event_name="preprocess_media_end",
+            )
             videos, sampled_video_fps, extracted_audio_from_video = videos_result
 
             audios, audio_from_video = merge_extracted_video_audio(
@@ -959,6 +969,11 @@ class Qwen3OmniPreprocessor:
                 if videos
                 else None
             )
+            _emit_event(
+                request_id=payload.request_id,
+                stage=None,
+                event_name="preprocess_processor_start",
+            )
             hf_inputs: BatchFeature = self.processor(
                 text=prompt_text,
                 images=images or None,
@@ -967,6 +982,11 @@ class Qwen3OmniPreprocessor:
                 add_special_tokens=False,
                 return_tensors="pt",
                 **processor_kwargs,
+            )
+            _emit_event(
+                request_id=payload.request_id,
+                stage=None,
+                event_name="preprocess_processor_end",
             )
         video_cache_key = (
             video_cache_key_future.result()
