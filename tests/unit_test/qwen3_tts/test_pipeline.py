@@ -9128,7 +9128,7 @@ def test_qwen3_tts_steady_decode_reports_cuda_graph_ready(
 
         def __init__(self) -> None:
             self.decode_feedback_embedding = torch.nn.Embedding(1, 4)
-            self.output_codes = torch.ones(1, 2)
+            self.output_codes = torch.ones(1, 2, dtype=torch.long)
             self.output_embeds = torch.ones(1, 4)
             self.prepare_calls = 0
 
