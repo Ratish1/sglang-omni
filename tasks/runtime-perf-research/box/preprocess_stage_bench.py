@@ -16,6 +16,9 @@ import threading
 import time
 from pathlib import Path
 
+import torch
+import xxhash
+
 import sglang_omni.models.qwen3_omni.stages as qwen_stages
 from benchmarks.dataset.videomme import load_videomme_samples
 from sglang_omni.proto.request import OmniRequest, StagePayload
@@ -37,11 +40,34 @@ def payload_of(request_id: str, prompt: str, video_path: str) -> StagePayload:
     )
 
 
+def tensor_hashes(value: object, prefix: str = "state") -> dict[str, str]:
+    """Hash of every tensor and cache key in a stage output, by its path."""
+    hashes: dict[str, str] = {}
+    if isinstance(value, torch.Tensor):
+        flat = value.detach().contiguous().cpu().reshape(-1).view(torch.uint8)
+        hashes[prefix] = (
+            f"{value.dtype} {tuple(value.shape)} "
+            + xxhash.xxh3_64_hexdigest(flat.numpy())
+        )
+    elif isinstance(value, str) and prefix.endswith(".cache_key"):
+        hashes[prefix] = value
+    elif isinstance(value, dict):
+        for name, item in value.items():
+            hashes.update(tensor_hashes(item, f"{prefix}.{name}"))
+    elif isinstance(value, (list, tuple)):
+        for index, item in enumerate(value):
+            hashes.update(tensor_hashes(item, f"{prefix}[{index}]"))
+    else:
+        pass
+    return hashes
+
+
 def run_pass(
     scheduler: object,
     samples: list[tuple[str, str]],
     concurrency: int,
     pass_name: str,
+    hashes: dict[str, dict[str, str]] | None = None,
 ) -> dict[str, float]:
     started: dict[str, float] = {}
     latencies: list[float] = []
@@ -69,6 +95,11 @@ def run_pass(
         message = scheduler.outbox.get(timeout=300)
         assert message.type == "result", repr(message.data)
         latencies.append(time.perf_counter() - started[message.request_id])
+        if hashes is not None:
+            sample_index = int(message.request_id.split(":")[1])
+            hashes[str(sample_index)] = tensor_hashes(message.data.data)
+        else:
+            pass
         if next_index < len(samples):
             submit()
         else:
@@ -99,6 +130,9 @@ def main() -> None:
     parser.add_argument("--videos-in-flight", type=int, default=0)
     parser.add_argument("--passes", type=int, default=2)
     parser.add_argument("--out", required=True)
+    parser.add_argument(
+        "--hashes", default="", help="write each sample's output tensor hashes here"
+    )
     args = parser.parse_args()
     samples = [
         (sample.prompt or sample.question, sample.video_path)
@@ -108,15 +142,24 @@ def main() -> None:
         MODEL,
         max_concurrency=args.processors,
         max_seq_len=32768,
-        max_videos_in_flight=args.videos_in_flight or None,
+        **(
+            {"max_videos_in_flight": args.videos_in_flight}
+            if args.videos_in_flight
+            else {}
+        ),
     )
     worker = threading.Thread(target=scheduler.start, daemon=True)
     worker.start()
+    hashes: dict[str, dict[str, str]] | None = {} if args.hashes else None
     results = [
-        run_pass(scheduler, samples, args.concurrency, f"pass{index}")
+        run_pass(scheduler, samples, args.concurrency, f"pass{index}", hashes)
         for index in range(args.passes)
     ]
     scheduler.stop()
+    if args.hashes:
+        Path(args.hashes).write_text(json.dumps(hashes), encoding="utf-8")
+    else:
+        pass
     record = {
         "cpus": len(os.sched_getaffinity(0)),
         "concurrency": args.concurrency,
