@@ -24,7 +24,7 @@ from pathlib import Path
 
 import httpx
 
-MODEL = "Qwen/Qwen3-TTS-12Hz-1.7B-Base"
+MODEL = os.environ.get("BOX_TTS_MODEL", "Qwen/Qwen3-TTS-12Hz-1.7B-Base")
 ASR_MODEL = "Qwen/Qwen3-ASR-1.7B"
 # transcription requests in flight while scoring, on the user's word (the scorer's default is 32)
 ASR_CONCURRENCY = 64

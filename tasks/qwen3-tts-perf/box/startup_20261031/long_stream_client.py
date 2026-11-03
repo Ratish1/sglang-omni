@@ -31,7 +31,7 @@ FRAME_SAMPLES = 1920
 BARRIER_TIMEOUT_S = 1200.0
 
 
-def request_body(harness: str, seed: int, text: str, reference: str, reference_text: str) -> dict:
+def request_body(harness: str, seed: int, text: str, reference: str, reference_text: str, stream: bool = True) -> dict:
     return {
         "model": MODEL,
         "input": text,
@@ -40,7 +40,7 @@ def request_body(harness: str, seed: int, text: str, reference: str, reference_t
         "ref_audio": reference,
         "ref_text": reference_text,
         "response_format": "pcm",
-        "stream": True,
+        "stream": stream,
         "speed": 1.0,
         "max_new_tokens": 2048,
         "seed": seed,
@@ -85,7 +85,7 @@ def quantile(values: list[float], share: float) -> float:
     return sorted(values)[min(len(values) - 1, int(share * len(values)))]
 
 
-def stress_bodies(harness: str, requests: int) -> list[dict]:
+def stress_bodies(harness: str, requests: int, stream: bool = True) -> list[dict]:
     """The harness's own long texts, reference and seeds, read from its scenario builder in its own tree."""
     script = (
         "import json,sys;"
@@ -101,7 +101,7 @@ def stress_bodies(harness: str, requests: int) -> list[dict]:
     texts = json.loads(lines[-2])
     reference_text = json.loads(lines[-1])[0]
     reference = f"file://{Path(harness) / 'docs/_static/audio/male-voice.wav'}"
-    return [request_body(harness, index, texts[index % len(texts)], reference, reference_text) for index in range(requests)]
+    return [request_body(harness, index, texts[index % len(texts)], reference, reference_text, stream) for index in range(requests)]
 
 
 def start_server(tree: str, card: int, port: int, media_root: Path, log: Path) -> subprocess.Popen:
@@ -156,9 +156,10 @@ def main() -> None:
     parser.add_argument("--label", default="run")
     parser.add_argument("--barrier", type=Path, default=None)
     parser.add_argument("--parties", type=int, default=2)
+    parser.add_argument("--no-stream", action="store_true")
     args = parser.parse_args()
     args.out.mkdir(parents=True, exist_ok=True)
-    bodies = stress_bodies(args.harness, args.requests)
+    bodies = stress_bodies(args.harness, args.requests, not args.no_stream)
     server = None
     if args.tree is not None:
         print(f"{args.label}: tree {args.tree} {identity(args.tree)} card {args.card}", flush=True)
