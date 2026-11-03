@@ -2619,23 +2619,57 @@ def test_qwen_video_cache_key_hash_ends_with_a_failed_request(
     ]
 
 
-def test_preprocessing_executor_dispatch_follows_its_worker_count(monkeypatch):
-    from sglang_omni.scheduling.simple_scheduler import SimpleScheduler
-    from sglang_omni.scheduling.threaded_simple_scheduler import ThreadedSimpleScheduler
+def test_preprocessing_one_worker_runs_requests_one_at_a_time(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    running = 0
+    most_running = 0
+    preprocessors: list[object] = []
 
-    monkeypatch.setattr(qwen_stages, "Qwen3OmniPreprocessor", lambda **_: object())
-    one = qwen_stages.create_preprocessing_executor("model", max_concurrency=1)
-    assert type(one) is SimpleScheduler
-    threaded = qwen_stages.create_preprocessing_executor("model", max_concurrency=2)
-    assert type(threaded) is ThreadedSimpleScheduler
+    class Preprocessor:
+        def __init__(self) -> None:
+            preprocessors.append(self)
+
+        async def __call__(self, payload: str) -> dict[str, str]:
+            nonlocal running, most_running
+            running += 1
+            most_running = max(most_running, running)
+            await asyncio.sleep(0.02)
+            running -= 1
+            return {"input": payload}
+
+    monkeypatch.setattr(
+        qwen_stages, "Qwen3OmniPreprocessor", lambda **_: Preprocessor()
+    )
+    scheduler = qwen_stages.create_preprocessing_executor("model", max_concurrency=1)
+    worker = threading.Thread(target=scheduler.start, daemon=True)
+    worker.start()
+    try:
+        for request_id in ("first", "second", "third"):
+            scheduler.inbox.put(
+                IncomingMessage(
+                    request_id=request_id, type="new_request", data=request_id
+                )
+            )
+        results = [scheduler.outbox.get(timeout=5) for _ in range(3)]
+    finally:
+        scheduler.stop()
+        worker.join(timeout=3)
+
+    assert {result.request_id for result in results} == {"first", "second", "third"}
+    assert all(result.type == "result" for result in results)
+    assert most_running == 1
+    assert len(preprocessors) == 1
 
 
-def test_preprocessing_pool_threads_each_run_their_own_preprocessor(monkeypatch):
+def test_preprocessing_pool_threads_each_run_their_own_preprocessor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     both_running = threading.Barrier(2, timeout=3)
     calls: list[tuple[int, int]] = []
 
     class Preprocessor:
-        async def __call__(self, payload):
+        async def __call__(self, payload: str) -> dict[str, str]:
             calls.append((id(self), threading.get_ident()))
             both_running.wait()
             return {"input": payload}
