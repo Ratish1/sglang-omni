@@ -691,7 +691,11 @@ def main() -> None:
             "launch",
             f"--session-new={args.nsys_session}",
             f"--trace={args.nsys_trace}",
-            f"--cuda-graph-trace={args.nsys_graph_trace}",
+            *(
+                [f"--cuda-graph-trace={args.nsys_graph_trace}"]
+                if "cuda" in args.nsys_trace
+                else []
+            ),
             *serve,
         ]
     else:
