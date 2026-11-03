@@ -36,6 +36,19 @@ read_block() {
   log "read $tag"
 }
 log "q1103_3451 start (cpus $(taskset -cp $$ | sed 's/.*: //'))"
+# note (ratish): a fresh container downloads the model and compiles FlashInfer on its first boots; both configs get one
+# unmeasured boot so no measured arm pays for them.
+export SGLANG_OMNI_STARTUP_TIMEOUT=2400
+fill() {
+  local name=$1 model=$2
+  wait_card
+  log "fill $name $model start"
+  python3 $K/baseline.py --tree $MAIN --model $model --card 0 --port 26000 --out $O/$name \
+    --loads 16 --passes warm > $O/$name.driver.log 2>&1
+  log "fill $name rc $?"
+}
+fill fill_a omni_colocated
+fill fill_b omni_colocated_h100_config
 boot a_m1 $MAIN omni_colocated
 boot a_p1 $P3 omni_colocated
 boot a_p2 $P3 omni_colocated
