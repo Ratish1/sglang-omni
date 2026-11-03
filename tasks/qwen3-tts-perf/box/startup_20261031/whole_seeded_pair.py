@@ -3,7 +3,7 @@
 modes' files are hashed, non-streaming is scored per card, then paired per request: SIM with a bootstrap interval, WER over
 all files, and the rows that moved most. BOX_TTS_MODEL picks the checkpoint.
 
-usage: python3 whole_seeded_pair.py --base TREE --arm TREE --root DIR [--port 16000]
+usage: python3 whole_seeded_pair.py --base TREE --arm TREE --root DIR [--port 16000] [--seed 1234] [--no-streaming]
 """
 
 import argparse
@@ -18,20 +18,20 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "next_20261031"))
 from seeded_tail import MODEL, audio_hashes, score_card, serve_phase  # noqa: E402
 from whole_seeded_quality import load, word_counts  # noqa: E402
 
-RUNS = (("c1n", 1, 1234, False), ("c1s", 1, 1234, True))
-
-
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--base", required=True)
     parser.add_argument("--arm", required=True)
     parser.add_argument("--root", type=Path, required=True)
     parser.add_argument("--port", type=int, default=16000)
+    parser.add_argument("--seed", type=int, default=1234)
+    parser.add_argument("--no-streaming", action="store_true")
     args = parser.parse_args()
     args.root.mkdir(parents=True, exist_ok=True)
-    print(f"model {MODEL}", flush=True)
-    serve_phase("seeded", [("base", args.base, 0, args.port), ("arm", args.arm, 1, args.port + 200)], list(RUNS), args.root)
-    for run, _, _, _ in RUNS:
+    print(f"model {MODEL} seed {args.seed}", flush=True)
+    runs = [("c1n", 1, args.seed, False)] if args.no_streaming else [("c1n", 1, args.seed, False), ("c1s", 1, args.seed, True)]
+    serve_phase("seeded", [("base", args.base, 0, args.port), ("arm", args.arm, 1, args.port + 200)], runs, args.root)
+    for run, _, _, _ in runs:
         base, arm = audio_hashes(args.root / run / "base"), audio_hashes(args.root / run / "arm")
         print(f"{run}: byte identical {sum(base[name] == arm.get(name) for name in base)} of {len(base)} ({len(arm)} in the arm)", flush=True)
     with concurrent.futures.ThreadPoolExecutor(2) as pool:
