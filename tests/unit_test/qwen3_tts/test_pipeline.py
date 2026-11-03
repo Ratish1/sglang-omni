@@ -9175,6 +9175,7 @@ def test_qwen3_tts_steady_decode_reports_cuda_graph_ready(
     runner.feedback_pool = torch.zeros(2, 4)
     runner.feedback_pool[1] = torch.ones(4)
     runner.decode_batch_reqs = None
+    runner.stream_step_target = None
     runner.code_table = Qwen3TTSCodeTable(
         num_rows=1, max_frames=8, num_codebooks=2, device="cpu"
     )
