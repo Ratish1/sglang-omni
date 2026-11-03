@@ -1013,6 +1013,7 @@ def create_preprocessing_executor(
     video_max_pixels: int | None = None,
     video_total_pixels: int | None = None,
     video_decode_threads: int | None = None,
+    max_processor_calls: int = 2,
 ) -> (
     SimpleScheduler[StagePayload, StagePayload]
     | ThreadedSimpleScheduler[StagePayload, StagePayload]
@@ -1021,6 +1022,7 @@ def create_preprocessing_executor(
         video_decode_threads = automatic_video_decode_threads(max(max_concurrency, 1))
     else:
         pass
+    processor_slots = threading.BoundedSemaphore(max_processor_calls)
 
     def build_preprocessor() -> Qwen3OmniPreprocessor:
         return Qwen3OmniPreprocessor(
@@ -1032,6 +1034,7 @@ def create_preprocessing_executor(
             video_max_pixels=video_max_pixels,
             video_total_pixels=video_total_pixels,
             video_decode_threads=video_decode_threads,
+            processor_slots=processor_slots,
         )
 
     if max_concurrency <= 1:

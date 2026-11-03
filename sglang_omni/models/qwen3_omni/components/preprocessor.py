@@ -8,6 +8,7 @@ import base64
 import json
 import logging
 import math
+import threading
 from collections.abc import Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -332,9 +333,11 @@ class Qwen3OmniPreprocessor:
         video_max_pixels: int | None = None,
         video_total_pixels: int | None = None,
         video_decode_threads: int,
+        processor_slots: threading.BoundedSemaphore | None = None,
     ) -> None:
         self.model_path = model_path
         self.video_decode_threads = video_decode_threads
+        self.processor_slots = processor_slots or threading.BoundedSemaphore(1)
         self.default_video_fps = float(video_fps) if video_fps is not None else None
         self.default_video_max_frames = (
             int(video_max_frames) if video_max_frames is not None else None
@@ -969,25 +972,27 @@ class Qwen3OmniPreprocessor:
                 if videos
                 else None
             )
-            _emit_event(
-                request_id=payload.request_id,
-                stage=None,
-                event_name="preprocess_processor_start",
-            )
-            hf_inputs: BatchFeature = self.processor(
-                text=prompt_text,
-                images=images or None,
-                videos=videos or None,
-                audio=audios or None,
-                add_special_tokens=False,
-                return_tensors="pt",
-                **processor_kwargs,
-            )
-            _emit_event(
-                request_id=payload.request_id,
-                stage=None,
-                event_name="preprocess_processor_end",
-            )
+            # note (ratish): this request's loop has nothing else to run here, so it waits for a slot in place.
+            with self.processor_slots:
+                _emit_event(
+                    request_id=payload.request_id,
+                    stage=None,
+                    event_name="preprocess_processor_start",
+                )
+                hf_inputs: BatchFeature = self.processor(
+                    text=prompt_text,
+                    images=images or None,
+                    videos=videos or None,
+                    audio=audios or None,
+                    add_special_tokens=False,
+                    return_tensors="pt",
+                    **processor_kwargs,
+                )
+                _emit_event(
+                    request_id=payload.request_id,
+                    stage=None,
+                    event_name="preprocess_processor_end",
+                )
         video_cache_key = (
             video_cache_key_future.result()
             if video_cache_key_future is not None
