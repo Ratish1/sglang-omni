@@ -515,7 +515,9 @@ class Qwen3OmniPreprocessor:
             event_name="preprocess_start",
         )
         try:
-            result = await self.call_impl(payload)
+            # note (ratish): this request's loop has nothing else to run yet, so it waits for a slot in place.
+            with self.processor_slots:
+                result = await self.call_impl(payload)
         finally:
             _emit_event(
                 request_id=payload.request_id,
@@ -859,20 +861,32 @@ class Qwen3OmniPreprocessor:
                 finally:
                     await connection.close()
 
-            _emit_event(
-                request_id=payload.request_id,
-                stage=None,
-                event_name="preprocess_media_start",
-            )
-            try:
-                images, videos_result, audios_result = await asyncio.gather(*tasks)
-            finally:
-                await await_media_cleanup(cleanup())
-            _emit_event(
-                request_id=payload.request_id,
-                stage=None,
-                event_name="preprocess_media_end",
-            )
+            async def load_media() -> list[object]:
+                _emit_event(
+                    request_id=payload.request_id,
+                    stage=None,
+                    event_name="preprocess_media_start",
+                )
+                try:
+                    loaded = await asyncio.gather(*tasks)
+                finally:
+                    await await_media_cleanup(cleanup())
+                _emit_event(
+                    request_id=payload.request_id,
+                    stage=None,
+                    event_name="preprocess_media_end",
+                )
+                return loaded
+
+            if request_videos is None:
+                images, videos_result, audios_result = await load_media()
+            else:
+                # note (ratish): a video's decode is the long wait a request has, so its slot serves another request over it.
+                self.processor_slots.release()
+                try:
+                    images, videos_result, audios_result = await load_media()
+                finally:
+                    self.processor_slots.acquire()
             videos, sampled_video_fps, extracted_audio_from_video = videos_result
 
             audios, audio_from_video = merge_extracted_video_audio(
@@ -972,27 +986,25 @@ class Qwen3OmniPreprocessor:
                 if videos
                 else None
             )
-            # note (ratish): this request's loop has nothing else to run here, so it waits for a slot in place.
-            with self.processor_slots:
-                _emit_event(
-                    request_id=payload.request_id,
-                    stage=None,
-                    event_name="preprocess_processor_start",
-                )
-                hf_inputs: BatchFeature = self.processor(
-                    text=prompt_text,
-                    images=images or None,
-                    videos=videos or None,
-                    audio=audios or None,
-                    add_special_tokens=False,
-                    return_tensors="pt",
-                    **processor_kwargs,
-                )
-                _emit_event(
-                    request_id=payload.request_id,
-                    stage=None,
-                    event_name="preprocess_processor_end",
-                )
+            _emit_event(
+                request_id=payload.request_id,
+                stage=None,
+                event_name="preprocess_processor_start",
+            )
+            hf_inputs: BatchFeature = self.processor(
+                text=prompt_text,
+                images=images or None,
+                videos=videos or None,
+                audio=audios or None,
+                add_special_tokens=False,
+                return_tensors="pt",
+                **processor_kwargs,
+            )
+            _emit_event(
+                request_id=payload.request_id,
+                stage=None,
+                event_name="preprocess_processor_end",
+            )
         video_cache_key = (
             video_cache_key_future.result()
             if video_cache_key_future is not None
