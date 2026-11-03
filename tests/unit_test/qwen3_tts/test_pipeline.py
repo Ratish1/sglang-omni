@@ -9110,7 +9110,7 @@ def test_qwen3_tts_steady_decode_reports_cuda_graph_ready(
     fake_forward_batch = SimpleNamespace(
         input_ids=torch.tensor([1]),
         forward_mode=SimpleNamespace(is_decode=lambda: True, is_extend=lambda: False),
-        positions=torch.tensor([0]),
+        positions=torch.tensor([4]),
         mrope_positions=None,
         req_pool_indices=torch.tensor([1]),
         seq_lens_cpu=torch.tensor([5]),
