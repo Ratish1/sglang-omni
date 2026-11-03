@@ -469,6 +469,22 @@ def patch_scheduler(module):
         return enqueue(self, payload, pending_stream_done, req_data, **kwargs)
 
     scheduler.enqueue_built_request = enqueue_marked
+    launch_joined = getattr(scheduler, "launch_joined_prefill", None)
+    if launch_joined is not None:
+        # note: a decode step's label is built before it knows of a join, so each poll marks what it found
+        def launch_joined_marked(self):
+            output = launch_joined(self)
+            if output is not None:
+                mark(f"sched.join rows={len(output.requests)}")
+            elif self.waiting_queue:
+                mark(f"sched.join_refused waiting={len(self.waiting_queue)}")
+            return output
+
+        scheduler.launch_joined_prefill = ranged(
+            launch_joined_marked, fixed("sched.join_poll")
+        )
+    else:
+        pass
 
 
 def patch_base_runner(module):
@@ -508,6 +524,9 @@ def patch_qwen_runner(module):
         ("launch_code_step", "mr.collect"),
         ("post_process_outputs", "mr.post"),
         ("write_feedback_buffers", "mr.feedback"),
+        ("launch_joined_prefill", "mr.join"),
+        ("predict_joined_rows", "mr.join_predict"),
+        ("finish_joined_rows", "mr.join_finish"),
     ):
         if hasattr(runner, name):
             setattr(runner, name, ranged(getattr(runner, name), fixed(label)))
