@@ -1315,6 +1315,10 @@ class ModelRunner(Generic[RequestDataInput]):
             else:
                 group[1].append(row_idx)
         # note (ratish): an indexed assignment of a Python scalar copies it to the device and waits for the stream, here the whole prefill forward; index_fill_ takes it as a kernel argument.
+        if row_groups and device.type == "cuda":
+            torch.cuda.current_stream(device).synchronize()
+        else:
+            pass
         for toks_t, rows in row_groups.values():
             if len(rows) == logits.shape[0]:
                 logits.index_fill_(1, toks_t, float("-inf"))
