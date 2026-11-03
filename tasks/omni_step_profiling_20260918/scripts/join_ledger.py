@@ -29,6 +29,8 @@ def main() -> None:
     t0, t1 = bench_window(db, args.bench_log)
     decode_steps: list[tuple[int, int]] = []
     extend_steps: list[tuple[float, int]] = []
+    extend_spans: list[tuple[int, int, int]] = []
+    recv_starts: list[int] = []
     hits: list[tuple[int, int]] = []
     refused: list[int] = []
     polls: list[tuple[int, int]] = []
@@ -52,6 +54,9 @@ def main() -> None:
         elif label.startswith("sched.batch extend"):
             rows = re.search(r"bs=(\d+)", label)
             extend_steps.append(((end - start) / 1e6, int(rows.group(1))))
+            extend_spans.append((start, end, int(rows.group(1))))
+        elif label == "sched.recv":
+            recv_starts.append(start)
         elif label == "sched.join_poll":
             polls.append((start, end))
         elif label in ranges:
@@ -72,7 +77,39 @@ def main() -> None:
     extend_walls = [wall for wall, _ in extend_steps]
     alone_rows = sum(rows for _, rows in extend_steps)
     joined_rows = sum(rows for _, rows in hits)
+    cycles: dict[str, list[float]] = {"decode alone": [], "decode carrying a prefill": [], "prefill alone": []}
+    batches = sorted(
+        [(start, end, "decode") for start, end in decode_steps] + [(start, end, "prefill") for start, end, _ in extend_spans]
+    )
+    batch_starts = [start for start, _, _ in batches]
+    tops: list[int] = []
+    for start in recv_starts:
+        index = bisect.bisect_right(batch_starts, start) - 1
+        if index < 0 or start >= batches[index][1]:
+            tops.append(start)
+        else:
+            pass
+    for top, next_top in zip(tops, tops[1:]):
+        index = bisect.bisect_left(batch_starts, top)
+        if index >= len(batches) or batches[index][0] >= next_top:
+            continue
+        else:
+            pass
+        start, end, kind = batches[index]
+        hit = bisect.bisect_left(hit_starts, start)
+        carries = hit < len(hit_starts) and hit_starts[hit] < end
+        name = "prefill alone" if kind == "prefill" else "decode carrying a prefill" if carries else "decode alone"
+        cycles[name].append((next_top - top) / 1e6)
     print(f"window {(t1 - t0) / 1e9:.2f} s")
+    for name, values in cycles.items():
+        print(f"loop cycle, {name}: {summary(values)}; total {sum(values):.0f} ms")
+    if all(cycles.values()):
+        apart = statistics.fmean(cycles["decode alone"]) + statistics.fmean(cycles["prefill alone"])
+        together = statistics.fmean(cycles["decode carrying a prefill"])
+        joined_cycles = len(cycles["decode carrying a prefill"])
+        print(f"whole cycles: apart {apart:.2f} ms, joined {together:.2f} ms, saved {apart - together:.2f} ms a join, {(apart - together) * joined_cycles:.0f} ms of {(t1 - t0) / 1e6:.0f}")
+    else:
+        pass
     print(f"decode step alone: {summary(alone_walls)}")
     print(f"decode step carrying a prefill: {summary(joined_walls)}")
     print(f"prefill step alone: {summary(extend_walls)}; rows a step {alone_rows / max(len(extend_steps), 1):.2f}")
@@ -84,8 +121,7 @@ def main() -> None:
     if joined_walls and alone_walls and extend_walls:
         apart = statistics.fmean(alone_walls) + statistics.fmean(extend_walls)
         together = statistics.fmean(joined_walls)
-        print(f"one prefill and one decode: apart {apart:.2f} ms, joined {together:.2f} ms, saved {apart - together:.2f} ms a join")
-        print(f"saved in the window: {(apart - together) * len(joined_walls):.0f} ms of {(t1 - t0) / 1e6:.0f}")
+        print(f"step ranges only, leaving out a prefill's own admission and loop: apart {apart:.2f} ms, joined {together:.2f} ms, saved {apart - together:.2f} ms a join")
     else:
         pass
 
