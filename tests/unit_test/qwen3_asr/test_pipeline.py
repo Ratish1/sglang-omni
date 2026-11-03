@@ -161,6 +161,7 @@ def test_per_stream_queue_env_defaults(
         "PER_STREAM_QUEUE"
     )
     assert stage_env["SGLANG_ENABLE_METADATA_GLUE_GRAPH"] == "1"
+    assert stage_env["SGLANG_OPT_CUDA_GRAPH_FILL_FAST_PATH"] == "1"
     config.stage_named("asr").env["PER_STREAM_QUEUE"] = "0"
     assert config.resolved_stage_env_defaults("asr")["PER_STREAM_QUEUE"] == "0"
 

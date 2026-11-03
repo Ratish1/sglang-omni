@@ -112,6 +112,8 @@ class Qwen3ASRPipelineConfig(PipelineConfig):
     def resolved_stage_env_defaults(self, stage_name: str) -> dict[str, str]:
         env_defaults = super().resolved_stage_env_defaults(stage_name)
         env_defaults.setdefault("SGLANG_ENABLE_METADATA_GLUE_GRAPH", "1")
+        # note (ratish): short transcripts spend most of their steps at one row, where the small copy's per-pair host checks and the padding reset cost more than the replay's extra launch.
+        env_defaults.setdefault("SGLANG_OPT_CUDA_GRAPH_FILL_FAST_PATH", "1")
         return env_defaults
 
     @property
