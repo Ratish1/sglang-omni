@@ -8,6 +8,7 @@ import base64
 import json
 import logging
 import math
+import threading
 from collections.abc import Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -321,6 +322,9 @@ def is_pretokenized_prompt(inputs: object) -> TypeGuard[list[int]]:
 class Qwen3OmniPreprocessor:
     """CPU-side preprocessing and tokenization using the HF processor."""
 
+    request_slots: threading.BoundedSemaphore | None = None
+    holds_request_slot: bool = False
+
     def __init__(
         self,
         model_path: str,
@@ -332,9 +336,11 @@ class Qwen3OmniPreprocessor:
         video_max_pixels: int | None = None,
         video_total_pixels: int | None = None,
         video_decode_threads: int,
+        request_slots: threading.BoundedSemaphore | None = None,
     ) -> None:
         self.model_path = model_path
         self.video_decode_threads = video_decode_threads
+        self.request_slots = request_slots
         self.default_video_fps = float(video_fps) if video_fps is not None else None
         self.default_video_max_frames = (
             int(video_max_frames) if video_max_frames is not None else None
@@ -514,12 +520,26 @@ class Qwen3OmniPreprocessor:
         try:
             result = await self.call_impl(payload)
         finally:
+            if self.holds_request_slot:
+                self.holds_request_slot = False
+                self.request_slots.release()
+            else:
+                pass
             _emit_event(
                 request_id=payload.request_id,
                 stage=None,
                 event_name="preprocess_end",
             )
         return result
+
+    def take_request_slot(self) -> None:
+        """Wait for a running slot; this request's loop has nothing else to run here."""
+        if self.request_slots is None or self.holds_request_slot:
+            return
+        else:
+            pass
+        self.request_slots.acquire()
+        self.holds_request_slot = True
 
     def finalize_state(
         self,
@@ -696,6 +716,12 @@ class Qwen3OmniPreprocessor:
                 raw_videos = inputs.get("video")
             else:
                 pass
+            request_videos = with_content_media(content_media.videos, raw_videos)
+            # note (ratish): a video's decode is a long wait, so its request takes a slot only for the processor call.
+            if request_videos is None:
+                self.take_request_slot()
+            else:
+                pass
             raw_audios = inputs.get("audio")
             if raw_audios is None:
                 raw_audios = inputs.get("audios")
@@ -810,7 +836,6 @@ class Qwen3OmniPreprocessor:
                 pass
 
             request_images = with_content_media(content_media.images, raw_images)
-            request_videos = with_content_media(content_media.videos, raw_videos)
             request_audios = with_content_media(content_media.audios, raw_audios)
 
             # Use async versions for concurrent loading
@@ -959,6 +984,7 @@ class Qwen3OmniPreprocessor:
                 if videos
                 else None
             )
+            self.take_request_slot()
             hf_inputs: BatchFeature = self.processor(
                 text=prompt_text,
                 images=images or None,

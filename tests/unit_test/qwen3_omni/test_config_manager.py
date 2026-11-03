@@ -39,7 +39,7 @@ def test_preprocessing_cpu_policy_is_resolved_at_launch(
     capacity.assert_not_called()
 
     assert (
-        config.resolved_stage_env_defaults("preprocessing")["OMP_NUM_THREADS"] == "16"
+        config.resolved_stage_env_defaults("preprocessing")["OMP_NUM_THREADS"] == "10"
     )
     for stage in config.stages:
         if stage.name != "preprocessing":
@@ -51,9 +51,9 @@ def test_preprocessing_cpu_policy_is_resolved_at_launch(
 
     capacity.return_value = 6
     rebuilt = config_cls.model_validate(document)
-    assert config.resolved_stage_env_defaults("preprocessing")["OMP_NUM_THREADS"] == "3"
+    assert config.resolved_stage_env_defaults("preprocessing")["OMP_NUM_THREADS"] == "1"
     assert (
-        rebuilt.resolved_stage_env_defaults("preprocessing")["OMP_NUM_THREADS"] == "3"
+        rebuilt.resolved_stage_env_defaults("preprocessing")["OMP_NUM_THREADS"] == "1"
     )
     assert rebuilt.model_dump() == document
 

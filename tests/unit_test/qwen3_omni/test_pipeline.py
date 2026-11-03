@@ -6,9 +6,9 @@ import asyncio
 import base64
 import inspect
 import threading
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
-from copy import deepcopy
+from copy import copy, deepcopy
 from io import BytesIO
 from types import SimpleNamespace
 from typing import Protocol
@@ -2641,7 +2641,9 @@ def test_preprocessing_one_worker_runs_requests_one_at_a_time(
     monkeypatch.setattr(
         qwen_stages, "Qwen3OmniPreprocessor", lambda **_: Preprocessor()
     )
-    scheduler = qwen_stages.create_preprocessing_executor("model", max_concurrency=1)
+    scheduler = qwen_stages.create_preprocessing_executor(
+        "model", max_concurrency=1, max_running_requests=1
+    )
     worker = threading.Thread(target=scheduler.start, daemon=True)
     worker.start()
     try:
@@ -2677,7 +2679,9 @@ def test_preprocessing_pool_threads_each_run_their_own_preprocessor(
     monkeypatch.setattr(
         qwen_stages, "Qwen3OmniPreprocessor", lambda **_: Preprocessor()
     )
-    scheduler = qwen_stages.create_preprocessing_executor("model", max_concurrency=2)
+    scheduler = qwen_stages.create_preprocessing_executor(
+        "model", max_concurrency=2, max_running_requests=2
+    )
     worker = threading.Thread(target=scheduler.start, daemon=True)
     worker.start()
     try:
@@ -2705,6 +2709,180 @@ def test_preprocessing_pool_threads_each_run_their_own_preprocessor(
     assert all(len(threads) == 1 for threads in threads_by_preprocessor.values())
 
 
+def text_request(request_id: str) -> StagePayload:
+    return StagePayload(
+        request_id=request_id,
+        request=OmniRequest(
+            inputs={"messages": [{"role": "user", "content": "hello"}]}
+        ),
+        data={},
+    )
+
+
+def video_request(request_id: str) -> StagePayload:
+    return StagePayload(
+        request_id=request_id,
+        request=OmniRequest(
+            inputs={
+                "messages": [{"role": "user", "content": "hello"}],
+                "videos": ["https://media.invalid/clip.mp4"],
+            }
+        ),
+        data={},
+    )
+
+
+@pytest.mark.parametrize("build_request", [text_request, video_request])
+def test_preprocessing_runs_no_more_requests_than_its_slots(
+    decoded_audio_preprocessor: tuple[
+        preprocessor_mod.Qwen3OmniPreprocessor, dict, object
+    ],
+    build_request: Callable[[str], StagePayload],
+) -> None:
+    pre, _, _ = decoded_audio_preprocessor
+    both_running = threading.Barrier(2, timeout=5)
+    running_lock = threading.Lock()
+    running = 0
+    most_running = 0
+    failures: list[BaseException] = []
+
+    class Processor:
+        def apply_chat_template(self, *args: object, **kwargs: object) -> str:
+            return "prompt"
+
+        def __call__(self, **kwargs: object) -> dict[str, torch.Tensor]:
+            nonlocal running, most_running
+            with running_lock:
+                running += 1
+                most_running = max(most_running, running)
+            both_running.wait()
+            threading.Event().wait(0.02)
+            with running_lock:
+                running -= 1
+            return {"input_ids": torch.tensor([[1, 2]])}
+
+    request_slots = threading.BoundedSemaphore(2)
+
+    def run_request(request_id: str) -> None:
+        instance = copy(pre)
+        instance.processor = Processor()
+        instance.request_slots = request_slots
+        try:
+            asyncio.run(instance(build_request(request_id)))
+        except BaseException as exc:
+            failures.append(exc)
+
+    threads = [
+        threading.Thread(target=run_request, args=(f"request-{index}",))
+        for index in range(4)
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=10)
+
+    assert failures == []
+    assert most_running == 2
+    assert request_slots.acquire(blocking=False)
+    assert request_slots.acquire(blocking=False)
+    assert not request_slots.acquire(blocking=False)
+
+
+def test_preprocessing_video_decode_leaves_its_slot_to_other_requests(
+    decoded_audio_preprocessor: tuple[
+        preprocessor_mod.Qwen3OmniPreprocessor, dict, object
+    ],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pre, _, _ = decoded_audio_preprocessor
+    text_request_finished = threading.Event()
+    decode_started = threading.Event()
+    decode_saw_text_request_finish: list[bool] = []
+
+    class Processor:
+        def apply_chat_template(self, *args: object, **kwargs: object) -> str:
+            return "prompt"
+
+        def __call__(self, **kwargs: object) -> dict[str, torch.Tensor]:
+            return {"input_ids": torch.tensor([[1, 2]])}
+
+    async def video_loader(
+        raw: object, **kwargs: object
+    ) -> tuple[list[torch.Tensor], None, None]:
+        if raw:
+            decode_started.set()
+            decode_saw_text_request_finish.append(text_request_finished.wait(timeout=5))
+        else:
+            pass
+        return [], None, None
+
+    monkeypatch.setattr(preprocessor_mod, "ensure_video_list_async", video_loader)
+    request_slots = threading.BoundedSemaphore(1)
+
+    def run_request(payload: StagePayload) -> None:
+        instance = copy(pre)
+        instance.processor = Processor()
+        instance.request_slots = request_slots
+        asyncio.run(instance(payload))
+
+    video_thread = threading.Thread(
+        target=run_request, args=(video_request("video"),), daemon=True
+    )
+    video_thread.start()
+    assert decode_started.wait(timeout=5)
+    text_thread = threading.Thread(
+        target=run_request, args=(text_request("text"),), daemon=True
+    )
+    text_thread.start()
+    text_thread.join(timeout=4)
+    if not text_thread.is_alive():
+        text_request_finished.set()
+    else:
+        pass
+    video_thread.join(timeout=10)
+    text_thread.join(timeout=10)
+
+    assert decode_saw_text_request_finish == [True]
+    assert request_slots.acquire(blocking=False)
+
+
+@pytest.mark.parametrize("failing_step", ["processor", "video load"])
+def test_preprocessing_failed_request_returns_its_slot(
+    decoded_audio_preprocessor: tuple[
+        preprocessor_mod.Qwen3OmniPreprocessor, dict, object
+    ],
+    monkeypatch: pytest.MonkeyPatch,
+    failing_step: str,
+) -> None:
+    pre, _, _ = decoded_audio_preprocessor
+
+    class Processor:
+        def apply_chat_template(self, *args: object, **kwargs: object) -> str:
+            return "prompt"
+
+        def __call__(self, **kwargs: object) -> dict[str, torch.Tensor]:
+            raise RuntimeError("processor failed")
+
+    async def video_loader(
+        raw: object, **kwargs: object
+    ) -> tuple[list[torch.Tensor], None, None]:
+        if failing_step == "video load":
+            raise RuntimeError("video load failed")
+        else:
+            pass
+        return [], None, None
+
+    monkeypatch.setattr(preprocessor_mod, "ensure_video_list_async", video_loader)
+    pre.processor = Processor()
+    pre.request_slots = threading.BoundedSemaphore(1)
+
+    with pytest.raises(RuntimeError, match="failed"):
+        asyncio.run(pre(video_request("failing")))
+
+    assert not pre.holds_request_slot
+    assert pre.request_slots.acquire(blocking=False)
+
+
 def test_preprocessing_dispatch_preserves_results_errors_and_running_abort(monkeypatch):
     entered, release, finished = threading.Event(), threading.Event(), threading.Event()
 
@@ -2721,7 +2899,9 @@ def test_preprocessing_dispatch_preserves_results_errors_and_running_abort(monke
     monkeypatch.setattr(
         qwen_stages, "Qwen3OmniPreprocessor", lambda **_: Preprocessor()
     )
-    scheduler = qwen_stages.create_preprocessing_executor("model", max_concurrency=2)
+    scheduler = qwen_stages.create_preprocessing_executor(
+        "model", max_concurrency=2, max_running_requests=2
+    )
     worker = threading.Thread(target=scheduler.start, daemon=True)
     worker.start()
 
@@ -2982,7 +3162,9 @@ def test_threaded_preprocessing_loads_repeated_remote_images(monkeypatch):
     server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
     http_worker = threading.Thread(target=server.serve_forever, daemon=True)
     http_worker.start()
-    scheduler = qwen_stages.create_preprocessing_executor("model", max_concurrency=2)
+    scheduler = qwen_stages.create_preprocessing_executor(
+        "model", max_concurrency=2, max_running_requests=2
+    )
     worker = threading.Thread(target=scheduler.start, daemon=True)
     worker.start()
     try:

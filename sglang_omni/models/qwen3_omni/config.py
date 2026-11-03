@@ -41,10 +41,11 @@ ENABLE_TALKER_START_TOPOLOGY = False
 
 TALKER_MAX_RUNNING_REQUESTS = 32
 
-# note (ratish): two workers overlap one request's media decode and HF processor call with the next one's.
-PREPROCESSING_WORKERS = 2
+# note (ratish): a video decodes outside the running bound, so the stage holds more requests than it runs.
+PREPROCESSING_REQUEST_THREADS = 6
+PREPROCESSING_RUNNING_REQUESTS = 2
 
-# note (ratish): a torch op past its parallel grain wakes its thread's OpenMP team, so each worker's team is capped.
+# note (ratish): a torch op past its parallel grain wakes its thread's OpenMP team, so each thread's team is capped.
 PREPROCESSING_MAX_INTRAOP_THREADS = 16
 
 # SGLang reads this when DeepGEMM compile utilities are imported. Qwen AR
@@ -78,7 +79,10 @@ def preprocessing_stage(*, process: str, speech_enabled: bool = False) -> StageC
         name="preprocessing",
         process=process,
         factory_path=f"{_PKG}.stages.create_preprocessing_executor",
-        factory=FactoryArgs(max_concurrency=PREPROCESSING_WORKERS),
+        factory=FactoryArgs(
+            max_concurrency=PREPROCESSING_REQUEST_THREADS,
+            max_running_requests=PREPROCESSING_RUNNING_REQUESTS,
+        ),
         next=next_stages,
         route_fn=route_fn,
         project_payload={
@@ -393,7 +397,7 @@ class Qwen3OmniBasePipelineConfig(PipelineConfig):
     )
 
     def resolved_stage_env_defaults(self, stage_name: str) -> dict[str, str]:
-        """Split the CPUs over the preprocessing workers unless OMP is configured."""
+        """Split the CPUs over the preprocessing threads unless OMP is configured."""
         env_defaults = super().resolved_stage_env_defaults(stage_name)
         if stage_name == "preprocessing" and "OMP_NUM_THREADS" not in env_defaults:
             env_defaults["OMP_NUM_THREADS"] = str(
