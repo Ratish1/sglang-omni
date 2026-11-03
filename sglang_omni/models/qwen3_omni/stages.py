@@ -1016,13 +1016,18 @@ def create_preprocessing_executor(
     video_max_pixels: int | None = None,
     video_total_pixels: int | None = None,
     video_decode_threads: int | None = None,
+    max_videos_in_flight: int | None = None,
 ) -> (
     SimpleScheduler[StagePayload, StagePayload]
     | ThreadedSimpleScheduler[StagePayload, StagePayload]
 ):
     if video_decode_threads is None:
         video_decode_threads = automatic_video_decode_threads(
-            global_thread_pool._max_workers  # noqa: leading-underscore
+            min(
+                max_videos_in_flight
+                or global_thread_pool._max_workers,  # noqa: leading-underscore
+                global_thread_pool._max_workers,  # noqa: leading-underscore
+            )
         )
     else:
         pass
@@ -1056,6 +1061,10 @@ def create_preprocessing_executor(
 
     request_preprocessor.call_processor_on_thread = call_processor_on_thread
     request_preprocessor.request_gate = asyncio.Semaphore(max_concurrency)
+    if max_videos_in_flight is not None:
+        request_preprocessor.video_gate = asyncio.Semaphore(max_videos_in_flight)
+    else:
+        pass
     request_preprocessor.processor_executor = ThreadPoolExecutor(
         max_workers=max_concurrency,
         initializer=bind_thread_processor,

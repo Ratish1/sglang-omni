@@ -327,11 +327,17 @@ REQUEST_HOLDS_GATE: ContextVar[bool] = ContextVar(
 )
 
 
+REQUEST_HOLDS_VIDEO_GATE: ContextVar[bool] = ContextVar(
+    "qwen3_omni_preprocessing_request_holds_video_gate", default=False
+)
+
+
 class Qwen3OmniPreprocessor:
     """CPU-side preprocessing and tokenization using the HF processor."""
 
     processor_executor: ThreadPoolExecutor | None = None
     request_gate: asyncio.Semaphore | None = None
+    video_gate: asyncio.Semaphore | None = None
     call_processor_on_thread: Callable[..., BatchFeature] | None = None
 
     def __init__(
@@ -532,6 +538,11 @@ class Qwen3OmniPreprocessor:
                 self.request_gate.release()
             else:
                 pass
+            if REQUEST_HOLDS_VIDEO_GATE.get():
+                REQUEST_HOLDS_VIDEO_GATE.set(False)
+                self.video_gate.release()
+            else:
+                pass
             _emit_event(
                 request_id=payload.request_id,
                 stage=None,
@@ -730,6 +741,9 @@ class Qwen3OmniPreprocessor:
             # note (ratish): a video's decode is a long wait, so its request enters the gate only for the processor call.
             if request_videos is None:
                 await self.enter_request_gate()
+            elif self.video_gate is not None:
+                await self.video_gate.acquire()
+                REQUEST_HOLDS_VIDEO_GATE.set(True)
             else:
                 pass
             raw_audios = inputs.get("audio")
