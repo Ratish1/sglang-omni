@@ -5,11 +5,13 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import contextvars
 import json
 import logging
 import math
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
+from functools import partial
 from pathlib import Path
 from typing import TypedDict, TypeGuard
 
@@ -320,6 +322,9 @@ def is_pretokenized_prompt(inputs: object) -> TypeGuard[list[int]]:
 
 class Qwen3OmniPreprocessor:
     """CPU-side preprocessing and tokenization using the HF processor."""
+
+    processor_executor: ThreadPoolExecutor | None = None
+    call_processor_on_thread: Callable[..., BatchFeature] | None = None
 
     def __init__(
         self,
@@ -969,25 +974,37 @@ class Qwen3OmniPreprocessor:
                 if videos
                 else None
             )
-            _emit_event(
-                request_id=payload.request_id,
-                stage=None,
-                event_name="preprocess_processor_start",
-            )
-            hf_inputs: BatchFeature = self.processor(
-                text=prompt_text,
-                images=images or None,
-                videos=videos or None,
-                audio=audios or None,
-                add_special_tokens=False,
-                return_tensors="pt",
-                **processor_kwargs,
-            )
-            _emit_event(
-                request_id=payload.request_id,
-                stage=None,
-                event_name="preprocess_processor_end",
-            )
+
+            def call_processor() -> BatchFeature:
+                _emit_event(
+                    request_id=payload.request_id,
+                    stage=None,
+                    event_name="preprocess_processor_start",
+                )
+                processor_call = self.call_processor_on_thread or self.processor
+                result = processor_call(
+                    text=prompt_text,
+                    images=images or None,
+                    videos=videos or None,
+                    audio=audios or None,
+                    add_special_tokens=False,
+                    return_tensors="pt",
+                    **processor_kwargs,
+                )
+                _emit_event(
+                    request_id=payload.request_id,
+                    stage=None,
+                    event_name="preprocess_processor_end",
+                )
+                return result
+
+            if self.processor_executor is None:
+                hf_inputs: BatchFeature = call_processor()
+            else:
+                hf_inputs = await asyncio.get_running_loop().run_in_executor(
+                    self.processor_executor,
+                    partial(contextvars.copy_context().run, call_processor),
+                )
         video_cache_key = (
             video_cache_key_future.result()
             if video_cache_key_future is not None

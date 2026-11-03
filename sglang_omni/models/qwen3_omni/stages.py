@@ -8,11 +8,13 @@ Each factory returns either:
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import queue
 import threading
 from collections.abc import Callable, Mapping
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Literal, TypedDict
 
@@ -20,7 +22,7 @@ import torch
 import torch.nn.functional as F
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
-from transformers import AutoConfig
+from transformers import AutoConfig, BatchFeature
 
 from sglang_omni.models.qwen3_omni.bootstrap import create_thinker_scheduler
 from sglang_omni.models.qwen3_omni.components.audio_encoder import Qwen3OmniAudioEncoder
@@ -39,6 +41,7 @@ from sglang_omni.models.qwen3_omni.request_builders import (
     apply_encoder_result,
     build_encoder_request,
 )
+from sglang_omni.preprocessing.resource_connector import global_thread_pool
 from sglang_omni.profiler.event_recorder import emit as _emit_event
 from sglang_omni.proto import StagePayload
 from sglang_omni.scheduling.generation_batch_policy import (
@@ -1018,7 +1021,9 @@ def create_preprocessing_executor(
     | ThreadedSimpleScheduler[StagePayload, StagePayload]
 ):
     if video_decode_threads is None:
-        video_decode_threads = automatic_video_decode_threads(max(max_concurrency, 1))
+        video_decode_threads = automatic_video_decode_threads(
+            global_thread_pool._max_workers  # noqa: leading-underscore
+        )
     else:
         pass
 
@@ -1034,32 +1039,39 @@ def create_preprocessing_executor(
             video_decode_threads=video_decode_threads,
         )
 
-    if max_concurrency <= 1:
-        preprocessor = build_preprocessor()
-
-        async def _preprocess(payload: StagePayload) -> StagePayload:
-            return await preprocessor(payload)
-
-        return SimpleScheduler[StagePayload, StagePayload](_preprocess)
-    else:
-        pass
-
-    # note (ratish): every pool thread runs its own preprocessor and so its own HF processor, which is not promised to be thread safe.
-    idle_preprocessors: queue.SimpleQueue[Qwen3OmniPreprocessor] = queue.SimpleQueue()
+    # note (ratish): one loop runs every request's logic, so only the processor calls overlap, each on a private HF processor.
+    request_preprocessor = build_preprocessor()
+    idle_processors: queue.SimpleQueue[Callable[..., BatchFeature]] = (
+        queue.SimpleQueue()
+    )
     for _ in range(max_concurrency):
-        idle_preprocessors.put(build_preprocessor())
+        idle_processors.put(build_preprocessor().processor)
     thread_state = threading.local()
 
-    def bind_thread_preprocessor() -> None:
-        thread_state.preprocessor = idle_preprocessors.get_nowait()
+    def bind_thread_processor() -> None:
+        thread_state.processor = idle_processors.get_nowait()
 
-    async def preprocess_on_thread(payload: StagePayload) -> StagePayload:
-        return await thread_state.preprocessor(payload)
+    def call_processor_on_thread(**processor_arguments: object) -> BatchFeature:
+        return thread_state.processor(**processor_arguments)
+
+    request_preprocessor.call_processor_on_thread = call_processor_on_thread
+    request_preprocessor.processor_executor = ThreadPoolExecutor(
+        max_workers=max_concurrency,
+        initializer=bind_thread_processor,
+        thread_name_prefix="preprocessing-processor",
+    )
+    request_loop = asyncio.new_event_loop()
+    threading.Thread(
+        target=request_loop.run_forever, name="preprocessing-requests", daemon=True
+    ).start()
+
+    def dispatch_request(payload: StagePayload) -> Future[StagePayload]:
+        return asyncio.run_coroutine_threadsafe(
+            request_preprocessor(payload), request_loop
+        )
 
     return ThreadedSimpleScheduler[StagePayload, StagePayload](
-        preprocess_on_thread,
-        max_concurrency=max_concurrency,
-        thread_initializer=bind_thread_preprocessor,
+        None, max_concurrency=None, dispatch_fn=dispatch_request
     )
 
 
