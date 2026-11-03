@@ -15,6 +15,7 @@ from sglang_omni.model_runner.prefill_inputs import (
     OmniPrefillInputs,
     attach_omni_prefill_inputs,
 )
+from sglang_omni.profiler.spans import span
 from sglang_omni.scheduling.message import OutgoingMessage, put_messages
 from sglang_omni.scheduling.pending_text_queue import PendingTextTensorQueue
 from sglang_omni.scheduling.sglang_backend.request_data import (
@@ -118,8 +119,10 @@ class QwenTalkerModelRunner(ModelRunner["SGLangARRequestData"]):
         else:
             pass
 
-        self.model.prepare_decode_buffers(requests)
-        self.write_feedback_buffers(requests)
+        with span("omni.prepare_decode_buffers"):
+            self.model.prepare_decode_buffers(requests)
+        with span("omni.write_feedback"):
+            self.write_feedback_buffers(requests)
 
     def post_prefill(
         self,
@@ -149,12 +152,15 @@ class QwenTalkerModelRunner(ModelRunner["SGLangARRequestData"]):
             talker_hidden = talker_hidden.unsqueeze(1)
         else:
             pass
-        self.model.code_predictor_forward(layer0_codes, talker_hidden)
-        self.stage_token_ids(result, result.next_token_ids)
-        self.emit_code_chunks_and_feedback(
-            schedule_batch=schedule_batch,
-            requests=requests,
-        )
+        with span("omni.predictor"):
+            self.model.code_predictor_forward(layer0_codes, talker_hidden)
+        with span("omni.stage_tokens"):
+            self.stage_token_ids(result, result.next_token_ids)
+        with span("omni.emit"):
+            self.emit_code_chunks_and_feedback(
+                schedule_batch=schedule_batch,
+                requests=requests,
+            )
 
     def post_decode(
         self,

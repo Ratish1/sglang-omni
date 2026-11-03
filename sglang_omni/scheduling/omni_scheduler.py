@@ -93,7 +93,7 @@ from sglang_omni.profiler.event_recorder import (
     emit_model_path_start as _emit_model_path_start,
 )
 from sglang_omni.profiler.event_recorder import get_active_stage as _get_active_stage
-from sglang_omni.profiler.spans import span
+from sglang_omni.profiler.spans import rows_span, span
 from sglang_omni.proto.admin import (
     ADMIN_CONTINUE_GENERATION,
     ADMIN_DESTROY_WEIGHTS_UPDATE_GROUP,
@@ -1434,7 +1434,8 @@ class OmniScheduler(Generic[RequestDataT]):
         )
         session_unit = self.active_session_unit(req_id)
         if session_unit is None:
-            req_data = self.request_builder(payload)
+            with span("omni.build_request"):
+                req_data = self.request_builder(payload)
         else:
             bridge = self.session_bridge
             assert bridge is not None
@@ -3853,7 +3854,8 @@ class OmniScheduler(Generic[RequestDataT]):
             self.process_admin_requests()
             recv_reqs = self.recv_requests()
             recv_reqs.extend(self.take_deferred_request_payloads())
-            self.process_input_requests(recv_reqs)
+            with rows_span("omni.loop_admit", len(recv_reqs)):
+                self.process_input_requests(recv_reqs)
             if self._engine_paused:  # noqa: leading-underscore
                 self.process_admin_requests()
                 time.sleep(0.001)

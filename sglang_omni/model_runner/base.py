@@ -290,7 +290,8 @@ class ModelRunner(Generic[RequestDataInput]):
             result, "_host_token_ids_event", None
         )  # noqa: leading-underscore  # upstream spelling, or the public name is already taken
         if event is not None:
-            event.synchronize()
+            with span("omni.host_tokens_wait"):
+                event.synchronize()
             result._host_token_ids_event = None  # noqa: leading-underscore  # upstream spelling, or the public name is already taken
         else:
             pass
@@ -1116,17 +1117,20 @@ class ModelRunner(Generic[RequestDataInput]):
         schedule_batch: ScheduleBatch | None,
         requests: list[SchedulerRequest],
     ) -> torch.Tensor:
-        self.apply_codec_suppress_tokens(logits_output, requests)
-        self.process_sampling_logits(logits_output, requests)
+        with span("omni.suppress_write"):
+            self.apply_codec_suppress_tokens(logits_output, requests)
+        with span("omni.sampling_logits"):
+            self.process_sampling_logits(logits_output, requests)
         self.install_sampling_seeds(forward_batch, requests)
         wants_rollout_logprob = any(sr.data.return_logprob for sr in requests)
         if wants_rollout_logprob:
             self.enable_sampler_logprobs(forward_batch, len(requests))
         else:
             pass
-        next_token_ids = self.tp_worker.model_runner.sample(
-            logits_output, forward_batch
-        )
+        with span("omni.sampler"):
+            next_token_ids = self.tp_worker.model_runner.sample(
+                logits_output, forward_batch
+            )
         if wants_rollout_logprob:
             try:
                 next_token_logprobs = logits_output.next_token_logprobs
