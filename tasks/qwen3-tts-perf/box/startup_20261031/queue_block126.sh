@@ -57,4 +57,16 @@ tail_run() {
 tail_run tail0 0 $port &
 tail_run tail1 1 $((port + 400)) &
 wait
+port=$((port + 800))
+DESIGN=Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign
+DESIGN_ARGS="--task-type VoiceDesign --no-ref-audio --instructions=A_calm_adult_female_voice_speaking_clearly"
+design_seeded() {
+  local label=$1 tree=$2 card=$3 port=$4 seed=$5
+  (cd $K/inline_20261026 && ARM_ROOT=$W/arms timeout 3000 python3 serve_arm.py --label $label --tree $tree --card $card --port $port --concurrency 1 --no-stream --seed $seed --score \
+    --barrier $W/barrier_design_$seed --parties 2 --model $DESIGN "--bench-args=$DESIGN_ARGS" > $W/$label.out 2>&1)
+  echo "$label card $card exit $? $(date +%T); $(grep -hE 'WER \(corpus|Total errors|substitutions' $W/arms/$label/score--transcribe-only.log 2>/dev/null | tr -s ' ' | cut -c1-70 | tr '\n' ';'); tracebacks $(grep -c Traceback $W/arms/$label/serve.log 2>/dev/null)" >> $L
+}
+design_seeded design_main_1234 $MAIN 0 $port 1234 &
+design_seeded design_head_1234 $ARM 1 $((port + 400)) 1234 &
+wait
 echo "queue $BLOCK done $(date +%T)" >> $L
