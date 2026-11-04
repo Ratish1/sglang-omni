@@ -2575,18 +2575,12 @@ def test_qwen_video_cache_key_hash_ends_with_a_failed_request(
     pre, _, _ = decoded_audio_preprocessor
     trace: list[str] = []
     hash_started = threading.Event()
-    request_cleanup = threading.Event()
     compute_video_cache_key = preprocessor_mod.compute_video_cache_key
-
-    class RequestExecutor(ThreadPoolExecutor):
-        def shutdown(self, wait: bool = True, *, cancel_futures: bool = False) -> None:
-            request_cleanup.set()
-            super().shutdown(wait=wait, cancel_futures=cancel_futures)
 
     def video_cache_key(videos: list[torch.Tensor]) -> str | None:
         trace.append("hash started")
         hash_started.set()
-        request_cleanup.wait(timeout=10)
+        threading.Event().wait(0.1)
         key = compute_video_cache_key(videos)
         trace.append("hash finished")
         return key
@@ -2605,7 +2599,6 @@ def test_qwen_video_cache_key_hash_ends_with_a_failed_request(
         trace.append("processor failed")
         raise RuntimeError("processor failed")
 
-    monkeypatch.setattr(preprocessor_mod, "ThreadPoolExecutor", RequestExecutor)
     with pytest.raises(RuntimeError, match="processor failed"):
         run_video_request(
             pre, monkeypatch, torch.zeros(4, 3, 2, 2), process, video_cache_key
@@ -2940,6 +2933,58 @@ def test_preprocessing_failed_request_returns_its_slots(
 
     assert not pre.request_limits.running_slots.locked()
     assert not pre.request_limits.video_slots.locked()
+
+
+def test_preprocessing_failed_request_waits_for_its_hash_off_the_event_loop(
+    decoded_audio_preprocessor: tuple[
+        preprocessor_mod.Qwen3OmniPreprocessor, dict[str, object], object
+    ],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pre, _, _ = decoded_audio_preprocessor
+    loop_progressed = threading.Event()
+    hash_outcomes: list[bool] = []
+
+    def video_cache_key(videos: list[torch.Tensor]) -> str | None:
+        hash_outcomes.append(loop_progressed.wait(timeout=2))
+        return "key"
+
+    async def video_loader(
+        raw: object, **arguments: object
+    ) -> tuple[list[torch.Tensor], list[float] | None, None]:
+        if raw:
+            return [torch.zeros(4, 3, 2, 2)], [2.0], None
+        else:
+            return [], None, None
+
+    def call_processor(**arguments: object) -> dict[str, torch.Tensor]:
+        raise RuntimeError("processor failed")
+
+    monkeypatch.setattr(preprocessor_mod, "compute_video_cache_key", video_cache_key)
+    monkeypatch.setattr(preprocessor_mod, "ensure_video_list_async", video_loader)
+
+    async def run_requests() -> None:
+        request = asyncio.create_task(pre(video_request("failing")))
+        while not request.done():
+            await asyncio.sleep(0.01)
+            if pre.request_limits.running_slots.locked():
+                await asyncio.sleep(0.05)
+                loop_progressed.set()
+            else:
+                pass
+        with pytest.raises(RuntimeError, match="processor failed"):
+            request.result()
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        pre.request_limits = request_limits_for(
+            running_slots=1,
+            video_slots=1,
+            processor_executor=executor,
+            call_processor_on_thread=call_processor,
+        )
+        asyncio.run(run_requests())
+
+    assert hash_outcomes == [True]
 
 
 def test_preprocessing_requests_see_the_stage_bound_to_the_scheduler_thread(

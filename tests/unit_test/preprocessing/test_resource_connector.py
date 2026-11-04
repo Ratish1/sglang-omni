@@ -14,10 +14,13 @@ zero load_file calls.
 from __future__ import annotations
 
 import asyncio
+import threading
 from pathlib import Path
 
+import numpy as np
 import pytest
 
+from sglang_omni.preprocessing import audio as audio_module
 from sglang_omni.preprocessing import resource_connector
 from sglang_omni.preprocessing.audio import ensure_audio_list_async
 from sglang_omni.preprocessing.base import MediaIO
@@ -138,3 +141,32 @@ def test_file_url_rejection_never_reaches_media_io(tmp_path: Path) -> None:
         connector.load_resource(traversal_url, media_io)
 
     assert media_io.loaded_paths == []
+
+
+def test_local_audio_decode_leaves_the_event_loop_to_other_requests(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    audio_path = tmp_path / "long.wav"
+    audio_path.write_bytes(b"RIFF")
+    monkeypatch.setenv(resource_connector.ALLOWED_LOCAL_MEDIA_PATH_ENV, str(tmp_path))
+    monkeypatch.setenv(resource_connector.ALLOWED_MEDIA_DOMAINS_ENV, "")
+    resource_connector.export_media_policy(str(tmp_path), [])
+    loop_progressed = threading.Event()
+
+    def load_audio_path(path: Path, *, target_sr: int) -> np.ndarray:
+        assert loop_progressed.wait(timeout=2), "the decode held the event loop"
+        return np.zeros(4, dtype=np.float32)
+
+    monkeypatch.setattr(audio_module, "load_audio_path", load_audio_path)
+
+    async def run_requests() -> list[object]:
+        decode = asyncio.create_task(
+            ensure_audio_list_async(
+                [str(audio_path)], resource_connector=MultiModalResourceConnector()
+            )
+        )
+        await asyncio.sleep(0)
+        loop_progressed.set()
+        return await decode
+
+    assert len(asyncio.run(run_requests())) == 1
