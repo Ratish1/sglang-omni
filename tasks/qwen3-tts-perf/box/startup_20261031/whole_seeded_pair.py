@@ -26,19 +26,23 @@ def main() -> None:
     parser.add_argument("--port", type=int, default=16000)
     parser.add_argument("--seed", type=int, default=1234)
     parser.add_argument("--no-streaming", action="store_true")
+    parser.add_argument("--compare-only", action="store_true", help="read the scored files already under --root")
     args = parser.parse_args()
     args.root.mkdir(parents=True, exist_ok=True)
     print(f"model {MODEL} seed {args.seed}", flush=True)
-    runs = [("c1n", 1, args.seed, False)] if args.no_streaming else [("c1n", 1, args.seed, False), ("c1s", 1, args.seed, True)]
-    serve_phase("seeded", [("base", args.base, 0, args.port), ("arm", args.arm, 1, args.port + 200)], runs, args.root)
-    for run, _, _, _ in runs:
-        base, arm = audio_hashes(args.root / run / "base"), audio_hashes(args.root / run / "arm")
-        print(f"{run}: byte identical {sum(base[name] == arm.get(name) for name in base)} of {len(base)} ({len(arm)} in the arm)", flush=True)
-    with concurrent.futures.ThreadPoolExecutor(2) as pool:
-        list(pool.map(
-            lambda job: score_card(job[0], job[1], job[2], [args.root / "c1n" / job[3]], args.root),
-            [(0, args.port + 400, args.base, "base"), (1, args.port + 600, args.arm, "arm")],
-        ))
+    if not args.compare_only:
+        runs = [("c1n", 1, args.seed, False)] if args.no_streaming else [("c1n", 1, args.seed, False), ("c1s", 1, args.seed, True)]
+        serve_phase("seeded", [("base", args.base, 0, args.port), ("arm", args.arm, 1, args.port + 200)], runs, args.root)
+        for run, _, _, _ in runs:
+            base, arm = audio_hashes(args.root / run / "base"), audio_hashes(args.root / run / "arm")
+            print(f"{run}: byte identical {sum(base[name] == arm.get(name) for name in base)} of {len(base)} ({len(arm)} in the arm)", flush=True)
+        with concurrent.futures.ThreadPoolExecutor(2) as pool:
+            list(pool.map(
+                lambda job: score_card(job[0], job[1], job[2], [args.root / "c1n" / job[3]], args.root),
+                [(0, args.port + 400, args.base, "base"), (1, args.port + 600, args.arm, "arm")],
+            ))
+    else:
+        pass
     base_sim, base_wer = load(args.root / "c1n" / "base")
     arm_sim, arm_wer = load(args.root / "c1n" / "arm")
     keys = sorted(set(base_sim) & set(arm_sim))
