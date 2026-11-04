@@ -321,9 +321,13 @@ async def ensure_audio_list_async(
                     url_indices.append(idx)
                     normalized.append(None)  # note (Teery): Placeholder
                 else:
-                    # note (Teery): Local path - can be loaded synchronously
+                    # note (ratish): a long file decodes for seconds, and the event loop may serve other requests.
                     path = resource_connector.local_media_path(item)
-                    normalized.append(load_audio_path(path, target_sr=target_sr))
+                    normalized.append(
+                        await asyncio.to_thread(
+                            load_audio_path, path, target_sr=target_sr
+                        )
+                    )
             else:
                 # note (Teery): Already processed (numpy array, etc.)
                 normalized.append(item)
