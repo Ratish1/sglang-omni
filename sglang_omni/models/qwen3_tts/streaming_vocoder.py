@@ -6,11 +6,12 @@ import asyncio
 import bisect
 import contextlib
 import inspect
+import json
 import logging
 import queue
 import threading
 import time
-from collections import deque
+from collections import Counter, deque
 from collections.abc import Iterable, Iterator, Sequence
 from dataclasses import dataclass, field
 from itertools import count
@@ -1057,6 +1058,18 @@ class Qwen3TTSStreamingVocoderScheduler(
             queue.Queue()
         )
         self.whole_request_rows: deque[tuple[str, Qwen3TTSStreamState]] = deque()
+        self.probe_row_enqueued: dict[str, float] = {}
+        self.probe_slot_waits: list[float] = []
+        self.probe_live_rows: Counter[int] = Counter()
+        self.probe_rows_with_slots: Counter[int] = Counter()
+        self.probe_groups: Counter[str] = Counter()
+        self.probe_plans = 0
+        self.probe_binding_plans = 0
+        self.probe_blocked_rows = 0
+        self.probe_busy_s = 0.0
+        self.probe_first_replay_s = 0.0
+        self.probe_last_replay_s = 0.0
+        self.probe_last_log_s = 0.0
         self.followup_queue: queue.PriorityQueue[
             tuple[float, int, str, Qwen3TTSStreamState | None]
         ] = queue.PriorityQueue()
@@ -2931,15 +2944,57 @@ class Qwen3TTSStreamingVocoderScheduler(
             if entry[1].whole_audio is None or entry[1].incremental_codec_fallback:
                 first_chunks.append(entry)
             else:
+                self.probe_row_enqueued[entry[0]] = time.monotonic()
                 self.whole_request_rows.append(entry)
         if first_chunks:
             self.run_initial_batch(first_chunks)
         else:
             pass
         if self.whole_request_rows:
+            started = time.monotonic()
             self.run_whole_request_replay(*self.plan_whole_request_replay())
+            self.probe_note_replay(started, time.monotonic())
         else:
             pass
+
+    def probe_note_replay(self, started: float, ended: float) -> None:
+        self.probe_busy_s += ended - started
+        self.probe_first_replay_s = self.probe_first_replay_s or started
+        self.probe_last_replay_s = ended
+        if ended - self.probe_last_log_s < 2.0:
+            return
+        else:
+            pass
+        self.probe_last_log_s = ended
+        waits = sorted(self.probe_slot_waits)
+        logger.warning(
+            "WHOLE_SLOTS %s",
+            json.dumps(
+                {
+                    "limit": self.initial_max_batch_size,
+                    "arena_slots": self.codec_arena.num_slots,
+                    "plans": self.probe_plans,
+                    "binding_plans": self.probe_binding_plans,
+                    "blocked_rows": self.probe_blocked_rows,
+                    "busy_s": round(self.probe_busy_s, 3),
+                    "span_s": round(ended - self.probe_first_replay_s, 3),
+                    "live_rows": sorted(self.probe_live_rows.items()),
+                    "rows_with_slots": sorted(self.probe_rows_with_slots.items()),
+                    "groups": sorted(self.probe_groups.items()),
+                    "slot_waits": len(waits),
+                    "slot_wait_mean_ms": (
+                        round(1000 * sum(waits) / len(waits), 2) if waits else 0.0
+                    ),
+                    "slot_wait_p50_ms": (
+                        round(1000 * waits[len(waits) // 2], 2) if waits else 0.0
+                    ),
+                    "slot_wait_p99_ms": (
+                        round(1000 * waits[len(waits) * 99 // 100], 2) if waits else 0.0
+                    ),
+                    "slot_wait_max_ms": round(1000 * waits[-1], 2) if waits else 0.0,
+                }
+            ),
+        )
 
     def plan_whole_request_replay(
         self,
@@ -3003,6 +3058,10 @@ class Qwen3TTSStreamingVocoderScheduler(
                         pass
                     state.codec_slot = slot
                     rows_with_slots += 1
+                    self.probe_slot_waits.append(
+                        time.monotonic()
+                        - self.probe_row_enqueued.pop(request_id, time.monotonic())
+                    )
                     if state.codec_frame_position:
                         self.codec_arena.start_slot(slot, state.codec_frame_position)
                     else:
@@ -3039,6 +3098,18 @@ class Qwen3TTSStreamingVocoderScheduler(
                 )
             self.whole_request_rows = waiting_rows
             self.mark_codec_slots_in_flight([entry[2].slot for entry in group])
+            blocked_rows = sum(row[1].codec_slot is None for row in waiting_rows)
+            self.probe_plans += 1
+            self.probe_live_rows[len(live_rows)] += 1
+            self.probe_rows_with_slots[rows_with_slots] += 1
+            self.probe_groups[
+                f"{'tail' if group_tail_runner else 'window'}{group[0][2].fresh_frames if group else 0}x{len(group)}"
+            ] += 1
+            if rows_with_slots == self.initial_max_batch_size and blocked_rows:
+                self.probe_binding_plans += 1
+                self.probe_blocked_rows += blocked_rows
+            else:
+                pass
         return (group, group_tail_runner)
 
     def run_whole_request_replay(
