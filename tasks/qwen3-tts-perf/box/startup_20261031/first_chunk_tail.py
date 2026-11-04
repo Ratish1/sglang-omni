@@ -13,6 +13,7 @@ import json
 import statistics
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import httpx
@@ -26,6 +27,8 @@ from long_stream_client import start_server  # noqa: E402
 from seeded_tail import bench, identity, stop_group, wait_healthy  # noqa: E402
 
 CONCURRENCY_PER_CLIENT = 8
+EVENT_BUFFER_CAPACITY = 4_000_000
+EVENT_WRITE_TIMEOUT_S = 300
 FIRST_CHUNK_SENT = ("vocoder", "stage_first_stream_chunk_sent")
 LAUNCHED = "qwen3_tts_vocoder_decode_launched"
 RESOLVED = "qwen3_tts_vocoder_decode_resolved"
@@ -39,6 +42,19 @@ def run_long(harness: str, port: int, requests: int, out: Path) -> str:
     )
     lines = [line for line in done.stdout.splitlines() if " of " in line and " ok;" in line]
     return lines[-1] if lines else f"long client rc {done.returncode}: {done.stderr[-300:]}"
+
+
+def wait_for_event_files(event_dir: Path) -> None:
+    """A stop does not wait for the writers, and each process writes its status file after its last event."""
+    deadline = time.monotonic() + EVENT_WRITE_TIMEOUT_S
+    while time.monotonic() < deadline:
+        if len(list(event_dir.glob("run_status_*.json"))) >= len(list(event_dir.glob("events_*.jsonl"))):
+            break
+        else:
+            time.sleep(1)
+    for path in sorted(event_dir.glob("run_status_*.json")):
+        status = json.loads(path.read_text())
+        print(f"{path.name}: {status['written_events']} written, {status['dropped_events']} dropped, stages {status['stages']}", flush=True)
 
 
 def read_events(event_dir: Path) -> list[dict]:
@@ -131,6 +147,7 @@ def main() -> None:
         wait_healthy(args.port, server)
         httpx.post(f"http://127.0.0.1:{args.port}/start_profile", timeout=60, trust_env=False, json={
             "run_id": "tail", "event_dir": str(args.root / "events"), "enable_torch": False,
+            "event_buffer_capacity": EVENT_BUFFER_CAPACITY,
         }).raise_for_status()
         with concurrent.futures.ThreadPoolExecutor(2) as pool:
             stream_job = pool.submit(bench, args.tree, args.port, args.root / "stream", CONCURRENCY_PER_CLIENT, None, True)
@@ -143,6 +160,7 @@ def main() -> None:
             long_line = long_job.result() if long_job is not None else long_line
         httpx.post(f"http://127.0.0.1:{args.port}/stop_profile", json={"run_id": "tail"}, timeout=600,
                    trust_env=False).raise_for_status()
+        wait_for_event_files(args.root / "events")
     finally:
         stop_group(server, args.port)
     stream = json.loads((args.root / "stream" / "bench" / "speed_results.json").read_text())["summary"]
