@@ -100,7 +100,8 @@ def main():
     else:
         programs = counters["stats"]["unique_graphs"]
         shapes = sorted(decoder.compiled_shapes)
-    result = {"build_s": round(build_s, 2), "programs": programs, "compiled_shapes": shapes, "keys": {}}
+    result = {"build_s": round(build_s, 2), "programs": programs, "compiled_shapes": shapes, "keys": {},
+              "memory": {name: runner.memory_stats for name, runner, _ in runners}, "arena_bytes": scheduler.codec_arena.total_bytes}
     waveforms = {}
     for name, runner, only_width in runners:
         for key in sorted(runner.graphs, key=lambda item: (item.fresh_frames, item.batch_bucket)):
