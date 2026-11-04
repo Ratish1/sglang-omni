@@ -58,6 +58,8 @@ class MossTranscribeDiarizePipelineConfig(PipelineConfig):
             name="asr",
             process="asr",
             factory_path=f"{_PKG}.stages.create_sglang_moss_transcribe_diarize_executor",
+            # note (ratish): plain positions leave one dense integer copy per decode step, so its host checks can go.
+            env={"SGLANG_OPT_CUDA_GRAPH_FILL_FAST_PATH": "1"},
             factory=MossTDFactoryArgs(
                 encoder_cache_size_bytes=4 * 1024**3,
                 encoder_max_batch_size=_ENCODER_MAX_BATCH_SIZE,

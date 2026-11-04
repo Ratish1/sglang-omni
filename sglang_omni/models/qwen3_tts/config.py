@@ -103,6 +103,8 @@ class Qwen3TTSPipelineConfig(PipelineConfig):
             process="pipeline",
             factory_path=f"{_PKG}.stages.create_sglang_tts_engine_executor",
             factory=FactoryArgs(dtype="bfloat16"),
+            # note (ratish): plain positions leave one dense integer copy per decode step, so its host checks can go.
+            env={"SGLANG_OPT_CUDA_GRAPH_FILL_FAST_PATH": "1"},
             gpu=0,
             next="vocoder",
             stream_to=["vocoder"],

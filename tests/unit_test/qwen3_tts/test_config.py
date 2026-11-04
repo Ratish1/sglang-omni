@@ -16,6 +16,13 @@ from sglang_omni.serve.speech_service import SpeechRequestValidator
 from sglang_omni.utils.imports import import_string
 
 
+def test_engine_stage_takes_the_graph_fill_fast_path() -> None:
+    config = Qwen3TTSPipelineConfig(model_path="model")
+
+    stage_env = config.resolved_stage_env_defaults("tts_engine")
+    assert stage_env["SGLANG_OPT_CUDA_GRAPH_FILL_FAST_PATH"] == "1"
+
+
 @pytest.mark.parametrize("use_npu", [True, False])
 def test_vocoder_platform_default_keeps_npu_opt_in(
     monkeypatch: pytest.MonkeyPatch, use_npu: bool

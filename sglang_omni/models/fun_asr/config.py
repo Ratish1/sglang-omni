@@ -43,6 +43,8 @@ class FunASRPipelineConfig(PipelineConfig):
             name="asr",
             process="asr",
             factory_path=f"{_PKG}.stages.create_sglang_fun_asr_executor",
+            # note (ratish): plain positions leave one dense integer copy per decode step, so its host checks can go.
+            env={"SGLANG_OPT_CUDA_GRAPH_FILL_FAST_PATH": "1"},
             gpu=0,
             terminal=True,
         )

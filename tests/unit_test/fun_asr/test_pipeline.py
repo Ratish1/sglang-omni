@@ -18,6 +18,13 @@ from sglang_omni.models.fun_asr.config import FunASRPipelineConfig
 from sglang_omni.models.registry import PIPELINE_CONFIG_REGISTRY
 
 
+def test_asr_stage_takes_the_graph_fill_fast_path() -> None:
+    config = FunASRPipelineConfig(model_path="FunAudioLLM/Fun-ASR-Nano-2512-hf")
+
+    stage_env = config.resolved_stage_env_defaults("asr")
+    assert stage_env["SGLANG_OPT_CUDA_GRAPH_FILL_FAST_PATH"] == "1"
+
+
 def test_fun_asr_config_uses_batched_stage_with_64_running_requests() -> None:
     config = FunASRPipelineConfig(model_path="FunAudioLLM/Fun-ASR-Nano-2512-hf")
 

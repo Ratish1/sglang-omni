@@ -159,6 +159,17 @@ def test_moss_transcribe_diarize_omp_default_tracks_request_workers(
     assert calls[-1] == (expected_workers, 8)
 
 
+def test_asr_stage_takes_the_graph_fill_fast_path() -> None:
+    from sglang_omni.models.moss_transcribe_diarize.config import (
+        MossTranscribeDiarizePipelineConfig,
+    )
+
+    config = MossTranscribeDiarizePipelineConfig(model_path="dummy")
+
+    stage_env = config.resolved_stage_env_defaults("asr")
+    assert stage_env["SGLANG_OPT_CUDA_GRAPH_FILL_FAST_PATH"] == "1"
+
+
 def test_moss_transcribe_diarize_preserves_explicit_omp_default(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
