@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# 11-05, node-0000, after q1105_fp2: the rest of #3451's arm b6309c620 against main. Seeded c1 byte identity first, since the arm
+# 11-05, node-0000, after q1105_fp3: the rest of #3451's arm b6309c620 against main. Seeded c1 byte identity first, since the arm
 # only moves a wait. Then the default h200 config, the unseeded h100_bf16 config, and two-card c64 and c16.
 set -u
 O=/data/rp1105
@@ -10,7 +10,7 @@ CPUS0=0-55,112-167 CPUS1=56-111,168-223
 log() { echo "$* $(date -u +%T)" >> $O/queue.log; }
 cpus() { if [ "$1" = 0 ]; then echo $CPUS0; else echo $CPUS1; fi; }
 port() { if [ "$1" = 0 ]; then echo 28400; else echo 28800; fi; }
-until grep -q "q1105_fp2 done" $O/queue.log 2>/dev/null; do sleep 15; done
+until grep -q "q1105_fp3 done" $O/queue.log 2>/dev/null; do sleep 15; done
 identity() {
   local name=$1 tree=$2 card=$3
   log "boot $name $(git -C $tree rev-parse --short HEAD) seeded c1 card $card start"
