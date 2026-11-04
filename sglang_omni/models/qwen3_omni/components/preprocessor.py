@@ -1002,15 +1002,19 @@ class Qwen3OmniPreprocessor:
         else:
             pass
 
-        # note (ratish): the video key only tags the encoder inputs, and the HF processor reads float32 frames without writing them, so the request's own thread hashes them while the processor runs; leaving the block waits for the hash on every exit.
-        with ThreadPoolExecutor(
-            max_workers=1, thread_name_prefix="qwen3-omni-video-cache-key"
-        ) as video_cache_key_executor:
-            video_cache_key_future = (
-                video_cache_key_executor.submit(compute_video_cache_key, videos)
-                if videos
-                else None
+        # note (ratish): the video key only tags the encoder inputs, and the HF processor reads float32 frames without writing them, so a thread hashes them while the processor runs; every exit waits for the hash without holding the loop.
+        video_cache_key_future = (
+            asyncio.get_running_loop().run_in_executor(
+                None, compute_video_cache_key, videos
             )
+            if videos
+            else None
+        )
+
+        async def finish_video_hash() -> None:
+            await asyncio.gather(video_cache_key_future, return_exceptions=True)
+
+        try:
             await self.take_running_slot()
             call_processor = partial(
                 (
@@ -1033,6 +1037,11 @@ class Qwen3OmniPreprocessor:
                     self.request_limits.processor_executor,
                     partial(copy_context().run, call_processor),
                 )
+        finally:
+            if video_cache_key_future is not None:
+                await await_media_cleanup(finish_video_hash())
+            else:
+                pass
         video_cache_key = (
             video_cache_key_future.result()
             if video_cache_key_future is not None
