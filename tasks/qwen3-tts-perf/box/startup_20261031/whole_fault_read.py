@@ -1,15 +1,17 @@
-"""A whole request whose window replay fails partway, on the real codec. For each case decodes the same random valid codes clean,
-then with the failure, and prints whether the request completed, the samples before the failure against the clean run, the rest's
-relative L2 against the clean run, and the largest sample step at the join against the clean run's steps. Random codes test the
-mechanics, not speech. The last case tears the graphs down as a real replay failure does.
+"""A whole request whose window replay fails partway, on the real codec. For each case decodes the same codes clean, then with the
+failure, and prints whether the request completed, the samples before the failure against the clean run, the rest's relative L2
+against the clean run, and the sample step at the join against the clean run's steps. The codes are the tree's reference recordings
+encoded by the codec and repeated to length, so they are speech. The last case tears the graphs down as a real replay failure does.
 
 usage: cd TREE && PYTHONPATH=TREE python3 whole_fault_read.py
 """
 
 import asyncio
 import json
+from pathlib import Path
 
 import numpy as np
+import soundfile
 import torch
 
 from sglang_omni.models.qwen3_tts.compat import apply_qwen_tts_transformers_compatibility_patches
@@ -21,7 +23,15 @@ from sglang_omni.scheduling.message import IncomingMessage
 apply_qwen_tts_transformers_compatibility_patches()
 from qwen_tts import Qwen3TTSTokenizer  # noqa: E402
 
-CASES = ((301, 0, 2, False), (129, 400, 3, False), (2047, 0, 5, False), (301, 0, 3, True))
+CASES = ((301, 0, 2, False), (129, 400, 2, False), (2047, 0, 5, False), (301, 0, 3, True))
+
+
+def speech_codes(tokenizer) -> torch.Tensor:
+    pieces = []
+    for path in sorted((Path.cwd() / "docs/_static/audio").glob("*.wav")):
+        samples, sample_rate = soundfile.read(path, dtype="float32", always_2d=True)
+        pieces.append(tokenizer.encode(samples.mean(axis=1), sr=sample_rate).audio_codes[0].cpu())
+    return torch.cat(pieces, dim=0)
 
 
 def message(request_id: str, codes: torch.Tensor, reference_frames: int) -> IncomingMessage:
@@ -67,11 +77,12 @@ def main() -> None:
     loop = asyncio.new_event_loop()
     runner = scheduler.initial_window_decode_graphs
     real_decode_slots = runner.decode_slots
-    generator = torch.Generator().manual_seed(3477)
-    quantizers = scheduler.decoder.config.num_quantizers
-    codebook_size = scheduler.decoder.config.codebook_size
+    with torch.inference_mode():
+        speech = speech_codes(tokenizer)
+    print(json.dumps({"speech_frames": speech.shape[0], "quantizers": speech.shape[1]}), flush=True)
     for index, (generated, reference_frames, failed_replay, disables) in enumerate(CASES):
-        codes = torch.randint(codebook_size, (generated + reference_frames, quantizers), generator=generator)
+        frames = generated + reference_frames
+        codes = speech.repeat(frames // speech.shape[0] + 1, 1)[:frames].clone()
         with torch.inference_mode(), torch.cuda.stream(scheduler.decode_stream):
             clean, error = decode(scheduler, loop, f"clean-{index}", codes, reference_frames)
             assert error is None, error
@@ -101,6 +112,7 @@ def main() -> None:
             continue
         else:
             pass
+        assert emitted_before_failure, "the failed replay was never reached"
         join = emitted_before_failure[0] * scheduler.samples_per_frame
         rest = faulted[join:].astype(np.float64) - clean[join:].astype(np.float64)
         steps = np.abs(np.diff(clean))
