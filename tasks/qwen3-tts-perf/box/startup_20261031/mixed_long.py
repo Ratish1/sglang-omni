@@ -9,6 +9,7 @@ usage: python3 mixed_long.py --a LABEL=TREE --b LABEL=TREE --harness TREE --root
 import argparse
 import concurrent.futures
 import json
+import shlex
 import subprocess
 import sys
 from pathlib import Path
@@ -22,9 +23,9 @@ CONCURRENCY_PER_CLIENT = 8
 HERE = Path(__file__).resolve().parent
 
 
-def run_long(harness: str, port: int, requests: int, out: Path, label: str) -> str:
+def run_long(harness: str, port: int, requests: int, out: Path, label: str, concurrency: int = CONCURRENCY_PER_CLIENT) -> str:
     done = subprocess.run(
-        [sys.executable, str(HERE / "long_stream_client.py"), "--port", str(port), "--concurrency", str(CONCURRENCY_PER_CLIENT),
+        [sys.executable, str(HERE / "long_stream_client.py"), "--port", str(port), "--concurrency", str(concurrency),
          "--requests", str(requests), "--harness", harness, "--out", str(out), "--label", label, "--no-stream"],
         capture_output=True, text=True, check=False,
     )
@@ -42,7 +43,11 @@ def main() -> None:
     parser.add_argument("--port", type=int, default=18000)
     parser.add_argument("--long-requests", type=int, default=32)
     parser.add_argument("--short-no-stream", action="store_true", help="SeedTTS's requests non-streaming too: read their latency")
+    parser.add_argument("--long-concurrency", type=int, default=CONCURRENCY_PER_CLIENT)
+    parser.add_argument("--a-serve-args", default="")
+    parser.add_argument("--b-serve-args", default="")
     args = parser.parse_args()
+    serve_args = [tuple(shlex.split(value)) for value in (args.a_serve_args, args.b_serve_args)]
     arms = [tuple(value.split("=", 1)) for value in (args.a, args.b)]
     # note: SeedTTS's references sit in a temporary directory and the long requests' in the harness tree
     media_root = Path("/")
@@ -54,9 +59,9 @@ def main() -> None:
         servers = []
         long_lines = {}
         try:
-            for label, tree, card, arm_port in placed:
-                print(f"{order} {label}: card {card} port {arm_port} {identity(tree)}", flush=True)
-                servers.append((start_server(tree, card, arm_port, media_root, root / f"serve_{label}.log"), arm_port))
+            for (label, tree, card, arm_port), extra_args in zip(placed, serve_args):
+                print(f"{order} {label}: card {card} port {arm_port} {identity(tree)} {' '.join(extra_args)}", flush=True)
+                servers.append((start_server(tree, card, arm_port, media_root, root / f"serve_{label}.log", extra_args), arm_port))
             for server, arm_port in servers:
                 wait_healthy(arm_port, server)
             with concurrent.futures.ThreadPoolExecutor(2 * len(placed)) as pool:
@@ -65,7 +70,7 @@ def main() -> None:
                     for label, tree, _, arm_port in placed
                 ]
                 long_jobs = {
-                    label: pool.submit(run_long, args.harness, arm_port, args.long_requests, root / label / "long", label)
+                    label: pool.submit(run_long, args.harness, arm_port, args.long_requests, root / label / "long", label, args.long_concurrency)
                     for label, _, _, arm_port in placed
                 }
                 for job in stream_jobs:

@@ -104,11 +104,11 @@ def stress_bodies(harness: str, requests: int, stream: bool = True) -> list[dict
     return [request_body(harness, index, texts[index % len(texts)], reference, reference_text, stream) for index in range(requests)]
 
 
-def start_server(tree: str, card: int, port: int, media_root: Path, log: Path) -> subprocess.Popen:
+def start_server(tree: str, card: int, port: int, media_root: Path, log: Path, extra_args: tuple[str, ...] = ()) -> subprocess.Popen:
     env = dict(os.environ, PYTHONPATH=tree, SGLANG_OMNI_STRICT_PORT="1")
     command = [sys.executable, "-m", "sglang_omni.cli", "serve", "--model-path", MODEL, "--host", "127.0.0.1",
                "--port", str(port), "--tts_engine.gpu", str(card), "--vocoder.gpu", str(card),
-               "--allowed-local-media-path", str(media_root)]
+               "--allowed-local-media-path", str(media_root), *extra_args]
     with open(log, "w", encoding="utf-8") as handle:
         return subprocess.Popen(command, cwd=tree, env=env, stdout=handle, stderr=subprocess.STDOUT, start_new_session=True)
 
