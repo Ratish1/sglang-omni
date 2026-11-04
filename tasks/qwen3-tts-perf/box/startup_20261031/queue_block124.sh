@@ -2,7 +2,7 @@
 # Block 124 of 11-04: the head against main on 0.5.23, the PR's tables. Non-streaming c64 and c16, streaming c64 and first
 # chunks beside long requests, all both orders. Seeded c1 streaming must stay byte identical; non-streaming gets WER and SIM on
 # the same codes, 1.7B and 0.6B, since a whole request's decode differs from main's on both. 0.6B non-streaming c64 and c16.
-# usage: D=... T=<kit tree> MAIN=<tree> ARM=<tree> HARNESS=<tree> [BLOCK=block124] [PORT=1000] bash queue_block124.sh
+# usage: D=... T=<kit tree> MAIN=<tree> ARM=<tree> HARNESS=<tree> [BLOCK=block124] [PORT=2050] bash queue_block124.sh
 set -u
 D=${D:?the results directory}
 T=${T:?the kit tree}
@@ -10,7 +10,7 @@ MAIN=${MAIN:?main}
 ARM=${ARM:?the head}
 HARNESS=${HARNESS:?the harness tree}
 BLOCK=${BLOCK:-block124}
-PORT=${PORT:-1000}
+PORT=${PORT:-2050}
 K=$T/tasks/qwen3-tts-perf/box
 S=$K/startup_20261031
 W=$D/$BLOCK
