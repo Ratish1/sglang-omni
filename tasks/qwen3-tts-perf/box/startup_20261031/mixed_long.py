@@ -41,6 +41,7 @@ def main() -> None:
     parser.add_argument("--root", type=Path, required=True)
     parser.add_argument("--port", type=int, default=18000)
     parser.add_argument("--long-requests", type=int, default=32)
+    parser.add_argument("--short-no-stream", action="store_true", help="SeedTTS's requests non-streaming too: read their latency")
     args = parser.parse_args()
     arms = [tuple(value.split("=", 1)) for value in (args.a, args.b)]
     # note: SeedTTS's references sit in a temporary directory and the long requests' in the harness tree
@@ -60,7 +61,7 @@ def main() -> None:
                 wait_healthy(arm_port, server)
             with concurrent.futures.ThreadPoolExecutor(2 * len(placed)) as pool:
                 stream_jobs = [
-                    pool.submit(bench, tree, arm_port, root / label / "stream", CONCURRENCY_PER_CLIENT, None, True)
+                    pool.submit(bench, tree, arm_port, root / label / "stream", CONCURRENCY_PER_CLIENT, None, not args.short_no_stream)
                     for label, tree, _, arm_port in placed
                 ]
                 long_jobs = {
@@ -76,6 +77,18 @@ def main() -> None:
         for label, _, card, _ in placed:
             stream = json.loads((root / label / "stream" / "bench" / "speed_results.json").read_text())["summary"]
             log = (root / f"serve_{label}.log").read_text(errors="replace")
+            if args.short_no_stream:
+                print(
+                    f"{order} {label} card {card}: short done {stream['completed_requests']}/{stream['total_requests']} latency ms mean "
+                    f"{1000 * stream['latency_mean_s']:.1f} p50 {1000 * stream['latency_median_s']:.1f} p95 {1000 * stream['latency_p95_s']:.1f} "
+                    f"p99 {1000 * stream['latency_p99_s']:.1f} RTF {stream['rtf_mean']:.4f}; tracebacks {log.count('Traceback')}, "
+                    f"left context {log.count('left-context decoder')}",
+                    flush=True,
+                )
+                print(f"  {long_lines.get(label, 'no long line')}", flush=True)
+                continue
+            else:
+                pass
             print(
                 f"{order} {label} card {card}: stream done {stream['completed_requests']}/{stream['total_requests']} first chunk mean "
                 f"{1000 * stream['audio_ttfp_mean_s']:.1f} p50 {1000 * stream['audio_ttfp_median_s']:.1f} p95 "
