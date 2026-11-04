@@ -395,7 +395,13 @@ class Qwen3OmniBasePipelineConfig(PipelineConfig):
     def resolved_stage_env_defaults(self, stage_name: str) -> dict[str, str]:
         """Split the CPUs over the preprocessing workers unless OMP is configured."""
         env_defaults = super().resolved_stage_env_defaults(stage_name)
-        if stage_name == "preprocessing" and "OMP_NUM_THREADS" not in env_defaults:
+        if stage_name != "preprocessing":
+            return env_defaults
+        else:
+            pass
+        # note (ratish): OpenMP threads spin after each region, and a request's regions are short and far apart, so that spin is most of this stage's CPU and does no work.
+        env_defaults.setdefault("OMP_WAIT_POLICY", "PASSIVE")
+        if "OMP_NUM_THREADS" not in env_defaults:
             env_defaults["OMP_NUM_THREADS"] = str(
                 bounded_intraop_threads(
                     worker_count=self.stage_named(stage_name).factory.max_concurrency,
