@@ -38,6 +38,8 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--state", choices=("alive", "torn", "clear", "capture_fail"), required=True)
     parser.add_argument("--no-empty-cache", action="store_true")
+    parser.add_argument("--fail-runner", choices=("window", "tail"), default="window")
+    parser.add_argument("--no-tail", action="store_true")
     parser.add_argument("--own-capture-streams", action="store_true")
     parser.add_argument("--slot", choices=("stream", "reserved"), required=True)
     parser.add_argument("--frames", type=int, required=True)
@@ -51,7 +53,7 @@ def main() -> None:
     scheduler = Qwen3TTSStreamingVocoderScheduler(
         tokenizer, device="cuda:0", tts_model_size="1b7", async_decode=True, enable_stateful_codec_decoder=True,
         incremental_codec_cuda_graph=True, incremental_codec_compile=True, fused_snake_activation=True, initial_max_batch_size=8,
-        followup_max_batch_size=8, followup_worker_count=1, codec_state_slots=16, has_reference_prefixed_first_chunks=True,
+        followup_max_batch_size=8, followup_worker_count=1, codec_state_slots=16, has_reference_prefixed_first_chunks=not args.no_tail,
     )
     window = scheduler.initial_window_decode_graphs
     cold = scheduler.initial_incremental_decode_graphs
@@ -59,6 +61,10 @@ def main() -> None:
     if args.own_capture_streams:
         handle = window.graph_backend.graph_pool_handle()
         for runner in (cold, window, tail):
+            if runner is None:
+                continue
+            else:
+                pass
             runner.graph_pool = IncrementalCodecGraphPool(
                 stream_priority=scheduler.decode_stream_priority, handle=handle,
                 capture_stream=torch.cuda.Stream(device=scheduler.device, priority=scheduler.decode_stream_priority),
@@ -66,7 +72,8 @@ def main() -> None:
     else:
         pass
     if args.state == "capture_fail":
-        real_headroom = window.require_headroom
+        failing_runner = tail if args.fail_runner == "tail" else window
+        real_headroom = failing_runner.require_headroom
         headroom_calls = []
 
         def failing_headroom(free_bytes, *, key=None):
@@ -76,7 +83,7 @@ def main() -> None:
             else:
                 real_headroom(free_bytes, key=key)
 
-        window.require_headroom = failing_headroom
+        failing_runner.require_headroom = failing_headroom
     else:
         pass
     scheduler.warmup_now()
@@ -86,8 +93,10 @@ def main() -> None:
         pass
     arena = scheduler.codec_arena
     row["footprint_mib"] = {
-        runner.mode: runner.memory_stats.get("graph_footprint_bytes", 0) // 1048576 for runner in (cold, window, tail)
+        runner.mode: runner.memory_stats.get("graph_footprint_bytes", 0) // 1048576
+        for runner in (cold, window, tail) if runner is not None
     }
+    row["enabled"] = {runner.mode: runner.enabled for runner in (cold, window, tail) if runner is not None}
     row["reserved_mib"] = torch.cuda.memory_reserved() // 1048576
     row["ring_frames"] = arena.ring_frames
     row["in_place_frames"] = arena.ring_frames - scheduler.incremental_decoder.state_spec().retained_context
