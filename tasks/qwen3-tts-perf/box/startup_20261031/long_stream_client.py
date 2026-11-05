@@ -31,7 +31,14 @@ FRAME_SAMPLES = 1920
 BARRIER_TIMEOUT_S = 1200.0
 
 
-def request_body(harness: str, seed: int, text: str, reference: str, reference_text: str, stream: bool = True) -> dict:
+def request_body(
+    harness: str,
+    seed: int,
+    text: str,
+    reference: str,
+    reference_text: str,
+    stream: bool = True,
+) -> dict:
     return {
         "model": MODEL,
         "input": text,
@@ -63,8 +70,15 @@ async def one_request(session: aiohttp.ClientSession, url: str, body: dict) -> d
                 largest_gap = max(largest_gap, now - last)
             last = now
             received += len(chunk)
-    return {"status": status, "start": start, "end": last, "first": first, "latency": last - start,
-            "gap": largest_gap, "bytes": received}
+    return {
+        "status": status,
+        "start": start,
+        "end": last,
+        "first": first,
+        "latency": last - start,
+        "gap": largest_gap,
+        "bytes": received,
+    }
 
 
 async def run_load(args: argparse.Namespace, bodies: list[dict]) -> list[dict]:
@@ -96,21 +110,67 @@ def stress_bodies(harness: str, requests: int, stream: bool = True) -> list[dict
         "print(json.dumps([s.params.file_ref_text]))"
     )
     env = dict(os.environ, PYTHONPATH=harness, CUDA_VISIBLE_DEVICES="")
-    lines = subprocess.run([sys.executable, "-c", script], cwd=harness, env=env, check=True, capture_output=True,
-                           text=True).stdout.splitlines()
+    lines = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=harness,
+        env=env,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.splitlines()
     texts = json.loads(lines[-2])
     reference_text = json.loads(lines[-1])[0]
     reference = f"file://{Path(harness) / 'docs/_static/audio/male-voice.wav'}"
-    return [request_body(harness, index, texts[index % len(texts)], reference, reference_text, stream) for index in range(requests)]
+    return [
+        request_body(
+            harness, index, texts[index % len(texts)], reference, reference_text, stream
+        )
+        for index in range(requests)
+    ]
 
 
-def start_server(tree: str, card: int, port: int, media_root: Path, log: Path, extra_args: tuple[str, ...] = ()) -> subprocess.Popen:
+def start_server(
+    tree: str,
+    card: int,
+    port: int,
+    media_root: Path,
+    log: Path,
+    extra_args: tuple[str, ...] = (),
+) -> subprocess.Popen:
     env = dict(os.environ, PYTHONPATH=tree, SGLANG_OMNI_STRICT_PORT="1")
-    command = [sys.executable, "-m", "sglang_omni.cli", "serve", "--model-path", MODEL, "--host", "127.0.0.1",
-               "--port", str(port), "--tts_engine.gpu", str(card), "--vocoder.gpu", str(card),
-               "--allowed-local-media-path", str(media_root), *extra_args]
+    # note: CARD_CPUS="0=0-31,64-95;1=32-63,96-127" starts each server on its own card's socket
+    cpus = dict(
+        item.split("=") for item in os.environ.get("CARD_CPUS", "").split(";") if item
+    ).get(str(card))
+    command = [
+        *(["taskset", "-c", cpus] if cpus else []),
+        sys.executable,
+        "-m",
+        "sglang_omni.cli",
+        "serve",
+        "--model-path",
+        MODEL,
+        "--host",
+        "127.0.0.1",
+        "--port",
+        str(port),
+        "--tts_engine.gpu",
+        str(card),
+        "--vocoder.gpu",
+        str(card),
+        "--allowed-local-media-path",
+        str(media_root),
+        *extra_args,
+    ]
     with open(log, "w", encoding="utf-8") as handle:
-        return subprocess.Popen(command, cwd=tree, env=env, stdout=handle, stderr=subprocess.STDOUT, start_new_session=True)
+        return subprocess.Popen(
+            command,
+            cwd=tree,
+            env=env,
+            stdout=handle,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+        )
 
 
 def wait_at_barrier(barrier: Path | None, parties: int, label: str) -> None:
@@ -162,8 +222,17 @@ def main() -> None:
     bodies = stress_bodies(args.harness, args.requests, not args.no_stream)
     server = None
     if args.tree is not None:
-        print(f"{args.label}: tree {args.tree} {identity(args.tree)} card {args.card}", flush=True)
-        server = start_server(args.tree, args.card, args.port, Path(args.harness) / "docs/_static/audio", args.out / "serve.log")
+        print(
+            f"{args.label}: tree {args.tree} {identity(args.tree)} card {args.card}",
+            flush=True,
+        )
+        server = start_server(
+            args.tree,
+            args.card,
+            args.port,
+            Path(args.harness) / "docs/_static/audio",
+            args.out / "serve.log",
+        )
         wait_healthy(args.port, server)
     else:
         pass
