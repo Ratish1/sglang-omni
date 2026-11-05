@@ -14,8 +14,12 @@ from pathlib import Path
 import soundfile
 import torch
 
-from sglang_omni.models.qwen3_tts.compat import apply_qwen_tts_transformers_compatibility_patches
-from sglang_omni.models.qwen3_tts.incremental_codec_cuda_graph import IncrementalCodecGraphPool
+from sglang_omni.models.qwen3_tts.compat import (
+    apply_qwen_tts_transformers_compatibility_patches,
+)
+from sglang_omni.models.qwen3_tts.incremental_codec_cuda_graph import (
+    IncrementalCodecGraphPool,
+)
 from sglang_omni.models.qwen3_tts.streaming_vocoder import (
     IncrementalDecodeBatch,
     IncrementalDecodePlan,
@@ -30,30 +34,50 @@ def speech_codes(tokenizer) -> torch.Tensor:
     pieces = []
     for path in sorted((Path.cwd() / "docs/_static/audio").glob("*.wav")):
         samples, sample_rate = soundfile.read(path, dtype="float32", always_2d=True)
-        pieces.append(tokenizer.encode(samples.mean(axis=1), sr=sample_rate).audio_codes[0].cpu())
+        pieces.append(
+            tokenizer.encode(samples.mean(axis=1), sr=sample_rate).audio_codes[0].cpu()
+        )
     return torch.cat(pieces, dim=0)
 
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--state", choices=("alive", "torn", "clear", "capture_fail"), required=True)
+    parser.add_argument(
+        "--state", choices=("alive", "torn", "clear", "capture_fail"), required=True
+    )
     parser.add_argument("--no-empty-cache", action="store_true")
     parser.add_argument("--fail-runner", choices=("window", "tail"), default="window")
     parser.add_argument("--no-tail", action="store_true")
     parser.add_argument("--own-capture-streams", action="store_true")
     parser.add_argument("--slot", choices=("stream", "reserved"), required=True)
     parser.add_argument("--frames", type=int, required=True)
-    parser.add_argument("--path", choices=("direct", "launch", "tail", "warm"), required=True)
+    parser.add_argument(
+        "--path", choices=("direct", "launch", "tail", "warm"), required=True
+    )
     parser.add_argument("--pageable", action="store_true")
     parser.add_argument("--steps", type=int, default=3)
     args = parser.parse_args()
     row = dict(vars(args))
-    tokenizer = Qwen3TTSTokenizer.from_pretrained("Qwen/Qwen3-TTS-Tokenizer-12Hz", device_map="cuda:0", dtype=torch.bfloat16,
-                                                  attn_implementation="sdpa")
+    tokenizer = Qwen3TTSTokenizer.from_pretrained(
+        "Qwen/Qwen3-TTS-Tokenizer-12Hz",
+        device_map="cuda:0",
+        dtype=torch.bfloat16,
+        attn_implementation="sdpa",
+    )
     scheduler = Qwen3TTSStreamingVocoderScheduler(
-        tokenizer, device="cuda:0", tts_model_size="1b7", async_decode=True, enable_stateful_codec_decoder=True,
-        incremental_codec_cuda_graph=True, incremental_codec_compile=True, fused_snake_activation=True, initial_max_batch_size=8,
-        followup_max_batch_size=8, followup_worker_count=1, codec_state_slots=16, has_reference_prefixed_first_chunks=not args.no_tail,
+        tokenizer,
+        device="cuda:0",
+        tts_model_size="1b7",
+        async_decode=True,
+        enable_stateful_codec_decoder=True,
+        incremental_codec_cuda_graph=True,
+        incremental_codec_compile=True,
+        fused_snake_activation=True,
+        initial_max_batch_size=8,
+        followup_max_batch_size=8,
+        followup_worker_count=1,
+        codec_state_slots=16,
+        has_reference_prefixed_first_chunks=not args.no_tail,
     )
     window = scheduler.initial_window_decode_graphs
     cold = scheduler.initial_incremental_decode_graphs
@@ -66,9 +90,16 @@ def main() -> None:
             else:
                 pass
             runner.graph_pool = IncrementalCodecGraphPool(
-                stream_priority=scheduler.decode_stream_priority, handle=handle,
-                capture_stream=torch.cuda.Stream(device=scheduler.device, priority=scheduler.decode_stream_priority),
+                stream_priority=scheduler.decode_stream_priority,
+                handle=handle,
+                capture_stream=torch.cuda.Stream(
+                    device=scheduler.device, priority=scheduler.decode_stream_priority
+                ),
             )
+            if hasattr(runner.graph_pool, "runners"):
+                runner.graph_pool.runners.append(runner)
+            else:
+                pass
     else:
         pass
     if args.state == "capture_fail":
@@ -94,12 +125,19 @@ def main() -> None:
     arena = scheduler.codec_arena
     row["footprint_mib"] = {
         runner.mode: runner.memory_stats.get("graph_footprint_bytes", 0) // 1048576
-        for runner in (cold, window, tail) if runner is not None
+        for runner in (cold, window, tail)
+        if runner is not None
     }
-    row["enabled"] = {runner.mode: runner.enabled for runner in (cold, window, tail) if runner is not None}
+    row["enabled"] = {
+        runner.mode: runner.enabled
+        for runner in (cold, window, tail)
+        if runner is not None
+    }
     row["reserved_mib"] = torch.cuda.memory_reserved() // 1048576
     row["ring_frames"] = arena.ring_frames
-    row["in_place_frames"] = arena.ring_frames - scheduler.incremental_decoder.state_spec().retained_context
+    row["in_place_frames"] = (
+        arena.ring_frames - scheduler.incremental_decoder.state_spec().retained_context
+    )
     row["window_enabled"] = window.enabled
     with torch.inference_mode():
         speech = speech_codes(tokenizer)
@@ -118,33 +156,67 @@ def main() -> None:
             else:
                 pass
             row["window_enabled_after"] = window.enabled
-            slot = arena.acquire() if args.slot == "stream" else list(arena.reserved_slots)[0]
+            row["enabled_after"] = {
+                runner.mode: runner.enabled
+                for runner in (cold, window, tail)
+                if runner is not None
+            }
+            row["reserved_mib_after"] = torch.cuda.memory_reserved() // 1048576
+            slot = (
+                arena.acquire()
+                if args.slot == "stream"
+                else list(arena.reserved_slots)[0]
+            )
             arena.zero_slot(slot)
             row["slot_index"] = slot
             position = 0
             for _ in range(args.steps):
                 codes = speech[position : position + args.frames].T.unsqueeze(0)
                 if args.path == "tail":
-                    waveform = tail.decode_slots(codes.to(scheduler.device), [slot], valid_frames=[args.frames])
+                    waveform = tail.decode_slots(
+                        codes.to(scheduler.device), [slot], valid_frames=[args.frames]
+                    )
+                    if waveform is None:
+                        row["tail_missed"] = True
+                        state = arena.gather([slot])
+                        waveform = scheduler.incremental_decoder.decode(
+                            codes.to(scheduler.device), state
+                        )
+                        arena.scatter([slot], state)
+                    else:
+                        pass
                     samples = waveform.float().cpu()
                 elif args.path == "warm":
                     holder = scheduler.followup_incremental_graph_holders[0]
                     with torch.cuda.stream(scheduler.followup_decode_streams[0]):
-                        waveform = holder.decode_slots(codes.to(scheduler.device), [slot])
+                        waveform = holder.decode_slots(
+                            codes.to(scheduler.device), [slot]
+                        )
                         samples = waveform.float().cpu()
                 elif args.path == "direct":
                     state = arena.gather([slot])
-                    waveform = scheduler.incremental_decoder.decode(codes.to(scheduler.device), state)
+                    waveform = scheduler.incremental_decoder.decode(
+                        codes.to(scheduler.device), state
+                    )
                     arena.scatter([slot], state)
                     samples = waveform.float().cpu()
                 else:
                     plan = IncrementalDecodePlan(
-                        decoder_input=codes, slot=slot, fresh_frames=args.frames, reference_trim_frames=0,
-                        generated_frames=position + args.frames, emitted_generated_frames=position,
+                        decoder_input=codes,
+                        slot=slot,
+                        fresh_frames=args.frames,
+                        reference_trim_frames=0,
+                        generated_frames=position + args.frames,
+                        emitted_generated_frames=position,
                     )
                     handle = scheduler.launch_decode_plans(
-                        [plan], stream=scheduler.decode_stream,
-                        incremental=IncrementalDecodeBatch(decoder=scheduler.incremental_decoder, arena=arena, slots=[slot]),
+                        [plan],
+                        stream=scheduler.decode_stream,
+                        incremental=IncrementalDecodeBatch(
+                            decoder=scheduler.incremental_decoder,
+                            arena=arena,
+                            slots=[slot],
+                        ),
                     )
                     samples = handle.resolve_partial()[0][0]
                 row[f"step{done}_rms"] = float(samples.pow(2).mean().sqrt())
