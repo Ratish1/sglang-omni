@@ -3,9 +3,11 @@ codec and repeated to length. Decodes each case clean, then with the failure, an
 faulted row's sample count, finiteness and relative L2 against the clean run. The last case holds nine rows, so the replay that
 fails and tears the graphs down holds eight and the ninth continues without them.
 
-usage: cd TREE && PYTHONPATH=TREE python3 whole_fault_read.py
+usage: cd TREE && PYTHONPATH=TREE python3 whole_fault_read.py [--only-case N] [--no-clean] [--no-native]
+--no-clean skips the clean decode and the comparison, and --no-native returns silence from the whole decode, to bisect a fault's sequence.
 """
 
+import argparse
 import asyncio
 import json
 from pathlib import Path
@@ -61,6 +63,11 @@ def decode(scheduler, loop, rows: list[tuple[str, torch.Tensor]], reference_fram
 
 
 def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--only-case", type=int, default=None)
+    parser.add_argument("--no-clean", action="store_true")
+    parser.add_argument("--no-native", action="store_true")
+    args = parser.parse_args()
     torch.manual_seed(3477)
     tokenizer = Qwen3TTSTokenizer.from_pretrained("Qwen/Qwen3-TTS-Tokenizer-12Hz", device_map="cuda:0", dtype=torch.bfloat16,
                                                   attn_implementation="sdpa")
@@ -78,11 +85,21 @@ def main() -> None:
     real_decode_slots = runner.decode_slots
     with torch.inference_mode():
         speech = speech_codes(tokenizer)
+    if args.no_native:
+        scheduler.decode_state_audio = lambda state: torch.zeros(
+            (len(state.audio_codes) - state.ref_code_len) * scheduler.samples_per_frame
+        )
+    else:
+        pass
     for index, (generated, reference_frames, row_count, failed_replay, disables) in enumerate(CASES):
+        if args.only_case is not None and index != args.only_case:
+            continue
+        else:
+            pass
         frames = generated + reference_frames
         rows = [(f"{index}-{row}", speech[row:].repeat(frames // speech.shape[0] + 1, 1)[:frames].clone()) for row in range(row_count)]
         with torch.inference_mode(), torch.cuda.stream(scheduler.decode_stream):
-            clean = decode(scheduler, loop, rows, reference_frames)
+            clean = {} if args.no_clean else decode(scheduler, loop, rows, reference_frames)
             calls = []
 
             def failing(window_codes, slots, **kwargs):
@@ -103,7 +120,9 @@ def main() -> None:
             row = {"case": index, "row": name, "generated": generated, "reference": reference_frames, "failed_replay": failed_replay,
                    "disables": disables, "free_slots": len(scheduler.free_whole_request_slots), "window_calls": len(calls)}
             if isinstance(faulted[name], str):
-                print(json.dumps({**row, "completed": False, "error": faulted[name]}), flush=True)
+                print(json.dumps({**row, "completed": False, "error": faulted[name][:200]}), flush=True)
+            elif args.no_clean:
+                print(json.dumps({**row, "completed": True, "samples": int(faulted[name].size)}), flush=True)
             else:
                 delta = faulted[name].astype(np.float64) - clean[name].astype(np.float64)
                 print(json.dumps({**row, "completed": True, "samples": int(faulted[name].size), "clean_samples": int(clean[name].size),
