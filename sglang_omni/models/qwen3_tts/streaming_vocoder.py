@@ -936,7 +936,6 @@ class Qwen3TTSStreamingVocoderScheduler(
             and num_quantizers > 0
             and not self.deterministic_inference
             and tts_model_size in {"0b6", "1b7"}
-            and not self.decodes_whole_requests
         )
         self.full_decode_stream: torch.cuda.Stream | None = None
         if tts_model_size == "0b6" and full_decode_graphs_enabled:
