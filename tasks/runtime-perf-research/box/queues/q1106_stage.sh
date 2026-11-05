@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# 11-06, node-0000, after q1106_fill: the stage alone on CPU, closed loop on the Video-MME CI videos, with non-video requests on main's
-# serial path and each video on its own thread. Thread count at 112, 16 and 8 CPUs under passive OpenMP, the team size the CPU split gives
-# on the full host and on a socket, and what one more private preprocessor costs. Starts when the host is quiet.
+# 11-06, node-0000, after q1106_fill: the stage alone on CPU, non-video requests on main's serial path and each video on its own thread, all
+# sharing one HF processor. First the byte identity of that sharing against serial, under mixed speech and video. Then video threads at 112,
+# 16 and 8 CPUs under passive OpenMP, and the team size the CPU split gives on the full host and on a socket. Starts when the host is quiet.
 set -u
 O=/data/rp1106
 K=/workspace/kit/tasks/runtime-perf-research/box
@@ -31,9 +31,11 @@ cell() {
 }
 log "q1106_stage start"
 wait_quiet
-( cd $T && PYTHONPATH=$T OMP_NUM_THREADS=8 taskset -c 56-63,168-175 python3 $K/preprocessor_cost.py --count 9 > $O/stage/preprocessor_cost.txt 2>&1 )
-log "preprocessor cost rc $?"
 C112=56-111,168-223 C16=56-63,168-175 C8=56-59,168-171
+( cd $T && OMP_NUM_THREADS=8 OMP_WAIT_POLICY=PASSIVE PYTHONPATH=$T taskset -c $C112 python3 $K/preprocess_shared_identity.py --threads 8 --out $O/stage/identity.json > $O/stage/identity.log 2>&1 )
+log "identity rc $? $(tail -3 $O/stage/identity.log | cut -c1-100 | tr '\n' ' ')"
+( cd $T && PYTHONPATH=$T OMP_NUM_THREADS=8 taskset -c $C16 python3 $K/preprocessor_cost.py --count 3 > $O/stage/preprocessor_cost.txt 2>&1 )
+log "preprocessor cost rc $?"
 for threads in 2 4 6 8; do cell $C112 c112 8 $threads; done
 cell $C112 c112 14 8
 cell 0-223 c224 28 8
