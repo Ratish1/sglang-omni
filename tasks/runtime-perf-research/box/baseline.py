@@ -66,6 +66,11 @@ MODELS = {
         "config": "",
         "placement": "",
     },
+    "omni_text_fused": {
+        "path": "Qwen/Qwen3-Omni-30B-A3B-Instruct",
+        "config": "examples/configs/qwen3_omni_mmmu_h100.yaml",
+        "placement": "--image_encoder.gpu {card} --audio_encoder.gpu {card} --mm_aggregate.gpu {card} --thinker.gpu {card}",
+    },
     "minicpmo_text": {
         "path": "openbmb/MiniCPM-o-4_5",
         "config": "",
@@ -119,6 +124,34 @@ def bench_command(
             "1" if warmup else "0",
             "--max-concurrency",
             str(load),
+            "--output-dir",
+            str(out),
+            "--disable-tqdm",
+        ]
+    elif bench == "mmsu":
+        # note (ratish): the CI's MMSU arguments, text output over the 2,000 samples
+        return [
+            sys.executable,
+            "-m",
+            "benchmarks.eval.benchmark_omni_mmsu",
+            "--host",
+            "127.0.0.1",
+            "--port",
+            str(port),
+            "--modalities",
+            "text",
+            "--max-tokens",
+            "32",
+            "--temperature",
+            "0.0",
+            "--warmup",
+            "1" if warmup else "0",
+            "--max-concurrency",
+            str(load),
+            "--timeout-s",
+            "300",
+            "--repo-id",
+            "zhaochenyang20/mmsu-ci-2000",
             "--output-dir",
             str(out),
             "--disable-tqdm",
@@ -625,7 +658,7 @@ def main() -> None:
     parser.add_argument(
         "--bench",
         default="seedtts",
-        choices=("seedtts", "videomme", "videomme_text", "asr_longform"),
+        choices=("seedtts", "videomme", "videomme_text", "mmsu", "asr_longform"),
     )
     parser.add_argument(
         "--meta", default="", help="meta.lst for a seedtts bench (long-form targets)"
