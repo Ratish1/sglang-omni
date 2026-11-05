@@ -36,6 +36,7 @@ STOP_TIMEOUT_S = 90.0
 BENCH_TIMEOUT_S = 10800.0
 # note (ratish): the recorder keeps 1,024 events a producer by default and drops the rest, which truncates a pass to its opening burst.
 EVENT_BUFFER_CAPACITY = 4_000_000
+EVENT_FLUSH_TIMEOUT_S = 300.0
 
 MODELS = {
     "tts": {
@@ -534,6 +535,13 @@ def run_pass(
             post(args.port, "/stop_request_profile", {"run_id": f"c{load}"}),
             encoding="utf-8",
         )
+        # note (ratish): each process writes its events at idle priority and its status file last, so stopping the server sooner loses them.
+        deadline = time.monotonic() + EVENT_FLUSH_TIMEOUT_S
+        events_dir = out / "events"
+        while time.monotonic() < deadline and len(
+            list(events_dir.glob("run_status_*.json"))
+        ) < len(list(events_dir.glob("events_*.jsonl"))):
+            time.sleep(1.0)
     elif kind == "nsys":
         # note (ratish): exported after the benchmark ends, so the export's CPU does not land in a traced window
         with open(out / "nsys.log", "a", encoding="utf-8") as nsys_log:
