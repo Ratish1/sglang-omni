@@ -126,7 +126,7 @@ def main() -> None:
     audio = Path(args.harness) / "docs/_static/audio"
     reference_script = (
         "import json;from benchmarks.tts_serving.spec import load_spec;"
-        "print(json.dumps(load_spec('benchmarks/tts_serving/examples/stress_qwen3_tts_long_c64.json').params.file_ref_text))"
+        "print(json.dumps(load_spec('benchmarks/tts_serving/examples/stress.json').params.file_ref_text))"
     )
     reference_text = json.loads(
         subprocess.run(
