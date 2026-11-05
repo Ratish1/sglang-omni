@@ -1,7 +1,9 @@
 """One eager or launched stateful decode on the real codec, in its own process, to place the illegal address block 131 saw after the
 window graphs were torn down. Prints one JSON line. Steps decode consecutive speech windows against one slot.
 
-usage: cd TREE && PYTHONPATH=TREE python3 eager_decode_probe.py --state alive|torn --slot stream|reserved --frames 64 --path direct|launch [--pageable] [--steps 3]
+usage: cd TREE && PYTHONPATH=TREE python3 eager_decode_probe.py --state alive|torn|clear|capture_fail --slot stream|reserved --frames 64
+       --path direct|launch|tail|warm [--pageable] [--steps 3] [--no-empty-cache] [--own-capture-streams]
+torn disables the window runner, clear frees the cuBLAS workspaces with every graph alive, capture_fail makes the window capture fail partway.
 """
 
 import argparse
@@ -13,6 +15,7 @@ import soundfile
 import torch
 
 from sglang_omni.models.qwen3_tts.compat import apply_qwen_tts_transformers_compatibility_patches
+from sglang_omni.models.qwen3_tts.incremental_codec_cuda_graph import IncrementalCodecGraphPool
 from sglang_omni.models.qwen3_tts.streaming_vocoder import (
     IncrementalDecodeBatch,
     IncrementalDecodePlan,
@@ -33,10 +36,12 @@ def speech_codes(tokenizer) -> torch.Tensor:
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--state", choices=("alive", "torn"), required=True)
+    parser.add_argument("--state", choices=("alive", "torn", "clear", "capture_fail"), required=True)
+    parser.add_argument("--no-empty-cache", action="store_true")
+    parser.add_argument("--own-capture-streams", action="store_true")
     parser.add_argument("--slot", choices=("stream", "reserved"), required=True)
     parser.add_argument("--frames", type=int, required=True)
-    parser.add_argument("--path", choices=("direct", "launch"), required=True)
+    parser.add_argument("--path", choices=("direct", "launch", "tail", "warm"), required=True)
     parser.add_argument("--pageable", action="store_true")
     parser.add_argument("--steps", type=int, default=3)
     args = parser.parse_args()
@@ -48,9 +53,42 @@ def main() -> None:
         incremental_codec_cuda_graph=True, incremental_codec_compile=True, fused_snake_activation=True, initial_max_batch_size=8,
         followup_max_batch_size=8, followup_worker_count=1, codec_state_slots=16, has_reference_prefixed_first_chunks=True,
     )
-    scheduler.warmup_now()
-    arena = scheduler.codec_arena
     window = scheduler.initial_window_decode_graphs
+    cold = scheduler.initial_incremental_decode_graphs
+    tail = scheduler.initial_tail_decode_graphs
+    if args.own_capture_streams:
+        handle = window.graph_backend.graph_pool_handle()
+        for runner in (cold, window, tail):
+            runner.graph_pool = IncrementalCodecGraphPool(
+                stream_priority=scheduler.decode_stream_priority, handle=handle,
+                capture_stream=torch.cuda.Stream(device=scheduler.device, priority=scheduler.decode_stream_priority),
+            )
+    else:
+        pass
+    if args.state == "capture_fail":
+        real_headroom = window.require_headroom
+        headroom_calls = []
+
+        def failing_headroom(free_bytes, *, key=None):
+            headroom_calls.append(1)
+            if len(headroom_calls) == 5:
+                raise RuntimeError("injected capture failure")
+            else:
+                real_headroom(free_bytes, key=key)
+
+        window.require_headroom = failing_headroom
+    else:
+        pass
+    scheduler.warmup_now()
+    if args.no_empty_cache:
+        torch.cuda.empty_cache = lambda: None
+    else:
+        pass
+    arena = scheduler.codec_arena
+    row["footprint_mib"] = {
+        runner.mode: runner.memory_stats.get("graph_footprint_bytes", 0) // 1048576 for runner in (cold, window, tail)
+    }
+    row["reserved_mib"] = torch.cuda.memory_reserved() // 1048576
     row["ring_frames"] = arena.ring_frames
     row["in_place_frames"] = arena.ring_frames - scheduler.incremental_decoder.state_spec().retained_context
     row["window_enabled"] = window.enabled
@@ -61,19 +99,31 @@ def main() -> None:
         with torch.inference_mode(), torch.cuda.stream(scheduler.decode_stream):
             if args.state == "torn":
                 window.disable_runtime("probe")
+            elif args.state == "clear":
+                torch._C._cuda_clearCublasWorkspaces()
+                torch.cuda.empty_cache()
             else:
                 pass
             if args.pageable:
                 scheduler.pinned_staging_disabled = True
             else:
                 pass
+            row["window_enabled_after"] = window.enabled
             slot = arena.acquire() if args.slot == "stream" else list(arena.reserved_slots)[0]
             arena.zero_slot(slot)
             row["slot_index"] = slot
             position = 0
             for _ in range(args.steps):
                 codes = speech[position : position + args.frames].T.unsqueeze(0)
-                if args.path == "direct":
+                if args.path == "tail":
+                    waveform = tail.decode_slots(codes.to(scheduler.device), [slot], valid_frames=[args.frames])
+                    samples = waveform.float().cpu()
+                elif args.path == "warm":
+                    holder = scheduler.followup_incremental_graph_holders[0]
+                    with torch.cuda.stream(scheduler.followup_decode_streams[0]):
+                        waveform = holder.decode_slots(codes.to(scheduler.device), [slot])
+                        samples = waveform.float().cpu()
+                elif args.path == "direct":
                     state = arena.gather([slot])
                     waveform = scheduler.incremental_decoder.decode(codes.to(scheduler.device), state)
                     arena.scatter([slot], state)
