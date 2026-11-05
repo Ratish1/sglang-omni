@@ -1011,7 +1011,7 @@ class Qwen3TTSStreamingVocoderScheduler(
             int(codec_state_slots),
             # note (ratish): as many whole requests as streams hold state at once, and neither
             # takes the other's slots, so stream load never changes a whole request's audio.
-            reserved_slots=int(codec_state_slots) if self.decodes_whole_requests else 0,
+            reserved_slots=1 if self.decodes_whole_requests else 0,
             dtype=codec_state_dtype,
             # note (ratish): the widest cold and follow-up decodes, which graphs may compile, so
             # each attends in place; compiled, the gathered step would copy every ring a decode.
