@@ -34,6 +34,8 @@ TREE = Path(__file__).resolve().parents[3]
 HEALTH_TIMEOUT_S = 1800.0
 STOP_TIMEOUT_S = 90.0
 BENCH_TIMEOUT_S = 10800.0
+# note (ratish): the recorder keeps 1,024 events a producer by default and drops the rest, which truncates a pass to its opening burst.
+EVENT_BUFFER_CAPACITY = 4_000_000
 
 MODELS = {
     "tts": {
@@ -361,7 +363,11 @@ def run_pass(
             post(
                 args.port,
                 "/start_request_profile",
-                {"run_id": f"c{load}", "event_dir": str(out / "events")},
+                {
+                    "run_id": f"c{load}",
+                    "event_dir": str(out / "events"),
+                    "event_buffer_capacity": EVENT_BUFFER_CAPACITY,
+                },
             ),
             encoding="utf-8",
         )
