@@ -1103,7 +1103,7 @@ class Qwen3TTSStreamingVocoderScheduler(
             stream_source_hint="Qwen3-TTS",
             max_batch_size=max_batch_size,
             # note (ratish): whole requests batch on the initial worker, not on this clock.
-            max_batch_wait_ms=0 if self.decodes_whole_requests else max_batch_wait_ms,
+            max_batch_wait_ms=max_batch_wait_ms,
         )
 
     def build_codec_arena(
