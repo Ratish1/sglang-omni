@@ -66,6 +66,12 @@ MODELS = {
         "config": "",
         "placement": "",
     },
+    "omni_fp8_colocated": {
+        "path": "marksverdhei/Qwen3-Omni-30B-A3B-FP8",
+        "config": "examples/configs/qwen3_omni_colocated_h100_fp8.yaml",
+        "placement": "--colocate --image_encoder.gpu {card} --audio_encoder.gpu {card} --thinker.gpu {card} "
+        "--talker_ar.gpu {card} --code2wav.gpu {card}",
+    },
     "omni_text_fused": {
         "path": "Qwen/Qwen3-Omni-30B-A3B-Instruct",
         "config": "examples/configs/qwen3_omni_mmmu_h100.yaml",
@@ -118,6 +124,36 @@ def bench_command(
             *(["--enable-audio"] if bench == "videomme" else []),
             "--max-tokens",
             "256",
+            "--timeout-s",
+            "500",
+            "--warmup",
+            "1" if warmup else "0",
+            "--max-concurrency",
+            str(load),
+            "--output-dir",
+            str(out),
+            "--disable-tqdm",
+        ]
+    elif bench == "videoamme":
+        # note (ratish): the CI's Video-AMME arguments, text output over the 50 samples
+        return [
+            sys.executable,
+            "-m",
+            "benchmarks.eval.benchmark_omni_videoamme",
+            "--host",
+            "127.0.0.1",
+            "--port",
+            str(port),
+            "--repo-id",
+            "zhaochenyang20/Video_AMME_ci",
+            "--max-samples",
+            "50",
+            "--video-fps",
+            "2",
+            "--video-max-frames",
+            "128",
+            "--video-max-pixels",
+            "401408",
             "--timeout-s",
             "500",
             "--warmup",
@@ -658,7 +694,14 @@ def main() -> None:
     parser.add_argument(
         "--bench",
         default="seedtts",
-        choices=("seedtts", "videomme", "videomme_text", "mmsu", "asr_longform"),
+        choices=(
+            "seedtts",
+            "videomme",
+            "videomme_text",
+            "videoamme",
+            "mmsu",
+            "asr_longform",
+        ),
     )
     parser.add_argument(
         "--meta", default="", help="meta.lst for a seedtts bench (long-form targets)"
