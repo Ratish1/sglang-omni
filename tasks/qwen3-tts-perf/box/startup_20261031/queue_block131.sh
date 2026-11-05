@@ -29,9 +29,13 @@ echo "queue $BLOCK start $(date +%T) kit $(git -C $T rev-parse HEAD); gpus $(nvi
 echo "suite rc $? $(date +%T): $(grep -E '[0-9]+ (passed|failed)' $W/suite.log | tail -n 1 | cut -c1-90)" >> $L
 grep -E "^FAILED|^ERROR" $W/suite.log | head -n 16 | cut -c1-170 >> $L
 export TORCHINDUCTOR_CACHE_DIR=$D/cache/inductor TRITON_CACHE_DIR=$D/cache/triton
-(cd $ARM && PYTHONPATH=$ARM CUDA_VISIBLE_DEVICES=0 timeout 1500 python3 $S/whole_fault_read.py > $W/fault.log 2>&1)
-echo "fault rc $? $(date +%T)" >> $L
-grep -E '^\{"(stream_slots|case)"' $W/fault.log | cut -c1-300 >> $L
+export CARD_CPUS="0=0-31,64-95;1=32-63,96-127"
+for cases in "0 1 2" 3 4; do
+  name=fault_$(echo $cases | tr -d ' ')
+  (cd $ARM && PYTHONPATH=$ARM CUDA_VISIBLE_DEVICES=0 timeout 1500 python3 $S/whole_fault_read.py --only-case $cases > $W/$name.log 2>&1)
+  echo "$name rc $? $(date +%T)" >> $L
+  grep -E '^\{"(stream_slots|case)"' $W/$name.log | cut -c1-280 >> $L
+done
 (cd $K/next_20261031 && python3 seeded_identity.py --main $LAST --branch $ARM --root $W/identity_last --port $PORT > $W/identity_last.txt 2>&1)
 echo "identity last rc $? $(date +%T): $(grep -E 'byte identical|error lines|Error|Traceback' $W/identity_last.txt | cut -c1-120 | tr '\n' '#')" >> $L
 (cd $K/next_20261031 && python3 seeded_identity.py --main $MAIN --branch $ARM --root $W/identity_main --port $((PORT + 800)) > $W/identity_main.txt 2>&1)
