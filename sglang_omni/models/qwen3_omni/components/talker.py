@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import logging
 import os
+from contextlib import ExitStack
 from typing import Iterable, Optional, Tuple
 
 import torch
@@ -67,6 +68,8 @@ from sglang_omni.vendor.sglang.utils import make_layers
 
 if current_platform.is_cuda():
     from flashinfer.autotuner import autotune
+    from flashinfer.fused_moe.core import get_cutlass_fused_moe_module
+    from tvm_ffi import Module, load_module
 else:
     pass
 
@@ -463,6 +466,18 @@ class Qwen3OmniMoeTalkerTextModel(nn.Module):
         self.layers_to_capture = []
         self.diagnostic_layers: dict[str, torch.Tensor] = {}
         self.diagnostic_attention: dict[str, torch.Tensor] = {}
+        rounding_library = os.environ.get("SGLANG_OMNI_DIAGNOSTIC_ROUNDING_LIBRARY")
+        self.diagnostic_rounding_module: Module | None = None
+        self.diagnostic_rounding_runner: Module | None = None
+        if rounding_library is not None:
+            assert current_platform.is_cuda() and quant_config is None
+            assert self.codec_embedding.weight.dtype == torch.bfloat16
+            self.diagnostic_rounding_module = load_module(rounding_library)
+            self.diagnostic_rounding_runner = self.diagnostic_rounding_module.init(
+                *((torch.bfloat16,) * 3 + (False,) * 6)
+            )
+        else:
+            pass
         if os.environ.get("SGLANG_OMNI_DIAGNOSTIC_ATTENTION_TRACE") is not None:
 
             def capture_attention(
@@ -558,28 +573,41 @@ class Qwen3OmniMoeTalkerTextModel(nn.Module):
         else:
             pass
 
-        for i in range(self.start_layer, self.end_layer):
-            layer = self.layers[i]
-            hidden_states = layer(
-                positions=positions,
-                hidden_states=hidden_states,
-                forward_batch=forward_batch,
-                captured_last_layer_outputs=(
-                    aux_hidden_states if i in capture_layers and i != 0 else None
-                ),
-            )
-            if os.environ.get(
-                "SGLANG_OMNI_DIAGNOSTIC_LAYER_TRACE"
-            ) is not None and hidden_states.shape[0] in (1, 128):
-                self.diagnostic_layers[f"layer_{i}_{hidden_states.shape[0]}"] = (
-                    residual_batch.snapshot(hidden_states, forward_batch)
+        with ExitStack() as numerical_scope:
+            if (
+                self.diagnostic_rounding_runner is not None
+                and forward_batch.forward_mode.is_extend()
+            ):
+                runner_key = (torch.bfloat16,) * 3 + (False,) * 6
+                runners = get_cutlass_fused_moe_module("90").MoERunner.runner_dict
+                numerical_scope.callback(
+                    runners.__setitem__, runner_key, runners[runner_key]
                 )
+                runners[runner_key] = self.diagnostic_rounding_runner
             else:
                 pass
+            for i in range(self.start_layer, self.end_layer):
+                layer = self.layers[i]
+                hidden_states = layer(
+                    positions=positions,
+                    hidden_states=hidden_states,
+                    forward_batch=forward_batch,
+                    captured_last_layer_outputs=(
+                        aux_hidden_states if i in capture_layers and i != 0 else None
+                    ),
+                )
+                if os.environ.get(
+                    "SGLANG_OMNI_DIAGNOSTIC_LAYER_TRACE"
+                ) is not None and hidden_states.shape[0] in (1, 128):
+                    self.diagnostic_layers[f"layer_{i}_{hidden_states.shape[0]}"] = (
+                        residual_batch.snapshot(hidden_states, forward_batch)
+                    )
+                else:
+                    pass
 
-        hidden_states = residual_batch.final_norm(
-            hidden_states, forward_batch, self.norm, skip_empty=True
-        )
+            hidden_states = residual_batch.final_norm(
+                hidden_states, forward_batch, self.norm, skip_empty=True
+            )
 
         if aux_hidden_states:
             return hidden_states, aux_hidden_states
