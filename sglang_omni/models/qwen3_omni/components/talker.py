@@ -341,9 +341,13 @@ class Qwen3OmniMoeTalkerSparseMoeBlock(Qwen3OmniMoeThinkerTextSparseMoeBlock):
         else:
             pass
 
-        capture_experts = os.environ.get("SGLANG_OMNI_DIAGNOSTIC_MOE_TRACE") is not None
+        capture_experts = os.environ.get(
+            "SGLANG_OMNI_DIAGNOSTIC_MOE_TRACE"
+        ) is not None and num_tokens in (1, 128)
         if capture_experts:
-            self.diagnostic_tensors["input"] = linear_hidden_states.clone()
+            self.diagnostic_tensors[f"input_{num_tokens}"] = (
+                linear_hidden_states.clone()
+            )
         else:
             pass
         # Shared branch must consume the original MLP input before routed experts.
@@ -357,15 +361,25 @@ class Qwen3OmniMoeTalkerSparseMoeBlock(Qwen3OmniMoeThinkerTextSparseMoeBlock):
         topk_output = self.topk(linear_hidden_states, router_logits)
         if capture_experts:
             assert isinstance(topk_output, StandardTopKOutput)
-            self.diagnostic_tensors["router_logits"] = router_logits.clone()
-            self.diagnostic_tensors["weights"] = topk_output.topk_weights.clone()
-            self.diagnostic_tensors["experts"] = topk_output.topk_ids.clone()
-            self.diagnostic_tensors["shared_output"] = shared_output.clone()
+            self.diagnostic_tensors[f"router_logits_{num_tokens}"] = (
+                router_logits.clone()
+            )
+            self.diagnostic_tensors[f"weights_{num_tokens}"] = (
+                topk_output.topk_weights.clone()
+            )
+            self.diagnostic_tensors[f"experts_{num_tokens}"] = (
+                topk_output.topk_ids.clone()
+            )
+            self.diagnostic_tensors[f"shared_output_{num_tokens}"] = (
+                shared_output.clone()
+            )
         else:
             pass
         routed_output = self.experts(linear_hidden_states, topk_output)
         if capture_experts:
-            self.diagnostic_tensors["routed_output"] = routed_output.clone()
+            self.diagnostic_tensors[f"routed_output_{num_tokens}"] = (
+                routed_output.clone()
+            )
         else:
             pass
 

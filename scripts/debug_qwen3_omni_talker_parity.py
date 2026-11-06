@@ -126,14 +126,26 @@ def main() -> None:
                 for layer_index, layer in enumerate(reference.model.layers):
                     prefix = f"moe_{layer_index}_"
                     live_rows = embeddings.shape[-2]
-                    native_input = after[prefix + "input"][:live_rows].to(device)
+                    bucket_rows = min(
+                        tensor.shape[0]
+                        for name, tensor in after.items()
+                        if name.startswith(prefix + "input_")
+                        and tensor.shape[0] >= live_rows
+                    )
+                    native_input = after[f"{prefix}input_{bucket_rows}"][:live_rows].to(
+                        device
+                    )
                     router_logits, routing_weights, selected_experts = layer.mlp.gate(
                         native_input
                     )
                     native_experts = (
-                        after[prefix + "experts"][:live_rows].to(device).long()
+                        after[f"{prefix}experts_{bucket_rows}"][:live_rows]
+                        .to(device)
+                        .long()
                     )
-                    native_weights = after[prefix + "weights"][:live_rows].to(device)
+                    native_weights = after[f"{prefix}weights_{bucket_rows}"][
+                        :live_rows
+                    ].to(device)
                     shared_output = layer.mlp.shared_expert(native_input)
                     shared_output *= layer.mlp.shared_expert_gate(
                         native_input
@@ -154,13 +166,25 @@ def main() -> None:
                         "native_weight_sum_max": native_weights.sum(-1).max().item(),
                     }
                     for name, expected, actual in (
-                        ("router", router_logits, after[prefix + "router_logits"]),
-                        ("shared", shared_output, after[prefix + "shared_output"]),
-                        ("routed", routed_output, after[prefix + "routed_output"]),
+                        (
+                            "router",
+                            router_logits,
+                            after[f"{prefix}router_logits_{bucket_rows}"],
+                        ),
+                        (
+                            "shared",
+                            shared_output,
+                            after[f"{prefix}shared_output_{bucket_rows}"],
+                        ),
+                        (
+                            "routed",
+                            routed_output,
+                            after[f"{prefix}routed_output_{bucket_rows}"],
+                        ),
                         (
                             "fixed_routing",
                             fixed_routing_output,
-                            after[prefix + "routed_output"],
+                            after[f"{prefix}routed_output_{bucket_rows}"],
                         ),
                     ):
                         difference = (
