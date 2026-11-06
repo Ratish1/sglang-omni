@@ -320,6 +320,16 @@ def main() -> None:
         "reference_attention": "sdpa_math",
         "profiles": arguments.profiles,
         "captured_kernel": arguments.captured_kernel,
+        "libraries": {
+            name: {
+                "path": str(path),
+                "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+            }
+            for name, path in (
+                ("rebuilt_control", arguments.control_library),
+                ("rounded_fused", arguments.rounded_library),
+            )
+        },
         "layer_count": len(reports),
         "selected_experts_per_token": selected_experts.shape[1],
         "prefix_logits_error": asdict(

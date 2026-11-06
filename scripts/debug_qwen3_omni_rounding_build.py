@@ -61,6 +61,10 @@ def main() -> None:
         "cutlass_extensions/gemm/kernel/fused_moe_kernel_routine.cuh"
     )
     assert b"FLASHINFER_DIAGNOSTIC_ROUND_GATE_UP_BF16" in header.read_bytes()
+    if arguments.round_activation:
+        assert b"FLASHINFER_DIAGNOSTIC_ROUND_ACTIVATION_BF16" in header.read_bytes()
+    else:
+        pass
     print(f"Building {specification.name} in {specification.build_dir}", flush=True)
     specification.build_and_load()
     library = arguments.output_directory / "projection_rounding.so"
