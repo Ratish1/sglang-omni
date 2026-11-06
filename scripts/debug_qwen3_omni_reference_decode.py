@@ -26,6 +26,11 @@ def main() -> None:
     parser.add_argument("--model-path", required=True)
     parser.add_argument("--trace-directory", type=Path, required=True)
     parser.add_argument("--gpu", type=int, required=True)
+    parser.add_argument(
+        "--feedback-reduction",
+        choices=("reference", "incremental"),
+        default="reference",
+    )
     parser.add_argument("--output-directory", type=Path, required=True)
     arguments = parser.parse_args()
     device = torch.device("cuda", arguments.gpu)
@@ -117,7 +122,12 @@ def main() -> None:
                 talker.code_predictor.get_input_embeddings()
             ):
                 embedding_rows.append(embedding(residual[:, index : index + 1]))
-            feedback = torch.cat(embedding_rows, dim=1).sum(1)
+            if arguments.feedback_reduction == "reference":
+                feedback = torch.cat(embedding_rows, dim=1).sum(1)
+            else:
+                feedback = torch.zeros_like(embedding_rows[0][:, 0])
+                for embedding_row in embedding_rows:
+                    feedback.add_(embedding_row[:, 0])
             text = trailing_text[step] if step < len(trailing_text) else padding
             embeddings = (feedback + text).unsqueeze(1)
             repetition_mask[0, sampled.item()] = True
