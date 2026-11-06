@@ -222,6 +222,8 @@ def main() -> None:
     native_vision = Qwen3OmniImageEncoder(
         arguments.model_path, device=str(device), dtype=torch.bfloat16
     ).eval()
+    for name, parameter in reference_vision.named_parameters():
+        assert torch.equal(parameter, native_vision.visual.get_parameter(name)), name
     rows, columns = np.indices((56, 84))
     pixels = np.stack(
         ((rows * 3) % 256, (columns * 2) % 256, (rows + columns) % 256), axis=-1

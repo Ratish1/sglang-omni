@@ -178,6 +178,9 @@ def main() -> None:
         report["incremental_vs_full_native"] = asdict(
             compare_tensors(incremental, full_native)
         )
+        report["incremental_vs_math_native"] = asdict(
+            compare_tensors(incremental, actual)
+        )
         report["chunk_frames"] = arguments.chunk_frames
         report["ring_frames"] = pool.ring_frames
         report["ring_wraps"] = codes.shape[-1] // pool.ring_frames

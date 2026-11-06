@@ -30,6 +30,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model-path", required=True)
     parser.add_argument("--trace-root", type=Path, required=True)
+    parser.add_argument("--request-id", action="append")
     parser.add_argument("--gpu", type=int, required=True)
     parser.add_argument("--output-directory", type=Path, required=True)
     arguments = parser.parse_args()
@@ -68,6 +69,15 @@ def main() -> None:
         layer.register_forward_hook(capture_layer) for layer in reference.model.layers
     ]
     trace_files = sorted(arguments.trace_root.glob("*/thinker-prefill.pt"))
+    if arguments.request_id is not None:
+        trace_files = [
+            trace_file
+            for trace_file in trace_files
+            if trace_file.parent.name in arguments.request_id
+        ]
+        assert len(trace_files) == len(set(arguments.request_id))
+    else:
+        pass
     assert trace_files, arguments.trace_root
     reports = []
     with torch.inference_mode(), sdpa_kernel(SDPBackend.MATH):
