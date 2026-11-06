@@ -54,6 +54,7 @@ from sglang_omni.vendor.sglang.layers import (
     MergedColumnParallelLinear,
     MRotaryEmbedding,
     QuantizationConfig,
+    RadixAttention,
     ReplicatedLinear,
     RMSNorm,
     RowParallelLinear,
@@ -448,6 +449,36 @@ class Qwen3OmniMoeTalkerTextModel(nn.Module):
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.layers_to_capture = []
         self.diagnostic_layers: dict[str, torch.Tensor] = {}
+        self.diagnostic_attention: dict[str, torch.Tensor] = {}
+        if os.environ.get("SGLANG_OMNI_DIAGNOSTIC_ATTENTION_TRACE") is not None:
+
+            def capture_attention(
+                module: RadixAttention,
+                arguments: tuple[
+                    torch.Tensor, torch.Tensor, torch.Tensor, ForwardBatch
+                ],
+                output: torch.Tensor,
+            ) -> None:
+                query, key, value, _ = arguments
+                rows = query.shape[0]
+                if rows in (1, 128):
+                    prefix = f"attention_{module.layer_id}_"
+                    for name, tensor in (
+                        ("query", query),
+                        ("key", key),
+                        ("value", value),
+                        ("output", output),
+                    ):
+                        self.diagnostic_attention[f"{prefix}{name}_{rows}"] = (
+                            tensor.clone()
+                        )
+                else:
+                    pass
+
+            for layer in self.layers:
+                layer.self_attn.attn.register_forward_hook(capture_attention)
+        else:
+            pass
         max_batch_size = get_schedule().max_running_requests
         self.cp_enabled = True
         self.feedback_buffer = torch.zeros(
