@@ -13,6 +13,7 @@ from itertools import combinations, product
 from pathlib import Path
 
 import torch
+from huggingface_hub import snapshot_download
 from transformers import Qwen3OmniMoeConfig
 
 from sglang_omni.models.qwen3_omni.config import (
@@ -174,16 +175,15 @@ def main() -> None:
             }
             for stage in stages
         ]
-    config = Qwen3OmniMoeConfig.from_pretrained(
-        arguments.model_path, local_files_only=True
-    )
+    snapshot = Path(snapshot_download(arguments.model_path, local_files_only=True))
+    config = Qwen3OmniMoeConfig.from_pretrained(snapshot, local_files_only=True)
     source = Path(inspect.getfile(resolve_preprocessing_next_stages_speech))
     report = {
         "revision": subprocess.check_output(
             ["git", "rev-parse", "HEAD"], text=True
         ).strip(),
         "model_path": arguments.model_path,
-        "checkpoint_revision": config._commit_hash,
+        "checkpoint_revision": snapshot.name,
         "source_sha256": hashlib.sha256(source.read_bytes()).hexdigest(),
         "scope": "Real route and join functions over explicit post-preprocessing encoder-presence states. No media decode, encoder, Thinker, Talker, lifecycle or task-quality execution is implied.",
         "video_audio_condition": "True represents successful extraction. Silent videos and mixed valid/missing tracks are separate preprocessing contracts, not an assumed audio branch.",
