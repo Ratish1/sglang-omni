@@ -1378,6 +1378,16 @@ class Qwen3OmniTalker(nn.Module):
                 logits_output.next_token_logits,
                 forward_batch,
             )
+            diagnostic_override = os.environ.get(
+                "SGLANG_OMNI_DIAGNOSTIC_CODEC_OVERRIDE"
+            )
+            if diagnostic_override is not None:
+                position, token_id = map(int, diagnostic_override.split(":"))
+                sampled_token_ids = torch.where(
+                    forward_batch.positions == position, token_id, sampled_token_ids
+                )
+            else:
+                pass
             batch_size = sampled_token_ids.shape[0]
             self.sampled_token_ids[:batch_size].copy_(sampled_token_ids)
             self.code_predictor_forward(
