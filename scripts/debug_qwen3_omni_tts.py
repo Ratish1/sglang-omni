@@ -17,11 +17,13 @@ from pathlib import Path
 
 import aiohttp
 
-from benchmarks.benchmarker.data import RequestResult
+from benchmarks.benchmarker.data import RequestResult, finish_reason_from_server
 from benchmarks.benchmarker.runner import BenchmarkRunner, RunConfig
 from benchmarks.benchmarker.utils import get_wav_duration
 from benchmarks.dataset.prepare import DATASETS
 from benchmarks.dataset.seedtts import SampleInput, load_seedtts_samples
+from benchmarks.metrics.performance import compute_speed_metrics
+from benchmarks.tasks.tts import save_generated_audio_metadata, save_speed_results
 
 
 async def replay_requests(
@@ -30,6 +32,7 @@ async def replay_requests(
     samples: list[SampleInput],
     concurrency: int,
     rounds: int,
+    request_namespace: uuid.UUID | None,
 ) -> None:
     worker_urls = itertools.cycle(base_urls)
     for round_index in range(rounds):
@@ -39,7 +42,11 @@ async def replay_requests(
         async def send_request(
             session: aiohttp.ClientSession, sample: SampleInput
         ) -> RequestResult:
-            request_id = str(uuid.uuid4())
+            request_id = str(
+                uuid.uuid5(request_namespace, f"{round_index}/{sample.sample_id}")
+                if request_namespace is not None
+                else uuid.uuid4()
+            )
             base_url = next(worker_urls)
             prompt_text = (
                 f'Listen to the audio above. The speaker is reading: "{sample.ref_text}". '
@@ -59,7 +66,7 @@ async def replay_requests(
             }
             request_path = round_directory / f"{request_id}.request.json"
             request_path.write_text(json.dumps(payload, indent=2))
-            result = RequestResult(request_id=request_id, text=sample.target_text)
+            result = RequestResult(request_id=sample.sample_id, text=sample.target_text)
             started_at = time.perf_counter()
             async with session.post(
                 f"{base_url}/v1/chat/completions", json=payload
@@ -81,6 +88,17 @@ async def replay_requests(
                     result.wav_path = str(audio_path)
                     result.audio_duration_s = get_wav_duration(audio_bytes)
                     result.is_success = result.audio_duration_s > 0
+                    result.rtf = (
+                        result.latency_s / result.audio_duration_s
+                        if result.is_success
+                        else 0.0
+                    )
+                    result.finish_reason = finish_reason_from_server(
+                        choices[0]["finish_reason"]
+                    )
+                    usage = response_json["usage"]
+                    result.prompt_tokens = usage["prompt_tokens"]
+                    result.completion_tokens = usage["completion_tokens"]
                     audio["sha256"] = hashlib.sha256(audio_bytes).hexdigest()
                     audio["wav_path"] = result.wav_path
                 record = {
@@ -91,6 +109,9 @@ async def replay_requests(
                     "http_status": response.status,
                     "latency_s": result.latency_s,
                     "audio_duration_s": result.audio_duration_s,
+                    "request_sha256": hashlib.sha256(
+                        json.dumps(payload, sort_keys=True).encode()
+                    ).hexdigest(),
                     "response": response_json,
                 }
             response_path = round_directory / f"{request_id}.response.json"
@@ -102,6 +123,19 @@ async def replay_requests(
             RunConfig(max_concurrency=concurrency, warmup=0, disable_tqdm=True)
         )
         results = await runner.run(samples, send_request)
+        save_generated_audio_metadata(results, samples, str(round_directory))
+        save_speed_results(
+            results,
+            compute_speed_metrics(results, runner.wall_clock_s),
+            {
+                "concurrency": concurrency,
+                "request_namespace": (
+                    str(request_namespace) if request_namespace is not None else None
+                ),
+                "warmup": 0,
+            },
+            str(round_directory),
+        )
         summary = {
             "round": round_index + 1,
             "requests": len(results),
@@ -120,6 +154,8 @@ def main() -> None:
     parser.add_argument("--sample-id")
     parser.add_argument("--concurrency", type=int, required=True)
     parser.add_argument("--rounds", type=int, required=True)
+    parser.add_argument("--request-namespace", type=uuid.UUID)
+    parser.add_argument("--reference-directory", type=Path)
     arguments = parser.parse_args()
     logging.basicConfig(level=logging.INFO)
     arguments.output_directory.mkdir(parents=True, exist_ok=False)
@@ -131,8 +167,10 @@ def main() -> None:
         assert samples, arguments.sample_id
     else:
         pass
-    reference_directory = arguments.output_directory / "references"
-    reference_directory.mkdir()
+    reference_directory = (
+        arguments.reference_directory or arguments.output_directory / "references"
+    )
+    reference_directory.mkdir(parents=True, exist_ok=True)
     for sample in samples:
         reference_path = reference_directory / f"{sample.sample_id}.wav"
         shutil.copyfile(sample.ref_audio, reference_path)
@@ -144,6 +182,7 @@ def main() -> None:
             samples,
             arguments.concurrency,
             arguments.rounds,
+            arguments.request_namespace,
         )
     )
 
