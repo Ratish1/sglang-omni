@@ -25,6 +25,7 @@ def main() -> None:
     parser.add_argument("--gpu", type=int, required=True)
     parser.add_argument("--steps", type=int, required=True)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--compare-experts", action="store_true")
     arguments = parser.parse_args()
     device = torch.device("cuda", arguments.gpu)
     torch.cuda.set_device(device)
@@ -43,7 +44,7 @@ def main() -> None:
     assert not loading["missing_keys"], loading["missing_keys"]
     assert not loading["mismatched_keys"], loading["mismatched_keys"]
     reference.eval()
-    comparisons: list[dict[str, str | int | float | list[int]]] = []
+    comparisons = []
     cache = None
     with torch.inference_mode():
         for step in range(arguments.steps):
@@ -71,7 +72,7 @@ def main() -> None:
             logits = reference.codec_head(outputs.last_hidden_state[:, -1]).float()
             actual_logits = after["logits"].to(device).float()
             difference = logits - actual_logits
-            comparison: dict[str, str | int | float | list[int]] = {
+            comparison = {
                 "step": step,
                 "logits_max_absolute_error": difference.abs().max().item(),
                 "logits_relative_error": (difference.norm() / logits.norm()).item(),
@@ -120,6 +121,61 @@ def main() -> None:
             comparison["feedback_max_absolute_error"] = (
                 (feedback - actual_feedback).abs().max().item()
             )
+            if arguments.compare_experts:
+                expert_comparisons = []
+                for layer_index, layer in enumerate(reference.model.layers):
+                    prefix = f"moe_{layer_index}_"
+                    live_rows = embeddings.shape[-2]
+                    native_input = after[prefix + "input"][:live_rows].to(device)
+                    router_logits, routing_weights, selected_experts = layer.mlp.gate(
+                        native_input
+                    )
+                    native_experts = (
+                        after[prefix + "experts"][:live_rows].to(device).long()
+                    )
+                    native_weights = after[prefix + "weights"][:live_rows].to(device)
+                    shared_output = layer.mlp.shared_expert(native_input)
+                    shared_output *= layer.mlp.shared_expert_gate(
+                        native_input
+                    ).sigmoid()
+                    routed_output = layer.mlp.experts(
+                        native_input, selected_experts, routing_weights
+                    )
+                    fixed_routing_output = layer.mlp.experts(
+                        native_input, native_experts, native_weights
+                    )
+                    expert_comparison = {
+                        "layer": layer_index,
+                        "expert_sets_equal": torch.equal(
+                            selected_experts.sort(-1).values,
+                            native_experts.sort(-1).values,
+                        ),
+                        "native_weight_sum_min": native_weights.sum(-1).min().item(),
+                        "native_weight_sum_max": native_weights.sum(-1).max().item(),
+                    }
+                    for name, expected, actual in (
+                        ("router", router_logits, after[prefix + "router_logits"]),
+                        ("shared", shared_output, after[prefix + "shared_output"]),
+                        ("routed", routed_output, after[prefix + "routed_output"]),
+                        (
+                            "fixed_routing",
+                            fixed_routing_output,
+                            after[prefix + "routed_output"],
+                        ),
+                    ):
+                        difference = (
+                            expected.float() - actual[:live_rows].to(device).float()
+                        )
+                        expert_comparison[f"{name}_relative_error"] = (
+                            difference.norm() / expected.float().norm()
+                        ).item()
+                        expert_comparison[f"{name}_max_error"] = (
+                            difference.abs().max().item()
+                        )
+                    expert_comparisons.append(expert_comparison)
+                comparison["experts"] = expert_comparisons
+            else:
+                pass
             comparisons.append(comparison)
             print(json.dumps(comparison), flush=True)
     arguments.output.write_text(json.dumps(comparisons, indent=2))
