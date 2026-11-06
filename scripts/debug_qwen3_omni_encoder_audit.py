@@ -26,7 +26,10 @@ from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import (
 
 from scripts.qwen3_omni_audit_utils import compare_tensors
 from sglang_omni.client.client import Client
-from sglang_omni.models.qwen3_omni.components.audio_encoder import Qwen3OmniAudioEncoder
+from sglang_omni.models.qwen3_omni.components.audio_encoder import (
+    GraphedLayerStack,
+    Qwen3OmniAudioEncoder,
+)
 from sglang_omni.models.qwen3_omni.components.image_encoder import Qwen3OmniImageEncoder
 from sglang_omni.models.qwen3_omni.components.preprocessor import Qwen3OmniPreprocessor
 from sglang_omni.models.qwen3_omni.payload_types import Qwen3OmniPipelineState
@@ -181,12 +184,15 @@ def main() -> None:
         compare_tensors(graphed_audio["audio_embeds"], actual_audio["audio_embeds"])
     )
     captured_graph = runner.graphs[replay_buckets[0]]
+    graph_stack = native_audio.audio_tower.layers
+    assert isinstance(graph_stack, GraphedLayerStack)
     with torch.inference_mode():
-        padded_eager = runner.run_layers(
-            captured_graph.hidden_states.clone(),
-            captured_graph.cu_seqlens.clone(),
-            runner.window,
-        )
+        with patch.object(native_audio.audio_tower, "layers", graph_stack.layers):
+            padded_eager = runner.run_layers(
+                captured_graph.hidden_states.clone(),
+                captured_graph.cu_seqlens.clone(),
+                runner.window,
+            )
         repeated_graph = native_audio(
             input_features=features, feature_attention_mask=mask
         )
