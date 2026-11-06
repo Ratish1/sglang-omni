@@ -5,12 +5,12 @@ from __future__ import annotations
 
 import argparse
 import json
-from contextlib import ExitStack
+from contextlib import ExitStack, nullcontext
 from importlib.metadata import version
 from pathlib import Path
 
 import torch
-from flashinfer.autotuner import AutoTuner
+from flashinfer.autotuner import AutoTuner, autotune
 from flashinfer.fused_moe import cutlass_fused_moe
 from flashinfer.fused_moe.core import ActivationType
 from huggingface_hub import snapshot_download
@@ -26,6 +26,7 @@ def main() -> None:
     parser.add_argument("--tune-max-tokens", type=int, nargs="+", required=True)
     parser.add_argument("--profiles", type=int, nargs=2)
     parser.add_argument("--cache", type=Path)
+    parser.add_argument("--autotune", action="store_true")
     parser.add_argument("--reference", action="store_true")
     parser.add_argument("--output-directory", type=Path, required=True)
     arguments = parser.parse_args()
@@ -116,19 +117,30 @@ def main() -> None:
                 if arguments.profiles is not None
                 else {}
             )
-            output = cutlass_fused_moe(
-                input=hidden_states,
-                token_selected_experts=selected_experts,
-                token_final_scales=routing_weights,
-                fc1_expert_weights=gate_up_weights,
-                fc2_expert_weights=down_weights,
-                output_dtype=torch.bfloat16,
-                quant_scales=None,
-                tune_max_num_tokens=max_tokens,
-                activation_type=ActivationType.Swiglu,
-                use_fused_finalize=False,
-                **profile_override,
-            )[0]
+            tuning_context = (
+                autotune(
+                    True,
+                    cache=str(
+                        arguments.output_directory / f"autotune-{max_tokens}.json"
+                    ),
+                )
+                if arguments.autotune
+                else nullcontext()
+            )
+            with tuning_context:
+                output = cutlass_fused_moe(
+                    input=hidden_states,
+                    token_selected_experts=selected_experts,
+                    token_final_scales=routing_weights,
+                    fc1_expert_weights=gate_up_weights,
+                    fc2_expert_weights=down_weights,
+                    output_dtype=torch.bfloat16,
+                    quant_scales=None,
+                    tune_max_num_tokens=max_tokens,
+                    activation_type=ActivationType.Swiglu,
+                    use_fused_finalize=False,
+                    **profile_override,
+                )[0]
             difference = output.float() - native_output.float()
             comparison = dict(
                 tune_max_tokens=max_tokens,
@@ -145,6 +157,7 @@ def main() -> None:
         json.dumps(
             dict(
                 flashinfer=version("flashinfer-python"),
+                autotuned=arguments.autotune,
                 profiles=arguments.profiles,
                 cache=str(arguments.cache),
                 comparisons=comparisons,
