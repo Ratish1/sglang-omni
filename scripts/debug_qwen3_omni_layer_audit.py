@@ -7,7 +7,7 @@ import argparse
 import hashlib
 import inspect
 import json
-from dataclasses import asdict, dataclass
+from dataclasses import asdict
 from importlib.metadata import version
 from pathlib import Path
 from unittest.mock import patch
@@ -28,28 +28,7 @@ from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import (
     Qwen3OmniMoeTalkerTextSparseMoeBlock,
 )
 
-
-@dataclass(kw_only=True)
-class TensorDifference:
-    exact: bool
-    equal_fraction: float
-    maximum_absolute_error: float
-    relative_l2_error: float | None
-
-
-def compare_tensors(actual: torch.Tensor, expected: torch.Tensor) -> TensorDifference:
-    assert actual.shape == expected.shape
-    assert torch.isfinite(actual).all() and torch.isfinite(expected).all()
-    difference = actual.float() - expected.float()
-    expected_norm = expected.float().norm().item()
-    return TensorDifference(
-        exact=torch.equal(actual, expected),
-        equal_fraction=(actual == expected).float().mean().item(),
-        maximum_absolute_error=difference.abs().max().item(),
-        relative_l2_error=(
-            difference.norm().item() / expected_norm if expected_norm else None
-        ),
-    )
+from scripts.qwen3_omni_audit_utils import compare_tensors
 
 
 def run_experts(
@@ -82,6 +61,11 @@ def main() -> None:
     parser.add_argument("--profiles", type=int, nargs=2, required=True)
     parser.add_argument("--control-library", type=Path, required=True)
     parser.add_argument("--rounded-library", type=Path, required=True)
+    parser.add_argument(
+        "--captured-kernel",
+        choices=("rebuilt_control", "rounded_fused"),
+        default="rebuilt_control",
+    )
     parser.add_argument("--output-directory", type=Path, required=True)
     arguments = parser.parse_args()
     arguments.output_directory.mkdir(exist_ok=False)
@@ -173,13 +157,29 @@ def main() -> None:
             shared = layer.mlp.shared_expert(hidden_states)
             shared *= layer.mlp.shared_expert_gate(hidden_states).sigmoid()
             _, reference_weights, reference_experts = layer.mlp.gate(hidden_states)
+            routing_sets_equal = torch.equal(
+                selected_experts.sort(-1).values, reference_experts.sort(-1).values
+            )
+            if routing_sets_equal:
+                routing_weight_error = asdict(
+                    compare_tensors(
+                        routing_weights.gather(1, selected_experts.argsort(-1)),
+                        reference_weights.gather(1, reference_experts.argsort(-1)),
+                    )
+                )
+            else:
+                routing_weight_error = None
+            canonical_routed = layer.mlp.experts(
+                hidden_states, reference_experts, reference_weights
+            )
             report = {
                 "layer": layer_index,
                 "live_tokens": live_token_count,
                 "bucket_tokens": bucket_token_count,
-                "routing_sets_equal": torch.equal(
-                    selected_experts.sort(-1).values,
-                    reference_experts.sort(-1).values,
+                "routing_sets_equal": routing_sets_equal,
+                "routing_weight_error": routing_weight_error,
+                "routing_precision_effect": asdict(
+                    compare_tensors(reference_routed, canonical_routed)
                 ),
                 "shared_reference_error": asdict(
                     compare_tensors(captured_shared, shared)
@@ -211,7 +211,7 @@ def main() -> None:
                         down_weights,
                         arguments.profiles,
                     )
-                if name == "rebuilt_control":
+                if name == arguments.captured_kernel:
                     assert torch.equal(routed, captured_routed), layer_index
                 else:
                     pass
@@ -319,6 +319,7 @@ def main() -> None:
         "reference_experts": reference.model.config._experts_implementation,
         "reference_attention": "sdpa_math",
         "profiles": arguments.profiles,
+        "captured_kernel": arguments.captured_kernel,
         "layer_count": len(reports),
         "selected_experts_per_token": selected_experts.shape[1],
         "prefix_logits_error": asdict(
