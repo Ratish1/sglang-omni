@@ -97,7 +97,7 @@ def make_model_config(
     "case",
     [
         BackendPolicyCase(
-            name="bf16_talker_auto_uses_flashinfer_cutlass",
+            name="bf16_talker_auto_uses_sglang_policy",
             model_quantization=None,
             server_quantization=None,
             native_fp8_block_quant=False,
@@ -108,7 +108,7 @@ def make_model_config(
             ep_size=1,
             cutlass_supported=True,
             expected_quantization=None,
-            expected_moe_backend="flashinfer_cutlass",
+            expected_moe_backend="auto",
             expected_fp8_gemm_backend="auto",
         ),
         BackendPolicyCase(
@@ -352,7 +352,6 @@ def test_model_worker_backend_policy_precedence(
         "is_fp8_cutlass_moe_supported",
         lambda: case.cutlass_supported,
     )
-    monkeypatch.setattr(cuda, "is_h20_device", lambda: False)
     server_args = make_server_args(
         quantization=case.server_quantization,
         moe_runner_backend=case.initial_moe_backend,
@@ -447,29 +446,6 @@ def test_model_worker_backend_policy_uses_strict_server_args_override(
             ),
         ]
     )
-
-
-def test_bf16_talker_moe_downgrade_keys_on_device_not_fp8(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A bf16 talker's flashinfer_cutlass->triton downgrade must never be gated on
-    FP8 CUTLASS availability. Off-CUDA is structural now that the policy hangs off
-    CUDAOmniPlatform, so a non-CUDA platform never reaches this kernel choice.
-    """
-    monkeypatch.setattr(cuda, "is_fp8_cutlass_moe_supported", lambda: False)
-    monkeypatch.setattr(cuda, "is_h20_device", lambda: False)
-
-    server_args = make_server_args(moe_runner_backend="auto")
-    model_config = make_model_config(quantization=None, has_moe=True)
-
-    effective_quantization = cuda_platform.apply_model_worker_backend_policy(
-        server_args,
-        model_config,
-        "Qwen3OmniTalker",
-    )
-
-    assert effective_quantization is None
-    assert resolution_result(server_args, "moe_runner_backend") == "flashinfer_cutlass"
 
 
 @pytest.mark.parametrize("backend", ["flashinfer_cutlass", "cutlass"])
@@ -795,9 +771,6 @@ def test_configure_backend_policy_fp8_gemm_ordering(
         is_sm100_supported=lambda: False,
         is_sm120_supported=lambda: False,
     )
-
-    # Patch _is_h20_device so we get deterministic BF16 policy.
-    monkeypatch.setattr(cuda, "is_h20_device", lambda: False)
 
     monkeypatch.setattr(
         model_worker, "current_platform", SimpleNamespace(device_type="cuda")

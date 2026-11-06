@@ -26,22 +26,6 @@ else:
 logger = logging.getLogger(__name__)
 
 
-def is_h20_device() -> bool:
-    """True only on NVIDIA H20 (word-boundary match so "H200" isn't caught)."""
-    try:
-        import re
-
-        import torch
-
-        if not torch.cuda.is_available():
-            return False
-        else:
-            pass
-        return bool(re.search(r"\bH20\b", torch.cuda.get_device_name(0)))
-    except Exception:
-        return False
-
-
 def is_fp8_cutlass_moe_supported() -> bool:
     """Mirror SGLang's CUTLASS FP8 MoE assertions."""
     from sglang.srt.layers.quantization.fp8_utils import cutlass_fp8_supported
@@ -168,22 +152,6 @@ class CUDAOmniPlatform(CudaDeviceMixin, OmniPlatform):
             and normalize_quantization(quant_dict.get("quant_method")) == "fp8"
             and quant_dict.get("weight_block_size") is not None
         )
-
-        if (
-            model_arch_override == "Qwen3OmniTalker"
-            and effective_quantization is None
-            and moe_runner_backend == "auto"
-        ):
-            # Note:(Chenchen Hong) flashinfer_cutlass MoE deadlocks CUDA-graph
-            # capture on H20 (no H20 kernel coverage); triton captures cleanly there.
-            moe_runner_backend = "triton" if is_h20_device() else "flashinfer_cutlass"
-            override_server_args(
-                server_args,
-                "sglang-omni-qwen3-backend-policy",
-                moe_runner_backend=moe_runner_backend,
-            )
-        else:
-            pass
 
         if (
             is_qwen3_omni_arch
