@@ -65,6 +65,11 @@ from sglang_omni.vendor.sglang.layers import (
 from sglang_omni.vendor.sglang.models import FusedSetKVBufferArg, apply_qk_norm
 from sglang_omni.vendor.sglang.utils import make_layers
 
+if current_platform.is_cuda():
+    from flashinfer.autotuner import autotune
+else:
+    pass
+
 logger = logging.getLogger(__name__)
 
 
@@ -376,7 +381,15 @@ class Qwen3OmniMoeTalkerSparseMoeBlock(Qwen3OmniMoeThinkerTextSparseMoeBlock):
             )
         else:
             pass
-        routed_output = self.experts(linear_hidden_states, topk_output)
+        if (
+            os.environ.get("SGLANG_OMNI_DIAGNOSTIC_PREFILL_DEFAULT_MOE") is not None
+            and forward_batch is not None
+            and forward_batch.forward_mode.is_extend()
+        ):
+            with autotune(False, skip_ops={"trtllm::fused_moe::gemm1"}):
+                routed_output = self.experts(linear_hidden_states, topk_output)
+        else:
+            routed_output = self.experts(linear_hidden_states, topk_output)
         if capture_experts:
             self.diagnostic_tensors[f"routed_output_{num_tokens}"] = (
                 routed_output.clone()
