@@ -26,6 +26,7 @@ def main() -> None:
     parser.add_argument("--steps", type=int, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--compare-experts", action="store_true")
+    parser.add_argument("--expert-steps", type=int, nargs="+")
     parser.add_argument("--backbone-only", action="store_true")
     arguments = parser.parse_args()
     device = torch.device("cuda", arguments.gpu)
@@ -131,7 +132,9 @@ def main() -> None:
                 )
             else:
                 pass
-            if arguments.compare_experts:
+            if arguments.compare_experts and (
+                arguments.expert_steps is None or step in arguments.expert_steps
+            ):
                 expert_comparisons = []
                 for layer_index, layer in enumerate(reference.model.layers):
                     prefix = f"moe_{layer_index}_"
