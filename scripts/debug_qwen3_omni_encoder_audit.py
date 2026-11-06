@@ -41,10 +41,15 @@ def capture_layer(
     output: torch.Tensor | tuple[torch.Tensor, torch.Tensor | None],
     *,
     snapshots: list[torch.Tensor],
+    input_snapshots: list[torch.Tensor] | None = None,
 ) -> None:
     """The fixed hook signature includes the module and its positional inputs."""
     tensor = output[0] if isinstance(output, tuple) else output
     snapshots.append(tensor.detach().clone())
+    if input_snapshots is not None:
+        input_snapshots.append(inputs[0].detach().clone())
+    else:
+        pass
 
 
 def main() -> None:
@@ -151,6 +156,7 @@ def main() -> None:
     runner = native_audio.layer_graph_runner
     assert runner is not None and runner.has_graphs
     replay_results: list[bool] = []
+    replay_buckets: list[int] = []
     maybe_replay = runner.maybe_replay
 
     def record_replay(
@@ -160,6 +166,9 @@ def main() -> None:
     ) -> torch.Tensor | None:
         output = maybe_replay(hidden_states, cumulative_sequence_lengths, segments)
         replay_results.append(output is not None)
+        bucket = runner.select(hidden_states.shape[0], segments)
+        assert bucket is not None
+        replay_buckets.append(bucket)
         return output
 
     with torch.inference_mode(), patch.object(runner, "maybe_replay", record_replay):
@@ -170,6 +179,23 @@ def main() -> None:
     audio_report["graph_replay_executed"] = True
     audio_report["graph_vs_eager_error"] = asdict(
         compare_tensors(graphed_audio["audio_embeds"], actual_audio["audio_embeds"])
+    )
+    captured_graph = runner.graphs[replay_buckets[0]]
+    with torch.inference_mode():
+        padded_eager = runner.run_layers(
+            captured_graph.hidden_states.clone(),
+            captured_graph.cu_seqlens.clone(),
+            runner.window,
+        )
+        repeated_graph = native_audio(
+            input_features=features, feature_attention_mask=mask
+        )
+    audio_report["graph_bucket_tokens"] = replay_buckets[0]
+    audio_report["graph_stack_vs_same_padded_eager"] = asdict(
+        compare_tensors(captured_graph.output, padded_eager)
+    )
+    audio_report["graph_repeat_error"] = asdict(
+        compare_tensors(repeated_graph["audio_embeds"], graphed_audio["audio_embeds"])
     )
     (arguments.output_directory / "audio.json").write_text(
         json.dumps(audio_report, indent=2)
@@ -217,15 +243,25 @@ def main() -> None:
             grid_name = "image_grid_thw" if modality == "image" else "video_grid_thw"
             vision_reference_layers: list[torch.Tensor] = []
             vision_native_layers: list[torch.Tensor] = []
+            reference_layer_inputs: list[torch.Tensor] = []
+            native_layer_inputs: list[torch.Tensor] = []
             hooks = [
                 block.register_forward_hook(
-                    partial(capture_layer, snapshots=vision_reference_layers)
+                    partial(
+                        capture_layer,
+                        snapshots=vision_reference_layers,
+                        input_snapshots=reference_layer_inputs,
+                    )
                 )
                 for block in reference_vision.blocks
             ]
             hooks.extend(
                 block.register_forward_hook(
-                    partial(capture_layer, snapshots=vision_native_layers)
+                    partial(
+                        capture_layer,
+                        snapshots=vision_native_layers,
+                        input_snapshots=native_layer_inputs,
+                    )
                 )
                 for block in native_vision.visual.blocks
             )
@@ -253,6 +289,22 @@ def main() -> None:
                 {
                     "modality": modality,
                     "grid": model_inputs[grid_name].tolist(),
+                    "patch_embedding_error": asdict(
+                        compare_tensors(
+                            native_vision.visual.patch_embed(
+                                model_inputs[pixel_name].to(device, torch.bfloat16)
+                            ),
+                            reference_vision.patch_embed(
+                                model_inputs[pixel_name].to(device, torch.bfloat16)
+                            ),
+                        )
+                    ),
+                    "layer_input_errors": [
+                        asdict(compare_tensors(actual_input, reference_input))
+                        for actual_input, reference_input in zip(
+                            native_layer_inputs, reference_layer_inputs, strict=True
+                        )
+                    ],
                     "output_error": asdict(
                         compare_tensors(
                             actual[f"{modality}_embeds"], expected.pooler_output
