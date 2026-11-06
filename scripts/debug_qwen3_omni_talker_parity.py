@@ -26,6 +26,7 @@ def main() -> None:
     parser.add_argument("--steps", type=int, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--compare-experts", action="store_true")
+    parser.add_argument("--backbone-only", action="store_true")
     arguments = parser.parse_args()
     device = torch.device("cuda", arguments.gpu)
     torch.cuda.set_device(device)
@@ -79,48 +80,51 @@ def main() -> None:
                 "reference_top_tokens": logits[0].topk(8).indices.tolist(),
                 "actual_top_tokens": actual_logits[0].topk(8).indices.tolist(),
             }
-            sampled = torch.load(
-                arguments.trace_directory
-                / f"{step:04d}-{'post_prefill' if step == 0 else 'post_decode'}.pt",
-                weights_only=True,
-            )
-            codes = sampled["codec_ids"].to(device)
-            native_hidden = sampled["hidden_states"].to(device).unsqueeze(1)
-            first_embedding = reference.model.codec_embedding(codes[:, :1])
-            predicted = reference.code_predictor.generate(
-                inputs_embeds=torch.cat((native_hidden, first_embedding), dim=1),
-                max_new_tokens=config.num_code_groups - 1,
-                do_sample=False,
-                return_dict_in_generate=True,
-                output_scores=True,
-            )
-            reference_codes = predicted.sequences[0].tolist()
-            comparison["reference_residual_codes"] = reference_codes
-            comparison["actual_residual_codes"] = codes[0, 1:].tolist()
-            for index, reference_code in enumerate(reference_codes):
-                actual_code = codes[0, index + 1].item()
-                if reference_code != actual_code:
-                    scores = predicted.scores[index][0].float()
-                    comparison["first_residual_difference"] = index
-                    comparison["residual_logit_margin"] = (
-                        scores[reference_code] - scores[actual_code]
-                    ).item()
-                    comparison["actual_code_reference_rank"] = (
-                        (scores > scores[actual_code]).sum().item()
-                    )
-                    break
-                else:
-                    pass
-            embedding_rows = [first_embedding]
-            for index, embedding in enumerate(
-                reference.code_predictor.get_input_embeddings()
-            ):
-                embedding_rows.append(embedding(codes[:, index + 1 : index + 2]))
-            feedback = torch.cat(embedding_rows, dim=1).sum(dim=1)
-            actual_feedback = sampled["codec_feedback"].to(device)
-            comparison["feedback_max_absolute_error"] = (
-                (feedback - actual_feedback).abs().max().item()
-            )
+            if not arguments.backbone_only:
+                sampled = torch.load(
+                    arguments.trace_directory
+                    / f"{step:04d}-{'post_prefill' if step == 0 else 'post_decode'}.pt",
+                    weights_only=True,
+                )
+                codes = sampled["codec_ids"].to(device)
+                native_hidden = sampled["hidden_states"].to(device).unsqueeze(1)
+                first_embedding = reference.model.codec_embedding(codes[:, :1])
+                predicted = reference.code_predictor.generate(
+                    inputs_embeds=torch.cat((native_hidden, first_embedding), dim=1),
+                    max_new_tokens=config.num_code_groups - 1,
+                    do_sample=False,
+                    return_dict_in_generate=True,
+                    output_scores=True,
+                )
+                reference_codes = predicted.sequences[0].tolist()
+                comparison["reference_residual_codes"] = reference_codes
+                comparison["actual_residual_codes"] = codes[0, 1:].tolist()
+                for index, reference_code in enumerate(reference_codes):
+                    actual_code = codes[0, index + 1].item()
+                    if reference_code != actual_code:
+                        scores = predicted.scores[index][0].float()
+                        comparison["first_residual_difference"] = index
+                        comparison["residual_logit_margin"] = (
+                            scores[reference_code] - scores[actual_code]
+                        ).item()
+                        comparison["actual_code_reference_rank"] = (
+                            (scores > scores[actual_code]).sum().item()
+                        )
+                        break
+                    else:
+                        pass
+                embedding_rows = [first_embedding]
+                for index, embedding in enumerate(
+                    reference.code_predictor.get_input_embeddings()
+                ):
+                    embedding_rows.append(embedding(codes[:, index + 1 : index + 2]))
+                feedback = torch.cat(embedding_rows, dim=1).sum(dim=1)
+                actual_feedback = sampled["codec_feedback"].to(device)
+                comparison["feedback_max_absolute_error"] = (
+                    (feedback - actual_feedback).abs().max().item()
+                )
+            else:
+                pass
             if arguments.compare_experts:
                 expert_comparisons = []
                 for layer_index, layer in enumerate(reference.model.layers):
