@@ -79,6 +79,12 @@ def main() -> None:
                 "logits_relative_error": (difference.norm() / logits.norm()).item(),
                 "reference_top_tokens": logits[0].topk(8).indices.tolist(),
                 "actual_top_tokens": actual_logits[0].topk(8).indices.tolist(),
+                "reference_eos_raw_probability": logits.softmax(-1)[
+                    0, config.codec_eos_token_id
+                ].item(),
+                "actual_eos_raw_probability": actual_logits.softmax(-1)[
+                    0, config.codec_eos_token_id
+                ].item(),
             }
             if not arguments.backbone_only:
                 sampled = torch.load(
