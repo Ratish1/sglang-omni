@@ -422,6 +422,10 @@ class Qwen3OmniThinkerModelRunner(ThinkerModelRunner):
         schedule_batch: ScheduleBatch | None,
         requests: list[SchedulerRequest],
     ) -> None:
+        if os.environ.get("SGLANG_OMNI_DIAGNOSTIC_THINKER_DIRECTORY") is not None:
+            self.diagnostic_visual_masks = None
+        else:
+            pass
         disposition = self.classify_prefill(forward_batch, schedule_batch, requests)
         if disposition.kind != _SIDECAR:
             return
