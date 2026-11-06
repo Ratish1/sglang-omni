@@ -102,7 +102,7 @@ class DiagnosticThinkerBackbone(Qwen3MoeLLMModel):
 
     def forward(
         self,
-        input_ids: torch.Tensor,
+        input_ids: torch.Tensor | None,
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
         input_embeds: torch.Tensor | None = None,
@@ -111,12 +111,13 @@ class DiagnosticThinkerBackbone(Qwen3MoeLLMModel):
     ) -> torch.Tensor | tuple[torch.Tensor, AuxHiddenStateList]:
         self.diagnostic_visual = input_deepstack_embeds is not None
         variant = "visual" if self.diagnostic_visual else "plain"
-        suffix = f"{input_ids.numel()}_{variant}"
+        trace_ids = forward_batch.input_ids if input_ids is None else input_ids
+        suffix = f"{trace_ids.numel()}_{variant}"
         if forward_batch.forward_mode.is_extend():
             embeddings = (
                 self.embed_tokens(input_ids) if input_embeds is None else input_embeds
             )
-            self.diagnostic_tensors[f"input_ids_{suffix}"] = input_ids.clone()
+            self.diagnostic_tensors[f"input_ids_{suffix}"] = trace_ids.clone()
             self.diagnostic_tensors[f"positions_{suffix}"] = positions.clone()
             self.diagnostic_tensors[f"input_embeds_{suffix}"] = embeddings.clone()
             if input_deepstack_embeds is not None:
