@@ -8,7 +8,7 @@ import os
 from collections import deque
 from pathlib import Path
 from queue import Queue
-from typing import TYPE_CHECKING, TypeAlias
+from typing import TYPE_CHECKING, Literal, TypeAlias
 
 import torch
 
@@ -93,6 +93,27 @@ class QwenTalkerModelRunner(ModelRunner["SGLangARRequestData"]):
         else:
             pass
         input_embeds, input_embeds_are_projected = composed
+        fixture_directory = os.environ.get("SGLANG_OMNI_DIAGNOSTIC_INPUT_DIRECTORY")
+        if (
+            fixture_directory is not None
+            and len(requests) == 1
+            and requests[0].request_id == Path(fixture_directory).name
+        ):
+            fixture = torch.load(
+                Path(fixture_directory) / "0000-before_prefill.pt", weights_only=True
+            )
+            assert torch.equal(fixture["input_ids"], forward_batch.input_ids.cpu())
+            assert fixture["prefill_embeds"].shape == input_embeds.shape
+            input_embeds = fixture["prefill_embeds"].to(input_embeds)
+            request = requests[0].data
+            request.prefill_input_embeds = input_embeds
+            request.pending_text_queue = PendingTextTensorQueue.from_tensor(
+                fixture["trailing_text_embeds"].to(input_embeds)
+            )
+            request.tts_pad_embed = fixture["tts_pad_embed"].to(input_embeds)
+            request.tts_eos_embed = fixture["tts_eos_embed"].to(input_embeds)
+        else:
+            pass
         attach_omni_prefill_inputs(
             forward_batch,
             OmniPrefillInputs(
@@ -201,7 +222,13 @@ class QwenTalkerModelRunner(ModelRunner["SGLangARRequestData"]):
 
     def trace_forward(
         self,
-        phase: str,
+        phase: Literal[
+            "before_prefill",
+            "prefill_forward",
+            "before_decode",
+            "post_prefill",
+            "post_decode",
+        ],
         forward_batch: ForwardBatch,
         requests: list[SchedulerRequest],
         result: GenerationBatchResult | None = None,
