@@ -225,7 +225,6 @@ class TalkerPrefillBuilder:
                 captured_positions
                 == prompt_positions.nonzero(as_tuple=True)[0].tolist()
             ), "the thinker's prompt hidden rows are not the prompt's multimodal rows"
-            prompt_hidden[captured_positions] = prompt_chunk.data.to(prompt_hidden)
         else:
             pass
         thinker_hidden = torch.cat([prompt_hidden, assistant_embed], dim=0)
