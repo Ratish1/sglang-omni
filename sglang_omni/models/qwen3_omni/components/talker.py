@@ -435,6 +435,14 @@ class Qwen3OmniMoeTalkerTextModel(nn.Module):
         for idx in range(self.start_layer, self.end_layer):
             self.layers[idx].self_attn.use_fused_qk_norm_rope = False
             self.layers[idx].self_attn.compatible_with_fused_qk_norm_rope = False
+        if os.environ.get("SGLANG_OMNI_DIAGNOSTIC_HF_NORM") is not None:
+            for module in self.modules():
+                if isinstance(module, RMSNorm):
+                    module.cast_x_before_out_mul = True
+                else:
+                    pass
+        else:
+            pass
 
     def get_input_embeddings(self) -> nn.Embedding:
         return self.codec_embedding
