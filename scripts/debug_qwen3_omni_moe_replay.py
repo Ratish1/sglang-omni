@@ -30,6 +30,7 @@ def main() -> None:
     parser.add_argument("--profiles", type=int, nargs=2)
     parser.add_argument("--cache", type=Path)
     parser.add_argument("--rounding-library", type=Path)
+    parser.add_argument("--identity-down-column", type=int)
     parser.add_argument("--autotune", action="store_true")
     parser.add_argument("--reference", action="store_true")
     parser.add_argument("--output-directory", type=Path, required=True)
@@ -84,6 +85,16 @@ def main() -> None:
     selected_experts = saved["moe_0_experts_128"].to(device).int()
     routing_weights = saved["moe_0_weights_128"].to(device).float()
     native_output = saved["moe_0_routed_output_128"].to(device)
+    if arguments.identity_down_column is not None:
+        assert 0 <= arguments.identity_down_column < selected_experts.shape[1]
+        assert down_weights.shape[2] <= down_weights.shape[1]
+        down_weights.zero_()
+        diagonal = torch.arange(down_weights.shape[2], device=device)
+        down_weights[:, diagonal, diagonal] = 1
+        routing_weights = torch.zeros_like(routing_weights)
+        routing_weights[:, arguments.identity_down_column] = 1
+    else:
+        pass
     if arguments.cache is not None:
         AutoTuner.get().load_configs(str(arguments.cache))
     else:
@@ -187,18 +198,26 @@ def main() -> None:
                     use_fused_finalize=False,
                     **profile_override,
                 )[0]
-            expected_output = native_output.narrow(0, 0, token_count)
-            difference = output.float() - expected_output.float()
             comparison = dict(
                 tune_max_tokens=max_tokens,
                 token_count=token_count,
                 choices=choices.copy(),
-                native_equal=torch.equal(output, expected_output),
-                relative_error=(
-                    difference.norm() / expected_output.float().norm()
-                ).item(),
-                max_error=difference.abs().max().item(),
             )
+            if arguments.identity_down_column is None:
+                expected_output = native_output.narrow(0, 0, token_count)
+                difference = output.float() - expected_output.float()
+                comparison.update(
+                    native_equal=torch.equal(output, expected_output),
+                    relative_error=(
+                        difference.norm() / expected_output.float().norm()
+                    ).item(),
+                    max_error=difference.abs().max().item(),
+                )
+            else:
+                comparison["identity_down_column"] = arguments.identity_down_column
+                comparison["activation_columns"] = down_weights.shape[2]
+                assert torch.isfinite(output).all()
+                assert torch.count_nonzero(output[:, down_weights.shape[2] :]) == 0
             comparisons.append(comparison)
             output_path = (
                 arguments.output_directory / f"{call_index:02d}-{max_tokens}.pt"

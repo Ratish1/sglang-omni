@@ -61,7 +61,11 @@ def main() -> None:
         "library_sha256": hashlib.sha256(library.read_bytes()).hexdigest(),
         "header_sha256": hashlib.sha256(header.read_bytes()).hexdigest(),
         "cuda_flags": specification.extra_cuda_cflags,
-        "scope": "BF16 gated SM80-family GEMM1 rounds both FP32 projections to BF16 immediately before the existing activation. No tactic or reduction algorithm is changed.",
+        "scope": (
+            "BF16 gated SM80-family GEMM1 rounds both FP32 projections to BF16 immediately before the existing activation. No tactic or reduction algorithm is changed."
+            if arguments.round_projections
+            else "Unmodified arithmetic rebuilt from the same source and compiler as the rounding diagnostic."
+        ),
     }
     (arguments.output_directory / "manifest.json").write_text(
         json.dumps(manifest, indent=2)
