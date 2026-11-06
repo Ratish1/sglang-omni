@@ -1979,6 +1979,15 @@ class Qwen3OmniTalker(nn.Module):
             layer0_codes=layer0_codes,
             talker_hidden=talker_hidden,
         )
+        if os.environ.get("SGLANG_OMNI_DIAGNOSTIC_REFERENCE_SUM") is not None:
+            embedding_rows = [self.model.codec_embedding(result_codes[:, 0])]
+            for index, embedding in enumerate(
+                self.code_predictor.model.codec_embedding
+            ):
+                embedding_rows.append(embedding(result_codes[:, index + 1]))
+            summed_embeddings.copy_(torch.stack(embedding_rows, dim=1).sum(dim=1))
+        else:
+            pass
         return result_codes, summed_embeddings
 
     def precompile_kernels_after_loading(self) -> None:
