@@ -109,7 +109,6 @@ def main() -> None:
             tokenize=True,
             return_dict=True,
             return_tensors="pt",
-            padding=True,
         ).to(model.device, dtype=torch.bfloat16)
         seed = derive_sampling_seed("sglang-omni-unseeded-row", request.request_id)
         torch.manual_seed(seed)
