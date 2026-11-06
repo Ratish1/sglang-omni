@@ -90,9 +90,26 @@ def main() -> None:
                 inputs_embeds=torch.cat((native_hidden, first_embedding), dim=1),
                 max_new_tokens=config.num_code_groups - 1,
                 do_sample=False,
+                return_dict_in_generate=True,
+                output_scores=True,
             )
-            comparison["reference_residual_codes"] = predicted[0].tolist()
+            reference_codes = predicted.sequences[0].tolist()
+            comparison["reference_residual_codes"] = reference_codes
             comparison["actual_residual_codes"] = codes[0, 1:].tolist()
+            for index, reference_code in enumerate(reference_codes):
+                actual_code = codes[0, index + 1].item()
+                if reference_code != actual_code:
+                    scores = predicted.scores[index][0].float()
+                    comparison["first_residual_difference"] = index
+                    comparison["residual_logit_margin"] = (
+                        scores[reference_code] - scores[actual_code]
+                    ).item()
+                    comparison["actual_code_reference_rank"] = (
+                        (scores > scores[actual_code]).sum().item()
+                    )
+                    break
+                else:
+                    pass
             embedding_rows = [first_embedding]
             for index, embedding in enumerate(
                 reference.code_predictor.get_input_embeddings()
