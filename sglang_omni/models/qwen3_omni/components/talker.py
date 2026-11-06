@@ -5,6 +5,7 @@ SGLang-native Talker model for Qwen3-Omni compatiable with hf formatting.
 from __future__ import annotations
 
 import logging
+import os
 from typing import Iterable, Optional, Tuple
 
 import torch
@@ -413,6 +414,7 @@ class Qwen3OmniMoeTalkerTextModel(nn.Module):
 
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.layers_to_capture = []
+        self.diagnostic_layers: dict[str, torch.Tensor] = {}
         max_batch_size = get_schedule().max_running_requests
         self.cp_enabled = True
         self.feedback_buffer = torch.zeros(
@@ -481,6 +483,14 @@ class Qwen3OmniMoeTalkerTextModel(nn.Module):
                     aux_hidden_states if i in capture_layers and i != 0 else None
                 ),
             )
+            if os.environ.get(
+                "SGLANG_OMNI_DIAGNOSTIC_LAYER_TRACE"
+            ) is not None and hidden_states.shape[0] in (1, 128):
+                self.diagnostic_layers[f"layer_{i}_{hidden_states.shape[0]}"] = (
+                    residual_batch.snapshot(hidden_states, forward_batch)
+                )
+            else:
+                pass
 
         hidden_states = residual_batch.final_norm(
             hidden_states, forward_batch, self.norm, skip_empty=True

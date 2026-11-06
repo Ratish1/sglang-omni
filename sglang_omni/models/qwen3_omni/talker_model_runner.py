@@ -242,6 +242,10 @@ class QwenTalkerModelRunner(ModelRunner["SGLangARRequestData"]):
                 pass
         else:
             pass
+        if os.environ.get("SGLANG_OMNI_DIAGNOSTIC_LAYER_TRACE") is not None:
+            tensors.update(self.model.model.diagnostic_layers)
+        else:
+            pass
         destination = Path(directory) / request.request_id
         destination.mkdir(parents=True, exist_ok=True)
         torch.save(
