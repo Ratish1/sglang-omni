@@ -308,7 +308,9 @@ class QwenTalkerModelRunner(ModelRunner["SGLangARRequestData"]):
             f"codec_token_count={len(req_data.req.output_ids)} "
             f"last_codec_token={req_data.req.output_ids[-1:]} "
             f"finish_reason={req_data.finish_reason} "
-            f"sampling_seed={req_data.req.sampling_params.sampling_seed}"
+            f"sampling_seed={req_data.req.sampling_params.sampling_seed} "
+            f"prompt_token_count={len(req_data.req.origin_input_ids)} "
+            f"codec_tokens={list(req_data.req.output_ids)}"
         )
         pending = req_data.pending_codec_rows
         if not pending:
