@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import logging
 from collections import deque
 from queue import Queue
 from typing import TYPE_CHECKING, TypeAlias
@@ -44,6 +45,8 @@ else:
 TalkerInputQueue: TypeAlias = (
     PendingTextTensorQueue | deque[torch.Tensor] | list[torch.Tensor] | None
 )
+
+logger = logging.getLogger(__name__)
 
 
 class QwenTalkerModelRunner(ModelRunner["SGLangARRequestData"]):
@@ -300,6 +303,13 @@ class QwenTalkerModelRunner(ModelRunner["SGLangARRequestData"]):
     def on_request_finished(
         self, request_id: str, req_data: "SGLangARRequestData"
     ) -> None:
+        logger.info(
+            f"Talker terminal request_id={request_id} "
+            f"codec_token_count={len(req_data.req.output_ids)} "
+            f"last_codec_token={req_data.req.output_ids[-1:]} "
+            f"finish_reason={req_data.finish_reason} "
+            f"sampling_seed={req_data.req.sampling_params.sampling_seed}"
+        )
         pending = req_data.pending_codec_rows
         if not pending:
             return
