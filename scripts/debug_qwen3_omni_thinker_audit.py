@@ -14,10 +14,6 @@ from pathlib import Path
 import torch
 from torch.nn.attention import SDPBackend, sdpa_kernel
 from transformers import Qwen3OmniMoeConfig
-from transformers.conversion_mapping import (
-    get_checkpoint_conversion_mapping,
-    register_checkpoint_conversion_mapping,
-)
 from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import (
     Qwen3OmniMoeThinkerForConditionalGeneration,
     Qwen3OmniMoeThinkerTextDecoderLayer,
@@ -38,9 +34,6 @@ def main() -> None:
     torch.cuda.set_device(arguments.gpu)
     device = torch.device("cuda", arguments.gpu)
     config = Qwen3OmniMoeConfig.from_pretrained(arguments.model_path).thinker_config
-    register_checkpoint_conversion_mapping(
-        config.model_type, get_checkpoint_conversion_mapping("qwen3_omni_moe")
-    )
     reference, loading = Qwen3OmniMoeThinkerForConditionalGeneration.from_pretrained(
         arguments.model_path,
         config=config,
