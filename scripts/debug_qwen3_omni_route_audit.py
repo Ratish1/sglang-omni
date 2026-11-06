@@ -16,6 +16,7 @@ import torch
 from huggingface_hub import snapshot_download
 from transformers import Qwen3OmniMoeConfig
 
+from sglang_omni.client.client import Client
 from sglang_omni.models.qwen3_omni.config import (
     COLOCATED_SPEECH_PROCESSES,
     qwen_session_stages,
@@ -35,6 +36,8 @@ from sglang_omni.models.qwen3_omni.request_builders import (
     resolve_thinker_stream_done_targets,
 )
 from sglang_omni.proto.request import OmniRequest, StagePayload
+from sglang_omni.serve.openai_api import build_chat_generate_request
+from sglang_omni.serve.protocol import ChatCompletionRequest, ChatMessage
 
 INPUT_MODALITIES = ("text", "audio", "image", "video")
 OUTPUT_MODALITIES = (None, ("text",), ("audio",), ("text", "audio"))
@@ -178,12 +181,24 @@ def main() -> None:
     snapshot = Path(snapshot_download(arguments.model_path, local_files_only=True))
     config = Qwen3OmniMoeConfig.from_pretrained(snapshot, local_files_only=True)
     source = Path(inspect.getfile(resolve_preprocessing_next_stages_speech))
+    public_default = Client.build_omni_request(
+        build_chat_generate_request(
+            ChatCompletionRequest(
+                model=arguments.model_path,
+                messages=[ChatMessage(role="user", content="audit")],
+            )
+        )
+    )
     report = {
         "revision": subprocess.check_output(
             ["git", "rev-parse", "HEAD"], text=True
         ).strip(),
         "model_path": arguments.model_path,
         "checkpoint_revision": snapshot.name,
+        "chat_api_default_output_modalities": public_default.metadata[
+            "output_modalities"
+        ],
+        "internal_omitted_metadata_default": "audio branch enabled",
         "source_sha256": hashlib.sha256(source.read_bytes()).hexdigest(),
         "scope": "Real route and join functions over explicit post-preprocessing encoder-presence states. No media decode, encoder, Thinker, Talker, lifecycle or task-quality execution is implied.",
         "video_audio_condition": "True represents successful extraction. Silent videos and mixed valid/missing tracks are separate preprocessing contracts, not an assumed audio branch.",

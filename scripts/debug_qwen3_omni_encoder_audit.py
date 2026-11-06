@@ -25,11 +25,14 @@ from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import (
 )
 
 from scripts.qwen3_omni_audit_utils import compare_tensors
+from sglang_omni.client.client import Client
 from sglang_omni.models.qwen3_omni.components.audio_encoder import Qwen3OmniAudioEncoder
 from sglang_omni.models.qwen3_omni.components.image_encoder import Qwen3OmniImageEncoder
 from sglang_omni.models.qwen3_omni.components.preprocessor import Qwen3OmniPreprocessor
 from sglang_omni.models.qwen3_omni.payload_types import Qwen3OmniPipelineState
-from sglang_omni.proto.request import OmniRequest, StagePayload
+from sglang_omni.proto.request import StagePayload
+from sglang_omni.serve.openai_api import build_chat_generate_request
+from sglang_omni.serve.protocol import ChatCompletionRequest
 
 
 def capture_layer(
@@ -58,12 +61,12 @@ def main() -> None:
     processor = Qwen3OmniPreprocessor(
         arguments.model_path, max_seq_len=32768, video_decode_threads=1
     )
-    request = json.loads(arguments.request_file.read_text())
+    request = ChatCompletionRequest.model_validate_json(
+        arguments.request_file.read_text()
+    )
     payload = StagePayload(
         request_id="encoder-audit",
-        request=OmniRequest(
-            inputs=request, params={"max_new_tokens": request["max_tokens"]}
-        ),
+        request=Client.build_omni_request(build_chat_generate_request(request)),
         data={},
     )
     payload = asyncio.run(processor(payload))
