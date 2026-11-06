@@ -20,6 +20,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--gpu", type=int, required=True)
     parser.add_argument("--output-directory", type=Path, required=True)
+    parser.add_argument("--round-projections", action="store_true")
     arguments = parser.parse_args()
     arguments.output_directory.mkdir(exist_ok=False)
     torch.cuda.set_device(arguments.gpu)
@@ -27,10 +28,18 @@ def main() -> None:
     assert original.extra_cuda_cflags is not None
     specification = replace(
         original,
-        name="fused_moe_90_projection_rounding_diagnostic",
+        name=(
+            "fused_moe_90_projection_rounding_diagnostic"
+            if arguments.round_projections
+            else "fused_moe_90_projection_control_diagnostic"
+        ),
         extra_cuda_cflags=[
             *original.extra_cuda_cflags,
-            "-DFLASHINFER_DIAGNOSTIC_ROUND_GATE_UP_BF16=1",
+            *(
+                ["-DFLASHINFER_DIAGNOSTIC_ROUND_GATE_UP_BF16=1"]
+                if arguments.round_projections
+                else []
+            ),
         ],
     )
     header = FLASHINFER_CSRC_DIR / (
@@ -46,6 +55,7 @@ def main() -> None:
         "flashinfer": version("flashinfer-python"),
         "gpu": torch.cuda.get_device_name(arguments.gpu),
         "module": specification.name,
+        "round_projections": arguments.round_projections,
         "original_library": str(original.get_library_path()),
         "diagnostic_library": str(library),
         "library_sha256": hashlib.sha256(library.read_bytes()).hexdigest(),
