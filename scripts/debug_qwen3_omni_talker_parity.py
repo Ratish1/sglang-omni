@@ -5,9 +5,11 @@ from __future__ import annotations
 
 import argparse
 import json
+from contextlib import nullcontext
 from pathlib import Path
 
 import torch
+from torch.nn.attention import SDPBackend, sdpa_kernel
 from transformers import Qwen3OmniMoeConfig
 from transformers.conversion_mapping import (
     get_checkpoint_conversion_mapping,
@@ -28,6 +30,9 @@ def main() -> None:
     parser.add_argument("--compare-experts", action="store_true")
     parser.add_argument("--expert-steps", type=int, nargs="+")
     parser.add_argument("--backbone-only", action="store_true")
+    parser.add_argument(
+        "--reference-attention", choices=("auto", "math"), default="auto"
+    )
     arguments = parser.parse_args()
     device = torch.device("cuda", arguments.gpu)
     torch.cuda.set_device(device)
@@ -48,7 +53,12 @@ def main() -> None:
     reference.eval()
     comparisons = []
     cache = None
-    with torch.inference_mode():
+    attention_context = (
+        sdpa_kernel(SDPBackend.MATH)
+        if arguments.reference_attention == "math"
+        else nullcontext()
+    )
+    with torch.inference_mode(), attention_context:
         for step in range(arguments.steps):
             before_phase = "before_prefill" if step == 0 else "before_decode"
             after_phase = "prefill_forward" if step == 0 else "post_decode"
