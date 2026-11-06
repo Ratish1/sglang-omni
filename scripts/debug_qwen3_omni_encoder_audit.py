@@ -223,7 +223,13 @@ def main() -> None:
         arguments.model_path, device=str(device), dtype=torch.bfloat16
     ).eval()
     for name, parameter in reference_vision.named_parameters():
-        assert torch.equal(parameter, native_vision.visual.get_parameter(name)), name
+        native_name = name.replace("patch_embed.proj.", "patch_embed.linear.")
+        expected_parameter = (
+            parameter.flatten(1) if name == "patch_embed.proj.weight" else parameter
+        )
+        assert torch.equal(
+            expected_parameter, native_vision.visual.get_parameter(native_name)
+        ), name
     rows, columns = np.indices((56, 84))
     pixels = np.stack(
         ((rows * 3) % 256, (columns * 2) % 256, (rows + columns) % 256), axis=-1
