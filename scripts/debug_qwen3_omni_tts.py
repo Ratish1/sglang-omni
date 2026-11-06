@@ -152,6 +152,10 @@ def main() -> None:
     parser.add_argument("--base-url", action="append", required=True)
     parser.add_argument("--output-directory", type=Path, required=True)
     parser.add_argument("--sample-id")
+    parser.add_argument(
+        "--dataset", choices=("seedtts", "seedtts-50"), default="seedtts-50"
+    )
+    parser.add_argument("--max-samples", type=int)
     parser.add_argument("--concurrency", type=int, required=True)
     parser.add_argument("--rounds", type=int, required=True)
     parser.add_argument("--request-namespace", type=uuid.UUID)
@@ -159,7 +163,9 @@ def main() -> None:
     arguments = parser.parse_args()
     logging.basicConfig(level=logging.INFO)
     arguments.output_directory.mkdir(parents=True, exist_ok=False)
-    samples = load_seedtts_samples(DATASETS["seedtts-50"], 50, split="en")
+    samples = load_seedtts_samples(
+        DATASETS[arguments.dataset], arguments.max_samples, split="en"
+    )
     if arguments.sample_id is not None:
         samples = [
             sample for sample in samples if sample.sample_id == arguments.sample_id
