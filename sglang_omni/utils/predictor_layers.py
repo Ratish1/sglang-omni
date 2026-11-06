@@ -38,6 +38,7 @@ The module imports where Triton is unavailable; the resolvers then keep the plai
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 
 import torch
@@ -1095,6 +1096,10 @@ class FusedPredictorLayers:
             shape, max_rows, device
         )
         self.fitted_stages: dict[tuple[str, int], int] = {}
+        self.diagnostic_enabled: bool = (
+            os.environ.get("SGLANG_OMNI_DIAGNOSTIC_PREDICTOR_TRACE") is not None
+        )
+        self.diagnostic_tensors: dict[str, torch.Tensor] = {}
 
     def covers(self, rows: int) -> bool:
         return rows <= self.max_rows
@@ -1119,11 +1124,23 @@ class FusedPredictorLayers:
         rows = batch_size * num_tokens
         end = cache_len + num_tokens
         hidden = token_embeds.reshape(rows, hidden_size)
+        if self.diagnostic_enabled:
+            self.diagnostic_tensors[f"predictor_input_{cache_len}_{rows}"] = (
+                hidden.clone()
+            )
+        else:
+            pass
         residual = self.residual[:rows]
         q_out = self.q[:rows]
         attention_output = self.attention_output[:rows]
         activated = self.activated[:rows]
         for layer_idx, layer in enumerate(layers):
+            if self.diagnostic_enabled:
+                self.diagnostic_tensors[
+                    f"predictor_layer_input_{layer_idx}_{cache_len}_{rows}"
+                ] = hidden.clone()
+            else:
+                pass
             attention = layer.self_attn
             layer_k_cache = k_cache[layer_idx, :batch_size]
             layer_v_cache = v_cache[layer_idx, :batch_size]
@@ -1181,7 +1198,19 @@ class FusedPredictorLayers:
                 shape=shape,
                 fitted_stages=self.fitted_stages,
             )
+            if self.diagnostic_enabled:
+                self.diagnostic_tensors[
+                    f"predictor_layer_output_{layer_idx}_{cache_len}_{rows}"
+                ] = residual.clone()
+            else:
+                pass
         normed = final_norm(residual)
+        if self.diagnostic_enabled:
+            self.diagnostic_tensors[f"predictor_final_{cache_len}_{rows}"] = (
+                normed.clone()
+            )
+        else:
+            pass
         return normed.reshape(batch_size, num_tokens, hidden_size)
 
 

@@ -269,6 +269,11 @@ class QwenTalkerModelRunner(ModelRunner["SGLangARRequestData"]):
                 pass
         else:
             pass
+        if os.environ.get("SGLANG_OMNI_DIAGNOSTIC_PREDICTOR_TRACE") is not None:
+            assert self.model.predictor_fused_layers is not None
+            tensors.update(self.model.predictor_fused_layers.diagnostic_tensors)
+        else:
+            pass
         if os.environ.get("SGLANG_OMNI_DIAGNOSTIC_LAYER_TRACE") is not None:
             tensors.update(self.model.model.diagnostic_layers)
         else:

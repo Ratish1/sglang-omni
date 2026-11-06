@@ -1873,6 +1873,15 @@ class Qwen3OmniTalker(nn.Module):
 
             for layer_idx in range(num_groups - 1):
                 logits, _ = self.code_predictor.lm_head[layer_idx](last_hidden)
+                if (
+                    self.predictor_fused_layers is not None
+                    and self.predictor_fused_layers.diagnostic_enabled
+                ):
+                    self.predictor_fused_layers.diagnostic_tensors[
+                        f"predictor_logits_{layer_idx}_{batch_size}"
+                    ] = logits.clone()
+                else:
+                    pass
                 codebook_embedding = self.code_predictor.model.codec_embedding[
                     layer_idx
                 ]
