@@ -240,6 +240,13 @@ class QwenTalkerModelRunner(ModelRunner["SGLangARRequestData"]):
             pass
         assert len(requests) == 1, "tensor diagnosis requires serial requests"
         request = requests[0]
+        trace_frames = os.environ.get("SGLANG_OMNI_DIAGNOSTIC_MAX_TRACE_FRAMES")
+        if trace_frames is not None and len(request.data.req.output_ids) >= int(
+            trace_frames
+        ):
+            return
+        else:
+            pass
         tensors = {
             "input_ids": forward_batch.input_ids,
             "positions": forward_batch.positions,
@@ -271,7 +278,16 @@ class QwenTalkerModelRunner(ModelRunner["SGLangARRequestData"]):
             pass
         if os.environ.get("SGLANG_OMNI_DIAGNOSTIC_PREDICTOR_TRACE") is not None:
             assert self.model.predictor_fused_layers is not None
-            tensors.update(self.model.predictor_fused_layers.diagnostic_tensors)
+            if phase == "post_prefill":
+                bucket_rows = self.model.predictor_decode_graph_bucket_size(
+                    len(requests)
+                )
+                graph = self.model.predictor_decode_graphs[
+                    (bucket_rows, result.next_token_ids.dtype)
+                ]
+                tensors.update(graph.diagnostic_tensors)
+            else:
+                tensors.update(self.model.predictor_fused_layers.diagnostic_tensors)
         else:
             pass
         if os.environ.get("SGLANG_OMNI_DIAGNOSTIC_LAYER_TRACE") is not None:

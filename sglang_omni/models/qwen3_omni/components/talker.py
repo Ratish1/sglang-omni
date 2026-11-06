@@ -117,6 +117,12 @@ class PredictorDecodeGraph:
         self.result_codes: torch.Tensor | None = None
         self.summed_embeddings: torch.Tensor | None = None
         self.capture()
+        self.diagnostic_tensors: dict[str, torch.Tensor] = (
+            dict(self.model.predictor_fused_layers.diagnostic_tensors)
+            if self.model.predictor_fused_layers is not None
+            and self.model.predictor_fused_layers.diagnostic_enabled
+            else {}
+        )
 
     # Note (zijiecode): capture in the same mode as replay. SGLang registers the
     # CUDA generator from inference mode, so on torch 2.9 (ROCm) a no_grad
