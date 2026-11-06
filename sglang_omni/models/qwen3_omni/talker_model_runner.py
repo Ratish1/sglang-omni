@@ -287,6 +287,23 @@ class QwenTalkerModelRunner(ModelRunner["SGLangARRequestData"]):
             tensors.update(self.model.model.diagnostic_attention)
         else:
             pass
+        if (
+            phase == "prefill_forward"
+            and os.environ.get("SGLANG_OMNI_DIAGNOSTIC_CACHE_TRACE") is not None
+        ):
+            cache_locations = forward_batch.out_cache_loc[
+                : forward_batch.input_ids.shape[0]
+            ]
+            cache_pool = self.tp_worker.model_runner.token_to_kv_pool
+            for layer_index in range(len(self.model.model.layers)):
+                tensors[f"prefix_keys_{layer_index}"] = cache_pool.get_key_buffer(
+                    layer_index
+                )[cache_locations]
+                tensors[f"prefix_values_{layer_index}"] = cache_pool.get_value_buffer(
+                    layer_index
+                )[cache_locations]
+        else:
+            pass
         destination = Path(directory) / request.request_id
         destination.mkdir(parents=True, exist_ok=True)
         torch.save(
