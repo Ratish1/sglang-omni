@@ -25,6 +25,7 @@ def main() -> None:
     parser.add_argument("--trace-file", type=Path, required=True)
     parser.add_argument("--gpu", type=int, required=True)
     parser.add_argument("--tune-max-tokens", type=int, nargs="+", required=True)
+    parser.add_argument("--token-counts", type=int, nargs="+")
     parser.add_argument("--profiles", type=int, nargs=2)
     parser.add_argument("--cache", type=Path)
     parser.add_argument("--autotune", action="store_true")
@@ -95,11 +96,13 @@ def main() -> None:
             tuner, custom_op, runners, tuning_config, inputs, gemm_idx=gemm_idx
         )
         spec = tuning_config.dynamic_tensor_specs[0]
+        activation = inputs[0]
+        assert activation is not None
         choices.append(
             dict(
                 operation=custom_op,
                 tactic=tactic,
-                token_bucket=spec.map_to_tuning_buckets(hidden_states.shape[0]),
+                token_bucket=spec.map_to_tuning_buckets(activation.shape[0]),
                 maximum_bucket=spec.gen_tuning_buckets[-1],
             )
         )
@@ -138,7 +141,12 @@ def main() -> None:
             torch.save(float_output.cpu(), arguments.output_directory / "float32.pt")
         else:
             pass
-        for call_index, max_tokens in enumerate(arguments.tune_max_tokens):
+        token_counts = arguments.token_counts or [hidden_states.shape[0]] * len(
+            arguments.tune_max_tokens
+        )
+        for call_index, (max_tokens, token_count) in enumerate(
+            zip(arguments.tune_max_tokens, token_counts, strict=True)
+        ):
             choices.clear()
             profile_override = (
                 {"profile_ids": arguments.profiles}
@@ -157,9 +165,9 @@ def main() -> None:
             )
             with tuning_context:
                 output = cutlass_fused_moe(
-                    input=hidden_states,
-                    token_selected_experts=selected_experts,
-                    token_final_scales=routing_weights,
+                    input=hidden_states.narrow(0, 0, token_count),
+                    token_selected_experts=selected_experts.narrow(0, 0, token_count),
+                    token_final_scales=routing_weights.narrow(0, 0, token_count),
                     fc1_expert_weights=gate_up_weights,
                     fc2_expert_weights=down_weights,
                     output_dtype=torch.bfloat16,
@@ -169,13 +177,15 @@ def main() -> None:
                     use_fused_finalize=False,
                     **profile_override,
                 )[0]
-            difference = output.float() - native_output.float()
+            expected_output = native_output.narrow(0, 0, token_count)
+            difference = output.float() - expected_output.float()
             comparison = dict(
                 tune_max_tokens=max_tokens,
+                token_count=token_count,
                 choices=choices.copy(),
-                native_equal=torch.equal(output, native_output),
+                native_equal=torch.equal(output, expected_output),
                 relative_error=(
-                    difference.norm() / native_output.float().norm()
+                    difference.norm() / expected_output.float().norm()
                 ).item(),
                 max_error=difference.abs().max().item(),
             )
