@@ -74,16 +74,24 @@ def main() -> None:
             logits = reference.codec_head(outputs.last_hidden_state[:, -1]).float()
             actual_logits = after["logits"].to(device).float()
             difference = logits - actual_logits
+            reference_probabilities = logits.softmax(-1)
+            actual_probabilities = actual_logits.softmax(-1)
             comparison = {
                 "step": step,
                 "logits_max_absolute_error": difference.abs().max().item(),
                 "logits_relative_error": (difference.norm() / logits.norm()).item(),
                 "reference_top_tokens": logits[0].topk(8).indices.tolist(),
                 "actual_top_tokens": actual_logits[0].topk(8).indices.tolist(),
-                "reference_eos_raw_probability": logits.softmax(-1)[
+                "raw_probability_l1_difference": (
+                    reference_probabilities - actual_probabilities
+                )
+                .abs()
+                .sum()
+                .item(),
+                "reference_eos_raw_probability": reference_probabilities[
                     0, config.codec_eos_token_id
                 ].item(),
-                "actual_eos_raw_probability": actual_logits.softmax(-1)[
+                "actual_eos_raw_probability": actual_probabilities[
                     0, config.codec_eos_token_id
                 ].item(),
             }
