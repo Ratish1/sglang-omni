@@ -26,6 +26,7 @@ def main() -> None:
     parser.add_argument("--tune-max-tokens", type=int, nargs="+", required=True)
     parser.add_argument("--profiles", type=int, nargs=2)
     parser.add_argument("--cache", type=Path)
+    parser.add_argument("--reference", action="store_true")
     parser.add_argument("--output-directory", type=Path, required=True)
     arguments = parser.parse_args()
     device = torch.device("cuda", arguments.gpu)
@@ -77,6 +78,38 @@ def main() -> None:
     arguments.output_directory.mkdir(exist_ok=False)
     comparisons = []
     with torch.inference_mode():
+        if arguments.reference:
+            torch.set_float32_matmul_precision("highest")
+            checkpoint_output = torch.zeros_like(hidden_states)
+            float_output = torch.zeros_like(hidden_states, dtype=torch.float32)
+            for expert in selected_experts.unique().tolist():
+                token_rows, routing_columns = (selected_experts == expert).nonzero(
+                    as_tuple=True
+                )
+                expert_input = hidden_states[token_rows]
+                up, gate = torch.nn.functional.linear(
+                    expert_input, gate_up_weights[expert]
+                ).chunk(2, dim=-1)
+                expert_output = torch.nn.functional.linear(
+                    torch.nn.functional.silu(gate) * up, down_weights[expert]
+                )
+                scales = routing_weights[token_rows, routing_columns, None]
+                checkpoint_output.index_add_(
+                    0, token_rows, expert_output * scales.to(expert_output.dtype)
+                )
+                up, gate = torch.nn.functional.linear(
+                    expert_input.float(), gate_up_weights[expert].float()
+                ).chunk(2, dim=-1)
+                expert_output = torch.nn.functional.linear(
+                    torch.nn.functional.silu(gate) * up, down_weights[expert].float()
+                )
+                float_output.index_add_(0, token_rows, expert_output * scales)
+            torch.save(
+                checkpoint_output.cpu(), arguments.output_directory / "checkpoint.pt"
+            )
+            torch.save(float_output.cpu(), arguments.output_directory / "float32.pt")
+        else:
+            pass
         for max_tokens in arguments.tune_max_tokens:
             profile_override = (
                 {"profile_ids": arguments.profiles}
