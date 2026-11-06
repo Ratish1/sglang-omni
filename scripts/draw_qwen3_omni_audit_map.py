@@ -112,7 +112,7 @@ def main() -> None:
         ),
         Node(
             identifier="image_encoder",
-            label="Vision encoder\nimage + video",
+            label=f"Vision encoder\n{dimensions['vision_encoder_layers']} layers\nimage + video",
             bounds=(37, 85, 14, 8),
             color="#eeeaff",
         ),
@@ -124,13 +124,13 @@ def main() -> None:
         ),
         Node(
             identifier="audio_encoder",
-            label="Audio encoder\nexplicit + video audio",
+            label=f"Audio encoder\n{dimensions['audio_encoder_layers']} layers\nexplicit + video audio",
             bounds=(37, 67, 14, 8),
             color="#eeeaff",
         ),
         Node(
             identifier="thinker",
-            label="Thinker\n\nmedia scatter\nM-RoPE\nvisual deepstack\ntext generation\nhidden-state handoff",
+            label=f"Thinker · {dimensions['thinker_layers']} layers\n\nmedia scatter\nM-RoPE\nvisual deepstack\ntext generation\nhidden-state handoff",
             bounds=(59, 67, 13, 26),
             color="#fff1d5",
         ),
@@ -148,7 +148,7 @@ def main() -> None:
         ),
         Node(
             identifier="code2wav",
-            label="Code2Wav\n16-group codec frames",
+            label=f"Code2Wav\n{dimensions['code2wav_layers']} transformer layers\n{dimensions['codec_groups']}-group codec frames",
             bounds=(79, 60, 18, 7),
             color="#e6f4ea",
         ),
