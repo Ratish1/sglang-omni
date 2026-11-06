@@ -125,13 +125,17 @@ def main() -> None:
         == len(native_layers)
         == config.code2wav_config.num_hidden_layers
     )
-    assert actual.shape[-1] == codes.shape[-1] * native.total_upsample
     report = {
         "model_path": arguments.model_path,
         "gpu": torch.cuda.get_device_name(device),
         "transformers": version("transformers"),
         "trace_hashes": trace_hashes,
         "codec_frames": codes.shape[-1],
+        "waveform_samples": actual.shape[-1],
+        "reference_waveform_samples": expected.shape[-1],
+        "transconv_trim_samples": int(
+            codes.shape[-1] * native.total_upsample - actual.shape[-1]
+        ),
         "fused_activations": replaced_activations,
         "waveform_error": asdict(compare_tensors(actual, expected)),
         "transformer_layers": [
