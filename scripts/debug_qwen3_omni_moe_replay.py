@@ -11,9 +11,10 @@ from pathlib import Path
 from unittest.mock import patch
 
 import torch
+import tvm_ffi
 from flashinfer.autotuner import AutoTuner, TunableRunner, TuningConfig, autotune
 from flashinfer.fused_moe import cutlass_fused_moe
-from flashinfer.fused_moe.core import ActivationType
+from flashinfer.fused_moe.core import ActivationType, get_cutlass_fused_moe_module
 from huggingface_hub import snapshot_download
 from safetensors import safe_open
 from transformers import Qwen3OmniMoeConfig
@@ -28,12 +29,21 @@ def main() -> None:
     parser.add_argument("--token-counts", type=int, nargs="+")
     parser.add_argument("--profiles", type=int, nargs=2)
     parser.add_argument("--cache", type=Path)
+    parser.add_argument("--rounding-library", type=Path)
     parser.add_argument("--autotune", action="store_true")
     parser.add_argument("--reference", action="store_true")
     parser.add_argument("--output-directory", type=Path, required=True)
     arguments = parser.parse_args()
     device = torch.device("cuda", arguments.gpu)
     torch.cuda.set_device(device)
+    if arguments.rounding_library is not None:
+        rounding_module = tvm_ffi.load_module(str(arguments.rounding_library))
+        runner_key = (torch.bfloat16,) * 3 + (False,) * 6
+        get_cutlass_fused_moe_module("90").MoERunner.runner_dict[runner_key] = (
+            rounding_module.init(*runner_key)
+        )
+    else:
+        pass
     checkpoint = Path(snapshot_download(arguments.model_path, local_files_only=True))
     config = Qwen3OmniMoeConfig.from_pretrained(arguments.model_path)
     expert_count = config.talker_config.text_config.num_experts
