@@ -41,7 +41,7 @@ from sglang_omni.serve.protocol import ChatCompletionRequest
 def capture_layer(
     module: torch.nn.Module,
     inputs: tuple[torch.Tensor, ...],
-    output: torch.Tensor | tuple[torch.Tensor, torch.Tensor | None],
+    output: torch.Tensor | tuple[torch.Tensor],
     *,
     snapshots: list[torch.Tensor],
     input_snapshots: list[torch.Tensor] | None = None,
