@@ -58,6 +58,7 @@ from sglang_omni.vendor.sglang.layers import (
     RMSNorm,
     RowParallelLinear,
     SiluAndMul,
+    StandardTopKOutput,
     residual_batch,
 )
 from sglang_omni.vendor.sglang.models import FusedSetKVBufferArg, apply_qk_norm
@@ -324,6 +325,7 @@ class Qwen3OmniMoeTalkerSparseMoeBlock(Qwen3OmniMoeThinkerTextSparseMoeBlock):
             quant_config=None,
             prefix=add_prefix("shared_expert_gate", prefix),
         )
+        self.diagnostic_tensors: dict[str, torch.Tensor] = {}
 
     def forward(
         self,
@@ -339,6 +341,11 @@ class Qwen3OmniMoeTalkerSparseMoeBlock(Qwen3OmniMoeThinkerTextSparseMoeBlock):
         else:
             pass
 
+        capture_experts = os.environ.get("SGLANG_OMNI_DIAGNOSTIC_MOE_TRACE") is not None
+        if capture_experts:
+            self.diagnostic_tensors["input"] = linear_hidden_states.clone()
+        else:
+            pass
         # Shared branch must consume the original MLP input before routed experts.
         # The fused MoE implementation mutates `hidden_states` in-place.
         shared_output = self.shared_expert(linear_hidden_states)
@@ -348,7 +355,19 @@ class Qwen3OmniMoeTalkerSparseMoeBlock(Qwen3OmniMoeThinkerTextSparseMoeBlock):
         # --- Routed experts (no all-reduce yet) ---
         router_logits, _ = self.gate(linear_hidden_states)
         topk_output = self.topk(linear_hidden_states, router_logits)
+        if capture_experts:
+            assert isinstance(topk_output, StandardTopKOutput)
+            self.diagnostic_tensors["router_logits"] = router_logits.clone()
+            self.diagnostic_tensors["weights"] = topk_output.topk_weights.clone()
+            self.diagnostic_tensors["experts"] = topk_output.topk_ids.clone()
+            self.diagnostic_tensors["shared_output"] = shared_output.clone()
+        else:
+            pass
         routed_output = self.experts(linear_hidden_states, topk_output)
+        if capture_experts:
+            self.diagnostic_tensors["routed_output"] = routed_output.clone()
+        else:
+            pass
 
         final_hidden_states = routed_output + shared_output
         return final_hidden_states.view(num_tokens, hidden_dim)

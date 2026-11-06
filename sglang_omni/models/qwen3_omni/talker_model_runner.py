@@ -246,6 +246,16 @@ class QwenTalkerModelRunner(ModelRunner["SGLangARRequestData"]):
             tensors.update(self.model.model.diagnostic_layers)
         else:
             pass
+        if os.environ.get("SGLANG_OMNI_DIAGNOSTIC_MOE_TRACE") is not None:
+            for layer_index, layer in enumerate(self.model.model.layers):
+                tensors.update(
+                    {
+                        f"moe_{layer_index}_{name}": tensor
+                        for name, tensor in layer.mlp.diagnostic_tensors.items()
+                    }
+                )
+        else:
+            pass
         destination = Path(directory) / request.request_id
         destination.mkdir(parents=True, exist_ok=True)
         torch.save(
