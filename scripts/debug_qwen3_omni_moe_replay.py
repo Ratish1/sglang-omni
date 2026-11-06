@@ -8,9 +8,10 @@ import json
 from contextlib import ExitStack, nullcontext
 from importlib.metadata import version
 from pathlib import Path
+from unittest.mock import patch
 
 import torch
-from flashinfer.autotuner import AutoTuner, autotune
+from flashinfer.autotuner import AutoTuner, TunableRunner, TuningConfig, autotune
 from flashinfer.fused_moe import cutlass_fused_moe
 from flashinfer.fused_moe.core import ActivationType
 from huggingface_hub import snapshot_download
@@ -78,7 +79,33 @@ def main() -> None:
         pass
     arguments.output_directory.mkdir(exist_ok=False)
     comparisons = []
-    with torch.inference_mode():
+    choices: list[dict[str, str | int]] = []
+    choose_one = AutoTuner.choose_one
+
+    def record_choice(
+        tuner: AutoTuner,
+        custom_op: str,
+        runners: list[TunableRunner],
+        tuning_config: TuningConfig,
+        inputs: list[torch.Tensor | None],
+        *,
+        gemm_idx: int,
+    ) -> tuple[TunableRunner, int]:
+        runner, tactic = choose_one(
+            tuner, custom_op, runners, tuning_config, inputs, gemm_idx=gemm_idx
+        )
+        spec = tuning_config.dynamic_tensor_specs[0]
+        choices.append(
+            dict(
+                operation=custom_op,
+                tactic=tactic,
+                token_bucket=spec.map_to_tuning_buckets(hidden_states.shape[0]),
+                maximum_bucket=spec.gen_tuning_buckets[-1],
+            )
+        )
+        return runner, tactic
+
+    with torch.inference_mode(), patch.object(AutoTuner, "choose_one", record_choice):
         if arguments.reference:
             torch.set_float32_matmul_precision("highest")
             checkpoint_output = torch.zeros_like(hidden_states)
@@ -111,7 +138,8 @@ def main() -> None:
             torch.save(float_output.cpu(), arguments.output_directory / "float32.pt")
         else:
             pass
-        for max_tokens in arguments.tune_max_tokens:
+        for call_index, max_tokens in enumerate(arguments.tune_max_tokens):
+            choices.clear()
             profile_override = (
                 {"profile_ids": arguments.profiles}
                 if arguments.profiles is not None
@@ -144,6 +172,7 @@ def main() -> None:
             difference = output.float() - native_output.float()
             comparison = dict(
                 tune_max_tokens=max_tokens,
+                choices=choices.copy(),
                 native_equal=torch.equal(output, native_output),
                 relative_error=(
                     difference.norm() / native_output.float().norm()
@@ -151,7 +180,11 @@ def main() -> None:
                 max_error=difference.abs().max().item(),
             )
             comparisons.append(comparison)
-            torch.save(output.cpu(), arguments.output_directory / f"{max_tokens}.pt")
+            output_path = (
+                arguments.output_directory / f"{call_index:02d}-{max_tokens}.pt"
+            )
+            comparison["output_file"] = output_path.name
+            torch.save(output.cpu(), output_path)
             print(json.dumps(comparison), flush=True)
     (arguments.output_directory / "comparisons.json").write_text(
         json.dumps(
