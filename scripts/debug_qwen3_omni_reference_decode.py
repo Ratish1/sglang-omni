@@ -32,6 +32,7 @@ def main() -> None:
         default="reference",
     )
     parser.add_argument("--output-directory", type=Path, required=True)
+    parser.add_argument("--first-decode-token", type=int)
     arguments = parser.parse_args()
     device = torch.device("cuda", arguments.gpu)
     torch.cuda.set_device(device)
@@ -102,6 +103,8 @@ def main() -> None:
             ).long()
             if step == 0:
                 assert sampled.item() == first_codec[0, 0].item()
+            elif step == 1 and arguments.first_decode_token is not None:
+                sampled.fill_(arguments.first_decode_token)
             else:
                 pass
             decisions.append(dict(step=step, first_code=sampled.item()))
