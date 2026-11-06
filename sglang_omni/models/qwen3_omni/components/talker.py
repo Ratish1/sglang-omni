@@ -925,6 +925,10 @@ class Qwen3OmniTalker(nn.Module):
             device,
             self.model.codec_embedding.weight.dtype,
         )
+        if os.environ.get("SGLANG_OMNI_DIAGNOSTIC_PLAIN_PREDICTOR") is not None:
+            self.predictor_fused_layers = None
+        else:
+            pass
         # note (ratish): where the exact kernel does not apply, the add and the norm
         # stay two launches.
         self.predictor_exact_add_norm = supports_exact_add_rmsnorm(
