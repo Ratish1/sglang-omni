@@ -3,9 +3,11 @@
 
 from __future__ import annotations
 
+import os
 from array import array
 from dataclasses import dataclass
 from numbers import Integral
+from pathlib import Path
 from typing import TypeGuard
 
 import torch
@@ -19,6 +21,9 @@ from sglang_omni.model_runner.prefill_inputs import (
     get_omni_prefill_inputs,
 )
 from sglang_omni.model_runner.thinker_model_runner import ThinkerModelRunner
+from sglang_omni.models.qwen3_omni.components.sglang_thinker import (
+    DiagnosticThinkerBackbone,
+)
 from sglang_omni.scheduling.types import SchedulerRequest
 
 _PREFILL_AUDIO_INPUT_KEYS = frozenset(
@@ -50,6 +55,68 @@ class Qwen3OmniThinkerModelRunner(ThinkerModelRunner):
     """
 
     supports_speculative_async_decode: bool = True
+    diagnostic_visual_masks: torch.Tensor | None = None
+
+    def inject_multimodal_embeds(
+        self,
+        forward_batch: ForwardBatch | None,
+        schedule_batch: ScheduleBatch,
+    ) -> tuple[torch.Tensor, list[torch.Tensor] | None, torch.Tensor | None] | None:
+        output = super().inject_multimodal_embeds(forward_batch, schedule_batch)
+        if os.environ.get("SGLANG_OMNI_DIAGNOSTIC_THINKER_DIRECTORY") is not None:
+            self.diagnostic_visual_masks = output[2] if output is not None else None
+        else:
+            pass
+        return output
+
+    def post_prefill(
+        self,
+        result: GenerationBatchResult,
+        forward_batch: ForwardBatch,
+        schedule_batch: ScheduleBatch,
+        requests: list[SchedulerRequest],
+    ) -> None:
+        super().post_prefill(result, forward_batch, schedule_batch, requests)
+        directory = os.environ.get("SGLANG_OMNI_DIAGNOSTIC_THINKER_DIRECTORY")
+        if directory is None:
+            return
+        else:
+            pass
+        assert len(requests) == 1 and schedule_batch.prefix_lens == [0]
+        assert isinstance(self.text_model, DiagnosticThinkerBackbone)
+        live_tokens = forward_batch.input_ids.numel()
+        variant = "visual" if self.diagnostic_visual_masks is not None else "plain"
+        snapshots = self.text_model.diagnostic_tensors
+        buckets = [
+            int(name.split("_")[-2])
+            for name in snapshots
+            if name.startswith("input_ids_") and name.endswith(variant)
+        ]
+        bucket_tokens = min(bucket for bucket in buckets if bucket >= live_tokens)
+        suffix = f"{bucket_tokens}_{variant}"
+        assert torch.equal(
+            snapshots[f"input_ids_{suffix}"][:live_tokens], forward_batch.input_ids
+        )
+        tensors = {
+            name.removesuffix(f"_{suffix}"): tensor.detach().cpu().clone()
+            for name, tensor in snapshots.items()
+            if name.endswith(f"_{suffix}")
+        }
+        tensors["live_tokens"] = torch.tensor(live_tokens)
+        tensors["logits"] = (
+            result.logits_output.next_token_logits.detach().cpu().clone()
+        )
+        if self.diagnostic_visual_masks is not None:
+            tensors["visual_masks"] = (
+                self.diagnostic_visual_masks.detach().cpu().clone()
+            )
+        else:
+            pass
+        destination = Path(directory) / requests[0].request_id
+        destination.mkdir(parents=True, exist_ok=True)
+        trace_file = destination / "thinker-prefill.pt"
+        assert not trace_file.exists(), trace_file
+        torch.save(tensors, trace_file)
 
     @staticmethod
     def origin_num_tokens(value: object) -> int | None:

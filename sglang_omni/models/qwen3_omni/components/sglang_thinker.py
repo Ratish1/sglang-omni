@@ -9,6 +9,7 @@ prefill, so this wrapper keeps only the text model and LM head.
 
 from __future__ import annotations
 
+import os
 import time
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -16,6 +17,8 @@ from typing import Iterable, Optional, Tuple
 
 import torch
 import torch.nn as nn
+from sglang.srt.layers.aux_hidden_states import AuxHiddenStateList
+from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
 from sglang.srt.layers.logits_processor import LogitsProcessor, LogitsProcessorOutput
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe_triton_config import (
@@ -33,7 +36,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTe
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.qwen3_moe import Qwen3MoeDecoderLayer, Qwen3MoeSparseMoeBlock
 from sglang.srt.models.qwen3_vl_moe import Qwen3MoeLLMModel, load_fused_expert_weights
-from sglang.srt.runtime_context import get_exec, max_prefill_buffer_tokens
+from sglang.srt.runtime_context import get_exec, get_parallel, max_prefill_buffer_tokens
 from sglang.srt.utils import add_prefix, logger
 from transformers import PretrainedConfig
 
@@ -63,6 +66,81 @@ class DecodeLiveRows:
     """The real rows of the current decode forward, shared by every MoE top-k."""
 
     is_live_row: torch.Tensor | None = None
+
+
+class DiagnosticThinkerBackbone(Qwen3MoeLLMModel):
+    """Retain device snapshots that captured forwards refresh during replay."""
+
+    def __init__(
+        self,
+        *,
+        config: PretrainedConfig,
+        quant_config: QuantizationConfig | None,
+        prefix: str,
+    ) -> None:
+        super().__init__(config=config, quant_config=quant_config, prefix=prefix)
+        assert get_parallel().tp_size == 1 and self.pp_group.world_size == 1
+        self.diagnostic_tensors: dict[str, torch.Tensor] = {}
+        self.diagnostic_visual: bool = False
+
+        def capture_layer(
+            module: Qwen3MoeDecoderLayer,
+            inputs: tuple[torch.Tensor, torch.Tensor, ForwardBatch],
+            output: torch.Tensor,
+        ) -> None:
+            forward_batch = inputs[2]
+            if forward_batch.forward_mode.is_extend():
+                variant = "visual" if self.diagnostic_visual else "plain"
+                self.diagnostic_tensors[
+                    f"layer_{module.layer_id}_{output.shape[0]}_{variant}"
+                ] = residual_batch.snapshot(output, forward_batch)
+            else:
+                pass
+
+        for layer in self.layers:
+            layer.register_forward_hook(capture_layer)
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+        input_embeds: torch.Tensor | None = None,
+        pp_proxy_tensors: PPProxyTensors | None = None,
+        input_deepstack_embeds: torch.Tensor | None = None,
+    ) -> torch.Tensor | tuple[torch.Tensor, AuxHiddenStateList]:
+        self.diagnostic_visual = input_deepstack_embeds is not None
+        variant = "visual" if self.diagnostic_visual else "plain"
+        suffix = f"{input_ids.numel()}_{variant}"
+        if forward_batch.forward_mode.is_extend():
+            embeddings = (
+                self.embed_tokens(input_ids) if input_embeds is None else input_embeds
+            )
+            self.diagnostic_tensors[f"input_ids_{suffix}"] = input_ids.clone()
+            self.diagnostic_tensors[f"positions_{suffix}"] = positions.clone()
+            self.diagnostic_tensors[f"input_embeds_{suffix}"] = embeddings.clone()
+            if input_deepstack_embeds is not None:
+                self.diagnostic_tensors[f"deepstack_{suffix}"] = (
+                    input_deepstack_embeds.clone()
+                )
+            else:
+                pass
+        else:
+            pass
+        output = super().forward(
+            input_ids,
+            positions,
+            forward_batch,
+            input_embeds,
+            pp_proxy_tensors,
+            input_deepstack_embeds,
+        )
+        if forward_batch.forward_mode.is_extend():
+            hidden_states = output[0] if isinstance(output, tuple) else output
+            self.diagnostic_tensors[f"final_{suffix}"] = hidden_states.clone()
+        else:
+            pass
+        return output
 
 
 class PaddedRowsTopK(nn.Module):
@@ -116,7 +194,12 @@ class Qwen3OmniThinkerForCausalLM(nn.Module):
         self.config = getattr(self.thinker_config, "text_config", self.thinker_config)
         self.is_mrope_enabled = config_uses_mrope(self.config)
 
-        self.model = Qwen3MoeLLMModel(
+        backbone_class = (
+            DiagnosticThinkerBackbone
+            if os.environ.get("SGLANG_OMNI_DIAGNOSTIC_THINKER_DIRECTORY") is not None
+            else Qwen3MoeLLMModel
+        )
+        self.model = backbone_class(
             config=self.config,
             quant_config=quant_config,
             prefix=add_prefix("model", prefix),
