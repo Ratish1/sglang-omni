@@ -9,6 +9,10 @@ from pathlib import Path
 
 import torch
 from transformers import Qwen3OmniMoeConfig
+from transformers.conversion_mapping import (
+    get_checkpoint_conversion_mapping,
+    register_checkpoint_conversion_mapping,
+)
 from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import (
     Qwen3OmniMoeTalkerForConditionalGeneration,
 )
@@ -25,6 +29,9 @@ def main() -> None:
     device = torch.device("cuda", arguments.gpu)
     torch.cuda.set_device(device)
     config = Qwen3OmniMoeConfig.from_pretrained(arguments.model_path).talker_config
+    register_checkpoint_conversion_mapping(
+        config.model_type, get_checkpoint_conversion_mapping("qwen3_omni_moe")
+    )
     reference, loading = Qwen3OmniMoeTalkerForConditionalGeneration.from_pretrained(
         arguments.model_path,
         config=config,
