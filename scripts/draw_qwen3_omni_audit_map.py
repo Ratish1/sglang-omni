@@ -17,6 +17,7 @@ from PIL import Image
 CANVAS_WIDTH_PIXELS = 2600
 CANVAS_HEIGHT_PIXELS = 2800
 CANVAS_DPI = 180
+PREVIEW_WIDTH_PIXELS = 1800
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -360,7 +361,7 @@ def main() -> None:
     axes.text(
         0,
         64.5,
-        "Text profile inserts mm_aggregate before Thinker. Audio keeps Decode terminal.",
+        "Talker registers early and receives encoder geometry, not encoder vectors.",
         fontsize=9.5,
         color="#42566e",
     )
@@ -446,12 +447,60 @@ def main() -> None:
     axes.text(
         0,
         2,
-        "Scope: video/audio decoding, checkpoint numerics, free-generation quality, sessions and H100 performance require separate evidence.",
+        "Text profile joins at mm_aggregate. Routing, numerics, generation quality, sessions and H100 performance are separate audit scopes.",
         fontsize=9.5,
         color="#42566e",
     )
     figure.canvas.draw()
     renderer = figure.canvas.get_renderer()
+    segments = [
+        (connection, start, end)
+        for connection in connections
+        for start, end in zip(connection.points, connection.points[1:])
+    ]
+    for index, (connection, start, end) in enumerate(segments):
+        for other, other_start, other_end in segments[index + 1 :]:
+            if connection is other:
+                continue
+            else:
+                first_horizontal = math.isclose(start[1], end[1])
+                second_horizontal = math.isclose(other_start[1], other_end[1])
+            if first_horizontal == second_horizontal:
+                fixed_axis = 1 if first_horizontal else 0
+                moving_axis = 1 - fixed_axis
+                intersects = math.isclose(
+                    start[fixed_axis], other_start[fixed_axis]
+                ) and max(
+                    min(start[moving_axis], end[moving_axis]),
+                    min(other_start[moving_axis], other_end[moving_axis]),
+                ) <= min(
+                    max(start[moving_axis], end[moving_axis]),
+                    max(other_start[moving_axis], other_end[moving_axis]),
+                )
+            else:
+                horizontal_start, horizontal_end = (
+                    (start, end) if first_horizontal else (other_start, other_end)
+                )
+                vertical_start, vertical_end = (
+                    (other_start, other_end) if first_horizontal else (start, end)
+                )
+                intersects = min(
+                    horizontal_start[0], horizontal_end[0]
+                ) <= vertical_start[0] <= max(
+                    horizontal_start[0], horizontal_end[0]
+                ) and min(
+                    vertical_start[1], vertical_end[1]
+                ) <= horizontal_start[
+                    1
+                ] <= max(
+                    vertical_start[1], vertical_end[1]
+                )
+            if intersects:
+                raise ValueError(
+                    f"Undeclared connector intersection: {connection} / {other}"
+                )
+            else:
+                pass
     for label, node in labels:
         extent = label.get_window_extent(renderer)
         left, bottom, width, height = node.bounds
@@ -466,8 +515,38 @@ def main() -> None:
             raise ValueError(f"Label exceeds its node: {node.identifier}")
         else:
             pass
-    for label in axes.texts:
+    for index, label in enumerate(axes.texts):
         extent = label.get_window_extent(renderer)
+        if extent.height * PREVIEW_WIDTH_PIXELS / CANVAS_WIDTH_PIXELS < 12:
+            raise ValueError(
+                f"Text is too small at destination width: {label.get_text()}"
+            )
+        else:
+            pass
+        for other in axes.texts[index + 1 :]:
+            if extent.overlaps(other.get_window_extent(renderer)):
+                raise ValueError(
+                    f"Labels overlap: {label.get_text()} / {other.get_text()}"
+                )
+            else:
+                pass
+        for connection, start, end in segments:
+            start_pixels = axes.transData.transform(start)
+            end_pixels = axes.transData.transform(end)
+            if math.isclose(start[1], end[1]):
+                intersects = extent.y0 - 3 < start_pixels[1] < extent.y1 + 3 and max(
+                    min(start_pixels[0], end_pixels[0]), extent.x0 - 3
+                ) < min(max(start_pixels[0], end_pixels[0]), extent.x1 + 3)
+            else:
+                intersects = extent.x0 - 3 < start_pixels[0] < extent.x1 + 3 and max(
+                    min(start_pixels[1], end_pixels[1]), extent.y0 - 3
+                ) < min(max(start_pixels[1], end_pixels[1]), extent.y1 + 3)
+            if intersects:
+                raise ValueError(
+                    f"Connector intersects a label: {connection} / {label.get_text()}"
+                )
+            else:
+                pass
         for node in nodes:
             if any(
                 label is node_label and node.identifier == owner.identifier
