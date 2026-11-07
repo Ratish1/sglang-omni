@@ -352,7 +352,8 @@ class Qwen3OmniMoeTalkerSparseMoeBlock(Qwen3OmniMoeThinkerTextSparseMoeBlock):
         shared_output = shared_output * torch.sigmoid(shared_gate)
 
         # --- Routed experts (no all-reduce yet) ---
-        router_logits, _ = self.gate(linear_hidden_states)
+        router_hidden_states = linear_hidden_states.to(dtype=self.gate.weight.dtype)
+        router_logits, _ = self.gate(router_hidden_states)
         topk_output = self.topk(linear_hidden_states, router_logits)
         routed_output = self.experts(linear_hidden_states, topk_output)
 
@@ -2093,3 +2094,7 @@ class Qwen3OmniTalker(nn.Module):
                 param.weight_loader(param, loaded_weight)
             else:
                 pass
+
+        # note (ratish): keep top-k cutoff ordering before BF16 logit rounding.
+        for layer in self.model.layers:
+            layer.mlp.gate.weight.data = layer.mlp.gate.weight.data.float()
