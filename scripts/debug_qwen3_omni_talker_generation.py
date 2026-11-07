@@ -21,6 +21,7 @@ from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import (
     Qwen3OmniMoeTalkerForConditionalGeneration,
 )
 
+from scripts.debug_qwen3_omni_normalization import NativeNormalization
 from sglang_omni.models.qwen3_omni.components.talker_prefill import (
     load_thinker_embedding_rows,
 )
@@ -37,6 +38,11 @@ def main() -> None:
     parser.add_argument("--repetition-penalty", type=float, required=True)
     parser.add_argument("--top-k", type=int, required=True)
     parser.add_argument("--top-p", type=float, required=True)
+    parser.add_argument(
+        "--normalization-semantics",
+        choices=("checkpoint", "native"),
+        default="checkpoint",
+    )
     parser.add_argument("--output-directory", type=Path, required=True)
     arguments = parser.parse_args()
     arguments.output_directory.mkdir(exist_ok=False)
@@ -60,6 +66,11 @@ def main() -> None:
     assert not loading["mismatched_keys"], loading["mismatched_keys"]
     assert not reference.code_predictor.generation_config.do_sample
     reference.eval()
+    normalization = NativeNormalization(reference=reference)
+    if arguments.normalization_semantics == "native":
+        normalization.install()
+    else:
+        pass
     checkpoint_directory = Path(
         hf_hub_download(arguments.model_path, "config.json")
     ).parent
@@ -277,6 +288,9 @@ def main() -> None:
                 "native_frames_including_eos": len(native_frames),
                 "reference_frames_including_eos": len(frame_reports),
                 "termination": termination,
+                "normalization_semantics": arguments.normalization_semantics,
+                "normalization_boundary_calls": normalization.boundary_calls,
+                "normalization_query_key_calls": normalization.query_key_calls,
                 "frames": frame_reports,
             }
             reports.append(report)
