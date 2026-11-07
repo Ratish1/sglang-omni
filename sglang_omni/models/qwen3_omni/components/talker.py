@@ -5,7 +5,6 @@ SGLang-native Talker model for Qwen3-Omni compatiable with hf formatting.
 from __future__ import annotations
 
 import logging
-from contextlib import nullcontext
 from typing import Iterable, Optional, Tuple
 
 import torch
@@ -18,7 +17,6 @@ from sglang.srt.runtime_context import get_context, get_schedule
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import add_prefix
-from sglang.srt.utils.common import is_flashinfer_available
 from torch import nn
 
 from sglang_omni.model_runner.kv_write_diagnostics import install_kv_write_observers
@@ -64,11 +62,6 @@ from sglang_omni.vendor.sglang.layers import (
 )
 from sglang_omni.vendor.sglang.models import FusedSetKVBufferArg, apply_qk_norm
 from sglang_omni.vendor.sglang.utils import make_layers
-
-if is_flashinfer_available():
-    from flashinfer.autotuner import autotune
-else:
-    pass
 
 logger = logging.getLogger(__name__)
 
@@ -481,32 +474,16 @@ class Qwen3OmniMoeTalkerTextModel(nn.Module):
         else:
             pass
 
-        if (
-            forward_batch.forward_mode.is_extend()
-            and current_platform.is_cuda()
-            and self.layers[
-                self.start_layer
-            ].mlp.experts.runner_backend.is_flashinfer_cutlass()
-            and self.layers[self.start_layer].mlp.experts.w13_weight.dtype
-            == torch.bfloat16
-        ):
-            # note (ratish): preserve BF16 prefill projection rounding without changing tuned decode kernels.
-            expert_precision_context = autotune(
-                False, skip_ops={"trtllm::fused_moe::gemm1"}
+        for i in range(self.start_layer, self.end_layer):
+            layer = self.layers[i]
+            hidden_states = layer(
+                positions=positions,
+                hidden_states=hidden_states,
+                forward_batch=forward_batch,
+                captured_last_layer_outputs=(
+                    aux_hidden_states if i in capture_layers and i != 0 else None
+                ),
             )
-        else:
-            expert_precision_context = nullcontext()
-        with expert_precision_context:
-            for i in range(self.start_layer, self.end_layer):
-                layer = self.layers[i]
-                hidden_states = layer(
-                    positions=positions,
-                    hidden_states=hidden_states,
-                    forward_batch=forward_batch,
-                    captured_last_layer_outputs=(
-                        aux_hidden_states if i in capture_layers and i != 0 else None
-                    ),
-                )
 
         hidden_states = residual_batch.final_norm(
             hidden_states, forward_batch, self.norm, skip_empty=True
