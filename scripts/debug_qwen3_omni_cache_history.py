@@ -24,7 +24,7 @@ async def run(
     request_file: Path,
     distractor_file: Path,
     audio_directory: Path,
-    capture_directory: Path,
+    capture_directory: Path | None,
     output_directory: Path,
 ) -> None:
     target = ChatCompletionRequest.model_validate_json(request_file.read_bytes())
@@ -98,14 +98,18 @@ async def run(
                 "finish_reason": choice["finish_reason"],
                 "usage": response_payload["usage"],
                 "waveform_sha256": hashlib.sha256(waveform).hexdigest(),
-                "capture_directory": str(capture_directory / request_id),
+                "capture_directory": (
+                    str(capture_directory / request_id)
+                    if capture_directory is not None
+                    else None
+                ),
             }
             observations.append(observation)
             (output_directory / "observations.json").write_text(
                 json.dumps(observations, indent=2)
             )
             print(json.dumps(observation), flush=True)
-            if label == "unrelated":
+            if label == "unrelated" or capture_directory is None:
                 continue
             else:
                 pass
@@ -114,6 +118,10 @@ async def run(
             decode = torch.load(decode_file, map_location="cpu", weights_only=True)
             assert decode["sampling_seed"].tolist() == [sampling_seed]
             target_captures.append(captured)
+    if capture_directory is None:
+        return
+    else:
+        pass
     comparisons = []
     baseline_directory = target_captures[0]
     for captured in target_captures[1:]:
@@ -160,7 +168,7 @@ def main() -> None:
     parser.add_argument("--request-file", type=Path, required=True)
     parser.add_argument("--distractor-file", type=Path, required=True)
     parser.add_argument("--audio-directory", type=Path, required=True)
-    parser.add_argument("--capture-directory", type=Path, required=True)
+    parser.add_argument("--capture-directory", type=Path)
     parser.add_argument("--output-directory", type=Path, required=True)
     arguments = parser.parse_args()
     asyncio.run(
