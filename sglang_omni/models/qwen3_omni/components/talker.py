@@ -67,6 +67,27 @@ from sglang_omni.vendor.sglang.utils import make_layers
 logger = logging.getLogger(__name__)
 
 
+def diagnostic_checkpoint_boundary_norm(
+    module: RMSNorm,
+    inputs: tuple[torch.Tensor | None, ...],
+    output: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+    if isinstance(output, tuple):
+        rounded_residual = output[1]
+    else:
+        rounded_residual = inputs[0]
+    assert isinstance(rounded_residual, torch.Tensor)
+    assert rounded_residual.dtype == module.weight.dtype == torch.bfloat16
+    normalized = rounded_residual.float()
+    variance = normalized.square().mean(dim=-1, keepdim=True)
+    normalized = normalized * torch.rsqrt(variance + module.variance_epsilon)
+    normalized = normalized.to(rounded_residual.dtype) * module.weight
+    if isinstance(output, tuple):
+        return normalized, rounded_residual
+    else:
+        return normalized
+
+
 def bind_default_weight_loaders(module: nn.Module) -> None:
     for param in module.parameters():
         if not hasattr(param, "weight_loader"):
@@ -446,6 +467,17 @@ class Qwen3OmniMoeTalkerTextModel(nn.Module):
         self.end_layer = config.num_hidden_layers
 
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        if os.environ.get("SGLANG_OMNI_DIAGNOSTIC_CHECKPOINT_BOUNDARY_NORM") == "1":
+            for layer in self.layers:
+                layer.input_layernorm.register_forward_hook(
+                    diagnostic_checkpoint_boundary_norm
+                )
+                layer.post_attention_layernorm.register_forward_hook(
+                    diagnostic_checkpoint_boundary_norm
+                )
+            self.norm.register_forward_hook(diagnostic_checkpoint_boundary_norm)
+        else:
+            pass
         self.layers_to_capture = []
         max_batch_size = get_schedule().max_running_requests
         self.cp_enabled = True
