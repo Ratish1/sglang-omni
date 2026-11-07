@@ -15,6 +15,7 @@ from sglang_omni.model_runner.prefill_inputs import (
     OmniPrefillInputs,
     attach_omni_prefill_inputs,
 )
+from sglang_omni.models.qwen3_omni.talker_diagnostics import TalkerStateObserver
 from sglang_omni.scheduling.message import OutgoingMessage, put_messages
 from sglang_omni.scheduling.pending_text_queue import PendingTextTensorQueue
 from sglang_omni.scheduling.sglang_backend.request_data import (
@@ -70,6 +71,11 @@ class QwenTalkerModelRunner(ModelRunner["SGLangARRequestData"]):
         self.codec_coalesce_frames = max(int(codec_coalesce_frames), 0)
         self.codec_coalesce_first_frames = max(int(codec_coalesce_first_frames), 0)
         self.codec_coalesce_early_frames = max(int(codec_coalesce_early_frames), 0)
+        self.state_observer = (
+            TalkerStateObserver(self.kv_observer.directory)
+            if self.kv_observer is not None
+            else None
+        )
 
     def execute(self, scheduler_output: SchedulerOutput) -> ModelRunnerOutput:
         return super().execute(scheduler_output)
@@ -119,7 +125,15 @@ class QwenTalkerModelRunner(ModelRunner["SGLangARRequestData"]):
             pass
 
         self.model.prepare_decode_buffers(requests)
+        if self.state_observer is not None:
+            self.state_observer.before_decode(self.model, requests)
+        else:
+            pass
         self.write_feedback_buffers(requests)
+        if self.state_observer is not None:
+            self.state_observer.after_decode_inputs(self.model, requests)
+        else:
+            pass
 
     def post_prefill(
         self,
@@ -188,6 +202,12 @@ class QwenTalkerModelRunner(ModelRunner["SGLangARRequestData"]):
         # in-graph write to the fixed-address _output_codes/_output_embeds.
         codes_snap = self.model.output_codes[:bs].detach().clone()
         embeds_snap = self.model.output_embeds[:bs].detach().clone()
+        if self.state_observer is not None:
+            self.state_observer.observe_output(
+                self.model, requests, codes_snap, embeds_snap
+            )
+        else:
+            pass
         coalesce = self.codec_coalesce_frames
         code_messages: list[OutgoingMessage] = []
         for idx, sched_req in enumerate(requests):
@@ -301,6 +321,10 @@ class QwenTalkerModelRunner(ModelRunner["SGLangARRequestData"]):
         self, request_id: str, req_data: "SGLangARRequestData"
     ) -> None:
         super().on_request_finished(request_id, req_data)
+        if self.state_observer is not None:
+            self.state_observer.finish(request_id, req_data)
+        else:
+            pass
         pending = req_data.pending_codec_rows
         if not pending:
             return
