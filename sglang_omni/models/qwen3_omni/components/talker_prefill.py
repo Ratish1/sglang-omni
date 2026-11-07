@@ -260,6 +260,36 @@ class TalkerPrefillBuilder:
             im_end_token_id=self.im_end_token_id,
         )
 
+        conditioning_directory = os.environ.get(
+            "SGLANG_OMNI_DIAGNOSTIC_CONDITIONING_DIRECTORY"
+        )
+        if conditioning_directory is not None:
+            conditioning_file = (
+                Path(conditioning_directory) / f"{payload.request_id}.pt"
+            )
+            if conditioning_file.exists():
+                conditioning = torch.load(
+                    conditioning_file,
+                    map_location=prompt_embed.device,
+                    weights_only=True,
+                )
+                assert torch.equal(conditioning["prompt_input_ids"][0], prompt_ids)
+                assert torch.equal(
+                    conditioning["native_prefill"], prefill["input_embeds"]
+                )
+                conditioning_variant = os.environ[
+                    "SGLANG_OMNI_DIAGNOSTIC_CONDITIONING_VARIANT"
+                ]
+                assert conditioning_variant in (
+                    "checkpoint_audio_prefill",
+                    "native_audio_prefill",
+                )
+                prefill["input_embeds"] = conditioning[conditioning_variant]
+            else:
+                pass
+        else:
+            pass
+
         diagnostic_directory = os.environ.get("SGLANG_OMNI_DIAGNOSTIC_TENSOR_DIRECTORY")
         if diagnostic_directory is not None:
             captured = {
