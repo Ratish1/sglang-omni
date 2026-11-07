@@ -45,6 +45,12 @@ def main() -> None:
         default="checkpoint",
     )
     parser.add_argument("--paired-normalization-controls", action="store_true")
+    parser.add_argument("--conditioning-directory", type=Path)
+    parser.add_argument(
+        "--conditioning-variant",
+        choices=("checkpoint_audio_prefill", "native_audio_prefill"),
+        default="checkpoint_audio_prefill",
+    )
     parser.add_argument("--output-directory", type=Path, required=True)
     arguments = parser.parse_args()
     arguments.output_directory.mkdir(exist_ok=False)
@@ -190,6 +196,20 @@ def main() -> None:
             assert int(reproduced_prefill_choice[0]) == int(
                 native_frames[0]["codec_ids"][0, 0]
             )
+            if arguments.conditioning_directory is not None:
+                conditioning = torch.load(
+                    arguments.conditioning_directory / f"{trace_directory.name}.pt",
+                    map_location=reference.device,
+                    weights_only=True,
+                )
+                assert torch.equal(
+                    conditioning["native_prefill"].to(reference.dtype), prefill
+                )
+                prefill = conditioning[arguments.conditioning_variant].to(
+                    reference.dtype
+                )
+            else:
+                pass
             mode_directory = (
                 arguments.output_directory / normalization_mode
                 if arguments.paired_normalization_controls
@@ -329,6 +349,11 @@ def main() -> None:
                 "reference_frames_including_eos": len(frame_reports),
                 "termination": termination,
                 "reference_dtype": arguments.dtype,
+                "conditioning_variant": (
+                    arguments.conditioning_variant
+                    if arguments.conditioning_directory is not None
+                    else "native"
+                ),
                 "normalization_semantics": normalization_mode,
                 "normalization_boundary_calls": normalization.boundary_calls,
                 "normalization_query_key_calls": normalization.query_key_calls,
