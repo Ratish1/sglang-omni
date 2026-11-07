@@ -105,6 +105,13 @@ def main() -> None:
             native = torch.load(
                 directory / "conditioning.pt", map_location="cpu", weights_only=True
             )
+            native.update(
+                torch.load(
+                    directory / "audio-conditioning.pt",
+                    map_location="cpu",
+                    weights_only=True,
+                )
+            )
             prompt_ids = inputs["input_ids"]
             assert torch.equal(prompt_ids[0].cpu(), native["prompt_input_ids"])
             audio_mask = prompt_ids[0] == model.config.thinker_config.audio_token_id
