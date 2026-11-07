@@ -22,27 +22,35 @@ from sglang_omni.serve.protocol import ChatCompletionRequest
 async def run(
     base_url: str,
     request_file: Path,
-    distractor_file: Path,
+    distractor_file: Path | None,
     audio_directory: Path,
     capture_directory: Path | None,
     output_directory: Path,
 ) -> None:
     target = ChatCompletionRequest.model_validate_json(request_file.read_bytes())
-    distractor = ChatCompletionRequest.model_validate_json(distractor_file.read_bytes())
-    assert target.request_id is not None and distractor.request_id is not None
-    assert target.temperature == distractor.temperature == 0.0
-    assert target.stream is distractor.stream is False
+    assert target.request_id is not None and target.stream is False
+    request_sequence = [("target-original", target)]
+    if distractor_file is not None:
+        distractor = ChatCompletionRequest.model_validate_json(
+            distractor_file.read_bytes()
+        )
+        assert distractor.request_id is not None and distractor.stream is False
+        assert target.temperature == distractor.temperature == 0.0
+        request_sequence.extend(
+            [
+                ("target-first", target),
+                ("unrelated", distractor),
+                ("target-after-unrelated", target),
+                ("target-repeat", target),
+            ]
+        )
+    else:
+        assert capture_directory is None
     output_directory.mkdir(exist_ok=False)
     observations = []
     target_captures = []
     async with aiohttp.ClientSession() as session:
-        for label, request in (
-            ("target-original", target),
-            ("target-first", target),
-            ("unrelated", distractor),
-            ("target-after-unrelated", target),
-            ("target-repeat", target),
-        ):
+        for label, request in request_sequence:
             assert request.request_id is not None and request.audios
             sampling_seed = request.seed
             if sampling_seed is None:
@@ -166,7 +174,9 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--base-url", required=True)
     parser.add_argument("--request-file", type=Path, required=True)
-    parser.add_argument("--distractor-file", type=Path, required=True)
+    replay_mode = parser.add_mutually_exclusive_group(required=True)
+    replay_mode.add_argument("--distractor-file", type=Path)
+    replay_mode.add_argument("--original-only", action="store_true")
     parser.add_argument("--audio-directory", type=Path, required=True)
     parser.add_argument("--capture-directory", type=Path)
     parser.add_argument("--output-directory", type=Path, required=True)
