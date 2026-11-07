@@ -33,6 +33,7 @@ def main() -> None:
     parser.add_argument("--model-path", required=True)
     parser.add_argument("--trace-directory", action="append", type=Path, required=True)
     parser.add_argument("--gpu", type=int, required=True)
+    parser.add_argument("--dtype", choices=("bfloat16", "float32"), default="bfloat16")
     parser.add_argument("--max-frames", type=int, required=True)
     parser.add_argument("--temperature", type=float, required=True)
     parser.add_argument("--repetition-penalty", type=float, required=True)
@@ -48,6 +49,7 @@ def main() -> None:
     arguments = parser.parse_args()
     arguments.output_directory.mkdir(exist_ok=False)
     torch.cuda.set_device(arguments.gpu)
+    torch.set_float32_matmul_precision("highest")
     model_config = Qwen3OmniMoeConfig.from_pretrained(arguments.model_path)
     config = model_config.talker_config
     register_checkpoint_conversion_mapping(
@@ -89,6 +91,11 @@ def main() -> None:
     reports = []
     with torch.inference_mode():
         projected_special_embeddings = reference.text_projection(special_embeddings)
+        if arguments.dtype == "float32":
+            reference.float()
+            projected_special_embeddings = projected_special_embeddings.float()
+        else:
+            pass
         eos_embedding = projected_special_embeddings[1:2]
         pad_embedding = projected_special_embeddings[2:3]
         token_ids = torch.arange(config.text_config.vocab_size, device=reference.device)
@@ -123,8 +130,12 @@ def main() -> None:
             )
             prefill_file = next(trace_directory.glob("*-before_prefill.pt"))
             before = torch.load(prefill_file, map_location="cpu", weights_only=True)
-            prefill = before["prefill_embeds"].to(reference.device)
-            text_rows = before["trailing_text_embeds"].to(reference.device)
+            prefill = before["prefill_embeds"].to(
+                device=reference.device, dtype=reference.dtype
+            )
+            text_rows = before["trailing_text_embeds"].to(
+                device=reference.device, dtype=reference.dtype
+            )
             assert torch.equal(
                 before["positions"], torch.arange(len(prefill))
             ), "this experiment requires captured linear audio-only positions"
@@ -160,7 +171,7 @@ def main() -> None:
                     reference.device
                 )
                 assert torch.equal(
-                    previous_feedback + next_text,
+                    previous_feedback + next_text.to(previous_feedback.dtype),
                     captured["feedback_input"].to(reference.device),
                 ), f"uncaptured text handoff at {filename}"
                 checked_feedback_rows += 1
@@ -317,6 +328,7 @@ def main() -> None:
                 "native_frames_including_eos": len(native_frames),
                 "reference_frames_including_eos": len(frame_reports),
                 "termination": termination,
+                "reference_dtype": arguments.dtype,
                 "normalization_semantics": normalization_mode,
                 "normalization_boundary_calls": normalization.boundary_calls,
                 "normalization_query_key_calls": normalization.query_key_calls,
