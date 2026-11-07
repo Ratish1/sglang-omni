@@ -48,6 +48,7 @@ def main() -> None:
     parser.add_argument("--trace-directory", action="append", type=Path, required=True)
     parser.add_argument("--compare-trace-directories", nargs=2, type=Path)
     parser.add_argument("--gpu", type=int, required=True)
+    parser.add_argument("--decode-only", action="store_true")
     parser.add_argument("--output-directory", type=Path, required=True)
     arguments = parser.parse_args()
     arguments.output_directory.mkdir(exist_ok=False)
@@ -102,7 +103,10 @@ def main() -> None:
         for trace_directory in arguments.trace_directory:
             frames = []
             expert_layers = []
-            trace_files = sorted(trace_directory.glob("*-post_*.pt"))
+            trace_pattern = (
+                "*-post_decode.pt" if arguments.decode_only else "*-post_*.pt"
+            )
+            trace_files = sorted(trace_directory.glob(trace_pattern))
             assert trace_files, trace_directory
             for trace_file in trace_files:
                 captured = torch.load(trace_file, weights_only=True)
@@ -128,20 +132,49 @@ def main() -> None:
                     ),
                 }
                 frames.append(frame_report)
-                if "post_prefill" not in trace_file.name:
+                if not arguments.decode_only and "post_prefill" not in trace_file.name:
                     continue
                 else:
                     pass
+                token_count = 1 if arguments.decode_only else 128
                 for layer_index, layer in enumerate(reference.model.layers):
                     prefix = f"moe_{layer_index}_"
-                    hidden_states = captured[f"{prefix}input_128"].to(device)
+                    hidden_states = captured[f"{prefix}input_{token_count}"].to(device)
                     selected_experts = (
-                        captured[f"{prefix}experts_128"].to(device).long()
+                        captured[f"{prefix}experts_{token_count}"].to(device).long()
                     )
                     routing_weights = (
-                        captured[f"{prefix}weights_128"].to(device).float()
+                        captured[f"{prefix}weights_{token_count}"].to(device).float()
                     )
-                    native_output = captured[f"{prefix}routed_output_128"].to(device)
+                    native_output = captured[f"{prefix}routed_output_{token_count}"].to(
+                        device
+                    )
+                    router_logits = captured[f"{prefix}router_logits_{token_count}"].to(
+                        device
+                    )
+                    selected_logits = router_logits.gather(1, selected_experts)
+                    topk_threshold = router_logits.topk(
+                        selected_experts.shape[1], dim=-1
+                    ).values[:, -1:]
+                    selected_weights = torch.softmax(
+                        router_logits.float(), dim=-1
+                    ).gather(1, selected_experts)
+                    if config.text_config.norm_topk_prob:
+                        selected_weights /= selected_weights.sum(dim=-1, keepdim=True)
+                    else:
+                        pass
+                    if arguments.decode_only:
+                        normalized_input = captured[
+                            f"boundary_{layer_index}_mlp_normalized_1"
+                        ].to(device)
+                        assert torch.equal(hidden_states, normalized_input)
+                        shared_output = captured[f"{prefix}shared_output_1"].to(device)
+                        whole_output = captured[
+                            f"boundary_{layer_index}_mlp_output_1"
+                        ].to(device)
+                        assert torch.equal(native_output + shared_output, whole_output)
+                    else:
+                        pass
                     reference_output = layer.mlp.experts(
                         hidden_states, selected_experts, routing_weights
                     )
@@ -167,7 +200,26 @@ def main() -> None:
                         )
                     expert_layers.append(
                         {
+                            "trace_file": trace_file.name,
                             "layer": layer_index,
+                            "expert_ids": selected_experts.cpu().tolist(),
+                            "routing_weights_dtype": str(
+                                captured[f"{prefix}weights_{token_count}"].dtype
+                            ),
+                            "selected_experts_are_topk": bool(
+                                (selected_logits >= topk_threshold).all()
+                            ),
+                            "router_logits_vs_checkpoint": asdict(
+                                compare_tensors(
+                                    router_logits,
+                                    torch.nn.functional.linear(
+                                        hidden_states, layer.mlp.gate.weight
+                                    ),
+                                )
+                            ),
+                            "routing_weights_vs_softmax": asdict(
+                                compare_tensors(routing_weights, selected_weights)
+                            ),
                             "native_vs_reference": asdict(
                                 compare_tensors(native_output, reference_output)
                             ),
@@ -183,6 +235,7 @@ def main() -> None:
                 "trace_directory": str(trace_directory),
                 "frames": frames,
                 "expert_layers": expert_layers,
+                "decode_only": arguments.decode_only,
             }
             reports.append(report)
             destination = (
