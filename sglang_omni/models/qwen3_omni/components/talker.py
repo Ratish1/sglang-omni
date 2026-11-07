@@ -326,6 +326,7 @@ class Qwen3OmniMoeTalkerSparseMoeBlock(Qwen3OmniMoeThinkerTextSparseMoeBlock):
             prefix=add_prefix("shared_expert_gate", prefix),
         )
         self.diagnostic_tensors: dict[str, torch.Tensor] = {}
+        self.diagnostic_token_counts: set[int] = set()
 
     def forward(
         self,
@@ -343,7 +344,9 @@ class Qwen3OmniMoeTalkerSparseMoeBlock(Qwen3OmniMoeThinkerTextSparseMoeBlock):
 
         capture_experts = os.environ.get(
             "SGLANG_OMNI_DIAGNOSTIC_MOE_TRACE"
-        ) is not None and num_tokens in (1, 128)
+        ) is not None and (
+            num_tokens in (1, 128) or num_tokens in self.diagnostic_token_counts
+        )
         if capture_experts:
             self.diagnostic_tensors[f"input_{num_tokens}"] = (
                 linear_hidden_states.clone()
@@ -464,6 +467,15 @@ class Qwen3OmniMoeTalkerTextModel(nn.Module):
         for idx in range(self.start_layer, self.end_layer):
             self.layers[idx].self_attn.use_fused_qk_norm_rope = False
             self.layers[idx].self_attn.compatible_with_fused_qk_norm_rope = False
+        diagnostic_token_counts = os.environ.get("SGLANG_OMNI_DIAGNOSTIC_LAYER_TOKENS")
+        if diagnostic_token_counts is not None:
+            token_counts = {int(value) for value in diagnostic_token_counts.split(",")}
+            for layer in self.layers:
+                layer.diagnostic_token_counts = token_counts
+                layer.self_attn.diagnostic_token_counts = token_counts
+                layer.mlp.diagnostic_token_counts = token_counts
+        else:
+            pass
 
     def get_input_embeddings(self) -> nn.Embedding:
         return self.codec_embedding

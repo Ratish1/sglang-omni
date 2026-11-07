@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 import os
 from collections import deque
 from pathlib import Path
@@ -205,6 +207,17 @@ class QwenTalkerModelRunner(ModelRunner["SGLangARRequestData"]):
             pass
         assert len(requests) == 1, "tensor diagnosis requires serial requests"
         request = requests[0]
+        profile_request_id = os.environ.get("SGLANG_OMNI_DIAGNOSTIC_PROFILE_REQUEST_ID")
+        should_profile = (
+            request.request_id == profile_request_id
+            and len(request.data.req.output_ids) == 1
+        )
+        if should_profile and phase == "post_decode":
+            torch.cuda.synchronize()
+            torch.cuda.nvtx.range_pop()
+            torch.cuda.profiler.stop()
+        else:
+            pass
         maximum_frames = os.environ.get("SGLANG_OMNI_DIAGNOSTIC_MAX_TRACE_FRAMES")
         if maximum_frames is not None and len(request.data.req.output_ids) >= int(
             maximum_frames
@@ -237,6 +250,37 @@ class QwenTalkerModelRunner(ModelRunner["SGLangARRequestData"]):
                 pass
         else:
             pass
+        if os.environ.get(
+            "SGLANG_OMNI_DIAGNOSTIC_LAYER_TOKENS"
+        ) is not None and phase in ("post_prefill", "post_decode"):
+            token_count = len(forward_batch.input_ids)
+            for layer_index, layer in enumerate(self.model.model.layers):
+                for prefix, captured_tensors in (
+                    ("boundary", layer.diagnostic_tensors),
+                    ("attention", layer.self_attn.diagnostic_tensors),
+                ):
+                    tensors.update(
+                        {
+                            f"{prefix}_{layer_index}_{name}": tensor
+                            for name, tensor in captured_tensors.items()
+                            if phase == "post_prefill"
+                            or name.endswith(f"_{token_count}")
+                        }
+                    )
+                tensors[f"input_norm_weight_{layer_index}"] = (
+                    layer.input_layernorm.weight
+                )
+                tensors[f"post_attention_norm_weight_{layer_index}"] = (
+                    layer.post_attention_layernorm.weight
+                )
+                tensors[f"query_norm_weight_{layer_index}"] = (
+                    layer.self_attn.q_norm.weight
+                )
+                tensors[f"key_norm_weight_{layer_index}"] = (
+                    layer.self_attn.k_norm.weight
+                )
+        else:
+            pass
         if os.environ.get("SGLANG_OMNI_DIAGNOSTIC_MOE_TRACE") is not None and phase in (
             "post_prefill",
             "post_decode",
@@ -247,7 +291,7 @@ class QwenTalkerModelRunner(ModelRunner["SGLangARRequestData"]):
                     {
                         f"moe_{layer_index}_{name}": tensor
                         for name, tensor in layer.mlp.diagnostic_tensors.items()
-                        if name.endswith(token_suffix)
+                        if phase == "post_prefill" or name.endswith(token_suffix)
                     }
                 )
         else:
@@ -258,6 +302,35 @@ class QwenTalkerModelRunner(ModelRunner["SGLangARRequestData"]):
             {name: tensor.detach().cpu().clone() for name, tensor in tensors.items()},
             destination / f"{len(request.data.req.output_ids):04d}-{phase}.pt",
         )
+        if (
+            os.environ.get("SGLANG_OMNI_DIAGNOSTIC_LAYER_TOKENS") is not None
+            and phase == "post_prefill"
+        ):
+            fingerprints = {}
+            for layer_index, layer in enumerate(self.model.model.layers):
+                for name, parameter in layer.named_parameters():
+                    if not name.startswith("mlp.experts."):
+                        fingerprints[f"layers.{layer_index}.{name}"] = hashlib.sha256(
+                            parameter.detach()
+                            .cpu()
+                            .contiguous()
+                            .view(torch.uint8)
+                            .numpy()
+                            .tobytes()
+                        ).hexdigest()
+                    else:
+                        pass
+            (destination / "parameter-sha256.json").write_text(
+                json.dumps(fingerprints, indent=2)
+            )
+        else:
+            pass
+        if should_profile and phase == "before_decode":
+            torch.cuda.synchronize()
+            torch.cuda.profiler.start()
+            torch.cuda.nvtx.range_push("Talker first decode")
+        else:
+            pass
 
     def emit_code_chunks_and_feedback(
         self,
