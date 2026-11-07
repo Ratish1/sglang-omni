@@ -89,9 +89,11 @@ def main() -> None:
                 cache = output.past_key_values
                 expected = reference.codec_head(output.last_hidden_state[:, -1]).float()
                 actual = native["logits"].to(reference.device).float()
+                native_hidden_states = native["hidden_states"].to(reference.device)
+                reprojected = reference.codec_head(native_hidden_states).float()
                 if frame_index == 0:
-                    # note (ratish): the prefill sampler divides this tensor in place.
-                    actual = actual * arguments.temperature
+                    # note (ratish): the prefill sampler overwrites its logits with probabilities.
+                    actual = reprojected
                     repetition_mask = torch.zeros_like(actual, dtype=torch.bool)
                 else:
                     repetition_mask = captured["repetition_mask"].to(reference.device)
@@ -121,6 +123,21 @@ def main() -> None:
                 chosen_column = int((allowed_ids == chosen_token).nonzero()[0])
                 report = {
                     "trace_file": after_file.name,
+                    "native_logits_source": (
+                        "reprojected_prefill_hidden_states"
+                        if frame_index == 0
+                        else "captured_decode_logits"
+                    ),
+                    "hidden_state_relative_l2_error": float(
+                        (
+                            native_hidden_states.float()
+                            - output.last_hidden_state[:, -1].float()
+                        ).norm()
+                        / output.last_hidden_state[:, -1].float().norm()
+                    ),
+                    "head_reprojection_matches_captured": (
+                        None if frame_index == 0 else torch.equal(actual, reprojected)
+                    ),
                     "maximum_absolute_logit_error": float(difference.abs().max()),
                     "relative_logit_l2_error": float(
                         difference.norm() / expected[finite].norm()
