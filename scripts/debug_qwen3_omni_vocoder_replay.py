@@ -16,7 +16,12 @@ from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import (
 )
 
 from benchmarks.metrics.wer import SampleOutput
-from benchmarks.tasks.asr import apply_wer, load_qwen3_asr, transcribe
+from benchmarks.tasks.asr import (
+    QWEN3_ASR_MODEL_PATH,
+    apply_wer,
+    load_router_asr,
+    transcribe,
+)
 from sglang_omni.client.audio import encode_wav
 
 
@@ -26,6 +31,7 @@ def main() -> None:
     parser.add_argument("--trace-directory", action="append", type=Path, required=True)
     parser.add_argument("--gpu", type=int, required=True)
     parser.add_argument("--asr-port", type=int, required=True)
+    parser.add_argument("--asr-model", default=QWEN3_ASR_MODEL_PATH)
     parser.add_argument("--target-text", required=True)
     parser.add_argument("--sample-rate", type=int, required=True)
     parser.add_argument("--output-directory", type=Path, required=True)
@@ -68,7 +74,7 @@ def main() -> None:
             )
             destination.write_bytes(wav_bytes)
             hypothesis = transcribe(
-                load_qwen3_asr(arguments.asr_port),
+                load_router_asr(arguments.asr_port, arguments.asr_model),
                 str(destination),
                 "en",
                 f"cuda:{arguments.gpu}",
