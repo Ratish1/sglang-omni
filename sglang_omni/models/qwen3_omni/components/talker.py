@@ -1733,7 +1733,7 @@ class Qwen3OmniTalker(nn.Module):
             )
             predictor_input[:, 1, :] = layer0_embed[:, 0, :]
             pos_codes[:, 0].copy_(layer0_code[:, 0])
-            pos_summed.add_(layer0_embed[:, 0, :])
+            feedback_embeddings = [layer0_embed]
 
             cache_len = 0
             pair_hidden = self.predictor_forward_tokens(
@@ -1757,7 +1757,6 @@ class Qwen3OmniTalker(nn.Module):
                         logits[:, -1, :],
                         codebook_embedding.weight,
                         pos_codes[:, layer_idx + 1],
-                        pos_summed,
                     )
                 else:
                     next_code = self.sample_code_predictor_token(logits)
@@ -1765,16 +1764,26 @@ class Qwen3OmniTalker(nn.Module):
                     new_embed = codebook_embedding(next_code).to(
                         dtype=predictor_input.dtype
                     )
-                    pos_summed.add_(new_embed[:, 0, :])
+                feedback_embeddings.append(new_embed)
                 if layer_idx < num_groups - 2:
+                    if (
+                        self.predictor_fused_layers is not None
+                        and self.predictor_fused_layers.covers(batch_size)
+                    ):
+                        predictor_token_embeds = new_embed
+                    else:
+                        # note (ratish): the plain predictor mutates its input residual.
+                        predictor_token_embeds = new_embed.clone()
                     last_hidden = self.predictor_forward_tokens(
-                        token_embeds=new_embed,
+                        token_embeds=predictor_token_embeds,
                         batch_size=batch_size,
                         cache_len=cache_len,
                     )
                     cache_len += 1
                 else:
                     pass
+
+            pos_summed.copy_(torch.cat(feedback_embeddings, dim=1).sum(dim=1))
 
         return result_codes, summed_embeddings
 
