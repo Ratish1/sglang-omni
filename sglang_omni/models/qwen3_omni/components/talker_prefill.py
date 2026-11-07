@@ -8,6 +8,7 @@ This module mirrors HF's talker prefill layout, then keeps HF's
 from __future__ import annotations
 
 import json
+import os
 from collections.abc import Mapping
 from pathlib import Path
 from typing import TYPE_CHECKING, TypedDict
@@ -258,6 +259,38 @@ class TalkerPrefillBuilder:
             include_assistant_eos=thinker_done,
             im_end_token_id=self.im_end_token_id,
         )
+
+        diagnostic_directory = os.environ.get("SGLANG_OMNI_DIAGNOSTIC_TENSOR_DIRECTORY")
+        if diagnostic_directory is not None:
+            captured = {
+                "prompt_input_ids": prompt_ids,
+                "assistant_token_ids": assistant_token_ids,
+                "prompt_token_embeddings": prompt_embed,
+                "prompt_hidden": prompt_hidden,
+                "multimodal_mask": multimodal_mask[: len(prompt_ids)],
+                "prefill_embeddings": prefill["input_embeds"],
+            }
+            for name in (
+                "audio_embeds",
+                "audio_feature_lengths",
+                "feature_attention_mask",
+            ):
+                value = prompt_model_inputs.get(name)
+                if isinstance(value, torch.Tensor):
+                    captured[name] = value
+                else:
+                    pass
+            destination = Path(diagnostic_directory) / payload.request_id
+            destination.mkdir(parents=True, exist_ok=True)
+            torch.save(
+                {
+                    name: value.detach().cpu().clone()
+                    for name, value in captured.items()
+                },
+                destination / "conditioning.pt",
+            )
+        else:
+            pass
 
         return {
             "input_embeds": prefill["input_embeds"],
