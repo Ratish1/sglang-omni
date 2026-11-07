@@ -37,6 +37,7 @@ from sglang.srt.runtime_context import get_exec, max_prefill_buffer_tokens
 from sglang.srt.utils import add_prefix, logger
 from transformers import PretrainedConfig
 
+from sglang_omni.model_runner.kv_diagnostics import install_kv_write_observers
 from sglang_omni.models.qwen3_omni.components.thinker_fused_rope import (
     install_thinker_fused_rope,
 )
@@ -135,6 +136,7 @@ class Qwen3OmniThinkerForCausalLM(nn.Module):
             )
         self.logits_processor = LogitsProcessor(self.config)
         self.fused_rope_gate = install_thinker_fused_rope(self.model)
+        install_kv_write_observers(self.model.layers)
         # note (ratish): a quantized MoE can share one activation scale across rows,
         # so a padded row's experts could change the live rows' rounding.
         self.decode_live_rows: DecodeLiveRows | None = None

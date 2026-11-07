@@ -21,6 +21,7 @@ from sglang.srt.utils import add_prefix
 from sglang.srt.utils.common import is_flashinfer_available
 from torch import nn
 
+from sglang_omni.model_runner.kv_diagnostics import install_kv_write_observers
 from sglang_omni.models.qwen3_omni.components.thinker_model import (
     Qwen3OmniMoeThinkerTextAttention,
     Qwen3OmniMoeThinkerTextDecoderLayer,
@@ -440,6 +441,8 @@ class Qwen3OmniMoeTalkerTextModel(nn.Module):
         for idx in range(self.start_layer, self.end_layer):
             self.layers[idx].self_attn.use_fused_qk_norm_rope = False
             self.layers[idx].self_attn.compatible_with_fused_qk_norm_rope = False
+
+        install_kv_write_observers(self.layers)
 
     def get_input_embeddings(self) -> nn.Embedding:
         return self.codec_embedding

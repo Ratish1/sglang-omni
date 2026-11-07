@@ -22,7 +22,7 @@ def main() -> None:
         for step_index, snapshot in enumerate(captured["snapshots"]):
             for name, query in snapshot.items():
                 matched = re.search(
-                    r"(?:^|\.)layers\.(\d+)\.self_attn\.diagnostic_query$", name
+                    r"(?:^|\.)layers\.(\d+)\.self_attn\.attn\.diagnostic_query$", name
                 )
                 if matched is None:
                     continue
