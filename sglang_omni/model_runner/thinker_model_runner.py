@@ -508,6 +508,13 @@ class ThinkerModelRunner(ModelRunner):
         model_runner = self.tp_worker.model_runner
         outer = self.outer_model
 
+        if self.kv_observer is not None:
+            self.kv_observer.capture_prefill_inputs(
+                forward_batch, forward_batch.rids, input_embeds
+            )
+        else:
+            pass
+
         model_runner.attn_backend.init_forward_metadata(forward_batch)
 
         positions = forward_batch.positions

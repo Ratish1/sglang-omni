@@ -117,6 +117,7 @@ class PrefixKVObservation:
     checks: list[torch.Tensor] = field(default_factory=list)
     sequence_lengths: list[int] = field(default_factory=list)
     snapshots: list[dict[str, torch.Tensor]] = field(default_factory=list)
+    write_conflicts: list[tuple[int, int, list[str]]] = field(default_factory=list)
 
 
 class FullPrefixKVObserver:
@@ -126,6 +127,7 @@ class FullPrefixKVObserver:
         self.runner = runner
         self.observations: dict[str, PrefixKVObservation] = {}
         self.prefill_inputs: dict[str, dict[str, torch.Tensor]] = {}
+        self.live_slots: dict[str, set[int]] = {}
         backend = runner.attn_backend
         pool = runner.token_to_kv_pool
         assert isinstance(backend, FlashAttentionBackend)
@@ -173,14 +175,24 @@ class FullPrefixKVObserver:
         (self.directory / "runtime.json").write_text(json.dumps(metadata, indent=2))
 
     def capture_prefill_inputs(
-        self, forward_batch: ForwardBatch, requests: list[SchedulerRequest]
+        self,
+        forward_batch: ForwardBatch,
+        request_ids: list[str],
+        embeddings: torch.Tensor | None = None,
     ) -> None:
-        sidecar = get_omni_prefill_inputs(forward_batch)
-        embeddings = (
-            sidecar.input_embeds if sidecar is not None else forward_batch.input_embeds
-        )
+        if embeddings is None:
+            sidecar = get_omni_prefill_inputs(forward_batch)
+            embeddings = (
+                sidecar.input_embeds
+                if sidecar is not None
+                else forward_batch.input_embeds
+            )
+        else:
+            pass
         row_start = 0
-        for request, extend_length in zip(requests, forward_batch.extend_seq_lens_cpu):
+        for request_id, extend_length in zip(
+            request_ids, forward_batch.extend_seq_lens_cpu
+        ):
             row_end = row_start + extend_length
             snapshot = {
                 "prefill_input_ids": forward_batch.input_ids[row_start:row_end].clone(),
@@ -198,7 +210,7 @@ class FullPrefixKVObserver:
                 ].clone()
             else:
                 pass
-            self.prefill_inputs[request.request_id] = snapshot
+            self.prefill_inputs[request_id] = snapshot
             row_start = row_end
 
     def observe(
@@ -214,6 +226,21 @@ class FullPrefixKVObserver:
         request_locations = request_table.index_select(0, request_pool_indices)[
             :, :maximum_sequence_length
         ]
+        for request, locations, sequence_length in zip(
+            requests, request_locations.cpu().tolist(), sequence_lengths
+        ):
+            self.live_slots[request.request_id] = set(locations[:sequence_length])
+        slot_owners: dict[int, list[str]] = {}
+        for request_id, locations in self.live_slots.items():
+            for location in locations:
+                slot_owners.setdefault(location, []).append(request_id)
+        write_locations = forward_batch.out_cache_loc.cpu().tolist()
+        write_lengths = (
+            [1] * len(requests)
+            if forward_batch.forward_mode.is_decode()
+            else forward_batch.extend_seq_lens_cpu
+        )
+        write_start = 0
         metadata = self.backend.forward_metadata
         page_locations = metadata.page_table[: len(requests)].index_select(
             1, token_offsets // self.runner.page_size
@@ -243,6 +270,20 @@ class FullPrefixKVObserver:
                 assert request.request_id not in self.observations
                 self.observations[request.request_id] = observation
             prefix_length = observation.prefix_locations.numel()
+            write_end = write_start + write_lengths[row_index]
+            for location in write_locations[write_start:write_end]:
+                foreign_owners = [
+                    owner
+                    for owner in slot_owners[location]
+                    if owner != request.request_id
+                ]
+                if foreign_owners:
+                    observation.write_conflicts.append(
+                        (sequence_length, location, foreign_owners)
+                    )
+                else:
+                    pass
+            write_start = write_end
             checks = [
                 (locations[:prefix_length] == observation.prefix_locations).all(),
                 (read_locations[row_index, :sequence_length] == locations).all(),
@@ -289,6 +330,12 @@ class FullPrefixKVObserver:
                     "request_pool_index": request_pool_indices[row_index].clone(),
                 }
                 if not decode:
+                    assert request.request_id in self.prefill_inputs, (
+                        self.directory.name,
+                        request.request_id,
+                        forward_batch.rids,
+                        list(self.prefill_inputs),
+                    )
                     snapshot.update(self.prefill_inputs.pop(request.request_id))
                 else:
                     pass
@@ -316,6 +363,7 @@ class FullPrefixKVObserver:
 
     def finish(self, request_id: str) -> None:
         observation = self.observations.pop(request_id)
+        self.live_slots.pop(request_id)
         checks = torch.stack(observation.checks).cpu()
         report = {
             "request_id": request_id,
@@ -323,6 +371,7 @@ class FullPrefixKVObserver:
             "forward_count": len(observation.checks),
             "sequence_lengths": observation.sequence_lengths,
             "failed_checks": (~checks).nonzero().tolist(),
+            "write_conflicts": observation.write_conflicts,
             "write_counts": {
                 name: tensor.cpu().tolist()
                 for name, tensor in self.attention_tensors.items()
