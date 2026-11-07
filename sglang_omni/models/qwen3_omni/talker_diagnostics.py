@@ -172,7 +172,7 @@ class TalkerStateObserver:
         observation = self.observations.pop(request_id)
         checks = torch.stack([value for _, value in observation.checks]).cpu().tolist()
         codes = torch.stack(observation.codes).cpu()
-        output_ids = request_data.req.output_ids
+        output_ids = list(request_data.req.output_ids)
         report = {
             "request_id": request_id,
             "text_rows": len(observation.text_rows),
