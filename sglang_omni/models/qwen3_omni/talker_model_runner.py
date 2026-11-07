@@ -3,7 +3,10 @@
 
 from __future__ import annotations
 
+import json
+import os
 from collections import deque
+from pathlib import Path
 from queue import Queue
 from typing import TYPE_CHECKING, TypeAlias
 
@@ -300,6 +303,36 @@ class QwenTalkerModelRunner(ModelRunner["SGLangARRequestData"]):
     def on_request_finished(
         self, request_id: str, req_data: "SGLangARRequestData"
     ) -> None:
+        diagnostic_directory = os.environ.get("SGLANG_OMNI_DIAGNOSTIC_FINISH_DIRECTORY")
+        if diagnostic_directory is not None:
+            directory = Path(diagnostic_directory)
+            directory.mkdir(parents=True, exist_ok=True)
+            request = req_data.req
+            reason = request.finished_reason
+            record = {
+                "request_id": request_id,
+                "finish_reason": reason.to_json() if reason is not None else None,
+                "output_ids": list(request.output_ids),
+                "max_new_tokens": request.sampling_params.max_new_tokens,
+                "codec_eos_token_id": self.model.config.codec_eos_token_id,
+                "thinker_chunks_done": req_data.thinker_chunks_done,
+                "pending_text_rows": (
+                    len(req_data.pending_text_queue)
+                    if req_data.pending_text_queue is not None
+                    else 0
+                ),
+                "pending_feedback_rows": len(req_data.pending_feedback_queue),
+                "decode_input_rows": (
+                    len(req_data.decode_input_embeds)
+                    if req_data.decode_input_embeds is not None
+                    else 0
+                ),
+                "coalesced_codec_frames": req_data.codec_frames_seen,
+            }
+            with (directory / f"finish-{os.getpid()}.jsonl").open("a") as output:
+                output.write(json.dumps(record) + "\n")
+        else:
+            pass
         pending = req_data.pending_codec_rows
         if not pending:
             return
