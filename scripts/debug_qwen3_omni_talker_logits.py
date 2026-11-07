@@ -26,6 +26,8 @@ def main() -> None:
     parser.add_argument("--temperature", type=float, required=True)
     parser.add_argument("--repetition-penalty", type=float, required=True)
     parser.add_argument("--max-decode-frames", type=int)
+    parser.add_argument("--dtype", choices=("bfloat16", "float32"), default="bfloat16")
+    parser.add_argument("--save-reference-tensors", action="store_true")
     parser.add_argument("--output-directory", type=Path, required=True)
     arguments = parser.parse_args()
     arguments.output_directory.mkdir(exist_ok=False)
@@ -37,7 +39,7 @@ def main() -> None:
     reference, loading = Qwen3OmniMoeTalkerForConditionalGeneration.from_pretrained(
         arguments.model_path,
         config=config,
-        dtype=torch.bfloat16,
+        dtype=torch.float32 if arguments.dtype == "float32" else torch.bfloat16,
         device_map={"": arguments.gpu},
         attn_implementation="sdpa",
         experts_implementation="eager",
@@ -50,6 +52,13 @@ def main() -> None:
     reports = []
     with torch.inference_mode():
         for directory in arguments.trace_directory:
+            if arguments.save_reference_tensors:
+                tensor_directory = (
+                    arguments.output_directory / directory.parent.name / directory.name
+                )
+                tensor_directory.mkdir(parents=True)
+            else:
+                pass
             prefill_file = next(directory.glob("*-before_prefill.pt"))
             before = torch.load(prefill_file, map_location="cpu", weights_only=True)
             prefill = before["prefill_embeds"]
@@ -74,7 +83,7 @@ def main() -> None:
                     prefill[None]
                     if frame_index == 0
                     else captured["feedback_input"][:, None]
-                ).to(reference.device)
+                ).to(device=reference.device, dtype=reference.dtype)
                 positions = captured["positions"].to(reference.device)
                 if frame_index > 0:
                     assert positions.tolist() == [cache.get_seq_length()]
@@ -89,7 +98,9 @@ def main() -> None:
                 cache = output.past_key_values
                 expected = reference.codec_head(output.last_hidden_state[:, -1]).float()
                 actual = native["logits"].to(reference.device).float()
-                native_hidden_states = native["hidden_states"].to(reference.device)
+                native_hidden_states = native["hidden_states"].to(
+                    device=reference.device, dtype=reference.dtype
+                )
                 reprojected = reference.codec_head(native_hidden_states).float()
                 if frame_index == 0:
                     # note (ratish): the prefill sampler overwrites its logits with probabilities.
@@ -151,6 +162,17 @@ def main() -> None:
                 predictor_ranks = (predictor_logits > selected_logits[:, :, None]).sum(
                     dim=-1
                 ) + 1
+                if arguments.save_reference_tensors:
+                    torch.save(
+                        {
+                            "logits": expected.cpu(),
+                            "hidden_states": output.last_hidden_state[:, -1].cpu(),
+                            "predictor_logits": predictor_logits.cpu(),
+                        },
+                        tensor_directory / after_file.name,
+                    )
+                else:
+                    pass
                 report = {
                     "trace_file": after_file.name,
                     "native_logits_source": (
@@ -200,7 +222,11 @@ def main() -> None:
                     )[0].tolist(),
                 }
                 frames.append(report)
-            report = {"trace_directory": str(directory), "frames": frames}
+            report = {
+                "trace_directory": str(directory),
+                "reference_dtype": arguments.dtype,
+                "frames": frames,
+            }
             reports.append(report)
             (arguments.output_directory / "results.json").write_text(
                 json.dumps(reports, indent=2)
