@@ -46,6 +46,7 @@ def main() -> None:
     )
     parser.add_argument("--paired-normalization-controls", action="store_true")
     parser.add_argument("--conditioning-directory", type=Path)
+    parser.add_argument("--thinker-hidden-directory", type=Path)
     parser.add_argument(
         "--conditioning-variant",
         choices=("checkpoint_audio_prefill", "native_audio_prefill"),
@@ -248,8 +249,25 @@ def main() -> None:
                 prefill = conditioning[arguments.conditioning_variant].to(
                     reference.dtype
                 )
+                if arguments.thinker_hidden_directory is not None:
+                    thinker_hidden = torch.load(
+                        arguments.thinker_hidden_directory
+                        / f"{trace_directory.name}.pt",
+                        map_location=reference.device,
+                        weights_only=True,
+                    )
+                    prompt_ids = conditioning["prompt_input_ids"][0]
+                    audio_mask = (
+                        prompt_ids == model_config.thinker_config.audio_token_id
+                    )
+                    prefill = conditioning["native_prefill"].to(reference.dtype).clone()
+                    prefill[conditioning["audio_rows"]] = reference.hidden_projection(
+                        thinker_hidden[0, audio_mask].to(reference.dtype)
+                    )
+                else:
+                    pass
             else:
-                pass
+                assert arguments.thinker_hidden_directory is None
             mode_directory = (
                 arguments.output_directory / normalization_mode
                 if arguments.paired_normalization_controls
@@ -394,6 +412,11 @@ def main() -> None:
                     arguments.conditioning_variant
                     if arguments.conditioning_directory is not None
                     else "native"
+                ),
+                "thinker_hidden_directory": (
+                    str(arguments.thinker_hidden_directory)
+                    if arguments.thinker_hidden_directory is not None
+                    else None
                 ),
                 "normalization_semantics": normalization_mode,
                 "normalization_boundary_calls": normalization.boundary_calls,
