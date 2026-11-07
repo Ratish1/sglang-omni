@@ -9,95 +9,12 @@ from pathlib import Path
 
 import torch
 from sglang.srt.layers.attention.flashattention_backend import FlashAttentionBackend
-from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.model_executor.forward_context import get_token_to_kv_pool
-from torch import nn
 
 from sglang_omni.model_runner.prefill_inputs import get_omni_prefill_inputs
 from sglang_omni.model_runner.sglang_model_runner import SGLModelRunner
 from sglang_omni.scheduling.types import SchedulerRequest
-
-
-class KVWriteHook:
-    def __call__(
-        self,
-        attention: RadixAttention,
-        arguments: tuple[torch.Tensor, torch.Tensor, torch.Tensor, ForwardBatch],
-        output: torch.Tensor,
-    ) -> None:
-        query, keys, values, forward_batch = arguments
-        locations = forward_batch.out_cache_loc.long()
-        pool = get_token_to_kv_pool()
-        stored_keys, stored_values = pool.get_kv_buffer(attention.layer_id)
-        valid = locations > 0
-        wrong_keys = (
-            stored_keys.index_select(0, locations)
-            != keys.reshape(-1, attention.tp_k_head_num, attention.head_dim)
-        ).any(dim=(1, 2))
-        wrong_values = (
-            stored_values.index_select(0, locations)
-            != values.reshape(-1, attention.tp_v_head_num, attention.v_head_dim)
-        ).any(dim=(1, 2))
-        attention.diagnostic_kv_write_counts.add_(
-            torch.stack(
-                [(wrong_keys & valid).sum(), (wrong_values & valid).sum(), valid.sum()]
-            )
-        )
-        last_query_index = attention.diagnostic_query_index
-        attention.diagnostic_query.copy_(
-            query.index_select(0, last_query_index).view(
-                attention.tp_q_head_num, attention.head_dim
-            )
-        )
-        attention.diagnostic_attention_output.copy_(
-            output.index_select(0, last_query_index).view(
-                attention.tp_q_head_num, attention.v_head_dim
-            )
-        )
-        attention.diagnostic_position.copy_(
-            forward_batch.positions.index_select(0, last_query_index)[0]
-        )
-
-
-def install_kv_write_observers(layers: nn.ModuleList) -> None:
-    if os.environ.get("SGLANG_OMNI_DIAGNOSTIC_KV_DIRECTORY") is None:
-        return
-    else:
-        pass
-    for layer in layers:
-        attention = layer.self_attn.attn
-        assert isinstance(attention, RadixAttention)
-        device = layer.self_attn.q_norm.weight.device
-        for name, shape, dtype in (
-            ("diagnostic_kv_write_counts", (3,), torch.int64),
-            (
-                "diagnostic_query",
-                (attention.tp_q_head_num, attention.head_dim),
-                torch.bfloat16,
-            ),
-            (
-                "diagnostic_attention_output",
-                (attention.tp_q_head_num, attention.v_head_dim),
-                torch.bfloat16,
-            ),
-            ("diagnostic_position", (), torch.int64),
-            ("diagnostic_query_index", (1,), torch.int64),
-        ):
-            attention.register_buffer(
-                name, torch.zeros(shape, dtype=dtype, device=device), persistent=False
-            )
-        attention.register_buffer(
-            "diagnostic_attention_properties",
-            torch.tensor(
-                [attention.scaling, attention.logit_cap, attention.sliding_window_size],
-                device=device,
-                dtype=torch.float64,
-            ),
-            persistent=False,
-        )
-        attention.register_forward_hook(KVWriteHook())
 
 
 @dataclass(kw_only=True)
@@ -118,7 +35,7 @@ class FullPrefixKVObserver:
         self.runner = runner
         self.observations: dict[str, PrefixKVObservation] = {}
         self.prefill_inputs: dict[str, dict[str, torch.Tensor]] = {}
-        self.live_slots: dict[str, set[int]] = {}
+        self.live_rows: dict[str, tuple[int, int]] = {}
         backend = runner.attn_backend
         pool = runner.token_to_kv_pool
         assert isinstance(backend, FlashAttentionBackend)
@@ -198,6 +115,14 @@ class FullPrefixKVObserver:
             request_ids, forward_batch.extend_seq_lens_cpu
         ):
             row_end = row_start + extend_length
+            if (
+                request_id in self.observations
+                and len(self.observations[request_id].snapshots) >= 4
+            ):
+                row_start = row_end
+                continue
+            else:
+                pass
             snapshot = {
                 "prefill_input_ids": forward_batch.input_ids[row_start:row_end].clone(),
                 "prefill_positions": forward_batch.positions[row_start:row_end].clone(),
@@ -230,13 +155,24 @@ class FullPrefixKVObserver:
         request_locations = request_table.index_select(0, request_pool_indices)[
             :, :maximum_sequence_length
         ]
-        for request, locations, sequence_length in zip(
-            requests, request_locations.cpu().tolist(), sequence_lengths
+        for request, pool_index, sequence_length in zip(
+            requests, request_pool_indices.cpu().tolist(), sequence_lengths
         ):
-            self.live_slots[request.request_id] = set(locations[:sequence_length])
+            self.live_rows[request.request_id] = (pool_index, sequence_length)
+        live_request_ids = list(self.live_rows)
+        live_pool_indices = torch.tensor(
+            [self.live_rows[request_id][0] for request_id in live_request_ids],
+            device=request_table.device,
+        )
+        maximum_live_length = max(length for _, length in self.live_rows.values())
+        live_locations = (
+            request_table.index_select(0, live_pool_indices)[:, :maximum_live_length]
+            .cpu()
+            .tolist()
+        )
         slot_owners: dict[int, list[str]] = {}
-        for request_id, locations in self.live_slots.items():
-            for location in locations:
+        for request_id, locations in zip(live_request_ids, live_locations):
+            for location in set(locations[: self.live_rows[request_id][1]]):
                 slot_owners.setdefault(location, []).append(request_id)
         write_locations = forward_batch.out_cache_loc.cpu().tolist()
         write_lengths = (
@@ -257,9 +193,10 @@ class FullPrefixKVObserver:
         for row_index, request in enumerate(requests):
             sequence_length = sequence_lengths[row_index]
             locations = request_locations[row_index, :sequence_length].long()
-            if decode:
+            if request.request_id in self.observations:
                 observation = self.observations[request.request_id]
             else:
+                assert not decode
                 observation = PrefixKVObservation(
                     prefix_locations=locations.clone(),
                     prefix_keys=[
@@ -271,7 +208,6 @@ class FullPrefixKVObserver:
                         for buffer in self.pool.v_buffer
                     ],
                 )
-                assert request.request_id not in self.observations
                 self.observations[request.request_id] = observation
             prefix_length = observation.prefix_locations.numel()
             write_end = write_start + write_lengths[row_index]
@@ -287,23 +223,16 @@ class FullPrefixKVObserver:
                     )
                 else:
                     pass
-            write_start = write_end
             checks = [
                 (locations[:prefix_length] == observation.prefix_locations).all(),
                 (read_locations[row_index, :sequence_length] == locations).all(),
                 metadata.cache_seqlens_int32[row_index] == sequence_length,
                 (locations > 0).all(),
                 (locations < self.pool.size + self.runner.page_size).all(),
+                forward_batch.positions[write_end - 1] == sequence_length - 1,
+                forward_batch.out_cache_loc[write_end - 1] == locations[-1],
             ]
-            if decode:
-                checks.extend(
-                    [
-                        forward_batch.positions[row_index] == sequence_length - 1,
-                        forward_batch.out_cache_loc[row_index] == locations[-1],
-                    ]
-                )
-            else:
-                checks.extend([torch.ones_like(checks[0])] * 2)
+            write_start = write_end
             for key_buffer, value_buffer, expected_keys, expected_values in zip(
                 self.pool.k_buffer,
                 self.pool.v_buffer,
@@ -324,6 +253,19 @@ class FullPrefixKVObserver:
                 )
             observation.checks.append(torch.stack(checks))
             observation.sequence_lengths.append(sequence_length)
+            prompt_length = min(sequence_length, len(request.data.req.origin_input_ids))
+            if prompt_length > prefix_length:
+                observation.prefix_locations = locations[:prompt_length].clone()
+                observation.prefix_keys = [
+                    buffer.index_select(0, observation.prefix_locations)
+                    for buffer in self.pool.k_buffer
+                ]
+                observation.prefix_values = [
+                    buffer.index_select(0, observation.prefix_locations)
+                    for buffer in self.pool.v_buffer
+                ]
+            else:
+                pass
             if len(observation.snapshots) < 4:
                 snapshot = {
                     "request_locations": locations.clone(),
@@ -367,7 +309,7 @@ class FullPrefixKVObserver:
 
     def finish(self, request_id: str) -> None:
         observation = self.observations.pop(request_id)
-        self.live_slots.pop(request_id)
+        self.live_rows.pop(request_id)
         checks = torch.stack(observation.checks).cpu()
         report = {
             "request_id": request_id,
@@ -387,8 +329,8 @@ class FullPrefixKVObserver:
                 "sequence_length",
                 "positive_locations",
                 "bounded_locations",
-                "decode_position",
-                "decode_write_location",
+                "last_write_position",
+                "last_write_location",
                 *[
                     f"layer_{layer_index}_{kind}_preserved"
                     for layer_index in range(self.pool.layer_num)

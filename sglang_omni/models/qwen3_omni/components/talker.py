@@ -21,7 +21,7 @@ from sglang.srt.utils import add_prefix
 from sglang.srt.utils.common import is_flashinfer_available
 from torch import nn
 
-from sglang_omni.model_runner.kv_diagnostics import install_kv_write_observers
+from sglang_omni.model_runner.kv_write_diagnostics import install_kv_write_observers
 from sglang_omni.models.qwen3_omni.components.thinker_model import (
     Qwen3OmniMoeThinkerTextAttention,
     Qwen3OmniMoeThinkerTextDecoderLayer,
