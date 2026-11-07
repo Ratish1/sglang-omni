@@ -193,6 +193,7 @@ def main() -> None:
         arguments.reference_directory or arguments.output_directory / "references"
     )
     reference_directory.mkdir(parents=True, exist_ok=True)
+    reference_inputs = []
     for sample in samples:
         reference_path = reference_directory / f"{sample.sample_id}.wav"
         if arguments.reference_sample_rate is None:
@@ -207,7 +208,29 @@ def main() -> None:
                 arguments.reference_sample_rate,
                 subtype="FLOAT",
             )
+        reference_inputs.append(
+            {
+                "sample_id": sample.sample_id,
+                "source_sha256": hashlib.sha256(
+                    Path(sample.ref_audio).read_bytes()
+                ).hexdigest(),
+                "reference_sha256": hashlib.sha256(
+                    reference_path.read_bytes()
+                ).hexdigest(),
+                "reference_path": str(reference_path.resolve()),
+            }
+        )
         sample.ref_audio = str(reference_path.resolve())
+    (arguments.output_directory / "reference-inputs.json").write_text(
+        json.dumps(
+            {
+                "dataset": DATASETS[arguments.dataset],
+                "reference_sample_rate": arguments.reference_sample_rate,
+                "samples": reference_inputs,
+            },
+            indent=2,
+        )
+    )
     asyncio.run(
         replay_requests(
             arguments.base_url,
