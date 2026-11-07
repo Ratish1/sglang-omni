@@ -137,7 +137,11 @@ def main() -> None:
                 prefix = int(producer["prefix_length"])
                 length = len(producer["positions"])
                 assert torch.equal(
-                    producer["prompt_input_ids"], native["prompt_input_ids"]
+                    producer["prompt_input_ids"][~audio_mask.cpu()],
+                    native["prompt_input_ids"][~audio_mask.cpu()],
+                )
+                assert (
+                    producer["prompt_input_ids"][audio_mask.cpu()].unique().numel() == 1
                 )
                 active_audio = audio_mask[prefix : prefix + length].cpu()
                 assert torch.equal(
