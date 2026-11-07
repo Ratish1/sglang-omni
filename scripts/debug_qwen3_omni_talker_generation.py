@@ -43,6 +43,7 @@ def main() -> None:
         choices=("checkpoint", "native"),
         default="checkpoint",
     )
+    parser.add_argument("--paired-normalization-controls", action="store_true")
     parser.add_argument("--output-directory", type=Path, required=True)
     arguments = parser.parse_args()
     arguments.output_directory.mkdir(exist_ok=False)
@@ -67,7 +68,10 @@ def main() -> None:
     assert not reference.code_predictor.generation_config.do_sample
     reference.eval()
     normalization = NativeNormalization(reference=reference)
-    if arguments.normalization_semantics == "native":
+    if (
+        arguments.normalization_semantics == "native"
+        or arguments.paired_normalization_controls
+    ):
         normalization.install()
     else:
         pass
@@ -94,7 +98,17 @@ def main() -> None:
         top_k = torch.tensor([arguments.top_k], device=reference.device)
         top_p = torch.tensor([arguments.top_p], device=reference.device)
         minimum_probability = torch.zeros(1, device=reference.device)
-        for trace_directory in arguments.trace_directory:
+        normalization_modes = (
+            ("checkpoint", "native", "checkpoint-repeat")
+            if arguments.paired_normalization_controls
+            else (arguments.normalization_semantics,)
+        )
+        for trace_directory, normalization_mode in (
+            (directory, mode)
+            for directory in arguments.trace_directory
+            for mode in normalization_modes
+        ):
+            normalization.enabled = normalization_mode == "native"
             prefill_file = next(trace_directory.glob("*-before_prefill.pt"))
             before = torch.load(prefill_file, map_location="cpu", weights_only=True)
             prefill = before["prefill_embeds"].to(reference.device)
@@ -153,10 +167,13 @@ def main() -> None:
             assert int(reproduced_prefill_choice[0]) == int(
                 native_frames[0]["codec_ids"][0, 0]
             )
+            mode_directory = (
+                arguments.output_directory / normalization_mode
+                if arguments.paired_normalization_controls
+                else arguments.output_directory
+            )
             case_directory = (
-                arguments.output_directory
-                / trace_directory.parent.name
-                / trace_directory.name
+                mode_directory / trace_directory.parent.name / trace_directory.name
             )
             case_directory.mkdir(parents=True)
             generated_ids = before["input_ids"][None].to(reference.device)
@@ -288,7 +305,7 @@ def main() -> None:
                 "native_frames_including_eos": len(native_frames),
                 "reference_frames_including_eos": len(frame_reports),
                 "termination": termination,
-                "normalization_semantics": arguments.normalization_semantics,
+                "normalization_semantics": normalization_mode,
                 "normalization_boundary_calls": normalization.boundary_calls,
                 "normalization_query_key_calls": normalization.query_key_calls,
                 "frames": frame_reports,

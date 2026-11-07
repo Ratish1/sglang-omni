@@ -20,6 +20,7 @@ from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import (
 @dataclass(kw_only=True)
 class NativeNormalization:
     reference: Qwen3OmniMoeTalkerForConditionalGeneration
+    enabled: bool = True
     attention_residual: torch.Tensor | None = None
     attention_output: torch.Tensor | None = None
     mlp_residual: torch.Tensor | None = None
@@ -67,6 +68,10 @@ class NativeNormalization:
         inputs: tuple[torch.Tensor],
         output: torch.Tensor,
     ) -> torch.Tensor:
+        if not self.enabled:
+            return output
+        else:
+            pass
         self.attention_residual = inputs[0]
         if module is self.reference.model.layers[0].input_layernorm:
             self.boundary_calls += 1
@@ -99,6 +104,10 @@ class NativeNormalization:
         inputs: tuple[torch.Tensor],
         output: torch.Tensor,
     ) -> torch.Tensor:
+        if not self.enabled:
+            return output
+        else:
+            pass
         assert self.attention_output is not None
         assert self.attention_residual is not None
         self.mlp_residual = inputs[0]
@@ -124,6 +133,10 @@ class NativeNormalization:
         inputs: tuple[torch.Tensor],
         output: torch.Tensor,
     ) -> torch.Tensor:
+        if not self.enabled:
+            return output
+        else:
+            pass
         self.query_key_calls += 1
         return rmsnorm(
             inputs[0].reshape(-1, module.weight.numel()),
@@ -137,6 +150,10 @@ class NativeNormalization:
         inputs: tuple[torch.Tensor],
         output: torch.Tensor,
     ) -> torch.Tensor:
+        if not self.enabled:
+            return output
+        else:
+            pass
         assert self.mlp_output is not None and self.mlp_residual is not None
         return self.normalize_sum(
             self.mlp_output,
