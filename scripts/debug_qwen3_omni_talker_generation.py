@@ -176,9 +176,7 @@ def main() -> None:
                     )
                     assert torch.equal(expected_text_rows, text_rows)
                     codec_bos = reference.get_input_embeddings()(
-                        torch.tensor(
-                            [config.codec_bos_token_id], device=reference.device
-                        )
+                        torch.tensor([config.codec_bos_id], device=reference.device)
                     )
                     assert torch.equal(
                         projected_assistant[:1] + codec_bos, prefill[-1:]
