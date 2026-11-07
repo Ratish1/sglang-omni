@@ -1,4 +1,4 @@
-"""Observe full-prefix KV preservation without changing model inputs."""
+"""Observe prompt and generated KV preservation without changing model inputs."""
 
 from __future__ import annotations
 
@@ -209,7 +209,7 @@ class FullPrefixKVObserver:
                     ],
                 )
                 self.observations[request.request_id] = observation
-            prefix_length = observation.prefix_locations.numel()
+            prefix_length = min(sequence_length, observation.prefix_locations.numel())
             write_end = write_start + write_lengths[row_index]
             for location in write_locations[write_start:write_end]:
                 foreign_owners = [
@@ -224,7 +224,6 @@ class FullPrefixKVObserver:
                 else:
                     pass
             checks = [
-                (locations[:prefix_length] == observation.prefix_locations).all(),
                 (read_locations[row_index, :sequence_length] == locations).all(),
                 metadata.cache_seqlens_int32[row_index] == sequence_length,
                 (locations > 0).all(),
@@ -242,30 +241,24 @@ class FullPrefixKVObserver:
                 checks.extend(
                     [
                         (
-                            key_buffer.index_select(0, observation.prefix_locations)
-                            == expected_keys
+                            key_buffer.index_select(0, locations[:prefix_length])
+                            == expected_keys[:prefix_length]
                         ).all(),
                         (
-                            value_buffer.index_select(0, observation.prefix_locations)
-                            == expected_values
+                            value_buffer.index_select(0, locations[:prefix_length])
+                            == expected_values[:prefix_length]
                         ).all(),
                     ]
                 )
             observation.checks.append(torch.stack(checks))
             observation.sequence_lengths.append(sequence_length)
-            prompt_length = min(sequence_length, len(request.data.req.origin_input_ids))
-            if prompt_length > prefix_length:
-                observation.prefix_locations = locations[:prompt_length].clone()
-                observation.prefix_keys = [
-                    buffer.index_select(0, observation.prefix_locations)
-                    for buffer in self.pool.k_buffer
-                ]
-                observation.prefix_values = [
-                    buffer.index_select(0, observation.prefix_locations)
-                    for buffer in self.pool.v_buffer
-                ]
-            else:
-                pass
+            observation.prefix_locations = locations.clone()
+            observation.prefix_keys = [
+                buffer.index_select(0, locations) for buffer in self.pool.k_buffer
+            ]
+            observation.prefix_values = [
+                buffer.index_select(0, locations) for buffer in self.pool.v_buffer
+            ]
             if len(observation.snapshots) < 4:
                 snapshot = {
                     "request_locations": locations.clone(),
@@ -313,7 +306,7 @@ class FullPrefixKVObserver:
         checks = torch.stack(observation.checks).cpu()
         report = {
             "request_id": request_id,
-            "prefix_tokens": observation.prefix_locations.numel(),
+            "history_tokens": observation.prefix_locations.numel(),
             "forward_count": len(observation.checks),
             "sequence_lengths": observation.sequence_lengths,
             "failed_checks": (~checks).nonzero().tolist(),
@@ -324,7 +317,6 @@ class FullPrefixKVObserver:
                 if name.endswith(".diagnostic_kv_write_counts")
             },
             "check_columns": [
-                "prefix_locations",
                 "read_locations",
                 "sequence_length",
                 "positive_locations",
