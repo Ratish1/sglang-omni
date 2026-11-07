@@ -167,13 +167,20 @@ def main() -> None:
                 .nonzero()
                 .flatten()
             )
-            differences = (
-                (generated_codes[:compared] != native_codes[:compared])
-                .any(dim=1)
-                .nonzero()
-                .flatten()
+            different_codes = generated_codes[:compared] != native_codes[:compared]
+            both_eos = (generated_codes[:compared, 0] == config.codec_eos_token_id) & (
+                native_codes[:compared, 0] == config.codec_eos_token_id
             )
-            torch.save(generated_codes, arguments.output_directory / f"{request_id}.pt")
+            different_codes[:, 1:] &= ~both_eos[:, None]
+            differences = different_codes.any(dim=1).nonzero().flatten()
+            destination = arguments.output_directory / f"{request_id}.pt"
+            if destination.exists():
+                previous_codes = torch.load(destination, weights_only=True)
+                repeat_exact = torch.equal(previous_codes, generated_codes)
+                destination = destination.with_suffix(".repeat.pt")
+            else:
+                repeat_exact = None
+            torch.save(generated_codes, destination)
             report = {
                 "request_id": request_id,
                 "dtype": arguments.dtype,
@@ -183,6 +190,8 @@ def main() -> None:
                 "termination": termination,
                 "frames": len(generated_codes),
                 "native_frames": len(native_codes),
+                "codes_file": str(destination),
+                "repeat_exact": repeat_exact,
                 "first_main_difference": (
                     int(main_differences[0]) if len(main_differences) else None
                 ),
@@ -195,6 +204,7 @@ def main() -> None:
                 json.dumps(reports, indent=2)
             )
             print(json.dumps(report), flush=True)
+            assert repeat_exact is not False, "unchanged checkpoint replay diverged"
 
 
 if __name__ == "__main__":
