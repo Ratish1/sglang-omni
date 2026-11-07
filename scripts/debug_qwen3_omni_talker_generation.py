@@ -146,6 +146,37 @@ def main() -> None:
                 before["positions"], torch.arange(len(prefill))
             ), "this experiment requires captured linear audio-only positions"
             assert torch.equal(text_rows[-1:], eos_embedding), "incomplete text queue"
+            complete_text_verified = False
+            conditioning_file = trace_directory / "conditioning.pt"
+            if arguments.dtype == "bfloat16" and conditioning_file.exists():
+                captured_conditioning = torch.load(
+                    conditioning_file, map_location="cpu", weights_only=True
+                )
+                assistant_ids = captured_conditioning["assistant_token_ids"]
+                if int(assistant_ids[-1]) == model_config.im_end_token_id:
+                    assistant_embeddings = load_thinker_embedding_rows(
+                        str(checkpoint_directory), assistant_ids[:-1].tolist()
+                    ).to(reference.device, dtype=reference.dtype)
+                    projected_assistant = reference.text_projection(
+                        assistant_embeddings
+                    )
+                    expected_text_rows = torch.cat(
+                        [projected_assistant[1:], eos_embedding], dim=0
+                    )
+                    assert torch.equal(expected_text_rows, text_rows)
+                    codec_bos = reference.get_input_embeddings()(
+                        torch.tensor(
+                            [config.codec_bos_token_id], device=reference.device
+                        )
+                    )
+                    assert torch.equal(
+                        projected_assistant[:1] + codec_bos, prefill[-1:]
+                    )
+                    complete_text_verified = True
+                else:
+                    pass
+            else:
+                pass
             native_files = sorted(trace_directory.glob("*-post_*.pt"))
             native_frames = []
             for filename in native_files:
@@ -343,6 +374,7 @@ def main() -> None:
                 "verified_sampling_seed": seed,
                 "captured_feedback_rows_verified": checked_feedback_rows,
                 "complete_text_queue_rows": len(text_rows),
+                "complete_text_projection_verified": complete_text_verified,
                 "first_codec_divergence": first_codec_divergence,
                 "first_main_code_divergence": first_main_code_divergence,
                 "native_frames_including_eos": len(native_frames),
