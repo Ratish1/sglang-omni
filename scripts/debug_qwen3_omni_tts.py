@@ -33,6 +33,7 @@ async def replay_requests(
     concurrency: int,
     rounds: int,
     request_namespace: uuid.UUID | None,
+    fixed_request_id: uuid.UUID | None,
 ) -> None:
     worker_urls = itertools.cycle(base_urls)
     for round_index in range(rounds):
@@ -42,11 +43,14 @@ async def replay_requests(
         async def send_request(
             session: aiohttp.ClientSession, sample: SampleInput
         ) -> RequestResult:
-            request_id = str(
-                uuid.uuid5(request_namespace, f"{round_index}/{sample.sample_id}")
-                if request_namespace is not None
-                else uuid.uuid4()
-            )
+            if fixed_request_id is not None:
+                request_id = str(fixed_request_id)
+            elif request_namespace is not None:
+                request_id = str(
+                    uuid.uuid5(request_namespace, f"{round_index}/{sample.sample_id}")
+                )
+            else:
+                request_id = str(uuid.uuid4())
             base_url = next(worker_urls)
             prompt_text = (
                 f'Listen to the audio above. The speaker is reading: "{sample.ref_text}". '
@@ -159,8 +163,15 @@ def main() -> None:
     parser.add_argument("--concurrency", type=int, required=True)
     parser.add_argument("--rounds", type=int, required=True)
     parser.add_argument("--request-namespace", type=uuid.UUID)
+    parser.add_argument("--fixed-request-id", type=uuid.UUID)
     parser.add_argument("--reference-directory", type=Path)
     arguments = parser.parse_args()
+    if arguments.fixed_request_id is not None and (
+        arguments.sample_id is None or arguments.rounds != 1
+    ):
+        parser.error("--fixed-request-id requires one selected sample and one round")
+    else:
+        pass
     logging.basicConfig(level=logging.INFO)
     arguments.output_directory.mkdir(parents=True, exist_ok=False)
     samples = load_seedtts_samples(
@@ -189,6 +200,7 @@ def main() -> None:
             arguments.concurrency,
             arguments.rounds,
             arguments.request_namespace,
+            arguments.fixed_request_id,
         )
     )
 

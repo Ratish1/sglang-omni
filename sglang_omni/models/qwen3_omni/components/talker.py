@@ -5,6 +5,7 @@ SGLang-native Talker model for Qwen3-Omni compatiable with hf formatting.
 from __future__ import annotations
 
 import logging
+import os
 from typing import Iterable, Optional, Tuple
 
 import torch
@@ -57,6 +58,7 @@ from sglang_omni.vendor.sglang.layers import (
     RMSNorm,
     RowParallelLinear,
     SiluAndMul,
+    StandardTopKOutput,
     residual_batch,
 )
 from sglang_omni.vendor.sglang.models import FusedSetKVBufferArg, apply_qk_norm
@@ -323,6 +325,7 @@ class Qwen3OmniMoeTalkerSparseMoeBlock(Qwen3OmniMoeThinkerTextSparseMoeBlock):
             quant_config=None,
             prefix=add_prefix("shared_expert_gate", prefix),
         )
+        self.diagnostic_tensors: dict[str, torch.Tensor] = {}
 
     def forward(
         self,
@@ -338,6 +341,16 @@ class Qwen3OmniMoeTalkerSparseMoeBlock(Qwen3OmniMoeThinkerTextSparseMoeBlock):
         else:
             pass
 
+        capture_experts = os.environ.get(
+            "SGLANG_OMNI_DIAGNOSTIC_MOE_TRACE"
+        ) is not None and num_tokens in (1, 128)
+        if capture_experts:
+            self.diagnostic_tensors[f"input_{num_tokens}"] = (
+                linear_hidden_states.clone()
+            )
+        else:
+            pass
+
         # Shared branch must consume the original MLP input before routed experts.
         # The fused MoE implementation mutates `hidden_states` in-place.
         shared_output = self.shared_expert(linear_hidden_states)
@@ -347,7 +360,25 @@ class Qwen3OmniMoeTalkerSparseMoeBlock(Qwen3OmniMoeThinkerTextSparseMoeBlock):
         # --- Routed experts (no all-reduce yet) ---
         router_logits, _ = self.gate(linear_hidden_states)
         topk_output = self.topk(linear_hidden_states, router_logits)
+        if capture_experts:
+            assert isinstance(topk_output, StandardTopKOutput)
+            self.diagnostic_tensors.update(
+                {
+                    f"router_logits_{num_tokens}": router_logits.clone(),
+                    f"weights_{num_tokens}": topk_output.topk_weights.clone(),
+                    f"experts_{num_tokens}": topk_output.topk_ids.clone(),
+                    f"shared_output_{num_tokens}": shared_output.clone(),
+                }
+            )
+        else:
+            pass
         routed_output = self.experts(linear_hidden_states, topk_output)
+        if capture_experts:
+            self.diagnostic_tensors[f"routed_output_{num_tokens}"] = (
+                routed_output.clone()
+            )
+        else:
+            pass
 
         final_hidden_states = routed_output + shared_output
         return final_hidden_states.view(num_tokens, hidden_dim)
@@ -1969,6 +2000,15 @@ class Qwen3OmniTalker(nn.Module):
             layer0_codes=layer0_codes,
             talker_hidden=talker_hidden,
         )
+        if os.environ.get("SGLANG_OMNI_DIAGNOSTIC_REFERENCE_SUM") is not None:
+            embedding_rows = [self.model.codec_embedding(result_codes[:, 0])]
+            for index, embedding in enumerate(
+                self.code_predictor.model.codec_embedding
+            ):
+                embedding_rows.append(embedding(result_codes[:, index + 1]))
+            summed_embeddings.copy_(torch.stack(embedding_rows, dim=1).sum(dim=1))
+        else:
+            pass
         return result_codes, summed_embeddings
 
     def precompile_kernels_after_loading(self) -> None:
