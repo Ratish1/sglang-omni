@@ -211,21 +211,33 @@ def main() -> None:
                         ).contiguous()
                         for first_profile in (-1, arguments.profile_tactics[0]):
                             for second_profile in (-1, arguments.profile_tactics[1]):
-                                replay = cutlass_fused_moe(
-                                    input=hidden_states.clone(),
-                                    token_selected_experts=selected_experts.to(
-                                        torch.int32
-                                    ),
-                                    token_final_scales=routing_weights,
-                                    fc1_expert_weights=packed_weights,
-                                    fc2_expert_weights=layer.mlp.experts.down_proj.contiguous(),
-                                    output_dtype=hidden_states.dtype,
-                                    quant_scales=None,
-                                    output=torch.empty_like(hidden_states),
-                                    activation_type=ActivationType.Swiglu,
-                                    use_fused_finalize=False,
-                                    profile_ids=[first_profile, second_profile],
-                                )[0]
+                                with torch.profiler.profile(
+                                    activities=[
+                                        torch.profiler.ProfilerActivity.CPU,
+                                        torch.profiler.ProfilerActivity.CUDA,
+                                    ]
+                                ) as profile:
+                                    replay = cutlass_fused_moe(
+                                        input=hidden_states.clone(),
+                                        token_selected_experts=selected_experts.to(
+                                            torch.int32
+                                        ),
+                                        token_final_scales=routing_weights,
+                                        fc1_expert_weights=packed_weights,
+                                        fc2_expert_weights=layer.mlp.experts.down_proj.contiguous(),
+                                        output_dtype=hidden_states.dtype,
+                                        quant_scales=None,
+                                        output=torch.empty_like(hidden_states),
+                                        activation_type=ActivationType.Swiglu,
+                                        use_fused_finalize=False,
+                                        profile_ids=[first_profile, second_profile],
+                                    )[0]
+                                profile.export_chrome_trace(
+                                    str(
+                                        arguments.output_directory
+                                        / f"{trace_directory.parent.name}-{trace_directory.name}-{first_profile}-{second_profile}.trace.json"
+                                    )
+                                )
                                 tactic_replays.append(
                                     {
                                         "profiles": [first_profile, second_profile],
