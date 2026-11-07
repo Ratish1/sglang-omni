@@ -8,6 +8,7 @@ import base64
 import json
 import logging
 import math
+import os
 from collections.abc import Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -532,6 +533,21 @@ class Qwen3OmniPreprocessor:
         encoder_inputs: dict[str, EncoderInputs],
     ) -> StagePayload:
         """Assemble the thinker-ready pipeline state (single source of shape)."""
+        diagnostic_directory = os.environ.get("SGLANG_OMNI_DIAGNOSTIC_TENSOR_DIRECTORY")
+        if diagnostic_directory is not None and isinstance(
+            full_mm_inputs["audio"].get("input_features"), torch.Tensor
+        ):
+            destination = Path(diagnostic_directory) / payload.request_id
+            destination.mkdir(parents=True, exist_ok=True)
+            torch.save(
+                {
+                    name: full_mm_inputs["audio"][name].detach().cpu().clone()
+                    for name in ("input_features", "feature_attention_mask")
+                },
+                destination / "audio-features.pt",
+            )
+        else:
+            pass
         state = Qwen3OmniPipelineState(
             mm_inputs=build_lightweight_mm_inputs(full_mm_inputs),
             prompt={
