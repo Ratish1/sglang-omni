@@ -19,9 +19,7 @@ def main() -> None:
     parser.add_argument("--output-directory", type=Path, required=True)
     parser.add_argument("--asr-model", required=True)
     parser.add_argument("--asr-port", type=int, required=True)
-    parser.add_argument(
-        "--arm", action="append", choices=("baseline", "candidate", "combined")
-    )
+    parser.add_argument("--arm", action="append")
     arguments = parser.parse_args()
     arguments.output_directory.mkdir(exist_ok=False)
     asr = load_router_asr(arguments.asr_port, arguments.asr_model)
