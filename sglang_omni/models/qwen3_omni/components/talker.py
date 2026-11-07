@@ -1760,12 +1760,12 @@ class Qwen3OmniTalker(nn.Module):
                         self.predictor_fused_layers is not None
                         and self.predictor_fused_layers.covers(batch_size)
                     ):
-                        predictor_token_embeds = new_embed
+                        predictor_token_embeddings = new_embed
                     else:
                         # note (ratish): the plain predictor mutates its input residual.
-                        predictor_token_embeds = new_embed.clone()
+                        predictor_token_embeddings = new_embed.clone()
                     last_hidden = self.predictor_forward_tokens(
-                        token_embeds=predictor_token_embeds,
+                        token_embeds=predictor_token_embeddings,
                         batch_size=batch_size,
                         cache_len=cache_len,
                     )
