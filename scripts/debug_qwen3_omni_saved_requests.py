@@ -55,10 +55,28 @@ async def replay(
                 print(json.dumps(result), flush=True)
                 return result
 
-        results = await asyncio.gather(
-            *(send(request_id) for request_id in request_ids)
+        outcomes = await asyncio.gather(
+            *(send(request_id) for request_id in request_ids), return_exceptions=True
         )
+    results: list[dict[str, str | float]] = []
+    failures: list[BaseException] = []
+    for request_id, outcome in zip(request_ids, outcomes):
+        if isinstance(outcome, BaseException):
+            results.append(
+                {
+                    "request_id": str(request_id),
+                    "error": str(outcome),
+                    "error_type": type(outcome).__name__,
+                }
+            )
+            failures.append(outcome)
+        else:
+            results.append(outcome)
     (output_directory / "summary.json").write_text(json.dumps(results, indent=2))
+    if failures:
+        raise BaseExceptionGroup("saved request replay failed", failures)
+    else:
+        pass
 
 
 def main() -> None:
