@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import logging
 import os
+from contextlib import nullcontext
 from typing import Iterable, Optional, Tuple
 
 import torch
@@ -18,6 +19,7 @@ from sglang.srt.runtime_context import get_context, get_schedule
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import add_prefix
+from sglang.srt.utils.common import is_flashinfer_available
 from torch import nn
 
 from sglang_omni.models.qwen3_omni.components.thinker_model import (
@@ -63,6 +65,11 @@ from sglang_omni.vendor.sglang.layers import (
 )
 from sglang_omni.vendor.sglang.models import FusedSetKVBufferArg, apply_qk_norm
 from sglang_omni.vendor.sglang.utils import make_layers
+
+if is_flashinfer_available():
+    from flashinfer.autotuner import autotune
+else:
+    pass
 
 logger = logging.getLogger(__name__)
 
@@ -1441,12 +1448,28 @@ class Qwen3OmniTalker(nn.Module):
         else:
             positions = forward_batch.positions
 
-        hidden_states = self.model(
-            input_ids=input_ids,
-            positions=positions,
-            forward_batch=forward_batch,
-            input_embeds=input_embeds,
-        )
+        if (
+            forward_batch.forward_mode.is_extend()
+            and current_platform.is_cuda()
+            and self.model.layers[
+                self.model.start_layer
+            ].mlp.experts.runner_backend.is_flashinfer_cutlass()
+            and self.model.layers[self.model.start_layer].mlp.experts.w13_weight.dtype
+            == torch.bfloat16
+        ):
+            # note (ratish): fused prefill GEMM1 removes BF16 projection rounding and regresses speech; decode keeps its tuned kernels.
+            expert_precision_context = autotune(
+                False, skip_ops={"trtllm::fused_moe::gemm1"}
+            )
+        else:
+            expert_precision_context = nullcontext()
+        with expert_precision_context:
+            hidden_states = self.model(
+                input_ids=input_ids,
+                positions=positions,
+                forward_batch=forward_batch,
+                input_embeds=input_embeds,
+            )
         if forward_batch.forward_mode.is_extend() and input_embeds is not None:
             return self.manual_extend_logits(hidden_states, forward_batch)
         else:
