@@ -34,10 +34,18 @@ from tests.test_model.test_qwen3_omni_mmsu_talker_ci import (
 )
 
 
-async def run(base_url: str, output_directory: Path) -> None:
-    samples = load_mmsu_samples(
-        max_samples=MAX_SAMPLES, repo_id=DATASETS["mmsu-ci-2000"]
-    )
+async def run(base_url: str, output_directory: Path, sample_file: Path) -> None:
+    if sample_file.exists():
+        samples = [
+            MmsuSample(**sample) for sample in json.loads(sample_file.read_text())
+        ]
+    else:
+        samples = load_mmsu_samples(
+            max_samples=MAX_SAMPLES, repo_id=DATASETS["mmsu-ci-2000"]
+        )
+        sample_file.write_text(
+            json.dumps([asdict(sample) for sample in samples], indent=2)
+        )
     output_directory.mkdir(exist_ok=False)
     (output_directory / "samples.json").write_text(
         json.dumps([asdict(sample) for sample in samples], indent=2)
@@ -145,8 +153,11 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--base-url", required=True)
     parser.add_argument("--output-directory", type=Path, required=True)
+    parser.add_argument("--sample-file", type=Path, required=True)
     arguments = parser.parse_args()
-    asyncio.run(run(arguments.base_url, arguments.output_directory))
+    asyncio.run(
+        run(arguments.base_url, arguments.output_directory, arguments.sample_file)
+    )
 
 
 if __name__ == "__main__":
