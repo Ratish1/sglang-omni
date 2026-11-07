@@ -46,6 +46,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model-path", required=True)
     parser.add_argument("--trace-directory", action="append", type=Path, required=True)
+    parser.add_argument("--compare-trace-directories", nargs=2, type=Path)
     parser.add_argument("--gpu", type=int, required=True)
     parser.add_argument("--output-directory", type=Path, required=True)
     arguments = parser.parse_args()
@@ -71,6 +72,32 @@ def main() -> None:
     assert not loading["mismatched_keys"], loading["mismatched_keys"]
     reference.eval()
     reports = []
+    paired_frames = []
+    if arguments.compare_trace_directories is not None:
+        native_directory, candidate_directory = arguments.compare_trace_directories
+        for native_file in sorted(native_directory.glob("*.pt")):
+            candidate_file = candidate_directory / native_file.name
+            if not candidate_file.is_file():
+                continue
+            else:
+                pass
+            native = torch.load(native_file, weights_only=True)
+            candidate = torch.load(candidate_file, weights_only=True)
+            paired_frames.append(
+                {
+                    "trace_file": native_file.name,
+                    "fields": {
+                        name: asdict(compare_tensors(native[name], candidate[name]))
+                        for name in sorted(native.keys() & candidate.keys())
+                        if native[name].shape == candidate[name].shape
+                    },
+                }
+            )
+        (arguments.output_directory / "paired-frames.json").write_text(
+            json.dumps(paired_frames, indent=2)
+        )
+    else:
+        pass
     with torch.inference_mode():
         for trace_directory in arguments.trace_directory:
             frames = []
@@ -180,6 +207,7 @@ def main() -> None:
                 "expert_attention": "not executed; fixed expert inputs only",
                 "scope": "Measured feedback arithmetic and teacher-forced expert differences, not a speech-quality or speed verdict. FP32 is a diagnostic comparison, not a replacement checkpoint execution contract.",
                 "reports": reports,
+                "paired_frames": paired_frames,
             },
             indent=2,
         )
