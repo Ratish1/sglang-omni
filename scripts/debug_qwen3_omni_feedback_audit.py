@@ -9,6 +9,8 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 
 import torch
+from flashinfer.fused_moe import cutlass_fused_moe
+from flashinfer.fused_moe.core import ActivationType
 from transformers import Qwen3OmniMoeConfig
 from transformers.conversion_mapping import (
     get_checkpoint_conversion_mapping,
@@ -49,6 +51,7 @@ def main() -> None:
     parser.add_argument("--compare-trace-directories", nargs=2, type=Path)
     parser.add_argument("--gpu", type=int, required=True)
     parser.add_argument("--decode-only", action="store_true")
+    parser.add_argument("--profile-tactics", nargs=2, type=int)
     parser.add_argument("--output-directory", type=Path, required=True)
     arguments = parser.parse_args()
     arguments.output_directory.mkdir(exist_ok=False)
@@ -198,6 +201,49 @@ def main() -> None:
                             expert_output
                             * routing_weights[token_rows, selected_columns, None],
                         )
+                    tactic_replays = []
+                    if arguments.profile_tactics is not None and layer_index == 0:
+                        gate_weights, up_weights = layer.mlp.experts.gate_up_proj.chunk(
+                            2, dim=1
+                        )
+                        packed_weights = torch.cat(
+                            (up_weights, gate_weights), dim=1
+                        ).contiguous()
+                        for first_profile in (-1, arguments.profile_tactics[0]):
+                            for second_profile in (-1, arguments.profile_tactics[1]):
+                                replay = cutlass_fused_moe(
+                                    input=hidden_states.clone(),
+                                    token_selected_experts=selected_experts.to(
+                                        torch.int32
+                                    ),
+                                    token_final_scales=routing_weights,
+                                    fc1_expert_weights=packed_weights,
+                                    fc2_expert_weights=layer.mlp.experts.down_proj.contiguous(),
+                                    output_dtype=hidden_states.dtype,
+                                    quant_scales=None,
+                                    output=torch.empty_like(hidden_states),
+                                    activation_type=ActivationType.Swiglu,
+                                    use_fused_finalize=False,
+                                    profile_ids=[first_profile, second_profile],
+                                )[0]
+                                tactic_replays.append(
+                                    {
+                                        "profiles": [first_profile, second_profile],
+                                        "native_vs_replay": asdict(
+                                            compare_tensors(native_output, replay)
+                                        ),
+                                        "replay_vs_float32": asdict(
+                                            compare_tensors(replay, float_output)
+                                        ),
+                                    }
+                                )
+                                torch.save(
+                                    replay.detach().cpu(),
+                                    arguments.output_directory
+                                    / f"{trace_directory.parent.name}-{trace_directory.name}-{first_profile}-{second_profile}.pt",
+                                )
+                    else:
+                        pass
                     expert_layers.append(
                         {
                             "trace_file": trace_file.name,
@@ -229,6 +275,7 @@ def main() -> None:
                             "reference_vs_float32": asdict(
                                 compare_tensors(reference_output, float_output)
                             ),
+                            "tactic_replays": tactic_replays,
                         }
                     )
             report = {
