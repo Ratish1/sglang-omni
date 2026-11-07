@@ -20,7 +20,8 @@ from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import (
 @dataclass(kw_only=True)
 class NativeNormalization:
     reference: Qwen3OmniMoeTalkerForConditionalGeneration
-    enabled: bool = True
+    boundary_enabled: bool = True
+    query_key_enabled: bool = True
     attention_residual: torch.Tensor | None = None
     attention_output: torch.Tensor | None = None
     mlp_residual: torch.Tensor | None = None
@@ -68,7 +69,7 @@ class NativeNormalization:
         inputs: tuple[torch.Tensor],
         output: torch.Tensor,
     ) -> torch.Tensor:
-        if not self.enabled:
+        if not self.boundary_enabled:
             return output
         else:
             pass
@@ -104,7 +105,7 @@ class NativeNormalization:
         inputs: tuple[torch.Tensor],
         output: torch.Tensor,
     ) -> torch.Tensor:
-        if not self.enabled:
+        if not self.boundary_enabled:
             return output
         else:
             pass
@@ -133,7 +134,7 @@ class NativeNormalization:
         inputs: tuple[torch.Tensor],
         output: torch.Tensor,
     ) -> torch.Tensor:
-        if not self.enabled:
+        if not self.query_key_enabled:
             return output
         else:
             pass
@@ -150,7 +151,7 @@ class NativeNormalization:
         inputs: tuple[torch.Tensor],
         output: torch.Tensor,
     ) -> torch.Tensor:
-        if not self.enabled:
+        if not self.boundary_enabled:
             return output
         else:
             pass

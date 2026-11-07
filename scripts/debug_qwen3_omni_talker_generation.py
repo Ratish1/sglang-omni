@@ -40,7 +40,7 @@ def main() -> None:
     parser.add_argument("--top-p", type=float, required=True)
     parser.add_argument(
         "--normalization-semantics",
-        choices=("checkpoint", "native"),
+        choices=("checkpoint", "native", "native-boundary", "native-query-key"),
         default="checkpoint",
     )
     parser.add_argument("--paired-normalization-controls", action="store_true")
@@ -69,7 +69,7 @@ def main() -> None:
     reference.eval()
     normalization = NativeNormalization(reference=reference)
     if (
-        arguments.normalization_semantics == "native"
+        arguments.normalization_semantics.startswith("native")
         or arguments.paired_normalization_controls
     ):
         normalization.install()
@@ -98,8 +98,13 @@ def main() -> None:
         top_k = torch.tensor([arguments.top_k], device=reference.device)
         top_p = torch.tensor([arguments.top_p], device=reference.device)
         minimum_probability = torch.zeros(1, device=reference.device)
+        intervention_mode = (
+            "native"
+            if arguments.normalization_semantics == "checkpoint"
+            else arguments.normalization_semantics
+        )
         normalization_modes = (
-            ("checkpoint", "native", "checkpoint-repeat")
+            ("checkpoint", intervention_mode, "checkpoint-repeat")
             if arguments.paired_normalization_controls
             else (arguments.normalization_semantics,)
         )
@@ -108,7 +113,14 @@ def main() -> None:
             for directory in arguments.trace_directory
             for mode in normalization_modes
         ):
-            normalization.enabled = normalization_mode == "native"
+            normalization.boundary_enabled = normalization_mode in (
+                "native",
+                "native-boundary",
+            )
+            normalization.query_key_enabled = normalization_mode in (
+                "native",
+                "native-query-key",
+            )
             prefill_file = next(trace_directory.glob("*-before_prefill.pt"))
             before = torch.load(prefill_file, map_location="cpu", weights_only=True)
             prefill = before["prefill_embeds"].to(reference.device)
