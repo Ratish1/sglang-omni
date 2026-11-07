@@ -42,6 +42,20 @@ class FullPrefixKVObserver:
         assert pool.kv_cache_layout == "nhd"
         self.backend = backend
         self.pool = pool
+        self.attention_tensors = {
+            name: buffer
+            for name, buffer in runner.model.named_buffers()
+            if name.endswith(
+                (
+                    ".diagnostic_kv_write_counts",
+                    ".diagnostic_query",
+                    ".diagnostic_attention_output",
+                    ".diagnostic_position",
+                    ".diagnostic_attention_properties",
+                )
+            )
+        }
+        assert len(self.attention_tensors) == 5 * pool.layer_num
         metadata = {
             "pool_class": type(pool).__name__,
             "allocator_class": type(runner.token_to_kv_pool_allocator).__name__,
@@ -139,16 +153,33 @@ class FullPrefixKVObserver:
             observation.checks.append(torch.stack(checks))
             observation.sequence_lengths.append(sequence_length)
             if len(observation.snapshots) < 4:
-                observation.snapshots.append(
-                    {
-                        "request_locations": locations.clone(),
-                        "read_locations": read_locations[
-                            row_index, :sequence_length
-                        ].clone(),
-                        "sequence_length": forward_batch.seq_lens[row_index].clone(),
-                        "request_pool_index": request_pool_indices[row_index].clone(),
-                    }
-                )
+                snapshot = {
+                    "request_locations": locations.clone(),
+                    "read_locations": read_locations[
+                        row_index, :sequence_length
+                    ].clone(),
+                    "sequence_length": forward_batch.seq_lens[row_index].clone(),
+                    "request_pool_index": request_pool_indices[row_index].clone(),
+                }
+                if decode and len(requests) == 1:
+                    snapshot.update(
+                        {
+                            name: tensor.clone()
+                            for name, tensor in self.attention_tensors.items()
+                        }
+                    )
+                    for layer_index, (key_buffer, value_buffer) in enumerate(
+                        zip(self.pool.k_buffer, self.pool.v_buffer)
+                    ):
+                        snapshot[f"layer_{layer_index}_keys"] = key_buffer.index_select(
+                            0, locations
+                        )
+                        snapshot[f"layer_{layer_index}_values"] = (
+                            value_buffer.index_select(0, locations)
+                        )
+                else:
+                    pass
+                observation.snapshots.append(snapshot)
             else:
                 pass
 
@@ -161,6 +192,11 @@ class FullPrefixKVObserver:
             "forward_count": len(observation.checks),
             "sequence_lengths": observation.sequence_lengths,
             "failed_checks": (~checks).nonzero().tolist(),
+            "write_counts": {
+                name: tensor.cpu().tolist()
+                for name, tensor in self.attention_tensors.items()
+                if name.endswith(".diagnostic_kv_write_counts")
+            },
             "check_columns": [
                 "prefix_locations",
                 "read_locations",

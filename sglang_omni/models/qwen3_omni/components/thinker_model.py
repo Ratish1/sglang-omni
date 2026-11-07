@@ -1,5 +1,6 @@
 import logging
 import math
+import os
 import re
 from collections.abc import Mapping
 from typing import Iterable, Optional, Tuple
@@ -7,7 +8,12 @@ from typing import Iterable, Optional, Tuple
 import torch
 from sglang.kernels.fused_op import get_fused_op_backend
 from sglang.kernels.spec import KernelBackend
-from sglang.srt.runtime_context import get_exec, get_parallel, get_stream
+from sglang.srt.runtime_context import (
+    get_exec,
+    get_parallel,
+    get_stream,
+    get_token_to_kv_pool,
+)
 from torch import nn
 from transformers import PretrainedConfig
 
@@ -255,6 +261,36 @@ class Qwen3OmniMoeThinkerTextAttention(nn.Module):
         self.q_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
         self.k_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
         self.alt_stream = alt_stream
+        self.observe_kv_writes = (
+            os.environ.get("SGLANG_OMNI_DIAGNOSTIC_KV_DIRECTORY") is not None
+        )
+        if self.observe_kv_writes:
+            for name, shape, dtype in (
+                ("diagnostic_kv_write_counts", (3,), torch.int64),
+                ("diagnostic_query", (self.num_heads, self.head_dim), torch.bfloat16),
+                (
+                    "diagnostic_attention_output",
+                    (self.num_heads, self.head_dim),
+                    torch.bfloat16,
+                ),
+                ("diagnostic_position", (), torch.int64),
+            ):
+                self.register_buffer(
+                    name,
+                    torch.zeros(shape, dtype=dtype, device=self.q_norm.weight.device),
+                    persistent=False,
+                )
+            self.register_buffer(
+                "diagnostic_attention_properties",
+                torch.tensor(
+                    [self.scaling, self.attn.logit_cap, self.attn.sliding_window_size],
+                    device=self.q_norm.weight.device,
+                    dtype=torch.float64,
+                ),
+                persistent=False,
+            )
+        else:
+            pass
 
     def forward_prepare_native(
         self,
@@ -378,6 +414,38 @@ class Qwen3OmniMoeThinkerTextAttention(nn.Module):
             fb,
             save_kv_cache=save_kv_cache,
         )
+        if self.observe_kv_writes:
+            pool = get_token_to_kv_pool()
+            locations = fb.out_cache_loc.long()
+            stored_keys, stored_values = pool.get_kv_buffer(self.attn.layer_id)
+            valid = locations > 0
+            wrong_keys = (
+                stored_keys.index_select(0, locations)
+                != k.reshape(-1, self.num_kv_heads, self.head_dim)
+            ).any(dim=(1, 2))
+            wrong_values = (
+                stored_values.index_select(0, locations)
+                != v.reshape(-1, self.num_kv_heads, self.head_dim)
+            ).any(dim=(1, 2))
+            self.diagnostic_kv_write_counts.add_(
+                torch.stack(
+                    [
+                        (wrong_keys & valid).sum(),
+                        (wrong_values & valid).sum(),
+                        valid.sum(),
+                    ]
+                )
+            )
+            if q.shape[0] == 1:
+                self.diagnostic_query.copy_(q.view(self.num_heads, self.head_dim))
+                self.diagnostic_attention_output.copy_(
+                    attn_output.view(self.num_heads, self.head_dim)
+                )
+                self.diagnostic_position.copy_(fb.positions.reshape(-1)[0])
+            else:
+                pass
+        else:
+            pass
         # Note:(Chenchen Hong) cast attn output to the compute dtype (v.dtype),
         # not o_proj.weight.dtype: for FP8 weights the latter feeds an fp8
         # activation to the quantizer, which post1's sgl_kernel rejects.
