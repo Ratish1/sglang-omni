@@ -16,6 +16,8 @@ import uuid
 from pathlib import Path
 
 import aiohttp
+import soundfile
+from transformers.audio_utils import load_audio
 
 from benchmarks.benchmarker.data import RequestResult, finish_reason_from_server
 from benchmarks.benchmarker.runner import BenchmarkRunner, RunConfig
@@ -165,6 +167,7 @@ def main() -> None:
     parser.add_argument("--request-namespace", type=uuid.UUID)
     parser.add_argument("--fixed-request-id", type=uuid.UUID)
     parser.add_argument("--reference-directory", type=Path)
+    parser.add_argument("--reference-sample-rate", type=int)
     arguments = parser.parse_args()
     if arguments.fixed_request_id is not None and (
         arguments.sample_id is None
@@ -192,7 +195,18 @@ def main() -> None:
     reference_directory.mkdir(parents=True, exist_ok=True)
     for sample in samples:
         reference_path = reference_directory / f"{sample.sample_id}.wav"
-        shutil.copyfile(sample.ref_audio, reference_path)
+        if arguments.reference_sample_rate is None:
+            shutil.copyfile(sample.ref_audio, reference_path)
+        else:
+            reference_waveform = load_audio(
+                sample.ref_audio, sampling_rate=arguments.reference_sample_rate
+            )
+            soundfile.write(
+                reference_path,
+                reference_waveform,
+                arguments.reference_sample_rate,
+                subtype="FLOAT",
+            )
         sample.ref_audio = str(reference_path.resolve())
     asyncio.run(
         replay_requests(
