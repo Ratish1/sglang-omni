@@ -7,6 +7,10 @@ from typing import Iterable, Optional, Tuple
 import torch
 from sglang.kernels.fused_op import get_fused_op_backend
 from sglang.kernels.spec import KernelBackend
+from sglang.srt.model_executor.forward_context import (
+    get_req_to_token_pool,
+    get_token_to_kv_pool,
+)
 from sglang.srt.runtime_context import get_exec, get_parallel, get_stream
 from torch import nn
 from transformers import PretrainedConfig
@@ -255,6 +259,8 @@ class Qwen3OmniMoeThinkerTextAttention(nn.Module):
         self.q_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
         self.k_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
         self.alt_stream = alt_stream
+        self.diagnostic_token_counts: set[int] = set()
+        self.diagnostic_tensors: dict[str, torch.Tensor] = {}
 
     def forward_prepare_native(
         self,
@@ -262,7 +268,18 @@ class Qwen3OmniMoeThinkerTextAttention(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
     ):
+        token_count = hidden_states.shape[0]
+        if token_count in self.diagnostic_token_counts:
+            self.diagnostic_tensors[f"projection_input_{token_count}"] = (
+                hidden_states.clone()
+            )
+        else:
+            pass
         qkv, _ = self.qkv_proj(hidden_states)
+        if token_count in self.diagnostic_token_counts:
+            self.diagnostic_tensors[f"projection_output_{token_count}"] = qkv.clone()
+        else:
+            pass
 
         q, k, v = self.apply_qk_norm_rope(qkv, positions, forward_batch)
 
@@ -317,6 +334,11 @@ class Qwen3OmniMoeThinkerTextAttention(nn.Module):
                 head_dim=self.head_dim,
                 alt_stream=self.alt_stream,
             )
+            if q.shape[0] in self.diagnostic_token_counts:
+                self.diagnostic_tensors[f"normalized_query_{q.shape[0]}"] = q.clone()
+                self.diagnostic_tensors[f"normalized_key_{q.shape[0]}"] = k.clone()
+            else:
+                pass
             # note (ratish): a forced torch backend runs the rope's native
             # forward, which cannot store K and V, so attention stores them.
             use_fused_set_kv_buffer = (
@@ -368,6 +390,12 @@ class Qwen3OmniMoeThinkerTextAttention(nn.Module):
             pass
 
         q, k, v, fb = inner_state
+        token_count = q.shape[0]
+        if token_count in self.diagnostic_token_counts:
+            self.diagnostic_tensors[f"rotated_query_{token_count}"] = q.clone()
+            self.diagnostic_tensors[f"projected_value_{token_count}"] = v.clone()
+        else:
+            pass
 
         must_save_kv = self.used_fused_qk_norm_rope_last_call
         save_kv_cache = must_save_kv or not self.used_fused_set_kv_buffer_last_call
@@ -385,7 +413,49 @@ class Qwen3OmniMoeThinkerTextAttention(nn.Module):
             attn_output = attn_output.to(dtype=v.dtype)
         else:
             pass
+        if token_count in self.diagnostic_token_counts:
+            token_cache = get_token_to_kv_pool()
+            cache_locations = fb.out_cache_loc[:token_count]
+            self.diagnostic_tensors[f"attention_output_{token_count}"] = (
+                attn_output.clone()
+            )
+            self.diagnostic_tensors[f"cache_locations_{token_count}"] = (
+                cache_locations.clone()
+            )
+            self.diagnostic_tensors[f"cached_key_{token_count}"] = (
+                token_cache.get_key_buffer(self.layer_id)[cache_locations].clone()
+            )
+            self.diagnostic_tensors[f"cached_value_{token_count}"] = (
+                token_cache.get_value_buffer(self.layer_id)[cache_locations].clone()
+            )
+            if token_count == 1:
+                prefix_capacity = max(self.diagnostic_token_counts)
+                prefix_slots = torch.arange(prefix_capacity, device=q.device)
+                prefix_locations = get_req_to_token_pool().req_to_token.index_select(
+                    0, fb.req_pool_indices[:1].long()
+                )[0, :prefix_capacity]
+                prefix_locations = torch.where(
+                    prefix_slots < fb.seq_lens[:1], prefix_locations, 0
+                )
+                self.diagnostic_tensors["prefix_lengths_1"] = fb.seq_lens[:1].clone()
+                self.diagnostic_tensors["prefix_locations_1"] = prefix_locations.clone()
+                self.diagnostic_tensors["prefix_key_1"] = token_cache.get_key_buffer(
+                    self.layer_id
+                ).index_select(0, prefix_locations.long())
+                self.diagnostic_tensors["prefix_value_1"] = (
+                    token_cache.get_value_buffer(self.layer_id).index_select(
+                        0, prefix_locations.long()
+                    )
+                )
+            else:
+                pass
+        else:
+            pass
         output, _ = self.o_proj(attn_output)
+        if token_count in self.diagnostic_token_counts:
+            self.diagnostic_tensors[f"output_projection_{token_count}"] = output.clone()
+        else:
+            pass
         return output
 
     def forward(
@@ -538,6 +608,8 @@ class Qwen3OmniMoeThinkerTextDecoderLayer(nn.Module):
             (attn, self.input_layernorm),
             (ffn, self.post_attention_layernorm),
         )
+        self.diagnostic_token_counts: set[int] = set()
+        self.diagnostic_tensors: dict[str, torch.Tensor] = {}
 
     @staticmethod
     def stage_facts(
@@ -560,12 +632,35 @@ class Qwen3OmniMoeThinkerTextDecoderLayer(nn.Module):
         captured_last_layer_outputs: Optional[AuxHiddenStateList] = None,
         **kwargs,
     ) -> torch.Tensor:
+        token_count = hidden_states.shape[0]
+        if token_count in self.diagnostic_token_counts:
+            self.diagnostic_tensors[f"attention_input_contribution_{token_count}"] = (
+                hidden_states.clone()
+            )
+            previous_residual = residual_batch.written_residual(forward_batch)
+            if previous_residual is not None:
+                self.diagnostic_tensors[
+                    f"attention_previous_residual_{token_count}"
+                ] = previous_residual.clone()
+            else:
+                pass
+        else:
+            pass
         hidden_states = self.attn_boundary.prepare(
             hidden_states,
             forward_batch,
             capture_gathered=captured_last_layer_outputs,
             **kwargs,
         )
+        if token_count in self.diagnostic_token_counts:
+            self.diagnostic_tensors[f"attention_residual_{token_count}"] = (
+                residual_batch.written_residual(forward_batch).clone()
+            )
+            self.diagnostic_tensors[f"attention_normalized_{token_count}"] = (
+                hidden_states.clone()
+            )
+        else:
+            pass
 
         if hidden_states.shape[0] != 0:
             hidden_states = self.self_attn(
@@ -577,9 +672,28 @@ class Qwen3OmniMoeThinkerTextDecoderLayer(nn.Module):
             pass
 
         hidden_states = self.attn_boundary.finish(hidden_states, forward_batch)
+        if token_count in self.diagnostic_token_counts:
+            self.diagnostic_tensors[f"mlp_input_contribution_{token_count}"] = (
+                hidden_states.clone()
+            )
+        else:
+            pass
         hidden_states = self.ffn_boundary.prepare(hidden_states, forward_batch)
+        if token_count in self.diagnostic_token_counts:
+            self.diagnostic_tensors[f"mlp_residual_{token_count}"] = (
+                residual_batch.written_residual(forward_batch).clone()
+            )
+            self.diagnostic_tensors[f"mlp_normalized_{token_count}"] = (
+                hidden_states.clone()
+            )
+        else:
+            pass
 
         hidden_states = self.mlp(hidden_states, forward_batch)
+        if token_count in self.diagnostic_token_counts:
+            self.diagnostic_tensors[f"mlp_output_{token_count}"] = hidden_states.clone()
+        else:
+            pass
         return self.ffn_boundary.finish(hidden_states, forward_batch)
 
 
