@@ -45,6 +45,7 @@ def main() -> None:
     parser.add_argument("--model-path", required=True)
     parser.add_argument("--trace-directory", action="append", type=Path, required=True)
     parser.add_argument("--gpu", type=int, required=True)
+    parser.add_argument("--decode-only", action="store_true")
     parser.add_argument("--output-directory", type=Path, required=True)
     arguments = parser.parse_args()
     arguments.output_directory.mkdir(exist_ok=False)
@@ -117,6 +118,10 @@ def main() -> None:
             previous_values: dict[int, torch.Tensor] = {}
             frames = []
             for trace_file in sorted(directory.glob("*-post_*.pt")):
+                if arguments.decode_only and "post_prefill" in trace_file.name:
+                    continue
+                else:
+                    pass
                 captured = torch.load(trace_file, map_location="cpu", weights_only=True)
                 is_prefill = "post_prefill" in trace_file.name
                 before_file = trace_file.with_name(
@@ -212,6 +217,14 @@ def main() -> None:
                     projection_output = captured[
                         f"{attention}projection_output_{token_count}"
                     ][:active_rows].to(reference.device)
+                    differences["projection_reads_normalized_attention"] = (
+                        compare_tensors(
+                            projection_input,
+                            captured[f"{boundary}attention_normalized_{token_count}"][
+                                :active_rows
+                            ].to(reference.device),
+                        )
+                    )
                     projection_weight = torch.cat(
                         [
                             layer.self_attn.q_proj.weight,
@@ -320,12 +333,15 @@ def main() -> None:
                             :prefix_length
                         ].to(reference.device)
                         assert key_prefix.shape[0] == prefix_length
-                        differences["retained_key_prefix"] = compare_tensors(
-                            key_prefix[:-1], previous_keys[layer_index]
-                        )
-                        differences["retained_value_prefix"] = compare_tensors(
-                            value_prefix[:-1], previous_values[layer_index]
-                        )
+                        if layer_index in previous_keys:
+                            differences["retained_key_prefix"] = compare_tensors(
+                                key_prefix[:-1], previous_keys[layer_index]
+                            )
+                            differences["retained_value_prefix"] = compare_tensors(
+                                value_prefix[:-1], previous_values[layer_index]
+                            )
+                        else:
+                            pass
                         differences["current_key_in_prefix"] = compare_tensors(
                             key_prefix[-1:], current_key
                         )
@@ -359,6 +375,12 @@ def main() -> None:
                     actual_projection = captured[
                         f"{attention}output_projection_{token_count}"
                     ][:active_rows].to(reference.device)
+                    differences["mlp_reads_attention_output"] = compare_tensors(
+                        captured[f"{boundary}mlp_input_contribution_{token_count}"][
+                            :active_rows
+                        ].to(reference.device),
+                        actual_projection,
+                    )
                     differences["output_projection"] = compare_tensors(
                         actual_projection, layer.self_attn.o_proj(actual_attention)
                     )
@@ -375,6 +397,15 @@ def main() -> None:
                     mlp_output = captured[f"{boundary}mlp_output_{token_count}"][
                         :active_rows
                     ].to(reference.device)
+                    if layer_index + 1 < len(reference.model.layers):
+                        differences["next_layer_reads_mlp_output"] = compare_tensors(
+                            captured[
+                                f"boundary_{layer_index + 1}_attention_input_contribution_{token_count}"
+                            ][:active_rows].to(reference.device),
+                            mlp_output,
+                        )
+                    else:
+                        pass
                     differences["whole_mlp_checkpoint_bfloat16"] = compare_tensors(
                         mlp_output, layer.mlp(mlp_input[None])[0]
                     )
@@ -410,6 +441,7 @@ def main() -> None:
                     "trace_directory": str(directory),
                     "parameter_fingerprints_checked": len(fingerprints),
                     "parameter_fingerprint_mismatches": weight_mismatches,
+                    "decode_only": arguments.decode_only,
                     "frames": frames,
                 }
             )
