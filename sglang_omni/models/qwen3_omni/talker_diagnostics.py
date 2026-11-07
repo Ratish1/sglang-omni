@@ -193,3 +193,17 @@ class TalkerStateObserver:
         }
         (self.directory / f"{request_id}.json").write_text(json.dumps(report, indent=2))
         torch.save(codes, self.directory / f"{request_id}.pt")
+        parameters = request_data.req.sampling_params
+        torch.save(
+            {
+                "future_text_rows": torch.stack(observation.text_rows).cpu(),
+                "pad_embedding": request_data.tts_pad_embed.cpu(),
+                "sampling_seed": parameters.sampling_seed,
+                "temperature": parameters.temperature,
+                "top_k": parameters.top_k,
+                "top_p": parameters.top_p,
+                "repetition_penalty": parameters.repetition_penalty,
+                "max_new_tokens": parameters.max_new_tokens,
+            },
+            self.directory / f"{request_id}.conditioning.pt",
+        )
