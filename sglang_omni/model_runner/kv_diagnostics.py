@@ -12,7 +12,7 @@ from sglang.srt.layers.attention.flashattention_backend import FlashAttentionBac
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.runtime_context import get_token_to_kv_pool
+from sglang.srt.model_executor.forward_context import get_token_to_kv_pool
 from torch import nn
 
 from sglang_omni.model_runner.sglang_model_runner import SGLModelRunner
