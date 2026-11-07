@@ -5,6 +5,7 @@ SGLang-native Talker model for Qwen3-Omni compatiable with hf formatting.
 from __future__ import annotations
 
 import logging
+import os
 from typing import Iterable, Optional, Tuple
 
 import torch
@@ -57,12 +58,34 @@ from sglang_omni.vendor.sglang.layers import (
     RMSNorm,
     RowParallelLinear,
     SiluAndMul,
+    StandardTopKOutput,
     residual_batch,
 )
 from sglang_omni.vendor.sglang.models import FusedSetKVBufferArg, apply_qk_norm
 from sglang_omni.vendor.sglang.utils import make_layers
 
 logger = logging.getLogger(__name__)
+
+
+def diagnostic_checkpoint_boundary_norm(
+    module: RMSNorm,
+    inputs: tuple[torch.Tensor | None, ...],
+    output: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+    if isinstance(output, tuple):
+        rounded_residual = output[1]
+    else:
+        rounded_residual = inputs[0]
+    assert isinstance(rounded_residual, torch.Tensor)
+    assert rounded_residual.dtype == module.weight.dtype == torch.bfloat16
+    normalized = rounded_residual.float()
+    variance = normalized.square().mean(dim=-1, keepdim=True)
+    normalized = normalized * torch.rsqrt(variance + module.variance_epsilon)
+    normalized = normalized.to(rounded_residual.dtype) * module.weight
+    if isinstance(output, tuple):
+        return normalized, rounded_residual
+    else:
+        return normalized
 
 
 def bind_default_weight_loaders(module: nn.Module) -> None:
@@ -323,6 +346,8 @@ class Qwen3OmniMoeTalkerSparseMoeBlock(Qwen3OmniMoeThinkerTextSparseMoeBlock):
             quant_config=None,
             prefix=add_prefix("shared_expert_gate", prefix),
         )
+        self.diagnostic_tensors: dict[str, torch.Tensor] = {}
+        self.diagnostic_token_counts: set[int] = set()
 
     def forward(
         self,
@@ -338,6 +363,18 @@ class Qwen3OmniMoeTalkerSparseMoeBlock(Qwen3OmniMoeThinkerTextSparseMoeBlock):
         else:
             pass
 
+        capture_experts = os.environ.get(
+            "SGLANG_OMNI_DIAGNOSTIC_MOE_TRACE"
+        ) is not None and (
+            num_tokens in (1, 128) or num_tokens in self.diagnostic_token_counts
+        )
+        if capture_experts:
+            self.diagnostic_tensors[f"input_{num_tokens}"] = (
+                linear_hidden_states.clone()
+            )
+        else:
+            pass
+
         # Shared branch must consume the original MLP input before routed experts.
         # The fused MoE implementation mutates `hidden_states` in-place.
         shared_output = self.shared_expert(linear_hidden_states)
@@ -347,7 +384,25 @@ class Qwen3OmniMoeTalkerSparseMoeBlock(Qwen3OmniMoeThinkerTextSparseMoeBlock):
         # --- Routed experts (no all-reduce yet) ---
         router_logits, _ = self.gate(linear_hidden_states)
         topk_output = self.topk(linear_hidden_states, router_logits)
+        if capture_experts:
+            assert isinstance(topk_output, StandardTopKOutput)
+            self.diagnostic_tensors.update(
+                {
+                    f"router_logits_{num_tokens}": router_logits.clone(),
+                    f"weights_{num_tokens}": topk_output.topk_weights.clone(),
+                    f"experts_{num_tokens}": topk_output.topk_ids.clone(),
+                    f"shared_output_{num_tokens}": shared_output.clone(),
+                }
+            )
+        else:
+            pass
         routed_output = self.experts(linear_hidden_states, topk_output)
+        if capture_experts:
+            self.diagnostic_tensors[f"routed_output_{num_tokens}"] = (
+                routed_output.clone()
+            )
+        else:
+            pass
 
         final_hidden_states = routed_output + shared_output
         return final_hidden_states.view(num_tokens, hidden_dim)
@@ -412,6 +467,17 @@ class Qwen3OmniMoeTalkerTextModel(nn.Module):
         self.end_layer = config.num_hidden_layers
 
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        if os.environ.get("SGLANG_OMNI_DIAGNOSTIC_CHECKPOINT_BOUNDARY_NORM") == "1":
+            for layer in self.layers:
+                layer.input_layernorm.register_forward_hook(
+                    diagnostic_checkpoint_boundary_norm
+                )
+                layer.post_attention_layernorm.register_forward_hook(
+                    diagnostic_checkpoint_boundary_norm
+                )
+            self.norm.register_forward_hook(diagnostic_checkpoint_boundary_norm)
+        else:
+            pass
         self.layers_to_capture = []
         max_batch_size = get_schedule().max_running_requests
         self.cp_enabled = True
@@ -433,6 +499,29 @@ class Qwen3OmniMoeTalkerTextModel(nn.Module):
         for idx in range(self.start_layer, self.end_layer):
             self.layers[idx].self_attn.use_fused_qk_norm_rope = False
             self.layers[idx].self_attn.compatible_with_fused_qk_norm_rope = False
+            if (
+                os.environ.get("SGLANG_OMNI_DIAGNOSTIC_CHECKPOINT_QUERY_KEY_NORM")
+                == "1"
+            ):
+                self.layers[idx].self_attn.q_norm.cast_x_before_out_mul = True
+                self.layers[idx].self_attn.k_norm.cast_x_before_out_mul = True
+                self.layers[idx].self_attn.q_norm.register_forward_hook(
+                    diagnostic_checkpoint_boundary_norm
+                )
+                self.layers[idx].self_attn.k_norm.register_forward_hook(
+                    diagnostic_checkpoint_boundary_norm
+                )
+            else:
+                pass
+        diagnostic_token_counts = os.environ.get("SGLANG_OMNI_DIAGNOSTIC_LAYER_TOKENS")
+        if diagnostic_token_counts is not None:
+            token_counts = {int(value) for value in diagnostic_token_counts.split(",")}
+            for layer in self.layers:
+                layer.diagnostic_token_counts = token_counts
+                layer.self_attn.diagnostic_token_counts = token_counts
+                layer.mlp.diagnostic_token_counts = token_counts
+        else:
+            pass
 
     def get_input_embeddings(self) -> nn.Embedding:
         return self.codec_embedding
@@ -1969,6 +2058,15 @@ class Qwen3OmniTalker(nn.Module):
             layer0_codes=layer0_codes,
             talker_hidden=talker_hidden,
         )
+        if os.environ.get("SGLANG_OMNI_DIAGNOSTIC_REFERENCE_SUM") is not None:
+            embedding_rows = [self.model.codec_embedding(result_codes[:, 0])]
+            for index, embedding in enumerate(
+                self.code_predictor.model.codec_embedding
+            ):
+                embedding_rows.append(embedding(result_codes[:, index + 1]))
+            summed_embeddings.copy_(torch.stack(embedding_rows, dim=1).sum(dim=1))
+        else:
+            pass
         return result_codes, summed_embeddings
 
     def precompile_kernels_after_loading(self) -> None:
