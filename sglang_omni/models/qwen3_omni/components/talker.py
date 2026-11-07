@@ -505,6 +505,12 @@ class Qwen3OmniMoeTalkerTextModel(nn.Module):
             ):
                 self.layers[idx].self_attn.q_norm.cast_x_before_out_mul = True
                 self.layers[idx].self_attn.k_norm.cast_x_before_out_mul = True
+                self.layers[idx].self_attn.q_norm.register_forward_hook(
+                    diagnostic_checkpoint_boundary_norm
+                )
+                self.layers[idx].self_attn.k_norm.register_forward_hook(
+                    diagnostic_checkpoint_boundary_norm
+                )
             else:
                 pass
         diagnostic_token_counts = os.environ.get("SGLANG_OMNI_DIAGNOSTIC_LAYER_TOKENS")
