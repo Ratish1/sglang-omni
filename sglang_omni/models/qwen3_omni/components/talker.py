@@ -2097,4 +2097,10 @@ class Qwen3OmniTalker(nn.Module):
 
         # note (ratish): keep top-k cutoff ordering before BF16 logit rounding.
         for layer in self.model.layers:
-            layer.mlp.gate.weight.data = layer.mlp.gate.weight.data.float()
+            if (
+                current_platform.is_cuda()
+                and layer.mlp.experts.w13_weight.dtype == torch.bfloat16
+            ):
+                layer.mlp.gate.weight.data = layer.mlp.gate.weight.data.float()
+            else:
+                pass
