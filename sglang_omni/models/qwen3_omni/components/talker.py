@@ -567,16 +567,32 @@ class Qwen3OmniMoeTalkerTextModel(nn.Module):
         else:
             pass
 
-        for i in range(self.start_layer, self.end_layer):
-            layer = self.layers[i]
-            hidden_states = layer(
-                positions=positions,
-                hidden_states=hidden_states,
-                forward_batch=forward_batch,
-                captured_last_layer_outputs=(
-                    aux_hidden_states if i in capture_layers and i != 0 else None
-                ),
+        if (
+            forward_batch.forward_mode.is_extend()
+            and current_platform.is_cuda()
+            and self.layers[
+                self.start_layer
+            ].mlp.experts.runner_backend.is_flashinfer_cutlass()
+            and self.layers[self.start_layer].mlp.experts.w13_weight.dtype
+            == torch.bfloat16
+        ):
+            # note (ratish): prefill graphs capture this backbone directly, so its GEMM1 precision policy belongs here rather than in the outer wrapper.
+            expert_precision_context = autotune(
+                False, skip_ops={"trtllm::fused_moe::gemm1"}
             )
+        else:
+            expert_precision_context = nullcontext()
+        with expert_precision_context:
+            for i in range(self.start_layer, self.end_layer):
+                layer = self.layers[i]
+                hidden_states = layer(
+                    positions=positions,
+                    hidden_states=hidden_states,
+                    forward_batch=forward_batch,
+                    captured_last_layer_outputs=(
+                        aux_hidden_states if i in capture_layers and i != 0 else None
+                    ),
+                )
 
         hidden_states = residual_batch.final_norm(
             hidden_states, forward_batch, self.norm, skip_empty=True
@@ -1448,28 +1464,12 @@ class Qwen3OmniTalker(nn.Module):
         else:
             positions = forward_batch.positions
 
-        if (
-            forward_batch.forward_mode.is_extend()
-            and current_platform.is_cuda()
-            and self.model.layers[
-                self.model.start_layer
-            ].mlp.experts.runner_backend.is_flashinfer_cutlass()
-            and self.model.layers[self.model.start_layer].mlp.experts.w13_weight.dtype
-            == torch.bfloat16
-        ):
-            # note (ratish): fused prefill GEMM1 removes BF16 projection rounding and regresses speech; decode keeps its tuned kernels.
-            expert_precision_context = autotune(
-                False, skip_ops={"trtllm::fused_moe::gemm1"}
-            )
-        else:
-            expert_precision_context = nullcontext()
-        with expert_precision_context:
-            hidden_states = self.model(
-                input_ids=input_ids,
-                positions=positions,
-                forward_batch=forward_batch,
-                input_embeds=input_embeds,
-            )
+        hidden_states = self.model(
+            input_ids=input_ids,
+            positions=positions,
+            forward_batch=forward_batch,
+            input_embeds=input_embeds,
+        )
         if forward_batch.forward_mode.is_extend() and input_embeds is not None:
             return self.manual_extend_logits(hidden_states, forward_batch)
         else:
