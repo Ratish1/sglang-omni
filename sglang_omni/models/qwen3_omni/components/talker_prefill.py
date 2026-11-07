@@ -273,7 +273,9 @@ class TalkerPrefillBuilder:
                     map_location=prompt_embed.device,
                     weights_only=True,
                 )
-                assert torch.equal(conditioning["prompt_input_ids"][0], prompt_ids)
+                assert torch.equal(
+                    conditioning["prompt_input_ids"][0].cpu(), prompt_ids
+                )
                 assert torch.equal(
                     conditioning["native_prefill"], prefill["input_embeds"]
                 )
