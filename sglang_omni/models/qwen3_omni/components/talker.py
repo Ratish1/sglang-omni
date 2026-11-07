@@ -499,6 +499,14 @@ class Qwen3OmniMoeTalkerTextModel(nn.Module):
         for idx in range(self.start_layer, self.end_layer):
             self.layers[idx].self_attn.use_fused_qk_norm_rope = False
             self.layers[idx].self_attn.compatible_with_fused_qk_norm_rope = False
+            if (
+                os.environ.get("SGLANG_OMNI_DIAGNOSTIC_CHECKPOINT_QUERY_KEY_NORM")
+                == "1"
+            ):
+                self.layers[idx].self_attn.q_norm.cast_x_before_out_mul = True
+                self.layers[idx].self_attn.k_norm.cast_x_before_out_mul = True
+            else:
+                pass
         diagnostic_token_counts = os.environ.get("SGLANG_OMNI_DIAGNOSTIC_LAYER_TOKENS")
         if diagnostic_token_counts is not None:
             token_counts = {int(value) for value in diagnostic_token_counts.split(",")}
