@@ -82,8 +82,12 @@ def main() -> None:
                 )
                 target_text = arguments.target_text
             else:
-                case_directory = arguments.output_directory / trace_directory.name
-                case_directory.mkdir(exist_ok=True)
+                case_directory = (
+                    arguments.output_directory
+                    / trace_directory.name
+                    / trace_directory.parent.parent.name
+                )
+                case_directory.mkdir(parents=True, exist_ok=True)
                 destination = case_directory / f"{trace_directory.parent.name}.wav"
                 target_text = target_text_by_request[trace_directory.name]
             destination.write_bytes(wav_bytes)
