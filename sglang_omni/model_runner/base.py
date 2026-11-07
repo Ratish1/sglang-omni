@@ -660,6 +660,10 @@ class ModelRunner(Generic[RequestDataInput]):
     ) -> GenerationBatchResult:
         """Prepare hook → standard forward (if not custom) → sample-before-post
         block. Returns ``batch_result``."""
+        if self.kv_observer is not None:
+            self.kv_observer.prepare_forward(forward_batch)
+        else:
+            pass
         try:
             if is_prefill:
                 self.retained_prefill_input_embeds = None

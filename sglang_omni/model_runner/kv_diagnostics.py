@@ -12,10 +12,7 @@ from sglang.srt.layers.attention.flashattention_backend import FlashAttentionBac
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.model_executor.forward_context import (
-    get_attn_backend,
-    get_token_to_kv_pool,
-)
+from sglang.srt.model_executor.forward_context import get_token_to_kv_pool
 from torch import nn
 
 from sglang_omni.model_runner.prefill_inputs import get_omni_prefill_inputs
@@ -48,14 +45,7 @@ class KVWriteHook:
                 [(wrong_keys & valid).sum(), (wrong_values & valid).sum(), valid.sum()]
             )
         )
-        if forward_batch.forward_mode.is_extend():
-            last_query_index = (
-                get_attn_backend().forward_metadata.cu_seqlens_q[1:2].long() - 1
-            )
-        else:
-            last_query_index = torch.zeros_like(
-                forward_batch.positions[:1], dtype=torch.long
-            )
+        last_query_index = attention.diagnostic_query_index
         attention.diagnostic_query.copy_(
             query.index_select(0, last_query_index).view(
                 attention.tp_q_head_num, attention.head_dim
@@ -93,6 +83,7 @@ def install_kv_write_observers(layers: nn.ModuleList) -> None:
                 torch.bfloat16,
             ),
             ("diagnostic_position", (), torch.int64),
+            ("diagnostic_query_index", (1,), torch.int64),
         ):
             attention.register_buffer(
                 name, torch.zeros(shape, dtype=dtype, device=device), persistent=False
@@ -147,11 +138,12 @@ class FullPrefixKVObserver:
                     ".diagnostic_query",
                     ".diagnostic_attention_output",
                     ".diagnostic_position",
+                    ".diagnostic_query_index",
                     ".diagnostic_attention_properties",
                 )
             )
         }
-        assert len(self.attention_tensors) == 5 * pool.layer_num, (
+        assert len(self.attention_tensors) == 6 * pool.layer_num, (
             stage,
             len(self.attention_tensors),
             pool.layer_num,
@@ -173,6 +165,18 @@ class FullPrefixKVObserver:
             "value_storage_offset": pool.v_buffer[0].storage_offset(),
         }
         (self.directory / "runtime.json").write_text(json.dumps(metadata, indent=2))
+
+    def prepare_forward(self, forward_batch: ForwardBatch) -> None:
+        query_index = (
+            forward_batch.extend_seq_lens_cpu[0] - 1
+            if forward_batch.forward_mode.is_extend()
+            else 0
+        )
+        for name, tensor in self.attention_tensors.items():
+            if name.endswith(".diagnostic_query_index"):
+                tensor.fill_(query_index)
+            else:
+                pass
 
     def capture_prefill_inputs(
         self,
