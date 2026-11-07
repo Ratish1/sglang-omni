@@ -154,12 +154,23 @@ def main() -> None:
                 )
                 assistant_ids = captured_conditioning["assistant_token_ids"]
                 if int(assistant_ids[-1]) == model_config.im_end_token_id:
+                    prompt_ids = captured_conditioning["prompt_input_ids"]
+                    assistant_start = int(
+                        (prompt_ids == model_config.im_start_token_id).nonzero(
+                            as_tuple=True
+                        )[0][-1]
+                    )
+                    assistant_prefix = prompt_ids[assistant_start:]
+                    assert int(assistant_prefix[1]) == model_config.assistant_token_id
+                    assistant_context_ids = torch.cat(
+                        [assistant_prefix, assistant_ids[:-1]]
+                    )
                     assistant_embeddings = load_thinker_embedding_rows(
-                        str(checkpoint_directory), assistant_ids[:-1].tolist()
+                        str(checkpoint_directory), assistant_context_ids.tolist()
                     ).to(reference.device, dtype=reference.dtype)
                     projected_assistant = reference.text_projection(
                         assistant_embeddings
-                    )
+                    )[len(assistant_prefix) :]
                     expected_text_rows = torch.cat(
                         [projected_assistant[1:], eos_embedding], dim=0
                     )
