@@ -56,6 +56,7 @@ def main() -> None:
     parser.add_argument("--model-path", required=True)
     parser.add_argument("--request-directory", type=Path, required=True)
     parser.add_argument("--native-directory", type=Path, required=True)
+    parser.add_argument("--frontend-directory", type=Path)
     parser.add_argument("--request-id", action="append", required=True)
     parser.add_argument("--gpu", type=int, required=True)
     parser.add_argument("--output-directory", type=Path, required=True)
@@ -131,6 +132,35 @@ def main() -> None:
                 native_audio,
                 native["feature_attention_mask"].to(model.device),
             )
+            frontend_report = {}
+            if arguments.frontend_directory is not None:
+                frontend = torch.load(
+                    arguments.frontend_directory / request_id / "audio-features.pt",
+                    map_location=model.device,
+                    weights_only=True,
+                )
+                assert torch.equal(
+                    frontend["feature_attention_mask"].cpu(),
+                    native["feature_attention_mask"],
+                )
+                native_features_audio = model.thinker.get_audio_features(
+                    frontend["input_features"].to(dtype=model.dtype),
+                    frontend["feature_attention_mask"],
+                    return_dict=True,
+                ).last_hidden_state
+                frontend_report = {
+                    "feature_difference": asdict(
+                        compare_tensors(
+                            frontend["input_features"].to(dtype=model.dtype),
+                            inputs["input_features"],
+                        )
+                    ),
+                    "encoder_with_identical_features": asdict(
+                        compare_tensors(native_audio, native_features_audio)
+                    ),
+                }
+            else:
+                pass
             prefix_proofs = []
             for filename in sorted(directory.glob("thinker-prefill-*.pt")):
                 producer = torch.load(filename, map_location="cpu", weights_only=True)
@@ -205,6 +235,7 @@ def main() -> None:
                 "audio_encoder": asdict(
                     compare_tensors(native_audio, checkpoint_audio)
                 ),
+                "frontend_control": frontend_report,
                 "hidden_with_checkpoint_audio": asdict(
                     compare_tensors(
                         native_hidden[audio_mask], checkpoint_hidden[0, audio_mask]
