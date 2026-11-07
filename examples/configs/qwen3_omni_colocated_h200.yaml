@@ -21,5 +21,7 @@ stages:
     gpu_memory_fraction: 0.769
   talker_ar:
     gpu_memory_fraction: 0.123
+    engine:
+      flashinfer_autotune_skip_ops: ["trtllm::fused_moe::gemm1"]
   code2wav:
     gpu_memory_fraction: 0.014
