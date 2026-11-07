@@ -8,7 +8,9 @@ visual embeddings for Qwen3-Omni's thinker stage.
 from __future__ import annotations
 
 import logging
+import os
 from numbers import Integral
+from pathlib import Path
 
 import torch
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
@@ -126,9 +128,44 @@ class ThinkerModelRunner(ModelRunner):
         schedule_batch: ScheduleBatch,
         requests: list[SchedulerRequest],
     ) -> None:
-        del requests
         if not forward_batch.capture_hidden_mode.is_full():
             return
+        else:
+            pass
+        diagnostic_directory = os.environ.get("SGLANG_OMNI_DIAGNOSTIC_TENSOR_DIRECTORY")
+        if diagnostic_directory is not None:
+            row_start = 0
+            for scheduled, request, prefix_length, extend_length in zip(
+                requests,
+                schedule_batch.reqs,
+                schedule_batch.prefix_lens,
+                schedule_batch.extend_lens,
+            ):
+                row_end = row_start + extend_length
+                captured = {
+                    "prompt_input_ids": torch.tensor(request.origin_input_ids),
+                    "positions": forward_batch.positions[row_start:row_end],
+                    "selected_hidden": result.logits_output.hidden_states[
+                        row_start:row_end
+                    ],
+                    "prefix_length": torch.tensor(prefix_length),
+                }
+                if forward_batch.mrope_positions is not None:
+                    captured["mrope_positions"] = forward_batch.mrope_positions[
+                        :, row_start:row_end
+                    ]
+                else:
+                    pass
+                destination = Path(diagnostic_directory) / scheduled.request_id
+                destination.mkdir(parents=True, exist_ok=True)
+                torch.save(
+                    {
+                        name: value.detach().cpu().clone()
+                        for name, value in captured.items()
+                    },
+                    destination / f"thinker-prefill-{prefix_length}.pt",
+                )
+                row_start = row_end
         else:
             pass
         request_rows: list[torch.Tensor] = []

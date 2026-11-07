@@ -269,6 +269,7 @@ class TalkerPrefillBuilder:
                 "prompt_hidden": prompt_hidden,
                 "multimodal_mask": multimodal_mask[: len(prompt_ids)],
                 "prefill_embeddings": prefill["input_embeds"],
+                "prefill_input_ids": prefill["input_ids"],
             }
             for name in (
                 "audio_embeds",
