@@ -196,6 +196,13 @@ class QwenTalkerModelRunner(ModelRunner["SGLangARRequestData"]):
             return
         else:
             pass
+        target_request_id = os.environ.get("SGLANG_OMNI_DIAGNOSTIC_REQUEST_ID")
+        if target_request_id is not None and not any(
+            request.request_id == target_request_id for request in requests
+        ):
+            return
+        else:
+            pass
         assert len(requests) == 1, "tensor diagnosis requires serial requests"
         request = requests[0]
         maximum_frames = os.environ.get("SGLANG_OMNI_DIAGNOSTIC_MAX_TRACE_FRAMES")
