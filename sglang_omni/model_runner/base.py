@@ -7,15 +7,18 @@ pass, sampling, logit post-processing, and output extraction.
 
 from __future__ import annotations
 
+import os
 from collections import Counter
 from collections.abc import Mapping
 from contextlib import AbstractContextManager
 from dataclasses import dataclass, replace
+from pathlib import Path
 from typing import TYPE_CHECKING, Generic, Protocol, TypeAlias
 
 import torch
 from sglang.srt.utils.common import is_pin_memory_available
 
+from sglang_omni.model_runner.kv_diagnostics import FullPrefixKVObserver
 from sglang_omni.model_runner.model_worker import ModelWorker
 from sglang_omni.model_runner.prefill_inputs import (
     clear_omni_prefill_inputs,
@@ -203,6 +206,14 @@ class ModelRunner(Generic[RequestDataInput]):
         ] = {}
         self.sampling_seed_batch_key: tuple[tuple[str | None, int | None], ...] = ()
         self.sampling_seed_batch_tensor: torch.Tensor | None = None
+        diagnostic_directory = os.environ.get("SGLANG_OMNI_DIAGNOSTIC_KV_DIRECTORY")
+        self.kv_observer = (
+            FullPrefixKVObserver(
+                Path(diagnostic_directory), tp_worker.model_runner, type(self).__name__
+            )
+            if diagnostic_directory is not None
+            else None
+        )
 
     def stage_token_ids(self, result: GenerationBatchResult, ids: torch.Tensor) -> None:
         # Note (wenyao): pinned host copy staged once at sample time so downstream
@@ -671,6 +682,11 @@ class ModelRunner(Generic[RequestDataInput]):
             else:
                 pass
 
+            if self.kv_observer is not None:
+                self.kv_observer.observe(forward_batch, requests)
+            else:
+                pass
+
             if (
                 not schedule_batch.is_prefill_only
                 and batch_result.next_token_ids is None
@@ -1008,6 +1024,10 @@ class ModelRunner(Generic[RequestDataInput]):
         is enqueued on the same outbox, so runners that buffer stream chunks
         across decode steps can flush them ahead of stream completion.
         """
+        if self.kv_observer is not None:
+            self.kv_observer.finish(request_id)
+        else:
+            pass
 
     def post_decode_launch(
         self,

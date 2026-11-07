@@ -300,6 +300,7 @@ class QwenTalkerModelRunner(ModelRunner["SGLangARRequestData"]):
     def on_request_finished(
         self, request_id: str, req_data: "SGLangARRequestData"
     ) -> None:
+        super().on_request_finished(request_id, req_data)
         pending = req_data.pending_codec_rows
         if not pending:
             return
