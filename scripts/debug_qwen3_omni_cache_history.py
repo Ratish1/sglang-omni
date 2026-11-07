@@ -37,6 +37,7 @@ async def run(
     target_captures = []
     async with aiohttp.ClientSession() as session:
         for label, request in (
+            ("target-original", target),
             ("target-first", target),
             ("unrelated", distractor),
             ("target-after-unrelated", target),
@@ -51,13 +52,18 @@ async def run(
                 )
             else:
                 pass
-            request_id = str(uuid.uuid5(uuid.UUID(request.request_id), label))
+            if label == "target-original":
+                request_id = request.request_id
+                submitted_seed = request.seed
+            else:
+                request_id = str(uuid.uuid5(uuid.UUID(request.request_id), label))
+                submitted_seed = sampling_seed
             audio_paths = [audio_directory / Path(path).name for path in request.audios]
             assert all(path.is_file() for path in audio_paths)
             submitted = request.model_copy(
                 update={
                     "request_id": request_id,
-                    "seed": sampling_seed,
+                    "seed": submitted_seed,
                     "audios": [str(path) for path in audio_paths],
                 }
             )
