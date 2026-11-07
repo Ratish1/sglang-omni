@@ -7,6 +7,10 @@ from typing import Iterable, Optional, Tuple
 import torch
 from sglang.kernels.fused_op import get_fused_op_backend
 from sglang.kernels.spec import KernelBackend
+from sglang.srt.model_executor.forward_context import (
+    get_req_to_token_pool,
+    get_token_to_kv_pool,
+)
 from sglang.srt.runtime_context import get_exec, get_parallel, get_stream
 from torch import nn
 from transformers import PretrainedConfig
@@ -410,6 +414,7 @@ class Qwen3OmniMoeThinkerTextAttention(nn.Module):
         else:
             pass
         if token_count in self.diagnostic_token_counts:
+            token_cache = get_token_to_kv_pool()
             cache_locations = fb.out_cache_loc[:token_count]
             self.diagnostic_tensors[f"attention_output_{token_count}"] = (
                 attn_output.clone()
@@ -418,15 +423,32 @@ class Qwen3OmniMoeThinkerTextAttention(nn.Module):
                 cache_locations.clone()
             )
             self.diagnostic_tensors[f"cached_key_{token_count}"] = (
-                fb.token_to_kv_pool.get_key_buffer(self.layer_id)[
-                    cache_locations
-                ].clone()
+                token_cache.get_key_buffer(self.layer_id)[cache_locations].clone()
             )
             self.diagnostic_tensors[f"cached_value_{token_count}"] = (
-                fb.token_to_kv_pool.get_value_buffer(self.layer_id)[
-                    cache_locations
-                ].clone()
+                token_cache.get_value_buffer(self.layer_id)[cache_locations].clone()
             )
+            if token_count == 1:
+                prefix_capacity = max(self.diagnostic_token_counts)
+                prefix_slots = torch.arange(prefix_capacity, device=q.device)
+                prefix_locations = get_req_to_token_pool().req_to_token.index_select(
+                    0, fb.req_pool_indices[:1].long()
+                )[0, :prefix_capacity]
+                prefix_locations = torch.where(
+                    prefix_slots < fb.seq_lens[:1], prefix_locations, 0
+                )
+                self.diagnostic_tensors["prefix_lengths_1"] = fb.seq_lens[:1].clone()
+                self.diagnostic_tensors["prefix_locations_1"] = prefix_locations.clone()
+                self.diagnostic_tensors["prefix_key_1"] = token_cache.get_key_buffer(
+                    self.layer_id
+                ).index_select(0, prefix_locations.long())
+                self.diagnostic_tensors["prefix_value_1"] = (
+                    token_cache.get_value_buffer(self.layer_id).index_select(
+                        0, prefix_locations.long()
+                    )
+                )
+            else:
+                pass
         else:
             pass
         output, _ = self.o_proj(attn_output)
