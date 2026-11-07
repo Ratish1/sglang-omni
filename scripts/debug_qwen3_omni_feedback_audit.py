@@ -1,0 +1,190 @@
+# SPDX-License-Identifier: Apache-2.0
+"""Measure captured Talker feedback reductions and expert arithmetic."""
+
+from __future__ import annotations
+
+import argparse
+import json
+from dataclasses import asdict, dataclass
+from pathlib import Path
+
+import torch
+from transformers import Qwen3OmniMoeConfig
+from transformers.conversion_mapping import (
+    get_checkpoint_conversion_mapping,
+    register_checkpoint_conversion_mapping,
+)
+from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import (
+    Qwen3OmniMoeTalkerForConditionalGeneration,
+)
+
+
+@dataclass(kw_only=True)
+class TensorDifference:
+    exact: bool
+    equal_fraction: float
+    maximum_absolute_error: float
+    relative_l2_error: float | None
+
+
+def compare_tensors(actual: torch.Tensor, expected: torch.Tensor) -> TensorDifference:
+    assert actual.shape == expected.shape
+    assert torch.isfinite(actual).all() and torch.isfinite(expected).all()
+    difference = actual.float() - expected.float()
+    expected_norm = expected.float().norm().item()
+    return TensorDifference(
+        exact=torch.equal(actual, expected),
+        equal_fraction=(actual == expected).float().mean().item(),
+        maximum_absolute_error=difference.abs().max().item(),
+        relative_l2_error=(
+            difference.norm().item() / expected_norm if expected_norm else None
+        ),
+    )
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--model-path", required=True)
+    parser.add_argument("--trace-directory", action="append", type=Path, required=True)
+    parser.add_argument("--gpu", type=int, required=True)
+    parser.add_argument("--output-directory", type=Path, required=True)
+    arguments = parser.parse_args()
+    arguments.output_directory.mkdir(exist_ok=False)
+    torch.cuda.set_device(arguments.gpu)
+    device = torch.device("cuda", arguments.gpu)
+    torch.set_float32_matmul_precision("highest")
+    config = Qwen3OmniMoeConfig.from_pretrained(arguments.model_path).talker_config
+    register_checkpoint_conversion_mapping(
+        config.model_type, get_checkpoint_conversion_mapping("qwen3_omni_moe")
+    )
+    reference, loading = Qwen3OmniMoeTalkerForConditionalGeneration.from_pretrained(
+        arguments.model_path,
+        config=config,
+        dtype=torch.bfloat16,
+        device_map={"": arguments.gpu},
+        attn_implementation="sdpa",
+        experts_implementation="eager",
+        use_kernels=False,
+        output_loading_info=True,
+    )
+    assert not loading["missing_keys"], loading["missing_keys"]
+    assert not loading["mismatched_keys"], loading["mismatched_keys"]
+    reference.eval()
+    reports = []
+    with torch.inference_mode():
+        for trace_directory in arguments.trace_directory:
+            frames = []
+            expert_layers = []
+            trace_files = sorted(trace_directory.glob("*-post_*.pt"))
+            assert trace_files, trace_directory
+            for trace_file in trace_files:
+                captured = torch.load(trace_file, weights_only=True)
+                codes = captured["codec_ids"].to(device)
+                embedding_rows = [reference.model.codec_embedding(codes[:, :1])]
+                for group, embedding in enumerate(
+                    reference.code_predictor.model.codec_embedding
+                ):
+                    embedding_rows.append(embedding(codes[:, group + 1 : group + 2]))
+                sequential_sum = torch.zeros_like(embedding_rows[0][:, 0])
+                for embedding in embedding_rows:
+                    sequential_sum.add_(embedding[:, 0])
+                reference_sum = torch.cat(embedding_rows, dim=1).sum(dim=1)
+                feedback = captured["codec_feedback"].to(device)
+                frame_report = {
+                    "trace_file": trace_file.name,
+                    "codes": codes.cpu().tolist(),
+                    "sequential_bf16": asdict(
+                        compare_tensors(feedback, sequential_sum)
+                    ),
+                    "single_reduction": asdict(
+                        compare_tensors(feedback, reference_sum)
+                    ),
+                }
+                frames.append(frame_report)
+                if "post_prefill" not in trace_file.name:
+                    continue
+                else:
+                    pass
+                for layer_index, layer in enumerate(reference.model.layers):
+                    prefix = f"moe_{layer_index}_"
+                    hidden_states = captured[f"{prefix}input_128"].to(device)
+                    selected_experts = (
+                        captured[f"{prefix}experts_128"].to(device).long()
+                    )
+                    routing_weights = (
+                        captured[f"{prefix}weights_128"].to(device).float()
+                    )
+                    native_output = captured[f"{prefix}routed_output_128"].to(device)
+                    reference_output = layer.mlp.experts(
+                        hidden_states, selected_experts, routing_weights
+                    )
+                    float_output = torch.zeros_like(hidden_states, dtype=torch.float32)
+                    for expert_index in selected_experts.unique().tolist():
+                        token_rows, selected_columns = (
+                            selected_experts == expert_index
+                        ).nonzero(as_tuple=True)
+                        projections = torch.nn.functional.linear(
+                            hidden_states[token_rows].float(),
+                            layer.mlp.experts.gate_up_proj[expert_index].float(),
+                        )
+                        gate, up = projections.chunk(2, dim=-1)
+                        expert_output = torch.nn.functional.linear(
+                            torch.nn.functional.silu(gate) * up,
+                            layer.mlp.experts.down_proj[expert_index].float(),
+                        )
+                        float_output.index_add_(
+                            0,
+                            token_rows,
+                            expert_output
+                            * routing_weights[token_rows, selected_columns, None],
+                        )
+                    expert_layers.append(
+                        {
+                            "layer": layer_index,
+                            "native_vs_reference": asdict(
+                                compare_tensors(native_output, reference_output)
+                            ),
+                            "native_vs_float32": asdict(
+                                compare_tensors(native_output, float_output)
+                            ),
+                            "reference_vs_float32": asdict(
+                                compare_tensors(reference_output, float_output)
+                            ),
+                        }
+                    )
+            report = {
+                "trace_directory": str(trace_directory),
+                "frames": frames,
+                "expert_layers": expert_layers,
+            }
+            reports.append(report)
+            destination = (
+                arguments.output_directory
+                / f"{trace_directory.parent.name}-{trace_directory.name}.json"
+            )
+            destination.write_text(json.dumps(report, indent=2))
+            print(
+                json.dumps(
+                    {
+                        "trace_directory": str(trace_directory),
+                        "frames": len(frames),
+                        "expert_layers": len(expert_layers),
+                    }
+                ),
+                flush=True,
+            )
+    (arguments.output_directory / "summary.json").write_text(
+        json.dumps(
+            {
+                "model_path": arguments.model_path,
+                "expert_attention": "not executed; fixed expert inputs only",
+                "scope": "Measured feedback arithmetic and teacher-forced expert differences, not a speech-quality or speed verdict. FP32 is a diagnostic comparison, not a replacement checkpoint execution contract.",
+                "reports": reports,
+            },
+            indent=2,
+        )
+    )
+
+
+if __name__ == "__main__":
+    main()

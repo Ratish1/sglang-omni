@@ -230,12 +230,17 @@ class QwenTalkerModelRunner(ModelRunner["SGLangARRequestData"]):
                 pass
         else:
             pass
-        if os.environ.get("SGLANG_OMNI_DIAGNOSTIC_MOE_TRACE") is not None:
+        if os.environ.get("SGLANG_OMNI_DIAGNOSTIC_MOE_TRACE") is not None and phase in (
+            "post_prefill",
+            "post_decode",
+        ):
+            token_suffix = "_128" if phase == "post_prefill" else "_1"
             for layer_index, layer in enumerate(self.model.model.layers):
                 tensors.update(
                     {
                         f"moe_{layer_index}_{name}": tensor
                         for name, tensor in layer.mlp.diagnostic_tensors.items()
+                        if name.endswith(token_suffix)
                     }
                 )
         else:
