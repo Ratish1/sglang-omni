@@ -678,6 +678,10 @@ class ModelRunner(Generic[RequestDataInput]):
                     forward_batch, schedule_batch, requests
                 )
             if batch_result is None:
+                if self.kv_observer is not None and is_prefill:
+                    self.kv_observer.capture_prefill_inputs(forward_batch, requests)
+                else:
+                    pass
                 batch_result = self.tp_worker.forward_batch_generation(forward_batch)
             else:
                 pass

@@ -12,9 +12,13 @@ from sglang.srt.layers.attention.flashattention_backend import FlashAttentionBac
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.model_executor.forward_context import get_token_to_kv_pool
+from sglang.srt.model_executor.forward_context import (
+    get_attn_backend,
+    get_token_to_kv_pool,
+)
 from torch import nn
 
+from sglang_omni.model_runner.prefill_inputs import get_omni_prefill_inputs
 from sglang_omni.model_runner.sglang_model_runner import SGLModelRunner
 from sglang_omni.scheduling.types import SchedulerRequest
 
@@ -44,16 +48,27 @@ class KVWriteHook:
                 [(wrong_keys & valid).sum(), (wrong_values & valid).sum(), valid.sum()]
             )
         )
-        if query.shape[0] == 1:
-            attention.diagnostic_query.copy_(
-                query.view(attention.tp_q_head_num, attention.head_dim)
+        if forward_batch.forward_mode.is_extend():
+            last_query_index = (
+                get_attn_backend().forward_metadata.cu_seqlens_q[1:2].long() - 1
             )
-            attention.diagnostic_attention_output.copy_(
-                output.view(attention.tp_q_head_num, attention.v_head_dim)
-            )
-            attention.diagnostic_position.copy_(forward_batch.positions.reshape(-1)[0])
         else:
-            pass
+            last_query_index = torch.zeros_like(
+                forward_batch.positions[:1], dtype=torch.long
+            )
+        attention.diagnostic_query.copy_(
+            query.index_select(0, last_query_index).view(
+                attention.tp_q_head_num, attention.head_dim
+            )
+        )
+        attention.diagnostic_attention_output.copy_(
+            output.index_select(0, last_query_index).view(
+                attention.tp_q_head_num, attention.v_head_dim
+            )
+        )
+        attention.diagnostic_position.copy_(
+            forward_batch.positions.index_select(0, last_query_index)[0]
+        )
 
 
 def install_kv_write_observers(layers: nn.ModuleList) -> None:
@@ -110,6 +125,7 @@ class FullPrefixKVObserver:
         self.directory.mkdir(parents=True, exist_ok=True)
         self.runner = runner
         self.observations: dict[str, PrefixKVObservation] = {}
+        self.prefill_inputs: dict[str, dict[str, torch.Tensor]] = {}
         backend = runner.attn_backend
         pool = runner.token_to_kv_pool
         assert isinstance(backend, FlashAttentionBackend)
@@ -155,6 +171,35 @@ class FullPrefixKVObserver:
             "value_storage_offset": pool.v_buffer[0].storage_offset(),
         }
         (self.directory / "runtime.json").write_text(json.dumps(metadata, indent=2))
+
+    def capture_prefill_inputs(
+        self, forward_batch: ForwardBatch, requests: list[SchedulerRequest]
+    ) -> None:
+        sidecar = get_omni_prefill_inputs(forward_batch)
+        embeddings = (
+            sidecar.input_embeds if sidecar is not None else forward_batch.input_embeds
+        )
+        row_start = 0
+        for request, extend_length in zip(requests, forward_batch.extend_seq_lens_cpu):
+            row_end = row_start + extend_length
+            snapshot = {
+                "prefill_input_ids": forward_batch.input_ids[row_start:row_end].clone(),
+                "prefill_positions": forward_batch.positions[row_start:row_end].clone(),
+            }
+            if embeddings is not None:
+                snapshot["prefill_input_embeddings"] = embeddings[
+                    row_start:row_end
+                ].clone()
+            else:
+                pass
+            if forward_batch.mrope_positions is not None:
+                snapshot["prefill_mrope_positions"] = forward_batch.mrope_positions[
+                    :, row_start:row_end
+                ].clone()
+            else:
+                pass
+            self.prefill_inputs[request.request_id] = snapshot
+            row_start = row_end
 
     def observe(
         self, forward_batch: ForwardBatch, requests: list[SchedulerRequest]
@@ -243,7 +288,11 @@ class FullPrefixKVObserver:
                     "sequence_length": forward_batch.seq_lens[row_index].clone(),
                     "request_pool_index": request_pool_indices[row_index].clone(),
                 }
-                if decode and len(requests) == 1:
+                if not decode:
+                    snapshot.update(self.prefill_inputs.pop(request.request_id))
+                else:
+                    pass
+                if len(requests) == 1:
                     snapshot.update(
                         {
                             name: tensor.clone()
