@@ -155,7 +155,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--base-url", action="append", required=True)
     parser.add_argument("--output-directory", type=Path, required=True)
-    parser.add_argument("--sample-id")
+    parser.add_argument("--sample-id", action="append")
     parser.add_argument(
         "--dataset", choices=("seedtts", "seedtts-50"), default="seedtts-50"
     )
@@ -167,7 +167,9 @@ def main() -> None:
     parser.add_argument("--reference-directory", type=Path)
     arguments = parser.parse_args()
     if arguments.fixed_request_id is not None and (
-        arguments.sample_id is None or arguments.rounds != 1
+        arguments.sample_id is None
+        or len(arguments.sample_id) != 1
+        or arguments.rounds != 1
     ):
         parser.error("--fixed-request-id requires one selected sample and one round")
     else:
@@ -179,9 +181,9 @@ def main() -> None:
     )
     if arguments.sample_id is not None:
         samples = [
-            sample for sample in samples if sample.sample_id == arguments.sample_id
+            sample for sample in samples if sample.sample_id in arguments.sample_id
         ]
-        assert samples, arguments.sample_id
+        assert len(samples) == len(set(arguments.sample_id)), arguments.sample_id
     else:
         pass
     reference_directory = (
