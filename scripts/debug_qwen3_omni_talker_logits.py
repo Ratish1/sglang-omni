@@ -121,6 +121,36 @@ def main() -> None:
                 chosen_token = int(native["codec_ids"][0, 0])
                 allowed_ids = token_ids[allowed]
                 chosen_column = int((allowed_ids == chosen_token).nonzero()[0])
+                codes = native["codec_ids"].to(reference.device)
+                predictor_embeddings = [
+                    native_hidden_states[:, None],
+                    reference.model.codec_embedding(codes[:, :1]),
+                ]
+                for group in range(config.num_code_groups - 2):
+                    predictor_embeddings.append(
+                        reference.code_predictor.model.codec_embedding[group](
+                            codes[:, group + 1 : group + 2]
+                        )
+                    )
+                predictor_output = reference.code_predictor.model(
+                    inputs_embeds=torch.cat(predictor_embeddings, dim=1),
+                    use_cache=False,
+                ).last_hidden_state
+                predictor_logits = torch.stack(
+                    [
+                        head(predictor_output[:, group + 1])
+                        for group, head in enumerate(reference.code_predictor.lm_head)
+                    ],
+                    dim=1,
+                ).float()
+                assert torch.isfinite(predictor_logits).all()
+                selected_logits = predictor_logits.gather(
+                    -1, codes[:, 1:, None]
+                ).squeeze(-1)
+                predictor_argmax = predictor_logits.argmax(dim=-1)
+                predictor_ranks = (predictor_logits > selected_logits[:, :, None]).sum(
+                    dim=-1
+                ) + 1
                 report = {
                     "trace_file": after_file.name,
                     "native_logits_source": (
@@ -162,6 +192,12 @@ def main() -> None:
                         ).sum()
                     )
                     + 1,
+                    "native_residual_codes": codes[0, 1:].tolist(),
+                    "reference_predictor_argmax": predictor_argmax[0].tolist(),
+                    "native_residual_reference_ranks": predictor_ranks[0].tolist(),
+                    "native_residual_reference_logit_gaps": (
+                        predictor_logits.max(dim=-1).values - selected_logits
+                    )[0].tolist(),
                 }
                 frames.append(report)
             report = {"trace_directory": str(directory), "frames": frames}
