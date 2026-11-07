@@ -32,7 +32,9 @@ def main() -> None:
     parser.add_argument("--gpu", type=int, required=True)
     parser.add_argument("--asr-port", type=int, required=True)
     parser.add_argument("--asr-model", default=QWEN3_ASR_MODEL_PATH)
-    parser.add_argument("--target-text", required=True)
+    target_arguments = parser.add_mutually_exclusive_group(required=True)
+    target_arguments.add_argument("--target-text")
+    target_arguments.add_argument("--targets-file", type=Path)
     parser.add_argument("--sample-rate", type=int, required=True)
     parser.add_argument("--output-directory", type=Path, required=True)
     arguments = parser.parse_args()
@@ -52,6 +54,11 @@ def main() -> None:
     assert not loading["missing_keys"], loading["missing_keys"]
     assert not loading["mismatched_keys"], loading["mismatched_keys"]
     reference.eval()
+    target_text_by_request = (
+        json.loads(arguments.targets_file.read_text())
+        if arguments.targets_file is not None
+        else {}
+    )
     reports = []
     with torch.inference_mode():
         for trace_directory in arguments.trace_directory:
@@ -69,9 +76,16 @@ def main() -> None:
             waveform = reference(codes).float().reshape(-1).cpu().numpy()
             assert torch.isfinite(torch.from_numpy(waveform)).all()
             wav_bytes = encode_wav(waveform, arguments.sample_rate)
-            destination = (
-                arguments.output_directory / f"{trace_directory.parent.name}.wav"
-            )
+            if arguments.targets_file is None:
+                destination = (
+                    arguments.output_directory / f"{trace_directory.parent.name}.wav"
+                )
+                target_text = arguments.target_text
+            else:
+                case_directory = arguments.output_directory / trace_directory.name
+                case_directory.mkdir(exist_ok=True)
+                destination = case_directory / f"{trace_directory.parent.name}.wav"
+                target_text = target_text_by_request[trace_directory.name]
             destination.write_bytes(wav_bytes)
             hypothesis = transcribe(
                 load_router_asr(arguments.asr_port, arguments.asr_model),
@@ -82,7 +96,7 @@ def main() -> None:
             score = apply_wer(
                 SampleOutput(
                     sample_id=trace_directory.parent.name,
-                    target_text=arguments.target_text,
+                    target_text=target_text,
                     audio_duration_s=len(waveform) / arguments.sample_rate,
                 ),
                 hypothesis,
