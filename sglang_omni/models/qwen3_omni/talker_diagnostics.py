@@ -187,6 +187,9 @@ class TalkerStateObserver:
                 if not passed
             ],
             "main_codes_match_request_output": codes[:, 0].tolist() == output_ids,
+            "request_output_ids": list(output_ids),
+            "codec_main_ids": codes[:, 0].tolist(),
+            "finish_reason": request_data.finish_reason,
         }
         (self.directory / f"{request_id}.json").write_text(json.dumps(report, indent=2))
         torch.save(codes, self.directory / f"{request_id}.pt")
