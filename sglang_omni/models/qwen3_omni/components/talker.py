@@ -353,7 +353,19 @@ class Qwen3OmniMoeTalkerSparseMoeBlock(Qwen3OmniMoeThinkerTextSparseMoeBlock):
         shared_output = shared_output * torch.sigmoid(shared_gate)
 
         # --- Routed experts (no all-reduce yet) ---
-        router_logits, _ = self.gate(linear_hidden_states)
+        if (
+            current_platform.is_cuda()
+            and linear_hidden_states.is_cuda
+            and linear_hidden_states.dtype == torch.bfloat16
+            and self.gate.weight.dtype == torch.bfloat16
+            and self.experts.w13_weight.dtype == torch.bfloat16
+        ):
+            # note (ratish): BF16 output rounding can tie the top-k cutoff.
+            router_logits = torch.mm(
+                linear_hidden_states, self.gate.weight.t(), out_dtype=torch.float32
+            )
+        else:
+            router_logits, _ = self.gate(linear_hidden_states)
         topk_output = self.topk(linear_hidden_states, router_logits)
         routed_output = self.experts(linear_hidden_states, topk_output)
 
