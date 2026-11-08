@@ -15,6 +15,7 @@ from sglang_omni.models.qwen3_omni.components.talker import (
     PredictorDecodeGraph,
     Qwen3OmniTalker,
 )
+from sglang_omni.models.qwen3_omni.corpus_numerics import PredictorNumerics
 from sglang_omni.models.qwen3_omni.stages import create_talker_ar_executor_from_config
 from sglang_omni.vendor.sglang.layers import ReplicatedLinear
 
@@ -67,6 +68,7 @@ class CorpusReplay:
         self.router_weights = [
             layer.mlp.gate.weight.double() for layer in native.model.layers
         ]
+        self.numerics = PredictorNumerics(native)
 
     def replay(
         self,
@@ -227,6 +229,7 @@ class CorpusReplay:
                         measurements[f"dense.{name}.{group}.{layer}.norm"] = norms[
                             group, layer
                         ]
+        measurements.update(self.numerics.measure(dense, metadata.live_rows))
         return checks, {name: values.cpu() for name, values in measurements.items()}
 
 
