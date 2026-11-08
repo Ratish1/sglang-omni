@@ -46,6 +46,10 @@ def main() -> None:
                     map_location="cpu",
                     mmap=True,
                 )
+                assert torch.equal(
+                    saved["codes"][row],
+                    torch.tensor(request.codes[frame], dtype=saved["codes"].dtype),
+                )
                 # note (ratish): clones prevent serialization of the original batch storage.
                 snapshots = {
                     name: tensor[row : row + 1].clone()
