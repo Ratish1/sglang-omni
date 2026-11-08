@@ -26,6 +26,8 @@ from sglang_omni.vendor.sglang.layers import ReplicatedLinear
 @dataclass(kw_only=True)
 class PredictorLogits:
     tensors: list[torch.Tensor] = field(default_factory=list)
+    hidden_states: list[torch.Tensor] = field(default_factory=list)
+    unrounded_logits: list[torch.Tensor] = field(default_factory=list)
 
     def record(
         self,
@@ -33,7 +35,16 @@ class PredictorLogits:
         inputs: tuple[torch.Tensor],
         output: tuple[torch.Tensor, torch.Tensor | None],
     ) -> None:
+        assert module.bias is None
         self.tensors.append(output[0].clone())
+        self.hidden_states.append(inputs[0].clone())
+        self.unrounded_logits.append(
+            torch.mm(
+                inputs[0].reshape(-1, module.weight.shape[1]),
+                module.weight.T,
+                out_dtype=torch.float32,
+            ).reshape_as(output[0])
+        )
 
 
 def teacher_forced_logits(
@@ -154,6 +165,8 @@ def main() -> None:
                 codes = saved_codes[frame : frame + 1]
                 assert int(codes[0, 0]) != config.codec_eos_token_id
                 capture.tensors.clear()
+                capture.hidden_states.clear()
+                capture.unrounded_logits.clear()
                 native_codes, _ = native.code_predictor_forward_incremental_eager(
                     codes[:, :1], hidden_row[None]
                 )
@@ -166,6 +179,8 @@ def main() -> None:
                 )
                 assert len(capture.tensors) == config.num_code_groups - 1
                 native_logits = torch.cat(capture.tensors, dim=1).float()
+                predictor_hidden_states = torch.cat(capture.hidden_states, dim=1)
+                unrounded_logits = torch.cat(capture.unrounded_logits, dim=1)
                 assert torch.equal(native_logits.argmax(-1), codes[:, 1:])
                 assert torch.equal(
                     teacher_forced_logits(native, codes, hidden_row), native_logits
@@ -222,6 +237,23 @@ def main() -> None:
                         {
                             "group": group + 1,
                             "native_code": int(codes[0, group + 1]),
+                            "unrounded_native_code": int(
+                                unrounded_logits[0, group].argmax()
+                            ),
+                            "native_tied_maxima": int(
+                                (
+                                    native_logits[0, group]
+                                    == native_logits[0, group].max()
+                                ).sum()
+                            ),
+                            "unrounded_output_rounds_to_native": bool(
+                                torch.equal(
+                                    unrounded_logits[0, group]
+                                    .to(native.model.codec_embedding.weight.dtype)
+                                    .float(),
+                                    native_logits[0, group],
+                                )
+                            ),
                             "plain_native_code": int(plain_logits[0, group].argmax()),
                             "reference_bfloat16_code": int(
                                 reference_logits[0][0, group].argmax()
@@ -240,6 +272,8 @@ def main() -> None:
                 torch.save(
                     {
                         "native_logits": native_logits.cpu(),
+                        "native_predictor_hidden_states": predictor_hidden_states.cpu(),
+                        "native_unrounded_logits": unrounded_logits.cpu(),
                         "plain_logits": plain_logits.cpu(),
                         "reference_bfloat16_logits": reference_logits[0].cpu(),
                         "reference_float32_logits": reference_logits[1].cpu(),
