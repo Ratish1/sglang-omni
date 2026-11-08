@@ -65,6 +65,27 @@ class FullPrefixKVObserver:
             len(self.attention_tensors),
             pool.layer_num,
         )
+        self.operator_tensors = {
+            name: buffer
+            for name, buffer in runner.model.named_buffers()
+            if name.rsplit(".", 1)[-1]
+            in {
+                "diagnostic_attention_input",
+                "diagnostic_qkv_projection",
+                "diagnostic_attention_projection",
+                "diagnostic_moe_input",
+                "diagnostic_moe_router_logits",
+                "diagnostic_moe_experts",
+                "diagnostic_moe_weights",
+                "diagnostic_moe_shared_output",
+                "diagnostic_moe_routed_output",
+                "diagnostic_moe_output",
+            }
+        }
+        if stage == "QwenTalkerModelRunner":
+            assert len(self.operator_tensors) == 10 * pool.layer_num
+        else:
+            assert not self.operator_tensors
         metadata = {
             "pool_class": type(pool).__name__,
             "allocator_class": type(runner.token_to_kv_pool_allocator).__name__,
@@ -279,6 +300,12 @@ class FullPrefixKVObserver:
                 else:
                     pass
                 if len(requests) == 1:
+                    snapshot.update(
+                        {
+                            name: tensor.clone()
+                            for name, tensor in self.operator_tensors.items()
+                        }
+                    )
                     snapshot.update(
                         {
                             name: tensor.clone()

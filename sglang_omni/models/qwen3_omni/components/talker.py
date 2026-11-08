@@ -13,6 +13,7 @@ import torch
 from sglang.kernels.fused_op import get_fused_op_backend
 from sglang.kernels.spec import KernelBackend
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+from sglang.srt.layers.moe.topk import StandardTopKOutput
 from sglang.srt.model_executor.runner_utils.capture_mode import get_is_capture_mode
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.runtime_context import get_context, get_schedule
@@ -335,6 +336,7 @@ class Qwen3OmniMoeTalkerSparseMoeBlock(Qwen3OmniMoeThinkerTextSparseMoeBlock):
             quant_config=None,
             prefix=add_prefix("shared_expert_gate", prefix),
         )
+        self.register_buffer("diagnostic_moe_query_index", None, persistent=False)
 
     def forward(
         self,
@@ -347,6 +349,15 @@ class Qwen3OmniMoeTalkerSparseMoeBlock(Qwen3OmniMoeThinkerTextSparseMoeBlock):
         linear_dtype = self.shared_expert_gate.weight.dtype
         if linear_hidden_states.dtype != linear_dtype:
             linear_hidden_states = linear_hidden_states.to(dtype=linear_dtype)
+        else:
+            pass
+
+        if self.diagnostic_moe_query_index is not None:
+            self.diagnostic_moe_input.copy_(
+                linear_hidden_states.index_select(
+                    0, self.diagnostic_moe_query_index
+                ).view(-1)
+            )
         else:
             pass
 
@@ -371,9 +382,33 @@ class Qwen3OmniMoeTalkerSparseMoeBlock(Qwen3OmniMoeThinkerTextSparseMoeBlock):
         else:
             router_logits, _ = self.gate(linear_hidden_states)
         topk_output = self.topk(linear_hidden_states, router_logits)
+        if self.diagnostic_moe_query_index is not None:
+            assert isinstance(topk_output, StandardTopKOutput)
+            for destination, source in (
+                (self.diagnostic_moe_router_logits, router_logits),
+                (self.diagnostic_moe_experts, topk_output.topk_ids),
+                (self.diagnostic_moe_weights, topk_output.topk_weights),
+                (self.diagnostic_moe_shared_output, shared_output),
+            ):
+                destination.copy_(
+                    source.index_select(0, self.diagnostic_moe_query_index).view(-1)
+                )
+        else:
+            pass
         routed_output = self.experts(linear_hidden_states, topk_output)
 
         final_hidden_states = routed_output + shared_output
+        if self.diagnostic_moe_query_index is not None:
+            self.diagnostic_moe_routed_output.copy_(
+                routed_output.index_select(0, self.diagnostic_moe_query_index).view(-1)
+            )
+            self.diagnostic_moe_output.copy_(
+                final_hidden_states.index_select(
+                    0, self.diagnostic_moe_query_index
+                ).view(-1)
+            )
+        else:
+            pass
         return final_hidden_states.view(num_tokens, hidden_dim)
 
 
@@ -458,7 +493,7 @@ class Qwen3OmniMoeTalkerTextModel(nn.Module):
             self.layers[idx].self_attn.use_fused_qk_norm_rope = False
             self.layers[idx].self_attn.compatible_with_fused_qk_norm_rope = False
 
-        install_kv_write_observers(self.layers)
+        install_kv_write_observers(self.layers, capture_moe=True)
 
     def get_input_embeddings(self) -> nn.Embedding:
         return self.codec_embedding

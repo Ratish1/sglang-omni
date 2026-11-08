@@ -10,7 +10,37 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_context import get_token_to_kv_pool
 from torch import nn
 
-from sglang_omni.vendor.sglang.layers import ReplicatedLinear
+from sglang_omni.vendor.sglang.layers import (
+    QKVParallelLinear,
+    ReplicatedLinear,
+    RowParallelLinear,
+)
+
+
+class ProjectionSnapshotHook:
+    def __init__(
+        self,
+        query_index: torch.Tensor,
+        input_snapshot: torch.Tensor | None,
+        output_snapshot: torch.Tensor,
+    ) -> None:
+        self.query_index = query_index
+        self.input_snapshot = input_snapshot
+        self.output_snapshot = output_snapshot
+
+    def __call__(
+        self,
+        linear: QKVParallelLinear | RowParallelLinear,
+        arguments: tuple[torch.Tensor],
+        output: tuple[torch.Tensor, torch.Tensor | None],
+    ) -> None:
+        if self.input_snapshot is not None:
+            self.input_snapshot.copy_(
+                arguments[0].index_select(0, self.query_index).view(-1)
+            )
+        else:
+            pass
+        self.output_snapshot.copy_(output[0].index_select(0, self.query_index).view(-1))
 
 
 class CodecLogitHook:
@@ -65,7 +95,9 @@ class KVWriteHook:
         )
 
 
-def install_kv_write_observers(layers: nn.ModuleList) -> None:
+def install_kv_write_observers(
+    layers: nn.ModuleList, *, capture_moe: bool = False
+) -> None:
     if os.environ.get("SGLANG_OMNI_DIAGNOSTIC_KV_DIRECTORY") is None:
         return
     else:
@@ -102,3 +134,58 @@ def install_kv_write_observers(layers: nn.ModuleList) -> None:
             persistent=False,
         )
         attention.register_forward_hook(KVWriteHook())
+        if capture_moe:
+            hidden_size = layer.config.hidden_size
+            for name, width in (
+                ("diagnostic_attention_input", hidden_size),
+                ("diagnostic_qkv_projection", layer.self_attn.qkv_proj.weight.shape[0]),
+                ("diagnostic_attention_projection", hidden_size),
+            ):
+                attention.register_buffer(
+                    name,
+                    torch.zeros(width, dtype=torch.bfloat16, device=device),
+                    persistent=False,
+                )
+            layer.self_attn.qkv_proj.register_forward_hook(
+                ProjectionSnapshotHook(
+                    attention.diagnostic_query_index,
+                    attention.diagnostic_attention_input,
+                    attention.diagnostic_qkv_projection,
+                )
+            )
+            layer.self_attn.o_proj.register_forward_hook(
+                ProjectionSnapshotHook(
+                    attention.diagnostic_query_index,
+                    None,
+                    attention.diagnostic_attention_projection,
+                )
+            )
+            layer.mlp.diagnostic_moe_query_index = attention.diagnostic_query_index
+            for name, width, dtype in (
+                ("diagnostic_moe_input", hidden_size, torch.bfloat16),
+                (
+                    "diagnostic_moe_router_logits",
+                    layer.config.num_experts,
+                    torch.float32,
+                ),
+                (
+                    "diagnostic_moe_experts",
+                    layer.config.num_experts_per_tok,
+                    torch.int32,
+                ),
+                (
+                    "diagnostic_moe_weights",
+                    layer.config.num_experts_per_tok,
+                    torch.float32,
+                ),
+                ("diagnostic_moe_shared_output", hidden_size, torch.bfloat16),
+                ("diagnostic_moe_routed_output", hidden_size, torch.bfloat16),
+                ("diagnostic_moe_output", hidden_size, torch.bfloat16),
+            ):
+                layer.mlp.register_buffer(
+                    name,
+                    torch.zeros(width, dtype=dtype, device=device),
+                    persistent=False,
+                )
+        else:
+            pass
