@@ -156,6 +156,13 @@ class CorpusReplay:
             sequential_feedback.cpu(), expected_feedback
         )
         measurements: dict[str, torch.Tensor] = {}
+        for name, tensor in snapshots.items():
+            if tensor.is_floating_point():
+                rows = tensor[: metadata.live_rows].float()
+                measurements[f"boundary.{name}.finite"] = rows.isfinite().all(-1)
+                measurements[f"boundary.{name}.norm"] = rows.norm(dim=-1)
+            else:
+                pass
         for group, weight in enumerate(self.head_weights):
             recorded = snapshots[f"predictor.{group}.output"][
                 : metadata.live_rows
@@ -203,6 +210,13 @@ class CorpusReplay:
             measurements[f"router.{layer}.weights_finite"] = (
                 snapshots[f"{prefix}.expert_weights"].isfinite().all(-1).cuda()
             )
+            shared = snapshots[f"{prefix}.shared"].cuda()
+            shared_gate = snapshots[f"{prefix}.shared_gate.output"].cuda()
+            routed = snapshots[f"{prefix}.routed"].cuda()
+            combined = snapshots[f"{prefix}.combined"].cuda()
+            measurements[f"router.{layer}.combined_branches_exact"] = (
+                combined == routed + shared * shared_gate.sigmoid()
+            ).all(-1)
         dense = tensors["dense"]
         assert isinstance(dense, dict)
         for name, tensor in dense.items():
