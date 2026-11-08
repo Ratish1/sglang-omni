@@ -13,6 +13,7 @@ import torch
 from sglang.srt.layers.moe.utils import MoeRunnerBackend
 from sglang.srt.managers.schedule_batch import ReqKvInfo
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.sampling.penaltylib.repetition_penalty import apply_scaling_penalties
 from sglang.srt.utils import DynamicGradMode
 from sglang.srt.utils.common import is_flashinfer_available
@@ -221,12 +222,13 @@ def test_talker_prefill_keeps_default_first_expert_projection_and_restores_tunin
     wrapper = Qwen3OmniTalker.__new__(Qwen3OmniTalker)
     nn.Module.__init__(wrapper)
     wrapper.model = backbone
-    wrapper.prepare_before_cuda_graph_capture(
-        Mock(
-            spec=talker_module.SGLangModelRunner,
-            max_running_requests=maximum_running_requests,
+    with get_parallel().override(attn_dp_enabled=False, disable_attn_tp_gather=True):
+        wrapper.prepare_before_cuda_graph_capture(
+            Mock(
+                spec=talker_module.SGLangModelRunner,
+                max_running_requests=maximum_running_requests,
+            )
         )
-    )
     hidden_states = torch.zeros(input_rows, 2)
 
     with autotune(False, skip_ops={"unrelated"}):
