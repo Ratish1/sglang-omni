@@ -12,6 +12,10 @@ import torch.nn.functional as functional
 from huggingface_hub import snapshot_download
 from safetensors import safe_open
 from transformers import Qwen3OmniMoeConfig
+from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import (
+    Qwen3OmniMoeTalkerRotaryEmbedding,
+    apply_rotary_pos_emb,
+)
 
 from scripts.debug_qwen3_omni_expert_corpus import compare_outputs
 from sglang_omni.models.qwen3_omni.corpus_diagnostics import StepMetadata
@@ -30,6 +34,7 @@ def main() -> None:
         arguments.model_path, revision=arguments.model_revision
     ).talker_config.text_config
     assert config.sliding_window is None
+    checkpoint_rotary = Qwen3OmniMoeTalkerRotaryEmbedding(config).cuda()
     model_directory = Path(
         snapshot_download(
             arguments.model_path,
@@ -63,6 +68,8 @@ def main() -> None:
                 "self_attn.k_proj.weight",
                 "self_attn.v_proj.weight",
                 "self_attn.o_proj.weight",
+                "self_attn.q_norm.weight",
+                "self_attn.k_norm.weight",
                 "mlp.shared_expert.gate_proj.weight",
                 "mlp.shared_expert.up_proj.weight",
                 "mlp.shared_expert.down_proj.weight",
@@ -99,6 +106,7 @@ def main() -> None:
             checked_rows = 0
             exact_projection_rows = {name: 0 for name in projections}
             maximum_attention_relative = 0.0
+            maximum_rotated_relative = {name: 0.0 for name in ("query", "key")}
             for metadata in prefill_steps:
                 saved = torch.load(
                     arguments.capture_directory / f"experts-{metadata.step:06d}.pt",
@@ -124,6 +132,45 @@ def main() -> None:
                         "maximum_relative_l2": float(metrics["relative_l2"].max()),
                         "maximum_absolute": float(metrics["max_absolute"].max()),
                     }
+                projected_queries, projected_keys, _ = (
+                    snapshots[observed + "qkv.output"][:real_rows]
+                    .cuda()
+                    .split((query_width, key_width, key_width), dim=-1)
+                )
+                normalized = []
+                for name, projected in (
+                    ("q", projected_queries),
+                    ("k", projected_keys),
+                ):
+                    projected = projected.reshape(real_rows, -1, config.head_dim)
+                    normalized_float = (
+                        projected.float()
+                        * (
+                            projected.float().square().mean(-1, keepdim=True)
+                            + config.rms_norm_eps
+                        ).rsqrt()
+                    )
+                    normalized.append(
+                        (
+                            normalized_float.to(projected.dtype)
+                            * weights[f"self_attn.{name}_norm.weight"]
+                        ).transpose(0, 1)[None]
+                    )
+                positions = saved["mrope_positions"].cuda()
+                assert positions.shape == (3, real_rows)
+                cosine, sine = checkpoint_rotary(projected_queries, positions[:, None])
+                rotated = apply_rotary_pos_emb(*normalized, cosine, sine)
+                rotated_metrics = {}
+                for name, expected in zip(("query", "key"), rotated, strict=True):
+                    expected = expected[0].transpose(0, 1).reshape(real_rows, -1)
+                    actual = snapshots[observed + name][:real_rows].cuda()
+                    metrics = compare_outputs(actual, expected)
+                    assert metrics["finite"].all()
+                    maximum_rotated_relative[name] = max(
+                        maximum_rotated_relative[name],
+                        float(metrics["relative_l2"].max()),
+                    )
+                    rotated_metrics[name] = metrics
                 offset = 0
                 for row, request_id in enumerate(metadata.request_ids):
                     extend_length = saved["extend_lengths"][row]
@@ -210,6 +257,14 @@ def main() -> None:
                         "real_rows": extend_length,
                         "prefix_rows": prefix_length,
                         "projection_metrics": projection_metrics,
+                        "checkpoint_normalized_rotated_relative_l2": {
+                            name: metrics["relative_l2"][selected].cpu().tolist()
+                            for name, metrics in rotated_metrics.items()
+                        },
+                        "checkpoint_normalized_rotated_maximum_absolute": {
+                            name: metrics["max_absolute"][selected].cpu().tolist()
+                            for name, metrics in rotated_metrics.items()
+                        },
                         "attention_relative_l2": metrics["relative_l2"].cpu().tolist(),
                         "attention_maximum_absolute": metrics["max_absolute"]
                         .cpu()
@@ -227,6 +282,9 @@ def main() -> None:
                     "real_rows": checked_rows,
                     "exact_projection_rows": exact_projection_rows,
                     "maximum_attention_relative_l2": maximum_attention_relative,
+                    "maximum_checkpoint_normalized_rotated_relative_l2": (
+                        maximum_rotated_relative
+                    ),
                 }
             )
             (arguments.output_directory / "summary.json").write_text(
