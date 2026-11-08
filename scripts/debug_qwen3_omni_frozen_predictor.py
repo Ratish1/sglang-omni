@@ -18,6 +18,7 @@ from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import (
     Qwen3OmniMoeTalkerForConditionalGeneration,
 )
 
+from sglang_omni.models.qwen3_omni.components.talker import Qwen3OmniTalker
 from sglang_omni.models.qwen3_omni.stages import create_talker_ar_executor_from_config
 from sglang_omni.vendor.sglang.layers import ReplicatedLinear
 
@@ -33,6 +34,31 @@ class PredictorLogits:
         output: tuple[torch.Tensor, torch.Tensor | None],
     ) -> None:
         self.tensors.append(output[0].clone())
+
+
+def teacher_forced_logits(
+    native: Qwen3OmniTalker, codes: torch.Tensor, hidden_row: torch.Tensor
+) -> torch.Tensor:
+    embeddings = torch.cat(
+        (hidden_row.view(1, 1, -1), native.model.codec_embedding(codes[:, :1])), dim=1
+    )
+    cache_length = 0
+    logits = []
+    for group in range(native.config.num_code_groups - 1):
+        hidden_states = native.predictor_forward_tokens(
+            token_embeds=embeddings, batch_size=1, cache_len=cache_length
+        )
+        logits.append(
+            native.code_predictor.lm_head[group](hidden_states[:, -1:])[0].clone()
+        )
+        cache_length += embeddings.shape[1]
+        if group < native.config.num_code_groups - 2:
+            embeddings = native.code_predictor.model.codec_embedding[group](
+                codes[:, group + 1 : group + 2]
+            )
+        else:
+            pass
+    return torch.cat(logits, dim=1).float()
 
 
 def main() -> None:
@@ -141,6 +167,14 @@ def main() -> None:
                 assert len(capture.tensors) == config.num_code_groups - 1
                 native_logits = torch.cat(capture.tensors, dim=1).float()
                 assert torch.equal(native_logits.argmax(-1), codes[:, 1:])
+                assert torch.equal(
+                    teacher_forced_logits(native, codes, hidden_row), native_logits
+                )
+                fused_layers = native.predictor_fused_layers
+                assert fused_layers is not None
+                native.predictor_fused_layers = None
+                plain_logits = teacher_forced_logits(native, codes, hidden_row)
+                native.predictor_fused_layers = fused_layers
                 embeddings = [
                     hidden_row.view(1, 1, -1),
                     reference.model.codec_embedding(codes[:, :1]),
@@ -180,10 +214,15 @@ def main() -> None:
                         (reference_logits[0] - reference_logits[1]).norm()
                         / reference_logits[1].norm()
                     ),
+                    "plain_float32_relative_l2": float(
+                        (plain_logits - reference_logits[1]).norm()
+                        / reference_logits[1].norm()
+                    ),
                     "groups": [
                         {
                             "group": group + 1,
                             "native_code": int(codes[0, group + 1]),
+                            "plain_native_code": int(plain_logits[0, group].argmax()),
                             "reference_bfloat16_code": int(
                                 reference_logits[0][0, group].argmax()
                             ),
@@ -201,6 +240,7 @@ def main() -> None:
                 torch.save(
                     {
                         "native_logits": native_logits.cpu(),
+                        "plain_logits": plain_logits.cpu(),
                         "reference_bfloat16_logits": reference_logits[0].cpu(),
                         "reference_float32_logits": reference_logits[1].cpu(),
                         "codes": codes.cpu(),
