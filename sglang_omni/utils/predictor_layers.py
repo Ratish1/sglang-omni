@@ -1134,6 +1134,12 @@ class FusedPredictorLayers:
                 self.corpus_buffers["input"][group_index, layer_idx, :batch_size].copy_(
                     hidden.view(batch_size, num_tokens, -1)[:, -1]
                 )
+                if cache_len == 0:
+                    self.corpus_buffers["opening_input"][layer_idx, :batch_size].copy_(
+                        hidden.view(batch_size, num_tokens, -1)[:, 0]
+                    )
+                else:
+                    pass
             else:
                 pass
             attention_inputs(
@@ -1155,6 +1161,12 @@ class FusedPredictorLayers:
                 self.corpus_buffers["query"][group_index, layer_idx, :batch_size].copy_(
                     q_out.view(batch_size, num_tokens, -1)[:, -1]
                 )
+                if cache_len == 0:
+                    self.corpus_buffers["opening_query"][layer_idx, :batch_size].copy_(
+                        q_out.view(batch_size, num_tokens, -1)[:, 0]
+                    )
+                else:
+                    pass
                 self.corpus_buffers["keys"][
                     group_index, layer_idx, :batch_size, :num_tokens
                 ].copy_(
@@ -1179,6 +1191,12 @@ class FusedPredictorLayers:
                 self.corpus_buffers["attention"][
                     group_index, layer_idx, :batch_size
                 ].copy_(attention_output.view(batch_size, num_tokens, -1)[:, -1])
+                if cache_len == 0:
+                    self.corpus_buffers["opening_attention"][
+                        layer_idx, :batch_size
+                    ].copy_(attention_output.view(batch_size, num_tokens, -1)[:, 0])
+                else:
+                    pass
             else:
                 pass
             o_proj_add(
@@ -1199,6 +1217,12 @@ class FusedPredictorLayers:
                 self.corpus_buffers["attention_residual"][
                     group_index, layer_idx, :batch_size
                 ].copy_(residual.view(batch_size, num_tokens, -1)[:, -1])
+                if cache_len == 0:
+                    self.corpus_buffers["opening_attention_residual"][
+                        layer_idx, :batch_size
+                    ].copy_(residual.view(batch_size, num_tokens, -1)[:, 0])
+                else:
+                    pass
             else:
                 pass
             mlp_up(
@@ -1213,6 +1237,12 @@ class FusedPredictorLayers:
                 self.corpus_buffers["activation"][
                     group_index, layer_idx, :batch_size
                 ].copy_(activated.view(batch_size, num_tokens, -1)[:, -1])
+                if cache_len == 0:
+                    self.corpus_buffers["opening_activation"][
+                        layer_idx, :batch_size
+                    ].copy_(activated.view(batch_size, num_tokens, -1)[:, 0])
+                else:
+                    pass
             else:
                 pass
             down_add(
@@ -1228,7 +1258,13 @@ class FusedPredictorLayers:
                 self.corpus_buffers["mlp_residual"][
                     group_index, layer_idx, :batch_size
                 ].copy_(residual.view(batch_size, num_tokens, -1)[:, -1])
-                self.corpus_buffers["seen"][group_index, layer_idx] = True
+                if cache_len == 0:
+                    self.corpus_buffers["opening_mlp_residual"][
+                        layer_idx, :batch_size
+                    ].copy_(residual.view(batch_size, num_tokens, -1)[:, 0])
+                else:
+                    pass
+                self.corpus_buffers["seen"][group_index, layer_idx].fill_(True)
             else:
                 pass
         normed = final_norm(residual)

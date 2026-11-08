@@ -208,6 +208,13 @@ class TalkerCorpusRecorder:
                 device=device,
                 dtype=torch.bfloat16,
             )
+            self.dense_snapshots[f"opening_{name}"] = torch.zeros(
+                predictor_layers,
+                max_batch_size,
+                width,
+                device=device,
+                dtype=torch.bfloat16,
+            )
         for name in ("keys", "values"):
             self.dense_snapshots[name] = torch.zeros(
                 group_count,
@@ -375,12 +382,14 @@ class TalkerCorpusRecorder:
             for name, count in counts.items()
             if not name.startswith("predictor.")
         ), counts
-        dense = {
-            name: (
-                tensor.cpu() if name == "seen" else tensor[:, :, :predictor_batch].cpu()
-            )
-            for name, tensor in self.dense_snapshots.items()
-        }
+        dense: dict[str, torch.Tensor] = {}
+        for name, tensor in self.dense_snapshots.items():
+            if name == "seen":
+                dense[name] = tensor.cpu()
+            elif name.startswith("opening_"):
+                dense[name] = tensor[:, :predictor_batch].cpu()
+            else:
+                dense[name] = tensor[:, :, :predictor_batch].cpu()
         metadata = {
             "step": self.step_index,
             "phase": forward_batch.forward_mode.name,
