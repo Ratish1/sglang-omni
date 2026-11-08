@@ -33,7 +33,7 @@ def main() -> None:
     parser.add_argument("--evidence-directory", type=Path, required=True)
     parser.add_argument("--control-directory", type=Path, required=True)
     parser.add_argument("--score-directory", type=Path, required=True)
-    parser.add_argument("--arm", required=True)
+    parser.add_argument("--arm", action="append", required=True)
     parser.add_argument("--asr-model", required=True)
     parser.add_argument("--asr-port", type=int, required=True)
     parser.add_argument("--output-directory", type=Path, required=True)
@@ -57,43 +57,42 @@ def main() -> None:
     }
     control_ids = {record.request_id for record in controls}
     for workload in ("tts", "mmsu"):
-        directory = (
-            arguments.evidence_directory / f"qualification-{arguments.arm}-{workload}"
-        )
-        if workload == "tts":
-            directory = directory / "round-1"
-        else:
-            pass
-        scores = json.loads(
-            (arguments.score_directory / f"{arguments.arm}-{workload}.json").read_text()
-        )
         selected = {
             record["sample_id"]
-            for record in scores["per_sample"]
+            for arm in arguments.arm
+            for record in json.loads(
+                (arguments.score_directory / f"{arm}-{workload}.json").read_text()
+            )["per_sample"]
             if record["spoken_score"]["wer"] > 0.5
         }
-        for path in directory.glob("*.response.json"):
-            record = json.loads(path.read_text())
-            if (
-                record["sample_id"] not in selected
-                and record["request_id"] not in control_ids
-            ):
-                continue
+        for arm in arguments.arm:
+            directory = arguments.evidence_directory / f"qualification-{arm}-{workload}"
+            if workload == "tts":
+                directory = directory / "round-1"
             else:
                 pass
-            message = record["response"]["choices"][0]["message"]
-            if workload == "tts":
-                waveform_path = Path(message["audio"]["wav_path"])
-                expected_hash = message["audio"]["sha256"]
-            else:
-                waveform_path = Path(record["result"]["wav_path"])
-                expected_hash = record["waveform_sha256"]
-            cases[waveform_path] = AudioCase(
-                label=f"{workload}:{record['sample_id']}",
-                waveform_path=waveform_path,
-                waveform_sha256=expected_hash,
-                returned_text=message["content"],
-            )
+            for path in directory.glob("*.response.json"):
+                record = json.loads(path.read_text())
+                if (
+                    record["sample_id"] not in selected
+                    and record["request_id"] not in control_ids
+                ):
+                    continue
+                else:
+                    pass
+                message = record["response"]["choices"][0]["message"]
+                if workload == "tts":
+                    waveform_path = Path(message["audio"]["wav_path"])
+                    expected_hash = message["audio"]["sha256"]
+                else:
+                    waveform_path = Path(record["result"]["wav_path"])
+                    expected_hash = record["waveform_sha256"]
+                cases[waveform_path] = AudioCase(
+                    label=f"{arm}:{workload}:{record['sample_id']}",
+                    waveform_path=waveform_path,
+                    waveform_sha256=expected_hash,
+                    returned_text=message["content"],
+                )
     asr = load_router_asr(arguments.asr_port, arguments.asr_model)
     results = []
     for case in cases.values():
