@@ -7,10 +7,6 @@ import torch
 from sglang.srt.layers.sampler import multinomial_with_seed
 from transformers.generation.logits_process import TopKLogitsWarper, TopPLogitsWarper
 
-from sglang_omni.sampling.sampler_compile import (
-    SamplerCompileForms,
-    compile_sampler_functions,
-)
 from sglang_omni.sampling.seed import derive_sampling_seed, resolve_row_seed
 from sglang_omni.scheduling.sglang_backend.request_data import SGLangARRequestData
 from sglang_omni.scheduling.types import SchedulerRequest
@@ -23,11 +19,7 @@ class ResidualCodeSampler:
     """Keep each request's residual draws independent of batching and replay."""
 
     def __init__(
-        self,
-        max_batch_size: int,
-        num_code_groups: int,
-        device: torch.device,
-        vocab_size: int,
+        self, max_batch_size: int, num_code_groups: int, device: torch.device
     ) -> None:
         self.residual_group_count = num_code_groups - 1
         self.sampling_state = torch.zeros(
@@ -39,13 +31,6 @@ class ResidualCodeSampler:
         self.greedy_rows.fill_(1)
         self.top_k = TopKLogitsWarper(RESIDUAL_TOP_K)
         self.top_p = TopPLogitsWarper(RESIDUAL_TOP_P)
-        compile_sampler_functions(
-            SamplerCompileForms(
-                device=device,
-                vocab_size=vocab_size,
-                seeded_log_probability_dtype=torch.float64,
-            )
-        )
 
     def prepare(self, requests: list[SchedulerRequest]) -> None:
         request_seeds: list[int] = []
@@ -73,6 +58,7 @@ class ResidualCodeSampler:
             )
         )
 
+    @torch.inference_mode()
     def sample(
         self,
         logits: torch.Tensor,

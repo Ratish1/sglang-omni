@@ -881,12 +881,7 @@ class Qwen3OmniTalker(nn.Module):
         server_args = get_context().server_args
         max_batch_size = get_schedule().max_running_requests
         self.residual_sampler = (
-            ResidualCodeSampler(
-                max_batch_size,
-                config.num_code_groups,
-                device,
-                config.code_predictor_config.vocab_size,
-            )
+            ResidualCodeSampler(max_batch_size, config.num_code_groups, device)
             if device.type == "cuda"
             else None
         )
