@@ -21,9 +21,14 @@ from benchmarks.benchmarker.utils import get_wav_duration
 from benchmarks.dataset.mmsu import MmsuSample
 from benchmarks.metrics.mmsu import compute_mmsu_metrics
 from benchmarks.metrics.performance import compute_speed_metrics
+from benchmarks.metrics.speaker_similarity import WavLMSpeakerSimilarity
+from benchmarks.metrics.speaker_similarity_assets import (
+    ensure_speaker_similarity_assets,
+)
 from benchmarks.metrics.wer import SampleOutput, calculate_wer_metrics
 from benchmarks.tasks.asr import apply_wer, load_router_asr, transcribe
 from benchmarks.tasks.audio_understanding import build_mmsu_results
+from benchmarks.tasks.tts import SPEAKER_SIMILARITY_BATCH_SIZE, run_seedtts_utmos
 
 
 class SavedRequest(BaseModel):
@@ -70,6 +75,13 @@ class CompletedSpeech(BaseModel):
 class ReplayRequest:
     record: SavedRequest
     request_bytes: bytes
+
+
+@dataclass(kw_only=True)
+class QualityConfiguration:
+    model: str
+    output_dir: str
+    device: str
 
 
 async def replay(arguments: argparse.Namespace) -> None:
@@ -239,9 +251,91 @@ def score(arguments: argparse.Namespace) -> None:
     print(json.dumps(summary), flush=True)
 
 
+def quality(arguments: argparse.Namespace) -> None:
+    assert arguments.workload == "tts"
+    arguments.output_directory.mkdir(exist_ok=False)
+    generation = json.loads((arguments.input_directory / "results.json").read_text())
+    speeches = {
+        speech.sample_id: speech
+        for source in arguments.input_directory.glob("*.speech.json")
+        for speech in [CompletedSpeech.model_validate_json(source.read_bytes())]
+    }
+    records = [speeches[result["request_id"]] for result in generation["per_request"]]
+    assert records
+    assert len(records) == len(speeches) == generation["summary"]["completed_requests"]
+    assert generation["summary"]["failed_requests"] == 0
+    generated = []
+    reference_paths = []
+    for record, result in zip(records, generation["per_request"], strict=True):
+        waveform = arguments.input_directory / f"{record.request_id}.wav"
+        assert (
+            hashlib.sha256(waveform.read_bytes()).hexdigest() == record.waveform_sha256
+        )
+        payload = json.loads(
+            (
+                arguments.input_directory / f"{record.request_id}.request.json"
+            ).read_bytes()
+        )
+        assert len(payload["audios"]) == 1
+        reference_paths.append(payload["audios"][0])
+        generated.append({**result, "sample_id": record.sample_id})
+    (arguments.output_directory / "generated.json").write_text(
+        json.dumps(generated, indent=2)
+    )
+    configuration = QualityConfiguration(
+        model=payload["model"],
+        output_dir=str(arguments.output_directory),
+        device="cuda:0",
+    )
+    utmos = run_seedtts_utmos(configuration)
+    assert utmos["summary"]["evaluated"] == len(records)
+    assert utmos["summary"]["skipped"] == 0
+    assets = ensure_speaker_similarity_assets()
+    scorer = WavLMSpeakerSimilarity(
+        finetune_checkpoint=assets.finetune_checkpoint,
+        wavlm_base=assets.wavlm_base,
+        device=configuration.device,
+    )
+    similarities = []
+    for start in range(0, len(records), SPEAKER_SIMILARITY_BATCH_SIZE):
+        batch = records[start : start + SPEAKER_SIMILARITY_BATCH_SIZE]
+        scores = scorer.score_batch(
+            reference_paths[start : start + SPEAKER_SIMILARITY_BATCH_SIZE],
+            [
+                str(arguments.input_directory / f"{record.request_id}.wav")
+                for record in batch
+            ],
+        )
+        assert len(scores) == len(batch)
+        similarities.extend(
+            {
+                "id": record.sample_id,
+                "speaker_similarity": similarity,
+                "is_success": True,
+            }
+            for record, similarity in zip(batch, scores, strict=True)
+        )
+    report = {
+        "summary": {
+            "speaker_similarity_mean": sum(
+                result["speaker_similarity"] for result in similarities
+            )
+            / len(similarities),
+            "total_samples": len(records),
+            "evaluated": len(similarities),
+            "skipped": 0,
+        },
+        "per_sample": similarities,
+    }
+    (arguments.output_directory / "similarity_results.json").write_text(
+        json.dumps(report, indent=2)
+    )
+    print(json.dumps(report["summary"]), flush=True)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--mode", choices=("replay", "score"), required=True)
+    parser.add_argument("--mode", choices=("replay", "score", "quality"), required=True)
     parser.add_argument("--workload", choices=("tts", "mmsu"), required=True)
     parser.add_argument("--input-directory", type=Path, required=True)
     parser.add_argument("--output-directory", type=Path, required=True)
@@ -255,9 +349,11 @@ def main() -> None:
         assert arguments.reference_results and arguments.base_url
         assert arguments.concurrency and arguments.concurrency > 0
         asyncio.run(replay(arguments))
-    else:
+    elif arguments.mode == "score":
         assert arguments.asr_port and arguments.asr_model
         score(arguments)
+    else:
+        quality(arguments)
 
 
 if __name__ == "__main__":
