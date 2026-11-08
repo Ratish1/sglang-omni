@@ -394,11 +394,12 @@ def main() -> None:
             "decomposed_logits_exact": True,
             "prefix_unchanged": True,
             "head_projection": {
+                "recorded_logits_dtype": str(expected_logits.dtype),
                 "float32_output_argmax": int(projected_logits.argmax(-1)),
                 "float32_output_top_two_gap": float(
                     projected_logits.topk(2, dim=-1).values.diff(dim=-1).neg()[0, 0]
                 ),
-                "bfloat16_tied_maxima": int(
+                "recorded_tied_maxima": int(
                     (expected_logits == expected_logits.max()).sum()
                 ),
                 "float32_rounds_to_recorded_logits": bool(
