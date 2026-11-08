@@ -21,6 +21,9 @@ from sglang.srt.utils import add_prefix
 from sglang.srt.utils.common import is_flashinfer_available
 from torch import nn
 
+from sglang_omni.models.qwen3_omni.components.residual_sampling import (
+    ResidualCodeSampler,
+)
 from sglang_omni.models.qwen3_omni.components.thinker_model import (
     Qwen3OmniMoeThinkerTextAttention,
     Qwen3OmniMoeThinkerTextDecoderLayer,
@@ -810,6 +813,8 @@ class Qwen3OmniMoeTalkerCodePredictor(nn.Module):
 class Qwen3OmniTalker(nn.Module):
     """Talker: Text-to-Audio generation model."""
 
+    residual_sampler: ResidualCodeSampler | None = None
+
     def __init__(
         self,
         config,
@@ -875,6 +880,11 @@ class Qwen3OmniTalker(nn.Module):
         predictor_len = config.num_code_groups + 1
         server_args = get_context().server_args
         max_batch_size = get_schedule().max_running_requests
+        self.residual_sampler = (
+            ResidualCodeSampler(max_batch_size, config.num_code_groups, device)
+            if device.type == "cuda"
+            else None
+        )
         self.cp_enabled = self.model.cp_enabled
         self.feedback_buffer = self.model.feedback_buffer
         self.feedback_mask = self.model.feedback_mask
@@ -1777,7 +1787,10 @@ class Qwen3OmniTalker(nn.Module):
                 # note (ratish): the codebook step runs where the fused layers do, on CUDA
                 # with Triton; the checkpoint's bf16 tables are 2048 by 1024, the
                 # power-of-two widths it needs.
-                if self.predictor_fused_layers is not None:
+                if (
+                    self.predictor_fused_layers is not None
+                    and self.residual_sampler is None
+                ):
                     new_embed = codebook_step(
                         logits[:, -1, :],
                         codebook_embedding.weight,
@@ -1785,7 +1798,15 @@ class Qwen3OmniTalker(nn.Module):
                         pos_summed,
                     )
                 else:
-                    next_code = self.sample_code_predictor_token(logits)
+                    if self.residual_sampler is None:
+                        next_code = self.sample_code_predictor_token(logits)
+                    else:
+                        next_code = self.residual_sampler.sample(
+                            logits[:, -1, :],
+                            pos_codes[:, 1 : layer_idx + 1],
+                            group_index=layer_idx,
+                            frame_offset=pos,
+                        ).unsqueeze(1)
                     pos_codes[:, layer_idx + 1].copy_(next_code[:, 0])
                     new_embed = codebook_embedding(next_code).to(
                         dtype=predictor_input.dtype

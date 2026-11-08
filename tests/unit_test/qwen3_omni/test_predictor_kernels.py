@@ -5,6 +5,7 @@ decode attention against fp32 over stale slots."""
 
 from __future__ import annotations
 
+from array import array
 from collections.abc import Iterator
 from types import SimpleNamespace
 
@@ -14,19 +15,27 @@ from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.layers.rotary_embedding.base import RotaryEmbedding
+from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.model_executor.cuda_graph_config import (
     Backend,
     CudaGraphConfig,
     PhaseConfig,
 )
 from sglang.srt.runtime_context import get_context
+from sglang.srt.sampling.sampling_params import SamplingParams
 from torch import nn
+from transformers.generation.logits_process import TopKLogitsWarper, TopPLogitsWarper
 
 from sglang_omni.models.qwen3_omni.components import talker as talker_module
+from sglang_omni.models.qwen3_omni.components.residual_sampling import (
+    ResidualCodeSampler,
+)
 from sglang_omni.models.qwen3_omni.components.talker import Qwen3OmniTalker
 from sglang_omni.platforms import current_platform
 from sglang_omni.platforms.cuda import CUDAOmniPlatform
 from sglang_omni.platforms.rocm import ROCMOmniPlatform
+from sglang_omni.scheduling.sglang_backend.request_data import SGLangARRequestData
+from sglang_omni.scheduling.types import SchedulerRequest
 from sglang_omni.utils import predictor_layers
 from sglang_omni.utils.predictor_layers import (
     HIDDEN_SIZE,
@@ -763,8 +772,10 @@ def test_decode_attention_tracks_fp32_and_reads_no_slot_past_a_rows_position(
 @accelerator
 @pytest.mark.accelerator
 @pytest.mark.usefixtures("published_server_args")
+@pytest.mark.parametrize("sample_residuals", [False, True])
 def test_captured_predictor_step_replays_fresh_inputs_as_the_torch_codebook_ops_do(
     monkeypatch: pytest.MonkeyPatch,
+    sample_residuals: bool,
 ) -> None:
     device = torch.device("cuda")
     vocab, rows = 2048, 3
@@ -788,6 +799,10 @@ def test_captured_predictor_step_replays_fresh_inputs_as_the_torch_codebook_ops_
     talker.output_embeds = torch.zeros(MAX_BS, HIDDEN, device=device, dtype=DTYPE)
     layer0_codes = torch.zeros(rows, 1, device=device, dtype=torch.long)
     talker_hidden = torch.zeros(rows, 1, HIDDEN, device=device, dtype=DTYPE)
+    if sample_residuals:
+        talker.residual_sampler = ResidualCodeSampler(MAX_BS, NUM_CODE_GROUPS, device)
+    else:
+        pass
 
     def step() -> tuple[torch.Tensor, torch.Tensor]:
         return talker.code_predictor_forward_incremental_eager(
@@ -816,13 +831,21 @@ def test_captured_predictor_step_replays_fresh_inputs_as_the_torch_codebook_ops_
         return embedding[:, None, :]
 
     generator = torch.Generator(device=device).manual_seed(33)
-    for _ in range(2):
+    for iteration in range(2):
         layer0_codes.copy_(
             torch.randint(0, 3072, (rows, 1), device=device, generator=generator)
         )
         talker_hidden.copy_(
             torch.randn(rows, 1, HIDDEN, device=device, generator=generator).to(DTYPE)
         )
+        if sample_residuals:
+            talker.residual_sampler.request_seeds[:rows].fill_(33 + iteration)
+            talker.residual_sampler.frame_indices[:rows].fill_(iteration)
+            talker.residual_sampler.greedy_rows[:rows].copy_(
+                torch.tensor([iteration, 0, 1 - iteration], device=device)
+            )
+        else:
+            pass
         graph.replay()
         replayed = (captured_codes.clone(), captured_embeds.clone())
         with monkeypatch.context() as patch, torch.no_grad():
@@ -830,6 +853,58 @@ def test_captured_predictor_step_replays_fresh_inputs_as_the_torch_codebook_ops_
             expected_codes, expected_embeds = step()
         assert torch.equal(replayed[0], expected_codes)
         assert torch.equal(replayed[1], expected_embeds)
+
+
+@accelerator
+@pytest.mark.accelerator
+def test_residual_draws_follow_requests_across_batch_reorder_and_graph_padding() -> (
+    None
+):
+    device = torch.device("cuda")
+    sampler = ResidualCodeSampler(4, NUM_CODE_GROUPS, device)
+    requests: list[SchedulerRequest] = []
+    for request_index in range(3):
+        sampling_parameters = SamplingParams(
+            temperature=0.0 if request_index == 2 else 1.0,
+            sampling_seed=31 + request_index,
+        )
+        backend_request = Req(
+            rid=f"residual-{request_index}",
+            origin_input_text="",
+            origin_input_ids=array("q", [1]),
+            sampling_params=sampling_parameters,
+        )
+        backend_request.output_ids.extend([1] * request_index)
+        requests.append(
+            SchedulerRequest(
+                request_id=backend_request.rid,
+                data=SGLangARRequestData(req=backend_request),
+            )
+        )
+    logits = torch.zeros(4, 2048, device=device, dtype=DTYPE)
+    logits[:, :60] = 1
+    residual_prefix = torch.empty(4, 0, device=device, dtype=torch.long)
+    sampler.prepare(requests)
+    sampler.sample(logits, residual_prefix, group_index=0, frame_offset=0)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured_codes = sampler.sample(
+            logits, residual_prefix, group_index=0, frame_offset=0
+        )
+    graph.replay()
+    original_codes = captured_codes[:3].clone()
+    expected_support = TopPLogitsWarper(0.8)(
+        residual_prefix, TopKLogitsWarper(50)(residual_prefix, logits.float())
+    ).isfinite()
+    assert expected_support[:2].gather(1, captured_codes[:2, None]).all()
+    assert original_codes[2] == logits[2].argmax()
+    reordered_requests = [requests[1], requests[0], requests[2]]
+    sampler.prepare(reordered_requests)
+    graph.replay()
+    assert torch.equal(captured_codes[:3], original_codes[[1, 0, 2]])
+    sampler.prepare([requests[0]])
+    graph.replay()
+    assert captured_codes[0] == original_codes[0]
 
 
 @accelerator

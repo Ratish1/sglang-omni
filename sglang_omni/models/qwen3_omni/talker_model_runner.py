@@ -15,6 +15,9 @@ from sglang_omni.model_runner.prefill_inputs import (
     OmniPrefillInputs,
     attach_omni_prefill_inputs,
 )
+from sglang_omni.models.qwen3_omni.components.residual_sampling import (
+    ResidualCodeSampler,
+)
 from sglang_omni.scheduling.message import OutgoingMessage, put_messages
 from sglang_omni.scheduling.pending_text_queue import PendingTextTensorQueue
 from sglang_omni.scheduling.sglang_backend.request_data import (
@@ -48,6 +51,7 @@ TalkerInputQueue: TypeAlias = (
 
 class QwenTalkerModelRunner(ModelRunner["SGLangARRequestData"]):
     model: Qwen3OmniTalker
+    residual_sampler: ResidualCodeSampler | None = None
 
     def __init__(
         self,
@@ -63,6 +67,7 @@ class QwenTalkerModelRunner(ModelRunner["SGLangARRequestData"]):
         codec_coalesce_early_frames: int = 0,
     ) -> None:
         super().__init__(tp_worker, output_processor)
+        self.residual_sampler = self.model.residual_sampler
         self.outbox = outbox
         self.code2wav_target = code2wav_target
         self.code2wav_in_process = code2wav_in_process
@@ -119,6 +124,10 @@ class QwenTalkerModelRunner(ModelRunner["SGLangARRequestData"]):
             pass
 
         self.model.prepare_decode_buffers(requests)
+        if self.residual_sampler is not None:
+            self.residual_sampler.prepare(requests)
+        else:
+            pass
         self.write_feedback_buffers(requests)
 
     def post_prefill(
@@ -147,6 +156,10 @@ class QwenTalkerModelRunner(ModelRunner["SGLangARRequestData"]):
         talker_hidden = result.logits_output.hidden_states
         if isinstance(talker_hidden, torch.Tensor) and talker_hidden.ndim == 2:
             talker_hidden = talker_hidden.unsqueeze(1)
+        else:
+            pass
+        if self.residual_sampler is not None:
+            self.residual_sampler.prepare(requests)
         else:
             pass
         self.model.code_predictor_forward(layer0_codes, talker_hidden)
