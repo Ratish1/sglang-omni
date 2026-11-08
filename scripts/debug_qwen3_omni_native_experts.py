@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 from collections import defaultdict
 from pathlib import Path
 
 import torch
+from flashinfer.autotuner import AutoTuner
 from flashinfer.fused_moe import cutlass_fused_moe
 from huggingface_hub import snapshot_download
 from pydantic import BaseModel
@@ -41,8 +43,10 @@ def main() -> None:
     parser.add_argument("--expert-directory", type=Path, required=True)
     parser.add_argument("--output-directory", type=Path, required=True)
     parser.add_argument("--tune-max-num-tokens", type=int, required=True)
+    parser.add_argument("--autotune-cache", type=Path, required=True)
     arguments = parser.parse_args()
     arguments.output_directory.mkdir(exist_ok=False)
+    assert AutoTuner.get().load_configs(str(arguments.autotune_cache))
     config = Qwen3OmniMoeConfig.from_pretrained(
         arguments.model_path, revision=arguments.model_revision
     ).talker_config.text_config
@@ -99,6 +103,9 @@ def main() -> None:
         ],
         "use_fused_finalize": False,
         "tune_max_num_tokens": arguments.tune_max_num_tokens,
+        "autotune_cache_sha256": hashlib.sha256(
+            arguments.autotune_cache.read_bytes()
+        ).hexdigest(),
         "layers": [],
         "scope": "Native CUTLASS replay uses all original rows, IDs and scales only where captured. Missing prefill/padding rows are never synthesized. Eager replay is measured against captured graph output, not assumed identical. Reference validation runs the independent checkpoint Experts forward in FP64 on the actual first live batch.",
     }
