@@ -25,6 +25,7 @@ def main() -> None:
     parser.add_argument("--control-directory", type=Path, required=True)
     parser.add_argument("--capture-directory", type=Path, required=True)
     parser.add_argument("--output-directory", type=Path, required=True)
+    parser.add_argument("--include-visual", action="store_true")
     arguments = parser.parse_args()
     arguments.output_directory.mkdir(exist_ok=False)
     records = [
@@ -33,10 +34,11 @@ def main() -> None:
             (arguments.control_directory / "summary.json").read_text()
         )
     ]
-    audio_controls = {
+    selected_controls = {
         record.request_id: record
         for record in records
         if json.loads(record.source_request.read_text()).get("audios")
+        or arguments.include_visual
     }
     request_order = [
         request_id
@@ -46,14 +48,14 @@ def main() -> None:
         for metadata in [json.loads(line)]
         if metadata["phase"] == "EXTEND"
         for request_id in metadata["request_ids"]
-        if request_id in audio_controls
+        if request_id in selected_controls
     ]
-    assert len(request_order) == len(set(request_order)) == len(audio_controls)
+    assert len(request_order) == len(set(request_order)) == len(selected_controls)
     requests = [
         (
             request_id,
-            audio_controls[request_id].source_request.read_bytes(),
-            audio_controls[request_id].waveform_sha256,
+            selected_controls[request_id].source_request.read_bytes(),
+            selected_controls[request_id].waveform_sha256,
         )
         for request_id in request_order
     ]
