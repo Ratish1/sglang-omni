@@ -1,9 +1,10 @@
-"""Replay every recorded decode draw without changing its request seed or history."""
+"""Replay every recorded main-code draw without changing its seed or history."""
 
 from __future__ import annotations
 
 import argparse
 import json
+from collections import Counter
 from pathlib import Path
 
 import torch
@@ -71,18 +72,21 @@ def main() -> None:
     )
     counts = {request_id: 0 for request_id in identities}
     mismatches = []
-    skipped_prefill_steps = 0
+    draws_by_phase: Counter[str] = Counter()
     with (
         (arguments.capture_directory / "steps.jsonl").open() as manifest,
         (arguments.output_directory / "draws.jsonl").open("w") as output,
     ):
         for line in manifest:
             metadata = StepMetadata.model_validate_json(line)
-            if not ForwardMode[metadata.phase].is_decode():
-                skipped_prefill_steps += 1
+            if not identities.intersection(metadata.request_ids):
                 continue
             else:
                 pass
+            assert (
+                ForwardMode[metadata.phase].is_decode()
+                or ForwardMode[metadata.phase].is_extend()
+            )
             saved = torch.load(
                 arguments.capture_directory / f"step-{metadata.step:06d}.pt",
                 weights_only=True,
@@ -126,8 +130,13 @@ def main() -> None:
                 dtype=torch.float32,
             )
             probabilities = (logits / temperature).softmax(-1)
+            if ForwardMode[metadata.phase].is_extend():
+                actual_positions = torch.tensor(metadata.sequence_lengths) - 1
+                assert torch.equal(actual_positions, saved["positions"])
+            else:
+                actual_positions = saved["positions"]
             positions = F.pad(
-                saved["positions"].cuda(), (0, padded_rows - metadata.live_rows)
+                actual_positions.cuda(), (0, padded_rows - metadata.live_rows)
             )
             sampled = top_k_top_p_min_p_sampling_from_probs_torch(
                 probabilities,
@@ -145,6 +154,7 @@ def main() -> None:
             actual = saved["codes"][:, 0]
             report = {
                 "step": metadata.step,
+                "phase": metadata.phase,
                 "request_ids": metadata.request_ids,
                 "frames": metadata.frame_indices,
                 "positions": saved["positions"].tolist(),
@@ -159,6 +169,7 @@ def main() -> None:
                 else:
                     pass
                 counts[request_id] += 1
+                draws_by_phase[metadata.phase] += 1
                 if sampled[row] != actual[row]:
                     mismatches.append(
                         {
@@ -171,6 +182,9 @@ def main() -> None:
                     )
                 else:
                     pass
+    assert all(
+        counts[request_id] == len(trace.codes) for request_id, trace in traces.items()
+    )
     summary = {
         "model_path": arguments.model_path,
         "model_revision": arguments.model_revision,
@@ -179,11 +193,11 @@ def main() -> None:
         "top_k": arguments.top_k,
         "top_p": arguments.top_p,
         "requests": len(identities),
-        "decode_draws": sum(counts.values()),
-        "decode_draws_per_request": counts,
+        "main_draws": sum(counts.values()),
+        "main_draws_per_request": counts,
+        "draws_by_phase": draws_by_phase,
         "mismatches": mismatches,
-        "skipped_prefill_steps": skipped_prefill_steps,
-        "scope": "Actual decode logits, recorded positions and main-code histories, with the unchanged source-derived request seed. Prefill sampling is not reproduced by this tool.",
+        "scope": "Actual prefill and decode logits, recorded main-code histories and source-derived request seeds. Prefill uses sequence length minus one, matching the model runner's actual sampling call. Default Talker suppression and output-history repetition penalties are held fixed, not tuned.",
     }
     (arguments.output_directory / "summary.json").write_text(
         json.dumps(summary, indent=2)
@@ -193,7 +207,7 @@ def main() -> None:
             {
                 name: value
                 for name, value in summary.items()
-                if name not in ("decode_draws_per_request", "mismatches")
+                if name not in ("main_draws_per_request", "mismatches")
             }
             | {"mismatch_count": len(mismatches)}
         ),
