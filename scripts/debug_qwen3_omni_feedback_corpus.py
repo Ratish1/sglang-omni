@@ -23,6 +23,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model-path", required=True)
     parser.add_argument("--model-revision", required=True)
+    parser.add_argument("--reference-device", choices=("cpu", "cuda"), required=True)
     parser.add_argument("--capture-directory", type=Path, required=True)
     parser.add_argument("--output-directory", type=Path, required=True)
     arguments = parser.parse_args()
@@ -56,18 +57,27 @@ def main() -> None:
             local_files_only=True,
         )
         with safe_open(shard_path, framework="pt", device="cpu") as shard:
-            tables.append(shard.get_tensor(name))
+            tables.append(shard.get_tensor(name).to(arguments.reference_device))
     assert all(table.dtype == torch.bfloat16 for table in tables)
     codes = torch.tensor(
-        [frame for request in requests for frame in request.codes], dtype=torch.long
+        [frame for request in requests for frame in request.codes],
+        dtype=torch.long,
+        device=arguments.reference_device,
     )
-    sequential = torch.zeros(codes.shape[0], tables[0].shape[1], dtype=torch.bfloat16)
+    sequential = torch.zeros(
+        codes.shape[0],
+        tables[0].shape[1],
+        dtype=torch.bfloat16,
+        device=arguments.reference_device,
+    )
     accurate = sequential.double()
     relative_errors = []
     absolute_errors = []
     changed_coordinates = []
+    embedding_rows = []
     for group, table in enumerate(tables):
         embedding = table[codes[:, group]]
+        embedding_rows.append(embedding)
         sequential.add_(embedding)
         accurate.add_(embedding.double())
         rounded = accurate.bfloat16()
@@ -83,9 +93,9 @@ def main() -> None:
     changed_coordinates = torch.stack(changed_coordinates)
     torch.save(
         {
-            "relative_l2": relative_errors,
-            "max_absolute": absolute_errors,
-            "changed_coordinates": changed_coordinates,
+            "relative_l2": relative_errors.cpu(),
+            "max_absolute": absolute_errors.cpu(),
+            "changed_coordinates": changed_coordinates.cpu(),
         },
         arguments.output_directory / "feedback.pt",
     )
@@ -111,6 +121,7 @@ def main() -> None:
         "frames": codes.shape[0],
         "model_path": arguments.model_path,
         "model_revision": arguments.model_revision,
+        "reference_device": arguments.reference_device,
         "scope": "Checkpoint-table arithmetic on all actual codes, including terminal frames. Not a free-running speech-quality experiment.",
         "groups": [
             {
@@ -125,6 +136,15 @@ def main() -> None:
             for group in range(group_count)
         ],
         "per_request": request_reports,
+    }
+    checkpoint_sum = torch.stack(embedding_rows, dim=1).sum(dim=1)
+    rounded_accurate = accurate.bfloat16()
+    summary["checkpoint_sum_vs_rounded_fp64"] = {
+        "changed_frames": int((checkpoint_sum != rounded_accurate).any(-1).sum()),
+        "changed_coordinates": int((checkpoint_sum != rounded_accurate).sum()),
+        "maximum_absolute": float(
+            (checkpoint_sum.float() - rounded_accurate.float()).abs().max()
+        ),
     }
     (arguments.output_directory / "summary.json").write_text(
         json.dumps(summary, indent=2)
