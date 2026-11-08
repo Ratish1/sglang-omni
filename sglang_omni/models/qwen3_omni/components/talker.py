@@ -1770,7 +1770,11 @@ class Qwen3OmniTalker(nn.Module):
             cache_len += 2
 
             for layer_idx in range(num_groups - 1):
-                logits, _ = self.code_predictor.lm_head[layer_idx](last_hidden)
+                logits = torch.mm(
+                    last_hidden[:, -1],
+                    self.code_predictor.lm_head[layer_idx].weight.T,
+                    out_dtype=torch.float32,
+                ).unsqueeze(1)
                 codebook_embedding = self.code_predictor.model.codec_embedding[
                     layer_idx
                 ]
