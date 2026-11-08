@@ -12,6 +12,8 @@ from pathlib import Path
 import torch
 from pydantic import BaseModel
 
+from sglang_omni.models.qwen3_omni.corpus_diagnostics import RequestTrace
+
 
 class CorpusStep(BaseModel):
     step: int
@@ -26,15 +28,6 @@ class CorpusStep(BaseModel):
 class RequestIdentity(BaseModel):
     request_id: str
     sample_id: str
-
-
-class RequestCompletion(BaseModel):
-    request_id: str
-    ordinal: int
-    steps: list[int]
-    codes: list[list[int]]
-    main_codes_match: bool
-    finish_reason: str
 
 
 class SpeechScore(BaseModel):
@@ -90,7 +83,7 @@ def main() -> None:
     assert identities
     samples = {identity.request_id: identity.sample_id for identity in identities}
     completions = {
-        request_id: RequestCompletion.model_validate_json(
+        request_id: RequestTrace.model_validate_json(
             (
                 arguments.capture_directory / "requests" / f"{request_id}.json"
             ).read_text()

@@ -11,17 +11,11 @@ from huggingface_hub import hf_hub_download
 from pydantic import BaseModel
 from safetensors import safe_open
 
+from sglang_omni.models.qwen3_omni.corpus_diagnostics import RequestTrace
+
 
 class CheckpointIndex(BaseModel):
     weight_map: dict[str, str]
-
-
-class RequestCodes(BaseModel):
-    request_id: str
-    ordinal: int
-    steps: list[int]
-    codes: list[list[int]]
-    main_codes_match: bool
 
 
 @torch.inference_mode()
@@ -35,7 +29,7 @@ def main() -> None:
     arguments.output_directory.mkdir(exist_ok=False)
     requests = sorted(
         [
-            RequestCodes.model_validate_json(path.read_text())
+            RequestTrace.model_validate_json(path.read_text())
             for path in (arguments.capture_directory / "requests").glob("*.json")
         ],
         key=lambda request: request.ordinal,

@@ -38,6 +38,16 @@ class StepMetadata(BaseModel):
     predictor_stages: dict[str, int]
 
 
+class RequestTrace(BaseModel):
+    request_id: str
+    ordinal: int
+    steps: list[int]
+    codes: list[list[int]]
+    output_ids: list[int]
+    main_codes_match: bool
+    finish_reason: str
+
+
 @dataclass(kw_only=True)
 class CorpusProgress:
     ordinal: int
