@@ -24,6 +24,8 @@ class TalkerStateObservation:
     checks: list[tuple[str, torch.Tensor]] = field(default_factory=list)
     codes: list[torch.Tensor] = field(default_factory=list)
     backbone_hidden_states: list[torch.Tensor] = field(default_factory=list)
+    codec_logits: list[torch.Tensor] = field(default_factory=list)
+    decode_input_embeddings: list[torch.Tensor] = field(default_factory=list)
     decode_input: torch.Tensor | None = None
 
 
@@ -58,6 +60,9 @@ class TalkerStateObserver:
             if len(observation.backbone_hidden_states) < BACKBONE_SNAPSHOT_COUNT:
                 observation.backbone_hidden_states.append(
                     model.predictor_input_buffer[row, 0].clone()
+                )
+                observation.codec_logits.append(
+                    model.codec_head.diagnostic_last_logits[row].clone()
                 )
             else:
                 pass
@@ -160,6 +165,12 @@ class TalkerStateObserver:
     ) -> None:
         for row, request in enumerate(requests):
             observation = self.observations[request.request_id]
+            if len(observation.decode_input_embeddings) < BACKBONE_SNAPSHOT_COUNT - 1:
+                observation.decode_input_embeddings.append(
+                    model.feedback_buffer[row].clone()
+                )
+            else:
+                pass
             observation.checks.extend(
                 [
                     ("feedback_mask", model.feedback_mask[row].clone()),
@@ -209,6 +220,16 @@ class TalkerStateObserver:
                 "native_backbone_hidden_states": torch.stack(
                     observation.backbone_hidden_states
                 ).cpu(),
+                "native_codec_logits": torch.stack(observation.codec_logits).cpu(),
+                "native_decode_input_embeddings": (
+                    torch.stack(observation.decode_input_embeddings).cpu()
+                    if observation.decode_input_embeddings
+                    else torch.empty(
+                        (0, observation.feedback.numel()),
+                        dtype=observation.feedback.dtype,
+                        device="cpu",
+                    )
+                ),
                 "pad_embedding": request_data.tts_pad_embed.cpu(),
                 "sampling_seed": parameters.sampling_seed,
                 "temperature": parameters.temperature,

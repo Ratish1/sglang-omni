@@ -5,6 +5,7 @@ SGLang-native Talker model for Qwen3-Omni compatiable with hf formatting.
 from __future__ import annotations
 
 import logging
+import os
 from contextlib import nullcontext
 from typing import Iterable, Optional, Tuple
 
@@ -21,7 +22,10 @@ from sglang.srt.utils import add_prefix
 from sglang.srt.utils.common import is_flashinfer_available
 from torch import nn
 
-from sglang_omni.model_runner.kv_write_diagnostics import install_kv_write_observers
+from sglang_omni.model_runner.kv_write_diagnostics import (
+    CodecLogitHook,
+    install_kv_write_observers,
+)
 from sglang_omni.models.qwen3_omni.components.thinker_model import (
     Qwen3OmniMoeThinkerTextAttention,
     Qwen3OmniMoeThinkerTextDecoderLayer,
@@ -879,6 +883,20 @@ class Qwen3OmniTalker(nn.Module):
         server_args = get_context().server_args
         max_batch_size = get_schedule().max_running_requests
         self.cp_enabled = self.model.cp_enabled
+        if os.environ.get("SGLANG_OMNI_DIAGNOSTIC_KV_DIRECTORY") is not None:
+            self.codec_head.register_buffer(
+                "diagnostic_last_logits",
+                torch.zeros(
+                    max_batch_size,
+                    config.text_config.vocab_size,
+                    device=device,
+                    dtype=self.codec_head.weight.dtype,
+                ),
+                persistent=False,
+            )
+            self.codec_head.register_forward_hook(CodecLogitHook())
+        else:
+            pass
         self.feedback_buffer = self.model.feedback_buffer
         self.feedback_mask = self.model.feedback_mask
         # note (ratish): two slots, the talker hidden and the layer-0 embedding; the

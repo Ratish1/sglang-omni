@@ -10,6 +10,19 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_context import get_token_to_kv_pool
 from torch import nn
 
+from sglang_omni.vendor.sglang.layers import ReplicatedLinear
+
+
+class CodecLogitHook:
+    def __call__(
+        self,
+        linear: ReplicatedLinear,
+        arguments: tuple[torch.Tensor],
+        output: tuple[torch.Tensor, torch.Tensor | None],
+    ) -> None:
+        logits = output[0]
+        linear.diagnostic_last_logits[: logits.shape[0]].copy_(logits)
+
 
 class KVWriteHook:
     def __call__(
