@@ -25,6 +25,9 @@ from torch import nn
 
 from sglang_omni.model_runner.kv_write_diagnostics import (
     CodecLogitHook,
+    HeadPrecisionControl,
+    HeadPrecisionHook,
+    HeadPrecisionMode,
     install_kv_write_observers,
 )
 from sglang_omni.models.qwen3_omni.components.thinker_model import (
@@ -918,6 +921,39 @@ class Qwen3OmniTalker(nn.Module):
         server_args = get_context().server_args
         max_batch_size = get_schedule().max_running_requests
         self.cp_enabled = self.model.cp_enabled
+        self.head_precision_control: HeadPrecisionControl | None = None
+        head_control = os.environ.get("SGLANG_OMNI_DIAGNOSTIC_HEAD_CONTROL")
+        if head_control is not None:
+            request_id, frame_index, group_index, mode = head_control.split(":")
+            frame_index, group_index = int(frame_index), int(group_index)
+            if frame_index < 1 or not 1 <= group_index < config.num_code_groups:
+                raise ValueError(
+                    "Head control requires a decode frame and residual group"
+                )
+            else:
+                pass
+            self.head_precision_control = HeadPrecisionControl(
+                request_id=request_id,
+                frame_index=frame_index,
+                group_index=group_index,
+                mode=HeadPrecisionMode(mode),
+                mask=torch.zeros(
+                    max_batch_size,
+                    config.num_code_groups - 1,
+                    device=device,
+                    dtype=torch.bool,
+                ),
+            )
+            self.head_precision_control.reset()
+            for group, head in enumerate(self.code_predictor.lm_head):
+                head.register_buffer(
+                    "diagnostic_head_precision_mask",
+                    self.head_precision_control.mask[:, group],
+                    persistent=False,
+                )
+                head.register_forward_hook(HeadPrecisionHook())
+        else:
+            pass
         if os.environ.get("SGLANG_OMNI_DIAGNOSTIC_KV_DIRECTORY") is not None:
             self.codec_head.register_buffer(
                 "diagnostic_last_logits",

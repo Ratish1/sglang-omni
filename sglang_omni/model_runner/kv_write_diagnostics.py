@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import logging
 import os
+from dataclasses import dataclass
+from enum import StrEnum
 
 import torch
 from sglang.srt.layers.radix_attention import RadixAttention
@@ -15,6 +18,63 @@ from sglang_omni.vendor.sglang.layers import (
     ReplicatedLinear,
     RowParallelLinear,
 )
+
+logger = logging.getLogger(__name__)
+
+
+class HeadPrecisionMode(StrEnum):
+    ONLY = "only"
+    EXCEPT = "except"
+
+
+@dataclass(kw_only=True)
+class HeadPrecisionControl:
+    request_id: str
+    frame_index: int
+    group_index: int
+    mode: HeadPrecisionMode
+    mask: torch.Tensor
+    activations: int = 0
+
+    def reset(self) -> None:
+        self.mask.fill_(self.mode is HeadPrecisionMode.EXCEPT)
+
+    def select(self, request_ids: list[str], frame_indices: list[int]) -> None:
+        self.reset()
+        for row, (request_id, frame_index) in enumerate(
+            zip(request_ids, frame_indices, strict=True)
+        ):
+            if request_id == self.request_id and frame_index == self.frame_index:
+                self.mask[row, self.group_index - 1] = (
+                    self.mode is HeadPrecisionMode.ONLY
+                )
+                self.activations += 1
+                logger.info(
+                    f"Head precision control request={request_id} frame={frame_index} "
+                    f"group={self.group_index} mode={self.mode} activations={self.activations}"
+                )
+            else:
+                pass
+
+
+class HeadPrecisionHook:
+    def __call__(
+        self,
+        linear: ReplicatedLinear,
+        arguments: tuple[torch.Tensor],
+        output: tuple[torch.Tensor, torch.Tensor | None],
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        assert linear.bias is None
+        unrounded = torch.mm(
+            arguments[0].reshape(-1, linear.weight.shape[1]),
+            linear.weight.T,
+            out_dtype=torch.float32,
+        ).reshape_as(output[0])
+        selected = linear.diagnostic_head_precision_mask[: output[0].shape[0]]
+        return (
+            torch.where(selected[:, None, None], unrounded, output[0].float()),
+            output[1],
+        )
 
 
 class ProjectionSnapshotHook:

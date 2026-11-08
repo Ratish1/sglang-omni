@@ -87,6 +87,10 @@ class QwenTalkerModelRunner(ModelRunner["SGLangARRequestData"]):
         requests: list[SchedulerRequest],
     ) -> None:
         del schedule_batch
+        if self.model.head_precision_control is not None:
+            self.model.head_precision_control.reset()
+        else:
+            pass
         composed = self.compose_prefill_embeds(forward_batch, requests)
         if composed is None:
             return
@@ -125,6 +129,13 @@ class QwenTalkerModelRunner(ModelRunner["SGLangARRequestData"]):
             pass
 
         self.model.prepare_decode_buffers(requests)
+        if self.model.head_precision_control is not None:
+            self.model.head_precision_control.select(
+                [request.request_id for request in requests],
+                [len(request.data.req.output_ids) for request in requests],
+            )
+        else:
+            pass
         if self.state_observer is not None:
             self.state_observer.before_decode(self.model, requests)
         else:
@@ -321,6 +332,11 @@ class QwenTalkerModelRunner(ModelRunner["SGLangARRequestData"]):
         self, request_id: str, req_data: "SGLangARRequestData"
     ) -> None:
         super().on_request_finished(request_id, req_data)
+        control = self.model.head_precision_control
+        if control is not None and request_id == control.request_id:
+            assert control.activations == 1
+        else:
+            pass
         if self.state_observer is not None:
             self.state_observer.finish(request_id, req_data)
         else:
