@@ -18,9 +18,12 @@ from pydantic import BaseModel
 from benchmarks.benchmarker.data import RequestResult, finish_reason_from_server
 from benchmarks.benchmarker.runner import BenchmarkRunner, RunConfig
 from benchmarks.benchmarker.utils import get_wav_duration
+from benchmarks.dataset.mmsu import MmsuSample
+from benchmarks.metrics.mmsu import compute_mmsu_metrics
 from benchmarks.metrics.performance import compute_speed_metrics
 from benchmarks.metrics.wer import SampleOutput, calculate_wer_metrics
 from benchmarks.tasks.asr import apply_wer, load_router_asr, transcribe
+from benchmarks.tasks.audio_understanding import build_mmsu_results
 
 
 class SavedRequest(BaseModel):
@@ -159,6 +162,19 @@ async def replay(arguments: argparse.Namespace) -> None:
         "summary": compute_speed_metrics(results, runner.wall_clock_s),
         "per_request": [asdict(result) for result in results],
     }
+    if arguments.workload == "mmsu":
+        samples = [
+            MmsuSample(**sample)
+            for sample in json.loads(
+                (arguments.input_directory / "samples.json").read_text()
+            )
+        ]
+        predictions = build_mmsu_results(results, samples, ["text", "audio"])
+        assert len(predictions) == len(results)
+        report["mmsu_accuracy"] = compute_mmsu_metrics(predictions)
+        report["mmsu_predictions"] = [asdict(prediction) for prediction in predictions]
+    else:
+        pass
     (arguments.output_directory / "results.json").write_text(
         json.dumps(report, indent=2)
     )
@@ -168,7 +184,8 @@ async def replay(arguments: argparse.Namespace) -> None:
 def score(arguments: argparse.Namespace) -> None:
     arguments.output_directory.mkdir(exist_ok=False)
     asr = load_router_asr(arguments.asr_port, arguments.asr_model)
-    outputs: list[SampleOutput] = []
+    requested_outputs: list[SampleOutput] = []
+    spoken_outputs: list[SampleOutput] = []
     for source in sorted(arguments.input_directory.glob("*.speech.json")):
         record = CompletedSpeech.model_validate_json(source.read_bytes())
         waveform = source.with_name(f"{record.request_id}.wav")
@@ -176,22 +193,46 @@ def score(arguments: argparse.Namespace) -> None:
             hashlib.sha256(waveform.read_bytes()).hexdigest() == record.waveform_sha256
         )
         transcript = transcribe(asr, str(waveform), "en", "cuda:0")
-        reference = record.target_text if arguments.workload == "tts" else record.text
-        output = apply_wer(
-            SampleOutput(sample_id=record.sample_id, target_text=reference),
+        spoken = apply_wer(
+            SampleOutput(sample_id=record.sample_id, target_text=record.text),
             transcript,
             "en",
         )
-        assert output.is_success, output.error
-        outputs.append(output)
+        assert spoken.is_success, spoken.error
+        spoken_outputs.append(spoken)
+        if arguments.workload == "tts":
+            requested = apply_wer(
+                SampleOutput(
+                    sample_id=record.sample_id, target_text=record.target_text
+                ),
+                transcript,
+                "en",
+            )
+            assert requested.is_success, requested.error
+            requested_outputs.append(requested)
+            requested_score = asdict(requested)
+        else:
+            requested_score = None
         (arguments.output_directory / f"{record.request_id}.json").write_text(
             json.dumps(
-                {"speech": record.model_dump(), "score": asdict(output)}, indent=2
+                {
+                    "speech": record.model_dump(),
+                    "spoken_score": asdict(spoken),
+                    "requested_score": requested_score,
+                },
+                indent=2,
             )
         )
     expected = json.loads((arguments.input_directory / "results.json").read_text())
-    assert len(outputs) == len(expected["per_request"])
-    summary = calculate_wer_metrics(outputs, "en")
+    assert len(spoken_outputs) == len(expected["per_request"])
+    summary = {
+        "spoken_summary": calculate_wer_metrics(spoken_outputs, "en"),
+        "requested_summary": (
+            calculate_wer_metrics(requested_outputs, "en")
+            if requested_outputs
+            else None
+        ),
+    }
     (arguments.output_directory / "summary.json").write_text(
         json.dumps(summary, indent=2)
     )
