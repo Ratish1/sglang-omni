@@ -20,6 +20,10 @@ def normalize_rope_scaling(
         pass
 
     normalized = dict(rope_scaling)
+    if "interleaved" in normalized and "mrope_interleaved" not in normalized:
+        normalized["mrope_interleaved"] = normalized["interleaved"]
+    else:
+        pass
     if "type" in normalized and "rope_type" not in normalized:
         normalized["rope_type"] = normalized["type"]
     else:
