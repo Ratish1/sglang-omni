@@ -10,6 +10,7 @@ import torch
 from torch.nn import functional as F
 
 from scripts.debug_qwen3_omni_operator_audit import compare_tensors
+from sglang_omni.models.qwen3_omni.components.talker import Qwen3OmniTalker
 from sglang_omni.models.qwen3_omni.stages import create_talker_ar_executor_from_config
 from sglang_omni.utils.predictor_layers import (
     attention_inputs,
@@ -18,6 +19,27 @@ from sglang_omni.utils.predictor_layers import (
     mlp_up,
     o_proj_add,
 )
+
+
+def predictor_prefix(
+    native: Qwen3OmniTalker,
+    codes: torch.Tensor,
+    hidden_row: torch.Tensor,
+    target_group: int,
+) -> tuple[torch.Tensor, int]:
+    embeddings = torch.cat(
+        (hidden_row, native.model.codec_embedding(codes[:, :1])), dim=1
+    )
+    cache_length = 0
+    for group in range(1, target_group):
+        native.predictor_forward_tokens(
+            token_embeds=embeddings, batch_size=1, cache_len=cache_length
+        )
+        cache_length += embeddings.shape[1]
+        embeddings = native.code_predictor.model.codec_embedding[group - 1](
+            codes[:, group : group + 1]
+        )
+    return embeddings, cache_length
 
 
 def main() -> None:
@@ -67,20 +89,9 @@ def main() -> None:
     assert torch.equal(hidden_row.flatten(), captured_predictor["hidden_states"])
     reports = []
     with torch.inference_mode():
-        token_embeddings = torch.cat(
-            (hidden_row, native.model.codec_embedding(codes[:, :1])), dim=1
+        token_embeddings, cache_length = predictor_prefix(
+            native, codes, hidden_row, arguments.group
         )
-        cache_length = 0
-        for group in range(1, arguments.group):
-            output = native.predictor_forward_tokens(
-                token_embeds=token_embeddings, batch_size=1, cache_len=cache_length
-            )
-            logits, _ = native.code_predictor.lm_head[group - 1](output[:, -1:])
-            assert int(logits.argmax(-1)) == int(codes[0, group])
-            cache_length += token_embeddings.shape[1]
-            token_embeddings = native.code_predictor.model.codec_embedding[group - 1](
-                codes[:, group : group + 1]
-            )
         with torch.profiler.profile(
             activities=[
                 torch.profiler.ProfilerActivity.CPU,
@@ -105,6 +116,49 @@ def main() -> None:
         )
         prefix_keys = native.predictor_k_cache[:, :1, :cache_length].clone()
         prefix_values = native.predictor_v_cache[:, :1, :cache_length].clone()
+        head = native.code_predictor.lm_head[arguments.group - 1]
+        history_controls = {"fused_past_fused_current": expected_logits}
+        native.predictor_fused_layers = None
+        plain_current = native.predictor_forward_tokens(
+            token_embeds=token_embeddings, batch_size=1, cache_len=cache_length
+        )
+        history_controls["fused_past_plain_current"] = head(plain_current[:, -1:])[
+            0
+        ].clone()
+        rebuilt_embeddings, rebuilt_cache_length = predictor_prefix(
+            native, codes, hidden_row, arguments.group
+        )
+        assert (
+            torch.equal(token_embeddings, rebuilt_embeddings)
+            and cache_length == rebuilt_cache_length
+        )
+        native.predictor_fused_layers = fused
+        fused_current = native.predictor_forward_tokens(
+            token_embeds=token_embeddings, batch_size=1, cache_len=cache_length
+        )
+        history_controls["plain_past_fused_current"] = head(fused_current[:, -1:])[
+            0
+        ].clone()
+        native.predictor_fused_layers = None
+        plain_current = native.predictor_forward_tokens(
+            token_embeds=token_embeddings, batch_size=1, cache_len=cache_length
+        )
+        history_controls["plain_past_plain_current"] = head(plain_current[:, -1:])[
+            0
+        ].clone()
+        assert torch.equal(
+            history_controls["plain_past_plain_current"].float(),
+            captured_predictor["plain_logits"][
+                :, arguments.group - 1 : arguments.group
+            ],
+        )
+        native.predictor_fused_layers = fused
+        native.predictor_k_cache[:, :1, :cache_length].copy_(prefix_keys)
+        native.predictor_v_cache[:, :1, :cache_length].copy_(prefix_values)
+        torch.save(
+            {name: logits.cpu() for name, logits in history_controls.items()},
+            arguments.output_directory / "history-controls.pt",
+        )
         token_count = token_embeddings.shape[1]
         hidden_states = token_embeddings.reshape(token_count, -1)
         residual = fused.residual[:token_count]
@@ -322,6 +376,19 @@ def main() -> None:
             "decomposed_hidden_exact": True,
             "decomposed_logits_exact": True,
             "prefix_unchanged": True,
+            "history_controls": {
+                name: {
+                    "argmax": int(logits.argmax(-1)),
+                    "top_two_gap": float(
+                        logits.float()
+                        .topk(2, dim=-1)
+                        .values.diff(dim=-1)
+                        .neg()
+                        .flatten()[0]
+                    ),
+                }
+                for name, logits in history_controls.items()
+            },
             "layers": reports,
         }
         (arguments.output_directory / "summary.json").write_text(
