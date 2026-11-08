@@ -13,6 +13,8 @@ from sglang_omni.sampling.seed import derive_sampling_seed
 from sglang_omni.scheduling.sglang_backend.request_data import SGLangARRequestData
 from sglang_omni.scheduling.types import SchedulerRequest
 
+BACKBONE_SNAPSHOT_COUNT = 4
+
 
 @dataclass(kw_only=True)
 class TalkerStateObservation:
@@ -21,6 +23,7 @@ class TalkerStateObservation:
     text_index: int = 0
     checks: list[tuple[str, torch.Tensor]] = field(default_factory=list)
     codes: list[torch.Tensor] = field(default_factory=list)
+    backbone_hidden_states: list[torch.Tensor] = field(default_factory=list)
     decode_input: torch.Tensor | None = None
 
 
@@ -52,6 +55,12 @@ class TalkerStateObserver:
             else:
                 pass
             observation = self.observations[request.request_id]
+            if len(observation.backbone_hidden_states) < BACKBONE_SNAPSHOT_COUNT:
+                observation.backbone_hidden_states.append(
+                    model.predictor_input_buffer[row, 0].clone()
+                )
+            else:
+                pass
             observation.checks.append(
                 ("codec_feedback", (feedback[row] == expected_feedback[row]).all())
             )
@@ -197,6 +206,9 @@ class TalkerStateObserver:
         torch.save(
             {
                 "future_text_rows": torch.stack(observation.text_rows).cpu(),
+                "native_backbone_hidden_states": torch.stack(
+                    observation.backbone_hidden_states
+                ).cpu(),
                 "pad_embedding": request_data.tts_pad_embed.cpu(),
                 "sampling_seed": parameters.sampling_seed,
                 "temperature": parameters.temperature,
