@@ -18,6 +18,7 @@ from sglang_omni.models.qwen3_omni.corpus_hooks import (
     ProjectionCapture,
     TopKCapture,
 )
+from sglang_omni.models.qwen3_omni.expert_capture import FullExpertCapture
 from sglang_omni.scheduling.sglang_backend.request_data import SGLangARRequestData
 from sglang_omni.scheduling.types import SchedulerRequest
 
@@ -59,6 +60,7 @@ class TalkerCorpusRecorder:
     kv_pool: MHATokenToKVPool | None = None
     request_table: torch.Tensor | None = None
     predictor_counters: torch.Tensor | None = None
+    full_experts: FullExpertCapture | None = None
 
     def __init__(
         self,
@@ -265,6 +267,10 @@ class TalkerCorpusRecorder:
             count.zero_()
         self.dense_snapshots["seen"].zero_()
         self.predictor_batch.zero_()
+        if self.full_experts is not None:
+            self.full_experts.prepare()
+        else:
+            pass
 
     def capture(
         self,
@@ -340,6 +346,19 @@ class TalkerCorpusRecorder:
                     self.directory
                     / f"prefix-{request.request_id}-{self.step_index:06d}.pt",
                 )
+        else:
+            pass
+        if self.full_experts is not None:
+            real_rows = (
+                sum(forward_batch.extend_seq_lens_cpu)
+                if forward_batch.forward_mode.is_extend()
+                else live_rows
+            )
+            self.full_experts.save(
+                self.directory / f"experts-{self.step_index:06d}.pt",
+                real_rows,
+                self.query_indices[:live_rows],
+            )
         else:
             pass
         if codes is None:

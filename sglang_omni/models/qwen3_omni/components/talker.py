@@ -27,6 +27,7 @@ from sglang_omni.models.qwen3_omni.components.thinker_model import (
     Qwen3OmniMoeThinkerTextSparseMoeBlock,
 )
 from sglang_omni.models.qwen3_omni.corpus_diagnostics import TalkerCorpusRecorder
+from sglang_omni.models.qwen3_omni.expert_capture import FullExpertCapture
 from sglang_omni.models.qwen3_omni.hf_config import (
     Qwen3OmniMoeTalkerConfig,
     Qwen3OmniMoeTalkerTextConfig,
@@ -1050,6 +1051,13 @@ class Qwen3OmniTalker(nn.Module):
                 self.code_predictor.model.layers[0].mlp.down_proj.weight.shape[1],
                 device,
             )
+            if os.environ.get("SGLANG_OMNI_CORPUS_FULL_EXPERTS") == "1":
+                self.corpus_recorder.full_experts = FullExpertCapture(
+                    self.model.layers,
+                    max(max_batch_size, get_schedule().max_prefill_tokens),
+                )
+            else:
+                pass
             assert self.predictor_fused_layers is not None
             self.predictor_fused_layers.corpus_buffers = (
                 self.corpus_recorder.dense_snapshots

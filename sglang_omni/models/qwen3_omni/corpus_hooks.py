@@ -46,7 +46,7 @@ class OutputCapture:
     def __init__(
         self,
         snapshot: torch.Tensor,
-        query_indices: torch.Tensor,
+        query_indices: torch.Tensor | None,
         finite: torch.Tensor,
         row_count: torch.Tensor,
     ) -> None:
@@ -65,7 +65,10 @@ class OutputCapture:
         ),
         output: torch.Tensor,
     ) -> None:
-        self.snapshot.copy_(output.index_select(0, self.query_indices))
+        if self.query_indices is None:
+            self.snapshot[: output.shape[0]].copy_(output)
+        else:
+            self.snapshot.copy_(output.index_select(0, self.query_indices))
         self.finite.copy_(output.isfinite().all())
         self.row_count.fill_(output.shape[0])
 
@@ -75,7 +78,7 @@ class TopKCapture:
         self,
         expert_ids: torch.Tensor,
         weights: torch.Tensor,
-        query_indices: torch.Tensor,
+        query_indices: torch.Tensor | None,
         row_count: torch.Tensor,
     ) -> None:
         self.expert_ids = expert_ids
@@ -90,8 +93,12 @@ class TopKCapture:
         output: StandardTopKOutput,
     ) -> None:
         assert isinstance(output, StandardTopKOutput)
-        self.expert_ids.copy_(output.topk_ids.index_select(0, self.query_indices))
-        self.weights.copy_(output.topk_weights.index_select(0, self.query_indices))
+        if self.query_indices is None:
+            self.expert_ids[: output.topk_ids.shape[0]].copy_(output.topk_ids)
+            self.weights[: output.topk_weights.shape[0]].copy_(output.topk_weights)
+        else:
+            self.expert_ids.copy_(output.topk_ids.index_select(0, self.query_indices))
+            self.weights.copy_(output.topk_weights.index_select(0, self.query_indices))
         self.row_count.fill_(output.topk_ids.shape[0])
 
 
