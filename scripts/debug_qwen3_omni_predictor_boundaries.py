@@ -100,7 +100,9 @@ def main() -> None:
             record_shapes=True,
         ) as profile:
             expected_hidden = native.predictor_forward_tokens(
-                token_embeds=token_embeddings, batch_size=1, cache_len=cache_length
+                token_embeds=token_embeddings.clone(),
+                batch_size=1,
+                cache_len=cache_length,
             ).clone()
             expected_logits = native.code_predictor.lm_head[arguments.group - 1](
                 expected_hidden[:, -1:]
@@ -120,7 +122,7 @@ def main() -> None:
         history_controls = {"fused_past_fused_current": expected_logits}
         native.predictor_fused_layers = None
         plain_current = native.predictor_forward_tokens(
-            token_embeds=token_embeddings, batch_size=1, cache_len=cache_length
+            token_embeds=token_embeddings.clone(), batch_size=1, cache_len=cache_length
         )
         history_controls["fused_past_plain_current"] = head(plain_current[:, -1:])[
             0
@@ -134,14 +136,14 @@ def main() -> None:
         )
         native.predictor_fused_layers = fused
         fused_current = native.predictor_forward_tokens(
-            token_embeds=token_embeddings, batch_size=1, cache_len=cache_length
+            token_embeds=token_embeddings.clone(), batch_size=1, cache_len=cache_length
         )
         history_controls["plain_past_fused_current"] = head(fused_current[:, -1:])[
             0
         ].clone()
         native.predictor_fused_layers = None
         plain_current = native.predictor_forward_tokens(
-            token_embeds=token_embeddings, batch_size=1, cache_len=cache_length
+            token_embeds=token_embeddings.clone(), batch_size=1, cache_len=cache_length
         )
         history_controls["plain_past_plain_current"] = head(plain_current[:, -1:])[
             0
