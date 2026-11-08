@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+from bisect import bisect_right
 from pathlib import Path
 
 import torch
@@ -11,7 +12,7 @@ from huggingface_hub import hf_hub_download
 from pydantic import BaseModel
 from safetensors import safe_open
 
-from sglang_omni.models.qwen3_omni.corpus_diagnostics import RequestTrace
+from sglang_omni.models.qwen3_omni.corpus_diagnostics import RequestTrace, StepMetadata
 
 
 class CheckpointIndex(BaseModel):
@@ -74,10 +75,8 @@ def main() -> None:
     relative_errors = []
     absolute_errors = []
     changed_coordinates = []
-    embedding_rows = []
     for group, table in enumerate(tables):
         embedding = table[codes[:, group]]
-        embedding_rows.append(embedding)
         sequential.add_(embedding)
         accurate.add_(embedding.double())
         rounded = accurate.bfloat16()
@@ -137,14 +136,74 @@ def main() -> None:
         ],
         "per_request": request_reports,
     }
-    checkpoint_sum = torch.stack(embedding_rows, dim=1).sum(dim=1)
+    starts = [report["start"] for report in request_reports]
+    offsets = {
+        request.request_id: start
+        for request, start in zip(requests, starts, strict=True)
+    }
+    checkpoint_sum = torch.empty_like(sequential)
+    recorded_geometries: set[int] = set()
+    written_rows: set[int] = set()
+    for line in (arguments.capture_directory / "steps.jsonl").read_text().splitlines():
+        metadata = StepMetadata.model_validate_json(line)
+        if metadata.predictor_batch == 0:
+            continue
+        else:
+            pass
+        recorded_geometries.add(metadata.predictor_batch)
+        frame_rows = [
+            offsets[request_id] + frame
+            for request_id, frame in zip(
+                metadata.request_ids, metadata.frame_indices, strict=True
+            )
+        ]
+        assert all(row not in written_rows for row in frame_rows)
+        written_rows.update(frame_rows)
+        indices = torch.tensor(
+            frame_rows,
+            dtype=torch.long,
+            device=arguments.reference_device,
+        )
+        step_codes = torch.zeros(
+            metadata.predictor_batch,
+            group_count,
+            dtype=torch.long,
+            device=arguments.reference_device,
+        )
+        step_codes[: metadata.live_rows] = codes[indices]
+        embeddings = torch.stack(
+            [table[step_codes[:, group]] for group, table in enumerate(tables)], dim=1
+        )
+        checkpoint_sum[indices] = embeddings.sum(dim=1)[: metadata.live_rows]
+    assert len(written_rows) == codes.shape[0]
     rounded_accurate = accurate.bfloat16()
+    differing_coordinates = (
+        (checkpoint_sum != rounded_accurate).nonzero().cpu().tolist()
+    )
+    differences = []
+    for frame_row, coordinate in differing_coordinates:
+        request_index = bisect_right(starts, frame_row) - 1
+        request = requests[request_index]
+        frame = frame_row - starts[request_index]
+        differences.append(
+            {
+                "request_id": request.request_id,
+                "ordinal": request.ordinal,
+                "frame": frame,
+                "step": request.steps[frame],
+                "coordinate": coordinate,
+                "checkpoint_value": float(checkpoint_sum[frame_row, coordinate]),
+                "rounded_fp64_value": float(rounded_accurate[frame_row, coordinate]),
+            }
+        )
     summary["checkpoint_sum_vs_rounded_fp64"] = {
+        "recorded_predictor_batches": sorted(recorded_geometries),
         "changed_frames": int((checkpoint_sum != rounded_accurate).any(-1).sum()),
         "changed_coordinates": int((checkpoint_sum != rounded_accurate).sum()),
         "maximum_absolute": float(
             (checkpoint_sum.float() - rounded_accurate.float()).abs().max()
         ),
+        "differences": differences,
     }
     (arguments.output_directory / "summary.json").write_text(
         json.dumps(summary, indent=2)
