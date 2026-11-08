@@ -11,6 +11,7 @@ import torch
 import torch.nn.functional as functional
 from huggingface_hub import snapshot_download
 from safetensors import safe_open
+from sglang.srt.layers.rotary_embedding import get_rope
 from transformers import Qwen3OmniMoeConfig
 from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import (
     Qwen3OmniMoeTalkerRotaryEmbedding,
@@ -19,6 +20,7 @@ from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import (
 
 from scripts.debug_qwen3_omni_expert_corpus import compare_outputs
 from sglang_omni.models.qwen3_omni.corpus_diagnostics import StepMetadata
+from sglang_omni.models.qwen3_omni.hf_config import Qwen3OmniMoeTalkerTextConfig
 
 
 @torch.inference_mode()
@@ -35,6 +37,28 @@ def main() -> None:
     ).talker_config.text_config
     assert config.sliding_window is None
     checkpoint_rotary = Qwen3OmniMoeTalkerRotaryEmbedding(config).cuda()
+    native_config = Qwen3OmniMoeTalkerTextConfig(**config.to_dict())
+    assert native_config.rope_scaling is not None
+    rotary_operators = {
+        name: get_rope(
+            native_config.head_dim,
+            rotary_dim=native_config.head_dim,
+            max_position=native_config.max_position_embeddings,
+            base=native_config.rope_theta,
+            rope_scaling=scaling,
+            dtype=torch.bfloat16,
+        ).cuda()
+        for name, scaling in (
+            ("serialized", native_config.rope_scaling),
+            (
+                "checkpoint_layout",
+                {
+                    **native_config.rope_scaling,
+                    "mrope_interleaved": config.rope_parameters["interleaved"],
+                },
+            ),
+        )
+    }
     model_directory = Path(
         snapshot_download(
             arguments.model_path,
@@ -171,6 +195,27 @@ def main() -> None:
                         float(metrics["relative_l2"].max()),
                     )
                     rotated_metrics[name] = metrics
+                normalized_flat = [
+                    tensor[0].transpose(0, 1).reshape(real_rows, -1)
+                    for tensor in normalized
+                ]
+                layout_metrics = {}
+                for layout, operator in rotary_operators.items():
+                    native_rotated = operator.forward_native(
+                        positions, *(tensor.clone() for tensor in normalized_flat)
+                    )
+                    layout_metrics[layout] = {}
+                    for name, actual, expected in zip(
+                        ("query", "key"), native_rotated, rotated, strict=True
+                    ):
+                        expected = expected[0].transpose(0, 1).reshape(real_rows, -1)
+                        metrics = compare_outputs(actual, expected)
+                        assert metrics["finite"].all()
+                        if layout == "checkpoint_layout":
+                            assert torch.equal(actual, expected), (layer, metadata.step)
+                        else:
+                            pass
+                        layout_metrics[layout][name] = metrics["relative_l2"]
                 offset = 0
                 for row, request_id in enumerate(metadata.request_ids):
                     extend_length = saved["extend_lengths"][row]
@@ -264,6 +309,13 @@ def main() -> None:
                         "checkpoint_normalized_rotated_maximum_absolute": {
                             name: metrics["max_absolute"][selected].cpu().tolist()
                             for name, metrics in rotated_metrics.items()
+                        },
+                        "rotary_layout_relative_l2": {
+                            layout: {
+                                name: metrics[selected].cpu().tolist()
+                                for name, metrics in comparisons.items()
+                            }
+                            for layout, comparisons in layout_metrics.items()
                         },
                         "attention_relative_l2": metrics["relative_l2"].cpu().tolist(),
                         "attention_maximum_absolute": metrics["max_absolute"]
