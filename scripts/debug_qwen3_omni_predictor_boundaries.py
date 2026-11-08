@@ -119,6 +119,21 @@ def main() -> None:
         prefix_keys = native.predictor_k_cache[:, :1, :cache_length].clone()
         prefix_values = native.predictor_v_cache[:, :1, :cache_length].clone()
         head = native.code_predictor.lm_head[arguments.group - 1]
+        assert head.bias is None
+        projected_logits = torch.mm(
+            expected_hidden[:, -1].contiguous(),
+            head.weight.T,
+            out_dtype=torch.float32,
+        )
+        torch.save(
+            {
+                "hidden_states": expected_hidden[:, -1].cpu(),
+                "weight": head.weight.cpu(),
+                "native_logits": expected_logits.cpu(),
+                "float32_output_logits": projected_logits.cpu(),
+            },
+            arguments.output_directory / "head-operands.pt",
+        )
         history_controls = {"fused_past_fused_current": expected_logits}
         native.predictor_fused_layers = None
         plain_current = native.predictor_forward_tokens(
@@ -378,6 +393,23 @@ def main() -> None:
             "decomposed_hidden_exact": True,
             "decomposed_logits_exact": True,
             "prefix_unchanged": True,
+            "head_projection": {
+                "float32_output_argmax": int(projected_logits.argmax(-1)),
+                "float32_output_top_two_gap": float(
+                    projected_logits.topk(2, dim=-1).values.diff(dim=-1).neg()[0, 0]
+                ),
+                "bfloat16_tied_maxima": int(
+                    (expected_logits == expected_logits.max()).sum()
+                ),
+                "float32_rounds_to_recorded_logits": bool(
+                    torch.equal(
+                        projected_logits.to(expected_logits.dtype).reshape_as(
+                            expected_logits
+                        ),
+                        expected_logits,
+                    )
+                ),
+            },
             "history_controls": {
                 name: {
                     "argmax": int(logits.argmax(-1)),
