@@ -239,6 +239,7 @@ def measure_layer(
             frame_count, hidden_size, device="cuda", dtype=torch.float64
         ),
         "checkpoint_steps": torch.zeros_like(inputs),
+        "checkpoint_steps_bf16_scales": torch.zeros_like(inputs),
         "bf16_gemm_fused_activation": torch.zeros(
             frame_count, hidden_size, device="cuda", dtype=torch.float32
         ),
@@ -272,6 +273,11 @@ def measure_layer(
             )
             # note (ratish): unique rows preserve ascending-expert BF16 accumulation.
             routed[name][rows] = routed[name][rows] + scaled.to(routed[name].dtype)
+        rounded_scales = selected_scales.to(inputs.dtype)
+        rounded_output = references.outputs["checkpoint_steps"] * rounded_scales
+        routed["checkpoint_steps_bf16_scales"][rows] = (
+            routed["checkpoint_steps_bf16_scales"][rows] + rounded_output
+        )
     assert selected_written.all()
     measurements = {
         f"expert.{name}": values.cpu() for name, values in expert_measurements.items()
@@ -280,6 +286,10 @@ def measure_layer(
         reference = output if name == "fp64" else output.bfloat16()
         for metric, values in compare_outputs(observed, reference).items():
             measurements[f"routed.{name}.{metric}"] = values.cpu()
+    for metric, values in compare_outputs(
+        routed["checkpoint_steps_bf16_scales"], routed["checkpoint_steps"]
+    ).items():
+        measurements[f"routing.bf16_scale_boundary.{metric}"] = values.cpu()
     shared = reference_mlp(
         inputs,
         weights["shared_expert.gate_proj.weight"],
@@ -311,6 +321,9 @@ def measure_layer(
         (scales.double() - normalized).abs().amax(-1).cpu()
     )
     measurements["routing.scale_sum_error"] = (scales.double().sum(-1) - 1).abs().cpu()
+    measurements["routing.bf16_scale_cast_max_absolute"] = (
+        (scales - scales.to(inputs.dtype).float()).abs().amax(-1).cpu()
+    )
     return measurements
 
 
@@ -324,6 +337,7 @@ def main() -> None:
         "--response-directory", type=Path, action="append", required=True
     )
     parser.add_argument("--output-directory", type=Path, required=True)
+    parser.add_argument("--packed-directory", type=Path)
     arguments = parser.parse_args()
     arguments.output_directory.mkdir(exist_ok=False)
     config = Qwen3OmniMoeConfig.from_pretrained(
@@ -348,12 +362,30 @@ def main() -> None:
     assert identities and len({record.request_id for record in identities}) == len(
         identities
     )
-    packed = pack_corpus(
-        arguments.capture_directory,
-        {record.request_id: record.sample_id for record in identities},
-        config.num_hidden_layers,
-        arguments.output_directory,
-    )
+    if arguments.packed_directory is None:
+        packed = pack_corpus(
+            arguments.capture_directory,
+            {record.request_id: record.sample_id for record in identities},
+            config.num_hidden_layers,
+            arguments.output_directory,
+        )
+    else:
+        packed = torch.load(
+            arguments.packed_directory / "selected-routes.pt",
+            map_location="cpu",
+            weights_only=True,
+            mmap=True,
+        )
+        rows = [
+            json.loads(line)
+            for line in (arguments.packed_directory / "rows.jsonl")
+            .read_text()
+            .splitlines()
+        ]
+        assert {row["request_id"] for row in rows} == {
+            record.request_id for record in identities
+        }
+        assert len(rows) == packed["router.input"].shape[1]
     summary = {
         "requests": len(identities),
         "frames": packed["router.input"].shape[1],
@@ -361,6 +393,12 @@ def main() -> None:
         "experts_per_token": config.num_experts_per_tok,
         "model_revision": arguments.model_revision,
         "scope": "All captured current-query rows and full generated lifetimes. Actual expert IDs and weights remain fixed. FP64 and explicitly named rounding variants are local mathematical references, not the actual kernel's internal intermediates or free-running quality results.",
+        "routing_scale_scope": "checkpoint_steps retains FP32 routing scales for comparison with earlier evidence. checkpoint_steps_bf16_scales rounds those same frozen scales to BF16 before multiplication, keeping expert outputs and ascending-expert accumulation fixed. This isolates one checkpoint boundary, not a complete free-running checkpoint implementation.",
+        "reused_packed_directory": (
+            str(arguments.packed_directory)
+            if arguments.packed_directory is not None
+            else None
+        ),
         "measurements": {},
     }
     for layer in range(config.num_hidden_layers):
