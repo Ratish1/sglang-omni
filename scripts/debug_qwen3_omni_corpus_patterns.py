@@ -120,6 +120,16 @@ def main() -> None:
                 continue
             else:
                 pass
+            selected_rows = [
+                row
+                for row, request_id in enumerate(metadata.request_ids)
+                if request_id in samples
+            ]
+            if not selected_rows:
+                ignored_rows += len(metadata.request_ids)
+                continue
+            else:
+                pass
             measurements = torch.load(
                 arguments.measurement_directory / f"step-{metadata.step:06d}.pt",
                 map_location="cpu",
@@ -132,11 +142,6 @@ def main() -> None:
                 .tolist()
                 for name, tensor in measurements.items()
             }
-            selected_rows = [
-                row
-                for row, request_id in enumerate(metadata.request_ids)
-                if request_id in samples
-            ]
             for name, tensor in measurements.items():
                 if tensor.ndim == 2:
                     for position in range(tensor.shape[0]):
@@ -147,6 +152,7 @@ def main() -> None:
                         )
                 else:
                     pass
+            selected_buckets: dict[str, list[int]] = defaultdict(list)
             for row, (request_id, frame_index) in enumerate(
                 zip(metadata.request_ids, metadata.frame_indices, strict=True)
             ):
@@ -174,32 +180,31 @@ def main() -> None:
                     f"geometry:{metadata.live_rows}/{metadata.predictor_batch}/{metadata.phase}/{metadata.captured_graph}",
                     f"quality:{quality}",
                 )
-                for name, rows in row_values.items():
-                    values = rows[row]
-                    for bucket in buckets:
-                        aggregate = aggregates[bucket].setdefault(
-                            name, MetricAggregate()
-                        )
-                        aggregate.update(values)
-                    if name.endswith("fp64_changes_argmax") or name.endswith(
-                        "fp64_changes_set"
-                    ):
-                        per_request[request_id][name] += int(sum(values))
-                    elif (
-                        name.endswith("selected_is_argmax")
-                        or name.endswith("selected_set_valid")
-                        or name.endswith(".finite")
-                        or name.endswith(".exact")
-                        or name.endswith("_finite")
-                        or name.endswith("_exact")
-                    ):
-                        per_request[request_id][f"invalid:{name}"] += len(values) - int(
-                            sum(values)
-                        )
-                    else:
-                        pass
-                    numeric_totals.setdefault(name, MetricAggregate()).update(values)
+                for bucket in buckets:
+                    selected_buckets[bucket].append(row)
                 per_request[request_id]["frames"] += 1
+            for name, rows in row_values.items():
+                numeric_totals.setdefault(name, MetricAggregate()).update(
+                    [value for row in selected_rows for value in rows[row]]
+                )
+                for bucket, bucket_rows in selected_buckets.items():
+                    aggregates[bucket].setdefault(name, MetricAggregate()).update(
+                        [value for row in bucket_rows for value in rows[row]]
+                    )
+                if name.endswith("fp64_changes_argmax") or name.endswith(
+                    "fp64_changes_set"
+                ):
+                    for row in selected_rows:
+                        per_request[metadata.request_ids[row]][name] += int(
+                            sum(rows[row])
+                        )
+                elif measurements[name].dtype == torch.bool or name.endswith("_exact"):
+                    for row in selected_rows:
+                        per_request[metadata.request_ids[row]][
+                            f"invalid:{name}"
+                        ] += len(rows[row]) - int(sum(rows[row]))
+                else:
+                    pass
     coverage = {
         request_id: completion.main_codes_match
         and observed_steps[request_id] == completion.steps

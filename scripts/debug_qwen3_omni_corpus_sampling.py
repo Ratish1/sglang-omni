@@ -66,7 +66,9 @@ def main() -> None:
     ).talker_config
     vocab_size = config.text_config.vocab_size
     token_ids = torch.arange(vocab_size, device="cuda")
-    allowed = (token_ids < vocab_size - 1024) | (token_ids == config.codec_eos_token_id)
+    allowed = (token_ids < config.code_predictor_config.vocab_size) | (
+        token_ids == config.codec_eos_token_id
+    )
     counts = {request_id: 0 for request_id in identities}
     mismatches = []
     skipped_prefill_steps = 0
@@ -170,6 +172,12 @@ def main() -> None:
                 else:
                     pass
     summary = {
+        "model_path": arguments.model_path,
+        "model_revision": arguments.model_revision,
+        "temperature": arguments.temperature,
+        "repetition_penalty": arguments.repetition_penalty,
+        "top_k": arguments.top_k,
+        "top_p": arguments.top_p,
         "requests": len(identities),
         "decode_draws": sum(counts.values()),
         "decode_draws_per_request": counts,
