@@ -21,6 +21,37 @@ from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import (
 )
 
 
+class ReferenceStateHook:
+    def __init__(self, snapshots: dict[str, torch.Tensor], name: str) -> None:
+        self.snapshots = snapshots
+        self.name = name
+
+    def tensor_output(
+        self,
+        module: torch.nn.Module,
+        arguments: tuple[torch.Tensor],
+        output: torch.Tensor,
+    ) -> None:
+        self.snapshots[self.name] = output[0, -1].clone()
+
+    def attention_output(
+        self,
+        module: torch.nn.Module,
+        arguments: tuple[torch.Tensor],
+        output: tuple[torch.Tensor, torch.Tensor | None],
+    ) -> None:
+        self.snapshots[self.name] = output[0][0, -1].clone()
+
+    def router_output(
+        self,
+        module: torch.nn.Module,
+        arguments: tuple[torch.Tensor],
+        output: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+    ) -> None:
+        for name, tensor in zip(("logits", "weights", "experts"), output, strict=True):
+            self.snapshots[f"{self.name}_{name}"] = tensor[-1].clone()
+
+
 def native_cache(
     snapshot: dict[str, torch.Tensor],
     config: Qwen3OmniMoeTalkerTextConfig,
@@ -80,6 +111,29 @@ def main() -> None:
         reference.float()
     else:
         pass
+    boundary_snapshots: dict[str, torch.Tensor] = {}
+    for layer_index, layer in enumerate(reference.model.layers):
+        for name, module in (
+            ("attention_input", layer.input_layernorm),
+            ("moe_input", layer.post_attention_layernorm),
+            ("moe_output", layer.mlp),
+            ("layer_output", layer),
+        ):
+            module.register_forward_hook(
+                ReferenceStateHook(
+                    boundary_snapshots, f"layer_{layer_index}_{name}"
+                ).tensor_output
+            )
+        layer.self_attn.register_forward_hook(
+            ReferenceStateHook(
+                boundary_snapshots, f"layer_{layer_index}_attention_projection"
+            ).attention_output
+        )
+        layer.mlp.gate.register_forward_hook(
+            ReferenceStateHook(
+                boundary_snapshots, f"layer_{layer_index}_router"
+            ).router_output
+        )
     reports = []
     with torch.inference_mode():
         for request_id in arguments.request_id:
@@ -238,6 +292,31 @@ def main() -> None:
                         ),
                     }
                     reports.append(report)
+                    assert (
+                        len(boundary_snapshots)
+                        == 8 * config.text_config.num_hidden_layers
+                    )
+                    torch.save(
+                        {
+                            "reference_boundaries": {
+                                name: tensor.cpu()
+                                for name, tensor in boundary_snapshots.items()
+                            },
+                            "native_logits": actual_logits.cpu(),
+                            "reference_logits": expected_logits.cpu(),
+                            "native_hidden_states": actual_hidden.cpu(),
+                            "reference_hidden_states": expected_hidden.cpu(),
+                            "repetition_mask": repeated.cpu(),
+                            "seed": seed.cpu(),
+                            "positions": frame_positions[-1:].cpu(),
+                            "temperature": conditioning["temperature"],
+                            "repetition_penalty": conditioning["repetition_penalty"],
+                            "top_k": conditioning["top_k"],
+                            "top_p": conditioning["top_p"],
+                        },
+                        arguments.output_directory
+                        / f"{request_id}.{history}.{frame_index}.pt",
+                    )
                     arguments.output_directory.joinpath("summary.json").write_text(
                         json.dumps(reports, indent=2)
                     )
