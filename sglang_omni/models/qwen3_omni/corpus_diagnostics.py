@@ -358,6 +358,7 @@ class TalkerCorpusRecorder:
                 self.directory / f"experts-{self.step_index:06d}.pt",
                 real_rows,
                 self.query_indices[:live_rows],
+                forward_batch,
             )
         else:
             pass

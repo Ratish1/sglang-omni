@@ -5,9 +5,11 @@ from __future__ import annotations
 from pathlib import Path
 
 import torch
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from torch import nn
 
 from sglang_omni.models.qwen3_omni.corpus_hooks import (
+    AttentionCapture,
     OutputCapture,
     ProjectionCapture,
     TopKCapture,
@@ -15,16 +17,35 @@ from sglang_omni.models.qwen3_omni.corpus_hooks import (
 
 
 class FullExpertCapture:
-    def __init__(self, layers: nn.ModuleList, maximum_rows: int) -> None:
+    def __init__(
+        self,
+        layers: nn.ModuleList,
+        maximum_rows: int,
+        *,
+        include_attention: bool = False,
+    ) -> None:
+        self.maximum_rows = maximum_rows
         self.snapshots: dict[str, torch.Tensor] = {}
         self.counts: dict[str, torch.Tensor] = {}
         self.finite: dict[str, torch.Tensor] = {}
         for layer_index, layer in enumerate(layers):
             prefix = f"backbone.{layer_index}."
-            for name, projection in (
+            projections = [
                 ("router", layer.mlp.gate),
                 ("shared_gate", layer.mlp.shared_expert_gate),
-            ):
+            ]
+            if include_attention:
+                projections.extend(
+                    [
+                        ("qkv", layer.self_attn.qkv_proj),
+                        ("attention_projection", layer.self_attn.o_proj),
+                        ("shared_up", layer.mlp.shared_expert.gate_up_proj),
+                        ("shared_down", layer.mlp.shared_expert.down_proj),
+                    ]
+                )
+            else:
+                pass
+            for name, projection in projections:
                 weight = projection.weight
                 inputs = torch.empty(
                     maximum_rows,
@@ -79,15 +100,45 @@ class FullExpertCapture:
             self.snapshots[prefix + "expert_weights"] = scales
             self.counts[prefix + "topk"] = count
             layer.mlp.topk.register_forward_hook(TopKCapture(ids, scales, None, count))
+            if include_attention:
+                attention = layer.self_attn
+                for name, width in (
+                    ("query", attention.q_size),
+                    ("key", attention.kv_size),
+                    ("value", attention.kv_size),
+                ):
+                    self.snapshots[prefix + name] = torch.empty(
+                        maximum_rows, width, device=weight.device, dtype=weight.dtype
+                    )
+                count = torch.zeros((), device=weight.device, dtype=torch.int64)
+                self.counts[prefix + "attention"] = count
+                attention.attn.register_forward_hook(
+                    AttentionCapture(
+                        None,
+                        self.snapshots[prefix + "query"],
+                        self.snapshots[prefix + "key"],
+                        self.snapshots[prefix + "value"],
+                        count,
+                    )
+                )
+            else:
+                pass
 
     def prepare(self) -> None:
         for count in self.counts.values():
             count.zero_()
 
-    def save(self, path: Path, real_rows: int, query_indices: torch.Tensor) -> None:
+    def save(
+        self,
+        path: Path,
+        real_rows: int,
+        query_indices: torch.Tensor,
+        forward_batch: ForwardBatch,
+    ) -> None:
         counts = {name: int(count.cpu()) for name, count in self.counts.items()}
         row_count = counts["backbone.0.router"]
         assert 0 < real_rows <= row_count and set(counts.values()) == {row_count}
+        assert row_count <= self.maximum_rows, (row_count, self.maximum_rows)
         torch.save(
             {
                 "snapshots": {
@@ -99,6 +150,22 @@ class FullExpertCapture:
                 },
                 "real_rows": real_rows,
                 "query_indices": query_indices.cpu(),
+                "positions": forward_batch.positions[:real_rows].cpu(),
+                "mrope_positions": (
+                    forward_batch.mrope_positions[:, :real_rows].cpu()
+                    if forward_batch.mrope_positions is not None
+                    else torch.empty(0, device="cpu")
+                ),
+                "extend_lengths": (
+                    list(forward_batch.extend_seq_lens_cpu)
+                    if forward_batch.forward_mode.is_extend()
+                    else [1] * len(query_indices)
+                ),
+                "prefix_lengths": (
+                    list(forward_batch.extend_prefix_lens_cpu)
+                    if forward_batch.forward_mode.is_extend()
+                    else []
+                ),
             },
             path,
         )

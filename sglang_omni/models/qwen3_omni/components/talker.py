@@ -1054,7 +1054,14 @@ class Qwen3OmniTalker(nn.Module):
             if os.environ.get("SGLANG_OMNI_CORPUS_FULL_EXPERTS") == "1":
                 self.corpus_recorder.full_experts = FullExpertCapture(
                     self.model.layers,
-                    max(max_batch_size, get_schedule().max_prefill_tokens),
+                    (
+                        int(os.environ["SGLANG_OMNI_CORPUS_CAPTURE_ROWS"])
+                        if "SGLANG_OMNI_CORPUS_CAPTURE_ROWS" in os.environ
+                        else max(max_batch_size, get_schedule().max_prefill_tokens)
+                    ),
+                    include_attention=(
+                        os.environ.get("SGLANG_OMNI_CORPUS_FULL_ATTENTION") == "1"
+                    ),
                 )
             else:
                 pass

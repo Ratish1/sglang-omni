@@ -35,8 +35,9 @@ class ProjectionCapture:
         self.row_count.fill_(input_rows.shape[0])
         self.finite.copy_(output_rows.isfinite().all())
         if self.query_indices is None:
-            self.input_snapshot[: input_rows.shape[0]].copy_(input_rows)
-            self.output_snapshot[: output_rows.shape[0]].copy_(output_rows)
+            captured_rows = min(input_rows.shape[0], self.input_snapshot.shape[0])
+            self.input_snapshot[:captured_rows].copy_(input_rows[:captured_rows])
+            self.output_snapshot[:captured_rows].copy_(output_rows[:captured_rows])
         else:
             self.input_snapshot.copy_(input_rows.index_select(0, self.query_indices))
             self.output_snapshot.copy_(output_rows.index_select(0, self.query_indices))
@@ -62,11 +63,13 @@ class OutputCapture:
             tuple[torch.Tensor]
             | tuple[torch.Tensor, ForwardBatch | None]
             | tuple[torch.Tensor, StandardTopKOutput]
+            | tuple[torch.Tensor, torch.Tensor, torch.Tensor, ForwardBatch]
         ),
         output: torch.Tensor,
     ) -> None:
         if self.query_indices is None:
-            self.snapshot[: output.shape[0]].copy_(output)
+            captured_rows = min(output.shape[0], self.snapshot.shape[0])
+            self.snapshot[:captured_rows].copy_(output[:captured_rows])
         else:
             self.snapshot.copy_(output.index_select(0, self.query_indices))
         self.finite.copy_(output.isfinite().all())
@@ -94,8 +97,9 @@ class TopKCapture:
     ) -> None:
         assert isinstance(output, StandardTopKOutput)
         if self.query_indices is None:
-            self.expert_ids[: output.topk_ids.shape[0]].copy_(output.topk_ids)
-            self.weights[: output.topk_weights.shape[0]].copy_(output.topk_weights)
+            captured_rows = min(output.topk_ids.shape[0], self.expert_ids.shape[0])
+            self.expert_ids[:captured_rows].copy_(output.topk_ids[:captured_rows])
+            self.weights[:captured_rows].copy_(output.topk_weights[:captured_rows])
         else:
             self.expert_ids.copy_(output.topk_ids.index_select(0, self.query_indices))
             self.weights.copy_(output.topk_weights.index_select(0, self.query_indices))
@@ -105,7 +109,7 @@ class TopKCapture:
 class AttentionCapture:
     def __init__(
         self,
-        query_indices: torch.Tensor,
+        query_indices: torch.Tensor | None,
         queries: torch.Tensor,
         keys: torch.Tensor,
         values: torch.Tensor,
@@ -124,17 +128,30 @@ class AttentionCapture:
         output: torch.Tensor,
     ) -> None:
         query, keys, values, forward_batch = arguments
-        self.queries.copy_(
-            query.reshape(-1, self.queries.shape[-1]).index_select(
-                0, self.query_indices
-            )
-        )
         key_buffer, value_buffer = get_token_to_kv_pool().get_kv_buffer(module.layer_id)
-        locations = forward_batch.out_cache_loc.index_select(
-            0, self.query_indices
-        ).long()
-        self.keys.copy_(key_buffer.index_select(0, locations).reshape_as(self.keys))
-        self.values.copy_(
-            value_buffer.index_select(0, locations).reshape_as(self.values)
-        )
+        if self.query_indices is None:
+            captured_rows = min(query.shape[0], self.queries.shape[0])
+            self.queries[:captured_rows].copy_(
+                query.reshape(-1, self.queries.shape[-1])[:captured_rows]
+            )
+            locations = forward_batch.out_cache_loc[:captured_rows].long()
+            self.keys[:captured_rows].copy_(
+                key_buffer.index_select(0, locations).reshape(captured_rows, -1)
+            )
+            self.values[:captured_rows].copy_(
+                value_buffer.index_select(0, locations).reshape(captured_rows, -1)
+            )
+        else:
+            self.queries.copy_(
+                query.reshape(-1, self.queries.shape[-1]).index_select(
+                    0, self.query_indices
+                )
+            )
+            locations = forward_batch.out_cache_loc.index_select(
+                0, self.query_indices
+            ).long()
+            self.keys.copy_(key_buffer.index_select(0, locations).reshape_as(self.keys))
+            self.values.copy_(
+                value_buffer.index_select(0, locations).reshape_as(self.values)
+            )
         self.row_count.fill_(query.shape[0])
