@@ -12,13 +12,18 @@ import torch
 from sglang.kernels.fused_op import get_fused_op_backend
 from sglang.kernels.spec import KernelBackend
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+from sglang.srt.model_executor.model_runner import ModelRunner as SGLangModelRunner
 from sglang.srt.model_executor.runner_utils.capture_mode import get_is_capture_mode
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.runtime_context import get_context, get_schedule
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import add_prefix
-from sglang.srt.utils.common import is_flashinfer_available
+from sglang.srt.utils.common import (
+    get_eager_max_batch_size,
+    is_flashinfer_available,
+    next_power_of_2,
+)
 from torch import nn
 
 from sglang_omni.models.qwen3_omni.components.thinker_model import (
@@ -383,6 +388,8 @@ class Qwen3OmniMoeTalkerTextModel(nn.Module):
     Uses codec_embedding instead of embed_tokens.
     """
 
+    decode_tuning_max_tokens: int
+
     def __init__(
         self,
         config: Qwen3OmniMoeTalkerTextConfig,
@@ -486,8 +493,9 @@ class Qwen3OmniMoeTalkerTextModel(nn.Module):
             ].mlp.experts.runner_backend.is_flashinfer_cutlass()
             and self.layers[self.start_layer].mlp.experts.w13_weight.dtype
             == torch.bfloat16
+            and hidden_states.shape[0] > self.decode_tuning_max_tokens
         ):
-            # note (ratish): preserve BF16 prefill projection rounding without changing tuned decode kernels.
+            # note (ratish): preserve previously untuned prefill rounding without changing decode-sized shapes.
             expert_precision_context = autotune(
                 False, skip_ops={"trtllm::fused_moe::gemm1"}
             )
@@ -1050,6 +1058,13 @@ class Qwen3OmniTalker(nn.Module):
     @property
     def activation_dtype(self) -> torch.dtype:
         return self.model.codec_embedding.weight.dtype
+
+    def prepare_before_cuda_graph_capture(
+        self, model_runner: SGLangModelRunner
+    ) -> None:
+        self.model.decode_tuning_max_tokens = next_power_of_2(
+            get_eager_max_batch_size(model_runner.max_running_requests)
+        )
 
     @staticmethod
     def sample_code_predictor_token(logits: torch.Tensor) -> torch.Tensor:

@@ -62,7 +62,7 @@ else:
 @pytest.mark.accelerator
 @pytest.mark.skipif(not is_flashinfer_available(), reason="requires FlashInfer on CUDA")
 @pytest.mark.parametrize(
-    "forward_mode,runner_backend,weight_dtype,is_cuda,raise_after_selection,expected_first_tactic",
+    "forward_mode,runner_backend,weight_dtype,is_cuda,raise_after_selection,input_rows,maximum_running_requests,expected_first_tactic",
     [
         (
             ForwardMode.EXTEND,
@@ -70,6 +70,8 @@ else:
             torch.bfloat16,
             True,
             False,
+            33,
+            32,
             -1,
         ),
         (
@@ -78,15 +80,28 @@ else:
             torch.bfloat16,
             True,
             False,
+            1,
+            32,
             7,
         ),
-        (ForwardMode.EXTEND, MoeRunnerBackend.TRITON, torch.bfloat16, True, False, 7),
+        (
+            ForwardMode.EXTEND,
+            MoeRunnerBackend.TRITON,
+            torch.bfloat16,
+            True,
+            False,
+            33,
+            32,
+            7,
+        ),
         (
             ForwardMode.EXTEND,
             MoeRunnerBackend.FLASHINFER_CUTLASS,
             torch.float16,
             True,
             False,
+            33,
+            32,
             7,
         ),
         (
@@ -95,6 +110,8 @@ else:
             torch.float8_e4m3fn,
             True,
             False,
+            33,
+            32,
             7,
         ),
         (
@@ -103,6 +120,8 @@ else:
             torch.bfloat16,
             False,
             False,
+            33,
+            32,
             7,
         ),
         (
@@ -111,6 +130,38 @@ else:
             torch.bfloat16,
             True,
             True,
+            33,
+            32,
+            -1,
+        ),
+        (
+            ForwardMode.EXTEND,
+            MoeRunnerBackend.FLASHINFER_CUTLASS,
+            torch.bfloat16,
+            True,
+            False,
+            32,
+            32,
+            7,
+        ),
+        (
+            ForwardMode.EXTEND,
+            MoeRunnerBackend.FLASHINFER_CUTLASS,
+            torch.bfloat16,
+            True,
+            False,
+            48,
+            64,
+            7,
+        ),
+        (
+            ForwardMode.EXTEND,
+            MoeRunnerBackend.FLASHINFER_CUTLASS,
+            torch.bfloat16,
+            True,
+            False,
+            65,
+            64,
             -1,
         ),
     ],
@@ -122,9 +173,11 @@ def test_talker_prefill_keeps_default_first_expert_projection_and_restores_tunin
     weight_dtype: torch.dtype,
     is_cuda: bool,
     raise_after_selection: bool,
+    input_rows: int,
+    maximum_running_requests: int,
     expected_first_tactic: int,
 ) -> None:
-    """Prefill tuning replaced the first expert projection's speech arithmetic and must not affect decode."""
+    """Compatibility must retain previously tuned shapes and never change decode or other backends."""
     tuner = AutoTuner.get()
     cached_runner = Mock(spec=TunableRunner)
     monkeypatch.setattr(tuner, "search_cache", Mock(return_value=(True, 0, 7, None)))
@@ -165,25 +218,37 @@ def test_talker_prefill_keeps_default_first_expert_projection_and_restores_tunin
     backbone.end_layer = 1
     backbone.layers_to_capture = []
     backbone.norm = nn.Identity()
-    hidden_states = torch.zeros(1, 2)
+    wrapper = Qwen3OmniTalker.__new__(Qwen3OmniTalker)
+    nn.Module.__init__(wrapper)
+    wrapper.model = backbone
+    wrapper.prepare_before_cuda_graph_capture(
+        Mock(
+            spec=talker_module.SGLangModelRunner,
+            max_running_requests=maximum_running_requests,
+        )
+    )
+    hidden_states = torch.zeros(input_rows, 2)
 
     with autotune(False, skip_ops={"unrelated"}):
         if raise_after_selection:
             with pytest.raises(RuntimeError, match="expert execution failed"):
                 backbone(
-                    input_ids=torch.zeros(1, dtype=torch.long),
-                    positions=torch.zeros(1, dtype=torch.long),
+                    input_ids=torch.zeros(input_rows, dtype=torch.long),
+                    positions=torch.zeros(input_rows, dtype=torch.long),
                     forward_batch=SimpleNamespace(forward_mode=forward_mode),
                     input_embeds=hidden_states,
                 )
         else:
             result = backbone(
-                input_ids=torch.zeros(1, dtype=torch.long),
-                positions=torch.zeros(1, dtype=torch.long),
+                input_ids=torch.zeros(input_rows, dtype=torch.long),
+                positions=torch.zeros(input_rows, dtype=torch.long),
                 forward_batch=SimpleNamespace(forward_mode=forward_mode),
                 input_embeds=hidden_states,
             )
-            assert torch.equal(result, torch.tensor([[expected_first_tactic, 7]]))
+            assert torch.equal(
+                result,
+                torch.tensor([[expected_first_tactic, 7]]).expand(input_rows, -1),
+            )
         assert selected_tactics == [expected_first_tactic, 7]
         for operation, expected_tactic in (
             ("trtllm::fused_moe::gemm1", 7),
