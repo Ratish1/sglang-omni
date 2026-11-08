@@ -374,12 +374,13 @@ class Qwen3OmniMoeTalkerDecoderLayer(Qwen3OmniMoeThinkerTextDecoderLayer):
 
 
 class Qwen3OmniMoeTalkerTextModel(nn.Module):
-    corpus_input: torch.Tensor | None = None
-    corpus_query_indices: torch.Tensor | None = None
     """Talker's MoE text backbone (20-layer, with shared expert).
 
     Uses codec_embedding instead of embed_tokens.
     """
+
+    corpus_input: torch.Tensor | None = None
+    corpus_query_indices: torch.Tensor | None = None
 
     def __init__(
         self,
