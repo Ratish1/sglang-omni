@@ -44,19 +44,45 @@ def replay_draw(
         map_location="cuda",
         weights_only=True,
     )
-    logits = after["logits"].float()
+    draw = sampling_draw(
+        after["logits"],
+        before["repetition_mask"],
+        before["sampling_seed"].reshape(1),
+        before["positions"].reshape(1),
+        temperature,
+        repetition_penalty,
+        top_k,
+        top_p,
+        codebook_size,
+        eos_token_id,
+    )
+    assert draw.sampled_token_id == int(after["codec_ids"][0, 0])
+    return draw
+
+
+def sampling_draw(
+    logits: torch.Tensor,
+    repetition_mask: torch.Tensor,
+    seed: torch.Tensor,
+    positions: torch.Tensor,
+    temperature: float,
+    repetition_penalty: float,
+    top_k: int,
+    top_p: float,
+    codebook_size: int,
+    eos_token_id: int,
+) -> SamplingDraw:
+    logits = logits.float()
     assert logits.shape[0] == 1 and torch.isfinite(logits).all()
     penalized = torch.where(
         logits > 0, logits / repetition_penalty, logits * repetition_penalty
     )
-    logits = torch.where(before["repetition_mask"], penalized, logits)
+    logits = torch.where(repetition_mask, penalized, logits)
     token_ids = torch.arange(logits.shape[-1], device=logits.device)
     allowed = (token_ids < codebook_size) | (token_ids == eos_token_id)
     probabilities = torch.softmax(
         logits.masked_fill(~allowed, -torch.inf) / temperature, dim=-1
     )
-    seed = before["sampling_seed"].reshape(1)
-    positions = before["positions"].reshape(1)
     sampled, weights, sorted_token_ids, _ = top_k_top_p_min_p_sampling_from_probs_torch(
         probabilities,
         torch.tensor([top_k], device=logits.device),
@@ -67,7 +93,6 @@ def replay_draw(
         positions,
         return_filtered_probs=True,
     )
-    assert int(sampled[0]) == int(after["codec_ids"][0, 0])
     hashed = murmur_hash32(seed.to(torch.uint64), positions, token_ids)
     noise = hashed.to(torch.float64) / torch.iinfo(torch.uint32).max
     noise.log_().clamp_(min=torch.finfo(noise.dtype).min, max=-(2.0**-32)).neg_()
@@ -86,7 +111,7 @@ def replay_draw(
         sampled_rank=int(selected_rank[0]),
         seed=int(seed[0]),
         position=int(positions[0]),
-        repetition_mask=before["repetition_mask"],
+        repetition_mask=repetition_mask,
     )
 
 
