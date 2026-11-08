@@ -2,10 +2,127 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import torch
 import torch.nn.functional as F
+from sglang.srt.model_executor.forward_batch_info import ForwardMode
 
 from sglang_omni.models.qwen3_omni.components.talker import Qwen3OmniTalker
+from sglang_omni.models.qwen3_omni.corpus_diagnostics import StepMetadata
+
+
+class BackboneAttentionNumerics:
+    def __init__(self, native: Qwen3OmniTalker, capture_directory: Path) -> None:
+        self.capture_directory = capture_directory
+        self.attention = native.model.layers[0].self_attn
+        self.layer_count = len(native.model.layers)
+        self.contexts: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
+
+    def measure(
+        self, metadata: StepMetadata, snapshots: dict[str, torch.Tensor]
+    ) -> dict[str, torch.Tensor]:
+        measurements: dict[str, list[float]] = {}
+        for row, request_id in enumerate(metadata.request_ids):
+            current_keys, current_values = [
+                torch.stack(
+                    [
+                        snapshots[f"backbone.{layer}.{name}"][row]
+                        for layer in range(self.layer_count)
+                    ]
+                ).reshape(
+                    self.layer_count,
+                    1,
+                    self.attention.num_kv_heads,
+                    self.attention.head_dim,
+                )
+                for name in ("key", "value")
+            ]
+            if ForwardMode[metadata.phase].is_extend():
+                prefix = torch.load(
+                    self.capture_directory
+                    / f"prefix-{request_id}-{metadata.step:06d}.pt",
+                    map_location="cpu",
+                    weights_only=True,
+                )
+                keys = torch.stack(prefix["keys"])
+                values = torch.stack(prefix["values"])
+            else:
+                assert ForwardMode[metadata.phase].is_decode()
+                old_keys, old_values = self.contexts[request_id]
+                assert old_keys.shape[1] + 1 == metadata.sequence_lengths[row]
+                keys = torch.cat((old_keys, current_keys), dim=1)
+                values = torch.cat((old_values, current_values), dim=1)
+            assert keys.shape[1] == metadata.sequence_lengths[row]
+            self.contexts[request_id] = (keys, values)
+            cache_exact = (keys[:, -1:] == current_keys).flatten(1).all(-1) & (
+                values[:, -1:] == current_values
+            ).flatten(1).all(-1)
+            queries = (
+                torch.stack(
+                    [
+                        snapshots[f"backbone.{layer}.query"][row]
+                        for layer in range(self.layer_count)
+                    ]
+                )
+                .cuda()
+                .double()
+                .reshape(
+                    self.layer_count,
+                    self.attention.num_heads,
+                    1,
+                    self.attention.head_dim,
+                )
+            )
+            keys = (
+                keys.cuda()
+                .double()
+                .permute(0, 2, 1, 3)
+                .repeat_interleave(
+                    self.attention.num_heads // self.attention.num_kv_heads, dim=1
+                )
+            )
+            values = (
+                values.cuda()
+                .double()
+                .permute(0, 2, 1, 3)
+                .repeat_interleave(
+                    self.attention.num_heads // self.attention.num_kv_heads, dim=1
+                )
+            )
+            scores = (queries @ keys.transpose(-1, -2)) * self.attention.head_dim**-0.5
+            reference = (scores.softmax(-1) @ values).flatten(1)
+            observed = (
+                torch.stack(
+                    [
+                        snapshots[f"backbone.{layer}.attention_projection.input"][row]
+                        for layer in range(self.layer_count)
+                    ]
+                )
+                .cuda()
+                .double()
+            )
+            difference = observed - reference
+            relative = (
+                (
+                    difference.norm(dim=-1)
+                    / reference.norm(dim=-1).clamp_min(torch.finfo(torch.float64).tiny)
+                )
+                .cpu()
+                .tolist()
+            )
+            absolute = difference.abs().amax(-1).cpu().tolist()
+            for layer in range(self.layer_count):
+                measurements.setdefault(
+                    f"backbone_attention.{layer}.relative_l2", []
+                ).append(relative[layer])
+                measurements.setdefault(
+                    f"backbone_attention.{layer}.max_absolute", []
+                ).append(absolute[layer])
+                measurements.setdefault(
+                    f"backbone_attention.{layer}.current_cache_write_exact", []
+                ).append(float(cache_exact[layer]))
+        return {name: torch.tensor(values) for name, values in measurements.items()}
 
 
 class PredictorNumerics:

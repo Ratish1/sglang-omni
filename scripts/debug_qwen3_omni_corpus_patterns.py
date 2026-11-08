@@ -118,6 +118,7 @@ def main() -> None:
     per_request: dict[str, Counter[str]] = defaultdict(Counter)
     observed_steps: dict[str, list[int]] = defaultdict(list)
     numeric_totals: dict[str, MetricAggregate] = {}
+    predictor_positions: dict[str, MetricAggregate] = {}
     ignored_rows = 0
     with (arguments.capture_directory / "steps.jsonl").open() as manifest:
         for line in manifest:
@@ -131,6 +132,28 @@ def main() -> None:
                 map_location="cpu",
                 weights_only=True,
             )
+            row_values = {
+                name: tensor.double()
+                .movedim(-1, 0)
+                .reshape(metadata.live_rows, -1)
+                .tolist()
+                for name, tensor in measurements.items()
+            }
+            selected_rows = [
+                row
+                for row, request_id in enumerate(metadata.request_ids)
+                if request_id in samples
+            ]
+            for name, tensor in measurements.items():
+                if tensor.ndim == 2:
+                    for position in range(tensor.shape[0]):
+                        predictor_positions.setdefault(
+                            f"{name}.position.{position}", MetricAggregate()
+                        ).update(
+                            [row_values[name][row][position] for row in selected_rows]
+                        )
+                else:
+                    pass
             for row, (request_id, frame_index) in enumerate(
                 zip(metadata.request_ids, metadata.frame_indices, strict=True)
             ):
@@ -158,8 +181,8 @@ def main() -> None:
                     f"geometry:{metadata.live_rows}/{metadata.predictor_batch}/{metadata.phase}/{metadata.captured_graph}",
                     f"quality:{quality}",
                 )
-                for name, tensor in measurements.items():
-                    values = tensor[..., row].double().flatten().tolist()
+                for name, rows in row_values.items():
+                    values = rows[row]
                     for bucket in buckets:
                         aggregate = aggregates[bucket].setdefault(
                             name, MetricAggregate()
@@ -174,6 +197,8 @@ def main() -> None:
                         or name.endswith("selected_set_valid")
                         or name.endswith(".finite")
                         or name.endswith(".exact")
+                        or name.endswith("_finite")
+                        or name.endswith("_exact")
                     ):
                         per_request[request_id][f"invalid:{name}"] += len(values) - int(
                             sum(values)
@@ -216,6 +241,9 @@ def main() -> None:
         "global_measurements": {
             name: asdict(aggregate) for name, aggregate in numeric_totals.items()
         },
+        "predictor_positions": {
+            name: asdict(aggregate) for name, aggregate in predictor_positions.items()
+        },
         "buckets": {
             bucket: {
                 name: asdict(aggregate) for name, aggregate in measurements.items()
@@ -231,7 +259,7 @@ def main() -> None:
             {
                 name: value
                 for name, value in summary.items()
-                if name not in ("global_measurements", "buckets")
+                if name not in ("global_measurements", "buckets", "predictor_positions")
             }
         )
     )

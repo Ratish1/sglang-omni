@@ -9,31 +9,18 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import torch
-from pydantic import BaseModel
 
 from sglang_omni.models.qwen3_omni.components.talker import (
     PredictorDecodeGraph,
     Qwen3OmniTalker,
 )
-from sglang_omni.models.qwen3_omni.corpus_numerics import PredictorNumerics
+from sglang_omni.models.qwen3_omni.corpus_diagnostics import StepMetadata
+from sglang_omni.models.qwen3_omni.corpus_numerics import (
+    BackboneAttentionNumerics,
+    PredictorNumerics,
+)
 from sglang_omni.models.qwen3_omni.stages import create_talker_ar_executor_from_config
 from sglang_omni.vendor.sglang.layers import ReplicatedLinear
-
-
-class StepMetadata(BaseModel):
-    step: int
-    phase: str
-    captured_graph: bool
-    request_ids: list[str]
-    request_ordinals: list[int]
-    frame_indices: list[int]
-    live_rows: int
-    predictor_batch: int
-    projection_rows: dict[str, int]
-    finite_including_padding: dict[str, bool]
-    sequence_lengths: list[int]
-    predictor_geometry: dict[str, int]
-    predictor_stages: dict[str, int]
 
 
 @dataclass(kw_only=True)
@@ -61,7 +48,9 @@ class ReplayGraphs:
 class CorpusReplay:
     def __init__(self, native: Qwen3OmniTalker) -> None:
         self.native = native
-        self.graphs: dict[tuple[int, torch.dtype], ReplayGraphs] = {}
+        self.graphs: dict[
+            tuple[int, torch.dtype, tuple[tuple[str, int], ...]], ReplayGraphs
+        ] = {}
         self.head_weights = [
             head.weight.double() for head in native.code_predictor.lm_head
         ]
@@ -82,14 +71,20 @@ class CorpusReplay:
         assert isinstance(hidden_states, torch.Tensor)
         assert isinstance(code_int32, torch.Tensor)
         code_dtype = torch.int32 if bool(code_int32) else torch.int64
-        geometry = (metadata.predictor_batch, code_dtype)
+        geometry = (
+            metadata.predictor_batch,
+            code_dtype,
+            tuple(sorted(metadata.predictor_stages.items())),
+        )
         fused_layers = self.native.predictor_fused_layers
         assert fused_layers is not None
         for stage, count in metadata.predictor_stages.items():
             operation, rows = stage.split(":")
             fused_layers.fitted_stages[(operation, int(rows))] = count
         if geometry not in self.graphs:
-            plain = PredictorDecodeGraph(self.native, *geometry)
+            plain = PredictorDecodeGraph(
+                self.native, metadata.predictor_batch, code_dtype
+            )
             heads = []
             handles = []
             for head in self.native.code_predictor.lm_head:
@@ -109,7 +104,9 @@ class CorpusReplay:
                 )
                 heads.append(capture)
                 handles.append(head.register_forward_hook(capture))
-            observed = PredictorDecodeGraph(self.native, *geometry)
+            observed = PredictorDecodeGraph(
+                self.native, metadata.predictor_batch, code_dtype
+            )
             for handle in handles:
                 handle.remove()
             self.graphs[geometry] = ReplayGraphs(
@@ -129,22 +126,28 @@ class CorpusReplay:
         assert isinstance(snapshots, dict)
         assert isinstance(counters, torch.Tensor)
         checks = {"recorded_counters_zero": not bool(counters.any())}
+        measurements: dict[str, torch.Tensor] = {}
         for name, graph in (("plain", graphs.plain), ("observed", graphs.observed)):
             codes, feedback = graph.replay(layer0_codes, hidden_states)
-            checks[f"{name}_codes_exact"] = torch.equal(
-                codes[: metadata.live_rows, :, 0].cpu(), expected_codes
-            )
+            replayed_codes = codes[: metadata.live_rows, :, 0].cpu()
+            replayed_feedback = feedback[: metadata.live_rows, 0].cpu()
+            checks[f"{name}_codes_exact"] = torch.equal(replayed_codes, expected_codes)
             checks[f"{name}_feedback_exact"] = torch.equal(
-                feedback[: metadata.live_rows, 0].cpu(), expected_feedback
+                replayed_feedback, expected_feedback
             )
-        checks["head_inputs_exact"] = all(
-            torch.equal(head.inputs.cpu(), snapshots[f"predictor.{group}.input"])
-            for group, head in enumerate(graphs.heads)
-        )
-        checks["head_logits_exact"] = all(
-            torch.equal(head.outputs.cpu(), snapshots[f"predictor.{group}.output"])
-            for group, head in enumerate(graphs.heads)
-        )
+            measurements[f"replay.{name}.codes_exact"] = (
+                replayed_codes == expected_codes
+            ).T
+            measurements[f"replay.{name}.feedback_exact"] = (
+                replayed_feedback == expected_feedback
+            ).all(-1)
+        for group, head in enumerate(graphs.heads):
+            checks[f"head.{group}.inputs_exact"] = torch.equal(
+                head.inputs.cpu(), snapshots[f"predictor.{group}.input"]
+            )
+            checks[f"head.{group}.logits_exact"] = torch.equal(
+                head.outputs.cpu(), snapshots[f"predictor.{group}.output"]
+            )
         sequential_feedback = self.native.model.codec_embedding(
             expected_codes[:, 0].cuda()
         )
@@ -155,7 +158,6 @@ class CorpusReplay:
         checks["sequential_feedback_exact"] = torch.equal(
             sequential_feedback.cpu(), expected_feedback
         )
-        measurements: dict[str, torch.Tensor] = {}
         for name, tensor in snapshots.items():
             if tensor.is_floating_point():
                 rows = tensor[: metadata.live_rows].float()
@@ -265,6 +267,9 @@ def main() -> None:
         code2wav_in_process=True,
     )
     replay = CorpusReplay(scheduler.model_runner.model)
+    backbone_attention = BackboneAttentionNumerics(
+        scheduler.model_runner.model, arguments.capture_directory
+    )
     failures: Counter[str] = Counter()
     request_frames: Counter[str] = Counter()
     steps = 0
@@ -284,6 +289,9 @@ def main() -> None:
                 weights_only=True,
             )
             checks, measurements = replay.replay(metadata, tensors)
+            snapshots = tensors["snapshots"]
+            assert isinstance(snapshots, dict)
+            measurements.update(backbone_attention.measure(metadata, snapshots))
             failures.update(name for name, passed in checks.items() if not passed)
             for request_id in metadata.request_ids:
                 request_frames[request_id] += 1
@@ -317,6 +325,10 @@ def main() -> None:
         json.dumps(summary, indent=2)
     )
     print(json.dumps(summary), flush=True)
+    if failures:
+        raise RuntimeError(f"Frozen replay invariants failed: {dict(failures)}")
+    else:
+        pass
 
 
 if __name__ == "__main__":

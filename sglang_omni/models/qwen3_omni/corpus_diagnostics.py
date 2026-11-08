@@ -7,6 +7,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 import torch
+from pydantic import BaseModel
 from sglang.srt.layers.moe.topk import StandardTopKOutput
 from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -15,6 +16,22 @@ from torch import nn
 
 from sglang_omni.scheduling.sglang_backend.request_data import SGLangARRequestData
 from sglang_omni.scheduling.types import SchedulerRequest
+
+
+class StepMetadata(BaseModel):
+    step: int
+    phase: str
+    captured_graph: bool
+    request_ids: list[str]
+    request_ordinals: list[int]
+    frame_indices: list[int]
+    live_rows: int
+    predictor_batch: int
+    projection_rows: dict[str, int]
+    finite_including_padding: dict[str, bool]
+    sequence_lengths: list[int]
+    predictor_geometry: dict[str, int]
+    predictor_stages: dict[str, int]
 
 
 @dataclass(kw_only=True)
