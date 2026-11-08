@@ -800,7 +800,9 @@ def test_captured_predictor_step_replays_fresh_inputs_as_the_torch_codebook_ops_
     layer0_codes = torch.zeros(rows, 1, device=device, dtype=torch.long)
     talker_hidden = torch.zeros(rows, 1, HIDDEN, device=device, dtype=DTYPE)
     if sample_residuals:
-        talker.residual_sampler = ResidualCodeSampler(MAX_BS, NUM_CODE_GROUPS, device)
+        talker.residual_sampler = ResidualCodeSampler(
+            MAX_BS, NUM_CODE_GROUPS, device, vocab
+        )
     else:
         pass
 
@@ -811,7 +813,11 @@ def test_captured_predictor_step_replays_fresh_inputs_as_the_torch_codebook_ops_
 
     side = torch.cuda.Stream()
     side.wait_stream(torch.cuda.current_stream())
-    with torch.cuda.stream(side), torch.no_grad():
+    with (
+        torch.cuda.stream(side),
+        torch.inference_mode(sample_residuals),
+        torch.no_grad(),
+    ):
         step()
     torch.cuda.current_stream().wait_stream(side)
     graph = torch.cuda.CUDAGraph()
@@ -861,7 +867,7 @@ def test_residual_draws_follow_requests_across_batch_reorder_and_graph_padding()
     None
 ):
     device = torch.device("cuda")
-    sampler = ResidualCodeSampler(4, NUM_CODE_GROUPS, device)
+    sampler = ResidualCodeSampler(4, NUM_CODE_GROUPS, device, 2048)
     requests: list[SchedulerRequest] = []
     for request_index in range(3):
         sampling_parameters = SamplingParams(
