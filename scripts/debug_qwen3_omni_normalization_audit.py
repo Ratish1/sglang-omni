@@ -9,6 +9,7 @@ from pathlib import Path
 import torch
 from sgl_kernel import fused_add_rmsnorm, rmsnorm
 from sglang.kernels.ops.attention.rope import apply_rope_with_cos_sin_cache_inplace
+from sglang.kernels.ops.attention.rotary_triton import triton_mrope_fused
 from sglang.kernels.ops.layernorm.norm import fused_inplace_qknorm
 from transformers import Qwen3OmniMoeConfig
 from transformers.conversion_mapping import (
@@ -34,6 +35,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model-path", required=True)
     parser.add_argument("--capture-directory", type=Path, required=True)
+    parser.add_argument("--native-directory", type=Path, required=True)
     parser.add_argument("--request-id", action="append", required=True)
     parser.add_argument("--output-file", type=Path, required=True)
     arguments = parser.parse_args()
@@ -56,6 +58,23 @@ def main() -> None:
     assert not loading["missing_keys"], loading["missing_keys"]
     assert not loading["mismatched_keys"], loading["mismatched_keys"]
     reference.eval()
+    metadata = json.loads(
+        (arguments.native_directory / "native-metadata.json").read_text()
+    )
+    assert len(metadata) == len(reference.model.layers)
+    assert all(
+        row["rotary_class"] == "MRotaryEmbedding"
+        and row["rotary_cache_dtype"] == "torch.bfloat16"
+        and row["rotary_neox_style"]
+        and not row["query_norm_cast_before_weight"]
+        and not row["key_norm_cast_before_weight"]
+        for row in metadata
+    )
+    actual_rotary_cache = torch.load(
+        arguments.native_directory / "native-rotary-cache.pt",
+        map_location=reference.device,
+        weights_only=True,
+    )
     epsilon = config.text_config.rms_norm_eps
     head_size = config.text_config.head_dim
     query_width = config.text_config.num_attention_heads * head_size
@@ -82,6 +101,10 @@ def main() -> None:
                 / f"{request_id}.conditioning.pt",
                 map_location=reference.device,
                 weights_only=True,
+            )
+            assert torch.equal(
+                capture["snapshots"][0]["prefill_mrope_positions"],
+                capture["snapshots"][0]["prefill_positions"][None].expand(3, -1),
             )
             for frame, snapshot in enumerate(capture["snapshots"]):
                 hidden_states = (
@@ -159,6 +182,23 @@ def main() -> None:
                         head_dim=head_size,
                     )
                     position = int(attention["position"])
+                    actual_query = query.clone()
+                    actual_keys = keys.clone()
+                    triton_mrope_fused(
+                        actual_query.view(1, -1),
+                        actual_keys.view(1, -1),
+                        actual_rotary_cache,
+                        torch.full(
+                            (3, 1), position, device=reference.device, dtype=torch.long
+                        ),
+                        config.text_config.rope_parameters["mrope_section"],
+                        head_size,
+                        head_size,
+                        metadata[layer_index]["rotary_interleaved"],
+                        metadata[layer_index]["rotary_interleaved_glm"],
+                        True,
+                        None,
+                    )
                     frequencies = (
                         torch.arange(
                             position + 1, device=reference.device, dtype=torch.float32
@@ -206,12 +246,20 @@ def main() -> None:
                             moe["input"][None], mlp_normalized
                         ),
                         "query_position_vs_kernel": compare_tensors(
+                            attention["query"], actual_query[0]
+                        ),
+                        "query_position_vs_float32_cache_kernel": compare_tensors(
                             attention["query"], query[0]
                         ),
                         "query_position_vs_float32": compare_tensors(
                             attention["query"], float_rotated[0][0]
                         ),
-                        "key_position_vs_kernel": compare_tensors(native_keys, keys[0]),
+                        "key_position_vs_kernel": compare_tensors(
+                            native_keys, actual_keys[0]
+                        ),
+                        "key_position_vs_float32_cache_kernel": compare_tensors(
+                            native_keys, keys[0]
+                        ),
                         "key_position_vs_float32": compare_tensors(
                             native_keys, float_rotated[1][0]
                         ),

@@ -70,10 +70,20 @@ def main() -> None:
                     layer.self_attn.rotary_emb.cos_sin_cache.dtype
                 ),
                 "rotary_neox_style": layer.self_attn.rotary_emb.is_neox_style,
+                "rotary_interleaved": layer.self_attn.rotary_emb.mrope_interleaved,
+                "rotary_interleaved_glm": layer.self_attn.rotary_emb.mrope_interleaved_glm,
             }
         )
     (arguments.output_directory / "native-metadata.json").write_text(
         json.dumps(metadata, indent=2)
+    )
+    rotary_cache = native.model.layers[0].self_attn.rotary_emb.cos_sin_cache
+    assert all(
+        torch.equal(rotary_cache, layer.self_attn.rotary_emb.cos_sin_cache)
+        for layer in native.model.layers
+    )
+    torch.save(
+        rotary_cache.cpu(), arguments.output_directory / "native-rotary-cache.pt"
     )
     config = Qwen3OmniMoeConfig.from_pretrained(arguments.model_path).talker_config
     register_checkpoint_conversion_mapping(
