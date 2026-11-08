@@ -1072,6 +1072,8 @@ class FusedPredictorLayers:
     attention output, the residual stream and the MLP activation in buffers of max_rows
     rows, and the launches and row blocks that pipeline fewer than NUM_STAGES."""
 
+    corpus_buffers: dict[str, torch.Tensor] | None = None
+
     def __init__(
         self,
         shape: PredictorLayerShape,
@@ -1127,6 +1129,13 @@ class FusedPredictorLayers:
             attention = layer.self_attn
             layer_k_cache = k_cache[layer_idx, :batch_size]
             layer_v_cache = v_cache[layer_idx, :batch_size]
+            group_index = 0 if cache_len == 0 else cache_len - 1
+            if self.corpus_buffers is not None:
+                self.corpus_buffers["input"][group_index, layer_idx, :batch_size].copy_(
+                    hidden.view(batch_size, num_tokens, -1)[:, -1]
+                )
+            else:
+                pass
             attention_inputs(
                 x=hidden,
                 tokens_per_row=num_tokens,
@@ -1142,6 +1151,22 @@ class FusedPredictorLayers:
                 shape=shape,
                 fitted_stages=self.fitted_stages,
             )
+            if self.corpus_buffers is not None:
+                self.corpus_buffers["query"][group_index, layer_idx, :batch_size].copy_(
+                    q_out.view(batch_size, num_tokens, -1)[:, -1]
+                )
+                self.corpus_buffers["keys"][
+                    group_index, layer_idx, :batch_size, :num_tokens
+                ].copy_(
+                    layer_k_cache[:, cache_len:end].reshape(batch_size, num_tokens, -1)
+                )
+                self.corpus_buffers["values"][
+                    group_index, layer_idx, :batch_size, :num_tokens
+                ].copy_(
+                    layer_v_cache[:, cache_len:end].reshape(batch_size, num_tokens, -1)
+                )
+            else:
+                pass
             decode_attention(
                 q=q_out,
                 tokens_per_row=num_tokens,
@@ -1150,6 +1175,12 @@ class FusedPredictorLayers:
                 end=end,
                 attention_output=attention_output,
             )
+            if self.corpus_buffers is not None:
+                self.corpus_buffers["attention"][
+                    group_index, layer_idx, :batch_size
+                ].copy_(attention_output.view(batch_size, num_tokens, -1)[:, -1])
+            else:
+                pass
             o_proj_add(
                 attention_output=attention_output.view(
                     batch_size, num_tokens, shape.num_q_heads, shape.head_dim
@@ -1164,6 +1195,12 @@ class FusedPredictorLayers:
                 fitted_stages=self.fitted_stages,
             )
             hidden = residual
+            if self.corpus_buffers is not None:
+                self.corpus_buffers["attention_residual"][
+                    group_index, layer_idx, :batch_size
+                ].copy_(residual.view(batch_size, num_tokens, -1)[:, -1])
+            else:
+                pass
             mlp_up(
                 residual=residual,
                 norm=layer.post_attention_layernorm,
@@ -1172,6 +1209,12 @@ class FusedPredictorLayers:
                 shape=shape,
                 fitted_stages=self.fitted_stages,
             )
+            if self.corpus_buffers is not None:
+                self.corpus_buffers["activation"][
+                    group_index, layer_idx, :batch_size
+                ].copy_(activated.view(batch_size, num_tokens, -1)[:, -1])
+            else:
+                pass
             down_add(
                 activated=activated,
                 weight=layer.mlp.down_proj.weight,
@@ -1181,6 +1224,13 @@ class FusedPredictorLayers:
                 shape=shape,
                 fitted_stages=self.fitted_stages,
             )
+            if self.corpus_buffers is not None:
+                self.corpus_buffers["mlp_residual"][
+                    group_index, layer_idx, :batch_size
+                ].copy_(residual.view(batch_size, num_tokens, -1)[:, -1])
+                self.corpus_buffers["seen"][group_index, layer_idx] = True
+            else:
+                pass
         normed = final_norm(residual)
         return normed.reshape(batch_size, num_tokens, hidden_size)
 

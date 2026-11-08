@@ -15,6 +15,7 @@ from sglang_omni.model_runner.prefill_inputs import (
     OmniPrefillInputs,
     attach_omni_prefill_inputs,
 )
+from sglang_omni.models.qwen3_omni.corpus_diagnostics import TalkerCorpusRecorder
 from sglang_omni.scheduling.message import OutgoingMessage, put_messages
 from sglang_omni.scheduling.pending_text_queue import PendingTextTensorQueue
 from sglang_omni.scheduling.sglang_backend.request_data import (
@@ -48,6 +49,7 @@ TalkerInputQueue: TypeAlias = (
 
 class QwenTalkerModelRunner(ModelRunner["SGLangARRequestData"]):
     model: Qwen3OmniTalker
+    corpus_recorder: TalkerCorpusRecorder | None = None
 
     def __init__(
         self,
@@ -63,6 +65,14 @@ class QwenTalkerModelRunner(ModelRunner["SGLangARRequestData"]):
         codec_coalesce_early_frames: int = 0,
     ) -> None:
         super().__init__(tp_worker, output_processor)
+        self.corpus_recorder = self.model.corpus_recorder
+        if self.corpus_recorder is not None:
+            self.corpus_recorder.kv_pool = self.tp_worker.model_runner.token_to_kv_pool
+            self.corpus_recorder.request_table = (
+                self.tp_worker.model_runner.req_to_token_pool.req_to_token
+            )
+        else:
+            pass
         self.outbox = outbox
         self.code2wav_target = code2wav_target
         self.code2wav_in_process = code2wav_in_process
@@ -81,6 +91,11 @@ class QwenTalkerModelRunner(ModelRunner["SGLangARRequestData"]):
         requests: list[SchedulerRequest],
     ) -> None:
         del schedule_batch
+        if self.corpus_recorder is not None:
+            assert forward_batch is not None
+            self.corpus_recorder.prepare(forward_batch, requests)
+        else:
+            pass
         composed = self.compose_prefill_embeds(forward_batch, requests)
         if composed is None:
             return
@@ -104,8 +119,12 @@ class QwenTalkerModelRunner(ModelRunner["SGLangARRequestData"]):
         is_lookahead: bool = False,
     ) -> None:
         del is_lookahead
-        del forward_batch
         del schedule_batch
+        if self.corpus_recorder is not None:
+            assert forward_batch is not None
+            self.corpus_recorder.prepare(forward_batch, requests)
+        else:
+            pass
         if not self.feedback_enabled:
             return
         else:
@@ -136,6 +155,12 @@ class QwenTalkerModelRunner(ModelRunner["SGLangARRequestData"]):
             pass
 
         if result.next_token_ids is None:
+            if self.corpus_recorder is not None:
+                self.corpus_recorder.capture(
+                    forward_batch, requests, None, None, result.can_run_cuda_graph
+                )
+            else:
+                pass
             return
         else:
             pass
@@ -150,6 +175,16 @@ class QwenTalkerModelRunner(ModelRunner["SGLangARRequestData"]):
         else:
             pass
         self.model.code_predictor_forward(layer0_codes, talker_hidden)
+        if self.corpus_recorder is not None:
+            self.corpus_recorder.capture(
+                forward_batch,
+                requests,
+                self.model.output_codes[: len(requests)],
+                self.model.output_embeds[: len(requests)],
+                result.can_run_cuda_graph,
+            )
+        else:
+            pass
         self.stage_token_ids(result, result.next_token_ids)
         self.emit_code_chunks_and_feedback(
             schedule_batch=schedule_batch,
@@ -170,6 +205,16 @@ class QwenTalkerModelRunner(ModelRunner["SGLangARRequestData"]):
 
         batch_size = len(requests)
         result.next_token_ids = self.model.sampled_token_ids[:batch_size].clone()
+        if self.corpus_recorder is not None:
+            self.corpus_recorder.capture(
+                forward_batch,
+                requests,
+                self.model.output_codes[:batch_size],
+                self.model.output_embeds[:batch_size],
+                result.can_run_cuda_graph,
+            )
+        else:
+            pass
         self.stage_token_ids(result, result.next_token_ids)
         self.emit_code_chunks_and_feedback(
             schedule_batch=schedule_batch,
@@ -300,6 +345,10 @@ class QwenTalkerModelRunner(ModelRunner["SGLangARRequestData"]):
     def on_request_finished(
         self, request_id: str, req_data: "SGLangARRequestData"
     ) -> None:
+        if self.corpus_recorder is not None:
+            self.corpus_recorder.finish(request_id, req_data)
+        else:
+            pass
         pending = req_data.pending_codec_rows
         if not pending:
             return

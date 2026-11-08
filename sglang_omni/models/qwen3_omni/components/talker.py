@@ -5,6 +5,8 @@ SGLang-native Talker model for Qwen3-Omni compatiable with hf formatting.
 from __future__ import annotations
 
 import logging
+import os
+from pathlib import Path
 from typing import Iterable, Optional, Tuple
 
 import torch
@@ -24,6 +26,7 @@ from sglang_omni.models.qwen3_omni.components.thinker_model import (
     Qwen3OmniMoeThinkerTextDecoderLayer,
     Qwen3OmniMoeThinkerTextSparseMoeBlock,
 )
+from sglang_omni.models.qwen3_omni.corpus_diagnostics import TalkerCorpusRecorder
 from sglang_omni.models.qwen3_omni.hf_config import (
     Qwen3OmniMoeTalkerConfig,
     Qwen3OmniMoeTalkerTextConfig,
@@ -371,6 +374,8 @@ class Qwen3OmniMoeTalkerDecoderLayer(Qwen3OmniMoeThinkerTextDecoderLayer):
 
 
 class Qwen3OmniMoeTalkerTextModel(nn.Module):
+    corpus_input: torch.Tensor | None = None
+    corpus_query_indices: torch.Tensor | None = None
     """Talker's MoE text backbone (20-layer, with shared expert).
 
     Uses codec_embedding instead of embed_tokens.
@@ -460,6 +465,12 @@ class Qwen3OmniMoeTalkerTextModel(nn.Module):
         else:
             hidden_states = input_embeds
 
+        if self.corpus_input is not None:
+            self.corpus_input.copy_(
+                hidden_states.index_select(0, self.corpus_query_indices)
+            )
+        else:
+            pass
         residual_batch.start(forward_batch)
         capture_layers = set(self.layers_to_capture or [])
         aux_hidden_states = AuxHiddenStateList()
@@ -775,6 +786,8 @@ class Qwen3OmniMoeTalkerCodePredictor(nn.Module):
 class Qwen3OmniTalker(nn.Module):
     """Talker: Text-to-Audio generation model."""
 
+    corpus_recorder: TalkerCorpusRecorder | None = None
+
     def __init__(
         self,
         config,
@@ -1020,6 +1033,41 @@ class Qwen3OmniTalker(nn.Module):
         bind_default_weight_loaders(self)
         self.cached_params_dict = dict(self.named_parameters())
         self.sampler = None
+        corpus_directory = os.environ.get("SGLANG_OMNI_CORPUS_DIRECTORY")
+        if corpus_directory is not None:
+            predictor_attention = self.code_predictor.model.layers[0].self_attn
+            self.corpus_recorder = TalkerCorpusRecorder(
+                Path(corpus_directory),
+                self.model.layers,
+                self.codec_head,
+                self.code_predictor.lm_head,
+                max_batch_size,
+                hidden_size,
+                len(self.code_predictor.model.layers),
+                predictor_attention.q_size,
+                predictor_attention.kv_size,
+                self.code_predictor.model.layers[0].mlp.down_proj.weight.shape[1],
+                device,
+            )
+            assert self.predictor_fused_layers is not None
+            self.predictor_fused_layers.corpus_buffers = (
+                self.corpus_recorder.dense_snapshots
+            )
+            self.corpus_recorder.predictor_counters = (
+                self.predictor_fused_layers.counters
+            )
+            self.corpus_recorder.predictor_stages = (
+                self.predictor_fused_layers.fitted_stages
+            )
+            self.corpus_recorder.predictor_geometry = {
+                "split_qkv": self.predictor_fused_layers.shape.split_qkv,
+                "split_hidden": self.predictor_fused_layers.shape.split_hidden,
+                "maximum_rows": self.predictor_fused_layers.max_rows,
+            }
+            self.model.corpus_input = self.corpus_recorder.snapshots["backbone_input"]
+            self.model.corpus_query_indices = self.corpus_recorder.query_indices
+        else:
+            pass
 
     def get_input_embeddings(self) -> nn.Embedding:
         return self.model.get_input_embeddings()
@@ -1691,6 +1739,18 @@ class Qwen3OmniTalker(nn.Module):
         else:
             pass
 
+        if self.corpus_recorder is not None:
+            assert seq_len == 1
+            self.corpus_recorder.predictor_hidden[:batch_size].copy_(
+                talker_hidden[:, 0]
+            )
+            self.corpus_recorder.layer0_codes[:batch_size].copy_(layer0_codes[:, 0])
+            self.corpus_recorder.predictor_batch.fill_(batch_size)
+            self.corpus_recorder.predictor_code_int32.fill_(
+                layer0_codes.dtype == torch.int32
+            )
+        else:
+            pass
         predictor_input = self.predictor_input_buffer[:batch_size]
         num_groups = self.config.num_code_groups
         runtime_single_token = seq_len == 1

@@ -1,0 +1,487 @@
+"""Retain every Talker frame and its actual operation boundaries for replay."""
+
+from __future__ import annotations
+
+import json
+from dataclasses import dataclass, field
+from pathlib import Path
+
+import torch
+from sglang.srt.layers.moe.topk import StandardTopKOutput
+from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_executor.forward_context import get_token_to_kv_pool
+from torch import nn
+
+from sglang_omni.scheduling.sglang_backend.request_data import SGLangARRequestData
+from sglang_omni.scheduling.types import SchedulerRequest
+
+
+@dataclass(kw_only=True)
+class CorpusProgress:
+    ordinal: int
+    codes: list[list[int]] = field(default_factory=list)
+    steps: list[int] = field(default_factory=list)
+
+
+class ProjectionCapture:
+    def __init__(
+        self,
+        input_snapshot: torch.Tensor,
+        output_snapshot: torch.Tensor,
+        row_count: torch.Tensor,
+        finite: torch.Tensor,
+        query_indices: torch.Tensor | None,
+    ) -> None:
+        self.input_snapshot = input_snapshot
+        self.output_snapshot = output_snapshot
+        self.row_count = row_count
+        self.finite = finite
+        self.query_indices = query_indices
+
+    def __call__(
+        self,
+        module: nn.Module,
+        arguments: tuple[torch.Tensor],
+        output: tuple[torch.Tensor, torch.Tensor | None],
+    ) -> None:
+        input_rows = arguments[0].reshape(-1, self.input_snapshot.shape[-1])
+        output_rows = output[0].reshape(-1, self.output_snapshot.shape[-1])
+        self.row_count.fill_(input_rows.shape[0])
+        self.finite.copy_(output_rows.isfinite().all())
+        if self.query_indices is None:
+            self.input_snapshot[: input_rows.shape[0]].copy_(input_rows)
+            self.output_snapshot[: output_rows.shape[0]].copy_(output_rows)
+        else:
+            self.input_snapshot.copy_(input_rows.index_select(0, self.query_indices))
+            self.output_snapshot.copy_(output_rows.index_select(0, self.query_indices))
+
+
+class OutputCapture:
+    def __init__(
+        self,
+        snapshot: torch.Tensor,
+        query_indices: torch.Tensor,
+        finite: torch.Tensor,
+        row_count: torch.Tensor,
+    ) -> None:
+        self.snapshot = snapshot
+        self.query_indices = query_indices
+        self.finite = finite
+        self.row_count = row_count
+
+    def __call__(
+        self,
+        module: nn.Module,
+        arguments: (
+            tuple[torch.Tensor]
+            | tuple[torch.Tensor, ForwardBatch | None]
+            | tuple[torch.Tensor, StandardTopKOutput]
+        ),
+        output: torch.Tensor,
+    ) -> None:
+        self.snapshot.copy_(output.index_select(0, self.query_indices))
+        self.finite.copy_(output.isfinite().all())
+        self.row_count.fill_(output.shape[0])
+
+
+class TopKCapture:
+    def __init__(
+        self,
+        expert_ids: torch.Tensor,
+        weights: torch.Tensor,
+        query_indices: torch.Tensor,
+        row_count: torch.Tensor,
+    ) -> None:
+        self.expert_ids = expert_ids
+        self.weights = weights
+        self.query_indices = query_indices
+        self.row_count = row_count
+
+    def __call__(
+        self,
+        module: nn.Module,
+        arguments: tuple[torch.Tensor, torch.Tensor],
+        output: StandardTopKOutput,
+    ) -> None:
+        assert isinstance(output, StandardTopKOutput)
+        self.expert_ids.copy_(output.topk_ids.index_select(0, self.query_indices))
+        self.weights.copy_(output.topk_weights.index_select(0, self.query_indices))
+        self.row_count.fill_(output.topk_ids.shape[0])
+
+
+class AttentionCapture:
+    def __init__(
+        self,
+        query_indices: torch.Tensor,
+        queries: torch.Tensor,
+        keys: torch.Tensor,
+        values: torch.Tensor,
+        row_count: torch.Tensor,
+    ) -> None:
+        self.query_indices = query_indices
+        self.queries = queries
+        self.keys = keys
+        self.values = values
+        self.row_count = row_count
+
+    def __call__(
+        self,
+        module: nn.Module,
+        arguments: tuple[torch.Tensor, torch.Tensor, torch.Tensor, ForwardBatch],
+        output: torch.Tensor,
+    ) -> None:
+        query, keys, values, forward_batch = arguments
+        self.queries.copy_(
+            query.reshape(-1, self.queries.shape[-1]).index_select(
+                0, self.query_indices
+            )
+        )
+        key_buffer, value_buffer = get_token_to_kv_pool().get_kv_buffer(module.layer_id)
+        locations = forward_batch.out_cache_loc.index_select(
+            0, self.query_indices
+        ).long()
+        self.keys.copy_(key_buffer.index_select(0, locations).reshape_as(self.keys))
+        self.values.copy_(
+            value_buffer.index_select(0, locations).reshape_as(self.values)
+        )
+        self.row_count.fill_(query.shape[0])
+
+
+class TalkerCorpusRecorder:
+    kv_pool: MHATokenToKVPool | None = None
+    request_table: torch.Tensor | None = None
+    predictor_counters: torch.Tensor | None = None
+
+    def __init__(
+        self,
+        directory: Path,
+        layers: nn.ModuleList,
+        codec_head: nn.Module,
+        predictor_heads: nn.ModuleList,
+        max_batch_size: int,
+        hidden_size: int,
+        predictor_layers: int,
+        query_width: int,
+        key_width: int,
+        intermediate_size: int,
+        device: torch.device,
+    ) -> None:
+        self.directory = directory
+        self.directory.mkdir(parents=True, exist_ok=False)
+        (self.directory / "requests").mkdir()
+        self.query_indices = torch.zeros(
+            max_batch_size, device=device, dtype=torch.long
+        )
+        self.snapshots: dict[str, torch.Tensor] = {}
+        self.counts: dict[str, torch.Tensor] = {}
+        self.finite: dict[str, torch.Tensor] = {}
+        self.progress: dict[str, CorpusProgress] = {}
+        self.next_ordinal = 0
+        self.step_index = 0
+        self.predictor_stages: dict[tuple[str, int], int] = {}
+        self.predictor_geometry: dict[str, int] = {}
+        self.snapshots["backbone_input"] = torch.zeros(
+            max_batch_size, hidden_size, device=device, dtype=torch.bfloat16
+        )
+        self.layer0_codes = torch.zeros(max_batch_size, device=device, dtype=torch.long)
+        self.predictor_hidden = torch.zeros(
+            max_batch_size, hidden_size, device=device, dtype=torch.bfloat16
+        )
+        self.predictor_batch = torch.zeros((), device=device, dtype=torch.int64)
+        self.predictor_code_int32 = torch.zeros((), device=device, dtype=torch.bool)
+        group_count = len(predictor_heads)
+        self.dense_snapshots: dict[str, torch.Tensor] = {}
+        for name, width in (
+            ("input", hidden_size),
+            ("query", query_width),
+            ("attention", query_width),
+            ("attention_residual", hidden_size),
+            ("activation", intermediate_size),
+            ("mlp_residual", hidden_size),
+        ):
+            self.dense_snapshots[name] = torch.zeros(
+                group_count,
+                predictor_layers,
+                max_batch_size,
+                width,
+                device=device,
+                dtype=torch.bfloat16,
+            )
+        for name in ("keys", "values"):
+            self.dense_snapshots[name] = torch.zeros(
+                group_count,
+                predictor_layers,
+                max_batch_size,
+                2,
+                key_width,
+                device=device,
+                dtype=torch.bfloat16,
+            )
+        self.dense_snapshots["seen"] = torch.zeros(
+            group_count, predictor_layers, device=device, dtype=torch.bool
+        )
+        for layer_index, layer in enumerate(layers):
+            prefix = f"backbone.{layer_index}"
+            attention = layer.self_attn.attn
+            for name, width in (
+                ("query", attention.tp_q_head_num * attention.head_dim),
+                ("key", attention.tp_k_head_num * attention.head_dim),
+                ("value", attention.tp_v_head_num * attention.v_head_dim),
+            ):
+                self.snapshots[f"{prefix}.{name}"] = torch.zeros(
+                    max_batch_size, width, device=device, dtype=torch.bfloat16
+                )
+            row_count = torch.zeros((), device=device, dtype=torch.int64)
+            self.counts[f"{prefix}.attention"] = row_count
+            attention.register_forward_hook(
+                AttentionCapture(
+                    self.query_indices,
+                    self.snapshots[f"{prefix}.query"],
+                    self.snapshots[f"{prefix}.key"],
+                    self.snapshots[f"{prefix}.value"],
+                    row_count,
+                )
+            )
+            self.install_projection(
+                f"{prefix}.qkv", layer.self_attn.qkv_proj, max_batch_size, True
+            )
+            self.install_projection(
+                f"{prefix}.attention_projection",
+                layer.self_attn.o_proj,
+                max_batch_size,
+                True,
+            )
+            self.install_projection(
+                f"{prefix}.router", layer.mlp.gate, max_batch_size, True
+            )
+            self.install_projection(
+                f"{prefix}.shared_gate",
+                layer.mlp.shared_expert_gate,
+                max_batch_size,
+                True,
+            )
+            for name, module in (
+                ("shared", layer.mlp.shared_expert),
+                ("routed", layer.mlp.experts),
+                ("combined", layer.mlp),
+            ):
+                snapshot = torch.zeros(
+                    max_batch_size, hidden_size, device=device, dtype=torch.bfloat16
+                )
+                finite = torch.zeros((), device=device, dtype=torch.bool)
+                self.snapshots[f"{prefix}.{name}"] = snapshot
+                self.finite[f"{prefix}.{name}"] = finite
+                row_count = torch.zeros((), device=device, dtype=torch.int64)
+                self.counts[f"{prefix}.{name}"] = row_count
+                module.register_forward_hook(
+                    OutputCapture(snapshot, self.query_indices, finite, row_count)
+                )
+            expert_ids = torch.zeros(
+                max_batch_size,
+                layer.config.num_experts_per_tok,
+                device=device,
+                dtype=torch.int32,
+            )
+            weights = torch.zeros_like(expert_ids, dtype=torch.float32)
+            self.snapshots[f"{prefix}.expert_ids"] = expert_ids
+            self.snapshots[f"{prefix}.expert_weights"] = weights
+            row_count = torch.zeros((), device=device, dtype=torch.int64)
+            self.counts[f"{prefix}.topk"] = row_count
+            layer.mlp.topk.register_forward_hook(
+                TopKCapture(expert_ids, weights, self.query_indices, row_count)
+            )
+        self.install_projection("codec", codec_head, max_batch_size, False)
+        for group_index, head in enumerate(predictor_heads):
+            self.install_projection(
+                f"predictor.{group_index}", head, max_batch_size, False
+            )
+
+    def install_projection(
+        self, name: str, module: nn.Module, max_batch_size: int, gather_queries: bool
+    ) -> None:
+        weight = module.weight
+        input_snapshot = torch.zeros(
+            max_batch_size, weight.shape[1], device=weight.device, dtype=weight.dtype
+        )
+        output_snapshot = torch.zeros(
+            max_batch_size, weight.shape[0], device=weight.device, dtype=weight.dtype
+        )
+        row_count = torch.zeros((), device=weight.device, dtype=torch.int64)
+        finite = torch.zeros((), device=weight.device, dtype=torch.bool)
+        self.snapshots[f"{name}.input"] = input_snapshot
+        self.snapshots[f"{name}.output"] = output_snapshot
+        self.counts[name] = row_count
+        self.finite[name] = finite
+        module.register_forward_hook(
+            ProjectionCapture(
+                input_snapshot,
+                output_snapshot,
+                row_count,
+                finite,
+                self.query_indices if gather_queries else None,
+            )
+        )
+
+    def prepare(
+        self, forward_batch: ForwardBatch, requests: list[SchedulerRequest]
+    ) -> None:
+        indices: list[int] = []
+        if forward_batch.forward_mode.is_extend():
+            length = 0
+            for extend_length in forward_batch.extend_seq_lens_cpu:
+                length += extend_length
+                indices.append(length - 1)
+        else:
+            indices = list(range(len(requests)))
+        assert len(indices) == len(requests)
+        self.query_indices.zero_()
+        self.query_indices[: len(indices)].copy_(
+            torch.tensor(indices, device="cpu", dtype=torch.long)
+        )
+        for request in requests:
+            if request.request_id not in self.progress:
+                self.progress[request.request_id] = CorpusProgress(
+                    ordinal=self.next_ordinal
+                )
+                self.next_ordinal += 1
+            else:
+                pass
+        for count in self.counts.values():
+            count.zero_()
+        self.dense_snapshots["seen"].zero_()
+        self.predictor_batch.zero_()
+
+    def capture(
+        self,
+        forward_batch: ForwardBatch,
+        requests: list[SchedulerRequest],
+        codes: torch.Tensor | None,
+        feedback: torch.Tensor | None,
+        captured_graph: bool,
+    ) -> None:
+        predictor_batch = int(self.predictor_batch.cpu()) if codes is not None else 0
+        live_rows = len(requests)
+        snapshots = {
+            name: tensor[
+                : predictor_batch if name.startswith("predictor.") else live_rows
+            ].cpu()
+            for name, tensor in self.snapshots.items()
+        }
+        counts = {name: int(count.cpu()) for name, count in self.counts.items()}
+        finite = {name: bool(value.cpu()) for name, value in self.finite.items()}
+        assert all(
+            count > 0
+            for name, count in counts.items()
+            if not name.startswith("predictor.")
+        ), counts
+        dense = {
+            name: (
+                tensor.cpu() if name == "seen" else tensor[:, :, :predictor_batch].cpu()
+            )
+            for name, tensor in self.dense_snapshots.items()
+        }
+        metadata = {
+            "step": self.step_index,
+            "phase": forward_batch.forward_mode.name,
+            "captured_graph": captured_graph,
+            "request_ids": [request.request_id for request in requests],
+            "request_ordinals": [
+                self.progress[request.request_id].ordinal for request in requests
+            ],
+            "frame_indices": [
+                len(self.progress[request.request_id].codes) for request in requests
+            ],
+            "live_rows": live_rows,
+            "predictor_batch": predictor_batch,
+            "projection_rows": counts,
+            "finite_including_padding": finite,
+            "sequence_lengths": forward_batch.seq_lens[:live_rows].cpu().tolist(),
+            "predictor_geometry": self.predictor_geometry,
+            "predictor_stages": {
+                f"{name}:{rows}": stages
+                for (name, rows), stages in self.predictor_stages.items()
+            },
+        }
+        if forward_batch.forward_mode.is_extend():
+            assert self.kv_pool is not None and self.request_table is not None
+            for row, request in enumerate(requests):
+                locations = self.request_table[
+                    forward_batch.req_pool_indices[row],
+                    : metadata["sequence_lengths"][row],
+                ].long()
+                torch.save(
+                    {
+                        "keys": [
+                            buffer.index_select(0, locations).cpu()
+                            for buffer in self.kv_pool.k_buffer
+                        ],
+                        "values": [
+                            buffer.index_select(0, locations).cpu()
+                            for buffer in self.kv_pool.v_buffer
+                        ],
+                    },
+                    self.directory
+                    / f"prefix-{request.request_id}-{self.step_index:06d}.pt",
+                )
+        else:
+            pass
+        if codes is None:
+            cpu_codes = torch.empty(0, device="cpu", dtype=torch.long)
+            cpu_feedback = torch.empty(0, device="cpu")
+        else:
+            assert feedback is not None and predictor_batch >= live_rows
+            assert all(
+                counts[f"predictor.{group_index}"] == predictor_batch
+                for group_index in range(self.dense_snapshots["seen"].shape[0])
+            )
+            assert dense["seen"].all()
+            cpu_codes = codes.cpu()
+            cpu_feedback = feedback.cpu()
+            for row, request in enumerate(requests):
+                progress = self.progress[request.request_id]
+                progress.codes.append(cpu_codes[row].tolist())
+                progress.steps.append(self.step_index)
+        torch.save(
+            {
+                "snapshots": snapshots,
+                "dense": dense,
+                "codes": cpu_codes,
+                "feedback": cpu_feedback,
+                "predictor_hidden": self.predictor_hidden[:predictor_batch].cpu(),
+                "layer0_codes": self.layer0_codes[:predictor_batch].cpu(),
+                "code_int32": self.predictor_code_int32.cpu(),
+                "predictor_counters": self.predictor_counters.cpu(),
+                "positions": forward_batch.positions.index_select(
+                    0, self.query_indices[:live_rows]
+                ).cpu(),
+                "mrope_positions": (
+                    forward_batch.mrope_positions.index_select(
+                        1, self.query_indices[:live_rows]
+                    ).cpu()
+                    if forward_batch.mrope_positions is not None
+                    else torch.empty(0, device="cpu")
+                ),
+            },
+            self.directory / f"step-{self.step_index:06d}.pt",
+        )
+        with (self.directory / "steps.jsonl").open("a") as output:
+            output.write(json.dumps(metadata) + "\n")
+        self.step_index += 1
+
+    def finish(self, request_id: str, request_data: SGLangARRequestData) -> None:
+        progress = self.progress.pop(request_id)
+        assert request_data.req is not None
+        report = {
+            "request_id": request_id,
+            "ordinal": progress.ordinal,
+            "steps": progress.steps,
+            "codes": progress.codes,
+            "output_ids": list(request_data.req.output_ids),
+            "finish_reason": request_data.finish_reason,
+            "main_codes_match": [frame[0] for frame in progress.codes]
+            == list(request_data.req.output_ids),
+        }
+        (self.directory / "requests" / f"{request_id}.json").write_text(
+            json.dumps(report, indent=2)
+        )
