@@ -363,6 +363,16 @@ class Qwen3OmniMoeTalkerSparseMoeBlock(Qwen3OmniMoeThinkerTextSparseMoeBlock):
         # --- Routed experts (no all-reduce yet) ---
         router_logits, _ = self.gate(linear_hidden_states)
         topk_output = self.topk(linear_hidden_states, router_logits)
+        if (
+            self.experts.runner_backend.is_flashinfer_cutlass()
+            and self.experts.w13_weight.dtype == torch.bfloat16
+            and router_logits.dtype == torch.bfloat16
+        ):
+            topk_output = topk_output._replace(  # noqa: leading-underscore  # NamedTuple's documented replacement API.
+                topk_weights=topk_output.topk_weights.to(router_logits.dtype).float()
+            )
+        else:
+            pass
         routed_output = self.experts(linear_hidden_states, topk_output)
 
         final_hidden_states = routed_output + shared_output
