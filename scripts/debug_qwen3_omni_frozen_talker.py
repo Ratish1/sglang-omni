@@ -24,6 +24,7 @@ def main() -> None:
     parser.add_argument("--capture-directory", type=Path, required=True)
     parser.add_argument("--request-id", action="append", required=True)
     parser.add_argument("--dtype", choices=("bfloat16", "float32"), required=True)
+    parser.add_argument("--checkpoint-residual-sampling", action="store_true")
     parser.add_argument("--output-directory", type=Path, required=True)
     arguments = parser.parse_args()
     arguments.output_directory.mkdir(exist_ok=False)
@@ -45,6 +46,9 @@ def main() -> None:
     assert not loading["missing_keys"], loading["missing_keys"]
     assert not loading["mismatched_keys"], loading["mismatched_keys"]
     assert not reference.code_predictor.generation_config.do_sample
+    reference.code_predictor.generation_config.do_sample = (
+        arguments.checkpoint_residual_sampling
+    )
     reference.eval()
     if arguments.dtype == "float32":
         reference.float()
@@ -70,6 +74,11 @@ def main() -> None:
                 map_location="cpu",
                 weights_only=True,
             )
+            if arguments.checkpoint_residual_sampling:
+                assert conditioning["temperature"] > 0
+                torch.manual_seed(conditioning["sampling_seed"])
+            else:
+                pass
             prefill = snapshot["prefill_input_embeddings"].to(
                 reference.device, reference.dtype
             )
@@ -185,6 +194,12 @@ def main() -> None:
                 "request_id": request_id,
                 "dtype": arguments.dtype,
                 "seed": conditioning["sampling_seed"],
+                "checkpoint_residual_sampling": arguments.checkpoint_residual_sampling,
+                "residual_torch_seed": (
+                    conditioning["sampling_seed"]
+                    if arguments.checkpoint_residual_sampling
+                    else None
+                ),
                 "prefill_tokens": len(prefill),
                 "future_text_rows": len(text_rows),
                 "termination": termination,
