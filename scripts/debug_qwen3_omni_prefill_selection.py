@@ -1,4 +1,4 @@
-"""Compare cached and default GEMM1 on the exact complete prefill operands."""
+"""Compare both expert projections on the exact complete prefill operands."""
 
 from __future__ import annotations
 
@@ -75,7 +75,7 @@ def main() -> None:
         "autotune_cache_sha256": hashlib.sha256(
             arguments.autotune_cache.read_bytes()
         ).hexdigest(),
-        "scope": "Original complete prefill operands, IDs, weights and padding. Cached output must first reproduce the recorded native output exactly. The second arm changes only GEMM1 selection, with original inputs cloned independently because fused experts can mutate them.",
+        "scope": "Original complete prefill operands, IDs, weights and padding. Cached output must first reproduce the recorded native output exactly. All four cached/default GEMM1/GEMM2 combinations are compared with original inputs cloned independently because fused experts can mutate them.",
         "layers": [],
     }
     with (arguments.output_directory / "comparisons.jsonl").open("w") as reports:
@@ -101,6 +101,8 @@ def main() -> None:
                 ]
             )
             unchanged = 0
+            unchanged_second = 0
+            unchanged_second_with_default_first = 0
             for metadata in prefill_steps:
                 saved = torch.load(
                     arguments.capture_directory / f"experts-{metadata.step:06d}.pt",
@@ -131,10 +133,47 @@ def main() -> None:
                         down,
                         arguments.tune_max_num_tokens,
                     )
+                with autotune(False, skip_ops={"trtllm::fused_moe::gemm2"}):
+                    default_second = run_experts(
+                        inputs,
+                        ids,
+                        scales,
+                        up_gate,
+                        down,
+                        arguments.tune_max_num_tokens,
+                    )
+                with autotune(
+                    False,
+                    skip_ops={
+                        "trtllm::fused_moe::gemm1",
+                        "trtllm::fused_moe::gemm2",
+                    },
+                ):
+                    default_both = run_experts(
+                        inputs,
+                        ids,
+                        scales,
+                        up_gate,
+                        down,
+                        arguments.tune_max_num_tokens,
+                    )
                 metrics = compare_outputs(cached[:real_rows], default[:real_rows])
                 assert metrics["finite"].all()
                 exact = torch.equal(cached[:real_rows], default[:real_rows])
                 unchanged += int(exact)
+                second_metrics = compare_outputs(
+                    cached[:real_rows], default_second[:real_rows]
+                )
+                both_metrics = compare_outputs(
+                    default[:real_rows], default_both[:real_rows]
+                )
+                assert second_metrics["finite"].all() and both_metrics["finite"].all()
+                second_exact = torch.equal(
+                    cached[:real_rows], default_second[:real_rows]
+                )
+                both_exact = torch.equal(default[:real_rows], default_both[:real_rows])
+                unchanged_second += int(second_exact)
+                unchanged_second_with_default_first += int(both_exact)
                 record = {
                     "layer": layer,
                     "step": metadata.step,
@@ -145,6 +184,14 @@ def main() -> None:
                     "default_matches_cached": exact,
                     "maximum_relative_l2": float(metrics["relative_l2"].max()),
                     "maximum_absolute": float(metrics["max_absolute"].max()),
+                    "default_second_matches_cached": second_exact,
+                    "default_second_with_default_first_matches_default_first": both_exact,
+                    "second_projection_maximum_relative_l2": float(
+                        second_metrics["relative_l2"].max()
+                    ),
+                    "second_projection_with_default_first_maximum_relative_l2": float(
+                        both_metrics["relative_l2"].max()
+                    ),
                 }
                 reports.write(json.dumps(record) + "\n")
             summary["layers"].append(
@@ -152,6 +199,10 @@ def main() -> None:
                     "layer": layer,
                     "prefill_steps": len(prefill_steps),
                     "unchanged_steps": unchanged,
+                    "unchanged_second_projection_steps": unchanged_second,
+                    "unchanged_second_with_default_first_steps": (
+                        unchanged_second_with_default_first
+                    ),
                 }
             )
             reports.flush()
