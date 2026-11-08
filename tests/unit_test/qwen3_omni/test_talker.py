@@ -10,9 +10,12 @@ from unittest.mock import Mock
 
 import pytest
 import torch
+from sglang.srt.layers.moe.utils import MoeRunnerBackend
 from sglang.srt.managers.schedule_batch import ReqKvInfo
+from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.sampling.penaltylib.repetition_penalty import apply_scaling_penalties
 from sglang.srt.utils import DynamicGradMode
+from sglang.srt.utils.common import is_flashinfer_available
 from torch import nn
 from torch._dynamo.utils import counters
 
@@ -20,6 +23,7 @@ import sglang_omni.models.qwen3_omni.components.talker as talker_module
 from sglang_omni.model_runner.prefill_inputs import get_omni_prefill_inputs
 from sglang_omni.model_runner.thinker_model_runner import ThinkerModelRunner
 from sglang_omni.models.qwen3_omni.components.talker import (
+    Qwen3OmniMoeTalkerTextModel,
     Qwen3OmniTalker,
     bind_default_weight_loaders,
 )
@@ -42,10 +46,154 @@ from sglang_omni.scheduling.pending_text_queue import (
     coerce_pending_text_queue,
 )
 from sglang_omni.scheduling.sglang_backend import SGLangARRequestData
+from sglang_omni.vendor.sglang.core import ForwardBatch
+from sglang_omni.vendor.sglang.layers import AuxHiddenStateList
 from tests.unit_test.fixtures.qwen_fakes import FakeQwenTokenizer, RecordingOutbox
 from tests.unit_test.fixtures.qwen_predictor import (
     build_real_step_predictor_graph_talker,
 )
+
+if is_flashinfer_available():
+    from flashinfer.autotuner import AutoTuner, TunableRunner, TuningConfig, autotune
+else:
+    pass
+
+
+@pytest.mark.accelerator
+@pytest.mark.skipif(not is_flashinfer_available(), reason="requires FlashInfer on CUDA")
+@pytest.mark.parametrize(
+    "forward_mode,runner_backend,weight_dtype,is_cuda,raise_after_selection,expected_first_tactic",
+    [
+        (
+            ForwardMode.EXTEND,
+            MoeRunnerBackend.FLASHINFER_CUTLASS,
+            torch.bfloat16,
+            True,
+            False,
+            -1,
+        ),
+        (
+            ForwardMode.DECODE,
+            MoeRunnerBackend.FLASHINFER_CUTLASS,
+            torch.bfloat16,
+            True,
+            False,
+            7,
+        ),
+        (ForwardMode.EXTEND, MoeRunnerBackend.TRITON, torch.bfloat16, True, False, 7),
+        (
+            ForwardMode.EXTEND,
+            MoeRunnerBackend.FLASHINFER_CUTLASS,
+            torch.float16,
+            True,
+            False,
+            7,
+        ),
+        (
+            ForwardMode.EXTEND,
+            MoeRunnerBackend.FLASHINFER_CUTLASS,
+            torch.float8_e4m3fn,
+            True,
+            False,
+            7,
+        ),
+        (
+            ForwardMode.EXTEND,
+            MoeRunnerBackend.FLASHINFER_CUTLASS,
+            torch.bfloat16,
+            False,
+            False,
+            7,
+        ),
+        (
+            ForwardMode.EXTEND,
+            MoeRunnerBackend.FLASHINFER_CUTLASS,
+            torch.bfloat16,
+            True,
+            True,
+            -1,
+        ),
+    ],
+)
+def test_talker_prefill_keeps_default_first_expert_projection_and_restores_tuning(
+    monkeypatch: pytest.MonkeyPatch,
+    forward_mode: ForwardMode,
+    runner_backend: MoeRunnerBackend,
+    weight_dtype: torch.dtype,
+    is_cuda: bool,
+    raise_after_selection: bool,
+    expected_first_tactic: int,
+) -> None:
+    """Prefill tuning replaced the first expert projection's speech arithmetic and must not affect decode."""
+    tuner = AutoTuner.get()
+    cached_runner = Mock(spec=TunableRunner)
+    monkeypatch.setattr(tuner, "search_cache", Mock(return_value=(True, 0, 7, None)))
+    monkeypatch.setattr(talker_module.current_platform, "is_cuda", lambda: is_cuda)
+    selected_tactics: list[int] = []
+
+    class TacticSelectingLayer(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.mlp = SimpleNamespace(
+                experts=SimpleNamespace(
+                    runner_backend=runner_backend,
+                    w13_weight=torch.empty(0, dtype=weight_dtype),
+                )
+            )
+
+        def forward(
+            self,
+            positions: torch.Tensor,
+            hidden_states: torch.Tensor,
+            forward_batch: ForwardBatch,
+            captured_last_layer_outputs: AuxHiddenStateList | None,
+        ) -> torch.Tensor:
+            for operation in ("trtllm::fused_moe::gemm1", "trtllm::fused_moe::gemm2"):
+                _, selected_tactic = tuner.choose_one(
+                    operation, [cached_runner], TuningConfig(), [hidden_states]
+                )
+                selected_tactics.append(selected_tactic)
+            if raise_after_selection:
+                raise RuntimeError("expert execution failed")
+            else:
+                return hidden_states + torch.tensor(selected_tactics)
+
+    backbone = Qwen3OmniMoeTalkerTextModel.__new__(Qwen3OmniMoeTalkerTextModel)
+    nn.Module.__init__(backbone)
+    backbone.layers = nn.ModuleList([TacticSelectingLayer()])
+    backbone.start_layer = 0
+    backbone.end_layer = 1
+    backbone.layers_to_capture = []
+    backbone.norm = nn.Identity()
+    hidden_states = torch.zeros(1, 2)
+
+    with autotune(False, skip_ops={"unrelated"}):
+        if raise_after_selection:
+            with pytest.raises(RuntimeError, match="expert execution failed"):
+                backbone(
+                    input_ids=torch.zeros(1, dtype=torch.long),
+                    positions=torch.zeros(1, dtype=torch.long),
+                    forward_batch=SimpleNamespace(forward_mode=forward_mode),
+                    input_embeds=hidden_states,
+                )
+        else:
+            result = backbone(
+                input_ids=torch.zeros(1, dtype=torch.long),
+                positions=torch.zeros(1, dtype=torch.long),
+                forward_batch=SimpleNamespace(forward_mode=forward_mode),
+                input_embeds=hidden_states,
+            )
+            assert torch.equal(result, torch.tensor([[expected_first_tactic, 7]]))
+        assert selected_tactics == [expected_first_tactic, 7]
+        for operation, expected_tactic in (
+            ("trtllm::fused_moe::gemm1", 7),
+            ("trtllm::fused_moe::gemm2", 7),
+            ("unrelated", -1),
+        ):
+            _, selected_tactic = tuner.choose_one(
+                operation, [cached_runner], TuningConfig(), [hidden_states]
+            )
+            assert selected_tactic == expected_tactic
 
 
 def make_sched_req(**data_kwargs: object) -> SimpleNamespace:
