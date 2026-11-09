@@ -9,13 +9,16 @@ prefill, so this wrapper keeps only the text model and LM head.
 
 from __future__ import annotations
 
+import os
 import time
 from collections.abc import Mapping
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Iterable, Optional, Tuple
 
 import torch
 import torch.nn as nn
+from huggingface_hub import hf_hub_download
 from sglang.srt.layers.logits_processor import LogitsProcessor, LogitsProcessorOutput
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe_triton_config import (
@@ -40,6 +43,7 @@ from transformers import PretrainedConfig
 from sglang_omni.models.qwen3_omni.components.thinker_fused_rope import (
     install_thinker_fused_rope,
 )
+from sglang_omni.models.qwen3_omni.thinker_weight_audit import audit_thinker_weights
 from sglang_omni.quantization import get_weight_preprocessor
 from sglang_omni.sampling.sampler_compile import (
     SamplerCompileForms,
@@ -267,6 +271,20 @@ class Qwen3OmniThinkerForCausalLM(nn.Module):
         """Load FlashInfer's sampling module when it draws the unseeded requests, and run
         one MoE layer on zero rows once per fused MoE kernel variant that a forward up to
         the prefill ceiling reaches, so no request waits for either."""
+        audit_output = os.environ.get("SGLANG_OMNI_THINKER_WEIGHT_AUDIT")
+        if audit_output is not None:
+            index_file = hf_hub_download(
+                self.root_config.name_or_path,
+                "model.safetensors.index.json",
+                revision=self.root_config._commit_hash,  # noqa: leading-underscore  # Transformers' resolved revision
+            )
+            audit_thinker_weights(
+                dict(self.named_parameters()),
+                Path(index_file).parent,
+                Path(audit_output),
+            )
+        else:
+            pass
         compile_sampler_functions(
             SamplerCompileForms(
                 device=self.lm_head.weight.device,
