@@ -18,7 +18,6 @@ from typing import Iterable, Optional, Tuple
 
 import torch
 import torch.nn as nn
-from huggingface_hub import hf_hub_download
 from sglang.srt.layers.logits_processor import LogitsProcessor, LogitsProcessorOutput
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe_triton_config import (
@@ -273,14 +272,9 @@ class Qwen3OmniThinkerForCausalLM(nn.Module):
         the prefill ceiling reaches, so no request waits for either."""
         audit_output = os.environ.get("SGLANG_OMNI_THINKER_WEIGHT_AUDIT")
         if audit_output is not None:
-            index_file = hf_hub_download(
-                self.root_config.name_or_path,
-                "model.safetensors.index.json",
-                revision=self.root_config._commit_hash,  # noqa: leading-underscore  # Transformers' resolved revision
-            )
             audit_thinker_weights(
                 dict(self.named_parameters()),
-                Path(index_file).parent,
+                Path(os.environ["SGLANG_OMNI_THINKER_WEIGHT_AUDIT_CHECKPOINT"]),
                 Path(audit_output),
             )
         else:
