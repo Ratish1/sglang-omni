@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import torch
@@ -16,6 +16,28 @@ from sglang_omni.scheduling.types import SchedulerRequest
 @dataclass(kw_only=True)
 class TalkerConditioningRecorder:
     directory: Path
+    assistant_tokens: dict[str, list[int]] = field(default_factory=dict)
+
+    def record_prompt(
+        self,
+        request_id: str,
+        prompt_input_ids: torch.Tensor,
+        assistant_token_ids: torch.Tensor,
+        prompt_hidden: torch.Tensor,
+        speaker_id: int,
+    ) -> None:
+        destination = self.directory / request_id
+        destination.mkdir(parents=True, exist_ok=True)
+        self.assistant_tokens[request_id] = assistant_token_ids.tolist()
+        torch.save(
+            {
+                "prompt_input_ids": prompt_input_ids.cpu().clone(),
+                "initial_assistant_token_ids": assistant_token_ids.cpu().clone(),
+                "prompt_hidden": prompt_hidden.cpu().clone(),
+                "speaker_id": torch.tensor(speaker_id),
+            },
+            destination / "prompt.pt",
+        )
 
     def record_inputs(
         self,
@@ -109,6 +131,9 @@ class TalkerConditioningRecorder:
                 "tts_pad_embed": request_data.tts_pad_embed.cpu(),
                 "tts_eos_embed": request_data.tts_eos_embed.cpu(),
                 "thinker_done": torch.tensor(request_data.thinker_chunks_done),
+                "assistant_token_ids": torch.tensor(
+                    self.assistant_tokens.pop(request_id), dtype=torch.long
+                ),
             },
             self.directory / request_id / "finished.pt",
         )

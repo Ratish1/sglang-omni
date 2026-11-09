@@ -259,6 +259,17 @@ class TalkerPrefillBuilder:
             im_end_token_id=self.im_end_token_id,
         )
 
+        if self.model.corpus_recorder is not None:
+            self.model.corpus_recorder.conditioning.record_prompt(
+                payload.request_id,
+                prompt_ids,
+                assistant_token_ids,
+                prompt_hidden,
+                speaker_id,
+            )
+        else:
+            pass
+
         return {
             "input_embeds": prefill["input_embeds"],
             "input_ids": prefill["input_ids"],
@@ -282,6 +293,14 @@ class TalkerPrefillBuilder:
         token_id = metadata.get("token_id")
         if token_id is not None and int(token_id) == self.im_end_token_id:
             return
+        else:
+            pass
+
+        if self.model.corpus_recorder is not None:
+            assert req_data.req is not None and token_id is not None
+            self.model.corpus_recorder.conditioning.assistant_tokens[
+                req_data.req.rid
+            ].append(int(token_id))
         else:
             pass
 
