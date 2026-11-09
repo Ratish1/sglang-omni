@@ -38,6 +38,7 @@ def main() -> None:
     parser.add_argument("--capture-directory", type=Path, required=True)
     parser.add_argument("--request-id", action="append", required=True)
     parser.add_argument("--request-directory", type=Path)
+    parser.add_argument("--thinker-directory", type=Path)
     parser.add_argument("--gpu", type=int, required=True)
     parser.add_argument("--output-directory", type=Path, required=True)
     arguments = parser.parse_args()
@@ -231,6 +232,108 @@ def main() -> None:
                     checkpoint_hidden[0, audio_mask],
                 )
             )
+            if arguments.thinker_directory is not None:
+                prefix_inputs = [
+                    (
+                        int(filename.stem.removeprefix("thinker-input-")),
+                        torch.load(filename, weights_only=True),
+                    )
+                    for filename in sorted(
+                        (arguments.thinker_directory / request_id).glob(
+                            "thinker-input-*.pt"
+                        )
+                    )
+                ]
+                actual_prefix = torch.empty_like(embeddings[0, : len(prompt_ids)])
+                covered = torch.zeros(len(prompt_ids), dtype=torch.bool)
+                for prefix, actual_inputs in prefix_inputs:
+                    length = len(actual_inputs["positions"])
+                    selected = slice(prefix, prefix + length)
+                    actual_prefix[selected] = actual_inputs["input_embeds"].to(
+                        talker.device
+                    )
+                    covered[selected] = True
+                assert bool(
+                    covered[audio_mask.cpu()].all()
+                ), "audio rows hidden by an uncaptured prefix"
+                native_audio = actual_prefix[audio_mask]
+                assert torch.equal(
+                    prompt["audio_feature_lengths"].to(talker.device),
+                    inputs["feature_attention_mask"].sum(dim=1),
+                )
+                native_audio_hidden, native_audio_positions = prompt_hidden(
+                    owner,
+                    inputs["input_ids"],
+                    native_audio,
+                    inputs["feature_attention_mask"],
+                )
+                assert torch.equal(native_audio_positions, checkpoint_positions)
+                expected_inputs = owner.thinker.get_input_embeddings()(
+                    inputs["input_ids"]
+                )[0]
+                expected_inputs[audio_mask] = native_audio
+                prefix_proofs = []
+                for prefix, actual_inputs in prefix_inputs:
+                    length = len(actual_inputs["positions"])
+                    selected = slice(prefix, prefix + length)
+                    active_audio = audio_mask[selected].cpu()
+                    assert torch.equal(
+                        actual_inputs["input_ids"][~active_audio],
+                        prompt_ids[selected].cpu()[~active_audio],
+                    )
+                    delivered_exact = None
+                    if bool(active_audio.any()):
+                        actual_hidden = torch.load(
+                            arguments.thinker_directory
+                            / request_id
+                            / f"thinker-hidden-{prefix}.pt",
+                            weights_only=True,
+                        )
+                        delivered_exact = torch.equal(
+                            actual_hidden[active_audio],
+                            prompt["prompt_hidden"][selected][active_audio],
+                        )
+                        assert delivered_exact
+                    else:
+                        pass
+                    prefix_proofs.append(
+                        {
+                            "prefix": prefix,
+                            "rows": length,
+                            "inputs": asdict(
+                                compare_tensors(
+                                    actual_inputs["input_embeds"].to(talker.device),
+                                    expected_inputs[selected],
+                                )
+                            ),
+                            "mrope_positions_exact": torch.equal(
+                                actual_inputs["mrope_positions"],
+                                native_audio_positions[:, 0, selected].cpu(),
+                            ),
+                            "hidden_delivery_exact": delivered_exact,
+                        }
+                    )
+                assert prefix_proofs
+                report["producer_delivery"] = prefix_proofs
+                report["audio_encoder"] = asdict(
+                    compare_tensors(native_audio, audio_embeddings)
+                )
+                report["hidden_with_identical_audio"] = asdict(
+                    compare_tensors(
+                        hidden[0, : len(prompt_ids)][audio_mask],
+                        native_audio_hidden[0, audio_mask],
+                    )
+                )
+                native_audio_prefill = checkpoint_audio_prefill.clone()
+                native_audio_prefill[audio_rows] = talker.hidden_projection(
+                    native_audio_hidden[0, audio_mask]
+                )
+                saved_tensors["native_audio_prefill"] = native_audio_prefill.cpu()
+                saved_tensors["native_audio_reference_hidden"] = (
+                    native_audio_hidden.cpu()
+                )
+            else:
+                pass
             saved_tensors.update(
                 {
                     "native_prefill": before["prefill_embeds"],
