@@ -24,6 +24,7 @@ from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import (
 
 from scripts.debug_qwen3_omni_conditioning import prompt_hidden
 from scripts.debug_qwen3_omni_feedback_audit import compare_tensors
+from scripts.debug_qwen3_omni_prefix_provenance import recover_audio_prefix
 from sglang_omni.models.qwen3_omni.components.talker_prefill import (
     load_thinker_embedding_rows,
 )
@@ -39,6 +40,7 @@ def main() -> None:
     parser.add_argument("--request-id", action="append", required=True)
     parser.add_argument("--request-directory", type=Path)
     parser.add_argument("--thinker-directory", type=Path)
+    parser.add_argument("--cached-prefix-proof", type=Path)
     parser.add_argument("--gpu", type=int, required=True)
     parser.add_argument("--output-directory", type=Path, required=True)
     arguments = parser.parse_args()
@@ -254,9 +256,25 @@ def main() -> None:
                         talker.device
                     )
                     covered[selected] = True
-                assert bool(
-                    covered[: len(prompt_ids)][audio_mask.cpu()].all()
-                ), "audio rows hidden by an uncaptured prefix"
+                if not bool(covered[: len(prompt_ids)][audio_mask.cpu()].all()):
+                    assert (
+                        arguments.cached_prefix_proof is not None
+                    ), "cached audio requires its observed source proof"
+                    owners = recover_audio_prefix(
+                        arguments.thinker_directory,
+                        arguments.cached_prefix_proof,
+                        request_id,
+                        audio_mask.cpu().nonzero(as_tuple=True)[0],
+                        prompt["prompt_hidden"],
+                        actual_prefix,
+                        covered,
+                        checkpoint_positions,
+                    )
+                    report["cached_prefix_sources"] = [
+                        owner.model_dump() for owner in owners
+                    ]
+                else:
+                    pass
                 native_audio = actual_prefix[: len(prompt_ids)][audio_mask]
                 assert torch.equal(
                     prompt["audio_feature_lengths"].to(talker.device),
