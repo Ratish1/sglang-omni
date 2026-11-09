@@ -4,6 +4,8 @@
 from __future__ import annotations
 
 import logging
+import os
+from pathlib import Path
 from types import MethodType
 
 import torch
@@ -200,6 +202,8 @@ class GraphedLayerStack(nn.Module):
 class Qwen3OmniAudioEncoder(nn.Module):
     """Audio tower extracted from the HF thinker."""
 
+    capture_forward_index: int = 0
+
     def __init__(
         self,
         model_path: str,
@@ -274,6 +278,19 @@ class Qwen3OmniAudioEncoder(nn.Module):
         feature_attention_mask: torch.Tensor | None = None,
         audio_feature_lengths: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
+        capture_directory = os.environ.get("SGLANG_OMNI_DIAGNOSTIC_TENSOR_DIRECTORY")
+        if capture_directory is not None:
+            captured = {
+                name: tensor.detach().cpu().clone()
+                for name, tensor in (
+                    ("input_features", input_features),
+                    ("feature_attention_mask", feature_attention_mask),
+                    ("audio_feature_lengths", audio_feature_lengths),
+                )
+                if isinstance(tensor, torch.Tensor)
+            }
+        else:
+            captured = {}
         if feature_attention_mask is not None:
             audio_feature_lengths = torch.sum(feature_attention_mask, dim=1)
             input_features = pack_padded_audio_features(
@@ -334,6 +351,16 @@ class Qwen3OmniAudioEncoder(nn.Module):
         audio_output_lengths = self.downsample_lengths(
             audio_feature_lengths, tower.n_window
         )
+        if capture_directory is not None:
+            destination = Path(capture_directory) / "audio-forwards"
+            destination.mkdir(parents=True, exist_ok=True)
+            captured["audio_embeds"] = audio_embeds.detach().cpu().clone()
+            captured["audio_output_lengths"] = audio_output_lengths.cpu().clone()
+            captured["cu_seqlens"] = cu_seqlens.cpu().clone()
+            torch.save(captured, destination / f"{self.capture_forward_index:04d}.pt")
+            self.capture_forward_index += 1
+        else:
+            pass
         return {
             "audio_embeds": audio_embeds,
             "audio_feature_lengths": audio_feature_lengths,
