@@ -47,10 +47,12 @@ def compare_tensors(actual: torch.Tensor, expected: torch.Tensor) -> TensorDiffe
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model-path", required=True)
+    parser.add_argument("--model-revision", required=True)
     parser.add_argument("--trace-directory", action="append", type=Path, required=True)
     parser.add_argument("--compare-trace-directories", nargs=2, type=Path)
     parser.add_argument("--gpu", type=int, required=True)
     parser.add_argument("--decode-only", action="store_true")
+    parser.add_argument("--feedback-only", action="store_true")
     parser.add_argument("--profile-tactics", nargs=2, type=int)
     parser.add_argument("--output-directory", type=Path, required=True)
     arguments = parser.parse_args()
@@ -58,12 +60,15 @@ def main() -> None:
     torch.cuda.set_device(arguments.gpu)
     device = torch.device("cuda", arguments.gpu)
     torch.set_float32_matmul_precision("highest")
-    config = Qwen3OmniMoeConfig.from_pretrained(arguments.model_path).talker_config
+    config = Qwen3OmniMoeConfig.from_pretrained(
+        arguments.model_path, revision=arguments.model_revision
+    ).talker_config
     register_checkpoint_conversion_mapping(
         config.model_type, get_checkpoint_conversion_mapping("qwen3_omni_moe")
     )
     reference, loading = Qwen3OmniMoeTalkerForConditionalGeneration.from_pretrained(
         arguments.model_path,
+        revision=arguments.model_revision,
         config=config,
         dtype=torch.bfloat16,
         device_map={"": arguments.gpu},
@@ -135,7 +140,9 @@ def main() -> None:
                     ),
                 }
                 frames.append(frame_report)
-                if not arguments.decode_only and "post_prefill" not in trace_file.name:
+                if arguments.feedback_only or (
+                    not arguments.decode_only and "post_prefill" not in trace_file.name
+                ):
                     continue
                 else:
                     pass
