@@ -28,6 +28,7 @@ from sglang_omni.client.audio import encode_wav
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model-path", required=True)
+    parser.add_argument("--model-revision", required=True)
     parser.add_argument("--trace-directory", action="append", type=Path, required=True)
     parser.add_argument("--gpu", type=int, required=True)
     parser.add_argument("--asr-port", type=int, required=True)
@@ -40,9 +41,12 @@ def main() -> None:
     arguments = parser.parse_args()
     arguments.output_directory.mkdir(exist_ok=False)
     torch.cuda.set_device(arguments.gpu)
-    config = Qwen3OmniMoeConfig.from_pretrained(arguments.model_path)
+    config = Qwen3OmniMoeConfig.from_pretrained(
+        arguments.model_path, revision=arguments.model_revision
+    )
     reference, loading = Qwen3OmniMoeCode2Wav.from_pretrained(
         arguments.model_path,
+        revision=arguments.model_revision,
         config=config.code2wav_config,
         dtype=torch.bfloat16,
         device_map={"": arguments.gpu},
