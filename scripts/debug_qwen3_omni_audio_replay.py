@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 from dataclasses import asdict
 from pathlib import Path
@@ -20,6 +21,12 @@ from sglang_omni.models.qwen3_omni.components.audio_encoder import (
     pack_padded_audio_features,
 )
 from sglang_omni.serve.protocol import ChatCompletionRequest
+
+
+def tensor_digest(tensor: torch.Tensor) -> str:
+    return hashlib.sha256(
+        tensor.contiguous().view(torch.uint8).numpy().tobytes()
+    ).hexdigest()
 
 
 @torch.inference_mode()
@@ -82,6 +89,21 @@ def main() -> None:
     processor = Qwen3OmniMoeProcessor.from_pretrained(
         arguments.model_path, revision=arguments.model_revision
     )
+    batch_paths = sorted((arguments.capture_directory / "audio-forwards").glob("*.pt"))
+    assert batch_paths
+    sources: dict[str, list[tuple[torch.Tensor, str, int]]] = {}
+    for batch_path in batch_paths:
+        actual = torch.load(batch_path, weights_only=True)
+        cursor = 0
+        for row, output_rows in enumerate(actual["audio_output_lengths"].tolist()):
+            signature = tensor_digest(
+                actual["audio_embeds"][cursor : cursor + output_rows]
+            )
+            mask = actual["feature_attention_mask"][row].bool()
+            features = actual["input_features"][row][:, mask]
+            sources.setdefault(signature, []).append((features, batch_path.name, row))
+            cursor += output_rows
+        assert cursor == len(actual["audio_embeds"])
     for request_id in arguments.request_id:
         request = ChatCompletionRequest.model_validate_json(
             (arguments.request_directory / f"{request_id}.request.json").read_bytes()
@@ -107,13 +129,16 @@ def main() -> None:
             arguments.capture_directory / request_id / "audio-conditioning.pt",
             weights_only=True,
         )
-        native_mask = actual["feature_attention_mask"].bool()
         reference_mask = inputs["feature_attention_mask"].bool()
-        native_features = actual["input_features"].permute(0, 2, 1)[native_mask].T
+        matches = sources[tensor_digest(actual["audio_embeds"])]
+        native_features, source_batch, source_row = matches[0]
+        assert all(torch.equal(native_features, features) for features, _, _ in matches)
         reference_features = inputs["input_features"].permute(0, 2, 1)[reference_mask].T
         reports["frontend"].append(
             {
                 "request_id": request_id,
+                "source_batch": source_batch,
+                "source_row": source_row,
                 "features": asdict(
                     compare_tensors(native_features, reference_features)
                 ),
@@ -125,8 +150,9 @@ def main() -> None:
                 ),
             }
         )
-    batch_paths = sorted((arguments.capture_directory / "audio-forwards").glob("*.pt"))
-    assert batch_paths
+    (arguments.output_directory / "summary.json").write_text(
+        json.dumps(reports, indent=2)
+    )
     for batch_path in batch_paths:
         actual = torch.load(batch_path, weights_only=True)
         features = actual["input_features"].to(device, dtype=torch.bfloat16)
@@ -160,6 +186,9 @@ def main() -> None:
                 ),
             }
         )
+    (arguments.output_directory / "summary.json").write_text(
+        json.dumps(reports, indent=2)
+    )
     native.enable_layer_cuda_graph()
     runner = native.layer_graph_runner
     assert runner is not None and runner.has_graphs
