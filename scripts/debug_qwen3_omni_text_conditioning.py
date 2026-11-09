@@ -244,19 +244,20 @@ def main() -> None:
                         )
                     )
                 ]
-                actual_prefix = torch.empty_like(embeddings[0, : len(prompt_ids)])
-                covered = torch.zeros(len(prompt_ids), dtype=torch.bool)
+                actual_prefix = torch.empty_like(embeddings[0])
+                covered = torch.zeros(len(all_ids), dtype=torch.bool)
                 for prefix, actual_inputs in prefix_inputs:
                     length = len(actual_inputs["positions"])
+                    assert prefix + length <= len(all_ids)
                     selected = slice(prefix, prefix + length)
                     actual_prefix[selected] = actual_inputs["input_embeds"].to(
                         talker.device
                     )
                     covered[selected] = True
                 assert bool(
-                    covered[audio_mask.cpu()].all()
+                    covered[: len(prompt_ids)][audio_mask.cpu()].all()
                 ), "audio rows hidden by an uncaptured prefix"
-                native_audio = actual_prefix[audio_mask]
+                native_audio = actual_prefix[: len(prompt_ids)][audio_mask]
                 assert torch.equal(
                     prompt["audio_feature_lengths"].to(talker.device),
                     inputs["feature_attention_mask"].sum(dim=1),
@@ -268,18 +269,29 @@ def main() -> None:
                     inputs["feature_attention_mask"],
                 )
                 assert torch.equal(native_audio_positions, checkpoint_positions)
-                expected_inputs = owner.thinker.get_input_embeddings()(
-                    inputs["input_ids"]
-                )[0]
-                expected_inputs[audio_mask] = native_audio
+                expected_inputs = embeddings[0].clone()
+                expected_inputs[audio_mask.nonzero(as_tuple=True)[0]] = native_audio
+                complete_positions = owner.thinker.compute_3d_position_ids(
+                    input_ids=all_ids[None],
+                    image_grid_thw=None,
+                    video_grid_thw=None,
+                    inputs_embeds=expected_inputs[None],
+                    attention_mask=torch.ones_like(all_ids[None]),
+                    past_key_values=None,
+                    audio_feature_lengths=inputs["feature_attention_mask"].sum(dim=1),
+                )
+                assert torch.equal(
+                    complete_positions[:, :, : len(prompt_ids)], checkpoint_positions
+                )
+                complete_audio_mask = all_ids == config.thinker_config.audio_token_id
                 prefix_proofs = []
                 for prefix, actual_inputs in prefix_inputs:
                     length = len(actual_inputs["positions"])
                     selected = slice(prefix, prefix + length)
-                    active_audio = audio_mask[selected].cpu()
+                    active_audio = complete_audio_mask[selected].cpu()
                     assert torch.equal(
                         actual_inputs["input_ids"][~active_audio],
-                        prompt_ids[selected].cpu()[~active_audio],
+                        all_ids[selected].cpu()[~active_audio],
                     )
                     delivered_exact = None
                     if bool(active_audio.any()):
@@ -308,7 +320,7 @@ def main() -> None:
                             ),
                             "mrope_positions_exact": torch.equal(
                                 actual_inputs["mrope_positions"],
-                                native_audio_positions[:, 0, selected].cpu(),
+                                complete_positions[:, 0, selected].cpu(),
                             ),
                             "hidden_delivery_exact": delivered_exact,
                         }
