@@ -12,6 +12,9 @@ from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from torch import nn
 
+from sglang_omni.models.qwen3_omni.conditioning_capture import (
+    TalkerConditioningRecorder,
+)
 from sglang_omni.models.qwen3_omni.corpus_hooks import (
     AttentionCapture,
     OutputCapture,
@@ -77,6 +80,9 @@ class TalkerCorpusRecorder:
         device: torch.device,
     ) -> None:
         self.directory = directory
+        self.conditioning = TalkerConditioningRecorder(
+            directory=directory / "conditioning"
+        )
         self.directory.mkdir(parents=True, exist_ok=False)
         (self.directory / "requests").mkdir()
         self.query_indices = torch.zeros(
@@ -406,6 +412,7 @@ class TalkerCorpusRecorder:
         self.step_index += 1
 
     def finish(self, request_id: str, request_data: SGLangARRequestData) -> None:
+        self.conditioning.finish(request_id, request_data)
         progress = self.progress.pop(request_id)
         assert request_data.req is not None
         report = {

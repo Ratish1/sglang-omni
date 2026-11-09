@@ -109,6 +109,12 @@ class QwenTalkerModelRunner(ModelRunner["SGLangARRequestData"]):
                 input_embeds_are_projected=input_embeds_are_projected,
             ),
         )
+        if self.corpus_recorder is not None:
+            self.corpus_recorder.conditioning.record_inputs(
+                forward_batch, requests, input_embeds, None
+            )
+        else:
+            pass
 
     def before_decode(
         self,
@@ -138,6 +144,12 @@ class QwenTalkerModelRunner(ModelRunner["SGLangARRequestData"]):
             pass
 
         self.model.prepare_decode_buffers(requests)
+        if self.corpus_recorder is not None:
+            self.corpus_recorder.conditioning.record_inputs(
+                forward_batch, requests, None, self.model.sampling_seeds
+            )
+        else:
+            pass
         self.write_feedback_buffers(requests)
 
     def post_prefill(
