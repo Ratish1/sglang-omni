@@ -3,9 +3,11 @@
 
 from __future__ import annotations
 
+import os
 from array import array
 from dataclasses import dataclass
 from numbers import Integral
+from pathlib import Path
 from typing import TypeGuard
 
 import torch
@@ -390,6 +392,64 @@ class Qwen3OmniThinkerModelRunner(ThinkerModelRunner):
             forward_batch,
             OmniPrefillInputs(input_embeds=input_embeds),
         )
+        capture_directory = os.environ.get("SGLANG_OMNI_DIAGNOSTIC_TENSOR_DIRECTORY")
+        if capture_directory is not None:
+            row_start = 0
+            for request, prefix, length in zip(
+                requests,
+                forward_batch.extend_prefix_lens_cpu,
+                forward_batch.extend_seq_lens_cpu,
+            ):
+                destination = Path(capture_directory) / request.request_id
+                destination.mkdir(parents=True, exist_ok=True)
+                selected = slice(row_start, row_start + length)
+                captured = {
+                    "input_ids": forward_batch.input_ids[selected].cpu().clone(),
+                    "positions": forward_batch.positions[selected].cpu().clone(),
+                    "input_embeds": input_embeds[selected].cpu().clone(),
+                }
+                if forward_batch.mrope_positions is not None:
+                    captured["mrope_positions"] = (
+                        forward_batch.mrope_positions[:, selected].cpu().clone()
+                    )
+                else:
+                    pass
+                torch.save(
+                    captured,
+                    destination / f"thinker-input-{prefix}.pt",
+                )
+                row_start += length
+        else:
+            pass
+
+    def post_prefill(
+        self,
+        result: GenerationBatchResult,
+        forward_batch: ForwardBatch,
+        schedule_batch: ScheduleBatch,
+        requests: list[SchedulerRequest],
+    ) -> None:
+        super().post_prefill(result, forward_batch, schedule_batch, requests)
+        capture_directory = os.environ.get("SGLANG_OMNI_DIAGNOSTIC_TENSOR_DIRECTORY")
+        if (
+            capture_directory is not None
+            and forward_batch.capture_hidden_mode.is_full()
+        ):
+            row_start = 0
+            for request, prefix, length in zip(
+                requests, schedule_batch.prefix_lens, schedule_batch.extend_lens
+            ):
+                destination = Path(capture_directory) / request.request_id
+                destination.mkdir(parents=True, exist_ok=True)
+                torch.save(
+                    result.logits_output.hidden_states[row_start : row_start + length]
+                    .cpu()
+                    .clone(),
+                    destination / f"thinker-hidden-{prefix}.pt",
+                )
+                row_start += length
+        else:
+            pass
 
     def custom_prefill_forward(
         self,
