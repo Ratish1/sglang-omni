@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+import os
+from pathlib import Path
 from typing import TYPE_CHECKING, Iterable, TypeGuard
 
 if TYPE_CHECKING:
@@ -67,6 +69,30 @@ def merge_for_thinker(payloads: dict[str, StagePayload]) -> StagePayload:
             pass
 
     thinker_inputs = build_thinker_inputs(state, encoder_outs)
+
+    capture_directory = os.environ.get("SGLANG_OMNI_DIAGNOSTIC_TENSOR_DIRECTORY")
+    if (
+        capture_directory is not None
+        and "audio_embeds" in thinker_inputs["model_inputs"]
+    ):
+        captured = {
+            name: thinker_inputs["model_inputs"][name].detach().cpu().clone()
+            for name in (
+                "audio_embeds",
+                "audio_feature_lengths",
+                "feature_attention_mask",
+            )
+        }
+        features = state.encoder_inputs[AUDIO_STAGE].get("input_features")
+        if isinstance(features, torch.Tensor):
+            captured["input_features"] = features.detach().cpu().clone()
+        else:
+            pass
+        destination = Path(capture_directory) / base.request_id
+        destination.mkdir(parents=True, exist_ok=True)
+        torch.save(captured, destination / "audio-conditioning.pt")
+    else:
+        pass
 
     state.thinker_inputs = thinker_inputs
     state.encoder_inputs = {}
