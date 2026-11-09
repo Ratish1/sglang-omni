@@ -316,6 +316,7 @@ class Qwen3OmniMoeThinkerTextAttention(nn.Module):
                 k_norm=self.k_norm,
                 head_dim=self.head_dim,
                 alt_stream=self.alt_stream,
+                allow_inplace=not self.q_norm.cast_x_before_out_mul,
             )
             # note (ratish): a forced torch backend runs the rope's native
             # forward, which cannot store K and V, so attention stores them.
