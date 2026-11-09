@@ -5,20 +5,24 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
-from dataclasses import asdict
+from dataclasses import asdict, dataclass
 from pathlib import Path
 
 import torch
 from huggingface_hub import hf_hub_download
+from sglang.srt.layers.attention.vision import prepare_vision_attention_metadata
 from transformers import Qwen3OmniMoeConfig, Qwen3OmniMoeProcessor
 from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import (
     Qwen3OmniMoeAudioEncoder,
 )
 
-from scripts.debug_qwen3_omni_feedback_audit import compare_tensors
+from scripts.debug_qwen3_omni_feedback_audit import TensorDifference, compare_tensors
 from sglang_omni.models.qwen3_omni.components.audio_encoder import (
     Qwen3OmniAudioEncoder,
     pack_padded_audio_features,
+)
+from sglang_omni.models.qwen3_omni.components.audio_layer_graph import (
+    AudioLayerGraphRunner,
 )
 from sglang_omni.serve.protocol import ChatCompletionRequest
 
@@ -27,6 +31,113 @@ def tensor_digest(tensor: torch.Tensor) -> str:
     return hashlib.sha256(
         tensor.contiguous().view(torch.uint8).numpy().tobytes()
     ).hexdigest()
+
+
+@dataclass(kw_only=True)
+class PaddingLayerDifference:
+    layer_index: int
+    padding_values_isolated: bool
+    same_projections_attention_shape: TensorDifference
+    padded_attention_to_float64: TensorDifference
+    unpadded_attention_to_float64: TensorDifference
+    local_layer_shape: TensorDifference
+    cumulative_layer_shape: TensorDifference
+
+
+def audit_padding(
+    runner: AudioLayerGraphRunner,
+    padded_hidden_states: torch.Tensor,
+    padded_cumulative_sequence_lengths: torch.Tensor,
+    cumulative_sequence_lengths: torch.Tensor,
+    valid_token_count: int,
+) -> list[PaddingLayerDifference]:
+    padded_metadata = prepare_vision_attention_metadata(
+        padded_cumulative_sequence_lengths,
+        padded_cumulative_sequence_lengths.device,
+        max_seqlen=runner.window,
+    )
+    metadata = prepare_vision_attention_metadata(
+        cumulative_sequence_lengths,
+        cumulative_sequence_lengths.device,
+        max_seqlen=runner.window,
+    )
+    boundaries = cumulative_sequence_lengths.cpu().tolist()
+    unpadded_hidden_states = padded_hidden_states[:valid_token_count].clone()
+    layers = runner.tower.layers
+    differences: list[PaddingLayerDifference] = []
+    for layer_index, layer in enumerate(layers):
+        attention = layer.self_attn
+        projection = attention.qkv_proj(
+            layer.self_attn_layer_norm(padded_hidden_states)
+        ).reshape(len(padded_hidden_states), 3, attention.num_heads, -1)
+        changed_padding = projection.clone()
+        changed_padding[valid_token_count:] = 100
+        outputs: dict[str, torch.Tensor] = {}
+        for name, projected, attention_metadata in (
+            ("padded", projection, padded_metadata),
+            ("unpadded", projection[:valid_token_count], metadata),
+            ("changed_padding", changed_padding, padded_metadata),
+        ):
+            query, key, value = projected.unbind(1)
+            outputs[name] = runner.packed_attention(
+                query,
+                key,
+                value,
+                attention_metadata.cu_seqlens,
+                bsz=1,
+                seq_len=len(projected),
+                softmax_scale=attention.scaling,
+                forward_metadata=attention_metadata,
+            )[:valid_token_count]
+        expected: list[torch.Tensor] = []
+        for start, end in zip(boundaries[:-1], boundaries[1:], strict=True):
+            query, key, value = projection[start:end].unbind(1)
+            query = query.transpose(0, 1).double()
+            key = key.transpose(0, 1).double()
+            value = value.transpose(0, 1).double()
+            probabilities = torch.softmax(
+                (query @ key.transpose(-1, -2)) * attention.scaling, dim=-1
+            )
+            expected.append((probabilities @ value).transpose(0, 1))
+        reference = torch.cat(expected)
+        runner.tower.layers = torch.nn.ModuleList([layer])
+        same_input = runner.run_layers(
+            padded_hidden_states[:valid_token_count],
+            cumulative_sequence_lengths,
+            runner.window,
+        )
+        next_padded = runner.run_layers(
+            padded_hidden_states, padded_cumulative_sequence_lengths, runner.window
+        )
+        unpadded_hidden_states = runner.run_layers(
+            unpadded_hidden_states, cumulative_sequence_lengths, runner.window
+        )
+        differences.append(
+            PaddingLayerDifference(
+                layer_index=layer_index,
+                padding_values_isolated=torch.equal(
+                    outputs["padded"], outputs["changed_padding"]
+                ),
+                same_projections_attention_shape=compare_tensors(
+                    outputs["padded"], outputs["unpadded"]
+                ),
+                padded_attention_to_float64=compare_tensors(
+                    outputs["padded"], reference
+                ),
+                unpadded_attention_to_float64=compare_tensors(
+                    outputs["unpadded"], reference
+                ),
+                local_layer_shape=compare_tensors(
+                    next_padded[:valid_token_count], same_input
+                ),
+                cumulative_layer_shape=compare_tensors(
+                    next_padded[:valid_token_count], unpadded_hidden_states
+                ),
+            )
+        )
+        padded_hidden_states = next_padded
+    runner.tower.layers = layers
+    return differences
 
 
 @torch.inference_mode()
@@ -39,6 +150,7 @@ def main() -> None:
     parser.add_argument("--request-id", action="append", required=True)
     parser.add_argument("--gpu", type=int, required=True)
     parser.add_argument("--output-directory", type=Path, required=True)
+    parser.add_argument("--audit-padding", action="store_true")
     arguments = parser.parse_args()
     arguments.output_directory.mkdir(exist_ok=False)
     torch.cuda.set_device(arguments.gpu)
@@ -225,6 +337,19 @@ def main() -> None:
             report["same_padded_operands_graph_to_eager"] = asdict(
                 compare_tensors(replayed, ordinary)
             )
+            if arguments.audit_padding:
+                report["padding_audit"] = [
+                    asdict(difference)
+                    for difference in audit_padding(
+                        runner,
+                        captured.hidden_states.clone(),
+                        captured.cu_seqlens.clone(),
+                        actual["cu_seqlens"].to(device),
+                        len(graphed_output),
+                    )
+                ]
+            else:
+                pass
         else:
             pass
         print(json.dumps(report), flush=True)
