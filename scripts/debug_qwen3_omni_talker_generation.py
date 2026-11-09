@@ -31,6 +31,7 @@ from sglang_omni.sampling.seed import SAMPLING_SEED_MASK
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model-path", required=True)
+    parser.add_argument("--model-revision", required=True)
     parser.add_argument("--trace-directory", action="append", type=Path, required=True)
     parser.add_argument("--gpu", type=int, required=True)
     parser.add_argument("--dtype", choices=("bfloat16", "float32"), default="bfloat16")
@@ -57,13 +58,16 @@ def main() -> None:
     arguments.output_directory.mkdir(exist_ok=False)
     torch.cuda.set_device(arguments.gpu)
     torch.set_float32_matmul_precision("highest")
-    model_config = Qwen3OmniMoeConfig.from_pretrained(arguments.model_path)
+    model_config = Qwen3OmniMoeConfig.from_pretrained(
+        arguments.model_path, revision=arguments.model_revision
+    )
     config = model_config.talker_config
     register_checkpoint_conversion_mapping(
         config.model_type, get_checkpoint_conversion_mapping("qwen3_omni_moe")
     )
     reference, loading = Qwen3OmniMoeTalkerForConditionalGeneration.from_pretrained(
         arguments.model_path,
+        revision=arguments.model_revision,
         config=config,
         dtype=torch.bfloat16,
         device_map={"": arguments.gpu},
@@ -85,7 +89,9 @@ def main() -> None:
     else:
         pass
     checkpoint_directory = Path(
-        hf_hub_download(arguments.model_path, "config.json")
+        hf_hub_download(
+            arguments.model_path, "config.json", revision=arguments.model_revision
+        )
     ).parent
     special_embeddings = load_thinker_embedding_rows(
         str(checkpoint_directory),
@@ -136,6 +142,19 @@ def main() -> None:
                 "native-query-key",
             )
             prefill_file = next(trace_directory.glob("*-before_prefill.pt"))
+            captured_sampling = json.loads(
+                (trace_directory / "sampling.json").read_text()
+            )
+            assert captured_sampling["temperature"] == arguments.temperature
+            assert captured_sampling["top_k"] == arguments.top_k
+            assert captured_sampling["top_p"] == arguments.top_p
+            assert (
+                captured_sampling["repetition_penalty"] == arguments.repetition_penalty
+            )
+            assert captured_sampling["min_p"] == 0
+            assert sorted(captured_sampling["suppress_tokens"]) == (
+                (~allowed_tokens).nonzero(as_tuple=True)[0].tolist()
+            )
             before = torch.load(prefill_file, map_location="cpu", weights_only=True)
             prefill = before["prefill_embeds"].to(
                 device=reference.device, dtype=reference.dtype
@@ -202,6 +221,7 @@ def main() -> None:
                 & SAMPLING_SEED_MASK
             )
             sampling_seed = torch.tensor([seed], device=reference.device)
+            assert captured_sampling["sampling_seed"] == seed
             checked_feedback_rows = 0
             for frame_index, filename in enumerate(
                 sorted(trace_directory.glob("*-before_decode.pt"))
@@ -292,7 +312,8 @@ def main() -> None:
             first_main_code_divergence = None
             frame_reports = []
             termination = "frame_limit"
-            for frame_index in range(arguments.max_frames):
+            frame_limit = min(arguments.max_frames, captured_sampling["max_new_tokens"])
+            for frame_index in range(frame_limit):
                 output = reference(**prepared_inputs)
                 assert (
                     output.past_key_values.get_seq_length()
@@ -393,6 +414,8 @@ def main() -> None:
                 else:
                     pass
             report = {
+                "model_revision": arguments.model_revision,
+                "frame_limit": frame_limit,
                 "native_trace_directory": str(trace_directory),
                 "reference_trace_directory": str(case_directory),
                 "prefill_file_sha256": hashlib.sha256(
