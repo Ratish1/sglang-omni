@@ -12,6 +12,7 @@ from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from torch import nn
 
+from sglang_omni.models.qwen3_omni.cache_history import CacheHistoryRecorder
 from sglang_omni.models.qwen3_omni.conditioning_capture import (
     TalkerConditioningRecorder,
 )
@@ -80,6 +81,7 @@ class TalkerCorpusRecorder:
         device: torch.device,
     ) -> None:
         self.directory = directory
+        self.cache_history = CacheHistoryRecorder(directory=directory)
         self.conditioning = TalkerConditioningRecorder(
             directory=directory / "conditioning"
         )
@@ -338,22 +340,47 @@ class TalkerCorpusRecorder:
                     forward_batch.req_pool_indices[row],
                     : metadata["sequence_lengths"][row],
                 ].long()
+                keys = [
+                    buffer.index_select(0, locations).cpu()
+                    for buffer in self.kv_pool.k_buffer
+                ]
+                values = [
+                    buffer.index_select(0, locations).cpu()
+                    for buffer in self.kv_pool.v_buffer
+                ]
+                self.cache_history.record_prefix(request.request_id, keys, values)
                 torch.save(
-                    {
-                        "keys": [
-                            buffer.index_select(0, locations).cpu()
-                            for buffer in self.kv_pool.k_buffer
-                        ],
-                        "values": [
-                            buffer.index_select(0, locations).cpu()
-                            for buffer in self.kv_pool.v_buffer
-                        ],
-                    },
+                    {"keys": keys, "values": values},
                     self.directory
                     / f"prefix-{request.request_id}-{self.step_index:06d}.pt",
                 )
         else:
-            pass
+            assert self.kv_pool is not None and self.request_table is not None
+            for row, request in enumerate(requests):
+                locations = self.request_table[
+                    forward_batch.req_pool_indices[row],
+                    : metadata["sequence_lengths"][row],
+                ].long()
+                self.cache_history.verify_decode(
+                    request.request_id,
+                    metadata["frame_indices"][row],
+                    [
+                        buffer.index_select(0, locations).cpu()
+                        for buffer in self.kv_pool.k_buffer
+                    ],
+                    [
+                        buffer.index_select(0, locations).cpu()
+                        for buffer in self.kv_pool.v_buffer
+                    ],
+                    [
+                        snapshots[f"backbone.{layer_index}.key"][row]
+                        for layer_index in range(len(self.kv_pool.k_buffer))
+                    ],
+                    [
+                        snapshots[f"backbone.{layer_index}.value"][row]
+                        for layer_index in range(len(self.kv_pool.v_buffer))
+                    ],
+                )
         if self.full_experts is not None:
             real_rows = (
                 sum(forward_batch.extend_seq_lens_cpu)
@@ -413,6 +440,7 @@ class TalkerCorpusRecorder:
 
     def finish(self, request_id: str, request_data: SGLangARRequestData) -> None:
         self.conditioning.finish(request_id, request_data)
+        self.cache_history.finish(request_id)
         progress = self.progress.pop(request_id)
         assert request_data.req is not None
         report = {
