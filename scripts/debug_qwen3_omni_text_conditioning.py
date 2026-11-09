@@ -9,7 +9,11 @@ from pathlib import Path
 
 import torch
 from huggingface_hub import hf_hub_download
-from transformers import Qwen3OmniMoeConfig, Qwen3OmniMoeForConditionalGeneration
+from transformers import (
+    Qwen3OmniMoeConfig,
+    Qwen3OmniMoeForConditionalGeneration,
+    Qwen3OmniMoeProcessor,
+)
 from transformers.conversion_mapping import (
     get_checkpoint_conversion_mapping,
     register_checkpoint_conversion_mapping,
@@ -18,10 +22,12 @@ from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import (
     Qwen3OmniMoeTalkerForConditionalGeneration,
 )
 
+from scripts.debug_qwen3_omni_conditioning import prompt_hidden
 from scripts.debug_qwen3_omni_feedback_audit import compare_tensors
 from sglang_omni.models.qwen3_omni.components.talker_prefill import (
     load_thinker_embedding_rows,
 )
+from sglang_omni.serve.protocol import ChatCompletionRequest
 
 
 @torch.inference_mode()
@@ -31,6 +37,7 @@ def main() -> None:
     parser.add_argument("--model-revision", required=True)
     parser.add_argument("--capture-directory", type=Path, required=True)
     parser.add_argument("--request-id", action="append", required=True)
+    parser.add_argument("--request-directory", type=Path)
     parser.add_argument("--gpu", type=int, required=True)
     parser.add_argument("--output-directory", type=Path, required=True)
     arguments = parser.parse_args()
@@ -43,22 +50,40 @@ def main() -> None:
         config.talker_config.model_type,
         get_checkpoint_conversion_mapping("qwen3_omni_moe"),
     )
-    with torch.device("meta"):
-        owner = Qwen3OmniMoeForConditionalGeneration(config)
-    talker, loading = Qwen3OmniMoeTalkerForConditionalGeneration.from_pretrained(
-        arguments.model_path,
-        revision=arguments.model_revision,
-        config=config.talker_config,
-        dtype=torch.bfloat16,
-        device_map={"": arguments.gpu},
-        attn_implementation="sdpa",
-        experts_implementation="eager",
-        use_kernels=False,
-        output_loading_info=True,
-    )
+    if arguments.request_directory is not None:
+        owner, loading = Qwen3OmniMoeForConditionalGeneration.from_pretrained(
+            arguments.model_path,
+            revision=arguments.model_revision,
+            config=config,
+            dtype=torch.bfloat16,
+            device_map={"": arguments.gpu},
+            attn_implementation="sdpa",
+            experts_implementation="eager",
+            use_kernels=False,
+            output_loading_info=True,
+        )
+        talker = owner.talker
+        processor = Qwen3OmniMoeProcessor.from_pretrained(
+            arguments.model_path, revision=arguments.model_revision
+        )
+    else:
+        with torch.device("meta"):
+            owner = Qwen3OmniMoeForConditionalGeneration(config)
+        talker, loading = Qwen3OmniMoeTalkerForConditionalGeneration.from_pretrained(
+            arguments.model_path,
+            revision=arguments.model_revision,
+            config=config.talker_config,
+            dtype=torch.bfloat16,
+            device_map={"": arguments.gpu},
+            attn_implementation="sdpa",
+            experts_implementation="eager",
+            use_kernels=False,
+            output_loading_info=True,
+        )
     assert not loading["missing_keys"], loading["missing_keys"]
     assert not loading["mismatched_keys"], loading["mismatched_keys"]
     owner.talker = talker.eval()
+    owner.eval()
     checkpoint_directory = Path(
         hf_hub_download(
             arguments.model_path, "config.json", revision=arguments.model_revision
@@ -152,13 +177,73 @@ def main() -> None:
             "future_text": asdict(compare_tensors(native_future, future_text[0])),
             "scope": "Checkpoint input methods with actual native prompt hidden rows. Does not independently validate the multimodal Thinker hidden producer.",
         }
+        saved_tensors = {
+            "checkpoint_prefix": expected_prefix.cpu(),
+            "checkpoint_future_text": future_text[0].cpu(),
+            "native_prefix": before["prefill_embeds"],
+            "native_future_text": native_future.cpu(),
+        }
+        if arguments.request_directory is not None:
+            request = ChatCompletionRequest.model_validate_json(
+                (
+                    arguments.request_directory / f"{request_id}.request.json"
+                ).read_bytes()
+            )
+            assert request.audios and len(request.audios) == 1
+            messages = [
+                message.model_dump(exclude_none=True) for message in request.messages
+            ]
+            assert messages[-1]["role"] == "user"
+            assert isinstance(messages[-1]["content"], str)
+            messages[-1]["content"] = [
+                {"type": "audio", "path": request.audios[0]},
+                {"type": "text", "text": messages[-1]["content"]},
+            ]
+            inputs = processor.apply_chat_template(
+                messages,
+                add_generation_prompt=True,
+                tokenize=True,
+                return_dict=True,
+                return_tensors="pt",
+            ).to(talker.device, dtype=talker.dtype)
+            assert torch.equal(inputs["input_ids"][0], prompt_ids)
+            audio_embeddings = owner.thinker.get_audio_features(
+                inputs["input_features"],
+                inputs["feature_attention_mask"],
+                return_dict=True,
+            ).last_hidden_state
+            checkpoint_hidden, checkpoint_positions = prompt_hidden(
+                owner,
+                inputs["input_ids"],
+                audio_embeddings,
+                inputs["feature_attention_mask"],
+            )
+            audio_mask = prompt_ids == config.thinker_config.audio_token_id
+            projected_audio = talker.hidden_projection(checkpoint_hidden[0, audio_mask])
+            checkpoint_audio_prefill = (
+                before["prefill_embeds"].to(talker.device).clone()
+            )
+            audio_rows = audio_mask[user_mask].nonzero(as_tuple=True)[0]
+            checkpoint_audio_prefill[audio_rows] = projected_audio
+            report["independent_audio_hidden"] = asdict(
+                compare_tensors(
+                    hidden[0, : len(prompt_ids)][audio_mask],
+                    checkpoint_hidden[0, audio_mask],
+                )
+            )
+            saved_tensors.update(
+                {
+                    "native_prefill": before["prefill_embeds"],
+                    "checkpoint_audio_prefill": checkpoint_audio_prefill.cpu(),
+                    "checkpoint_prompt_hidden": checkpoint_hidden.cpu(),
+                    "checkpoint_positions": checkpoint_positions.cpu(),
+                    "checkpoint_audio_embeddings": audio_embeddings.cpu(),
+                }
+            )
+        else:
+            pass
         torch.save(
-            {
-                "checkpoint_prefix": expected_prefix.cpu(),
-                "checkpoint_future_text": future_text[0].cpu(),
-                "native_prefix": before["prefill_embeds"],
-                "native_future_text": native_future.cpu(),
-            },
+            saved_tensors,
             arguments.output_directory / f"{request_id}.pt",
         )
         reports.append(report)
