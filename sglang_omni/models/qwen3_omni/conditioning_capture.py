@@ -25,6 +25,7 @@ class TalkerConditioningRecorder:
         assistant_token_ids: torch.Tensor,
         prompt_hidden: torch.Tensor,
         speaker_id: int,
+        model_inputs: dict[str, object],
     ) -> None:
         destination = self.directory / request_id
         destination.mkdir(parents=True, exist_ok=True)
@@ -35,6 +36,16 @@ class TalkerConditioningRecorder:
                 "initial_assistant_token_ids": assistant_token_ids.cpu().clone(),
                 "prompt_hidden": prompt_hidden.cpu().clone(),
                 "speaker_id": torch.tensor(speaker_id),
+                **{
+                    name: tensor.detach().cpu().clone()
+                    for name in (
+                        "audio_embeds",
+                        "audio_feature_lengths",
+                        "feature_attention_mask",
+                    )
+                    for tensor in [model_inputs.get(name)]
+                    if isinstance(tensor, torch.Tensor)
+                },
             },
             destination / "prompt.pt",
         )

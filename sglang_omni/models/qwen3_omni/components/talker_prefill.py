@@ -266,6 +266,7 @@ class TalkerPrefillBuilder:
                 assistant_token_ids,
                 prompt_hidden,
                 speaker_id,
+                prompt_model_inputs,
             )
         else:
             pass
