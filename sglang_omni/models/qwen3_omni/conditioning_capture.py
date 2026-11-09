@@ -16,7 +16,11 @@ from sglang_omni.scheduling.types import SchedulerRequest
 @dataclass(kw_only=True)
 class TalkerConditioningRecorder:
     directory: Path
+    request_ids: frozenset[str] | None = None
     assistant_tokens: dict[str, list[int]] = field(default_factory=dict)
+
+    def should_capture(self, request_id: str) -> bool:
+        return self.request_ids is None or request_id in self.request_ids
 
     def record_prompt(
         self,
@@ -27,6 +31,10 @@ class TalkerConditioningRecorder:
         speaker_id: int,
         model_inputs: dict[str, object],
     ) -> None:
+        if not self.should_capture(request_id):
+            return
+        else:
+            pass
         destination = self.directory / request_id
         destination.mkdir(parents=True, exist_ok=True)
         self.assistant_tokens[request_id] = assistant_token_ids.tolist()
@@ -59,6 +67,14 @@ class TalkerConditioningRecorder:
     ) -> None:
         offset = 0
         for row, request in enumerate(requests):
+            if not self.should_capture(request.request_id):
+                if forward_batch.forward_mode.is_extend():
+                    offset += forward_batch.extend_seq_lens_cpu[row]
+                else:
+                    pass
+                continue
+            else:
+                pass
             request_data: SGLangARRequestData = request.data
             native_request = request_data.req
             assert native_request is not None
@@ -127,6 +143,10 @@ class TalkerConditioningRecorder:
             )
 
     def finish(self, request_id: str, request_data: SGLangARRequestData) -> None:
+        if not self.should_capture(request_id):
+            return
+        else:
+            pass
         pending_rows = list(request_data.pending_text_queue)
         assert request_data.tts_pad_embed is not None
         assert request_data.tts_eos_embed is not None

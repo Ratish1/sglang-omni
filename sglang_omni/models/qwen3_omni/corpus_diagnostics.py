@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -82,8 +83,14 @@ class TalkerCorpusRecorder:
     ) -> None:
         self.directory = directory
         self.cache_history = CacheHistoryRecorder(directory=directory)
+        request_id_file = os.environ.get("SGLANG_OMNI_CORPUS_REQUEST_ID_FILE")
         self.conditioning = TalkerConditioningRecorder(
-            directory=directory / "conditioning"
+            directory=directory / "conditioning",
+            request_ids=(
+                frozenset(json.loads(Path(request_id_file).read_text()))
+                if request_id_file is not None
+                else None
+            ),
         )
         self.directory.mkdir(parents=True, exist_ok=False)
         (self.directory / "requests").mkdir()
@@ -288,6 +295,12 @@ class TalkerCorpusRecorder:
         feedback: torch.Tensor | None,
         captured_graph: bool,
     ) -> None:
+        if not any(
+            self.conditioning.should_capture(request.request_id) for request in requests
+        ):
+            return
+        else:
+            pass
         predictor_batch = int(self.predictor_batch.cpu()) if codes is not None else 0
         live_rows = len(requests)
         snapshots = {
@@ -333,45 +346,37 @@ class TalkerCorpusRecorder:
                 for (name, rows), stages in self.predictor_stages.items()
             },
         }
-        if forward_batch.forward_mode.is_extend():
-            assert self.kv_pool is not None and self.request_table is not None
-            for row, request in enumerate(requests):
-                locations = self.request_table[
-                    forward_batch.req_pool_indices[row],
-                    : metadata["sequence_lengths"][row],
-                ].long()
-                keys = [
-                    buffer.index_select(0, locations).cpu()
-                    for buffer in self.kv_pool.k_buffer
-                ]
-                values = [
-                    buffer.index_select(0, locations).cpu()
-                    for buffer in self.kv_pool.v_buffer
-                ]
+        assert self.kv_pool is not None and self.request_table is not None
+        for row, request in enumerate(requests):
+            if not self.conditioning.should_capture(request.request_id):
+                continue
+            else:
+                pass
+            locations = self.request_table[
+                forward_batch.req_pool_indices[row],
+                : metadata["sequence_lengths"][row],
+            ].long()
+            keys = [
+                buffer.index_select(0, locations).cpu()
+                for buffer in self.kv_pool.k_buffer
+            ]
+            values = [
+                buffer.index_select(0, locations).cpu()
+                for buffer in self.kv_pool.v_buffer
+            ]
+            if forward_batch.forward_mode.is_extend():
                 self.cache_history.record_prefix(request.request_id, keys, values)
                 torch.save(
                     {"keys": keys, "values": values},
                     self.directory
                     / f"prefix-{request.request_id}-{self.step_index:06d}.pt",
                 )
-        else:
-            assert self.kv_pool is not None and self.request_table is not None
-            for row, request in enumerate(requests):
-                locations = self.request_table[
-                    forward_batch.req_pool_indices[row],
-                    : metadata["sequence_lengths"][row],
-                ].long()
+            else:
                 self.cache_history.verify_decode(
                     request.request_id,
                     metadata["frame_indices"][row],
-                    [
-                        buffer.index_select(0, locations).cpu()
-                        for buffer in self.kv_pool.k_buffer
-                    ],
-                    [
-                        buffer.index_select(0, locations).cpu()
-                        for buffer in self.kv_pool.v_buffer
-                    ],
+                    keys,
+                    values,
                     [
                         snapshots[f"backbone.{layer_index}.key"][row]
                         for layer_index in range(len(self.kv_pool.k_buffer))
@@ -439,6 +444,11 @@ class TalkerCorpusRecorder:
         self.step_index += 1
 
     def finish(self, request_id: str, request_data: SGLangARRequestData) -> None:
+        if not self.conditioning.should_capture(request_id):
+            self.progress.pop(request_id)
+            return
+        else:
+            pass
         self.conditioning.finish(request_id, request_data)
         self.cache_history.finish(request_id)
         progress = self.progress.pop(request_id)
