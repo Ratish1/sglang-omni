@@ -333,7 +333,6 @@ def main() -> None:
                 captured.cu_seqlens.clone(),
                 runner.window,
             )
-            native.audio_tower.layers = wrapper
             report["same_padded_operands_graph_to_eager"] = asdict(
                 compare_tensors(replayed, ordinary)
             )
@@ -350,6 +349,7 @@ def main() -> None:
                 ]
             else:
                 pass
+            native.audio_tower.layers = wrapper
         else:
             pass
         print(json.dumps(report), flush=True)
