@@ -48,7 +48,8 @@ def main() -> None:
     parser.add_argument(
         "--sampling-order",
         choices=("rank", "token"),
-        default="rank",
+        nargs="+",
+        default=("rank",),
         help="Generation noise coordinates; native draw verification remains rank keyed.",
     )
     parser.add_argument(
@@ -149,9 +150,10 @@ def main() -> None:
             if arguments.paired_normalization_controls
             else (arguments.normalization_semantics,)
         )
-        for trace_directory, normalization_mode in (
-            (directory, mode)
+        for trace_directory, sampling_order, normalization_mode in (
+            (directory, order, mode)
             for directory in arguments.trace_directory
+            for order in arguments.sampling_order
             for mode in normalization_modes
         ):
             normalization.boundary_enabled = normalization_mode in (
@@ -309,10 +311,15 @@ def main() -> None:
                     pass
             else:
                 assert arguments.thinker_hidden_directory is None
-            mode_directory = (
-                arguments.output_directory / normalization_mode
-                if arguments.paired_normalization_controls
+            sampling_directory = (
+                arguments.output_directory / sampling_order
+                if len(arguments.sampling_order) > 1
                 else arguments.output_directory
+            )
+            mode_directory = (
+                sampling_directory / normalization_mode
+                if arguments.paired_normalization_controls
+                else sampling_directory
             )
             case_directory = (
                 mode_directory / trace_directory.parent.name / trace_directory.name
@@ -395,7 +402,7 @@ def main() -> None:
                 sampling_positions = torch.tensor(
                     [sampling_position], device=reference.device
                 )
-                if arguments.sampling_order == "rank":
+                if sampling_order == "rank":
                     sampled_code = top_k_top_p_min_p_sampling_from_probs_torch(
                         probabilities,
                         top_k,
@@ -533,7 +540,7 @@ def main() -> None:
                     else None
                 ),
                 "normalization_semantics": normalization_mode,
-                "sampling_order": arguments.sampling_order,
+                "sampling_order": sampling_order,
                 "normalization_boundary_calls": normalization.boundary_calls,
                 "normalization_query_key_calls": normalization.query_key_calls,
                 "frames": frame_reports,
