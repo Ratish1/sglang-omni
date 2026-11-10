@@ -247,6 +247,7 @@ def main() -> None:
             initial_cuda_rng_state = torch.cuda.get_rng_state(model.device)
         else:
             pass
+        torch.cuda.nvtx.range_push(f"public_reference:{case.sample_id}")
         started = time.monotonic()
         with torch.inference_mode():
             text_ids, waveform = model.generate(
@@ -260,6 +261,7 @@ def main() -> None:
         ALL_ATTENTION_FUNCTIONS["sdpa"] = sdpa_attention_forward
         assert torch.isfinite(waveform).all() and waveform.numel() > 0
         waveform = waveform.reshape(-1).float().cpu().numpy()
+        torch.cuda.nvtx.range_pop()
         elapsed_seconds = time.monotonic() - started
         audio_file = arguments.output_directory / f"{case.sample_id}.wav"
         soundfile.write(audio_file, waveform, AUDIO_SAMPLE_RATE, subtype="PCM_16")
