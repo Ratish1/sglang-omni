@@ -73,6 +73,7 @@ def main() -> None:
         "steps": len(steps),
         "selected_steps": arguments.step,
         "selected_layers": arguments.layer,
+        "tune_max_num_tokens": arguments.tune_max_num_tokens,
         "routing_scale_dtype": arguments.routing_scale_dtype,
         "prefill_gemm1_fallback_above_rows": arguments.prefill_gemm1_fallback_above_rows,
         "routing_scale_scope": "The TopK hook precedes the model's routing-weight cast. Replay applies the serving source's selected storage dtype and restores FP32 for the kernel ABI.",
@@ -140,7 +141,12 @@ def main() -> None:
                     )
                 else:
                     precision_context = nullcontext()
-                with precision_context:
+                with (
+                    precision_context,
+                    torch.cuda.nvtx.range(
+                        f"actual-moe/layer-{layer:02d}/step-{metadata.step:06d}/{metadata.phase}"
+                    ),
+                ):
                     output = cutlass_fused_moe(
                         input=inputs,
                         token_selected_experts=ids,
