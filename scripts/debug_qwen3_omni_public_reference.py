@@ -7,7 +7,7 @@ import argparse
 import hashlib
 import json
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from importlib.metadata import version
 from pathlib import Path
 from typing import Literal
@@ -17,6 +17,12 @@ import torch
 from huggingface_hub import snapshot_download
 from pydantic import BaseModel, TypeAdapter
 from transformers import Qwen3OmniMoeForConditionalGeneration, Qwen3OmniMoeProcessor
+from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import (
+    Qwen3OmniMoeCode2Wav,
+    Qwen3OmniMoeRotaryEmbedding,
+    Qwen3OmniMoeThinkerTextRotaryEmbedding,
+    Qwen3OmniMoeVisionRotaryEmbedding,
+)
 
 from scripts.qwen3_omni_checkpoint_weights import audit_checkpoint_weights
 from sglang_omni.sampling.seed import derive_sampling_seed
@@ -49,6 +55,74 @@ class LayerObservation:
         self.last_output = hidden_states.detach()
 
 
+@dataclass(kw_only=True)
+class CodecInputObservation:
+    codec_chunks: list[torch.Tensor] = field(default_factory=list)
+
+    def __call__(
+        self,
+        module: Qwen3OmniMoeCode2Wav,
+        inputs: tuple[torch.Tensor, ...],
+    ) -> None:
+        codec_ids = inputs[0]
+        assert codec_ids.shape[1] == module.config.num_quantizers
+        self.codec_chunks.append(codec_ids.detach().cpu())
+
+
+def audit_rotary_buffers(
+    model: Qwen3OmniMoeForConditionalGeneration,
+    output_directory: Path,
+    phase: Literal["loaded", "generated"],
+) -> None:
+    reports = []
+    frequency_operands: dict[str, torch.Tensor] = {}
+    for module_path, module in model.named_modules():
+        if isinstance(
+            module,
+            (
+                Qwen3OmniMoeRotaryEmbedding,
+                Qwen3OmniMoeThinkerTextRotaryEmbedding,
+                Qwen3OmniMoeVisionRotaryEmbedding,
+            ),
+        ):
+            reference_rotary = type(module)(module.config)
+            for buffer_name, frequencies, reference_frequencies in (
+                ("inv_freq", module.inv_freq, reference_rotary.inv_freq),
+                (
+                    "original_inv_freq",
+                    module.original_inv_freq,
+                    reference_rotary.original_inv_freq,
+                ),
+            ):
+                frequencies = frequencies.detach().cpu()
+                reference_frequencies = reference_frequencies.detach().cpu()
+                buffer_path = f"{module_path}.{buffer_name}"
+                frequency_operands[f"{buffer_path}.actual"] = frequencies
+                frequency_operands[f"{buffer_path}.expected"] = reference_frequencies
+                reports.append(
+                    {
+                        "buffer": buffer_path,
+                        "dtype": str(frequencies.dtype),
+                        "expected_dtype": str(reference_frequencies.dtype),
+                        "exact_config": torch.equal(frequencies, reference_frequencies),
+                        "different_values": int(
+                            (frequencies != reference_frequencies).sum()
+                        ),
+                        "maximum_absolute_error": float(
+                            (frequencies.float() - reference_frequencies.float())
+                            .abs()
+                            .max()
+                        ),
+                    }
+                )
+        else:
+            pass
+    (output_directory / f"{phase}-rotary-buffers.json").write_text(
+        json.dumps(reports, indent=2)
+    )
+    torch.save(frequency_operands, output_directory / f"{phase}-rotary-buffers.pt")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model-path", required=True)
@@ -57,6 +131,7 @@ def main() -> None:
     parser.add_argument("--gpu", type=int, required=True)
     parser.add_argument("--output-directory", type=Path, required=True)
     parser.add_argument("--observe-layers", action="store_true")
+    parser.add_argument("--save-codec-inputs", action="store_true")
     arguments = parser.parse_args()
     cases = TypeAdapter(list[ReferenceCase]).validate_json(
         arguments.case_file.read_text()
@@ -77,6 +152,7 @@ def main() -> None:
     assert not loading["mismatched_keys"], loading["mismatched_keys"]
     assert not loading["unexpected_keys"], loading["unexpected_keys"]
     model.eval()
+    audit_rotary_buffers(model, arguments.output_directory, "loaded")
     processor = Qwen3OmniMoeProcessor.from_pretrained(
         arguments.model_path, revision=arguments.model_revision
     )
@@ -94,6 +170,11 @@ def main() -> None:
                 observation = LayerObservation(family=family, layer_index=layer_index)
                 layer_observations.append(observation)
                 layer.register_forward_hook(observation)
+    else:
+        pass
+    codec_observation = CodecInputObservation()
+    if arguments.save_codec_inputs:
+        model.code2wav.register_forward_pre_hook(codec_observation)
     else:
         pass
     reports = []
@@ -125,6 +206,7 @@ def main() -> None:
         for observation in layer_observations:
             observation.calls = 0
             observation.last_output = None
+        codec_observation.codec_chunks.clear()
         started = time.monotonic()
         with torch.inference_mode():
             text_ids, waveform = model.generate(
@@ -140,6 +222,14 @@ def main() -> None:
         elapsed_seconds = time.monotonic() - started
         audio_file = arguments.output_directory / f"{case.sample_id}.wav"
         soundfile.write(audio_file, waveform, AUDIO_SAMPLE_RATE, subtype="PCM_16")
+        if arguments.save_codec_inputs:
+            assert codec_observation.codec_chunks
+            torch.save(
+                {"codec_chunks": codec_observation.codec_chunks},
+                arguments.output_directory / f"{case.sample_id}.codec-inputs.pt",
+            )
+        else:
+            pass
         layer_reports = []
         for observation in layer_observations:
             if observation.last_output is not None:
@@ -175,6 +265,10 @@ def main() -> None:
                 text_ids[:, inputs["input_ids"].shape[1] :],
                 skip_special_tokens=True,
             ),
+            "waveform_sha256": hashlib.sha256(audio_file.read_bytes()).hexdigest(),
+            "codec_chunk_shapes": [
+                list(chunk.shape) for chunk in codec_observation.codec_chunks
+            ],
             "layers": layer_reports,
         }
         reports.append(report)
@@ -191,6 +285,7 @@ def main() -> None:
                 "model_path": arguments.model_path,
                 "model_revision": arguments.model_revision,
                 "observe_layers": arguments.observe_layers,
+                "save_codec_inputs": arguments.save_codec_inputs,
                 "transformers": version("transformers"),
                 "torch": version("torch"),
                 "parameter_dtypes": sorted(
@@ -202,6 +297,7 @@ def main() -> None:
             indent=2,
         )
     )
+    audit_rotary_buffers(model, arguments.output_directory, "generated")
     checkpoint_directory = Path(
         snapshot_download(
             arguments.model_path,
