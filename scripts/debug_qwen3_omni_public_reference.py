@@ -7,10 +7,8 @@ import argparse
 import hashlib
 import json
 import time
-from dataclasses import dataclass, field
 from importlib.metadata import version
 from pathlib import Path
-from typing import Literal
 
 import soundfile
 import torch
@@ -18,13 +16,17 @@ from huggingface_hub import snapshot_download
 from pydantic import BaseModel, TypeAdapter
 from torch.utils.hooks import RemovableHandle
 from transformers import Qwen3OmniMoeForConditionalGeneration, Qwen3OmniMoeProcessor
-from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import (
-    Qwen3OmniMoeCode2Wav,
-)
 
 from scripts.qwen3_omni_checkpoint_weights import (
     audit_checkpoint_buffers,
     audit_checkpoint_weights,
+    record_reference_runtime,
+)
+from scripts.qwen3_omni_reference_observers import (
+    CodecInputObservation,
+    LayerObservation,
+    PrefillAttentionObservation,
+    TensorCallObservation,
 )
 from sglang_omni.sampling.seed import derive_sampling_seed
 from sglang_omni.serve.protocol import ChatCompletionRequest
@@ -39,69 +41,6 @@ class ReferenceCase(BaseModel):
     capture_generation: bool = True
 
 
-@dataclass(kw_only=True)
-class LayerObservation:
-    family: Literal["audio", "vision", "thinker", "talker", "predictor", "vocoder"]
-    layer_index: int
-    calls: int = 0
-    last_output: torch.Tensor | None = None
-
-    def __call__(
-        self,
-        module: torch.nn.Module,
-        arguments: tuple[torch.Tensor | None, ...],
-        output: torch.Tensor | tuple[torch.Tensor, ...],
-    ) -> None:
-        self.calls += 1
-        hidden_states = output[0] if isinstance(output, tuple) else output
-        self.last_output = hidden_states.detach()
-
-
-@dataclass(kw_only=True)
-class CodecInputObservation:
-    codec_chunks: list[torch.Tensor] = field(default_factory=list)
-
-    def __call__(
-        self,
-        module: Qwen3OmniMoeCode2Wav,
-        inputs: tuple[torch.Tensor, ...],
-    ) -> None:
-        codec_ids = inputs[0]
-        assert codec_ids.shape[1] == module.config.num_quantizers
-        self.codec_chunks.append(codec_ids.detach().cpu())
-
-
-@dataclass(kw_only=True)
-class TensorCallObservation:
-    operation_name: str
-    tensor_calls: list[dict[str, torch.Tensor]] = field(default_factory=list)
-
-    def __call__(
-        self,
-        module: torch.nn.Module,
-        inputs: tuple[torch.Tensor, ...],
-        output: torch.Tensor | tuple[torch.Tensor, ...],
-    ) -> None:
-        assert not module.training
-        if isinstance(output, torch.Tensor):
-            output_tensors = (output,)
-        else:
-            output_tensors = output
-        self.tensor_calls.append(
-            {
-                **{
-                    f"input_{index}": tensor.detach().cpu()
-                    for index, tensor in enumerate(inputs)
-                },
-                **{
-                    f"output_{index}": tensor.detach().cpu()
-                    for index, tensor in enumerate(output_tensors)
-                },
-                "cuda_rng_state": torch.cuda.get_rng_state(inputs[0].device),
-            }
-        )
-
-
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model-path", required=True)
@@ -112,7 +51,11 @@ def main() -> None:
     parser.add_argument("--observe-layers", action="store_true")
     parser.add_argument("--save-codec-inputs", action="store_true")
     parser.add_argument("--save-generation-trace", action="store_true")
+    parser.add_argument("--trace-talker-prefill", action="store_true")
     arguments = parser.parse_args()
+    arguments.save_generation_trace = (
+        arguments.save_generation_trace or arguments.trace_talker_prefill
+    )
     cases = TypeAdapter(list[ReferenceCase]).validate_json(
         arguments.case_file.read_text()
     )
@@ -132,6 +75,7 @@ def main() -> None:
     assert not loading["mismatched_keys"], loading["mismatched_keys"]
     assert not loading["unexpected_keys"], loading["unexpected_keys"]
     model.eval()
+    record_reference_runtime(model, arguments.output_directory / "loaded-runtime.json")
     audit_checkpoint_buffers(model, arguments.output_directory / "loaded-model-buffers")
     processor = Qwen3OmniMoeProcessor.from_pretrained(
         arguments.model_path, revision=arguments.model_revision
@@ -160,6 +104,7 @@ def main() -> None:
     generation_observations: list[TensorCallObservation] = []
     generation_modules: dict[str, torch.nn.Module] = {}
     generation_hook_handles: list[RemovableHandle] = []
+    attention_observations: list[PrefillAttentionObservation] = []
     if arguments.save_generation_trace:
         generation_modules = {
             "audio_projection": model.thinker.audio_tower.proj2,
@@ -183,6 +128,45 @@ def main() -> None:
                 operation_name=operation_name
             )
             generation_observations.append(generation_observation)
+        if arguments.trace_talker_prefill:
+            for layer_index, layer in enumerate(model.talker.model.layers):
+                prefill_modules = {
+                    "block": layer,
+                    "input_norm": layer.input_layernorm,
+                    "query_projection": layer.self_attn.q_proj,
+                    "key_projection": layer.self_attn.k_proj,
+                    "value_projection": layer.self_attn.v_proj,
+                    "query_norm": layer.self_attn.q_norm,
+                    "key_norm": layer.self_attn.k_norm,
+                    "attention_output_projection": layer.self_attn.o_proj,
+                    "post_attention_norm": layer.post_attention_layernorm,
+                    "moe": layer.mlp,
+                    "router": layer.mlp.gate,
+                    "experts": layer.mlp.experts,
+                    "shared_gate_projection": layer.mlp.shared_expert.gate_proj,
+                    "shared_up_projection": layer.mlp.shared_expert.up_proj,
+                    "shared_down_projection": layer.mlp.shared_expert.down_proj,
+                    "shared_expert_gate": layer.mlp.shared_expert_gate,
+                }
+                for component_name, component in prefill_modules.items():
+                    operation_name = f"prefill.layer_{layer_index}.{component_name}"
+                    generation_modules[operation_name] = component
+                    generation_observations.append(
+                        TensorCallObservation(
+                            operation_name=operation_name, first_call_only=True
+                        )
+                    )
+                attention_observations.append(
+                    PrefillAttentionObservation(attention=layer.self_attn)
+                )
+            generation_modules["prefill.final_norm"] = model.talker.model.norm
+            generation_observations.append(
+                TensorCallObservation(
+                    operation_name="prefill.final_norm", first_call_only=True
+                )
+            )
+        else:
+            pass
     else:
         pass
     reports = []
@@ -220,10 +204,21 @@ def main() -> None:
         generation_hook_handles.clear()
         for generation_observation in generation_observations:
             generation_observation.tensor_calls.clear()
+            generation_observation.layout_calls.clear()
             if case.capture_generation:
                 module = generation_modules[generation_observation.operation_name]
                 generation_hook_handles.append(
                     module.register_forward_hook(generation_observation)
+                )
+            else:
+                pass
+        for attention_observation in attention_observations:
+            attention_observation.snapshot = None
+            if case.capture_generation:
+                generation_hook_handles.append(
+                    attention_observation.attention.register_forward_pre_hook(
+                        attention_observation, with_kwargs=True
+                    )
                 )
             else:
                 pass
@@ -267,6 +262,15 @@ def main() -> None:
                     "operations": {
                         observation.operation_name: observation.tensor_calls
                         for observation in generation_observations
+                    },
+                    "operation_layouts": {
+                        observation.operation_name: observation.layout_calls
+                        for observation in generation_observations
+                        if observation.layout_calls
+                    },
+                    "prefill_attention": {
+                        f"layer_{observation.attention.layer_idx}": observation.snapshot
+                        for observation in attention_observations
                     },
                 },
                 arguments.output_directory / f"{case.sample_id}.generation.pt",
@@ -332,6 +336,7 @@ def main() -> None:
                 "observe_layers": arguments.observe_layers,
                 "save_codec_inputs": arguments.save_codec_inputs,
                 "save_generation_trace": arguments.save_generation_trace,
+                "trace_talker_prefill": arguments.trace_talker_prefill,
                 "transformers": version("transformers"),
                 "torch": version("torch"),
                 "parameter_dtypes": sorted(
@@ -345,6 +350,9 @@ def main() -> None:
     )
     audit_checkpoint_buffers(
         model, arguments.output_directory / "generated-model-buffers"
+    )
+    record_reference_runtime(
+        model, arguments.output_directory / "generated-runtime.json"
     )
     checkpoint_directory = Path(
         snapshot_download(

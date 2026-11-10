@@ -2,15 +2,20 @@
 
 from __future__ import annotations
 
+import inspect
 import json
+import os
 import re
 from collections import Counter
 from pathlib import Path
+from typing import TypedDict
 
 import torch
 from pydantic import BaseModel
 from safetensors import safe_open
 from transformers import Qwen3OmniMoeForConditionalGeneration
+from transformers.integrations.moe import ALL_EXPERTS_FUNCTIONS
+from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
 from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import (
     Qwen3OmniMoeCode2Wav,
     Qwen3OmniMoeRotaryEmbedding,
@@ -18,7 +23,10 @@ from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import (
     Qwen3OmniMoeThinkerTextRotaryEmbedding,
     Qwen3OmniMoeVisionRotaryEmbedding,
     SinusoidsPositionEmbedding,
+    eager_attention_forward,
 )
+
+from scripts.qwen3_omni_reference_observers import tensor_layout
 
 EXPERT_WEIGHT = re.compile(
     r"(.+\.experts)\.(\d+)\.(gate_proj|up_proj|down_proj)\.weight"
@@ -27,6 +35,63 @@ EXPERT_WEIGHT = re.compile(
 
 class CheckpointIndex(BaseModel):
     weight_map: dict[str, str]
+
+
+class LayerRuntime(TypedDict):
+    layer_index: int
+    expert_implementation: str | None
+    expert_function: str
+    attention_implementation: str | None
+    attention_function: str
+
+
+def record_reference_runtime(
+    model: Qwen3OmniMoeForConditionalGeneration, output_file: Path
+) -> None:
+    layers: list[LayerRuntime] = []
+    for layer_index, layer in enumerate(model.talker.model.layers):
+        experts_module = layer.mlp.experts
+        expert_function = ALL_EXPERTS_FUNCTIONS.get_interface(
+            experts_module.config._experts_implementation,
+            inspect.unwrap(experts_module.forward),
+        )
+        attention_function = ALL_ATTENTION_FUNCTIONS.get_interface(
+            layer.self_attn.config._attn_implementation, eager_attention_forward
+        )
+        layers.append(
+            {
+                "layer_index": layer_index,
+                "expert_implementation": experts_module.config._experts_implementation,
+                "expert_function": f"{expert_function.__module__}.{expert_function.__qualname__}",
+                "attention_implementation": layer.self_attn.config._attn_implementation,
+                "attention_function": f"{attention_function.__module__}.{attention_function.__qualname__}",
+            }
+        )
+    report = {
+        "talker_layers": layers,
+        "talker_parameter_layouts": {
+            name: tensor_layout(parameter)
+            for name, parameter in model.talker.named_parameters()
+        },
+        "float32_matmul_precision": torch.get_float32_matmul_precision(),
+        "allow_tf32_matmul": torch.backends.cuda.matmul.allow_tf32,
+        "allow_bfloat16_reduced_precision_reduction": (
+            torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction
+        ),
+        "allow_tf32_convolutions": torch.backends.cudnn.allow_tf32,
+        "cudnn_benchmark": torch.backends.cudnn.benchmark,
+        "cudnn_deterministic": torch.backends.cudnn.deterministic,
+        "deterministic_algorithms": torch.are_deterministic_algorithms_enabled(),
+        "environment_controls": {
+            name: os.environ.get(name)
+            for name in (
+                "CUBLAS_WORKSPACE_CONFIG",
+                "TORCH_ALLOW_TF32_CUBLAS_OVERRIDE",
+                "NVIDIA_TF32_OVERRIDE",
+            )
+        },
+    }
+    output_file.write_text(json.dumps(report, indent=2))
 
 
 def audit_checkpoint_buffers(
