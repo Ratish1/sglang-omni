@@ -85,12 +85,22 @@ def audit_checkpoint_weights(
     unvisited = sorted(
         name for name, tensor in tensors.items() if id(tensor) not in visited
     )
+    device_properties = torch.cuda.get_device_properties(model.device)
     report = {
         "checkpoint_prefix": prefix,
         "checked_checkpoint_tensors": checked,
         "mismatches": mismatches,
         "unvisited_tensors": unvisited,
         "dtype_pairs": dict(dtypes),
+        "torch_version": str(torch.__version__),
+        "cuda_device": device_properties.name,
+        "multiprocessors": device_properties.multi_processor_count,
+        "float32_matmul_precision": torch.get_float32_matmul_precision(),
+        "allow_tf32": torch.backends.cuda.matmul.allow_tf32,
+        "allow_bfloat16_reduced_precision_reduction": (
+            torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction
+        ),
+        "deterministic_algorithms": torch.are_deterministic_algorithms_enabled(),
     }
     output_file.write_text(json.dumps(report, indent=2))
     assert not mismatches and not unvisited, report
