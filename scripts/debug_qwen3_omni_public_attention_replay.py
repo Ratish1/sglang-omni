@@ -50,7 +50,9 @@ def main() -> None:
             device=arguments.gpu,
         )
         tensor.copy_(tensors[name])
+        assert torch.equal(tensor.cpu(), tensors[name]), name
         operands[name] = tensor
+    print("Actual attention operands restored exactly", flush=True)
     query, key, value = (operands[name] for name in ("query", "key", "value"))
     assert key.shape[-1] == value.shape[-1] <= 256
     causal = configuration["is_causal"]
@@ -73,6 +75,7 @@ def main() -> None:
             .transpose(1, 2)
             .contiguous()
         )
+    print("Float64 attention oracle complete", flush=True)
     backend = {
         "flash": SDPBackend.FLASH_ATTENTION,
         "cudnn": SDPBackend.CUDNN_ATTENTION,
@@ -85,7 +88,7 @@ def main() -> None:
     )
     outputs: list[torch.Tensor] = []
     with context:
-        for _ in range(arguments.repeat_count):
+        for repeat_index in range(arguments.repeat_count):
             outputs.append(
                 functional.scaled_dot_product_attention(
                     query,
@@ -98,6 +101,7 @@ def main() -> None:
                 .transpose(1, 2)
                 .contiguous()
             )
+            print(f"Attention replay {repeat_index} complete", flush=True)
         if arguments.skip_profiler:
             profiled_output = None
         else:
@@ -121,6 +125,8 @@ def main() -> None:
                 str(arguments.output_directory / "profile.json")
             )
     captured_output = tensors["output"].to(arguments.gpu)
+    assert torch.equal(captured_output.cpu(), tensors["output"])
+    print("Captured attention output restored exactly", flush=True)
     reports = []
     comparison_outputs = [captured_output, *outputs]
     if profiled_output is not None:
@@ -128,6 +134,7 @@ def main() -> None:
     else:
         pass
     for index, output in enumerate(comparison_outputs):
+        print(f"Comparing attention output {index}", flush=True)
         difference = output.double() - oracle
         reports.append(
             {
