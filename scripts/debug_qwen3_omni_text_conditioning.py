@@ -25,6 +25,7 @@ from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import (
 from scripts.debug_qwen3_omni_conditioning import prompt_hidden
 from scripts.debug_qwen3_omni_feedback_audit import compare_tensors
 from scripts.debug_qwen3_omni_prefix_provenance import recover_audio_prefix
+from scripts.qwen3_omni_checkpoint_weights import audit_checkpoint_weights
 from sglang_omni.models.qwen3_omni.components.talker_prefill import (
     load_thinker_embedding_rows,
 )
@@ -41,6 +42,7 @@ def main() -> None:
     parser.add_argument("--request-directory", type=Path)
     parser.add_argument("--thinker-directory", type=Path)
     parser.add_argument("--cached-prefix-proof", type=Path)
+    parser.add_argument("--audit-loaded-weights", action="store_true")
     parser.add_argument("--gpu", type=int, required=True)
     parser.add_argument("--output-directory", type=Path, required=True)
     arguments = parser.parse_args()
@@ -384,6 +386,14 @@ def main() -> None:
             json.dumps(reports, indent=2)
         )
         print(json.dumps(report), flush=True)
+    if arguments.audit_loaded_weights:
+        audit_checkpoint_weights(
+            owner if arguments.request_directory is not None else talker,
+            checkpoint_directory,
+            arguments.output_directory / "loaded-weight-audit.json",
+        )
+    else:
+        pass
 
 
 if __name__ == "__main__":

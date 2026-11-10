@@ -22,6 +22,7 @@ from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import (
 )
 
 from scripts.debug_qwen3_omni_normalization import NativeNormalization
+from scripts.qwen3_omni_checkpoint_weights import audit_checkpoint_weights
 from sglang_omni.models.qwen3_omni.components.talker_prefill import (
     load_thinker_embedding_rows,
 )
@@ -46,6 +47,7 @@ def main() -> None:
         default="checkpoint",
     )
     parser.add_argument("--paired-normalization-controls", action="store_true")
+    parser.add_argument("--audit-loaded-weights", action="store_true")
     parser.add_argument("--conditioning-directory", type=Path)
     parser.add_argument("--thinker-hidden-directory", type=Path)
     parser.add_argument(
@@ -456,6 +458,14 @@ def main() -> None:
                 ),
                 flush=True,
             )
+        if arguments.audit_loaded_weights:
+            audit_checkpoint_weights(
+                reference,
+                checkpoint_directory,
+                arguments.output_directory / "loaded-weight-audit.json",
+            )
+        else:
+            pass
 
 
 if __name__ == "__main__":
