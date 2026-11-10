@@ -10,6 +10,7 @@ from dataclasses import asdict
 from pathlib import Path
 
 import torch
+from huggingface_hub import snapshot_download
 from transformers import Qwen3OmniMoeConfig
 from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import (
     Qwen3OmniMoeCode2Wav,
@@ -22,6 +23,7 @@ from benchmarks.tasks.asr import (
     load_router_asr,
     transcribe,
 )
+from scripts.qwen3_omni_checkpoint_weights import audit_checkpoint_weights
 from sglang_omni.client.audio import encode_wav
 
 
@@ -45,6 +47,7 @@ def main() -> None:
     parser.add_argument("--model-revision", required=True)
     parser.add_argument("--trace-directory", action="append", type=Path, required=True)
     parser.add_argument("--gpu", type=int, required=True)
+    parser.add_argument("--dtype", choices=("bfloat16", "float32"), default="bfloat16")
     parser.add_argument("--asr-port", type=int, required=True)
     parser.add_argument("--asr-model", default=QWEN3_ASR_MODEL_PATH)
     target_arguments = parser.add_mutually_exclusive_group(required=True)
@@ -55,6 +58,11 @@ def main() -> None:
     arguments = parser.parse_args()
     arguments.output_directory.mkdir(exist_ok=False)
     torch.cuda.set_device(arguments.gpu)
+    if arguments.dtype == "float32":
+        torch.backends.cuda.matmul.allow_tf32 = False
+        torch.backends.cudnn.allow_tf32 = False
+    else:
+        pass
     config = Qwen3OmniMoeConfig.from_pretrained(
         arguments.model_path, revision=arguments.model_revision
     )
@@ -62,7 +70,7 @@ def main() -> None:
         arguments.model_path,
         revision=arguments.model_revision,
         config=config.code2wav_config,
-        dtype=torch.bfloat16,
+        dtype={"bfloat16": torch.bfloat16, "float32": torch.float32}[arguments.dtype],
         device_map={"": arguments.gpu},
         key_mapping={r"^code2wav\.": ""},
         attn_implementation="sdpa",
@@ -72,6 +80,17 @@ def main() -> None:
     assert not loading["missing_keys"], loading["missing_keys"]
     assert not loading["mismatched_keys"], loading["mismatched_keys"]
     reference.eval()
+    audit_checkpoint_weights(
+        reference,
+        Path(
+            snapshot_download(
+                arguments.model_path,
+                revision=arguments.model_revision,
+                local_files_only=True,
+            )
+        ),
+        arguments.output_directory / "loaded-weight-audit.json",
+    )
     target_text_by_request = (
         json.loads(arguments.targets_file.read_text())
         if arguments.targets_file is not None
@@ -118,6 +137,8 @@ def main() -> None:
             )
             report = {
                 "trace_directory": str(trace_directory),
+                "reference_dtype": arguments.dtype,
+                "allow_tf32_convolutions": torch.backends.cudnn.allow_tf32,
                 "non_eos_frames": codes.shape[-1],
                 "waveform_samples": len(waveform),
                 "sample_rate": arguments.sample_rate,
