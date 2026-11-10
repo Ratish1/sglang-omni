@@ -43,6 +43,25 @@ class ReferenceReport(BaseModel):
     requests: list[ReferenceRequest]
 
 
+def sample_permuted_weights(
+    weights_by_token: torch.Tensor,
+    sorted_token_ids: torch.Tensor,
+    sampling_seed: torch.Tensor,
+    sampling_positions: torch.Tensor,
+) -> int:
+    permuted_weights = weights_by_token.gather(1, sorted_token_ids)
+    assert torch.equal(
+        torch.zeros_like(permuted_weights).scatter_(
+            1, sorted_token_ids, permuted_weights
+        ),
+        weights_by_token,
+    )
+    sampled_rank = multinomial_with_seed(
+        permuted_weights.double().log(), sampling_seed, sampling_positions
+    )
+    return int(sorted_token_ids.gather(1, sampled_rank)[0, 0])
+
+
 @torch.inference_mode()
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
@@ -87,29 +106,35 @@ def main() -> None:
                     map_location="cuda",
                     weights_only=True,
                 )
-                native_probabilities = captured["logits"]
                 assert int(captured["codec_ids"][0, 0]) == frame.native_main_code
-                checkpoint_logits = logits["checkpoint"][
-                    frame.frame_index : frame.frame_index + 1
-                ]
-                penalized = torch.where(
-                    checkpoint_logits > 0,
-                    checkpoint_logits / parameters.repetition_penalty,
-                    checkpoint_logits * parameters.repetition_penalty,
-                )
-                checkpoint_logits = torch.where(repeated, penalized, checkpoint_logits)
-                checkpoint_probabilities = torch.softmax(
-                    checkpoint_logits.masked_fill(suppressed, float("-inf"))
-                    / parameters.temperature,
-                    dim=-1,
-                )
+                probability_rows = []
+                for source in ("native", "checkpoint"):
+                    raw_logits = logits[source][
+                        frame.frame_index : frame.frame_index + 1
+                    ].float()
+                    penalized_logits = torch.where(
+                        raw_logits > 0,
+                        raw_logits / parameters.repetition_penalty,
+                        raw_logits * parameters.repetition_penalty,
+                    )
+                    sampling_logits = torch.where(
+                        repeated, penalized_logits, raw_logits
+                    )
+                    probability_rows.append(
+                        torch.softmax(
+                            sampling_logits.masked_fill(suppressed, float("-inf"))
+                            / parameters.temperature,
+                            dim=-1,
+                        )
+                    )
+                assert torch.equal(probability_rows[0], captured["logits"])
                 positions = logits["positions"][
                     frame.frame_index : frame.frame_index + 1
                 ]
                 choices = []
                 weights_by_token = []
                 permutations = []
-                for probabilities in (native_probabilities, checkpoint_probabilities):
+                for probabilities in probability_rows:
                     choice, weights, permutation, _ = (
                         top_k_top_p_min_p_sampling_from_probs_torch(
                             probabilities,
@@ -130,17 +155,12 @@ def main() -> None:
                     )
                     permutations.append(permutation.long())
                 assert choices[0] == frame.native_main_code
-                aligned_weights = weights_by_token[1].gather(1, permutations[0])
-                assert torch.equal(
-                    torch.zeros_like(aligned_weights).scatter_(
-                        1, permutations[0], aligned_weights
-                    ),
-                    weights_by_token[1],
+                aligned_choice = sample_permuted_weights(
+                    weights_by_token[1], permutations[0], seed, positions
                 )
-                aligned_rank = multinomial_with_seed(
-                    aligned_weights.double().log(), seed, positions
+                reordered_native_choice = sample_permuted_weights(
+                    weights_by_token[0], permutations[1], seed, positions
                 )
-                aligned_choice = int(permutations[0].gather(1, aligned_rank)[0, 0])
                 token_order_choices = [
                     int(
                         multinomial_with_seed(weights.double().log(), seed, positions)[
@@ -170,9 +190,11 @@ def main() -> None:
                     "frame_index": frame.frame_index,
                     "is_codec_eos": frame.is_codec_eos,
                     "native_choice_reproduced": True,
+                    "adapter_probability_reconstruction_exact": True,
                     "native_rank_choice": choices[0],
                     "checkpoint_rank_choice": choices[1],
                     "checkpoint_weights_native_rank_choice": aligned_choice,
+                    "native_weights_checkpoint_rank_choice": reordered_native_choice,
                     "fixed_token_order_choices": token_order_choices,
                     "filtered_distribution_total_variation": float(
                         0.5 * (normalized[0] - normalized[1]).abs().sum()
@@ -191,6 +213,12 @@ def main() -> None:
                 counts["fixed_token_order_choices_agree"] += (
                     token_order_choices[0] == token_order_choices[1]
                 )
+                counts["order_only_native_choice_changes"] += (
+                    choices[0] != reordered_native_choice
+                )
+                counts["order_only_matches_checkpoint_choice"] += (
+                    choices[1] == reordered_native_choice
+                )
                 repeated[:, frame.native_main_code] = True
             reports.append({"request_id": request.request_id, "counts": dict(counts)})
             print(json.dumps(reports[-1]), flush=True)
@@ -203,7 +231,7 @@ def main() -> None:
                     sampler_source.read_bytes()
                 ).hexdigest(),
                 "requests": reports,
-                "scope": "Actual native probabilities reproduce every recorded choice before attribution. Checkpoint logits follow the same complete native input history and codec repetition mask. Rank alignment permutes already-filtered checkpoint weights without changing their token probabilities. Fixed token order is a separate noise-coordinate control, not native serving semantics or a proposed quality fix. No new generation or seed sweep.",
+                "scope": "Probabilities replayed from captured native raw logits exactly match the existing verified adapter and reproduce every recorded native choice before attribution. They are not directly captured live softmax outputs. Checkpoint logits follow the same complete native input history, codec repetition mask and probability construction. Rank alignment permutes already-filtered checkpoint weights without changing their token probabilities. Fixed token order is a separate noise-coordinate control, not native serving semantics or a proposed quality fix. No new generation or seed sweep.",
             },
             indent=2,
         )
