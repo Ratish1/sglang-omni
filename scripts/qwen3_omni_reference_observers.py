@@ -236,6 +236,7 @@ class SDPAPrefillObservation:
                 "key_value_groups": module.num_key_value_groups,
                 "keyword_names": sorted(keywords),
             }
+            torch.cuda.nvtx.range_push(f"public_sdpa_prefill:{layer_index}")
         else:
             pass
         output = sdpa_attention_forward(
@@ -249,6 +250,7 @@ class SDPAPrefillObservation:
             **keywords,
         )
         if should_capture:
+            torch.cuda.nvtx.range_pop()
             self.tensor_calls[layer_index]["output"] = output[0].detach().cpu()
             self.layouts[layer_index]["output"] = tensor_layout(output[0])
         else:
