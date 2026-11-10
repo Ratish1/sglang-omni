@@ -25,6 +25,7 @@ def main() -> None:
     parser.add_argument("--repeat-count", type=int, required=True)
     parser.add_argument("--output-directory", type=Path, required=True)
     parser.add_argument("--skip-profiler", action="store_true")
+    parser.add_argument("--prime-output-buffer", action="store_true")
     parser.add_argument(
         "--backend", choices=("default", "flash", "cudnn", "math"), default="default"
     )
@@ -87,8 +88,15 @@ def main() -> None:
         else sdpa_kernel(backend[arguments.backend])
     )
     outputs: list[torch.Tensor] = []
+    primed_allocations: list[dict[str, int]] = []
     with context:
         for repeat_index in range(arguments.repeat_count):
+            if arguments.prime_output_buffer and repeat_index > 0:
+                primed_output = torch.full_like(query, torch.nan)
+                primed_pointer_bytes = primed_output.data_ptr()
+                del primed_output
+            else:
+                primed_pointer_bytes = None
             outputs.append(
                 functional.scaled_dot_product_attention(
                     query,
@@ -101,6 +109,17 @@ def main() -> None:
                 .transpose(1, 2)
                 .contiguous()
             )
+            if primed_pointer_bytes is not None:
+                assert outputs[-1].data_ptr() == primed_pointer_bytes
+                assert torch.isfinite(outputs[-1]).all()
+                primed_allocations.append(
+                    {
+                        "repeat_index": repeat_index,
+                        "pointer_bytes": primed_pointer_bytes,
+                    }
+                )
+            else:
+                pass
             print(f"Attention replay {repeat_index} complete", flush=True)
         if arguments.skip_profiler:
             profiled_output = None
@@ -169,6 +188,7 @@ def main() -> None:
         "layer": arguments.layer,
         "backend": arguments.backend,
         "skip_profiler": arguments.skip_profiler,
+        "primed_allocations": primed_allocations,
         "configuration": configuration,
         "layouts": layouts,
         "comparisons": reports,
