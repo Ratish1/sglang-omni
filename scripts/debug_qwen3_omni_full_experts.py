@@ -31,6 +31,8 @@ def main() -> None:
         "--routing-scale-dtype", choices=("bfloat16", "float32"), required=True
     )
     parser.add_argument("--prefill-gemm1-fallback-above-rows", type=int)
+    parser.add_argument("--layer", type=int, action="append")
+    parser.add_argument("--step", type=int, action="append")
     arguments = parser.parse_args()
     arguments.output_directory.mkdir(exist_ok=False)
     assert AutoTuner.get().load_configs(str(arguments.autotune_cache))
@@ -53,12 +55,24 @@ def main() -> None:
         .read_text()
         .splitlines()
     ]
+    if arguments.step is not None:
+        selected_steps = set(arguments.step)
+        assert selected_steps <= {metadata.step for metadata in steps}
+        steps = [metadata for metadata in steps if metadata.step in selected_steps]
+    else:
+        pass
+    layers = (
+        range(config.num_hidden_layers) if arguments.layer is None else arguments.layer
+    )
+    assert all(0 <= layer < config.num_hidden_layers for layer in layers)
     summary = {
         "model_revision": arguments.model_revision,
         "autotune_cache_sha256": hashlib.sha256(
             arguments.autotune_cache.read_bytes()
         ).hexdigest(),
         "steps": len(steps),
+        "selected_steps": arguments.step,
+        "selected_layers": arguments.layer,
         "routing_scale_dtype": arguments.routing_scale_dtype,
         "prefill_gemm1_fallback_above_rows": arguments.prefill_gemm1_fallback_above_rows,
         "routing_scale_scope": "The TopK hook precedes the model's routing-weight cast. Replay applies the serving source's selected storage dtype and restores FP32 for the kernel ABI.",
@@ -66,7 +80,7 @@ def main() -> None:
         "scope": "All actual prefill, decode and padding inputs, IDs and scales are replayed at their original row count. Exactness checks cover every non-padding row, including all prefill tokens, not only the final query. No missing rows are synthesized.",
     }
     with (arguments.output_directory / "replay.jsonl").open("w") as reports:
-        for layer in range(config.num_hidden_layers):
+        for layer in layers:
             weights = load_layer_weights(
                 model_directory, layer, config.num_experts, weight_map
             )
