@@ -8,6 +8,7 @@ from pathlib import Path
 
 import torch
 from huggingface_hub import snapshot_download
+from pydantic import BaseModel
 from transformers import Qwen3OmniMoeConfig
 from transformers.conversion_mapping import (
     get_checkpoint_conversion_mapping,
@@ -18,7 +19,20 @@ from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import (
 )
 
 from scripts.qwen3_omni_checkpoint_weights import audit_checkpoint_weights
-from sglang_omni.models.qwen3_omni.corpus_diagnostics import RequestTrace, StepMetadata
+
+
+class StepMetadata(BaseModel):
+    step: int
+    phase: str
+    request_ids: list[str]
+    frame_indices: list[int]
+    projection_rows: dict[str, int]
+
+
+class RequestTrace(BaseModel):
+    steps: list[int]
+    codes: list[list[int]]
+    main_codes_match: bool
 
 
 @torch.inference_mode()
