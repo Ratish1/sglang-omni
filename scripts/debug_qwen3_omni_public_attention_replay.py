@@ -24,6 +24,7 @@ def main() -> None:
     parser.add_argument("--gpu", type=int, required=True)
     parser.add_argument("--repeat-count", type=int, required=True)
     parser.add_argument("--output-directory", type=Path, required=True)
+    parser.add_argument("--skip-profiler", action="store_true")
     parser.add_argument(
         "--backend", choices=("default", "flash", "cudnn", "math"), default="default"
     )
@@ -97,26 +98,36 @@ def main() -> None:
                 .transpose(1, 2)
                 .contiguous()
             )
-        with profile(
-            activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
-            record_shapes=True,
-        ) as profiler:
-            profiled_output = (
-                functional.scaled_dot_product_attention(
-                    query,
-                    key,
-                    value,
-                    is_causal=causal,
-                    scale=configuration["scaling"],
-                    enable_gqa=grouped_query,
+        if arguments.skip_profiler:
+            profiled_output = None
+        else:
+            with profile(
+                activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+                record_shapes=True,
+            ) as profiler:
+                profiled_output = (
+                    functional.scaled_dot_product_attention(
+                        query,
+                        key,
+                        value,
+                        is_causal=causal,
+                        scale=configuration["scaling"],
+                        enable_gqa=grouped_query,
+                    )
+                    .transpose(1, 2)
+                    .contiguous()
                 )
-                .transpose(1, 2)
-                .contiguous()
+            profiler.export_chrome_trace(
+                str(arguments.output_directory / "profile.json")
             )
-    profiler.export_chrome_trace(str(arguments.output_directory / "profile.json"))
     captured_output = tensors["output"].to(arguments.gpu)
     reports = []
-    for index, output in enumerate([captured_output, *outputs, profiled_output]):
+    comparison_outputs = [captured_output, *outputs]
+    if profiled_output is not None:
+        comparison_outputs.append(profiled_output)
+    else:
+        pass
+    for index, output in enumerate(comparison_outputs):
         difference = output.double() - oracle
         reports.append(
             {
@@ -139,7 +150,9 @@ def main() -> None:
     torch.save(
         {
             "outputs": [output.cpu() for output in outputs],
-            "profiled_output": profiled_output.cpu(),
+            "profiled_output": (
+                profiled_output.cpu() if profiled_output is not None else None
+            ),
             "oracle": oracle.cpu(),
         },
         arguments.output_directory / "outputs.pt",
@@ -148,6 +161,7 @@ def main() -> None:
         "capture": str(arguments.capture),
         "layer": arguments.layer,
         "backend": arguments.backend,
+        "skip_profiler": arguments.skip_profiler,
         "configuration": configuration,
         "layouts": layouts,
         "comparisons": reports,
