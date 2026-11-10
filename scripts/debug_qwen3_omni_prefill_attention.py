@@ -29,6 +29,7 @@ def main() -> None:
     parser.add_argument("--model-path", required=True)
     parser.add_argument("--model-revision", required=True)
     parser.add_argument("--capture-directory", type=Path, required=True)
+    parser.add_argument("--request-id", action="append")
     parser.add_argument("--output-directory", type=Path, required=True)
     arguments = parser.parse_args()
     arguments.output_directory.mkdir(exist_ok=False)
@@ -76,11 +77,16 @@ def main() -> None:
         .splitlines()
     ]
     prefill_steps = [step for step in steps if step.phase == "EXTEND"]
+    requested_ids = set(arguments.request_id) if arguments.request_id else None
+    checked_ids: set[str] = set()
     summary = {
         "model_revision": arguments.model_revision,
         "prefill_steps": len(prefill_steps),
+        "requested_request_ids": (
+            sorted(requested_ids) if requested_ids is not None else None
+        ),
         "layers": [],
-        "scope": "All real prefill rows, actual complete per-request K/V, independent checkpoint projection weights and FP64 causal GQA. Padding is retained in the capture but excluded from real-row metrics. Local numerical differences are not speech-quality verdicts.",
+        "scope": "All real prefill rows of the selected requests, actual complete per-request K/V, independent checkpoint projection weights and FP64 causal GQA. Projection checks cover the full captured real batch. Padding is retained in the capture but excluded from real-row metrics. Local numerical differences are not speech-quality verdicts.",
     }
     query_width = config.num_attention_heads * config.head_dim
     key_width = config.num_key_value_heads * config.head_dim
@@ -222,6 +228,12 @@ def main() -> None:
                     prefix_length = saved["prefix_lengths"][row]
                     sequence_length = metadata.sequence_lengths[row]
                     assert extend_length + prefix_length == sequence_length
+                    if requested_ids is not None and request_id not in requested_ids:
+                        offset += extend_length
+                        continue
+                    else:
+                        pass
+                    checked_ids.add(request_id)
                     prefix_cache = torch.load(
                         arguments.capture_directory
                         / f"prefix-{request_id}-{metadata.step:06d}.pt",
@@ -344,6 +356,10 @@ def main() -> None:
             )
             reports.flush()
             print(json.dumps(summary["layers"][-1]), flush=True)
+    if requested_ids is not None:
+        assert checked_ids == requested_ids, (checked_ids, requested_ids)
+    else:
+        pass
 
 
 if __name__ == "__main__":
