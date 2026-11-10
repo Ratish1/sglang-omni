@@ -5,14 +5,20 @@ from __future__ import annotations
 import json
 import logging
 import threading
+from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
 import pytest
 import torch
+from safetensors.torch import save_file
 from sglang.kernels.ops.attention.flash_attention_v3 import _is_fa3_supported
+from transformers import Qwen3OmniMoeConfig
 from transformers.models.qwen3_omni_moe.configuration_qwen3_omni_moe import (
     Qwen3OmniMoeCode2WavConfig,
+)
+from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import (
+    Qwen3OmniMoeRotaryEmbedding,
 )
 
 from sglang_omni.config.schema import StageConfig
@@ -1001,6 +1007,33 @@ def make_tiny_code2wav(
             else:
                 parameter.normal_(0.0, parameter.shape[1] ** -0.5)
     return model.to(device=device, dtype=dtype)
+
+
+def test_bf16_vocoder_loading_preserves_rotary_frequencies(tmp_path: Path) -> None:
+    """Loading BF16 weights must not round the configured rotary frequencies."""
+    checkpoint = make_tiny_code2wav("cpu", torch.bfloat16)
+    config = Qwen3OmniMoeConfig(code2wav_config=checkpoint.config.to_dict())
+    config.save_pretrained(tmp_path)
+    save_file(
+        {
+            f"code2wav.{name}": tensor
+            for name, tensor in checkpoint.state_dict().items()
+        },
+        tmp_path / "model.safetensors",
+    )
+
+    loaded = code2wav_scheduler.load_code2wav_model(
+        str(tmp_path), device="cpu", dtype="bfloat16"
+    )
+    expected = Qwen3OmniMoeRotaryEmbedding(config.code2wav_config)
+
+    assert {parameter.dtype for parameter in loaded.parameters()} == {torch.bfloat16}
+    assert loaded.pre_transformer.rotary_emb.inv_freq.dtype == torch.float32
+    assert loaded.pre_transformer.rotary_emb.original_inv_freq.dtype == torch.float32
+    assert torch.equal(loaded.pre_transformer.rotary_emb.inv_freq, expected.inv_freq)
+    assert torch.equal(
+        loaded.pre_transformer.rotary_emb.original_inv_freq, expected.original_inv_freq
+    )
 
 
 @pytest.mark.accelerator
