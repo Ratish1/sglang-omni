@@ -193,9 +193,24 @@ class SDPACallConfiguration(TypedDict):
     keyword_names: list[str]
 
 
+class SDPAPrefillCapture(TypedDict):
+    sdpa_prefill: dict[int, dict[str, torch.Tensor]]
+    sdpa_layouts: dict[int, dict[str, TensorLayout]]
+    sdpa_configurations: dict[int, SDPACallConfiguration]
+
+
+@dataclass(kw_only=True)
+class SDPAPrefillReplacement:
+    layer_index: int
+    operands: dict[str, torch.Tensor]
+    configuration: SDPACallConfiguration
+    output: torch.Tensor
+
+
 @dataclass(kw_only=True)
 class SDPAPrefillObservation:
     attention_layers: dict[torch.nn.Module, int]
+    replacement: SDPAPrefillReplacement | None = None
     tensor_calls: dict[int, dict[str, torch.Tensor]] = field(default_factory=dict)
     layouts: dict[int, dict[str, TensorLayout]] = field(default_factory=dict)
     configurations: dict[int, SDPACallConfiguration] = field(default_factory=dict)
@@ -251,6 +266,19 @@ class SDPAPrefillObservation:
         )
         if should_capture:
             torch.cuda.nvtx.range_pop()
+            replacement = self.replacement
+            if replacement is not None and replacement.layer_index == layer_index:
+                assert self.configurations[layer_index] == replacement.configuration
+                for name, tensor in self.tensor_calls[layer_index].items():
+                    assert torch.equal(tensor, replacement.operands[name]), name
+                assert output[0].shape == replacement.output.shape
+                assert output[0].dtype == replacement.output.dtype
+                self.tensor_calls[layer_index]["computed_output"] = (
+                    output[0].detach().cpu()
+                )
+                output[0].copy_(replacement.output)
+            else:
+                pass
             self.tensor_calls[layer_index]["output"] = output[0].detach().cpu()
             self.layouts[layer_index]["output"] = tensor_layout(output[0])
         else:

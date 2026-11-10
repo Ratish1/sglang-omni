@@ -7,20 +7,13 @@ import argparse
 import json
 from contextlib import nullcontext
 from pathlib import Path
-from typing import TypedDict
 
 import torch
 import torch.nn.functional as functional
 from torch.nn.attention import SDPBackend, sdpa_kernel
 from torch.profiler import ProfilerActivity, profile
 
-from scripts.qwen3_omni_reference_observers import SDPACallConfiguration, TensorLayout
-
-
-class AttentionCapture(TypedDict):
-    sdpa_prefill: dict[int, dict[str, torch.Tensor]]
-    sdpa_layouts: dict[int, dict[str, TensorLayout]]
-    sdpa_configurations: dict[int, SDPACallConfiguration]
+from scripts.qwen3_omni_reference_observers import SDPAPrefillCapture
 
 
 @torch.inference_mode()
@@ -38,7 +31,7 @@ def main() -> None:
     assert arguments.repeat_count > 1
     arguments.output_directory.mkdir(exist_ok=False)
     torch.cuda.set_device(arguments.gpu)
-    capture: AttentionCapture = torch.load(
+    capture: SDPAPrefillCapture = torch.load(
         arguments.capture, map_location="cpu", weights_only=True
     )
     tensors = capture["sdpa_prefill"][arguments.layer]

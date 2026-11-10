@@ -28,7 +28,9 @@ from scripts.qwen3_omni_reference_observers import (
     CodecInputObservation,
     LayerObservation,
     PrefillAttentionObservation,
+    SDPAPrefillCapture,
     SDPAPrefillObservation,
+    SDPAPrefillReplacement,
     TensorCallObservation,
 )
 from sglang_omni.sampling.seed import derive_sampling_seed
@@ -37,11 +39,17 @@ from sglang_omni.serve.protocol import ChatCompletionRequest
 AUDIO_SAMPLE_RATE = 24000
 
 
+class AttentionReference(BaseModel):
+    capture_file: Path
+    layer_index: int
+
+
 class ReferenceCase(BaseModel):
     sample_id: str
     target_text: str
     request_file: Path
     capture_generation: bool = True
+    attention_reference: AttentionReference | None = None
 
 
 def main() -> None:
@@ -178,6 +186,24 @@ def main() -> None:
             pass
     else:
         pass
+    replacements: dict[str, SDPAPrefillReplacement] = {}
+    for case in cases:
+        reference = case.attention_reference
+        if reference is not None:
+            assert arguments.trace_talker_prefill and case.capture_generation
+            capture: SDPAPrefillCapture = torch.load(
+                reference.capture_file, map_location="cpu", weights_only=True
+            )
+            replacements[case.sample_id] = SDPAPrefillReplacement(
+                layer_index=reference.layer_index,
+                operands=capture["sdpa_prefill"][reference.layer_index],
+                configuration=capture["sdpa_configurations"][reference.layer_index],
+                output=capture["sdpa_prefill"][reference.layer_index]["output"].to(
+                    model.device
+                ),
+            )
+        else:
+            pass
     reports = []
     generated = []
     for case in cases:
@@ -234,6 +260,7 @@ def main() -> None:
         sdpa_observation.tensor_calls.clear()
         sdpa_observation.layouts.clear()
         sdpa_observation.configurations.clear()
+        sdpa_observation.replacement = replacements.get(case.sample_id)
         ALL_ATTENTION_FUNCTIONS["sdpa"] = (
             sdpa_observation
             if arguments.trace_talker_prefill and case.capture_generation
@@ -342,6 +369,11 @@ def main() -> None:
             "capture_generation": arguments.save_generation_trace
             and case.capture_generation,
             "layers": layer_reports,
+            "attention_reference": (
+                case.attention_reference.model_dump(mode="json")
+                if case.attention_reference is not None
+                else None
+            ),
         }
         reports.append(report)
         (arguments.output_directory / f"{case.sample_id}.json").write_text(
@@ -366,7 +398,7 @@ def main() -> None:
                     {str(parameter.dtype) for parameter in model.parameters()}
                 ),
                 "cases": reports,
-                "scope": "Full public checkpoint generation with real preprocessing and no frozen hidden states. Torch RNG and the sampled residual-code predictor differ from the native counter-based main-code RNG and greedy residual codes. These generations are not a same-noise numerical comparison or a speed benchmark. Optional layer observations count execution and check each last output, not every intermediate of every frame. Vision is not exercised by these audio/text cases.",
+                "scope": "Full public checkpoint generation with real preprocessing and no frozen hidden states. Torch RNG and the sampled residual-code predictor differ from the native counter-based main-code RNG and greedy residual codes. These generations are not a same-noise numerical comparison or a speed benchmark. Cases with attention_reference replace only the specified first-prefill SDPA result after exact operand/configuration checks, as a causal diagnostic rather than a serving fix. Optional layer observations count execution and check each last output, not every intermediate of every frame. Vision is not exercised by these audio/text cases.",
             },
             indent=2,
         )
