@@ -85,6 +85,7 @@ class Qwen3OmniThinkerModelRunner(ThinkerModelRunner):
             self.cache_history = ThinkerCacheHistory(
                 directory=destination,
                 pool=model_runner.token_to_kv_pool,
+                request_to_token=model_runner.req_to_token_pool.req_to_token,
             )
         else:
             pass

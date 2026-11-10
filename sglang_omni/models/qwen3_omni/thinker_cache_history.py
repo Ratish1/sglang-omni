@@ -33,6 +33,7 @@ class RequestCacheRows:
 class ThinkerCacheHistory:
     directory: Path
     pool: MHATokenToKVPool
+    request_to_token: torch.Tensor
     written_rows: dict[int, WrittenCacheRow] = field(default_factory=dict)
     forwards: int = 0
     written_tokens: int = 0
@@ -80,7 +81,7 @@ class ThinkerCacheHistory:
                     input_offset : input_offset + new_tokens
                 ].tolist()
             )
-            slot_ids = forward_batch.req_to_token_pool.req_to_token[
+            slot_ids = self.request_to_token[
                 request.req_pool_idx, :sequence_tokens
             ].long()
             assert torch.equal(
