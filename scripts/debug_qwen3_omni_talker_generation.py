@@ -13,6 +13,7 @@ import xxhash
 from huggingface_hub import hf_hub_download
 from sglang.srt.layers.sampler import top_k_top_p_min_p_sampling_from_probs_torch
 from transformers import Qwen3OmniMoeConfig
+from transformers.cache_utils import DynamicCache
 from transformers.conversion_mapping import (
     get_checkpoint_conversion_mapping,
     register_checkpoint_conversion_mapping,
@@ -48,6 +49,11 @@ def main() -> None:
     )
     parser.add_argument("--paired-normalization-controls", action="store_true")
     parser.add_argument("--audit-loaded-weights", action="store_true")
+    parser.add_argument(
+        "--capture-layer-states",
+        action="store_true",
+        help="Retain layer outputs and new KV rows for every reference frame.",
+    )
     parser.add_argument("--conditioning-directory", type=Path)
     parser.add_argument("--thinker-hidden-directory", type=Path)
     parser.add_argument(
@@ -316,12 +322,50 @@ def main() -> None:
             termination = "frame_limit"
             frame_limit = min(arguments.max_frames, captured_sampling["max_new_tokens"])
             for frame_index in range(frame_limit):
+                if arguments.capture_layer_states:
+                    captured_inputs = prepared_inputs["inputs_embeds"].detach().cpu()
+                    captured_positions = prepared_inputs["position_ids"].detach().cpu()
+                else:
+                    pass
                 output = reference(**prepared_inputs)
                 assert (
                     output.past_key_values.get_seq_length()
                     == len(prefill) + frame_index
                 )
                 assert output.generation_step == frame_index
+                if arguments.capture_layer_states:
+                    assert isinstance(output.past_key_values, DynamicCache)
+                    tokens = captured_inputs.shape[1]
+                    keys: list[torch.Tensor] = []
+                    values: list[torch.Tensor] = []
+                    for layer in output.past_key_values.layers:
+                        assert layer.keys is not None and layer.values is not None
+                        assert (
+                            layer.keys.shape[-2]
+                            == layer.values.shape[-2]
+                            == len(prefill) + frame_index
+                        )
+                        keys.append(
+                            layer.keys[..., -tokens:, :].detach().cpu().contiguous()
+                        )
+                        values.append(
+                            layer.values[..., -tokens:, :].detach().cpu().contiguous()
+                        )
+                    torch.save(
+                        {
+                            "input_embeddings": captured_inputs,
+                            "positions": captured_positions,
+                            "hidden_states": [
+                                hidden.detach().cpu().contiguous()
+                                for hidden in output.hidden_states[0]
+                            ],
+                            "keys": keys,
+                            "values": values,
+                        },
+                        case_directory / f"{frame_index:04d}-layers.pt",
+                    )
+                else:
+                    pass
                 logits = output.logits[:, -1].float()
                 penalized_logits = torch.where(
                     logits > 0,
