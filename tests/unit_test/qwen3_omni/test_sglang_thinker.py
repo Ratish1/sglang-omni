@@ -32,6 +32,7 @@ from sglang.srt.models.qwen3_vl_moe import Qwen3MoeLLMModel
 from sglang.srt.runtime_context import get_context
 from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import (
     Qwen3OmniMoeTalkerRotaryEmbedding,
+    Qwen3OmniMoeThinkerTextTopKRouter,
     apply_rotary_pos_emb,
 )
 
@@ -323,6 +324,35 @@ def test_topk_without_a_decode_mask_returns_the_routing_unchanged() -> None:
     )
 
     assert routed is topk_output
+
+
+def test_thinker_weights_match_checkpoint_precision_with_the_native_scale_dtype() -> (
+    None
+):
+    """Unrounded routing weights diverged from the checkpoint conditioning producer."""
+    config = Qwen3OmniMoeTextConfig(hidden_size=8, num_experts=4, num_experts_per_tok=2)
+    router = Qwen3OmniMoeThinkerTextTopKRouter(config).to(torch.bfloat16)
+    with torch.no_grad():
+        router.weight.copy_(torch.arange(32).reshape(4, 8).float().sin())
+    hidden_states = torch.tensor(
+        [[0.5, -0.25, 1, 2, -1, 0.75, 0.125, -0.5]], dtype=torch.bfloat16
+    )
+    router_logits, checkpoint_weights, expert_ids = router(hidden_states)
+    probabilities = torch.softmax(router_logits.float(), dim=-1)
+    routing_weights = probabilities.gather(1, expert_ids)
+    routing_weights /= routing_weights.sum(dim=-1, keepdim=True)
+    topk_output = StandardTopKOutput(
+        routing_weights, expert_ids.to(torch.int32), router_logits
+    )
+
+    routed = PaddedRowsTopK(FixedTopK(topk_output), DecodeLiveRows())(
+        hidden_states, router_logits
+    )
+
+    assert torch.equal(routed.topk_weights, checkpoint_weights.float())
+    assert routed.topk_weights.dtype == torch.float32
+    assert routed.topk_ids is topk_output.topk_ids
+    assert routed.router_logits is router_logits
 
 
 class RecordingTextModel(torch.nn.Module):

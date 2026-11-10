@@ -66,8 +66,7 @@ class DecodeLiveRows:
 
 
 class PaddedRowsTopK(nn.Module):
-    """Top-k that gives a padded decode row the experts of row 0, so padding adds
-    no experts to the fused MoE."""
+    """Keep checkpoint weight precision and route padded rows to row zero's experts."""
 
     def __init__(self, topk: TopK, live_rows: DecodeLiveRows) -> None:
         super().__init__()
@@ -78,6 +77,16 @@ class PaddedRowsTopK(nn.Module):
         self, hidden_states: torch.Tensor, router_logits: torch.Tensor
     ) -> TopKOutput:
         topk_output = self.topk(hidden_states, router_logits)
+        if router_logits.dtype == torch.bfloat16 and isinstance(
+            topk_output, StandardTopKOutput
+        ):
+            topk_output = StandardTopKOutput(
+                topk_weights=topk_output.topk_weights.to(torch.bfloat16).float(),
+                topk_ids=topk_output.topk_ids,
+                router_logits=topk_output.router_logits,
+            )
+        else:
+            pass
         is_live_row = self.live_rows.is_live_row
         # note (ratish): runners that route inside the expert kernel return no ids.
         if is_live_row is None or not isinstance(topk_output, StandardTopKOutput):
