@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import argparse
+import inspect
 import json
+import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -55,6 +57,10 @@ def main() -> None:
         code2wav_in_process=True,
     )
     native = scheduler.model_runner.model
+    source_directory = Path(__file__).resolve().parents[1]
+    assert (
+        Path(inspect.getfile(type(native))).resolve().is_relative_to(source_directory)
+    )
     fused = native.predictor_fused_layers
     assert fused is not None and native.corpus_recorder is None
     capture = PredictorHeadCapture()
@@ -95,6 +101,15 @@ def main() -> None:
                 == metadata.predictor_batch
             )
             assert fused.covers(metadata.predictor_batch * 2)
+            assert metadata.predictor_geometry == {
+                "split_qkv": fused.shape.split_qkv,
+                "split_hidden": fused.shape.split_hidden,
+                "maximum_rows": fused.max_rows,
+            }
+            assert metadata.predictor_stages == {
+                f"{name}:{rows}": stages
+                for (name, rows), stages in fused.fitted_stages.items()
+            }
             captured_logits = torch.stack(
                 [
                     saved["snapshots"][f"predictor.{group}.output"]
@@ -126,10 +141,17 @@ def main() -> None:
             native.predictor_fused_layers = fused
             fused_codes, fused_feedback, fused_logits = runs[0]
             plain_codes, plain_feedback, plain_logits = runs[1]
+            captured_logits_exact = torch.equal(fused_logits, captured_logits)
+            captured_codes_exact = torch.equal(
+                fused_codes[: metadata.live_rows], captured_codes
+            )
+            captured_feedback_exact = torch.equal(
+                fused_feedback[: metadata.live_rows], saved["feedback"]
+            )
             captured_exact = (
-                torch.equal(fused_logits, captured_logits)
-                and torch.equal(fused_codes[: metadata.live_rows], captured_codes)
-                and torch.equal(fused_feedback[: metadata.live_rows], saved["feedback"])
+                captured_logits_exact
+                and captured_codes_exact
+                and captured_feedback_exact
             )
             repeated_exact = all(
                 torch.equal(first, repeated)
@@ -182,6 +204,9 @@ def main() -> None:
                         "live_rows": metadata.live_rows,
                         "predictor_batch": metadata.predictor_batch,
                         "captured_logits_codes_feedback_exact": captured_exact,
+                        "captured_logits_exact": captured_logits_exact,
+                        "captured_codes_exact": captured_codes_exact,
+                        "captured_feedback_exact": captured_feedback_exact,
                         "fused_repeat_exact_after_plain": repeated_exact,
                         "changed_real_code_coordinates": int(
                             (
@@ -213,6 +238,9 @@ def main() -> None:
         assert covered_steps[request_id] == trace["steps"]
     summary = {
         "model_revision": arguments.model_revision,
+        "source_commit": subprocess.check_output(
+            ["git", "rev-parse", "HEAD"], cwd=source_directory, text=True
+        ).strip(),
         "batches": total_batches,
         "exact_captured_batches": exact_captured_batches,
         "fused_repeat_exact_batches": repeat_exact_batches,
