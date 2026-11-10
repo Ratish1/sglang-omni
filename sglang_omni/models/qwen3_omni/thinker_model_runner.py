@@ -3,14 +3,17 @@
 
 from __future__ import annotations
 
+import os
 from array import array
 from dataclasses import dataclass
 from numbers import Integral
+from pathlib import Path
 from typing import TypeGuard
 
 import torch
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
+from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 from sglang_omni.model_runner.prefill_inputs import (
@@ -19,6 +22,7 @@ from sglang_omni.model_runner.prefill_inputs import (
     get_omni_prefill_inputs,
 )
 from sglang_omni.model_runner.thinker_model_runner import ThinkerModelRunner
+from sglang_omni.models.qwen3_omni.thinker_cache_history import ThinkerCacheHistory
 from sglang_omni.scheduling.types import SchedulerRequest
 
 _PREFILL_AUDIO_INPUT_KEYS = frozenset(
@@ -50,6 +54,52 @@ class Qwen3OmniThinkerModelRunner(ThinkerModelRunner):
     """
 
     supports_speculative_async_decode: bool = True
+    cache_history: ThinkerCacheHistory | None = None
+
+    def prepare_and_forward(
+        self,
+        forward_batch: ForwardBatch,
+        schedule_batch: ScheduleBatch,
+        requests: list[SchedulerRequest],
+        is_prefill: bool,
+        *,
+        is_lookahead: bool = False,
+    ) -> GenerationBatchResult:
+        directory = os.environ.get("SGLANG_OMNI_THINKER_CACHE_AUDIT")
+        if directory is None:
+            return super().prepare_and_forward(
+                forward_batch,
+                schedule_batch,
+                requests,
+                is_prefill,
+                is_lookahead=is_lookahead,
+            )
+        else:
+            pass
+        if self.cache_history is None:
+            model_runner = self.tp_worker.model_runner
+            assert not model_runner.kv_index_translator.is_translating
+            assert isinstance(model_runner.token_to_kv_pool, MHATokenToKVPool)
+            destination = Path(directory)
+            destination.mkdir(parents=True, exist_ok=True)
+            self.cache_history = ThinkerCacheHistory(
+                directory=destination,
+                pool=model_runner.token_to_kv_pool,
+            )
+        else:
+            pass
+        request_rows = self.cache_history.prepare(forward_batch, schedule_batch)
+        self.cache_history.verify(request_rows, "before")
+        result = super().prepare_and_forward(
+            forward_batch,
+            schedule_batch,
+            requests,
+            is_prefill,
+            is_lookahead=is_lookahead,
+        )
+        self.cache_history.verify(request_rows, "after")
+        self.cache_history.record(request_rows)
+        return result
 
     @staticmethod
     def origin_num_tokens(value: object) -> int | None:
