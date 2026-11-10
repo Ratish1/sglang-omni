@@ -35,7 +35,12 @@ def main() -> None:
     parser.add_argument("--layer", type=int, action="append")
     parser.add_argument("--step", type=int, action="append")
     parser.add_argument("--tile-kernel-control", choices=("original", "barrier"))
+    parser.add_argument("--benchmark-replays", type=int, default=0)
+    parser.add_argument("--benchmark-warmup-replays", type=int, default=0)
     arguments = parser.parse_args()
+    assert arguments.benchmark_replays >= 0
+    assert arguments.benchmark_warmup_replays >= 0
+    assert not arguments.benchmark_replays or arguments.tile_kernel_control is not None
     arguments.output_directory.mkdir(exist_ok=False)
     assert AutoTuner.get().load_configs(str(arguments.autotune_cache))
     config = Qwen3OmniMoeConfig.from_pretrained(
@@ -209,6 +214,26 @@ def main() -> None:
                     "exact": exact,
                     "max_absolute": float(metrics["max_absolute"].max()),
                 }
+                if arguments.benchmark_replays:
+                    for _ in range(arguments.benchmark_warmup_replays):
+                        graph.replay()
+                    start = torch.cuda.Event(enable_timing=True)
+                    end = torch.cuda.Event(enable_timing=True)
+                    start.record()
+                    for _ in range(arguments.benchmark_replays):
+                        graph.replay()
+                    end.record()
+                    end.synchronize()
+                    assert torch.equal(actual[:real_rows], output[:real_rows])
+                    record["benchmark_replays"] = arguments.benchmark_replays
+                    record["benchmark_warmup_replays"] = (
+                        arguments.benchmark_warmup_replays
+                    )
+                    record["complete_moe_milliseconds_per_replay"] = (
+                        start.elapsed_time(end) / arguments.benchmark_replays
+                    )
+                else:
+                    pass
                 reports.write(json.dumps(record) + "\n")
                 if not exact:
                     mismatches.append(metadata.step)
