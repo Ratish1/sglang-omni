@@ -41,7 +41,7 @@ AUDIO_SAMPLE_RATE = 24000
 
 class AttentionReference(BaseModel):
     capture_file: Path
-    layer_index: int
+    layer_indices: list[int]
 
 
 class ReferenceCase(BaseModel):
@@ -186,7 +186,7 @@ def main() -> None:
             pass
     else:
         pass
-    replacements: dict[str, SDPAPrefillReplacement] = {}
+    replacements: dict[str, dict[int, SDPAPrefillReplacement]] = {}
     for case in cases:
         reference = case.attention_reference
         if reference is not None:
@@ -194,14 +194,16 @@ def main() -> None:
             capture: SDPAPrefillCapture = torch.load(
                 reference.capture_file, map_location="cpu", weights_only=True
             )
-            replacements[case.sample_id] = SDPAPrefillReplacement(
-                layer_index=reference.layer_index,
-                operands=capture["sdpa_prefill"][reference.layer_index],
-                configuration=capture["sdpa_configurations"][reference.layer_index],
-                output=capture["sdpa_prefill"][reference.layer_index]["output"].to(
-                    model.device
-                ),
-            )
+            replacements[case.sample_id] = {
+                layer_index: SDPAPrefillReplacement(
+                    operands=capture["sdpa_prefill"][layer_index],
+                    configuration=capture["sdpa_configurations"][layer_index],
+                    output=capture["sdpa_prefill"][layer_index]["output"].to(
+                        model.device
+                    ),
+                )
+                for layer_index in reference.layer_indices
+            }
         else:
             pass
     reports = []
@@ -260,7 +262,7 @@ def main() -> None:
         sdpa_observation.tensor_calls.clear()
         sdpa_observation.layouts.clear()
         sdpa_observation.configurations.clear()
-        sdpa_observation.replacement = replacements.get(case.sample_id)
+        sdpa_observation.replacements = replacements.get(case.sample_id, {})
         ALL_ATTENTION_FUNCTIONS["sdpa"] = (
             sdpa_observation
             if arguments.trace_talker_prefill and case.capture_generation

@@ -201,7 +201,6 @@ class SDPAPrefillCapture(TypedDict):
 
 @dataclass(kw_only=True)
 class SDPAPrefillReplacement:
-    layer_index: int
     operands: dict[str, torch.Tensor]
     configuration: SDPACallConfiguration
     output: torch.Tensor
@@ -210,7 +209,7 @@ class SDPAPrefillReplacement:
 @dataclass(kw_only=True)
 class SDPAPrefillObservation:
     attention_layers: dict[torch.nn.Module, int]
-    replacement: SDPAPrefillReplacement | None = None
+    replacements: dict[int, SDPAPrefillReplacement] = field(default_factory=dict)
     tensor_calls: dict[int, dict[str, torch.Tensor]] = field(default_factory=dict)
     layouts: dict[int, dict[str, TensorLayout]] = field(default_factory=dict)
     configurations: dict[int, SDPACallConfiguration] = field(default_factory=dict)
@@ -266,8 +265,8 @@ class SDPAPrefillObservation:
         )
         if should_capture:
             torch.cuda.nvtx.range_pop()
-            replacement = self.replacement
-            if replacement is not None and replacement.layer_index == layer_index:
+            replacement = self.replacements.get(layer_index)
+            if replacement is not None:
                 assert self.configurations[layer_index] == replacement.configuration
                 for name, tensor in self.tensor_calls[layer_index].items():
                     assert torch.equal(tensor, replacement.operands[name]), name
