@@ -12,6 +12,7 @@ from pydantic import BaseModel
 from safetensors import safe_open
 from transformers import Qwen3OmniMoeForConditionalGeneration
 from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import (
+    Qwen3OmniMoeCode2Wav,
     Qwen3OmniMoeTalkerForConditionalGeneration,
 )
 
@@ -29,6 +30,7 @@ def audit_checkpoint_weights(
     model: (
         Qwen3OmniMoeForConditionalGeneration
         | Qwen3OmniMoeTalkerForConditionalGeneration
+        | Qwen3OmniMoeCode2Wav
     ),
     checkpoint_directory: Path,
     output_file: Path,
@@ -36,11 +38,12 @@ def audit_checkpoint_weights(
     index = CheckpointIndex.model_validate_json(
         (checkpoint_directory / "model.safetensors.index.json").read_bytes()
     )
-    prefix = (
-        "talker."
-        if isinstance(model, Qwen3OmniMoeTalkerForConditionalGeneration)
-        else ""
-    )
+    if isinstance(model, Qwen3OmniMoeTalkerForConditionalGeneration):
+        prefix = "talker."
+    elif isinstance(model, Qwen3OmniMoeCode2Wav):
+        prefix = "code2wav."
+    else:
+        prefix = ""
     tensors = model.state_dict(keep_vars=True)
     shards: dict[str, list[str]] = {}
     for checkpoint_name, shard in index.weight_map.items():
