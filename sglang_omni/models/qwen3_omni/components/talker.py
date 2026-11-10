@@ -43,7 +43,6 @@ from sglang_omni.utils.predictor_layers import (
     add_rmsnorm_rounded,
     codebook_step,
     decode_attention,
-    resolve_fused_predictor_layers,
     supports_decode_attention,
     supports_exact_add_rmsnorm,
 )
@@ -910,13 +909,7 @@ class Qwen3OmniTalker(nn.Module):
         self.predictor_pair_cache_slots = (
             self.predictor_cache_slots[:2, :].t().reshape(-1).contiguous()
         )
-        self.predictor_fused_layers = resolve_fused_predictor_layers(
-            self.code_predictor,
-            predictor_len,
-            max_batch_size,
-            device,
-            self.model.codec_embedding.weight.dtype,
-        )
+        self.predictor_fused_layers = None
         # note (ratish): where the exact kernel does not apply, the add and the norm
         # stay two launches.
         self.predictor_exact_add_norm = supports_exact_add_rmsnorm(
