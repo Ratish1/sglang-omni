@@ -9,6 +9,7 @@ from pathlib import Path
 
 import torch
 from huggingface_hub import hf_hub_download
+from safetensors import safe_open
 from transformers import Qwen3OmniMoeConfig
 
 from scripts.debug_qwen3_omni_expert_corpus import load_layer_weights, measure_layer
@@ -43,6 +44,15 @@ def main() -> None:
         )
     )
     weight_map = json.loads(index_path.read_text())["weight_map"]
+    gate_weights = []
+    for layer in range(config.num_hidden_layers):
+        weight_name = f"talker.model.layers.{layer}.mlp.gate.weight"
+        with safe_open(
+            index_path.parent / weight_map[weight_name], framework="pt", device="cpu"
+        ) as shard:
+            weight = shard.get_tensor(weight_name)
+            assert weight.dtype == torch.bfloat16
+            gate_weights.append(weight.double())
     steps = [
         StepMetadata.model_validate_json(line)
         for line in (arguments.capture_directory / "steps.jsonl")
@@ -65,6 +75,8 @@ def main() -> None:
     prefill_rows_total = 0
     routing_invalid_rows = 0
     maximum_precast_scale_error = 0.0
+    projection_sensitive_rows = 0
+    maximum_gate_projection_error = 0.0
     with (
         (arguments.output_directory / "rows.jsonl").open("w") as reports,
         (arguments.output_directory / "routing.jsonl").open("w") as routing_reports,
@@ -98,16 +110,35 @@ def main() -> None:
             for layer in range(config.num_hidden_layers):
                 prefix = f"backbone.{layer}."
                 logits = snapshots[prefix + "router.output"][:real_rows].double()
-                ids = snapshots[prefix + "expert_ids"][:real_rows].long()
-                assert ids.min() >= 0 and ids.max() < logits.shape[1]
-                assert (ids.sort(-1).values.diff(dim=-1) > 0).all()
-                selected_logits = logits.gather(1, ids)
-                unselected_maximum = logits.scatter(1, ids, -torch.inf).amax(-1)
+                expert_ids = snapshots[prefix + "expert_ids"][:real_rows].long()
+                assert logits.isfinite().all()
+                assert expert_ids.shape == (real_rows, config.num_experts_per_tok)
+                assert expert_ids.min() >= 0 and expert_ids.max() < logits.shape[1]
+                assert (expert_ids.sort(-1).values.diff(dim=-1) > 0).all()
+                selected_logits = logits.gather(1, expert_ids)
+                unselected_maximum = logits.scatter(1, expert_ids, -torch.inf).amax(-1)
                 margin = selected_logits.amin(-1) - unselected_maximum
-                probabilities = logits.softmax(-1).gather(1, ids)
+                probabilities = logits.softmax(-1).gather(1, expert_ids)
                 probabilities /= probabilities.sum(-1, keepdim=True)
                 recorded_scales = snapshots[prefix + "expert_weights"][:real_rows]
+                assert recorded_scales.isfinite().all() and (recorded_scales >= 0).all()
                 scale_errors = (recorded_scales.double() - probabilities).abs().amax(-1)
+                reference_logits = (
+                    snapshots[prefix + "router.input"][:real_rows].double()
+                    @ gate_weights[layer].T
+                )
+                assert reference_logits.isfinite().all()
+                projection_errors = (logits - reference_logits).abs().amax(-1)
+                rounded_projection_errors = (
+                    (logits - reference_logits.bfloat16().double()).abs().amax(-1)
+                )
+                reference_boundary_margin = reference_logits.gather(1, expert_ids).amin(
+                    -1
+                ) - reference_logits.scatter(1, expert_ids, -torch.inf).amax(-1)
+                projection_sensitive_rows += int((reference_boundary_margin < 0).sum())
+                maximum_gate_projection_error = max(
+                    maximum_gate_projection_error, float(projection_errors.max())
+                )
                 invalid_rows = (margin < 0).nonzero().flatten().tolist()
                 routing_invalid_rows += len(invalid_rows)
                 maximum_precast_scale_error = max(
@@ -122,6 +153,9 @@ def main() -> None:
                             "invalid_source_rows": invalid_rows,
                             "topk_logit_boundary_margin": margin.tolist(),
                             "precast_scale_max_absolute_to_fp64": scale_errors.tolist(),
+                            "gate_projection_max_absolute_to_fp64": projection_errors.tolist(),
+                            "gate_projection_max_absolute_to_bf16_rounded_fp64": rounded_projection_errors.tolist(),
+                            "selected_boundary_margin_against_fp64_projection": reference_boundary_margin.tolist(),
                         }
                     )
                     + "\n"
@@ -162,7 +196,9 @@ def main() -> None:
         "row_layer_checks": real_rows_total * config.num_hidden_layers,
         "invalid_topk_rows": routing_invalid_rows,
         "maximum_precast_scale_error_to_fp64": maximum_precast_scale_error,
-        "scope": "Actual recorded logits and selected IDs, with ties accepted at the top-k boundary. FP64 normalized-weight differences are reported before the serving scale cast, without an invented tolerance.",
+        "projection_sensitive_rows": projection_sensitive_rows,
+        "maximum_gate_projection_error_to_fp64": maximum_gate_projection_error,
+        "scope": "Actual recorded logits and selected IDs, with ties accepted at the top-k boundary. The independent gate projection uses actual BF16 inputs and checkpoint weights in FP64. Selection differences against that projection measure rounding sensitivity, not an invalid BF16 top-k. Normalized-weight differences are reported before the serving scale cast, without an invented tolerance.",
     }
     (arguments.output_directory / "routing-summary.json").write_text(
         json.dumps(routing_summary, indent=2)
