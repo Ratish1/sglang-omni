@@ -69,6 +69,37 @@ class CodecInputObservation:
         self.codec_chunks.append(codec_ids.detach().cpu())
 
 
+@dataclass(kw_only=True)
+class TensorCallObservation:
+    operation_name: str
+    tensor_calls: list[dict[str, torch.Tensor]] = field(default_factory=list)
+
+    def __call__(
+        self,
+        module: torch.nn.Module,
+        inputs: tuple[torch.Tensor, ...],
+        output: torch.Tensor | tuple[torch.Tensor, ...],
+    ) -> None:
+        assert not module.training
+        if isinstance(output, torch.Tensor):
+            output_tensors = (output,)
+        else:
+            output_tensors = output
+        self.tensor_calls.append(
+            {
+                **{
+                    f"input_{index}": tensor.detach().cpu()
+                    for index, tensor in enumerate(inputs)
+                },
+                **{
+                    f"output_{index}": tensor.detach().cpu()
+                    for index, tensor in enumerate(output_tensors)
+                },
+                "cuda_rng_state": torch.cuda.get_rng_state(inputs[0].device),
+            }
+        )
+
+
 def audit_rotary_buffers(
     model: Qwen3OmniMoeForConditionalGeneration,
     output_directory: Path,
@@ -132,6 +163,7 @@ def main() -> None:
     parser.add_argument("--output-directory", type=Path, required=True)
     parser.add_argument("--observe-layers", action="store_true")
     parser.add_argument("--save-codec-inputs", action="store_true")
+    parser.add_argument("--save-generation-trace", action="store_true")
     arguments = parser.parse_args()
     cases = TypeAdapter(list[ReferenceCase]).validate_json(
         arguments.case_file.read_text()
@@ -177,6 +209,31 @@ def main() -> None:
         model.code2wav.register_forward_pre_hook(codec_observation)
     else:
         pass
+    generation_observations: list[TensorCallObservation] = []
+    if arguments.save_generation_trace:
+        observed_modules = [
+            ("audio_projection", model.thinker.audio_tower.proj2),
+            ("text_embedding", model.thinker.model.embed_tokens),
+            ("thinker_rotary", model.thinker.model.rotary_emb),
+            ("text_projection", model.talker.text_projection),
+            ("hidden_projection", model.talker.hidden_projection),
+            ("talker_rotary", model.talker.model.rotary_emb),
+            ("codec_head", model.talker.codec_head),
+            ("predictor_rotary", model.talker.code_predictor.model.rotary_emb),
+            ("vocoder_rotary", model.code2wav.pre_transformer.rotary_emb),
+            *(
+                (f"residual_head_{index}", projection)
+                for index, projection in enumerate(model.talker.code_predictor.lm_head)
+            ),
+        ]
+        for operation_name, module in observed_modules:
+            generation_observation = TensorCallObservation(
+                operation_name=operation_name
+            )
+            generation_observations.append(generation_observation)
+            module.register_forward_hook(generation_observation)
+    else:
+        pass
     reports = []
     generated = []
     for case in cases:
@@ -207,6 +264,16 @@ def main() -> None:
             observation.calls = 0
             observation.last_output = None
         codec_observation.codec_chunks.clear()
+        for generation_observation in generation_observations:
+            generation_observation.tensor_calls.clear()
+        if arguments.save_generation_trace:
+            processor_inputs = {
+                name: tensor.detach().cpu() for name, tensor in inputs.items()
+            }
+            initial_cpu_rng_state = torch.get_rng_state()
+            initial_cuda_rng_state = torch.cuda.get_rng_state(model.device)
+        else:
+            pass
         started = time.monotonic()
         with torch.inference_mode():
             text_ids, waveform = model.generate(
@@ -227,6 +294,21 @@ def main() -> None:
             torch.save(
                 {"codec_chunks": codec_observation.codec_chunks},
                 arguments.output_directory / f"{case.sample_id}.codec-inputs.pt",
+            )
+        else:
+            pass
+        if arguments.save_generation_trace:
+            torch.save(
+                {
+                    "processor_inputs": processor_inputs,
+                    "initial_cpu_rng_state": initial_cpu_rng_state,
+                    "initial_cuda_rng_state": initial_cuda_rng_state,
+                    "operations": {
+                        observation.operation_name: observation.tensor_calls
+                        for observation in generation_observations
+                    },
+                },
+                arguments.output_directory / f"{case.sample_id}.generation.pt",
             )
         else:
             pass
@@ -286,6 +368,7 @@ def main() -> None:
                 "model_revision": arguments.model_revision,
                 "observe_layers": arguments.observe_layers,
                 "save_codec_inputs": arguments.save_codec_inputs,
+                "save_generation_trace": arguments.save_generation_trace,
                 "transformers": version("transformers"),
                 "torch": version("torch"),
                 "parameter_dtypes": sorted(
