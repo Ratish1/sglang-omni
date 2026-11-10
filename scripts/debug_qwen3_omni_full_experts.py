@@ -15,6 +15,7 @@ from huggingface_hub import snapshot_download
 from transformers import Qwen3OmniMoeConfig
 
 from scripts.debug_qwen3_omni_expert_corpus import compare_outputs, load_layer_weights
+from scripts.qwen3_omni_moe_tile_control import compile_tile_kernel, replace_tile_kernel
 from sglang_omni.models.qwen3_omni.corpus_diagnostics import StepMetadata
 
 
@@ -33,6 +34,7 @@ def main() -> None:
     parser.add_argument("--prefill-gemm1-fallback-above-rows", type=int)
     parser.add_argument("--layer", type=int, action="append")
     parser.add_argument("--step", type=int, action="append")
+    parser.add_argument("--tile-kernel-control", choices=("original", "barrier"))
     arguments = parser.parse_args()
     arguments.output_directory.mkdir(exist_ok=False)
     assert AutoTuner.get().load_configs(str(arguments.autotune_cache))
@@ -65,6 +67,12 @@ def main() -> None:
         range(config.num_hidden_layers) if arguments.layer is None else arguments.layer
     )
     assert all(0 <= layer < config.num_hidden_layers for layer in layers)
+    if arguments.tile_kernel_control is not None:
+        tile_module, tile_function = compile_tile_kernel(
+            arguments.output_directory, arguments.tile_kernel_control
+        )
+    else:
+        tile_module, tile_function = None, None
     summary = {
         "model_revision": arguments.model_revision,
         "autotune_cache_sha256": hashlib.sha256(
@@ -74,6 +82,8 @@ def main() -> None:
         "selected_steps": arguments.step,
         "selected_layers": arguments.layer,
         "tune_max_num_tokens": arguments.tune_max_num_tokens,
+        "tile_kernel_control": arguments.tile_kernel_control,
+        "tile_module_handle": int(tile_module) if tile_module is not None else None,
         "routing_scale_dtype": arguments.routing_scale_dtype,
         "prefill_gemm1_fallback_above_rows": arguments.prefill_gemm1_fallback_above_rows,
         "routing_scale_scope": "The TopK hook precedes the model's routing-weight cast. Replay applies the serving source's selected storage dtype and restores FP32 for the kernel ABI.",
@@ -131,6 +141,23 @@ def main() -> None:
                 real_rows = int(saved["real_rows"])
                 assert 0 < real_rows <= inputs.shape[0]
                 assert int(saved["query_indices"].max()) < real_rows
+                if tile_function is not None:
+                    warmup = cutlass_fused_moe(
+                        input=inputs.clone(),
+                        token_selected_experts=ids,
+                        token_final_scales=scales,
+                        fc1_expert_weights=w13,
+                        fc2_expert_weights=w2,
+                        output_dtype=inputs.dtype,
+                        quant_scales=None,
+                        use_fused_finalize=False,
+                        tune_max_num_tokens=arguments.tune_max_num_tokens,
+                    )[0]
+                    assert torch.equal(actual[:real_rows], warmup[:real_rows])
+                    graph = torch.cuda.CUDAGraph(keep_graph=True)
+                    graph_context = torch.cuda.graph(graph)
+                else:
+                    graph_context = nullcontext()
                 if (
                     arguments.prefill_gemm1_fallback_above_rows is not None
                     and metadata.phase == "EXTEND"
@@ -146,6 +173,7 @@ def main() -> None:
                     torch.cuda.nvtx.range(
                         f"actual-moe/layer-{layer:02d}/step-{metadata.step:06d}/{metadata.phase}"
                     ),
+                    graph_context,
                 ):
                     output = cutlass_fused_moe(
                         input=inputs,
@@ -158,6 +186,11 @@ def main() -> None:
                         use_fused_finalize=False,
                         tune_max_num_tokens=arguments.tune_max_num_tokens,
                     )[0]
+                if tile_function is not None:
+                    replace_tile_kernel(graph, tile_function)
+                    graph.replay()
+                else:
+                    pass
                 metrics = compare_outputs(actual[:real_rows], output[:real_rows])
                 assert metrics["finite"].all()
                 exact = torch.equal(actual[:real_rows], output[:real_rows])
