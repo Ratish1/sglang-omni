@@ -58,7 +58,11 @@ def main() -> None:
     parser.add_argument("--thinker-hidden-directory", type=Path)
     parser.add_argument(
         "--conditioning-variant",
-        choices=("checkpoint_audio_prefill", "native_audio_prefill"),
+        choices=(
+            "checkpoint_audio_prefill",
+            "native_audio_prefill",
+            "checkpoint_native_features_prefill",
+        ),
         default="checkpoint_audio_prefill",
     )
     parser.add_argument("--output-directory", type=Path, required=True)

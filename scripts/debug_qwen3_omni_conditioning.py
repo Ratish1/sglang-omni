@@ -10,9 +10,11 @@ from dataclasses import asdict
 from pathlib import Path
 
 import torch
+from huggingface_hub import hf_hub_download
 from transformers import Qwen3OmniMoeForConditionalGeneration, Qwen3OmniMoeProcessor
 
 from scripts.debug_qwen3_omni_feedback_audit import compare_tensors
+from scripts.qwen3_omni_checkpoint_weights import audit_checkpoint_weights
 from sglang_omni.serve.protocol import ChatCompletionRequest
 
 
@@ -54,8 +56,12 @@ def prompt_hidden(
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model-path", required=True)
+    parser.add_argument("--model-revision", required=True)
     parser.add_argument("--request-directory", type=Path, required=True)
     parser.add_argument("--native-directory", type=Path, required=True)
+    parser.add_argument(
+        "--capture-layout", choices=("producer", "queue"), default="producer"
+    )
     parser.add_argument("--frontend-directory", type=Path)
     parser.add_argument("--request-id", action="append", required=True)
     parser.add_argument("--gpu", type=int, required=True)
@@ -66,6 +72,7 @@ def main() -> None:
     torch.set_float32_matmul_precision("highest")
     model, loading = Qwen3OmniMoeForConditionalGeneration.from_pretrained(
         arguments.model_path,
+        revision=arguments.model_revision,
         dtype=torch.bfloat16,
         device_map={"": arguments.gpu},
         attn_implementation="sdpa",
@@ -77,7 +84,9 @@ def main() -> None:
     assert not loading["mismatched_keys"], loading["mismatched_keys"]
     assert not loading["unexpected_keys"], loading["unexpected_keys"]
     model.eval()
-    processor = Qwen3OmniMoeProcessor.from_pretrained(arguments.model_path)
+    processor = Qwen3OmniMoeProcessor.from_pretrained(
+        arguments.model_path, revision=arguments.model_revision
+    )
     reports = []
     with torch.inference_mode():
         for request_id in arguments.request_id:
@@ -103,9 +112,21 @@ def main() -> None:
                 return_tensors="pt",
             ).to(model.device, dtype=torch.bfloat16)
             directory = arguments.native_directory / request_id
-            native = torch.load(
-                directory / "conditioning.pt", map_location="cpu", weights_only=True
-            )
+            if arguments.capture_layout == "queue":
+                native = torch.load(
+                    directory / "prompt.pt", map_location="cpu", weights_only=True
+                )
+                captured_prefill = torch.load(
+                    directory / "0000-before_prefill.pt",
+                    map_location="cpu",
+                    weights_only=True,
+                )
+                native["prefill_input_ids"] = captured_prefill["input_ids"]
+                native["prefill_embeddings"] = captured_prefill["prefill_embeds"]
+            else:
+                native = torch.load(
+                    directory / "conditioning.pt", map_location="cpu", weights_only=True
+                )
             native.update(
                 torch.load(
                     directory / "audio-conditioning.pt",
@@ -132,7 +153,12 @@ def main() -> None:
                 native_audio,
                 native["feature_attention_mask"].to(model.device),
             )
+            replacement_hidden_states = {
+                "checkpoint_audio_prefill": checkpoint_hidden,
+                "native_audio_prefill": native_audio_hidden,
+            }
             frontend_report = {}
+            frontend_tensors = {}
             if arguments.frontend_directory is not None:
                 frontend = torch.load(
                     arguments.frontend_directory / request_id / "audio-features.pt",
@@ -148,6 +174,20 @@ def main() -> None:
                     frontend["feature_attention_mask"],
                     return_dict=True,
                 ).last_hidden_state
+                native_features_hidden, native_features_positions = prompt_hidden(
+                    model,
+                    prompt_ids,
+                    native_features_audio,
+                    frontend["feature_attention_mask"],
+                )
+                assert torch.equal(native_features_positions, native_audio_positions)
+                replacement_hidden_states["checkpoint_native_features_prefill"] = (
+                    native_features_hidden
+                )
+                frontend_tensors = {
+                    "native_features_reference_audio": native_features_audio.cpu(),
+                    "native_features_reference_hidden": native_features_hidden.cpu(),
+                }
                 frontend_report = {
                     "feature_difference": asdict(
                         compare_tensors(
@@ -191,7 +231,10 @@ def main() -> None:
                         ),
                     }
                 )
-            assert prefix_proofs
+            if arguments.capture_layout == "producer":
+                assert prefix_proofs
+            else:
+                pass
             positions = torch.arange(prompt_ids.shape[1], device=model.device)[None]
             starts = torch.where(
                 prompt_ids == model.config.im_start_token_id,
@@ -212,21 +255,21 @@ def main() -> None:
             assert int(user_audio.sum()) == int(audio_mask.sum())
             audio_rows = user_audio.nonzero(as_tuple=True)[0]
             native_prefill = native["prefill_embeddings"].to(model.device)
-            checkpoint_projection = model.talker.hidden_projection(
-                checkpoint_hidden[0, audio_mask]
-            )
-            native_audio_projection = model.talker.hidden_projection(
-                native_audio_hidden[0, audio_mask]
-            )
             native_projection = model.talker.hidden_projection(
                 native_hidden[audio_mask]
             )
-            checkpoint_prefill = native_prefill.clone()
-            checkpoint_prefill[audio_rows] = checkpoint_projection
-            native_audio_prefill = native_prefill.clone()
-            native_audio_prefill[audio_rows] = native_audio_projection
+            replacement_prefills = {}
+            for name, hidden_states in replacement_hidden_states.items():
+                replacement_prefill = native_prefill.clone()
+                replacement_prefill[audio_rows] = model.talker.hidden_projection(
+                    hidden_states[0, audio_mask]
+                )
+                replacement_prefills[name] = replacement_prefill.cpu()
             report = {
                 "request_id": request_id,
+                "model_revision": arguments.model_revision,
+                "capture_layout": arguments.capture_layout,
+                "scope": "Actual captured prompt and prefill operands. Holding native audio embeddings fixed isolates the checkpoint Thinker computation. An explicit frontend directory supplies observed native mel features for a separate encoder-plus-Thinker control. Full checkpoint audio also changes the frontend. Queue captures alone do not attest Thinker cache delivery.",
                 "request_sha256": hashlib.sha256(request_bytes).hexdigest(),
                 "accept_hidden_layer": model.config.talker_config.accept_hidden_layer,
                 "prompt_tokens": prompt_ids.shape[1],
@@ -259,8 +302,8 @@ def main() -> None:
                     "checkpoint_audio": checkpoint_audio.cpu(),
                     "checkpoint_hidden": checkpoint_hidden.cpu(),
                     "native_audio_reference_hidden": native_audio_hidden.cpu(),
-                    "checkpoint_audio_prefill": checkpoint_prefill.cpu(),
-                    "native_audio_prefill": native_audio_prefill.cpu(),
+                    **replacement_prefills,
+                    **frontend_tensors,
                     "native_prefill": native_prefill.cpu(),
                     "audio_rows": audio_rows.cpu(),
                 },
@@ -271,6 +314,16 @@ def main() -> None:
                 json.dumps(reports, indent=2)
             )
             print(json.dumps(report), flush=True)
+        checkpoint_directory = Path(
+            hf_hub_download(
+                arguments.model_path, "config.json", revision=arguments.model_revision
+            )
+        ).parent
+        audit_checkpoint_weights(
+            model,
+            checkpoint_directory,
+            arguments.output_directory / "loaded-weight-audit.json",
+        )
 
 
 if __name__ == "__main__":
