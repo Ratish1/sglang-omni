@@ -4,10 +4,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Literal, TypedDict
+from typing import Literal, TypedDict, Unpack
 
 import torch
 from transformers.cache_utils import Cache
+from transformers.integrations.sdpa_attention import sdpa_attention_forward
+from transformers.modeling_flash_attention_utils import FlashAttentionKwargs
 from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import (
     Qwen3OmniMoeCode2Wav,
     Qwen3OmniMoeThinkerTextAttention,
@@ -170,3 +172,85 @@ class PrefillAttentionObservation:
             "cache_class": type(cache).__name__,
             "use_cache": keywords["use_cache"],
         }
+
+
+class SDPAForwardKeywords(FlashAttentionKwargs, total=False):
+    position_ids: torch.Tensor | None
+    use_cache: bool | None
+    output_router_logits: bool | None
+    output_hidden_states: bool | None
+    output_attentions: bool
+    sliding_window: int | None
+    is_causal: bool | None
+
+
+class SDPACallConfiguration(TypedDict):
+    dropout: float
+    scaling: float | None
+    is_causal: bool | None
+    module_is_causal: bool
+    key_value_groups: int
+    keyword_names: list[str]
+
+
+@dataclass(kw_only=True)
+class SDPAPrefillObservation:
+    attention_layers: dict[torch.nn.Module, int]
+    tensor_calls: dict[int, dict[str, torch.Tensor]] = field(default_factory=dict)
+    layouts: dict[int, dict[str, TensorLayout]] = field(default_factory=dict)
+    configurations: dict[int, SDPACallConfiguration] = field(default_factory=dict)
+
+    def __call__(
+        self,
+        module: torch.nn.Module,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        attention_mask: torch.Tensor | None,
+        dropout: float = 0.0,
+        scaling: float | None = None,
+        **keywords: Unpack[SDPAForwardKeywords],
+    ) -> tuple[torch.Tensor, None]:
+        layer_index = self.attention_layers.get(module)
+        should_capture = (
+            layer_index is not None and layer_index not in self.tensor_calls
+        )
+        if should_capture:
+            tensors = {"query": query, "key": key, "value": value}
+            if attention_mask is not None:
+                tensors["attention_mask"] = attention_mask
+            else:
+                pass
+            self.tensor_calls[layer_index] = {
+                name: tensor.detach().cpu() for name, tensor in tensors.items()
+            }
+            self.layouts[layer_index] = {
+                name: tensor_layout(tensor) for name, tensor in tensors.items()
+            }
+            assert isinstance(module, Qwen3OmniMoeThinkerTextAttention)
+            self.configurations[layer_index] = {
+                "dropout": dropout,
+                "scaling": scaling,
+                "is_causal": keywords.get("is_causal"),
+                "module_is_causal": module.is_causal,
+                "key_value_groups": module.num_key_value_groups,
+                "keyword_names": sorted(keywords),
+            }
+        else:
+            pass
+        output = sdpa_attention_forward(
+            module,
+            query,
+            key,
+            value,
+            attention_mask,
+            dropout=dropout,
+            scaling=scaling,
+            **keywords,
+        )
+        if should_capture:
+            self.tensor_calls[layer_index]["output"] = output[0].detach().cpu()
+            self.layouts[layer_index]["output"] = tensor_layout(output[0])
+        else:
+            pass
+        return output

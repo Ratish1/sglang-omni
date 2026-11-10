@@ -16,6 +16,8 @@ from huggingface_hub import snapshot_download
 from pydantic import BaseModel, TypeAdapter
 from torch.utils.hooks import RemovableHandle
 from transformers import Qwen3OmniMoeForConditionalGeneration, Qwen3OmniMoeProcessor
+from transformers.integrations.sdpa_attention import sdpa_attention_forward
+from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
 
 from scripts.qwen3_omni_checkpoint_weights import (
     audit_checkpoint_buffers,
@@ -26,6 +28,7 @@ from scripts.qwen3_omni_reference_observers import (
     CodecInputObservation,
     LayerObservation,
     PrefillAttentionObservation,
+    SDPAPrefillObservation,
     TensorCallObservation,
 )
 from sglang_omni.sampling.seed import derive_sampling_seed
@@ -105,6 +108,12 @@ def main() -> None:
     generation_modules: dict[str, torch.nn.Module] = {}
     generation_hook_handles: list[RemovableHandle] = []
     attention_observations: list[PrefillAttentionObservation] = []
+    sdpa_observation = SDPAPrefillObservation(
+        attention_layers={
+            layer.self_attn: index
+            for index, layer in enumerate(model.talker.model.layers)
+        }
+    )
     if arguments.save_generation_trace:
         generation_modules = {
             "audio_projection": model.thinker.audio_tower.proj2,
@@ -222,6 +231,14 @@ def main() -> None:
                 )
             else:
                 pass
+        sdpa_observation.tensor_calls.clear()
+        sdpa_observation.layouts.clear()
+        sdpa_observation.configurations.clear()
+        ALL_ATTENTION_FUNCTIONS["sdpa"] = (
+            sdpa_observation
+            if arguments.trace_talker_prefill and case.capture_generation
+            else sdpa_attention_forward
+        )
         if arguments.save_generation_trace:
             processor_inputs = {
                 name: tensor.detach().cpu() for name, tensor in inputs.items()
@@ -240,6 +257,7 @@ def main() -> None:
                 thinker_top_p=1.0,
                 thinker_top_k=0,
             )
+        ALL_ATTENTION_FUNCTIONS["sdpa"] = sdpa_attention_forward
         assert torch.isfinite(waveform).all() and waveform.numel() > 0
         waveform = waveform.reshape(-1).float().cpu().numpy()
         elapsed_seconds = time.monotonic() - started
@@ -272,6 +290,9 @@ def main() -> None:
                         f"layer_{observation.attention.layer_idx}": observation.snapshot
                         for observation in attention_observations
                     },
+                    "sdpa_prefill": sdpa_observation.tensor_calls,
+                    "sdpa_layouts": sdpa_observation.layouts,
+                    "sdpa_configurations": sdpa_observation.configurations,
                 },
                 arguments.output_directory / f"{case.sample_id}.generation.pt",
             )
