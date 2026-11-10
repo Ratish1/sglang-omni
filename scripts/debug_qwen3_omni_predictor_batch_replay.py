@@ -11,10 +11,59 @@ from pathlib import Path
 
 import torch
 from huggingface_hub import snapshot_download
+from pydantic import BaseModel
 
+from sglang_omni.models.qwen3_omni.components.talker import Qwen3OmniTalker
 from sglang_omni.models.qwen3_omni.corpus_diagnostics import StepMetadata
 from sglang_omni.models.qwen3_omni.stages import create_talker_ar_executor_from_config
-from sglang_omni.vendor.sglang.layers import ReplicatedLinear
+from sglang_omni.vendor.sglang.layers import ReplicatedLinear, RMSNorm
+
+
+class ReferenceFrame(BaseModel):
+    frame_index: int
+    is_codec_eos: bool
+    checkpoint_forced_prefix_argmax: list[int]
+
+
+class ReferenceRequest(BaseModel):
+    request_id: str
+    frames: list[ReferenceFrame]
+
+
+class ReferenceReport(BaseModel):
+    model_revision: str
+    requests: list[ReferenceRequest]
+
+
+def forced_prefix_logits(
+    native: Qwen3OmniTalker,
+    hidden_states: torch.Tensor,
+    codes: torch.Tensor,
+) -> torch.Tensor:
+    """Keep every native code fixed so earlier changed choices cannot amplify."""
+    batch_size = len(codes)
+    embeddings = torch.cat(
+        (hidden_states[:, None], native.get_input_embeddings()(codes[:, :1])), dim=1
+    )
+    predicted_hidden = native.predictor_forward_tokens(
+        token_embeds=embeddings, batch_size=batch_size, cache_len=0
+    )[:, -1:]
+    logits = []
+    for group, head in enumerate(native.code_predictor.lm_head):
+        predicted_logits, _ = head(predicted_hidden)
+        logits.append(predicted_logits[:, -1].detach().clone())
+        if group < len(native.code_predictor.lm_head) - 1:
+            embeddings = native.code_predictor.model.codec_embedding[group](
+                codes[:, group + 1 : group + 2]
+            )
+            predicted_hidden = native.predictor_forward_tokens(
+                token_embeds=embeddings.clone(),
+                batch_size=batch_size,
+                cache_len=group + 2,
+            )
+        else:
+            pass
+    return torch.stack(logits, dim=1).cpu()
 
 
 @dataclass(kw_only=True)
@@ -41,7 +90,19 @@ def main() -> None:
     parser.add_argument("--memory-fraction", type=float, required=True)
     parser.add_argument("--gpu", type=int, required=True)
     parser.add_argument("--output-directory", type=Path, required=True)
+    parser.add_argument("--checkpoint-reference", type=Path)
     arguments = parser.parse_args()
+    if arguments.checkpoint_reference is not None:
+        reference_report = ReferenceReport.model_validate_json(
+            arguments.checkpoint_reference.read_bytes()
+        )
+        assert reference_report.model_revision == arguments.model_revision
+        reference_frames = {
+            request.request_id: request.frames for request in reference_report.requests
+        }
+        assert set(arguments.request_id) <= reference_frames.keys()
+    else:
+        reference_frames = {}
     arguments.output_directory.mkdir(exist_ok=False)
     torch.cuda.set_device(arguments.gpu)
     checkpoint_directory = snapshot_download(
@@ -74,6 +135,8 @@ def main() -> None:
     exact_captured_batches = 0
     repeat_exact_batches = 0
     changed_selected_frames = {request_id: [] for request_id in requested_ids}
+    normalization_agreements = {name: 0 for name in ("fused", "plain", "checkpoint")}
+    normalization_choices = 0
     with (arguments.output_directory / "batches.jsonl").open("w") as reports:
         for line in (
             (arguments.capture_directory / "steps.jsonl").read_text().splitlines()
@@ -157,6 +220,33 @@ def main() -> None:
                 torch.equal(first, repeated)
                 for first, repeated in zip(runs[0], runs[2], strict=True)
             )
+            forced_runs = []
+            if arguments.checkpoint_reference is not None:
+                assert captured_exact and repeated_exact
+                exact_add_norm = native.predictor_exact_add_norm
+                norms = [
+                    module
+                    for module in native.code_predictor.model.modules()
+                    if isinstance(module, RMSNorm)
+                ]
+                assert norms and all(not norm.cast_x_before_out_mul for norm in norms)
+                for mode in ("fused", "plain", "checkpoint"):
+                    native.predictor_fused_layers = fused if mode == "fused" else None
+                    native.predictor_exact_add_norm = (
+                        exact_add_norm if mode != "checkpoint" else False
+                    )
+                    for norm in norms:
+                        norm.cast_x_before_out_mul = mode == "checkpoint"
+                    forced_runs.append(
+                        forced_prefix_logits(native, hidden_states, fused_codes.cuda())
+                    )
+                for norm in norms:
+                    norm.cast_x_before_out_mul = False
+                native.predictor_exact_add_norm = exact_add_norm
+                native.predictor_fused_layers = fused
+                assert torch.equal(forced_runs[0], fused_logits)
+            else:
+                pass
             exact_captured_batches += captured_exact
             repeat_exact_batches += repeated_exact
             total_batches += 1
@@ -194,6 +284,35 @@ def main() -> None:
                             ),
                         }
                     )
+                    if arguments.checkpoint_reference is not None:
+                        frame_index = metadata.frame_indices[row]
+                        reference = reference_frames[request_id][frame_index]
+                        assert reference.frame_index == frame_index
+                        choices = [values[row].argmax(-1) for values in forced_runs]
+                        expected = torch.tensor(
+                            reference.checkpoint_forced_prefix_argmax
+                        )
+                        selected[-1]["forced_prefix_argmax"] = {
+                            mode: values.tolist()
+                            for mode, values in zip(
+                                normalization_agreements, choices, strict=True
+                            )
+                        }
+                        selected[-1][
+                            "checkpoint_forced_prefix_argmax"
+                        ] = expected.tolist()
+                        if not reference.is_codec_eos:
+                            normalization_choices += len(expected)
+                            for mode, values in zip(
+                                normalization_agreements, choices, strict=True
+                            ):
+                                normalization_agreements[mode] += int(
+                                    (values == expected).sum()
+                                )
+                        else:
+                            pass
+                    else:
+                        pass
                 else:
                     pass
             reports.write(
@@ -248,6 +367,11 @@ def main() -> None:
             request_id: len(steps) for request_id, steps in covered_steps.items()
         },
         "changed_selected_frames": changed_selected_frames,
+        "checkpoint_normalization_control": {
+            "non_eos_choices": normalization_choices,
+            "agreements": normalization_agreements,
+            "scope": "Forced original query and codec prefixes at the original padded native geometry. Checkpoint mode uses the plain predictor and normalized-value BF16 rounding before multiplying all predictor norm weights. Projection and attention kernels remain native. This is not a free-generation quality or speed result.",
+        },
         "scope": "Original full padded predictor inputs, integer dtype, batch geometry and checkpoint weights. Fused/plain/fused controls isolate arithmetic from Thinker scheduling. Failure to reproduce captured logits, codes and feedback invalidates attribution to the original live frame.",
     }
     (arguments.output_directory / "summary.json").write_text(
