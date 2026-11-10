@@ -67,8 +67,13 @@ class ThinkerCacheHistory:
         )
         request_rows = []
         input_offset = 0
-        for request, sequence_tokens, prefix_tokens in zip(
-            schedule_batch.reqs, sequence_lengths, prefix_lengths, strict=True
+        request_pool_indices = forward_batch.req_pool_indices.tolist()
+        for request, sequence_tokens, prefix_tokens, request_pool_index in zip(
+            schedule_batch.reqs,
+            sequence_lengths,
+            prefix_lengths,
+            request_pool_indices,
+            strict=True,
         ):
             token_ids = (list(request.origin_input_ids) + list(request.output_ids))[
                 :sequence_tokens
@@ -82,7 +87,7 @@ class ThinkerCacheHistory:
                 ].tolist()
             )
             slot_ids = self.request_to_token[
-                request.req_pool_idx, :sequence_tokens
+                request_pool_index, :sequence_tokens
             ].long()
             assert torch.equal(
                 slot_ids[prefix_tokens:],
