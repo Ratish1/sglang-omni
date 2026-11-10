@@ -19,12 +19,12 @@ from pydantic import BaseModel, TypeAdapter
 from transformers import Qwen3OmniMoeForConditionalGeneration, Qwen3OmniMoeProcessor
 from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import (
     Qwen3OmniMoeCode2Wav,
-    Qwen3OmniMoeRotaryEmbedding,
-    Qwen3OmniMoeThinkerTextRotaryEmbedding,
-    Qwen3OmniMoeVisionRotaryEmbedding,
 )
 
-from scripts.qwen3_omni_checkpoint_weights import audit_checkpoint_weights
+from scripts.qwen3_omni_checkpoint_weights import (
+    audit_checkpoint_buffers,
+    audit_checkpoint_weights,
+)
 from sglang_omni.sampling.seed import derive_sampling_seed
 from sglang_omni.serve.protocol import ChatCompletionRequest
 
@@ -100,60 +100,6 @@ class TensorCallObservation:
         )
 
 
-def audit_rotary_buffers(
-    model: Qwen3OmniMoeForConditionalGeneration,
-    output_directory: Path,
-    phase: Literal["loaded", "generated"],
-) -> None:
-    reports = []
-    frequency_operands: dict[str, torch.Tensor] = {}
-    for module_path, module in model.named_modules():
-        if isinstance(
-            module,
-            (
-                Qwen3OmniMoeRotaryEmbedding,
-                Qwen3OmniMoeThinkerTextRotaryEmbedding,
-                Qwen3OmniMoeVisionRotaryEmbedding,
-            ),
-        ):
-            reference_rotary = type(module)(module.config)
-            for buffer_name, frequencies, reference_frequencies in (
-                ("inv_freq", module.inv_freq, reference_rotary.inv_freq),
-                (
-                    "original_inv_freq",
-                    module.original_inv_freq,
-                    reference_rotary.original_inv_freq,
-                ),
-            ):
-                frequencies = frequencies.detach().cpu()
-                reference_frequencies = reference_frequencies.detach().cpu()
-                buffer_path = f"{module_path}.{buffer_name}"
-                frequency_operands[f"{buffer_path}.actual"] = frequencies
-                frequency_operands[f"{buffer_path}.expected"] = reference_frequencies
-                reports.append(
-                    {
-                        "buffer": buffer_path,
-                        "dtype": str(frequencies.dtype),
-                        "expected_dtype": str(reference_frequencies.dtype),
-                        "exact_config": torch.equal(frequencies, reference_frequencies),
-                        "different_values": int(
-                            (frequencies != reference_frequencies).sum()
-                        ),
-                        "maximum_absolute_error": float(
-                            (frequencies.float() - reference_frequencies.float())
-                            .abs()
-                            .max()
-                        ),
-                    }
-                )
-        else:
-            pass
-    (output_directory / f"{phase}-rotary-buffers.json").write_text(
-        json.dumps(reports, indent=2)
-    )
-    torch.save(frequency_operands, output_directory / f"{phase}-rotary-buffers.pt")
-
-
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model-path", required=True)
@@ -184,7 +130,7 @@ def main() -> None:
     assert not loading["mismatched_keys"], loading["mismatched_keys"]
     assert not loading["unexpected_keys"], loading["unexpected_keys"]
     model.eval()
-    audit_rotary_buffers(model, arguments.output_directory, "loaded")
+    audit_checkpoint_buffers(model, arguments.output_directory / "loaded-model-buffers")
     processor = Qwen3OmniMoeProcessor.from_pretrained(
         arguments.model_path, revision=arguments.model_revision
     )
@@ -380,7 +326,9 @@ def main() -> None:
             indent=2,
         )
     )
-    audit_rotary_buffers(model, arguments.output_directory, "generated")
+    audit_checkpoint_buffers(
+        model, arguments.output_directory / "generated-model-buffers"
+    )
     checkpoint_directory = Path(
         snapshot_download(
             arguments.model_path,

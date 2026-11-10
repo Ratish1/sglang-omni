@@ -13,7 +13,11 @@ from safetensors import safe_open
 from transformers import Qwen3OmniMoeForConditionalGeneration
 from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import (
     Qwen3OmniMoeCode2Wav,
+    Qwen3OmniMoeRotaryEmbedding,
     Qwen3OmniMoeTalkerForConditionalGeneration,
+    Qwen3OmniMoeThinkerTextRotaryEmbedding,
+    Qwen3OmniMoeVisionRotaryEmbedding,
+    SinusoidsPositionEmbedding,
 )
 
 EXPERT_WEIGHT = re.compile(
@@ -23,6 +27,67 @@ EXPERT_WEIGHT = re.compile(
 
 class CheckpointIndex(BaseModel):
     weight_map: dict[str, str]
+
+
+def audit_checkpoint_buffers(
+    model: Qwen3OmniMoeForConditionalGeneration,
+    output_prefix: Path,
+) -> None:
+    expected_buffers: dict[str, torch.Tensor] = {}
+    for module_path, module in model.named_modules():
+        if isinstance(
+            module,
+            (
+                Qwen3OmniMoeRotaryEmbedding,
+                Qwen3OmniMoeThinkerTextRotaryEmbedding,
+                Qwen3OmniMoeVisionRotaryEmbedding,
+            ),
+        ):
+            reference_rotary = type(module)(module.config)
+            expected_buffers[f"{module_path}.inv_freq"] = reference_rotary.inv_freq
+            expected_buffers[f"{module_path}.original_inv_freq"] = (
+                reference_rotary.original_inv_freq
+            )
+        elif isinstance(module, SinusoidsPositionEmbedding):
+            position_embeddings = module.compute_default_singular_positional_embedding()
+            if module.positional_embedding.dtype == model.dtype:
+                position_embeddings = position_embeddings.to(model.dtype)
+            else:
+                pass
+            expected_buffers[f"{module_path}.positional_embedding"] = (
+                position_embeddings
+            )
+        elif isinstance(module, Qwen3OmniMoeCode2Wav):
+            expected_buffers[f"{module_path}.code_offset"] = (
+                torch.arange(module.config.num_quantizers).view(1, -1, 1)
+                * module.config.codebook_size
+            )
+        else:
+            pass
+    actual_buffers = dict(model.named_buffers())
+    assert actual_buffers.keys() == expected_buffers.keys()
+    reports = []
+    buffer_operands: dict[str, torch.Tensor] = {}
+    for buffer_path, expected in expected_buffers.items():
+        actual = actual_buffers[buffer_path].detach().cpu()
+        expected = expected.detach().cpu()
+        buffer_operands[f"{buffer_path}.actual"] = actual
+        buffer_operands[f"{buffer_path}.expected"] = expected
+        reports.append(
+            {
+                "buffer": buffer_path,
+                "dtype": str(actual.dtype),
+                "expected_dtype": str(expected.dtype),
+                "exact_config": actual.dtype == expected.dtype
+                and torch.equal(actual, expected),
+                "different_values": int((actual != expected).sum()),
+                "maximum_absolute_error": float(
+                    (actual.double() - expected.double()).abs().max()
+                ),
+            }
+        )
+    output_prefix.with_suffix(".json").write_text(json.dumps(reports, indent=2))
+    torch.save(buffer_operands, output_prefix.with_suffix(".pt"))
 
 
 @torch.inference_mode()
