@@ -163,6 +163,11 @@ def load_code2wav_model(
         device=device,
         strict=False,
     )
+    # note (ratish): weight conversion rounds rotary frequencies, which must stay in float32.
+    rotary_embedding = model.pre_transformer.rotary_emb
+    model.pre_transformer.rotary_emb = type(rotary_embedding)(code2wav_config).to(
+        rotary_embedding.inv_freq.device
+    )
     if current_platform.is_cuda() and torch.device(device).type == "cuda":
         model.use_channels_last()
         if model.dtype in (torch.bfloat16, torch.float16):
