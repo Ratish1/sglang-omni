@@ -16,6 +16,7 @@ import soundfile
 import torch
 from huggingface_hub import snapshot_download
 from pydantic import BaseModel, TypeAdapter
+from torch.utils.hooks import RemovableHandle
 from transformers import Qwen3OmniMoeForConditionalGeneration, Qwen3OmniMoeProcessor
 from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import (
     Qwen3OmniMoeCode2Wav,
@@ -35,6 +36,7 @@ class ReferenceCase(BaseModel):
     sample_id: str
     target_text: str
     request_file: Path
+    capture_generation: bool = True
 
 
 @dataclass(kw_only=True)
@@ -156,28 +158,31 @@ def main() -> None:
     else:
         pass
     generation_observations: list[TensorCallObservation] = []
+    generation_modules: dict[str, torch.nn.Module] = {}
+    generation_hook_handles: list[RemovableHandle] = []
     if arguments.save_generation_trace:
-        observed_modules = [
-            ("audio_projection", model.thinker.audio_tower.proj2),
-            ("text_embedding", model.thinker.model.embed_tokens),
-            ("thinker_rotary", model.thinker.model.rotary_emb),
-            ("text_projection", model.talker.text_projection),
-            ("hidden_projection", model.talker.hidden_projection),
-            ("talker_rotary", model.talker.model.rotary_emb),
-            ("codec_head", model.talker.codec_head),
-            ("predictor_rotary", model.talker.code_predictor.model.rotary_emb),
-            ("vocoder_rotary", model.code2wav.pre_transformer.rotary_emb),
-            *(
-                (f"residual_head_{index}", projection)
-                for index, projection in enumerate(model.talker.code_predictor.lm_head)
-            ),
-        ]
-        for operation_name, module in observed_modules:
+        generation_modules = {
+            "audio_projection": model.thinker.audio_tower.proj2,
+            "text_embedding": model.thinker.model.embed_tokens,
+            "thinker_rotary": model.thinker.model.rotary_emb,
+            "text_projection": model.talker.text_projection,
+            "hidden_projection": model.talker.hidden_projection,
+            "talker_rotary": model.talker.model.rotary_emb,
+            "codec_head": model.talker.codec_head,
+            "predictor_rotary": model.talker.code_predictor.model.rotary_emb,
+            "vocoder_rotary": model.code2wav.pre_transformer.rotary_emb,
+            **{
+                f"residual_head_{index}": residual_head
+                for index, residual_head in enumerate(
+                    model.talker.code_predictor.lm_head
+                )
+            },
+        }
+        for operation_name in generation_modules:
             generation_observation = TensorCallObservation(
                 operation_name=operation_name
             )
             generation_observations.append(generation_observation)
-            module.register_forward_hook(generation_observation)
     else:
         pass
     reports = []
@@ -210,8 +215,18 @@ def main() -> None:
             observation.calls = 0
             observation.last_output = None
         codec_observation.codec_chunks.clear()
+        for hook_handle in generation_hook_handles:
+            hook_handle.remove()
+        generation_hook_handles.clear()
         for generation_observation in generation_observations:
             generation_observation.tensor_calls.clear()
+            if case.capture_generation:
+                module = generation_modules[generation_observation.operation_name]
+                generation_hook_handles.append(
+                    module.register_forward_hook(generation_observation)
+                )
+            else:
+                pass
         if arguments.save_generation_trace:
             processor_inputs = {
                 name: tensor.detach().cpu() for name, tensor in inputs.items()
@@ -297,6 +312,8 @@ def main() -> None:
             "codec_chunk_shapes": [
                 list(chunk.shape) for chunk in codec_observation.codec_chunks
             ],
+            "capture_generation": arguments.save_generation_trace
+            and case.capture_generation,
             "layers": layer_reports,
         }
         reports.append(report)
