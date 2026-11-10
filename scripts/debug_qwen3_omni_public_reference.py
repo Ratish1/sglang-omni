@@ -14,9 +14,11 @@ from typing import Literal
 
 import soundfile
 import torch
+from huggingface_hub import snapshot_download
 from pydantic import BaseModel, TypeAdapter
 from transformers import Qwen3OmniMoeForConditionalGeneration, Qwen3OmniMoeProcessor
 
+from scripts.qwen3_omni_checkpoint_weights import audit_checkpoint_weights
 from sglang_omni.sampling.seed import derive_sampling_seed
 from sglang_omni.serve.protocol import ChatCompletionRequest
 
@@ -50,9 +52,11 @@ class LayerObservation:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model-path", required=True)
+    parser.add_argument("--model-revision", required=True)
     parser.add_argument("--case-file", type=Path, required=True)
     parser.add_argument("--gpu", type=int, required=True)
     parser.add_argument("--output-directory", type=Path, required=True)
+    parser.add_argument("--observe-layers", action="store_true")
     arguments = parser.parse_args()
     cases = TypeAdapter(list[ReferenceCase]).validate_json(
         arguments.case_file.read_text()
@@ -61,6 +65,7 @@ def main() -> None:
     torch.cuda.set_device(arguments.gpu)
     model, loading = Qwen3OmniMoeForConditionalGeneration.from_pretrained(
         arguments.model_path,
+        revision=arguments.model_revision,
         dtype=torch.bfloat16,
         device_map={"": arguments.gpu},
         attn_implementation="sdpa",
@@ -72,20 +77,25 @@ def main() -> None:
     assert not loading["mismatched_keys"], loading["mismatched_keys"]
     assert not loading["unexpected_keys"], loading["unexpected_keys"]
     model.eval()
-    processor = Qwen3OmniMoeProcessor.from_pretrained(arguments.model_path)
+    processor = Qwen3OmniMoeProcessor.from_pretrained(
+        arguments.model_path, revision=arguments.model_revision
+    )
     layer_observations: list[LayerObservation] = []
-    for family, layers in (
-        ("audio", model.thinker.audio_tower.layers),
-        ("vision", model.thinker.visual.blocks),
-        ("thinker", model.thinker.model.layers),
-        ("talker", model.talker.model.layers),
-        ("predictor", model.talker.code_predictor.model.layers),
-        ("vocoder", model.code2wav.pre_transformer.layers),
-    ):
-        for layer_index, layer in enumerate(layers):
-            observation = LayerObservation(family=family, layer_index=layer_index)
-            layer_observations.append(observation)
-            layer.register_forward_hook(observation)
+    if arguments.observe_layers:
+        for family, layers in (
+            ("audio", model.thinker.audio_tower.layers),
+            ("vision", model.thinker.visual.blocks),
+            ("thinker", model.thinker.model.layers),
+            ("talker", model.talker.model.layers),
+            ("predictor", model.talker.code_predictor.model.layers),
+            ("vocoder", model.code2wav.pre_transformer.layers),
+        ):
+            for layer_index, layer in enumerate(layers):
+                observation = LayerObservation(family=family, layer_index=layer_index)
+                layer_observations.append(observation)
+                layer.register_forward_hook(observation)
+    else:
+        pass
     reports = []
     generated = []
     for case in cases:
@@ -179,16 +189,30 @@ def main() -> None:
         json.dumps(
             {
                 "model_path": arguments.model_path,
+                "model_revision": arguments.model_revision,
+                "observe_layers": arguments.observe_layers,
                 "transformers": version("transformers"),
                 "torch": version("torch"),
                 "parameter_dtypes": sorted(
                     {str(parameter.dtype) for parameter in model.parameters()}
                 ),
                 "cases": reports,
-                "scope": "Full public checkpoint generation with real preprocessing and no frozen hidden states. Torch RNG is reproducible but is not the server's counter-based random stream. These generations are not a same-noise numerical comparison or a speed benchmark. Layer observations count execution and check each last output, not every intermediate of every frame. Vision is not exercised by these audio/text cases.",
+                "scope": "Full public checkpoint generation with real preprocessing and no frozen hidden states. Torch RNG and the sampled residual-code predictor differ from the native counter-based main-code RNG and greedy residual codes. These generations are not a same-noise numerical comparison or a speed benchmark. Optional layer observations count execution and check each last output, not every intermediate of every frame. Vision is not exercised by these audio/text cases.",
             },
             indent=2,
         )
+    )
+    checkpoint_directory = Path(
+        snapshot_download(
+            arguments.model_path,
+            revision=arguments.model_revision,
+            local_files_only=True,
+        )
+    )
+    audit_checkpoint_weights(
+        model,
+        checkpoint_directory,
+        arguments.output_directory / "loaded-weight-audit.json",
     )
 
 
