@@ -5,10 +5,11 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+from contextlib import nullcontext
 from pathlib import Path
 
 import torch
-from flashinfer.autotuner import AutoTuner
+from flashinfer.autotuner import AutoTuner, autotune
 from flashinfer.fused_moe import cutlass_fused_moe
 from huggingface_hub import snapshot_download
 from transformers import Qwen3OmniMoeConfig
@@ -29,6 +30,7 @@ def main() -> None:
     parser.add_argument(
         "--routing-scale-dtype", choices=("bfloat16", "float32"), required=True
     )
+    parser.add_argument("--prefill-gemm1-fallback-above-rows", type=int)
     arguments = parser.parse_args()
     arguments.output_directory.mkdir(exist_ok=False)
     assert AutoTuner.get().load_configs(str(arguments.autotune_cache))
@@ -58,6 +60,7 @@ def main() -> None:
         ).hexdigest(),
         "steps": len(steps),
         "routing_scale_dtype": arguments.routing_scale_dtype,
+        "prefill_gemm1_fallback_above_rows": arguments.prefill_gemm1_fallback_above_rows,
         "routing_scale_scope": "The TopK hook precedes the model's routing-weight cast. Replay applies the serving source's selected storage dtype and restores FP32 for the kernel ABI.",
         "layers": [],
         "scope": "All actual prefill, decode and padding inputs, IDs and scales are replayed at their original row count. Exactness checks cover every non-padding row, including all prefill tokens, not only the final query. No missing rows are synthesized.",
@@ -113,17 +116,28 @@ def main() -> None:
                 real_rows = int(saved["real_rows"])
                 assert 0 < real_rows <= inputs.shape[0]
                 assert int(saved["query_indices"].max()) < real_rows
-                output = cutlass_fused_moe(
-                    input=inputs,
-                    token_selected_experts=ids,
-                    token_final_scales=scales,
-                    fc1_expert_weights=w13,
-                    fc2_expert_weights=w2,
-                    output_dtype=inputs.dtype,
-                    quant_scales=None,
-                    use_fused_finalize=False,
-                    tune_max_num_tokens=arguments.tune_max_num_tokens,
-                )[0]
+                if (
+                    arguments.prefill_gemm1_fallback_above_rows is not None
+                    and metadata.phase == "EXTEND"
+                    and inputs.shape[0] > arguments.prefill_gemm1_fallback_above_rows
+                ):
+                    precision_context = autotune(
+                        False, skip_ops={"trtllm::fused_moe::gemm1"}
+                    )
+                else:
+                    precision_context = nullcontext()
+                with precision_context:
+                    output = cutlass_fused_moe(
+                        input=inputs,
+                        token_selected_experts=ids,
+                        token_final_scales=scales,
+                        fc1_expert_weights=w13,
+                        fc2_expert_weights=w2,
+                        output_dtype=inputs.dtype,
+                        quant_scales=None,
+                        use_fused_finalize=False,
+                        tune_max_num_tokens=arguments.tune_max_num_tokens,
+                    )[0]
                 metrics = compare_outputs(actual[:real_rows], output[:real_rows])
                 assert metrics["finite"].all()
                 exact = torch.equal(actual[:real_rows], output[:real_rows])
