@@ -80,7 +80,6 @@ def compile_tile_kernel(
     )
     with (output_directory / "tile-build.log").open("w") as build_log:
         subprocess.run(command, check=True, stdout=build_log, stderr=subprocess.STDOUT)
-    torch.cuda.init()
     status, module = driver.cuModuleLoad(str(cubin).encode())
     assert status == driver.CUresult.CUDA_SUCCESS, status
     status, function = driver.cuModuleGetFunction(module, b"qwen_moe_tile_control")

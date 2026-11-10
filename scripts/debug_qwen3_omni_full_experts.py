@@ -67,12 +67,7 @@ def main() -> None:
         range(config.num_hidden_layers) if arguments.layer is None else arguments.layer
     )
     assert all(0 <= layer < config.num_hidden_layers for layer in layers)
-    if arguments.tile_kernel_control is not None:
-        tile_module, tile_function = compile_tile_kernel(
-            arguments.output_directory, arguments.tile_kernel_control
-        )
-    else:
-        tile_module, tile_function = None, None
+    tile_module, tile_function = None, None
     summary = {
         "model_revision": arguments.model_revision,
         "autotune_cache_sha256": hashlib.sha256(
@@ -112,6 +107,13 @@ def main() -> None:
                     for expert in range(config.num_experts)
                 ]
             )
+            if arguments.tile_kernel_control is not None and tile_function is None:
+                tile_module, tile_function = compile_tile_kernel(
+                    arguments.output_directory, arguments.tile_kernel_control
+                )
+                summary["tile_module_handle"] = int(tile_module)
+            else:
+                pass
             exact_steps = 0
             real_rows_total = 0
             mismatches = []
