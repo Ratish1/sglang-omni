@@ -6,12 +6,15 @@ from __future__ import annotations
 
 import logging
 import os
+from dataclasses import replace
 from pathlib import Path
 from typing import Iterable, Optional, Tuple
 
 import torch
 from sglang.kernels.fused_op import get_fused_op_backend
 from sglang.kernels.spec import KernelBackend
+from sglang.srt.layers.layer_boundary.factories import StageDeclaration
+from sglang.srt.layers.layer_boundary.residual.add_norm import UNFUSED_NORM_READOUT
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.model_executor.runner_utils.capture_mode import get_is_capture_mode
 from sglang.srt.model_loader.weight_utils import default_weight_loader
@@ -379,6 +382,22 @@ class Qwen3OmniMoeTalkerDecoderLayer(Qwen3OmniMoeThinkerTextDecoderLayer):
     sparse_moe_block_cls = Qwen3OmniMoeTalkerSparseMoeBlock
 
 
+class Qwen3OmniMoeCheckpointTalkerDecoderLayer(Qwen3OmniMoeTalkerDecoderLayer):
+    """Round each residual sum before applying the checkpoint normalization."""
+
+    @staticmethod
+    def stage_facts(
+        config: Qwen3OmniMoeTalkerTextConfig, layer_id: int
+    ) -> tuple[StageDeclaration, StageDeclaration]:
+        attention, feed_forward = Qwen3OmniMoeTalkerDecoderLayer.stage_facts(
+            config, layer_id
+        )
+        return (
+            replace(attention, read=UNFUSED_NORM_READOUT),
+            replace(feed_forward, read=UNFUSED_NORM_READOUT),
+        )
+
+
 # ---------------------------------------------------------------------------
 # Talker Text Model
 # ---------------------------------------------------------------------------
@@ -411,9 +430,15 @@ class Qwen3OmniMoeTalkerTextModel(nn.Module):
 
         # Decoder layers
         alt_stream = torch.cuda.Stream() if current_platform.is_cuda() else None
+        self.uses_checkpoint_residual: bool = quant_config is None
+        decoder_layer_class = (
+            Qwen3OmniMoeCheckpointTalkerDecoderLayer
+            if self.uses_checkpoint_residual
+            else Qwen3OmniMoeTalkerDecoderLayer
+        )
         self.layers = make_layers(
             config.num_hidden_layers,
-            lambda idx, prefix: Qwen3OmniMoeTalkerDecoderLayer(
+            lambda idx, prefix: decoder_layer_class(
                 config=config,
                 layer_id=idx,
                 quant_config=quant_config,
@@ -421,14 +446,13 @@ class Qwen3OmniMoeTalkerTextModel(nn.Module):
                 alt_stream=alt_stream,
             ),
             prefix=add_prefix("layers", prefix),
-            stage_facts=lambda idx: Qwen3OmniMoeTalkerDecoderLayer.stage_facts(
-                config, idx
-            ),
+            stage_facts=lambda idx: decoder_layer_class.stage_facts(config, idx),
         )
         self.start_layer = 0
         self.end_layer = config.num_hidden_layers
 
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.norm.cast_x_before_out_mul = self.uses_checkpoint_residual
         self.layers_to_capture = []
         max_batch_size = get_schedule().max_running_requests
         self.cp_enabled = True
@@ -450,6 +474,11 @@ class Qwen3OmniMoeTalkerTextModel(nn.Module):
             self.layers[idx].self_attn.compatible_with_fused_qk_norm_rope = False
             self.layers[idx].self_attn.q_norm.cast_x_before_out_mul = True
             self.layers[idx].self_attn.k_norm.cast_x_before_out_mul = True
+            if self.uses_checkpoint_residual:
+                self.layers[idx].input_layernorm.cast_x_before_out_mul = True
+                self.layers[idx].post_attention_layernorm.cast_x_before_out_mul = True
+            else:
+                pass
 
     def get_input_embeddings(self) -> nn.Embedding:
         return self.codec_embedding
@@ -505,6 +534,10 @@ class Qwen3OmniMoeTalkerTextModel(nn.Module):
                 ),
             )
 
+        if self.uses_checkpoint_residual:
+            hidden_states = residual_batch.fold(hidden_states, forward_batch)
+        else:
+            pass
         hidden_states = residual_batch.final_norm(
             hidden_states, forward_batch, self.norm, skip_empty=True
         )
