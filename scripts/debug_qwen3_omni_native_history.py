@@ -44,6 +44,7 @@ def main() -> None:
     parser.add_argument("--request-id", action="append", required=True)
     parser.add_argument("--gpu", type=int, required=True)
     parser.add_argument("--output-directory", type=Path, required=True)
+    parser.add_argument("--save-frame-logits", action="store_true")
     arguments = parser.parse_args()
     arguments.output_directory.mkdir(exist_ok=False)
     torch.cuda.set_device(arguments.gpu)
@@ -84,6 +85,11 @@ def main() -> None:
         assert trace.main_codes_match
         cache = None
         frames = []
+        frame_logits: dict[str, list[torch.Tensor]] = {
+            "native": [],
+            "checkpoint": [],
+            "positions": [],
+        }
         for frame_index, step_index in enumerate(trace.steps):
             metadata = steps[step_index]
             row = metadata.request_ids.index(request_id)
@@ -129,6 +135,12 @@ def main() -> None:
             logits = reference.codec_head(hidden).float()
             native_hidden = observed["predictor_hidden"][row : row + 1].cuda()
             native_logits = observed["snapshots"]["codec.output"][row : row + 1].cuda()
+            if arguments.save_frame_logits:
+                frame_logits["native"].append(native_logits.cpu())
+                frame_logits["checkpoint"].append(logits.cpu())
+                frame_logits["positions"].append(positions[-1:].cpu())
+            else:
+                pass
             projected = reference.codec_head(native_hidden).float()
             assert hidden.isfinite().all() and logits.isfinite().all()
             selected_code = trace.codes[frame_index][0]
@@ -193,6 +205,13 @@ def main() -> None:
                 }
             )
         report = {"request_id": request_id, "frames": frames}
+        if arguments.save_frame_logits:
+            torch.save(
+                {name: torch.cat(values) for name, values in frame_logits.items()},
+                arguments.output_directory / f"{request_id}-logits.pt",
+            )
+        else:
+            pass
         reports.append(report)
         (arguments.output_directory / "results.json").write_text(
             json.dumps(
