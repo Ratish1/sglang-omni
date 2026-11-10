@@ -26,6 +26,9 @@ def main() -> None:
     parser.add_argument("--output-directory", type=Path, required=True)
     parser.add_argument("--autotune-cache", type=Path, required=True)
     parser.add_argument("--tune-max-num-tokens", type=int, required=True)
+    parser.add_argument(
+        "--routing-scale-dtype", choices=("bfloat16", "float32"), required=True
+    )
     arguments = parser.parse_args()
     arguments.output_directory.mkdir(exist_ok=False)
     assert AutoTuner.get().load_configs(str(arguments.autotune_cache))
@@ -54,6 +57,8 @@ def main() -> None:
             arguments.autotune_cache.read_bytes()
         ).hexdigest(),
         "steps": len(steps),
+        "routing_scale_dtype": arguments.routing_scale_dtype,
+        "routing_scale_scope": "The TopK hook precedes the model's routing-weight cast. Replay applies the serving source's selected storage dtype and restores FP32 for the kernel ABI.",
         "layers": [],
         "scope": "All actual prefill, decode and padding inputs, IDs and scales are replayed at their original row count. Exactness checks cover every non-padding row, including all prefill tokens, not only the final query. No missing rows are synthesized.",
     }
@@ -93,7 +98,16 @@ def main() -> None:
                 prefix = f"backbone.{layer}."
                 inputs = snapshots[prefix + "router.input"].cuda()
                 ids = snapshots[prefix + "expert_ids"].cuda()
-                scales = snapshots[prefix + "expert_weights"].cuda()
+                scales = (
+                    snapshots[prefix + "expert_weights"]
+                    .cuda()
+                    .to(
+                        {"bfloat16": torch.bfloat16, "float32": torch.float32}[
+                            arguments.routing_scale_dtype
+                        ]
+                    )
+                    .float()
+                )
                 actual = snapshots[prefix + "routed"].cuda()
                 assert inputs.shape[0] == metadata.projection_rows[prefix + "router"]
                 real_rows = int(saved["real_rows"])
