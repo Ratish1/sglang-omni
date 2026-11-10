@@ -25,6 +25,20 @@ from benchmarks.tasks.asr import (
 from sglang_omni.client.audio import encode_wav
 
 
+def read_codec_sequence(trace_directory: Path, eos_token_id: int) -> torch.Tensor:
+    trace_files = sorted(trace_directory.glob("*-post_*.pt"))
+    assert trace_files
+    frames = []
+    for trace_file in trace_files:
+        captured = torch.load(trace_file, map_location="cpu", weights_only=True)
+        codes = captured["codec_ids"]
+        if int(codes[0, 0]) == eos_token_id:
+            assert trace_file == trace_files[-1]
+        else:
+            frames.append(codes)
+    return torch.cat(frames, dim=0).T.unsqueeze(0)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model-path", required=True)
@@ -66,17 +80,9 @@ def main() -> None:
     reports = []
     with torch.inference_mode():
         for trace_directory in arguments.trace_directory:
-            trace_files = sorted(trace_directory.glob("*-post_*.pt"))
-            assert trace_files
-            frames = []
-            for trace_file in trace_files:
-                captured = torch.load(trace_file, weights_only=True)
-                codes = captured["codec_ids"]
-                if int(codes[0, 0]) == config.talker_config.codec_eos_token_id:
-                    assert trace_file == trace_files[-1]
-                else:
-                    frames.append(codes)
-            codes = torch.cat(frames, dim=0).T.unsqueeze(0).to(reference.device)
+            codes = read_codec_sequence(
+                trace_directory, config.talker_config.codec_eos_token_id
+            ).to(reference.device)
             waveform = reference(codes).float().reshape(-1).cpu().numpy()
             assert torch.isfinite(torch.from_numpy(waveform)).all()
             wav_bytes = encode_wav(waveform, arguments.sample_rate)
@@ -112,7 +118,7 @@ def main() -> None:
             )
             report = {
                 "trace_directory": str(trace_directory),
-                "non_eos_frames": len(frames),
+                "non_eos_frames": codes.shape[-1],
                 "waveform_samples": len(waveform),
                 "sample_rate": arguments.sample_rate,
                 "waveform_file": str(destination),
