@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Generate checkpoint Talker codes with captured conditioning and native sampling."""
+"""Generate checkpoint Talker codes with captured conditioning and sampling controls."""
 
 from __future__ import annotations
 
@@ -11,7 +11,10 @@ from pathlib import Path
 import torch
 import xxhash
 from huggingface_hub import hf_hub_download
-from sglang.srt.layers.sampler import top_k_top_p_min_p_sampling_from_probs_torch
+from sglang.srt.layers.sampler import (
+    multinomial_with_seed,
+    top_k_top_p_min_p_sampling_from_probs_torch,
+)
 from transformers import Qwen3OmniMoeConfig
 from transformers.cache_utils import DynamicCache
 from transformers.conversion_mapping import (
@@ -42,6 +45,12 @@ def main() -> None:
     parser.add_argument("--repetition-penalty", type=float, required=True)
     parser.add_argument("--top-k", type=int, required=True)
     parser.add_argument("--top-p", type=float, required=True)
+    parser.add_argument(
+        "--sampling-order",
+        choices=("rank", "token"),
+        default="rank",
+        help="Generation noise coordinates; native draw verification remains rank keyed.",
+    )
     parser.add_argument(
         "--normalization-semantics",
         choices=("checkpoint", "native", "native-boundary", "native-query-key"),
@@ -380,15 +389,47 @@ def main() -> None:
                     repeated_tokens, penalized_logits, logits
                 ).masked_fill(~allowed_tokens, float("-inf"))
                 sampling_position = len(prefill) - 1 + frame_index
-                sampled_code = top_k_top_p_min_p_sampling_from_probs_torch(
-                    torch.softmax(sampling_logits / arguments.temperature, dim=-1),
-                    top_k,
-                    top_p,
-                    minimum_probability,
-                    False,
-                    sampling_seed,
-                    torch.tensor([sampling_position], device=reference.device),
-                ).long()
+                probabilities = torch.softmax(
+                    sampling_logits / arguments.temperature, dim=-1
+                )
+                sampling_positions = torch.tensor(
+                    [sampling_position], device=reference.device
+                )
+                if arguments.sampling_order == "rank":
+                    sampled_code = top_k_top_p_min_p_sampling_from_probs_torch(
+                        probabilities,
+                        top_k,
+                        top_p,
+                        minimum_probability,
+                        False,
+                        sampling_seed,
+                        sampling_positions,
+                    ).long()
+                else:
+                    _, filtered_weights, sorted_token_ids, _ = (
+                        top_k_top_p_min_p_sampling_from_probs_torch(
+                            probabilities,
+                            top_k,
+                            top_p,
+                            minimum_probability,
+                            False,
+                            sampling_seed,
+                            sampling_positions,
+                            return_filtered_probs=True,
+                        )
+                    )
+                    weights_by_token = torch.zeros_like(filtered_weights).scatter_(
+                        1, sorted_token_ids.long(), filtered_weights
+                    )
+                    sampled_code = (
+                        multinomial_with_seed(
+                            weights_by_token.double().log(),
+                            sampling_seed,
+                            sampling_positions,
+                        )
+                        .reshape(-1)
+                        .long()
+                    )
                 repeated_tokens[:, sampled_code] = True
                 is_eos = int(sampled_code[0]) == config.codec_eos_token_id
                 generated_ids = torch.cat((generated_ids, sampled_code[:, None]), dim=1)
@@ -492,6 +533,7 @@ def main() -> None:
                     else None
                 ),
                 "normalization_semantics": normalization_mode,
+                "sampling_order": arguments.sampling_order,
                 "normalization_boundary_calls": normalization.boundary_calls,
                 "normalization_query_key_calls": normalization.query_key_calls,
                 "frames": frame_reports,
