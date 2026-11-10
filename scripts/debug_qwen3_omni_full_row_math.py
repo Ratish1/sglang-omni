@@ -22,6 +22,7 @@ def main() -> None:
     parser.add_argument("--model-revision", required=True)
     parser.add_argument("--capture-directory", type=Path, required=True)
     parser.add_argument("--output-directory", type=Path, required=True)
+    parser.add_argument("--routing-only", action="store_true")
     parser.add_argument(
         "--routing-scale-dtype", choices=("bfloat16", "float32"), required=True
     )
@@ -62,7 +63,12 @@ def main() -> None:
     chunks: dict[str, list[torch.Tensor]] = {name: [] for name in fields}
     real_rows_total = 0
     prefill_rows_total = 0
-    with (arguments.output_directory / "rows.jsonl").open("w") as reports:
+    routing_invalid_rows = 0
+    maximum_precast_scale_error = 0.0
+    with (
+        (arguments.output_directory / "rows.jsonl").open("w") as reports,
+        (arguments.output_directory / "routing.jsonl").open("w") as routing_reports,
+    ):
         for metadata in steps:
             saved = torch.load(
                 arguments.capture_directory / f"experts-{metadata.step:06d}.pt",
@@ -75,17 +81,51 @@ def main() -> None:
             assert sum(lengths) == real_rows
             assert len(lengths) == len(metadata.request_ids)
             snapshots = saved["snapshots"]
-            for name in fields:
-                values = []
-                for layer in range(config.num_hidden_layers):
-                    tensor = snapshots[f"backbone.{layer}.{name}"]
-                    assert (
-                        tensor.shape[0]
-                        == metadata.projection_rows[f"backbone.{layer}.router"]
+            if not arguments.routing_only:
+                for name in fields:
+                    values = []
+                    for layer in range(config.num_hidden_layers):
+                        tensor = snapshots[f"backbone.{layer}.{name}"]
+                        assert (
+                            tensor.shape[0]
+                            == metadata.projection_rows[f"backbone.{layer}.router"]
+                        )
+                        assert real_rows <= tensor.shape[0]
+                        values.append(tensor[:real_rows])
+                    chunks[name].append(torch.stack(values))
+            else:
+                pass
+            for layer in range(config.num_hidden_layers):
+                prefix = f"backbone.{layer}."
+                logits = snapshots[prefix + "router.output"][:real_rows].double()
+                ids = snapshots[prefix + "expert_ids"][:real_rows].long()
+                assert ids.min() >= 0 and ids.max() < logits.shape[1]
+                assert (ids.sort(-1).values.diff(dim=-1) > 0).all()
+                selected_logits = logits.gather(1, ids)
+                unselected_maximum = logits.scatter(1, ids, -torch.inf).amax(-1)
+                margin = selected_logits.amin(-1) - unselected_maximum
+                probabilities = logits.softmax(-1).gather(1, ids)
+                probabilities /= probabilities.sum(-1, keepdim=True)
+                recorded_scales = snapshots[prefix + "expert_weights"][:real_rows]
+                scale_errors = (recorded_scales.double() - probabilities).abs().amax(-1)
+                invalid_rows = (margin < 0).nonzero().flatten().tolist()
+                routing_invalid_rows += len(invalid_rows)
+                maximum_precast_scale_error = max(
+                    maximum_precast_scale_error, float(scale_errors.max())
+                )
+                routing_reports.write(
+                    json.dumps(
+                        {
+                            "step": metadata.step,
+                            "layer": layer,
+                            "real_rows": real_rows,
+                            "invalid_source_rows": invalid_rows,
+                            "topk_logit_boundary_margin": margin.tolist(),
+                            "precast_scale_max_absolute_to_fp64": scale_errors.tolist(),
+                        }
                     )
-                    assert real_rows <= tensor.shape[0]
-                    values.append(tensor[:real_rows])
-                chunks[name].append(torch.stack(values))
+                    + "\n"
+                )
             source_row = 0
             for request_id, frame_index, length in zip(
                 metadata.request_ids, metadata.frame_indices, lengths, strict=True
@@ -112,6 +152,26 @@ def main() -> None:
                 assert metadata.phase == "DECODE"
                 assert all(length == 1 for length in lengths)
             real_rows_total += real_rows
+    routing_summary = {
+        "source_commit": subprocess.check_output(
+            ["git", "rev-parse", "HEAD"],
+            cwd=Path(__file__).resolve().parents[1],
+            text=True,
+        ).strip(),
+        "steps": len(steps),
+        "row_layer_checks": real_rows_total * config.num_hidden_layers,
+        "invalid_topk_rows": routing_invalid_rows,
+        "maximum_precast_scale_error_to_fp64": maximum_precast_scale_error,
+        "scope": "Actual recorded logits and selected IDs, with ties accepted at the top-k boundary. FP64 normalized-weight differences are reported before the serving scale cast, without an invented tolerance.",
+    }
+    (arguments.output_directory / "routing-summary.json").write_text(
+        json.dumps(routing_summary, indent=2)
+    )
+    if arguments.routing_only:
+        print(json.dumps(routing_summary), flush=True)
+        return
+    else:
+        pass
     packed = {name: torch.cat(values, dim=1) for name, values in chunks.items()}
     chunks.clear()
     packed["expert_weights"] = (
