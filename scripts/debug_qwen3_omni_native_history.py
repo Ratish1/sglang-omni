@@ -132,6 +132,29 @@ def main() -> None:
             projected = reference.codec_head(native_hidden).float()
             assert hidden.isfinite().all() and logits.isfinite().all()
             selected_code = trace.codes[frame_index][0]
+            codes = observed["codes"][row : row + 1].long().cuda()
+            predictor_inputs = [
+                native_hidden[:, None],
+                reference.model.codec_embedding(codes[:, :1]),
+            ]
+            for group in range(config.num_code_groups - 2):
+                predictor_inputs.append(
+                    reference.code_predictor.model.codec_embedding[group](
+                        codes[:, group + 1 : group + 2]
+                    )
+                )
+            predictor_hidden = reference.code_predictor.model(
+                inputs_embeds=torch.cat(predictor_inputs, dim=1), use_cache=False
+            ).last_hidden_state
+            predictor_logits = torch.stack(
+                [
+                    head(predictor_hidden[:, group + 1])
+                    for group, head in enumerate(reference.code_predictor.lm_head)
+                ],
+                dim=1,
+            ).float()
+            assert predictor_logits.isfinite().all()
+            chosen_logits = predictor_logits.gather(-1, codes[:, 1:, None])
             frames.append(
                 {
                     "frame_index": frame_index,
@@ -139,6 +162,17 @@ def main() -> None:
                     "phase": metadata.phase,
                     "native_projection_rows": metadata.projection_rows["codec"],
                     "native_main_code": selected_code,
+                    "is_codec_eos": selected_code == config.codec_eos_token_id,
+                    "native_residual_codes": codes[0, 1:].tolist(),
+                    "checkpoint_forced_prefix_argmax": predictor_logits.argmax(-1)[
+                        0
+                    ].tolist(),
+                    "checkpoint_forced_prefix_native_code_ranks": (
+                        (predictor_logits > chosen_logits).sum(-1)[0] + 1
+                    ).tolist(),
+                    "checkpoint_forced_prefix_native_code_logit_gaps": (
+                        predictor_logits.max(-1).values - chosen_logits.squeeze(-1)
+                    )[0].tolist(),
                     "head_reprojection_exact": torch.equal(
                         projected, native_logits.float()
                     ),
@@ -164,7 +198,7 @@ def main() -> None:
             json.dumps(
                 {
                     "model_revision": arguments.model_revision,
-                    "scope": "Every captured native input and frame, including its actual feedback and text handoff. The checkpoint builds its own cache along that fixed input history. Reference geometry is one request, not the original padded native batch. No new sampling or waveform generation. Ranks use raw logits before penalties and suppression.",
+                    "scope": "Every captured native input and frame, including its actual feedback and text handoff. The checkpoint backbone builds its own cache along that fixed input history. Separately the checkpoint predictor receives the native backbone query, main code and each native residual-code prefix, isolating predictor error from changed backbone inputs or earlier code choices. Reference geometry is one request, not the original padded native batch. No new sampling or waveform generation. Main-code ranks use raw logits before penalties and suppression. Residual codes on EOS frames are not consumed audio.",
                     "requests": reports,
                 },
                 indent=2,
