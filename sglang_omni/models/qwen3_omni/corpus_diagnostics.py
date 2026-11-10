@@ -22,6 +22,7 @@ from sglang_omni.models.qwen3_omni.corpus_hooks import (
     OutputCapture,
     ProjectionCapture,
     TopKCapture,
+    record_cache_write_checks,
 )
 from sglang_omni.models.qwen3_omni.expert_capture import FullExpertCapture
 from sglang_omni.scheduling.sglang_backend.request_data import SGLangARRequestData
@@ -100,6 +101,7 @@ class TalkerCorpusRecorder:
         self.snapshots: dict[str, torch.Tensor] = {}
         self.counts: dict[str, torch.Tensor] = {}
         self.finite: dict[str, torch.Tensor] = {}
+        self.cache_write_checks: list[torch.Tensor] = []
         self.progress: dict[str, CorpusProgress] = {}
         self.next_ordinal = 0
         self.step_index = 0
@@ -165,6 +167,8 @@ class TalkerCorpusRecorder:
                 )
             row_count = torch.zeros((), device=device, dtype=torch.int64)
             self.counts[f"{prefix}.attention"] = row_count
+            write_check = torch.zeros(3, device=device, dtype=torch.int64)
+            self.cache_write_checks.append(write_check)
             attention.register_forward_hook(
                 AttentionCapture(
                     self.query_indices,
@@ -172,6 +176,7 @@ class TalkerCorpusRecorder:
                     self.snapshots[f"{prefix}.key"],
                     self.snapshots[f"{prefix}.value"],
                     row_count,
+                    write_check,
                 )
             )
             self.install_projection(
@@ -295,6 +300,12 @@ class TalkerCorpusRecorder:
         feedback: torch.Tensor | None,
         captured_graph: bool,
     ) -> None:
+        record_cache_write_checks(
+            self.directory,
+            self.cache_write_checks,
+            forward_batch,
+            [request.request_id for request in requests],
+        )
         if not any(
             self.conditioning.should_capture(request.request_id) for request in requests
         ):

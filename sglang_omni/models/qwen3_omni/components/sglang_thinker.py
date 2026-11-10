@@ -42,6 +42,7 @@ from transformers import PretrainedConfig
 from sglang_omni.models.qwen3_omni.components.thinker_fused_rope import (
     install_thinker_fused_rope,
 )
+from sglang_omni.models.qwen3_omni.corpus_hooks import CacheWriteCapture
 from sglang_omni.models.qwen3_omni.thinker_weight_audit import audit_thinker_weights
 from sglang_omni.quantization import get_weight_preprocessor
 from sglang_omni.sampling.sampler_compile import (
@@ -138,6 +139,18 @@ class Qwen3OmniThinkerForCausalLM(nn.Module):
             )
         self.logits_processor = LogitsProcessor(self.config)
         self.fused_rope_gate = install_thinker_fused_rope(self.model)
+        self.cache_write_checks: list[torch.Tensor] = []
+        write_audit_directory = os.environ.get("SGLANG_OMNI_THINKER_WRITE_AUDIT")
+        if write_audit_directory is not None:
+            Path(write_audit_directory).mkdir(parents=True, exist_ok=True)
+            for layer in self.model.layers:
+                checks = torch.zeros(
+                    3, dtype=torch.int64, device=layer.self_attn.qkv_proj.weight.device
+                )
+                self.cache_write_checks.append(checks)
+                layer.self_attn.attn.register_forward_hook(CacheWriteCapture(checks))
+        else:
+            pass
         # note (ratish): a quantized MoE can share one activation scale across rows,
         # so a padded row's experts could change the live rows' rounding.
         self.decode_live_rows: DecodeLiveRows | None = None

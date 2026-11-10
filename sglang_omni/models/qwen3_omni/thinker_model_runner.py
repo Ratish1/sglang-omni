@@ -21,6 +21,7 @@ from sglang_omni.model_runner.prefill_inputs import (
     get_omni_prefill_inputs,
 )
 from sglang_omni.model_runner.thinker_model_runner import ThinkerModelRunner
+from sglang_omni.models.qwen3_omni.corpus_hooks import record_cache_write_checks
 from sglang_omni.scheduling.types import SchedulerRequest
 
 _PREFILL_AUDIO_INPUT_KEYS = frozenset(
@@ -52,6 +53,34 @@ class Qwen3OmniThinkerModelRunner(ThinkerModelRunner):
     """
 
     supports_speculative_async_decode: bool = True
+
+    def prepare_and_forward(
+        self,
+        forward_batch: ForwardBatch,
+        schedule_batch: ScheduleBatch,
+        requests: list[SchedulerRequest],
+        is_prefill: bool,
+        *,
+        is_lookahead: bool = False,
+    ) -> GenerationBatchResult:
+        result = super().prepare_and_forward(
+            forward_batch,
+            schedule_batch,
+            requests,
+            is_prefill,
+            is_lookahead=is_lookahead,
+        )
+        directory = os.environ.get("SGLANG_OMNI_THINKER_WRITE_AUDIT")
+        if directory is not None:
+            record_cache_write_checks(
+                Path(directory),
+                self.outer_model.cache_write_checks,
+                forward_batch,
+                [request.request_id for request in requests],
+            )
+        else:
+            pass
+        return result
 
     @staticmethod
     def origin_num_tokens(value: object) -> int | None:

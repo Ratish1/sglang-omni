@@ -28,6 +28,7 @@ class FullExpertCapture:
         self.snapshots: dict[str, torch.Tensor] = {}
         self.counts: dict[str, torch.Tensor] = {}
         self.finite: dict[str, torch.Tensor] = {}
+        self.cache_write_checks: dict[str, torch.Tensor] = {}
         for layer_index, layer in enumerate(layers):
             prefix = f"backbone.{layer_index}."
             projections = [
@@ -112,6 +113,8 @@ class FullExpertCapture:
                     )
                 count = torch.zeros((), device=weight.device, dtype=torch.int64)
                 self.counts[prefix + "attention"] = count
+                write_check = torch.zeros(3, device=weight.device, dtype=torch.int64)
+                self.cache_write_checks[prefix] = write_check
                 attention.attn.register_forward_hook(
                     AttentionCapture(
                         None,
@@ -119,6 +122,7 @@ class FullExpertCapture:
                         self.snapshots[prefix + "key"],
                         self.snapshots[prefix + "value"],
                         count,
+                        write_check,
                     )
                 )
             else:
@@ -149,6 +153,10 @@ class FullExpertCapture:
                     name: value.cpu() for name, value in self.finite.items()
                 },
                 "real_rows": real_rows,
+                "cache_write_checks": {
+                    name: checks.cpu()
+                    for name, checks in self.cache_write_checks.items()
+                },
                 "query_indices": query_indices.cpu(),
                 "positions": forward_batch.positions[:real_rows].cpu(),
                 "mrope_positions": (
