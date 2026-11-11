@@ -43,6 +43,7 @@ from sglang_omni.models.qwen3_omni.components.thinker_fused_rope import (
     install_thinker_fused_rope,
 )
 from sglang_omni.models.qwen3_omni.corpus_hooks import CacheWriteCapture
+from sglang_omni.models.qwen3_omni.thinker_decisions import ThinkerDecisionCapture
 from sglang_omni.models.qwen3_omni.thinker_weight_audit import audit_thinker_weights
 from sglang_omni.quantization import get_weight_preprocessor
 from sglang_omni.sampling.sampler_compile import (
@@ -138,6 +139,17 @@ class Qwen3OmniThinkerForCausalLM(nn.Module):
                 prefix=add_prefix("lm_head", prefix),
             )
         self.logits_processor = LogitsProcessor(self.config)
+        decision_directory = os.environ.get("SGLANG_OMNI_THINKER_DECISION_AUDIT")
+        self.decision_capture = (
+            ThinkerDecisionCapture(
+                Path(decision_directory),
+                self.lm_head.weight.new_zeros(
+                    (max_prefill_buffer_tokens(), self.config.hidden_size)
+                ),
+            )
+            if decision_directory is not None
+            else None
+        )
         self.fused_rope_gate = install_thinker_fused_rope(self.model)
         self.cache_write_checks: list[torch.Tensor] = []
         write_audit_directory = os.environ.get("SGLANG_OMNI_THINKER_WRITE_AUDIT")
@@ -268,6 +280,10 @@ class Qwen3OmniThinkerForCausalLM(nn.Module):
         aux_hidden_states = None
         if isinstance(hidden_states, tuple):
             hidden_states, aux_hidden_states = hidden_states
+        else:
+            pass
+        if self.decision_capture is not None:
+            self.decision_capture.capture_hidden(hidden_states, forward_batch)
         else:
             pass
         return self.logits_processor(
