@@ -354,11 +354,14 @@ class Qwen3OmniMoeTalkerSparseMoeBlock(Qwen3OmniMoeThinkerTextSparseMoeBlock):
         shared_output = self.shared_expert(linear_hidden_states)
         shared_gate, _ = self.shared_expert_gate(linear_hidden_states)
         shared_output = shared_output * torch.sigmoid(shared_gate)
-        record_operands = (
-            self.operator_recorder is not None
-            and forward_batch.forward_mode.is_decode()
+        record_operands = self.operator_recorder is not None and (
+            forward_batch.forward_mode.is_decode()
+            or (
+                self.operator_recorder.retain_moe_batches
+                and forward_batch.forward_mode.is_extend()
+            )
         )
-        if record_operands:
+        if record_operands and forward_batch.forward_mode.is_decode():
             self.operator_recorder.record("shared_output", shared_output)
             self.operator_recorder.record("shared_gate", shared_gate)
         else:

@@ -7,7 +7,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 import torch
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 
 from sglang_omni.models.qwen3_omni.layer_operand_capture import (
     LayerOperandRecorder,
@@ -259,12 +259,25 @@ class TalkerConditioningRecorder:
                 },
                 destination / f"{frame_index:04d}-output.pt",
             )
-            if self.operator_recorders and not is_extend:
+            if self.operator_recorders and (not is_extend or self.retain_moe_batches):
                 step = int(self.operator_recorders[0].step_counter)
+                if is_extend:
+                    assert forward_batch.forward_mode == ForwardMode.EXTEND
+                    assert frame_index == 0
+                    assert forward_batch.extend_seq_lens_cpu[row] > 0
+                else:
+                    pass
+                operand_row = (
+                    sum(forward_batch.extend_seq_lens_cpu[: row + 1]) - 1
+                    if is_extend
+                    else row
+                )
                 torch.save(
                     [
                         recorder.read(
-                            step, row, retain_moe_batches=self.retain_moe_batches
+                            step,
+                            operand_row,
+                            retain_moe_batches=self.retain_moe_batches,
                         )
                         for recorder in self.operator_recorders
                     ],
