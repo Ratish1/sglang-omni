@@ -354,14 +354,11 @@ class Qwen3OmniMoeTalkerSparseMoeBlock(Qwen3OmniMoeThinkerTextSparseMoeBlock):
         shared_output = self.shared_expert(linear_hidden_states)
         shared_gate, _ = self.shared_expert_gate(linear_hidden_states)
         shared_output = shared_output * torch.sigmoid(shared_gate)
-        record_operands = self.operator_recorder is not None and (
-            forward_batch.forward_mode.is_decode()
-            or (
-                self.operator_recorder.retain_moe_batches
-                and forward_batch.forward_mode.is_extend()
-            )
+        record_operands = (
+            self.operator_recorder is not None
+            and self.operator_recorder.captures_mode(forward_batch.forward_mode)
         )
-        if record_operands and forward_batch.forward_mode.is_decode():
+        if record_operands:
             self.operator_recorder.record("shared_output", shared_output)
             self.operator_recorder.record("shared_gate", shared_gate)
         else:
@@ -880,9 +877,14 @@ class Qwen3OmniTalker(nn.Module):
             pass
         if os.environ.get("SGLANG_OMNI_DIAGNOSTIC_LAYER_OPERANDS") == "1":
             step_counter = torch.zeros((), dtype=torch.int64, device=device)
+            selected_prefill_token_row = torch.zeros(
+                1, dtype=torch.int64, device=device
+            )
             for layer in self.model.layers:
                 recorder = LayerOperandRecorder(
-                    step_counter=step_counter, retain_moe_batches=retain_moe_batches
+                    step_counter=step_counter,
+                    selected_prefill_token_row=selected_prefill_token_row,
+                    retain_moe_batches=retain_moe_batches,
                 )
                 self.backbone_recorders.append(recorder)
                 layer.operator_recorder = recorder

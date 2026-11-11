@@ -266,9 +266,8 @@ class Qwen3OmniMoeThinkerTextAttention(nn.Module):
         forward_batch: ForwardBatch,
     ):
         qkv, _ = self.qkv_proj(hidden_states)
-        if (
-            self.operator_recorder is not None
-            and forward_batch.forward_mode.is_decode()
+        if self.operator_recorder is not None and self.operator_recorder.captures_mode(
+            forward_batch.forward_mode
         ):
             self.operator_recorder.record("qkv", qkv)
         else:
@@ -329,7 +328,7 @@ class Qwen3OmniMoeThinkerTextAttention(nn.Module):
             )
             if (
                 self.operator_recorder is not None
-                and forward_batch.forward_mode.is_decode()
+                and self.operator_recorder.captures_mode(forward_batch.forward_mode)
             ):
                 self.operator_recorder.record("normalized_query", q)
                 self.operator_recorder.record("normalized_key", k)
@@ -386,7 +385,9 @@ class Qwen3OmniMoeThinkerTextAttention(nn.Module):
             pass
 
         q, k, v, fb = inner_state
-        if self.operator_recorder is not None and fb.forward_mode.is_decode():
+        if self.operator_recorder is not None and self.operator_recorder.captures_mode(
+            fb.forward_mode
+        ):
             self.operator_recorder.record("rotated_query", q)
             self.operator_recorder.record("rotated_key", k)
             self.operator_recorder.record("projected_value", v)
@@ -409,7 +410,9 @@ class Qwen3OmniMoeThinkerTextAttention(nn.Module):
             attn_output = attn_output.to(dtype=v.dtype)
         else:
             pass
-        if self.operator_recorder is not None and fb.forward_mode.is_decode():
+        if self.operator_recorder is not None and self.operator_recorder.captures_mode(
+            fb.forward_mode
+        ):
             self.operator_recorder.record("attention_values", attn_output)
         else:
             pass
@@ -595,18 +598,12 @@ class Qwen3OmniMoeThinkerTextDecoderLayer(nn.Module):
     ) -> torch.Tensor:
         record_operands = (
             self.operator_recorder is not None
-            and forward_batch.forward_mode.is_decode()
+            and self.operator_recorder.captures_mode(forward_batch.forward_mode)
         )
-        record_moe_prefill = (
-            self.operator_recorder is not None
-            and self.operator_recorder.retain_moe_batches
-            and forward_batch.forward_mode.is_extend()
-        )
-        if record_operands or record_moe_prefill:
-            self.operator_recorder.begin(positions)
-        else:
-            pass
         if record_operands:
+            self.operator_recorder.begin(
+                positions, is_prefill=forward_batch.forward_mode.is_extend()
+            )
             self.operator_recorder.record("input_contribution", hidden_states)
             previous_residual = residual_batch.written_residual(forward_batch)
             if previous_residual is not None:
@@ -644,11 +641,8 @@ class Qwen3OmniMoeThinkerTextDecoderLayer(nn.Module):
         else:
             pass
         hidden_states = self.ffn_boundary.prepare(hidden_states, forward_batch)
-        if record_operands or record_moe_prefill:
-            self.operator_recorder.record("mlp_normalized", hidden_states)
-        else:
-            pass
         if record_operands:
+            self.operator_recorder.record("mlp_normalized", hidden_states)
             self.operator_recorder.record(
                 "mlp_residual", residual_batch.written_residual(forward_batch)
             )
