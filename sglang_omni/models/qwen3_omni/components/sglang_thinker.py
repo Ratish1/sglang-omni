@@ -9,9 +9,11 @@ prefill, so this wrapper keeps only the text model and LM head.
 
 from __future__ import annotations
 
+import os
 import time
 from collections.abc import Mapping
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Iterable, Optional, Tuple
 
 import torch
@@ -40,6 +42,7 @@ from transformers import PretrainedConfig
 from sglang_omni.models.qwen3_omni.components.thinker_fused_rope import (
     install_thinker_fused_rope,
 )
+from sglang_omni.models.qwen3_omni.thinker_decisions import ThinkerDecisionCapture
 from sglang_omni.quantization import get_weight_preprocessor
 from sglang_omni.sampling.sampler_compile import (
     SamplerCompileForms,
@@ -134,6 +137,17 @@ class Qwen3OmniThinkerForCausalLM(nn.Module):
                 prefix=add_prefix("lm_head", prefix),
             )
         self.logits_processor = LogitsProcessor(self.config)
+        decision_directory = os.environ.get("SGLANG_OMNI_THINKER_DECISION_AUDIT")
+        self.decision_capture = (
+            ThinkerDecisionCapture(
+                Path(decision_directory),
+                self.lm_head.weight.new_zeros(
+                    (max_prefill_buffer_tokens(), self.config.hidden_size)
+                ),
+            )
+            if decision_directory is not None
+            else None
+        )
         self.fused_rope_gate = install_thinker_fused_rope(self.model)
         # note (ratish): a quantized MoE can share one activation scale across rows,
         # so a padded row's experts could change the live rows' rounding.
@@ -252,6 +266,10 @@ class Qwen3OmniThinkerForCausalLM(nn.Module):
         aux_hidden_states = None
         if isinstance(hidden_states, tuple):
             hidden_states, aux_hidden_states = hidden_states
+        else:
+            pass
+        if self.decision_capture is not None:
+            self.decision_capture.capture_hidden(hidden_states, forward_batch)
         else:
             pass
         return self.logits_processor(

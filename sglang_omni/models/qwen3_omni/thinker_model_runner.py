@@ -51,6 +51,21 @@ class Qwen3OmniThinkerModelRunner(ThinkerModelRunner):
 
     supports_speculative_async_decode: bool = True
 
+    def publish_next_tokens(
+        self,
+        result: GenerationBatchResult,
+        forward_batch: ForwardBatch,
+        schedule_batch: ScheduleBatch,
+        requests: list[SchedulerRequest],
+    ) -> None:
+        super().publish_next_tokens(result, forward_batch, schedule_batch, requests)
+        if self.outer_model.decision_capture is not None:
+            self.outer_model.decision_capture.record(
+                result, forward_batch, schedule_batch, requests
+            )
+        else:
+            pass
+
     @staticmethod
     def origin_num_tokens(value: object) -> int | None:
         if isinstance(value, torch.Tensor):
