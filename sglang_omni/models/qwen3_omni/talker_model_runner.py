@@ -135,7 +135,6 @@ class QwenTalkerModelRunner(ModelRunner["SGLangARRequestData"]):
         is_lookahead: bool = False,
     ) -> None:
         del is_lookahead
-        del forward_batch
         del schedule_batch
         if not self.feedback_enabled:
             return
