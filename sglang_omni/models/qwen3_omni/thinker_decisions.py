@@ -15,51 +15,13 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.models.qwen3_moe import Qwen3MoeDecoderLayer
 from torch import nn
 
+from sglang_omni.models.qwen3_omni.thinker_projection_capture import (
+    FullThinkerProjectionCapture,
+    ThinkerBoundaryCapture,
+)
 from sglang_omni.scheduling.types import SchedulerRequest
 
 TOP_TOKEN_COUNT = 8
-
-
-class ThinkerBoundaryCapture:
-    def __init__(
-        self,
-        query_indices: torch.Tensor,
-        input_rows: torch.Tensor,
-        output_rows: torch.Tensor,
-        observed: torch.Tensor,
-    ) -> None:
-        self.query_indices = query_indices
-        self.input_rows = input_rows
-        self.output_rows = output_rows
-        self.observed = observed
-
-    def capture_input(
-        self,
-        module: nn.Module,
-        arguments: tuple[torch.Tensor] | tuple[torch.Tensor, ForwardBatch | None],
-    ) -> None:
-        if arguments[0].shape[0] == 0:
-            return
-        else:
-            pass
-        assert arguments[0].dtype == self.input_rows.dtype
-        self.input_rows.copy_(arguments[0][self.query_indices])
-        self.observed.fill_(1)
-
-    def __call__(
-        self,
-        module: nn.Module,
-        arguments: tuple[torch.Tensor] | tuple[torch.Tensor, ForwardBatch | None],
-        output: torch.Tensor | tuple[torch.Tensor, torch.Tensor | None],
-    ) -> None:
-        tensor = output if isinstance(output, torch.Tensor) else output[0]
-        if tensor.shape[0] == 0:
-            return
-        else:
-            pass
-        assert tensor.dtype == self.output_rows.dtype
-        self.output_rows.copy_(tensor[self.query_indices])
-        self.observed.add_(1)
 
 
 class ThinkerRoutingCapture:
@@ -103,6 +65,14 @@ class ThinkerDecisionCapture:
         )
         self.request_ids = set(request_ids)
         self.hidden_states = hidden_states
+        full_projection_layers = os.environ.get("SGLANG_OMNI_THINKER_FULL_PROJECTIONS")
+        self.full_projections = (
+            FullThinkerProjectionCapture(
+                directory, layers, hidden_states, full_projection_layers
+            )
+            if full_projection_layers is not None
+            else None
+        )
         self.row_count = torch.zeros((), device=hidden_states.device, dtype=torch.int64)
         self.raw_logits_finite = torch.zeros(
             hidden_states.shape[0], device=hidden_states.device, dtype=torch.bool
@@ -195,6 +165,10 @@ class ThinkerDecisionCapture:
         self.step = 0
 
     def prepare(self, forward_batch: ForwardBatch) -> None:
+        if self.full_projections is not None:
+            self.full_projections.observed.zero_()
+        else:
+            pass
         if not self.layer_boundaries:
             return
         else:
@@ -265,6 +239,11 @@ class ThinkerDecisionCapture:
             )
         else:
             layer_boundaries = {}
+        full_projections = (
+            self.full_projections.snapshot(self.step, live_rows)
+            if self.full_projections is not None
+            else {}
+        )
         filename = f"step-{self.step:06d}.pt"
         torch.save(
             {
@@ -275,6 +254,7 @@ class ThinkerDecisionCapture:
                 "greedy_ids": greedy_ids,
                 "raw_logits_finite": self.raw_logits_finite[:live_rows].cpu().clone(),
                 "layer_boundaries": layer_boundaries,
+                "full_projections": full_projections,
             },
             self.directory / filename,
         )
@@ -304,6 +284,11 @@ class ThinkerDecisionCapture:
                 for row in head_inputs
             ],
             "inputs_before_forward": True,
+            "full_projection_layouts": (
+                self.full_projections.row_layouts
+                if self.full_projections is not None
+                else {}
+            ),
         }
         with (self.directory / "steps.jsonl").open("a") as output:
             output.write(json.dumps(report) + "\n")
