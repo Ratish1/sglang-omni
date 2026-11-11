@@ -26,10 +26,12 @@ class ThinkerBoundaryCapture:
         query_indices: torch.Tensor,
         input_rows: torch.Tensor,
         output_rows: torch.Tensor,
+        observed: torch.Tensor,
     ) -> None:
         self.query_indices = query_indices
         self.input_rows = input_rows
         self.output_rows = output_rows
+        self.observed = observed
 
     def __call__(
         self,
@@ -46,6 +48,7 @@ class ThinkerBoundaryCapture:
         assert tensor.dtype == self.output_rows.dtype
         self.input_rows.copy_(arguments[0][self.query_indices])
         self.output_rows.copy_(tensor[self.query_indices])
+        self.observed.fill_(True)
 
 
 class ThinkerRoutingCapture:
@@ -54,10 +57,12 @@ class ThinkerRoutingCapture:
         query_indices: torch.Tensor,
         expert_ids: torch.Tensor,
         expert_weights: torch.Tensor,
+        observed: torch.Tensor,
     ) -> None:
         self.query_indices = query_indices
         self.expert_ids = expert_ids
         self.expert_weights = expert_weights
+        self.observed = observed
 
     def __call__(
         self,
@@ -72,6 +77,7 @@ class ThinkerRoutingCapture:
             pass
         self.expert_ids.copy_(output.topk_ids[self.query_indices])
         self.expert_weights.copy_(output.topk_weights[self.query_indices])
+        self.observed.fill_(True)
 
 
 class ThinkerDecisionCapture:
@@ -91,6 +97,9 @@ class ThinkerDecisionCapture:
             hidden_states.shape[0], device=hidden_states.device, dtype=torch.bool
         )
         self.layer_boundaries: dict[str, torch.Tensor] = {}
+        self.boundaries_observed = torch.zeros(
+            len(layers), 5, device=hidden_states.device, dtype=torch.bool
+        )
         self.query_indices = torch.zeros(
             len(request_ids), device=hidden_states.device, dtype=torch.long
         )
@@ -98,26 +107,38 @@ class ThinkerDecisionCapture:
             for layer_index, layer in enumerate(layers):
                 assert isinstance(layer, Qwen3MoeDecoderLayer)
                 attention = layer.self_attn
-                for name, module, input_width, output_width in (
+                for boundary_index, (
+                    name,
+                    module,
+                    input_width,
+                    output_width,
+                ) in enumerate(
                     (
-                        "qkv",
-                        attention.qkv_proj,
-                        attention.hidden_size,
-                        attention.q_size + 2 * attention.kv_size,
-                    ),
-                    (
-                        "attention_projection",
-                        attention.o_proj,
-                        attention.q_size,
-                        attention.hidden_size,
-                    ),
-                    (
-                        "gate",
-                        layer.mlp.gate,
-                        attention.hidden_size,
-                        layer.config.num_experts,
-                    ),
-                    ("moe", layer.mlp, attention.hidden_size, attention.hidden_size),
+                        (
+                            "qkv",
+                            attention.qkv_proj,
+                            attention.hidden_size,
+                            attention.q_size + 2 * attention.kv_size,
+                        ),
+                        (
+                            "attention_projection",
+                            attention.o_proj,
+                            attention.q_size,
+                            attention.hidden_size,
+                        ),
+                        (
+                            "gate",
+                            layer.mlp.gate,
+                            attention.hidden_size,
+                            layer.config.num_experts,
+                        ),
+                        (
+                            "moe",
+                            layer.mlp,
+                            attention.hidden_size,
+                            attention.hidden_size,
+                        ),
+                    )
                 ):
                     input_rows = hidden_states.new_zeros(
                         (len(request_ids), input_width)
@@ -133,7 +154,10 @@ class ThinkerDecisionCapture:
                     )
                     module.register_forward_hook(
                         ThinkerBoundaryCapture(
-                            self.query_indices, input_rows, output_rows
+                            self.query_indices,
+                            input_rows,
+                            output_rows,
+                            self.boundaries_observed[layer_index, boundary_index],
                         )
                     )
                 expert_ids = torch.zeros(
@@ -149,7 +173,10 @@ class ThinkerDecisionCapture:
                 )
                 layer.mlp.topk.register_forward_hook(
                     ThinkerRoutingCapture(
-                        self.query_indices, expert_ids, expert_weights
+                        self.query_indices,
+                        expert_ids,
+                        expert_weights,
+                        self.boundaries_observed[layer_index, 4],
                     )
                 )
         else:
@@ -161,6 +188,7 @@ class ThinkerDecisionCapture:
             return
         else:
             pass
+        self.boundaries_observed.zero_()
         if forward_batch.forward_mode.is_extend():
             indices = forward_batch.extend_seq_lens.cumsum(0) - 1
         else:
@@ -215,6 +243,7 @@ class ThinkerDecisionCapture:
         head_inputs = self.hidden_states[:live_rows].cpu().clone()
         assert bool(head_inputs.isfinite().all())
         if self.layer_boundaries:
+            assert bool(self.boundaries_observed.all().cpu())
             assert live_rows <= self.query_indices.numel()
             layer_boundaries = {
                 name: tensor[:live_rows].cpu().clone()

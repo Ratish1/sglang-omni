@@ -4,10 +4,11 @@ from __future__ import annotations
 
 import argparse
 import json
-from collections import Counter
+from collections import Counter, defaultdict
 from dataclasses import dataclass
 from pathlib import Path
 
+import torch
 from pydantic import BaseModel
 
 
@@ -58,17 +59,103 @@ def read_decisions(directory: Path) -> dict[str, list[Decision]]:
     return requests
 
 
+def compare_boundaries(
+    first_directory: Path,
+    second_directory: Path,
+    pairs: dict[tuple[str, str], list[tuple[Decision, Decision]]],
+    output_directory: Path,
+) -> None:
+    counts: dict[str, Counter[str]] = defaultdict(Counter)
+    maximum_errors: dict[str, float] = defaultdict(float)
+    with (output_directory / "layer-differences.jsonl").open("w") as output:
+        for (first_filename, second_filename), rows in pairs.items():
+            first_boundaries = torch.load(
+                first_directory / first_filename,
+                weights_only=True,
+                map_location="cpu",
+                mmap=True,
+            )["layer_boundaries"]
+            second_boundaries = torch.load(
+                second_directory / second_filename,
+                weights_only=True,
+                map_location="cpu",
+                mmap=True,
+            )["layer_boundaries"]
+            assert first_boundaries and set(first_boundaries) == set(second_boundaries)
+            for first, second in rows:
+                changed: list[str] = []
+                equal_inputs_changed_outputs: list[str] = []
+                for name, first_tensor in first_boundaries.items():
+                    second_tensor = second_boundaries[name]
+                    assert isinstance(first_tensor, torch.Tensor)
+                    assert isinstance(second_tensor, torch.Tensor)
+                    before = first_tensor[first.row]
+                    after = second_tensor[second.row]
+                    assert before.shape == after.shape and before.dtype == after.dtype
+                    equal = torch.equal(before, after)
+                    counts[name]["compared_rows"] += 1
+                    counts[name]["changed_rows"] += not equal
+                    if equal:
+                        continue
+                    else:
+                        changed.append(name)
+                    if before.is_floating_point():
+                        maximum_errors[name] = max(
+                            maximum_errors[name],
+                            float((before.double() - after.double()).abs().max()),
+                        )
+                    else:
+                        pass
+                    if name.endswith(".output"):
+                        input_name = name.removesuffix(".output") + ".input"
+                        input_equal = torch.equal(
+                            first_boundaries[input_name][first.row],
+                            second_boundaries[input_name][second.row],
+                        )
+                        counts[name]["equal_query_input_changed_output"] += input_equal
+                        if input_equal:
+                            equal_inputs_changed_outputs.append(name)
+                        else:
+                            pass
+                    else:
+                        pass
+                output.write(
+                    json.dumps(
+                        {
+                            "request_id": first.step.request_ids[first.row],
+                            "output_position": len(
+                                first.step.output_prefixes[first.row]
+                            ),
+                            "changed_fields": changed,
+                            "equal_query_input_changed_outputs": equal_inputs_changed_outputs,
+                        }
+                    )
+                    + "\n"
+                )
+    report = {
+        "boundaries": {
+            name: {**counter, "maximum_absolute_change": maximum_errors.get(name)}
+            for name, counter in counts.items()
+        },
+        "interpretation": "Equal query rows do not establish equal attention history or equal expert-batch geometry.",
+    }
+    (output_directory / "layer-summary.json").write_text(json.dumps(report, indent=2))
+    print(json.dumps({"layer_boundaries": len(counts)}), flush=True)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--first-directory", type=Path, required=True)
     parser.add_argument("--second-directory", type=Path, required=True)
     parser.add_argument("--output-directory", type=Path, required=True)
+    parser.add_argument("--layer-boundaries", action="store_true")
     arguments = parser.parse_args()
     first_requests = read_decisions(arguments.first_directory)
     second_requests = read_decisions(arguments.second_directory)
     assert set(first_requests) == set(second_requests)
     arguments.output_directory.mkdir(exist_ok=False)
     totals: Counter[str] = Counter()
+    pairs: dict[tuple[str, str], list[tuple[Decision, Decision]]] = defaultdict(list)
     with (arguments.output_directory / "requests.jsonl").open("w") as output:
         for request_id, first_history in first_requests.items():
             second_history = second_requests[request_id]
@@ -83,6 +170,12 @@ def main() -> None:
                 ):
                     counts["different_prefix_rows"] += 1
                     continue
+                else:
+                    pass
+                if arguments.layer_boundaries:
+                    pairs[first_step.tensor_file, second_step.tensor_file].append(
+                        (first, second)
+                    )
                 else:
                     pass
                 counts["identical_prefix_rows"] += 1
@@ -155,6 +248,15 @@ def main() -> None:
         json.dumps(report, indent=2)
     )
     print(json.dumps(report), flush=True)
+    if arguments.layer_boundaries:
+        compare_boundaries(
+            arguments.first_directory,
+            arguments.second_directory,
+            pairs,
+            arguments.output_directory,
+        )
+    else:
+        pass
 
 
 if __name__ == "__main__":
