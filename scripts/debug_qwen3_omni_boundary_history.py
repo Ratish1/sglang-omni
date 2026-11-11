@@ -18,6 +18,7 @@ def main() -> None:
     parser.add_argument("--model-path", required=True)
     parser.add_argument("--model-revision", required=True)
     parser.add_argument("--gpu", type=int, required=True)
+    parser.add_argument("--reference-logits-directory", type=Path)
     arguments = parser.parse_args()
     torch.cuda.set_device(arguments.gpu)
     device = torch.device("cuda", arguments.gpu)
@@ -62,6 +63,11 @@ def main() -> None:
         top_p = torch.tensor([parameters["top_p"]], device=device)
         minimum_probability = torch.tensor([parameters["min_p"]], device=device)
         sampling_seed = torch.tensor([parameters["sampling_seed"]], device=device)
+        logit_sources = (
+            ("observed", "checkpoint", "native")
+            if arguments.reference_logits_directory is not None
+            else ("observed",)
+        )
         for frame, output in enumerate(outputs):
             phase = "before_prefill" if bool(output["is_extend"]) else "before_decode"
             before = torch.load(
@@ -113,31 +119,52 @@ def main() -> None:
                 )
             else:
                 combined_exact = None
-            if frame == 0:
-                probabilities = output["logits"].unsqueeze(0).to(device)
-            else:
-                logits = output["logits"].unsqueeze(0).to(device)
-                repeated = torch.zeros_like(logits, dtype=torch.bool)
-                repeated[:, finished["output_ids"][:frame].to(device)] = True
-                penalized = torch.where(
-                    logits > 0,
-                    logits / parameters["repetition_penalty"],
-                    logits * parameters["repetition_penalty"],
+            main_code_choices: dict[str, int] = {}
+            for source in logit_sources:
+                if source == "observed" and frame == 0:
+                    probabilities = output["logits"].unsqueeze(0).to(device)
+                else:
+                    if source == "observed":
+                        logits = output["logits"].unsqueeze(0).to(device)
+                    else:
+                        reference = torch.load(
+                            arguments.reference_logits_directory
+                            / directory.name
+                            / source
+                            / output_files[frame].name,
+                            weights_only=True,
+                        )
+                        reference_inputs = (
+                            prefix.unsqueeze(0)
+                            if frame == 0
+                            else history[frame - 1].view(1, 1, -1)
+                        )
+                        assert torch.equal(
+                            reference["hidden_states"][0], reference_inputs
+                        )
+                        logits = reference["logits"].to(device)
+                    repeated = torch.zeros_like(logits, dtype=torch.bool)
+                    repeated[:, finished["output_ids"][:frame].to(device)] = True
+                    penalized = torch.where(
+                        logits > 0,
+                        logits / parameters["repetition_penalty"],
+                        logits * parameters["repetition_penalty"],
+                    )
+                    logits = torch.where(repeated, penalized, logits)
+                    logits[:, parameters["suppress_tokens"]] = float("-inf")
+                    probabilities = torch.softmax(
+                        logits / parameters["temperature"], dim=-1
+                    )
+                sampled = top_k_top_p_min_p_sampling_from_probs_torch(
+                    probabilities,
+                    top_k,
+                    top_p,
+                    minimum_probability,
+                    False,
+                    sampling_seed,
+                    torch.tensor([expected_position], device=device),
                 )
-                logits = torch.where(repeated, penalized, logits)
-                logits[:, parameters["suppress_tokens"]] = float("-inf")
-                probabilities = torch.softmax(
-                    logits / parameters["temperature"], dim=-1
-                )
-            sampled = top_k_top_p_min_p_sampling_from_probs_torch(
-                probabilities,
-                top_k,
-                top_p,
-                minimum_probability,
-                False,
-                sampling_seed,
-                torch.tensor([expected_position], device=device),
-            )
+                main_code_choices[source] = int(sampled[0])
             frame_reports.append(
                 {
                     "frame": frame,
@@ -149,8 +176,9 @@ def main() -> None:
                     "repetition_mask_exact": repetition_mask_exact,
                     "sampling_seed_exact": seed_exact,
                     "previous_cache_exact": bool(output["past_exact"]),
-                    "sampled_code_exact": int(sampled[0])
+                    "sampled_code_exact": main_code_choices["observed"]
                     == int(output["codec_ids"][0]),
+                    "main_code_choices": main_code_choices,
                 }
             )
         report = {
@@ -166,6 +194,15 @@ def main() -> None:
             "mixed_or_recomputed_prefills": sum(
                 bool(output["is_extend"]) for output in outputs[1:]
             ),
+            "reference_main_code_matches": {
+                source: sum(
+                    row["main_code_choices"][source]
+                    == int(finished["output_ids"][row["frame"]])
+                    for row in frame_reports
+                )
+                for source in logit_sources
+                if source != "observed"
+            },
             "failures": [
                 row
                 for row in frame_reports
