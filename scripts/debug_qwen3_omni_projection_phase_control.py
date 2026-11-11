@@ -10,6 +10,7 @@ from pathlib import Path
 import torch
 import torch.nn.functional as F
 from safetensors import safe_open
+from sglang.srt.batch_invariant_ops.batch_invariant_ops import matmul_persistent
 
 from scripts.debug_qwen3_omni_compare_thinker_decisions import (
     read_boundaries,
@@ -26,6 +27,7 @@ def main() -> None:
     parser.add_argument("--comparison-directory", type=Path, required=True)
     parser.add_argument("--checkpoint-directory", type=Path, required=True)
     parser.add_argument("--output-directory", type=Path, required=True)
+    parser.add_argument("--batch-invariant-reference", action="store_true")
     arguments = parser.parse_args()
     first_requests = read_decisions(arguments.first_directory)
     second_requests = read_decisions(arguments.second_directory)
@@ -83,9 +85,15 @@ def main() -> None:
                 assert torch.equal(
                     inputs, after[name.removesuffix(".output") + ".input"][second.row]
                 )
-                reference = F.linear(inputs.unsqueeze(0).cuda(), weights[layer_index])[
-                    0
-                ].cpu()
+                reference_inputs = inputs.unsqueeze(0).cuda()
+                if arguments.batch_invariant_reference:
+                    reference = matmul_persistent(
+                        reference_inputs, weights[layer_index].T
+                    )[0].cpu()
+                else:
+                    reference = F.linear(reference_inputs, weights[layer_index])[
+                        0
+                    ].cpu()
                 first_output = before[name][first.row]
                 second_output = after[name][second.row]
                 matches_first = torch.equal(reference, first_output)
@@ -139,6 +147,11 @@ def main() -> None:
     )
     report = {
         "counts": dict(counts),
+        "reference": (
+            "sglang.matmul_persistent"
+            if arguments.batch_invariant_reference
+            else "torch.nn.functional.linear"
+        ),
         "scope": "Exact original query rows and raw checkpoint weights. Reusable tensors are query-level math witnesses, not complete padded GEMM operands.",
     }
     (arguments.output_directory / "summary.json").write_text(
