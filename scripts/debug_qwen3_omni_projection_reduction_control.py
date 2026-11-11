@@ -45,6 +45,43 @@ class ProjectionReplay:
     repeat_exact: bool
 
 
+@dataclass(kw_only=True)
+class RowOrderReplay:
+    eager: torch.Tensor
+    before: torch.Tensor
+    reordered: torch.Tensor
+    restored: torch.Tensor
+    permutation: torch.Tensor
+
+
+def replay_row_order(
+    inputs: torch.Tensor,
+    weight: torch.Tensor,
+    saved_input: torch.Tensor,
+    live_rows: int,
+) -> RowOrderReplay:
+    eager = F.linear(inputs, weight)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        output = F.linear(inputs, weight)
+    graph.replay()
+    before = output.clone()
+    permutation = torch.arange(inputs.shape[0], device=inputs.device)
+    permutation[:live_rows] = permutation[:live_rows].flip(0)
+    inputs.copy_(inputs[permutation])
+    graph.replay()
+    reordered = output[permutation].clone()
+    inputs.copy_(saved_input)
+    graph.replay()
+    return RowOrderReplay(
+        eager=eager.cpu(),
+        before=before.cpu(),
+        reordered=reordered.cpu(),
+        restored=output.cpu(),
+        permutation=permutation.cpu(),
+    )
+
+
 def restore_matrix(
     tensor: torch.Tensor, strides: list[int], storage_offset_elements: int
 ) -> torch.Tensor:
@@ -81,6 +118,7 @@ def main() -> None:
     parser.add_argument("--capture-directory", type=Path, required=True)
     parser.add_argument("--checkpoint-directory", type=Path, required=True)
     parser.add_argument("--output-directory", type=Path, required=True)
+    parser.add_argument("--row-order-control", action="store_true")
     arguments = parser.parse_args()
     runtime = ProjectionRuntime.model_validate_json(
         (arguments.capture_directory / "projection-runtime.json").read_bytes()
@@ -144,6 +182,65 @@ def main() -> None:
                         layout.storage_offset_elements,
                     )
                     weight = weights[name]
+                    if arguments.row_order_control:
+                        if metadata.phase != "DECODE" or len(metadata.request_ids) <= 1:
+                            counts["skipped_non_decode_or_single_request"] += 1
+                            continue
+                        else:
+                            pass
+                        row_replay = replay_row_order(
+                            inputs, weight, saved_input, len(metadata.request_ids)
+                        )
+                        order_changes = row_replay.before != row_replay.reordered
+                        native_exact = torch.equal(row_replay.before, actual)
+                        restored_exact = torch.equal(
+                            row_replay.before, row_replay.restored
+                        )
+                        counts["matrix_calls"] += 1
+                        counts["physical_rows"] += layout.rows
+                        counts["native_before_exact"] += native_exact
+                        counts["restored_exact"] += restored_exact
+                        counts["row_order_changes_output"] += bool(order_changes.any())
+                        counts["row_order_changed_coordinates"] += int(
+                            order_changes.sum()
+                        )
+                        counts["changed_padding_coordinates"] += int(
+                            order_changes[len(metadata.request_ids) :].sum()
+                        )
+                        if bool(order_changes.any()):
+                            torch.save(
+                                {
+                                    "permutation": row_replay.permutation,
+                                    "before": row_replay.before,
+                                    "reordered": row_replay.reordered,
+                                    "restored": row_replay.restored,
+                                },
+                                arguments.output_directory
+                                / f"row-order-{metadata.tensor_file.removesuffix('.pt')}-{name}.pt",
+                            )
+                        else:
+                            pass
+                        output.write(
+                            json.dumps(
+                                {
+                                    "tensor_file": metadata.tensor_file,
+                                    "boundary": name,
+                                    "native_before_exact": native_exact,
+                                    "restored_exact": restored_exact,
+                                    "eager_to_graph_exact": torch.equal(
+                                        row_replay.eager, row_replay.before
+                                    ),
+                                    "live_rows": len(metadata.request_ids),
+                                    "physical_rows": layout.rows,
+                                    "changed_coordinates": int(order_changes.sum()),
+                                }
+                            )
+                            + "\n"
+                        )
+                        output.flush()
+                        continue
+                    else:
+                        pass
                     expected = (inputs.double() @ weight.double().T).cpu()
                     assert bool(expected.isfinite().all() & actual.isfinite().all())
                     observations: dict[str, ProjectionReplay] = {}
@@ -224,6 +321,7 @@ def main() -> None:
     report = {
         "counts": dict(counts),
         "runtime": runtime.model_dump(),
+        "row_order_control": arguments.row_order_control,
         "scope": "All actual padded matrices, original strides/offsets and checkpoint-equal loaded weights. No synthetic rows and no model generation under changed precision.",
     }
     (arguments.output_directory / "summary.json").write_text(
