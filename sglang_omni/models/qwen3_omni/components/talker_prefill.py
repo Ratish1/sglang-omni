@@ -259,6 +259,20 @@ class TalkerPrefillBuilder:
             im_end_token_id=self.im_end_token_id,
         )
 
+        if self.model.conditioning_recorder is not None:
+            self.model.conditioning_recorder.record_prompt(
+                str(payload.request_id),
+                prompt_ids,
+                assistant_token_ids,
+                prompt_hidden,
+                speaker_id,
+                prompt_model_inputs,
+                captured_positions is not None,
+                prefill["future_text_rows"],
+            )
+        else:
+            pass
+
         return {
             "input_embeds": prefill["input_embeds"],
             "input_ids": prefill["input_ids"],
@@ -273,6 +287,12 @@ class TalkerPrefillBuilder:
     def append_text_chunk(
         self, req_data: "SGLangARRequestData", chunk: StreamItem
     ) -> None:
+        if self.model.conditioning_recorder is not None:
+            self.model.conditioning_recorder.record_text_chunk(
+                req_data, int(chunk.metadata["token_id"])
+            )
+        else:
+            pass
         if req_data.thinker_chunks_done:
             return
         else:
@@ -291,7 +311,12 @@ class TalkerPrefillBuilder:
             req_data.pending_text_queue = pending_text_queue
         else:
             pass
-        pending_text_queue.append(self.project_assistant_chunk(chunk))
+        projected = self.project_assistant_chunk(chunk)
+        if self.model.conditioning_recorder is not None:
+            self.model.conditioning_recorder.record_enqueue(req_data.req.rid, projected)
+        else:
+            pass
+        pending_text_queue.append(projected)
 
     def mark_thinker_done(self, req_data: "SGLangARRequestData") -> None:
         if req_data.thinker_chunks_done:
@@ -307,6 +332,12 @@ class TalkerPrefillBuilder:
         else:
             pass
         if isinstance(req_data.tts_eos_embed, torch.Tensor):
+            if self.model.conditioning_recorder is not None:
+                self.model.conditioning_recorder.record_enqueue(
+                    req_data.req.rid, req_data.tts_eos_embed
+                )
+            else:
+                pass
             pending_text_queue.append(req_data.tts_eos_embed)
         else:
             pass

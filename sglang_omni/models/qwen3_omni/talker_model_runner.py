@@ -5,17 +5,24 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from collections import deque
+from pathlib import Path
 from queue import Queue
 from typing import TYPE_CHECKING, TypeAlias
 
 import torch
+from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
 
 from sglang_omni.model_runner.base import ModelRunner
 from sglang_omni.model_runner.model_worker import ModelWorker
 from sglang_omni.model_runner.prefill_inputs import (
     OmniPrefillInputs,
     attach_omni_prefill_inputs,
+)
+from sglang_omni.models.qwen3_omni.conditioning_capture import (
+    TalkerConditioningRecorder,
 )
 from sglang_omni.scheduling.message import OutgoingMessage, put_messages
 from sglang_omni.scheduling.pending_text_queue import PendingTextTensorQueue
@@ -74,6 +81,20 @@ class QwenTalkerModelRunner(ModelRunner["SGLangARRequestData"]):
         self.codec_coalesce_frames = max(int(codec_coalesce_frames), 0)
         self.codec_coalesce_first_frames = max(int(codec_coalesce_first_frames), 0)
         self.codec_coalesce_early_frames = max(int(codec_coalesce_early_frames), 0)
+        directory = os.environ.get("SGLANG_OMNI_DIAGNOSTIC_CONDITIONING_DIRECTORY")
+        if directory is not None:
+            request_ids_file = Path(os.environ["SGLANG_OMNI_CORPUS_REQUEST_ID_FILE"])
+            pool = tp_worker.model_runner.token_to_kv_pool
+            assert isinstance(pool, MHATokenToKVPool)
+            self.model.conditioning_recorder = TalkerConditioningRecorder(
+                directory=Path(directory),
+                key_buffers=pool.k_buffer,
+                value_buffers=pool.v_buffer,
+                request_slots=tp_worker.model_runner.req_to_token_pool.req_to_token,
+                request_ids=frozenset(json.loads(request_ids_file.read_text())),
+            )
+        else:
+            pass
 
     def execute(self, scheduler_output: SchedulerOutput) -> ModelRunnerOutput:
         return super().execute(scheduler_output)
@@ -98,6 +119,12 @@ class QwenTalkerModelRunner(ModelRunner["SGLangARRequestData"]):
                 input_embeds_are_projected=input_embeds_are_projected,
             ),
         )
+        if self.model.conditioning_recorder is not None:
+            self.model.conditioning_recorder.record_inputs(
+                forward_batch, requests, input_embeds, None
+            )
+        else:
+            pass
 
     def before_decode(
         self,
@@ -123,6 +150,16 @@ class QwenTalkerModelRunner(ModelRunner["SGLangARRequestData"]):
             pass
 
         self.model.prepare_decode_buffers(requests)
+        if self.model.conditioning_recorder is not None:
+            self.model.conditioning_recorder.record_inputs(
+                forward_batch,
+                requests,
+                None,
+                self.model.sampling_seeds,
+                self.model.repetition_mask,
+            )
+        else:
+            pass
         self.write_feedback_buffers(requests)
 
     def post_prefill(
@@ -154,6 +191,16 @@ class QwenTalkerModelRunner(ModelRunner["SGLangARRequestData"]):
         else:
             pass
         self.model.code_predictor_forward(layer0_codes, talker_hidden)
+        if self.model.conditioning_recorder is not None:
+            self.model.conditioning_recorder.record_outputs(
+                forward_batch,
+                requests,
+                self.model.output_codes,
+                self.model.output_embeds,
+                result.logits_output.next_token_logits,
+            )
+        else:
+            pass
         self.stage_token_ids(result, result.next_token_ids)
         self.emit_code_chunks_and_feedback(
             schedule_batch=schedule_batch,
@@ -174,6 +221,16 @@ class QwenTalkerModelRunner(ModelRunner["SGLangARRequestData"]):
 
         batch_size = len(requests)
         result.next_token_ids = self.model.sampled_token_ids[:batch_size].clone()
+        if self.model.conditioning_recorder is not None:
+            self.model.conditioning_recorder.record_outputs(
+                forward_batch,
+                requests,
+                self.model.output_codes,
+                self.model.output_embeds,
+                result.logits_output.next_token_logits,
+            )
+        else:
+            pass
         self.stage_token_ids(result, result.next_token_ids)
         self.emit_code_chunks_and_feedback(
             schedule_batch=schedule_batch,
@@ -347,6 +404,10 @@ class QwenTalkerModelRunner(ModelRunner["SGLangARRequestData"]):
     def on_request_finished(
         self, request_id: str, req_data: "SGLangARRequestData"
     ) -> None:
+        if self.model.conditioning_recorder is not None:
+            self.model.conditioning_recorder.finish(request_id, req_data)
+        else:
+            pass
         if logger.isEnabledFor(logging.DEBUG):
             request = req_data.req
             assert request is not None and request.finished_reason is not None
@@ -377,6 +438,16 @@ class QwenTalkerModelRunner(ModelRunner["SGLangARRequestData"]):
         pending.append(last_row)
         self.flush_codec_rows(request_id, req_data, code_messages)
         self.put_code_messages(code_messages)
+
+    def process_sampling_logits(
+        self, logits_output: LogitsProcessorOutput, requests: list[SchedulerRequest]
+    ) -> None:
+        if self.model.conditioning_recorder is not None:
+            self.model.conditioning_recorder.record_logits(
+                requests, logits_output.next_token_logits
+            )
+        else:
+            pass
 
     def sample_before_post_prefill(
         self,

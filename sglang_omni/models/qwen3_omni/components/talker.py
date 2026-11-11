@@ -24,6 +24,9 @@ from sglang_omni.models.qwen3_omni.components.thinker_model import (
     Qwen3OmniMoeThinkerTextDecoderLayer,
     Qwen3OmniMoeThinkerTextSparseMoeBlock,
 )
+from sglang_omni.models.qwen3_omni.conditioning_capture import (
+    TalkerConditioningRecorder,
+)
 from sglang_omni.models.qwen3_omni.hf_config import (
     Qwen3OmniMoeTalkerConfig,
     Qwen3OmniMoeTalkerTextConfig,
@@ -774,6 +777,8 @@ class Qwen3OmniMoeTalkerCodePredictor(nn.Module):
 
 class Qwen3OmniTalker(nn.Module):
     """Talker: Text-to-Audio generation model."""
+
+    conditioning_recorder: TalkerConditioningRecorder | None = None
 
     def __init__(
         self,
