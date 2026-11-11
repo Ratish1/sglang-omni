@@ -52,6 +52,9 @@ from sglang_omni.sampling.sampler_compile import (
     compile_sampler_functions,
 )
 
+# note (ratish): all 92 observed same-input phase differences occur in these layers.
+PHASE_VARIANT_OUTPUT_LAYERS = (0, 1)
+
 
 def config_uses_mrope(config: PretrainedConfig) -> bool:
     """Return whether the exact Qwen text config declares M-RoPE."""
@@ -129,11 +132,12 @@ class Qwen3OmniThinkerForCausalLM(nn.Module):
         )
         if os.environ.get("SGLANG_OMNI_THINKER_INVARIANT_OUTPUT_PROJECTIONS") == "1":
             assert quant_config is None
-            for layer in self.model.layers:
+            for layer_index in PHASE_VARIANT_OUTPUT_LAYERS:
+                layer = self.model.layers[layer_index]
                 assert isinstance(layer, Qwen3MoeDecoderLayer)
                 layer.self_attn.o_proj.quant_method = InvariantThinkerOutputProjection()
             logger.info(
-                f"Diagnostic invariant output projections enabled for {len(self.model.layers)} Thinker layers"
+                f"Diagnostic invariant output projections enabled for Thinker layers {PHASE_VARIANT_OUTPUT_LAYERS}"
             )
         else:
             pass
