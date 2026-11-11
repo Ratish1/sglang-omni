@@ -232,7 +232,7 @@ def main() -> None:
                         norm.weight,
                         norm.variance_epsilon,
                     ).reshape_as(raw)
-                    differences[f"{name}_native_norm_replay"] = compare_tensors(
+                    differences[f"{name}_standalone_norm_replay"] = compare_tensors(
                         tensors[f"normalized_{name}"], normalized
                     )
                     differences[f"{name}_checkpoint_norm"] = compare_tensors(
