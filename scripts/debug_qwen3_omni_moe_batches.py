@@ -155,7 +155,7 @@ def main() -> None:
         native_weights.append((packed, down))
     filenames = sorted(directory.glob("*-operators.pt"))
     assert [filename.name for filename in filenames] == [
-        f"{frame:04d}-operators.pt" for frame in range(1, len(finished["output_ids"]))
+        f"{frame:04d}-operators.pt" for frame in range(len(finished["output_ids"]))
     ]
     exact_replays = 0
     comparisons = 0
