@@ -83,11 +83,13 @@ class SpeechComparison:
 
 
 def compare_population(
-    directory: Path, workload: str, recognizer: str
+    baseline_directory: Path, candidate_directory: Path, *, workload: str
 ) -> dict[str, SpeechComparison]:
     populations: dict[str, dict[str, SpeechRecord]] = {}
-    for arm in ("baseline", "candidate"):
-        score_directory = directory / f"{arm}-{workload}-{recognizer}-scores"
+    for arm, score_directory in (
+        ("baseline", baseline_directory),
+        ("candidate", candidate_directory),
+    ):
         assert (score_directory / "summary.json").is_file()
         populations[arm] = {
             source.stem: SpeechRecord.model_validate_json(source.read_bytes())
@@ -181,7 +183,9 @@ def main() -> None:
         f"{workload}-{recognizer}": {
             target: asdict(comparison)
             for target, comparison in compare_population(
-                arguments.directory, workload, recognizer
+                arguments.directory / f"baseline-{workload}-{recognizer}-scores",
+                arguments.directory / f"candidate-{workload}-{recognizer}-scores",
+                workload=workload,
             ).items()
         }
         for workload in ("tts", "mmsu")
