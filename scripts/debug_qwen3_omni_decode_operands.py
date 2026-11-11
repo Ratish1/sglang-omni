@@ -10,6 +10,7 @@ from pathlib import Path
 import torch
 from huggingface_hub import hf_hub_download
 from sgl_kernel import fused_add_rmsnorm, rmsnorm
+from sglang.kernels.ops.layernorm.norm import fused_inplace_qknorm
 from transformers import Qwen3OmniMoeConfig
 from transformers.conversion_mapping import (
     get_checkpoint_conversion_mapping,
@@ -21,6 +22,7 @@ from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import (
 )
 
 from scripts.debug_qwen3_omni_feedback_audit import TensorDifference, compare_tensors
+from scripts.debug_qwen3_omni_sampling_alignment import SamplingParameters
 from scripts.qwen3_omni_checkpoint_weights import audit_checkpoint_weights
 
 
@@ -32,6 +34,7 @@ def main() -> None:
     parser.add_argument("--model-revision", required=True)
     parser.add_argument("--gpu", type=int, required=True)
     parser.add_argument("--output-directory", type=Path, required=True)
+    parser.add_argument("--include-prefill", action="store_true")
     arguments = parser.parse_args()
     arguments.output_directory.mkdir(exist_ok=False)
     torch.cuda.set_device(arguments.gpu)
@@ -91,7 +94,14 @@ def main() -> None:
         "routed_output",
     }
     reports = []
-    for directory in sorted(arguments.capture_directory.iterdir()):
+    directories = sorted(
+        path for path in arguments.capture_directory.iterdir() if path.is_dir()
+    )
+    assert directories
+    for directory in directories:
+        sampling = SamplingParameters.model_validate_json(
+            (directory / "sampling.json").read_bytes()
+        )
         finished = torch.load(directory / "finished.pt", weights_only=True)
         initial = torch.load(directory / "0000-output.pt", weights_only=True)
         assert bool(initial["past_exact"])
@@ -105,7 +115,9 @@ def main() -> None:
         files = sorted(directory.glob("*-operators.pt"))
         assert [filename.name for filename in files] == [
             f"{frame:04d}-operators.pt"
-            for frame in range(1, len(finished["output_ids"]))
+            for frame in range(
+                0 if arguments.include_prefill else 1, len(finished["output_ids"])
+            )
         ]
         destination = arguments.output_directory / directory.name
         destination.mkdir()
@@ -117,11 +129,13 @@ def main() -> None:
             observed = torch.load(
                 directory / f"{frame:04d}-output.pt", weights_only=True
             )
+            phase = "before_prefill" if frame == 0 else "before_decode"
             before = torch.load(
-                directory / f"{frame:04d}-before_decode.pt", weights_only=True
+                directory / f"{frame:04d}-{phase}.pt", weights_only=True
             )
             snapshots = torch.load(filename, weights_only=True)
             assert bool(observed["past_exact"])
+            assert bool(observed["is_extend"]) == (frame == 0)
             assert (
                 len(observed["keys"])
                 == len(observed["values"])
@@ -131,18 +145,80 @@ def main() -> None:
             assert int(observed["codec_ids"][0]) == int(finished["output_ids"][frame])
             assert torch.equal(
                 snapshots[0]["input_contribution"],
-                finished["decode_input_history"][frame - 1],
+                (
+                    before["prefill_embeds"][-1]
+                    if frame == 0
+                    else finished["decode_input_history"][frame - 1]
+                ),
             )
+            position = before["positions"][-1:]
+            if frame == 0:
+                assert int(before["extend_prefix_length"]) == 0
+                assert torch.equal(
+                    before["positions"], torch.arange(len(before["prefill_embeds"]))
+                )
+                assert len(before["prefill_embeds"]) == int(observed["sequence_length"])
+            else:
+                pass
             cosine, sine = reference.model.rotary_emb(
                 snapshots[0]["input_contribution"].to(reference.device).view(1, 1, -1),
-                before["positions"].to(reference.device).view(1, 1, 1).expand(3, 1, 1),
+                position.to(reference.device).view(1, 1, 1).expand(3, 1, 1),
             )
             for index, (snapshot, layer) in enumerate(
                 zip(snapshots, reference.model.layers, strict=True)
             ):
-                assert set(snapshot) == required_fields | (
+                metadata_fields = set()
+                if "batch_selected_row" in snapshot:
+                    batch_fields = {
+                        "mlp_normalized",
+                        "router_logits",
+                        "expert_indices",
+                        "expert_weights",
+                        "routed_output",
+                    }
+                    metadata_fields = (
+                        {f"batch_{name}" for name in batch_fields}
+                        | {f"layout_{name}" for name in batch_fields}
+                        | {
+                            "batch_selected_row",
+                            "batch_is_graph",
+                            "layout_qkv",
+                            "layout_is_prefill",
+                        }
+                    )
+                    assert bool(snapshot["layout_is_prefill"]) == (frame == 0)
+                    packed_layout = snapshot["layout_qkv"].tolist()
+                    assert packed_layout == [
+                        len(snapshot["batch_mlp_normalized"]),
+                        (query_heads + 2 * key_heads) * head_dimensions,
+                        (query_heads + 2 * key_heads) * head_dimensions,
+                        1,
+                        0,
+                    ]
+                    if frame == 0:
+                        metadata_fields.add("layout_prefill_token_row")
+                        assert int(snapshot["layout_prefill_token_row"][0]) == int(
+                            snapshot["batch_selected_row"]
+                        )
+                    else:
+                        pass
+                    for name in batch_fields:
+                        assert torch.equal(
+                            snapshot[f"batch_{name}"][
+                                int(snapshot["batch_selected_row"])
+                            ],
+                            snapshot[name],
+                        )
+                else:
+                    pass
+                assert set(snapshot) == required_fields | metadata_fields | (
                     {"previous_residual"} if index else set()
                 )
+                snapshot = {
+                    name: tensor
+                    for name, tensor in snapshot.items()
+                    if name not in metadata_fields
+                }
                 assert snapshot["positions"].numel() in (1, 3)
                 assert (snapshot["positions"] == before["positions"][-1]).all()
                 for name, tensor in snapshot.items():
@@ -223,6 +299,43 @@ def main() -> None:
                     ),
                     dim=-1,
                 )
+                paired_projection = tensors["qkv"].clone()
+                paired_query = paired_projection.as_strided(
+                    (1, query_heads, head_dimensions),
+                    (paired_projection.stride(0), head_dimensions, 1),
+                )
+                paired_key = paired_projection.as_strided(
+                    (1, key_heads, head_dimensions),
+                    (paired_projection.stride(0), head_dimensions, 1),
+                    storage_offset=query_heads * head_dimensions,
+                )
+                assert (
+                    paired_projection.stride(0)
+                    == (query_heads + 2 * key_heads) * head_dimensions
+                )
+                assert all(
+                    tensor.data_ptr() % 16 == 0
+                    for tensor in (
+                        paired_query,
+                        paired_key,
+                        layer.self_attn.q_norm.weight,
+                        layer.self_attn.k_norm.weight,
+                    )
+                )
+                fused_inplace_qknorm(
+                    q=paired_query,
+                    k=paired_key,
+                    q_weight=layer.self_attn.q_norm.weight,
+                    k_weight=layer.self_attn.k_norm.weight,
+                    eps=layer.self_attn.q_norm.variance_epsilon,
+                    head_dim=head_dimensions,
+                )
+                differences["query_paired_norm_replay"] = compare_tensors(
+                    tensors["normalized_query"], paired_query.reshape_as(query)
+                )
+                differences["key_paired_norm_replay"] = compare_tensors(
+                    tensors["normalized_key"], paired_key.reshape_as(key)
+                )
                 for name, raw, norm in (
                     ("query", query, layer.self_attn.q_norm),
                     ("key", key, layer.self_attn.k_norm),
@@ -253,8 +366,8 @@ def main() -> None:
                 differences["key_checkpoint_rotary"] = compare_tensors(
                     tensors["rotated_key"], key_rotary.reshape_as(key)
                 )
-                current_key = observed["keys"][index].to(reference.device)
-                current_value = observed["values"][index].to(reference.device)
+                current_key = observed["keys"][index][-1:].to(reference.device)
+                current_value = observed["values"][index][-1:].to(reference.device)
                 assert (
                     current_key.shape
                     == current_value.shape
@@ -264,7 +377,7 @@ def main() -> None:
                 assert (
                     native_keys[index].shape
                     == native_values[index].shape
-                    == (int(before["positions"][-1]), key_heads, head_dimensions)
+                    == (int(position[0]) + (frame == 0), key_heads, head_dimensions)
                 )
                 assert (
                     native_keys[index].dtype
@@ -278,8 +391,13 @@ def main() -> None:
                     tensors["projected_value"].reshape_as(current_value), current_value
                 )
                 assert torch.equal(value.reshape_as(current_value), current_value)
-                native_keys[index] = torch.cat((native_keys[index], current_key))
-                native_values[index] = torch.cat((native_values[index], current_value))
+                if frame:
+                    native_keys[index] = torch.cat((native_keys[index], current_key))
+                    native_values[index] = torch.cat(
+                        (native_values[index], current_value)
+                    )
+                else:
+                    pass
                 assert len(native_keys[index]) == int(observed["sequence_length"])
                 keys = (
                     native_keys[index]
@@ -370,11 +488,28 @@ def main() -> None:
                         observed["hidden_states"].to(reference.device).unsqueeze(0),
                         final_hidden,
                     )
+                    captured_logits = (
+                        torch.load(
+                            directory / "0000-prefill-logits.pt", weights_only=True
+                        )
+                        if frame == 0
+                        else observed["logits"]
+                    )
+                    head_logits = reference.codec_head(
+                        observed["hidden_states"].to(reference.device).unsqueeze(0)
+                    ).float()
+                    assert head_logits.isfinite().all()
+                    if frame == 0:
+                        suppressed = torch.zeros_like(captured_logits, dtype=torch.bool)
+                        suppressed[sampling.suppress_tokens] = True
+                        assert torch.equal(captured_logits.isneginf(), suppressed)
+                        assert not suppressed[configuration.codec_eos_token_id]
+                        captured_logits = captured_logits[~suppressed]
+                        head_logits = head_logits[:, (~suppressed).to(reference.device)]
+                    else:
+                        pass
                     differences["head_reprojection"] = compare_tensors(
-                        observed["logits"].to(reference.device).unsqueeze(0),
-                        reference.codec_head(
-                            observed["hidden_states"].to(reference.device).unsqueeze(0)
-                        ).float(),
+                        captured_logits.to(reference.device).unsqueeze(0), head_logits
                     )
                 else:
                     pass
@@ -410,7 +545,10 @@ def main() -> None:
             )
         report = {
             "request_id": directory.name,
-            "decode_frames": len(files),
+            "decode_frames": sum(
+                int(filename.name.split("-")[0]) > 0 for filename in files
+            ),
+            "prefill_frames": int(arguments.include_prefill),
             "layer_rows": layer_rows,
             "exact_counts": exact_counts,
             "maximum_errors": maximum_errors,
