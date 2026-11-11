@@ -10,6 +10,7 @@ from pathlib import Path
 import torch
 from pydantic import BaseModel
 from safetensors import safe_open
+from transformers import AutoTokenizer
 
 
 class CheckpointIndex(BaseModel):
@@ -20,6 +21,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--capture-directory", type=Path, required=True)
     parser.add_argument("--checkpoint-directory", type=Path, required=True)
+    parser.add_argument("--response-directory", type=Path, required=True)
     parser.add_argument("--output-directory", type=Path, required=True)
     arguments = parser.parse_args()
     arguments.output_directory.mkdir(exist_ok=False)
@@ -36,6 +38,7 @@ def main() -> None:
     counts: Counter[str] = Counter()
     maximum_logit_error = 0.0
     seen: set[tuple[str, tuple[int, ...]]] = set()
+    output_tokens: dict[str, list[int]] = {}
     with (
         (arguments.capture_directory / "steps.jsonl").open() as steps,
         (arguments.output_directory / "decisions.jsonl").open("w") as output,
@@ -69,6 +72,8 @@ def main() -> None:
                 else:
                     pass
                 prefix = metadata["output_prefixes"][row]
+                assert prefix == output_tokens.get(request_id, []), request_id
+                output_tokens[request_id] = prefix + [int(tensors["token_ids"][row])]
                 identity = (request_id, tuple(prefix))
                 assert identity not in seen, identity
                 seen.add(identity)
@@ -108,8 +113,23 @@ def main() -> None:
                     )
                     + "\n"
                 )
+    expected_requests = json.loads(
+        (arguments.capture_directory / "request_ids.json").read_text()
+    )
+    assert set(output_tokens) == set(expected_requests)
+    tokenizer = AutoTokenizer.from_pretrained(arguments.checkpoint_directory)
+    for request_id, token_ids in output_tokens.items():
+        response = json.loads(
+            (arguments.response_directory / f"{request_id}.speech.json").read_text()
+        )
+        text = tokenizer.decode(
+            [token_id for token_id in token_ids if token_id != tokenizer.eos_token_id],
+            skip_special_tokens=True,
+        )
+        assert text == response["text"], (request_id, text, response["text"])
     report = {
         "counts": dict(counts),
+        "verified_response_texts": len(output_tokens),
         "maximum_top_logit_error": maximum_logit_error,
         "interpretation": "FP64 differences measure rounding sensitivity, not a serving failure.",
     }
