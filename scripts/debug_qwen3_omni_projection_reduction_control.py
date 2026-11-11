@@ -46,20 +46,22 @@ class ProjectionReplay:
 
 
 @dataclass(kw_only=True)
-class RowOrderReplay:
+class CohortProjectionReplay:
     eager: torch.Tensor
     before: torch.Tensor
-    reordered: torch.Tensor
+    controlled: torch.Tensor
     restored: torch.Tensor
     permutation: torch.Tensor
 
 
-def replay_row_order(
+def replay_cohort_projection(
     inputs: torch.Tensor,
     weight: torch.Tensor,
     saved_input: torch.Tensor,
     live_rows: int,
-) -> RowOrderReplay:
+    *,
+    single_rows: bool,
+) -> CohortProjectionReplay:
     eager = F.linear(inputs, weight)
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
@@ -67,17 +69,34 @@ def replay_row_order(
     graph.replay()
     before = output.clone()
     permutation = torch.arange(inputs.shape[0], device=inputs.device)
-    permutation[:live_rows] = permutation[:live_rows].flip(0)
-    inputs.copy_(inputs[permutation])
-    graph.replay()
-    reordered = output[permutation].clone()
-    inputs.copy_(saved_input)
-    graph.replay()
-    return RowOrderReplay(
+    if single_rows:
+        single_graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(single_graph):
+            single_output = torch.cat(
+                [F.linear(inputs[row : row + 1], weight) for row in range(live_rows)]
+            )
+        single_graph.replay()
+        controlled = single_output.clone()
+        single_graph.replay()
+        assert torch.equal(controlled, single_output)
+        graph.replay()
+        eager = eager[:live_rows]
+        before = before[:live_rows]
+        permutation = permutation[:live_rows]
+        restored = output[:live_rows].clone()
+    else:
+        permutation[:live_rows] = permutation[:live_rows].flip(0)
+        inputs.copy_(inputs[permutation])
+        graph.replay()
+        controlled = output[permutation].clone()
+        inputs.copy_(saved_input)
+        graph.replay()
+        restored = output.clone()
+    return CohortProjectionReplay(
         eager=eager.cpu(),
         before=before.cpu(),
-        reordered=reordered.cpu(),
-        restored=output.cpu(),
+        controlled=controlled.cpu(),
+        restored=restored.cpu(),
         permutation=permutation.cpu(),
     )
 
@@ -118,7 +137,9 @@ def main() -> None:
     parser.add_argument("--capture-directory", type=Path, required=True)
     parser.add_argument("--checkpoint-directory", type=Path, required=True)
     parser.add_argument("--output-directory", type=Path, required=True)
-    parser.add_argument("--row-order-control", action="store_true")
+    controls = parser.add_mutually_exclusive_group()
+    controls.add_argument("--row-order-control", action="store_true")
+    controls.add_argument("--single-row-control", action="store_true")
     arguments = parser.parse_args()
     runtime = ProjectionRuntime.model_validate_json(
         (arguments.capture_directory / "projection-runtime.json").read_bytes()
@@ -182,17 +203,26 @@ def main() -> None:
                         layout.storage_offset_elements,
                     )
                     weight = weights[name]
-                    if arguments.row_order_control:
+                    if arguments.row_order_control or arguments.single_row_control:
                         if metadata.phase != "DECODE" or len(metadata.request_ids) <= 1:
                             counts["skipped_non_decode_or_single_request"] += 1
                             continue
                         else:
                             pass
-                        row_replay = replay_row_order(
-                            inputs, weight, saved_input, len(metadata.request_ids)
+                        row_replay = replay_cohort_projection(
+                            inputs,
+                            weight,
+                            saved_input,
+                            len(metadata.request_ids),
+                            single_rows=arguments.single_row_control,
                         )
-                        order_changes = row_replay.before != row_replay.reordered
-                        native_exact = torch.equal(row_replay.before, actual)
+                        order_changes = row_replay.before != row_replay.controlled
+                        native_reference = (
+                            actual[: len(metadata.request_ids)]
+                            if arguments.single_row_control
+                            else actual
+                        )
+                        native_exact = torch.equal(row_replay.before, native_reference)
                         restored_exact = torch.equal(
                             row_replay.before, row_replay.restored
                         )
@@ -200,23 +230,33 @@ def main() -> None:
                         counts["physical_rows"] += layout.rows
                         counts["native_before_exact"] += native_exact
                         counts["restored_exact"] += restored_exact
-                        counts["row_order_changes_output"] += bool(order_changes.any())
-                        counts["row_order_changed_coordinates"] += int(
+                        control_name = (
+                            "single_row"
+                            if arguments.single_row_control
+                            else "row_order"
+                        )
+                        counts[f"{control_name}_changes_output"] += bool(
+                            order_changes.any()
+                        )
+                        counts[f"{control_name}_changed_coordinates"] += int(
                             order_changes.sum()
                         )
-                        counts["changed_padding_coordinates"] += int(
-                            order_changes[len(metadata.request_ids) :].sum()
-                        )
+                        if not arguments.single_row_control:
+                            counts["changed_padding_coordinates"] += int(
+                                order_changes[len(metadata.request_ids) :].sum()
+                            )
+                        else:
+                            pass
                         if bool(order_changes.any()):
                             torch.save(
                                 {
                                     "permutation": row_replay.permutation,
                                     "before": row_replay.before,
-                                    "reordered": row_replay.reordered,
+                                    "controlled": row_replay.controlled,
                                     "restored": row_replay.restored,
                                 },
                                 arguments.output_directory
-                                / f"row-order-{metadata.tensor_file.removesuffix('.pt')}-{name}.pt",
+                                / f"{control_name}-{metadata.tensor_file.removesuffix('.pt')}-{name}.pt",
                             )
                         else:
                             pass
@@ -322,6 +362,7 @@ def main() -> None:
         "counts": dict(counts),
         "runtime": runtime.model_dump(),
         "row_order_control": arguments.row_order_control,
+        "single_row_control": arguments.single_row_control,
         "scope": "All actual padded matrices, original strides/offsets and checkpoint-equal loaded weights. No synthetic rows and no model generation under changed precision.",
     }
     (arguments.output_directory / "summary.json").write_text(
