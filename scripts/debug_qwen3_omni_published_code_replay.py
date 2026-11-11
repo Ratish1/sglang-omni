@@ -6,6 +6,7 @@ import argparse
 import gzip
 import hashlib
 import json
+import math
 from dataclasses import asdict
 from pathlib import Path
 
@@ -24,6 +25,7 @@ from sglang_omni.client.audio import encode_wav
 
 CHECKPOINT_CHUNK_FRAMES = 300
 SERVING_CHUNK_FRAMES = 10
+LEFT_CONTEXT_FRAMES = 25
 
 
 class PublishedFrame(BaseModel):
@@ -84,6 +86,9 @@ def main() -> None:
     frequencies = reference.pre_transformer.rotary_emb.inv_freq
     assert frequencies.dtype == torch.float32
     assert torch.equal(frequencies, expected_frequencies.to(frequencies.device))
+    output_deficit_samples = 0
+    for upsample_rate in configuration.code2wav_config.upsample_rates:
+        output_deficit_samples = (output_deficit_samples + 1) * upsample_rate
     recognizer = load_router_asr(arguments.asr_port, arguments.asr_model)
     reports = []
     for arm in ("before", "after"):
@@ -124,16 +129,39 @@ def main() -> None:
             torch.save(
                 all_codes, arguments.output_directory / f"{arm}-{request_id}-codes.pt"
             )
-            for chunk_frames in (CHECKPOINT_CHUNK_FRAMES, SERVING_CHUNK_FRAMES):
-                waveform = reference.chunked_decode(codes, chunk_size=chunk_frames)
+            for chunk_frames, crop_mode in (
+                (CHECKPOINT_CHUNK_FRAMES, "checkpoint"),
+                (SERVING_CHUNK_FRAMES, "checkpoint"),
+                (SERVING_CHUNK_FRAMES, "serving"),
+            ):
+                if crop_mode == "checkpoint":
+                    waveform = reference.chunked_decode(codes, chunk_size=chunk_frames)
+                    lost_samples = (
+                        math.ceil(codes.shape[-1] / chunk_frames)
+                        * output_deficit_samples
+                    )
+                else:
+                    windows = []
+                    for start in range(0, codes.shape[-1], chunk_frames):
+                        end = min(start + chunk_frames, codes.shape[-1])
+                        context_frames = min(start, LEFT_CONTEXT_FRAMES)
+                        window = reference(codes[..., start - context_frames : end])
+                        windows.append(
+                            window[..., -(end - start) * reference.total_upsample :]
+                        )
+                    waveform = torch.cat(windows, dim=-1)
+                    lost_samples = output_deficit_samples
                 assert waveform.isfinite().all()
-                assert waveform.numel() == codes.shape[-1] * reference.total_upsample
+                assert (
+                    waveform.numel()
+                    == codes.shape[-1] * reference.total_upsample - lost_samples
+                )
                 wav_bytes = encode_wav(
                     waveform.float().reshape(-1).cpu().numpy(), arguments.sample_rate
                 )
                 destination = (
                     arguments.output_directory
-                    / f"{arm}-{request_id}-chunk{chunk_frames}.wav"
+                    / f"{arm}-{request_id}-chunk{chunk_frames}-{crop_mode}.wav"
                 )
                 destination.write_bytes(wav_bytes)
                 hypothesis = transcribe(
@@ -150,6 +178,9 @@ def main() -> None:
                         "request_id": request_id,
                         "non_eos_frames": codes.shape[-1],
                         "chunk_frames": chunk_frames,
+                        "crop_mode": crop_mode,
+                        "output_deficit_samples": output_deficit_samples,
+                        "lost_samples": lost_samples,
                         "waveform_samples": waveform.numel(),
                         "sample_rate": arguments.sample_rate,
                         "original_waveform_sha256": speech.waveform_sha256,
