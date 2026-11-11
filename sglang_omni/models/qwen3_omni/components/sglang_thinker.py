@@ -43,6 +43,9 @@ from sglang_omni.models.qwen3_omni.components.thinker_fused_rope import (
     install_thinker_fused_rope,
 )
 from sglang_omni.models.qwen3_omni.thinker_decisions import ThinkerDecisionCapture
+from sglang_omni.models.qwen3_omni.thinker_projection_capture import (
+    InvariantThinkerOutputProjection,
+)
 from sglang_omni.quantization import get_weight_preprocessor
 from sglang_omni.sampling.sampler_compile import (
     SamplerCompileForms,
@@ -124,6 +127,16 @@ class Qwen3OmniThinkerForCausalLM(nn.Module):
             quant_config=quant_config,
             prefix=add_prefix("model", prefix),
         )
+        if os.environ.get("SGLANG_OMNI_THINKER_INVARIANT_OUTPUT_PROJECTIONS") == "1":
+            assert quant_config is None
+            for layer in self.model.layers:
+                assert isinstance(layer, Qwen3MoeDecoderLayer)
+                layer.self_attn.o_proj.quant_method = InvariantThinkerOutputProjection()
+            logger.info(
+                f"Diagnostic invariant output projections enabled for {len(self.model.layers)} Thinker layers"
+            )
+        else:
+            pass
         # note (ratish): the default deepstack addition order lowers image and video
         # accuracy; drop this once the default passes the visual checks.
         self.model.use_hf_deepstack_order = True

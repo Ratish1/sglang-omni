@@ -6,8 +6,12 @@ import json
 from pathlib import Path
 
 import torch
+from sglang.srt.batch_invariant_ops.batch_invariant_ops import matmul_persistent
 from sglang.srt.layers.linear import RowParallelLinear
-from sglang.srt.layers.quantization.unquant import get_bf16_gemm_backend
+from sglang.srt.layers.quantization.unquant import (
+    UnquantizedLinearMethod,
+    get_bf16_gemm_backend,
+)
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.models.qwen3_moe import Qwen3MoeDecoderLayer
 from torch import nn
@@ -19,6 +23,21 @@ LAYOUT_FIELDS = (
     "storage_offset_elements",
     "data_pointer_bytes",
 )
+
+
+class InvariantThinkerOutputProjection(UnquantizedLinearMethod):
+    """Isolate output-projection reduction geometry without global operator overrides."""
+
+    def apply(
+        self,
+        layer: RowParallelLinear,
+        inputs: torch.Tensor,
+        bias: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        assert inputs.is_cuda and inputs.ndim == 2
+        assert inputs.dtype == layer.weight.dtype == torch.bfloat16
+        assert bias is None
+        return matmul_persistent(inputs, layer.weight.T)
 
 
 class ThinkerBoundaryCapture:
