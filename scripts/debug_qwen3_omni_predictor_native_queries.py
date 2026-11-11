@@ -30,6 +30,7 @@ def main() -> None:
     parser.add_argument("--model-revision", required=True)
     parser.add_argument("--gpu", type=int, required=True)
     parser.add_argument("--output-directory", type=Path, required=True)
+    parser.add_argument("--regenerate-residuals", action="store_true")
     arguments = parser.parse_args()
     arguments.output_directory.mkdir(exist_ok=False)
     torch.cuda.set_device(arguments.gpu)
@@ -52,6 +53,9 @@ def main() -> None:
     )
     assert not loading["missing_keys"] and not loading["mismatched_keys"]
     reference.eval()
+    (arguments.output_directory / "child-generation-defaults.json").write_text(
+        reference.code_predictor.generation_config.to_json_string(use_diff=False)
+    )
     audit_checkpoint_weights(
         reference,
         Path(
@@ -70,6 +74,8 @@ def main() -> None:
         destination = arguments.output_directory / directory.name
         destination.mkdir()
         finished = torch.load(directory / "finished.pt", weights_only=True)
+        parameters = json.loads((directory / "sampling.json").read_text())
+        torch.manual_seed(parameters["sampling_seed"])
         assert int(finished["output_ids"][-1]) == configuration.codec_eos_token_id
         output_files = sorted(directory.glob("*-output.pt"))
         assert [filename.name for filename in output_files] == [
@@ -182,12 +188,87 @@ def main() -> None:
                     else:
                         pass
                 assert cache.get_seq_length() == configuration.num_code_groups
+            if arguments.regenerate_residuals:
+                regenerated: dict[str, torch.Tensor] = {"native": codes.clone()}
+                if is_eos:
+                    regenerated["greedy"] = torch.zeros_like(codes)
+                    regenerated["sampled"] = torch.zeros_like(codes)
+                    sampled_repeat_exact = None
+                else:
+                    opening = torch.cat(
+                        (
+                            hidden_states.unsqueeze(1),
+                            reference.model.codec_embedding(codes[:, :1]),
+                        ),
+                        dim=1,
+                    )
+                    greedy = reference.code_predictor.generate(
+                        inputs_embeds=opening,
+                        max_new_tokens=configuration.num_code_groups - 1,
+                        do_sample=False,
+                        output_hidden_states=True,
+                        return_dict_in_generate=True,
+                    ).sequences
+                    rng_before = torch.cuda.get_rng_state(reference.device)
+                    sampled = reference.code_predictor.generate(
+                        inputs_embeds=opening,
+                        max_new_tokens=configuration.num_code_groups - 1,
+                        do_sample=True,
+                        top_k=50,
+                        top_p=0.8,
+                        output_hidden_states=True,
+                        return_dict_in_generate=True,
+                    ).sequences
+                    rng_after = torch.cuda.get_rng_state(reference.device)
+                    torch.cuda.set_rng_state(rng_before, reference.device)
+                    repeated_sampled = reference.code_predictor.generate(
+                        inputs_embeds=opening,
+                        max_new_tokens=configuration.num_code_groups - 1,
+                        do_sample=True,
+                        top_k=50,
+                        top_p=0.8,
+                        output_hidden_states=True,
+                        return_dict_in_generate=True,
+                    ).sequences
+                    torch.cuda.set_rng_state(rng_after, reference.device)
+                    sampled_repeat_exact = torch.equal(sampled, repeated_sampled)
+                    assert (
+                        greedy.shape
+                        == sampled.shape
+                        == (
+                            1,
+                            configuration.num_code_groups - 1,
+                        )
+                    )
+                    regenerated["greedy"] = torch.cat((codes[:, :1], greedy), dim=1)
+                    regenerated["sampled"] = torch.cat((codes[:, :1], sampled), dim=1)
+                for policy, regenerated_codes in regenerated.items():
+                    regenerated_codes[:, 0] = codes[:, 0]
+                    policy_directory = (
+                        arguments.output_directory
+                        / policy
+                        / "conditioning"
+                        / request_id
+                    )
+                    policy_directory.mkdir(parents=True, exist_ok=True)
+                    phase = "post_prefill" if frame == 0 else "post_decode"
+                    torch.save(
+                        {
+                            "codec_ids": regenerated_codes.cpu(),
+                            "hidden_states": hidden_states.cpu(),
+                            "logits": actual_logits.cpu(),
+                        },
+                        policy_directory / f"{frame:04d}-{phase}.pt",
+                    )
+            else:
+                sampled_repeat_exact = None
             row = {
                 "frame": frame,
                 "is_eos": is_eos,
                 "head_reprojection_exact": bool((head_difference == 0).all()),
                 "head_reprojection_maximum_error": float(head_difference.abs().max()),
                 "groups": groups,
+                "sampled_residual_repeat_exact": sampled_repeat_exact,
             }
             rows.append(row)
             with (destination / "frames.jsonl").open("a") as output:
@@ -199,6 +280,15 @@ def main() -> None:
                 row["head_reprojection_exact"] for row in rows
             ),
             "residual_choices": sum(len(row["groups"]) for row in rows),
+            "regenerated_residuals": arguments.regenerate_residuals,
+            "residual_sampling_seed": parameters["sampling_seed"],
+            "sampled_repeat_checked_frames": sum(
+                row["sampled_residual_repeat_exact"] is not None for row in rows
+            ),
+            "sampled_repeat_failures": sum(
+                row["sampled_residual_repeat_exact"] is False for row in rows
+            ),
+            "transplant_scope": "Regenerated residuals retain every native backbone query, main code, frame boundary and EOS. They do not update native feedback or future KV. Greedy and sampled residuals are component transplants, not a new free-running serving run. Sampled uses the checkpoint's top-k 50/top-p 0.8 call with one request-seeded CUDA random stream, and a same-state repeat per frame.",
             "scope": "Actual native backbone query and complete native residual-code prefix, independently replayed as full prefill and incremental checkpoint execution. Full-prefill repeats measure reference nonrepeatability. Reference comparison, not assumed numerical gold or new free-running generation. EOS residuals are excluded because they are not spoken.",
         }
         reports.append(report)
@@ -206,6 +296,7 @@ def main() -> None:
             json.dumps(reports, indent=2)
         )
         print(json.dumps(report), flush=True)
+    assert all(report["sampled_repeat_failures"] == 0 for report in reports)
 
 
 if __name__ == "__main__":
