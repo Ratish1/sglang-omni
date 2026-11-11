@@ -31,6 +31,7 @@ def main() -> None:
     parser.add_argument("--gpu", type=int, required=True)
     parser.add_argument("--output-directory", type=Path, required=True)
     parser.add_argument("--regenerate-residuals", action="store_true")
+    parser.add_argument("--native-past-query-directory", type=Path)
     arguments = parser.parse_args()
     arguments.output_directory.mkdir(exist_ok=False)
     torch.cuda.set_device(arguments.gpu)
@@ -66,9 +67,9 @@ def main() -> None:
         arguments.output_directory / "weight-audit.json",
     )
     reports = []
-    assert {
+    assert set(arguments.request_id) <= {
         directory.name for directory in arguments.capture_directory.iterdir()
-    } == set(arguments.request_id)
+    }
     for request_id in arguments.request_id:
         directory = arguments.capture_directory / request_id
         destination = arguments.output_directory / directory.name
@@ -88,6 +89,8 @@ def main() -> None:
             assert codes.shape == (1, configuration.num_code_groups)
             hidden_states = observed["hidden_states"].unsqueeze(0).to(reference.device)
             assert hidden_states.shape == (1, configuration.text_config.hidden_size)
+            assert hidden_states.dtype == torch.bfloat16
+            native_hidden_states = hidden_states
             assert int(codes[0, 0]) == int(finished["output_ids"][frame])
             projected = reference.codec_head(hidden_states).float()
             actual_logits = (
@@ -102,6 +105,30 @@ def main() -> None:
             finite_columns = actual_logits.isfinite()
             head_difference = (projected - actual_logits)[finite_columns]
             assert projected.isfinite().all()
+            if arguments.native_past_query_directory is not None:
+                replacement = torch.load(
+                    arguments.native_past_query_directory
+                    / request_id
+                    / "native"
+                    / filename.name,
+                    weights_only=True,
+                )
+                inputs = (
+                    torch.load(directory / "0000-before_prefill.pt", weights_only=True)[
+                        "prefill_embeds"
+                    ].unsqueeze(0)
+                    if frame == 0
+                    else finished["decode_input_history"][frame - 1].view(1, 1, -1)
+                )
+                assert torch.equal(replacement["hidden_states"][0], inputs)
+                assert replacement["hidden_states"][0].dtype == inputs.dtype
+                hidden_states = replacement["hidden_states"][-1][:, -1].to(
+                    reference.device
+                )
+                assert hidden_states.shape == native_hidden_states.shape
+                assert hidden_states.dtype == native_hidden_states.dtype
+            else:
+                pass
             is_eos = int(codes[0, 0]) == configuration.codec_eos_token_id
             if is_eos:
                 assert frame == len(output_files) - 1
@@ -255,7 +282,8 @@ def main() -> None:
                     torch.save(
                         {
                             "codec_ids": regenerated_codes.cpu(),
-                            "hidden_states": hidden_states.cpu(),
+                            "hidden_states": native_hidden_states.cpu(),
+                            "predictor_query": hidden_states.cpu(),
                             "logits": actual_logits.cpu(),
                         },
                         policy_directory / f"{frame:04d}-{phase}.pt",
@@ -281,6 +309,11 @@ def main() -> None:
             ),
             "residual_choices": sum(len(row["groups"]) for row in rows),
             "regenerated_residuals": arguments.regenerate_residuals,
+            "native_past_query_directory": (
+                str(arguments.native_past_query_directory)
+                if arguments.native_past_query_directory is not None
+                else None
+            ),
             "residual_sampling_seed": parameters["sampling_seed"],
             "sampled_repeat_checked_frames": sum(
                 row["sampled_residual_repeat_exact"] is not None for row in rows
@@ -288,8 +321,8 @@ def main() -> None:
             "sampled_repeat_failures": sum(
                 row["sampled_residual_repeat_exact"] is False for row in rows
             ),
-            "transplant_scope": "Regenerated residuals retain every native backbone query, main code, frame boundary and EOS. They do not update native feedback or future KV. Greedy and sampled residuals are component transplants, not a new free-running serving run. Sampled uses the checkpoint's top-k 50/top-p 0.8 call with one request-seeded CUDA random stream, and a same-state repeat per frame.",
-            "scope": "Actual native backbone query and complete native residual-code prefix, independently replayed as full prefill and incremental checkpoint execution. Full-prefill repeats measure reference nonrepeatability. Reference comparison, not assumed numerical gold or new free-running generation. EOS residuals are excluded because they are not spoken.",
+            "transplant_scope": "Regenerated residuals retain native main codes, frame boundaries and EOS. Query source is explicitly recorded; replacement queries require exactly matching captured native inputs and use the independently audited native-past reference. Neither form updates native feedback or future KV. Sampled uses checkpoint top-k 50/top-p 0.8 with one request-seeded CUDA stream and same-state repeats, not a full-pipeline RNG reconstruction.",
+            "scope": "The recorded query source and complete native residual-code prefixes are independently replayed as full prefill and incremental checkpoint execution. Head reprojection always checks the original native query. Full-prefill repeats measure reference nonrepeatability. Not numerical gold or free-running generation. EOS residuals are excluded from speech.",
         }
         reports.append(report)
         (arguments.output_directory / "summary.json").write_text(
