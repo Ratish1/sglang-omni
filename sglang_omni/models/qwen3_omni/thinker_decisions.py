@@ -37,7 +37,7 @@ class ThinkerDecisionCapture:
     ) -> None:
         if forward_batch.forward_mode.is_extend():
             query_indices = forward_batch.extend_seq_lens.cumsum(0) - 1
-            selected_hidden_states = hidden_states.index_select(0, query_indices)
+            selected_hidden_states = hidden_states[query_indices]
         else:
             assert forward_batch.forward_mode.is_decode()
             selected_hidden_states = hidden_states
