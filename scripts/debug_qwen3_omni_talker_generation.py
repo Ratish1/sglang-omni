@@ -39,6 +39,9 @@ def main() -> None:
     parser.add_argument("--model-revision", required=True)
     parser.add_argument("--trace-directory", action="append", type=Path, required=True)
     parser.add_argument("--gpu", type=int, required=True)
+    parser.add_argument(
+        "--attention-implementation", choices=("sdpa", "eager"), default="sdpa"
+    )
     parser.add_argument("--dtype", choices=("bfloat16", "float32"), default="bfloat16")
     parser.add_argument("--max-frames", type=int, required=True)
     parser.add_argument("--temperature", type=float, required=True)
@@ -93,7 +96,7 @@ def main() -> None:
         config=config,
         dtype=torch.bfloat16,
         device_map={"": arguments.gpu},
-        attn_implementation="sdpa",
+        attn_implementation=arguments.attention_implementation,
         experts_implementation="eager",
         use_kernels=False,
         output_loading_info=True,
@@ -102,6 +105,11 @@ def main() -> None:
     assert not loading["mismatched_keys"], loading["mismatched_keys"]
     assert not reference.code_predictor.generation_config.do_sample
     reference.eval()
+    assert all(
+        layer.self_attn.config._attn_implementation
+        == arguments.attention_implementation
+        for layer in (*reference.model.layers, *reference.code_predictor.model.layers)
+    )
     normalization = NativeNormalization(reference=reference)
     if (
         arguments.normalization_semantics.startswith("native")
@@ -571,6 +579,7 @@ def main() -> None:
                 "reference_frames_including_eos": len(frame_reports),
                 "termination": termination,
                 "reference_dtype": arguments.dtype,
+                "reference_attention_implementation": arguments.attention_implementation,
                 "conditioning_variant": (
                     arguments.conditioning_variant
                     if arguments.conditioning_directory is not None
