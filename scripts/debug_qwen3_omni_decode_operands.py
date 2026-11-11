@@ -35,7 +35,9 @@ def main() -> None:
     parser.add_argument("--gpu", type=int, required=True)
     parser.add_argument("--output-directory", type=Path, required=True)
     parser.add_argument("--include-prefill", action="store_true")
+    parser.add_argument("--full-prefill-prefix", action="store_true")
     arguments = parser.parse_args()
+    assert not arguments.full_prefill_prefix or arguments.include_prefill
     arguments.output_directory.mkdir(exist_ok=False)
     torch.cuda.set_device(arguments.gpu)
     configuration = Qwen3OmniMoeConfig.from_pretrained(
@@ -124,8 +126,10 @@ def main() -> None:
         exact_counts: dict[str, int] = {}
         maximum_errors: dict[str, float] = {}
         layer_rows = 0
+        layer_steps = 0
         for filename in files:
             frame = int(filename.name.split("-")[0])
+            full_prefix = frame == 0 and arguments.full_prefill_prefix
             observed = torch.load(
                 directory / f"{frame:04d}-output.pt", weights_only=True
             )
@@ -151,7 +155,25 @@ def main() -> None:
                     else finished["decode_input_history"][frame - 1]
                 ),
             )
-            position = before["positions"][-1:]
+            query_positions = (
+                before["positions"] if full_prefix else before["positions"][-1:]
+            )
+            first_inputs = (
+                snapshots[0]["prefix_input_contribution"]
+                if full_prefix
+                else snapshots[0]["input_contribution"].unsqueeze(0)
+            )
+            position_axes = (
+                snapshots[0]["prefix_positions"].reshape(len(query_positions), -1)
+                if full_prefix
+                else snapshots[0]["positions"].reshape(1, -1)
+            )
+            assert position_axes.shape[1] in (1, 3)
+            assert torch.equal(position_axes[:, 0], query_positions)
+            if full_prefix:
+                assert torch.equal(first_inputs, before["prefill_embeds"])
+            else:
+                pass
             if frame == 0:
                 assert int(before["extend_prefix_length"]) == 0
                 assert torch.equal(
@@ -161,13 +183,19 @@ def main() -> None:
             else:
                 pass
             cosine, sine = reference.model.rotary_emb(
-                snapshots[0]["input_contribution"].to(reference.device).view(1, 1, -1),
-                position.to(reference.device).view(1, 1, 1).expand(3, 1, 1),
+                first_inputs.to(reference.device).unsqueeze(0),
+                position_axes.to(reference.device)
+                .T.unsqueeze(1)
+                .expand(3, 1, len(query_positions)),
             )
+            previous_snapshot = None
             for index, (snapshot, layer) in enumerate(
                 zip(snapshots, reference.model.layers, strict=True)
             ):
                 metadata_fields = set()
+                expected_fields = required_fields | (
+                    {"previous_residual"} if index else set()
+                )
                 if "batch_selected_row" in snapshot:
                     batch_fields = {
                         "mlp_normalized",
@@ -195,7 +223,27 @@ def main() -> None:
                         1,
                         0,
                     ]
-                    if frame == 0:
+                    if "prefix_token_rows" in snapshot:
+                        metadata_fields.add("prefix_token_rows")
+                        metadata_fields.update(
+                            f"prefix_{name}" for name in expected_fields
+                        )
+                        start, stop = snapshot["prefix_token_rows"].tolist()
+                        assert (
+                            0 <= start < stop <= len(snapshot["batch_mlp_normalized"])
+                        )
+                        assert stop - start == len(before["positions"])
+                        assert stop == int(snapshot["batch_selected_row"]) + 1
+                        for name in expected_fields:
+                            assert torch.equal(
+                                snapshot[f"prefix_{name}"][-1], snapshot[name]
+                            )
+                        for name in batch_fields:
+                            assert torch.equal(
+                                snapshot[f"prefix_{name}"],
+                                snapshot[f"batch_{name}"][start:stop],
+                            )
+                    elif frame == 0:
                         metadata_fields.add("layout_prefill_token_row")
                         assert int(snapshot["layout_prefill_token_row"][0]) == int(
                             snapshot["batch_selected_row"]
@@ -211,16 +259,31 @@ def main() -> None:
                         )
                 else:
                     pass
-                assert set(snapshot) == required_fields | metadata_fields | (
-                    {"previous_residual"} if index else set()
-                )
+                assert set(snapshot) == expected_fields | metadata_fields
+                assert not full_prefix or "prefix_token_rows" in metadata_fields
                 snapshot = {
-                    name: tensor
-                    for name, tensor in snapshot.items()
-                    if name not in metadata_fields
+                    name: snapshot[f"prefix_{name}" if full_prefix else name]
+                    for name in expected_fields
                 }
-                assert snapshot["positions"].numel() in (1, 3)
-                assert (snapshot["positions"] == before["positions"][-1]).all()
+                observed_axes = (
+                    snapshot["positions"].reshape(len(query_positions), -1)
+                    if full_prefix
+                    else snapshot["positions"].reshape(1, -1)
+                )
+                assert torch.equal(observed_axes, position_axes)
+                if (
+                    frame == 0
+                    and before["mrope_positions"].numel()
+                    and observed_axes.shape[1] == 3
+                ):
+                    expected_axes = (
+                        before["mrope_positions"].T
+                        if full_prefix
+                        else before["mrope_positions"][:, -1:].T
+                    )
+                    assert torch.equal(observed_axes, expected_axes)
+                else:
+                    pass
                 for name, tensor in snapshot.items():
                     assert torch.isfinite(tensor).all()
                     if name == "positions":
@@ -232,18 +295,23 @@ def main() -> None:
                     else:
                         assert tensor.dtype == torch.bfloat16
                 if index:
+                    assert previous_snapshot is not None
                     assert torch.equal(
                         snapshot["input_contribution"],
-                        snapshots[index - 1]["mlp_output"],
+                        previous_snapshot["mlp_output"],
                     )
                     assert torch.equal(
                         snapshot["previous_residual"],
-                        snapshots[index - 1]["mlp_residual"],
+                        previous_snapshot["mlp_residual"],
                     )
                 else:
                     pass
                 tensors = {
-                    name: tensor.to(reference.device).unsqueeze(0)
+                    name: (
+                        tensor.to(reference.device)
+                        if full_prefix
+                        else tensor.to(reference.device).unsqueeze(0)
+                    )
                     for name, tensor in snapshot.items()
                 }
                 differences: dict[str, TensorDifference] = {}
@@ -301,11 +369,11 @@ def main() -> None:
                 )
                 paired_projection = tensors["qkv"].clone()
                 paired_query = paired_projection.as_strided(
-                    (1, query_heads, head_dimensions),
+                    (len(query_positions), query_heads, head_dimensions),
                     (paired_projection.stride(0), head_dimensions, 1),
                 )
                 paired_key = paired_projection.as_strided(
-                    (1, key_heads, head_dimensions),
+                    (len(query_positions), key_heads, head_dimensions),
                     (paired_projection.stride(0), head_dimensions, 1),
                     storage_offset=query_heads * head_dimensions,
                 )
@@ -353,31 +421,42 @@ def main() -> None:
                         norm(raw.reshape(1, -1, head_dimensions)).reshape_as(raw),
                     )
                 query_rotary, key_rotary = apply_rotary_pos_emb(
-                    tensors["normalized_query"].reshape(
-                        1, query_heads, 1, head_dimensions
-                    ),
-                    tensors["normalized_key"].reshape(1, key_heads, 1, head_dimensions),
+                    tensors["normalized_query"]
+                    .reshape(1, len(query_positions), query_heads, head_dimensions)
+                    .transpose(1, 2),
+                    tensors["normalized_key"]
+                    .reshape(1, len(query_positions), key_heads, head_dimensions)
+                    .transpose(1, 2),
                     cosine,
                     sine,
                 )
                 differences["query_checkpoint_rotary"] = compare_tensors(
-                    tensors["rotated_query"], query_rotary.reshape_as(query)
+                    tensors["rotated_query"],
+                    query_rotary.transpose(1, 2).reshape_as(query),
                 )
                 differences["key_checkpoint_rotary"] = compare_tensors(
-                    tensors["rotated_key"], key_rotary.reshape_as(key)
+                    tensors["rotated_key"], key_rotary.transpose(1, 2).reshape_as(key)
                 )
-                current_key = observed["keys"][index][-1:].to(reference.device)
-                current_value = observed["values"][index][-1:].to(reference.device)
+                current_key = observed["keys"][index].to(reference.device)
+                current_value = observed["values"][index].to(reference.device)
+                if not full_prefix:
+                    current_key, current_value = current_key[-1:], current_value[-1:]
+                else:
+                    pass
                 assert (
                     current_key.shape
                     == current_value.shape
-                    == (1, key_heads, head_dimensions)
+                    == (len(query_positions), key_heads, head_dimensions)
                 )
                 assert current_key.dtype == current_value.dtype == torch.bfloat16
                 assert (
                     native_keys[index].shape
                     == native_values[index].shape
-                    == (int(position[0]) + (frame == 0), key_heads, head_dimensions)
+                    == (
+                        int(before["positions"][-1]) + (frame == 0),
+                        key_heads,
+                        head_dimensions,
+                    )
                 )
                 assert (
                     native_keys[index].dtype
@@ -413,19 +492,26 @@ def main() -> None:
                 )
                 queries = (
                     tensors["rotated_query"]
-                    .reshape(1, query_heads, 1, head_dimensions)
+                    .reshape(1, len(query_positions), query_heads, head_dimensions)
+                    .transpose(1, 2)
                     .double()
+                )
+                scores = (queries @ keys.transpose(-1, -2)) * head_dimensions**-0.5
+                future = (
+                    torch.arange(keys.shape[-2], device=reference.device)[None, :]
+                    > query_positions.to(reference.device)[:, None]
                 )
                 attention = (
                     torch.softmax(
-                        (queries @ keys.transpose(-1, -2)) * head_dimensions**-0.5,
-                        dim=-1,
+                        scores.masked_fill(future[None, None], float("-inf")), dim=-1
                     )
                     @ values
                 )
                 differences["attention_float64_rounded"] = compare_tensors(
                     tensors["attention_values"],
-                    attention.reshape(1, -1).to(reference.dtype),
+                    attention.transpose(1, 2)
+                    .reshape(len(query_positions), -1)
+                    .to(reference.dtype),
                 )
                 differences["attention_projection_replay"] = compare_tensors(
                     tensors["attention_output"],
@@ -433,7 +519,7 @@ def main() -> None:
                 )
                 logits = tensors["router_logits"]
                 selected = tensors["expert_indices"].long()
-                assert len(selected[0].unique()) == selected.shape[1]
+                assert (selected.sort(dim=-1).values.diff(dim=-1) != 0).all()
                 assert ((selected >= 0) & (selected < logits.shape[1])).all()
                 assert (
                     logits.gather(1, selected)
@@ -486,7 +572,7 @@ def main() -> None:
                     )
                     differences["final_native_norm_replay"] = compare_tensors(
                         observed["hidden_states"].to(reference.device).unsqueeze(0),
-                        final_hidden,
+                        final_hidden[-1:],
                     )
                     captured_logits = (
                         torch.load(
@@ -518,13 +604,16 @@ def main() -> None:
                     maximum_errors[name] = max(
                         maximum_errors.get(name, 0), difference.maximum_absolute_error
                     )
-                layer_rows += 1
+                layer_rows += len(query_positions)
+                layer_steps += 1
+                previous_snapshot = snapshot
                 with (destination / "layers.jsonl").open("a") as output:
                     output.write(
                         json.dumps(
                             {
                                 "frame": frame,
                                 "layer": index,
+                                "query_positions": query_positions.tolist(),
                                 "differences": {
                                     name: asdict(difference)
                                     for name, difference in differences.items()
@@ -550,6 +639,9 @@ def main() -> None:
             ),
             "prefill_frames": int(arguments.include_prefill),
             "layer_rows": layer_rows,
+            "layer_steps": layer_steps,
+            "exact_counts_unit": "whole operator output tensors, not individual token rows",
+            "full_prefill_prefix": arguments.full_prefill_prefix,
             "exact_counts": exact_counts,
             "maximum_errors": maximum_errors,
         }
