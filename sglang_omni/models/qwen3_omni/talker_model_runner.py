@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+import json
+import logging
 from collections import deque
 from queue import Queue
 from typing import TYPE_CHECKING, TypeAlias
@@ -39,6 +41,8 @@ if TYPE_CHECKING:
     )
 else:
     pass
+
+logger = logging.getLogger(__name__)
 
 
 TalkerInputQueue: TypeAlias = (
@@ -188,6 +192,49 @@ class QwenTalkerModelRunner(ModelRunner["SGLangARRequestData"]):
         # in-graph write to the fixed-address _output_codes/_output_embeds.
         codes_snap = self.model.output_codes[:bs].detach().clone()
         embeds_snap = self.model.output_embeds[:bs].detach().clone()
+        if logger.isEnabledFor(logging.DEBUG):
+            with torch.no_grad():
+                reference_embeddings = [
+                    self.model.get_input_embeddings()(codes_snap[:, 0])
+                ]
+                for group_index, embedding in enumerate(
+                    self.model.code_predictor.model.codec_embedding
+                ):
+                    reference_embeddings.append(
+                        embedding(codes_snap[:, group_index + 1])
+                    )
+                expected_feedback = torch.stack(reference_embeddings, dim=1).sum(dim=1)
+                assert expected_feedback.shape == embeds_snap.shape
+                difference = embeds_snap.float() - expected_feedback.float()
+                maximum_errors = difference.abs().amax(dim=-1).cpu().tolist()
+                changed_coordinates = difference.count_nonzero(dim=-1).cpu().tolist()
+                recorded_codes = codes_snap.cpu().tolist()
+            for (
+                scheduled_request,
+                native_request,
+                codes,
+                maximum_error,
+                changed_count,
+            ) in zip(
+                requests,
+                schedule_batch.reqs,
+                recorded_codes,
+                maximum_errors,
+                changed_coordinates,
+                strict=True,
+            ):
+                assert scheduled_request.request_id == native_request.rid
+                observation = {
+                    "event": "feedback",
+                    "request_id": native_request.rid,
+                    "committed_output_token_count": len(native_request.output_ids),
+                    "codes": codes,
+                    "maximum_absolute_error": maximum_error,
+                    "changed_coordinates": changed_count,
+                }
+                logger.debug(f"speech_contract {json.dumps(observation)}")
+        else:
+            pass
         coalesce = self.codec_coalesce_frames
         code_messages: list[OutgoingMessage] = []
         for idx, sched_req in enumerate(requests):
@@ -300,6 +347,23 @@ class QwenTalkerModelRunner(ModelRunner["SGLangARRequestData"]):
     def on_request_finished(
         self, request_id: str, req_data: "SGLangARRequestData"
     ) -> None:
+        if logger.isEnabledFor(logging.DEBUG):
+            request = req_data.req
+            assert request is not None and request.finished_reason is not None
+            observation = {
+                "event": "terminal",
+                "request_id": request_id,
+                "finish_reason": request.finished_reason.to_json(),
+                "requested_frame_limit": req_data.max_new_tokens,
+                "effective_frame_limit": request.sampling_params.max_new_tokens,
+                "prompt_token_count": len(request.origin_input_ids),
+                "output_codes": list(request.output_ids),
+                "thinker_done": req_data.thinker_chunks_done,
+                "pending_text_rows": len(req_data.pending_text_queue),
+            }
+            logger.debug(f"speech_contract {json.dumps(observation)}")
+        else:
+            pass
         pending = req_data.pending_codec_rows
         if not pending:
             return
