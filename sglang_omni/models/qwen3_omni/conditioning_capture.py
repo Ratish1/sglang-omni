@@ -89,10 +89,6 @@ class TalkerConditioningRecorder:
     ) -> None:
         if self.operator_recorders:
             self.operator_recorders[0].step_counter.add_(1)
-            if forward_batch.forward_mode.is_extend():
-                self.operator_recorders[0].selected_prefill_token_row.zero_()
-            else:
-                pass
         else:
             pass
         offset = 0
@@ -117,13 +113,9 @@ class TalkerConditioningRecorder:
                 rows = forward_batch.extend_seq_lens_cpu[row]
                 selected = slice(offset, offset + rows)
                 if self.operator_recorders and self.retain_moe_batches:
-                    assert self.request_ids is not None and len(self.request_ids) == 1
                     assert rows > 0
                     assert frame_index == 0
                     assert forward_batch.forward_mode == ForwardMode.EXTEND
-                    self.operator_recorders[0].selected_prefill_token_row.fill_(
-                        offset + rows - 1
-                    )
                 else:
                     pass
                 captured = {
@@ -292,6 +284,16 @@ class TalkerConditioningRecorder:
                             step,
                             operand_row,
                             retain_moe_batches=self.retain_moe_batches,
+                            prefill_rows=(
+                                slice(
+                                    operand_row
+                                    + 1
+                                    - forward_batch.extend_seq_lens_cpu[row],
+                                    operand_row + 1,
+                                )
+                                if is_extend
+                                else None
+                            ),
                         )
                         for recorder in self.operator_recorders
                     ],

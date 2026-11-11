@@ -14,7 +14,7 @@ from sglang.kernels.spec import KernelBackend
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.model_executor.runner_utils.capture_mode import get_is_capture_mode
 from sglang.srt.model_loader.weight_utils import default_weight_loader
-from sglang.srt.runtime_context import get_context, get_schedule
+from sglang.srt.runtime_context import get_context, get_exec, get_schedule
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import add_prefix
@@ -877,13 +877,16 @@ class Qwen3OmniTalker(nn.Module):
             pass
         if os.environ.get("SGLANG_OMNI_DIAGNOSTIC_LAYER_OPERANDS") == "1":
             step_counter = torch.zeros((), dtype=torch.int64, device=device)
-            selected_prefill_token_row = torch.zeros(
-                1, dtype=torch.int64, device=device
+            maximum_prefill_token_rows = (
+                max(get_exec().graph.cuda_graph_config.prefill.bs)
+                if retain_moe_batches
+                else 0
             )
+            assert not retain_moe_batches or get_schedule().disable_overlap_schedule
             for layer in self.model.layers:
                 recorder = LayerOperandRecorder(
                     step_counter=step_counter,
-                    selected_prefill_token_row=selected_prefill_token_row,
+                    maximum_prefill_token_rows=maximum_prefill_token_rows,
                     retain_moe_batches=retain_moe_batches,
                 )
                 self.backbone_recorders.append(recorder)

@@ -133,6 +133,14 @@ class QwenTalkerModelRunner(ModelRunner["SGLangARRequestData"]):
                         {
                             "tune_max_num_tokens": _cutlass_moe_tune_max_num_tokens(1),
                             "use_fused_finalize": envs.SGLANG_FLASHINFER_MOE_FUSED_FINALIZE.get(),
+                            "maximum_prefill_token_rows": self.model.backbone_recorders[
+                                0
+                            ].maximum_prefill_token_rows,
+                            "prefill_buffer_bytes": sum(
+                                tensor.numel() * tensor.element_size()
+                                for recorder in self.model.backbone_recorders
+                                for tensor in recorder.prefill_buffers.values()
+                            ),
                             "tactic_choices": [
                                 asdict(choice)
                                 for choice in self.model.moe_tactic_choices

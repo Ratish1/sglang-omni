@@ -66,9 +66,10 @@ def observe_moe_tactics(choices: list[MoeTacticChoice]) -> None:
 @dataclass(kw_only=True)
 class LayerOperandRecorder:
     step_counter: torch.Tensor
-    selected_prefill_token_row: torch.Tensor
+    maximum_prefill_token_rows: int
     retain_moe_batches: bool = False
     recording_prefill: bool = False
+    prefill_buffers: dict[str, torch.Tensor] = field(default_factory=dict)
     graph_snapshots: list[dict[str, torch.Tensor]] = field(default_factory=list)
     eager_snapshot: dict[str, torch.Tensor] = field(default_factory=dict)
     current_snapshot: dict[str, torch.Tensor] = field(default_factory=dict)
@@ -90,12 +91,6 @@ class LayerOperandRecorder:
             )
         else:
             pass
-        if is_prefill:
-            self.current_snapshot["layout_prefill_token_row"] = (
-                self.selected_prefill_token_row.clone()
-            )
-        else:
-            pass
         if torch.cuda.is_current_stream_capturing():
             self.graph_snapshots.append(self.current_snapshot)
         else:
@@ -108,15 +103,31 @@ class LayerOperandRecorder:
             )
         else:
             pass
-        if self.recording_prefill and name not in MOE_BATCH_FIELDS:
-            self.current_snapshot[f"selected_{name}"] = tensor.index_select(
-                0, self.selected_prefill_token_row
-            )
+        if self.recording_prefill:
+            assert tensor.shape[0] <= self.maximum_prefill_token_rows
+            if name not in self.prefill_buffers:
+                assert not torch.cuda.is_current_stream_capturing()
+                self.prefill_buffers[name] = tensor.new_empty(
+                    (self.maximum_prefill_token_rows, *tensor.shape[1:])
+                )
+            else:
+                pass
+            captured = self.prefill_buffers[name][: len(tensor)]
+            # note (ratish): non-overlapping prefills let every graph bucket share stable storage.
+            assert captured.dtype == tensor.dtype and captured.shape == tensor.shape
+            captured.copy_(tensor)
+            self.current_snapshot[name] = captured
+            self.current_snapshot[f"fresh_{name}"] = self.step_counter.clone()
         else:
             self.current_snapshot[name] = tensor.clone()
 
     def read(
-        self, expected_step: int, row: int, *, retain_moe_batches: bool = False
+        self,
+        expected_step: int,
+        row: int,
+        *,
+        retain_moe_batches: bool = False,
+        prefill_rows: slice | None = None,
     ) -> dict[str, torch.Tensor]:
         snapshots = [
             snapshot
@@ -125,22 +136,48 @@ class LayerOperandRecorder:
         ]
         assert len(snapshots) == 1, (expected_step, len(snapshots))
         snapshot = snapshots[0]
-        if "layout_prefill_token_row" in snapshot:
-            assert int(snapshot["layout_prefill_token_row"][0]) == row
-        else:
-            pass
+        for name, tensor in snapshot.items():
+            if name.startswith("fresh_"):
+                assert int(tensor) == expected_step, name
+            else:
+                pass
         tensors = {
-            name.removeprefix("selected_"): (
+            name: (
                 tensor.detach().cpu().clone()
                 if name.startswith("layout_")
-                else tensor[0 if name.startswith("selected_") else row]
-                .detach()
-                .cpu()
-                .clone()
+                else tensor[row].detach().cpu().clone()
             )
             for name, tensor in snapshot.items()
-            if name != "step"
+            if name != "step" and not name.startswith("fresh_")
         }
+        if prefill_rows is not None:
+            assert bool(snapshot["layout_is_prefill"])
+            assert prefill_rows.start is not None and prefill_rows.stop is not None
+            assert (
+                0
+                <= prefill_rows.start
+                <= row
+                < prefill_rows.stop
+                <= len(snapshot["positions"])
+            )
+            assert all(
+                f"fresh_{name}" in snapshot
+                for name in snapshot
+                if name not in ("positions", "step")
+                and not name.startswith(("fresh_", "layout_"))
+            )
+            tensors.update(
+                {
+                    f"prefix_{name}": tensor[prefill_rows].detach().cpu().clone()
+                    for name, tensor in snapshot.items()
+                    if name != "step" and not name.startswith(("fresh_", "layout_"))
+                }
+            )
+            tensors["prefix_token_rows"] = torch.tensor(
+                (prefill_rows.start, prefill_rows.stop)
+            )
+        else:
+            pass
         if retain_moe_batches:
             tensors.update(
                 {
