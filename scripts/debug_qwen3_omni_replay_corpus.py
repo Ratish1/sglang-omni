@@ -26,7 +26,13 @@ from benchmarks.metrics.speaker_similarity_assets import (
     ensure_speaker_similarity_assets,
 )
 from benchmarks.metrics.wer import SampleOutput, calculate_wer_metrics
-from benchmarks.tasks.asr import apply_wer, load_router_asr, transcribe
+from benchmarks.tasks.asr import (
+    OMNI_WHISPER_MODEL_PATH,
+    OMNI_WHISPER_REQUEST_TIMEOUT_S,
+    apply_wer,
+    load_router_asr,
+    transcribe,
+)
 from benchmarks.tasks.audio_understanding import build_mmsu_results
 from benchmarks.tasks.tts import SPEAKER_SIMILARITY_BATCH_SIZE, run_seedtts_utmos
 
@@ -69,6 +75,10 @@ class CompletedSpeech(BaseModel):
     target_text: str
     text: str
     waveform_sha256: str
+
+
+class TranscriptionResponse(BaseModel):
+    text: str
 
 
 @dataclass(kw_only=True)
@@ -194,6 +204,10 @@ async def replay(arguments: argparse.Namespace) -> None:
 
 
 def score(arguments: argparse.Namespace) -> None:
+    if arguments.whisper_whole_upload:
+        assert arguments.asr_model == OMNI_WHISPER_MODEL_PATH
+    else:
+        pass
     arguments.output_directory.mkdir(exist_ok=False)
     asr = load_router_asr(arguments.asr_port, arguments.asr_model)
     requested_outputs: list[SampleOutput] = []
@@ -204,7 +218,25 @@ def score(arguments: argparse.Namespace) -> None:
         assert (
             hashlib.sha256(waveform.read_bytes()).hexdigest() == record.waveform_sha256
         )
-        transcript = transcribe(asr, str(waveform), "en", "cuda:0")
+        if arguments.whisper_whole_upload:
+            with waveform.open("rb") as audio_file:
+                response = httpx.post(
+                    f"http://127.0.0.1:{arguments.asr_port}/v1/audio/transcriptions",
+                    data={
+                        "model": arguments.asr_model,
+                        "language": "en",
+                        "temperature": "0",
+                    },
+                    files={"file": (waveform.name, audio_file, "audio/wav")},
+                    timeout=OMNI_WHISPER_REQUEST_TIMEOUT_S,
+                    trust_env=False,
+                )
+            response.raise_for_status()
+            transcript = TranscriptionResponse.model_validate_json(
+                response.content
+            ).text
+        else:
+            transcript = transcribe(asr, str(waveform), "en", "cuda:0")
         spoken = apply_wer(
             SampleOutput(sample_id=record.sample_id, target_text=record.text),
             transcript,
@@ -344,6 +376,7 @@ def main() -> None:
     parser.add_argument("--concurrency", type=int)
     parser.add_argument("--asr-port", type=int)
     parser.add_argument("--asr-model")
+    parser.add_argument("--whisper-whole-upload", action="store_true")
     arguments = parser.parse_args()
     if arguments.mode == "replay":
         assert arguments.reference_results and arguments.base_url
