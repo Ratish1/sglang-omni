@@ -26,6 +26,7 @@ class TalkerConditioningRecorder:
     previous_keys: dict[str, list[torch.Tensor]] = field(default_factory=dict)
     previous_values: dict[str, list[torch.Tensor]] = field(default_factory=dict)
     operator_recorders: list[LayerOperandRecorder] = field(default_factory=list)
+    retain_moe_batches: bool = False
 
     def should_capture(self, request_id: str) -> bool:
         return self.request_ids is None or request_id in self.request_ids
@@ -257,7 +258,12 @@ class TalkerConditioningRecorder:
             if self.operator_recorders and not is_extend:
                 step = int(self.operator_recorders[0].step_counter)
                 torch.save(
-                    [recorder.read(step, row) for recorder in self.operator_recorders],
+                    [
+                        recorder.read(
+                            step, row, retain_moe_batches=self.retain_moe_batches
+                        )
+                        for recorder in self.operator_recorders
+                    ],
                     destination / f"{frame_index:04d}-operators.pt",
                 )
             else:

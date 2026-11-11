@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
@@ -12,7 +13,12 @@ from queue import Queue
 from typing import TYPE_CHECKING, TypeAlias
 
 import torch
+from flashinfer.autotuner import AutoTuner
+from sglang.srt.environ import envs
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+from sglang.srt.layers.moe.moe_runner.flashinfer_cutlass import (
+    _cutlass_moe_tune_max_num_tokens,
+)
 from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
 
 from sglang_omni.model_runner.base import ModelRunner
@@ -83,6 +89,9 @@ class QwenTalkerModelRunner(ModelRunner["SGLangARRequestData"]):
         self.codec_coalesce_early_frames = max(int(codec_coalesce_early_frames), 0)
         directory = os.environ.get("SGLANG_OMNI_DIAGNOSTIC_CONDITIONING_DIRECTORY")
         if directory is not None:
+            retain_moe_batches = (
+                os.environ.get("SGLANG_OMNI_DIAGNOSTIC_MOE_BATCHES") == "1"
+            )
             request_ids_file = Path(os.environ["SGLANG_OMNI_CORPUS_REQUEST_ID_FILE"])
             pool = tp_worker.model_runner.token_to_kv_pool
             assert isinstance(pool, MHATokenToKVPool)
@@ -93,7 +102,68 @@ class QwenTalkerModelRunner(ModelRunner["SGLangARRequestData"]):
                 request_slots=tp_worker.model_runner.req_to_token_pool.req_to_token,
                 request_ids=frozenset(json.loads(request_ids_file.read_text())),
                 operator_recorders=self.model.backbone_recorders,
+                retain_moe_batches=retain_moe_batches,
             )
+            if retain_moe_batches:
+                destination = Path(directory)
+                destination.mkdir(parents=True, exist_ok=True)
+                layers = self.model.model.layers
+                configurations = [
+                    layer.mlp.experts.quant_method.moe_runner_config for layer in layers
+                ]
+                for layer, configuration in zip(layers, configurations, strict=True):
+                    assert layer.mlp.experts.runner_backend.is_flashinfer_cutlass()
+                    assert configuration.is_gated and configuration.activation == "silu"
+                    assert not configuration.apply_router_weight_on_input
+                    assert configuration.routed_scaling_factor is None
+                    assert configuration.gemm1_alpha is None
+                    assert configuration.gemm1_beta is None
+                    assert configuration.gemm1_clamp_limit is None
+                    assert configuration.swiglu_limit is None
+                AutoTuner.get().save_configs(str(destination / "moe-tactics.json"))
+                (destination / "moe-runtime.json").write_text(
+                    json.dumps(
+                        {
+                            "tune_max_num_tokens": _cutlass_moe_tune_max_num_tokens(1),
+                            "use_fused_finalize": envs.SGLANG_FLASHINFER_MOE_FUSED_FINALIZE.get(),
+                            "layers": [
+                                {
+                                    "tp_size": configuration.moe_tp_size,
+                                    "tp_rank": configuration.moe_tp_rank,
+                                    "ep_size": configuration.moe_ep_size,
+                                    "ep_rank": configuration.moe_ep_rank,
+                                    "weights": {
+                                        name: {
+                                            "shape": list(tensor.shape),
+                                            "dtype": str(tensor.dtype),
+                                            "sha256": hashlib.sha256(
+                                                tensor.detach()
+                                                .cpu()
+                                                .contiguous()
+                                                .view(torch.uint8)
+                                                .numpy()
+                                                .tobytes()
+                                            ).hexdigest(),
+                                        }
+                                        for name, tensor in (
+                                            (
+                                                "w13_weight",
+                                                layer.mlp.experts.w13_weight,
+                                            ),
+                                            ("w2_weight", layer.mlp.experts.w2_weight),
+                                        )
+                                    },
+                                }
+                                for layer, configuration in zip(
+                                    layers, configurations, strict=True
+                                )
+                            ],
+                        },
+                        indent=2,
+                    )
+                )
+            else:
+                pass
         else:
             pass
 
