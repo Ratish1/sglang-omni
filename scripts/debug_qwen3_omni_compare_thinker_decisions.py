@@ -25,6 +25,7 @@ class CapturedStep(BaseModel):
     top_ids: list[list[int]]
     top_logits: list[list[float]]
     hidden_sha256: list[str]
+    inputs_before_forward: bool = False
 
 
 @dataclass(kw_only=True)
@@ -68,19 +69,9 @@ def compare_boundaries(
     counts: dict[str, Counter[str]] = defaultdict(Counter)
     maximum_errors: dict[str, float] = defaultdict(float)
     with (output_directory / "layer-differences.jsonl").open("w") as output:
-        for (first_filename, second_filename), rows in pairs.items():
-            first_boundaries = torch.load(
-                first_directory / first_filename,
-                weights_only=True,
-                map_location="cpu",
-                mmap=True,
-            )["layer_boundaries"]
-            second_boundaries = torch.load(
-                second_directory / second_filename,
-                weights_only=True,
-                map_location="cpu",
-                mmap=True,
-            )["layer_boundaries"]
+        for rows in pairs.values():
+            first_boundaries = read_boundaries(first_directory, rows[0][0].step)
+            second_boundaries = read_boundaries(second_directory, rows[0][1].step)
             assert first_boundaries and set(first_boundaries) == set(second_boundaries)
             for first, second in rows:
                 changed: list[str] = []
@@ -138,9 +129,34 @@ def compare_boundaries(
             for name, counter in counts.items()
         },
         "interpretation": "Equal query rows do not establish equal attention history or equal expert-batch geometry.",
+        "post_forward_moe_input_recovery": "For older post-forward captures, gate.input is the same source operand before in-place experts. Raw artifacts remain unchanged.",
     }
     (output_directory / "layer-summary.json").write_text(json.dumps(report, indent=2))
     print(json.dumps({"layer_boundaries": len(counts)}), flush=True)
+
+
+def read_boundaries(directory: Path, metadata: CapturedStep) -> dict[str, torch.Tensor]:
+    boundaries = torch.load(
+        directory / metadata.tensor_file,
+        weights_only=True,
+        map_location="cpu",
+        mmap=True,
+    )["layer_boundaries"]
+    assert isinstance(boundaries, dict)
+    assert all(
+        isinstance(name, str) and isinstance(tensor, torch.Tensor)
+        for name, tensor in boundaries.items()
+    )
+    for name in boundaries:
+        if name.endswith(".moe.input"):
+            gate_input = boundaries[name.removesuffix(".moe.input") + ".gate.input"]
+            if metadata.inputs_before_forward:
+                assert torch.equal(boundaries[name], gate_input)
+            else:
+                boundaries[name] = gate_input
+        else:
+            pass
+    return boundaries
 
 
 def main() -> None:

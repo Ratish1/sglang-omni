@@ -33,6 +33,19 @@ class ThinkerBoundaryCapture:
         self.output_rows = output_rows
         self.observed = observed
 
+    def capture_input(
+        self,
+        module: nn.Module,
+        arguments: tuple[torch.Tensor] | tuple[torch.Tensor, ForwardBatch | None],
+    ) -> None:
+        if arguments[0].shape[0] == 0:
+            return
+        else:
+            pass
+        assert arguments[0].dtype == self.input_rows.dtype
+        self.input_rows.copy_(arguments[0][self.query_indices])
+        self.observed.fill_(1)
+
     def __call__(
         self,
         module: nn.Module,
@@ -44,11 +57,9 @@ class ThinkerBoundaryCapture:
             return
         else:
             pass
-        assert arguments[0].dtype == self.input_rows.dtype
         assert tensor.dtype == self.output_rows.dtype
-        self.input_rows.copy_(arguments[0][self.query_indices])
         self.output_rows.copy_(tensor[self.query_indices])
-        self.observed.fill_(True)
+        self.observed.add_(1)
 
 
 class ThinkerRoutingCapture:
@@ -77,7 +88,7 @@ class ThinkerRoutingCapture:
             pass
         self.expert_ids.copy_(output.topk_ids[self.query_indices])
         self.expert_weights.copy_(output.topk_weights[self.query_indices])
-        self.observed.fill_(True)
+        self.observed.fill_(2)
 
 
 class ThinkerDecisionCapture:
@@ -98,7 +109,7 @@ class ThinkerDecisionCapture:
         )
         self.layer_boundaries: dict[str, torch.Tensor] = {}
         self.boundaries_observed = torch.zeros(
-            len(layers), 5, device=hidden_states.device, dtype=torch.bool
+            len(layers), 5, device=hidden_states.device, dtype=torch.int32
         )
         self.query_indices = torch.zeros(
             len(request_ids), device=hidden_states.device, dtype=torch.long
@@ -152,14 +163,14 @@ class ThinkerDecisionCapture:
                     self.layer_boundaries[f"layer.{layer_index}.{name}.output"] = (
                         output_rows
                     )
-                    module.register_forward_hook(
-                        ThinkerBoundaryCapture(
-                            self.query_indices,
-                            input_rows,
-                            output_rows,
-                            self.boundaries_observed[layer_index, boundary_index],
-                        )
+                    boundary_capture = ThinkerBoundaryCapture(
+                        self.query_indices,
+                        input_rows,
+                        output_rows,
+                        self.boundaries_observed[layer_index, boundary_index],
                     )
+                    module.register_forward_pre_hook(boundary_capture.capture_input)
+                    module.register_forward_hook(boundary_capture)
                 expert_ids = torch.zeros(
                     len(request_ids),
                     layer.config.num_experts_per_tok,
@@ -243,7 +254,7 @@ class ThinkerDecisionCapture:
         head_inputs = self.hidden_states[:live_rows].cpu().clone()
         assert bool(head_inputs.isfinite().all())
         if self.layer_boundaries:
-            assert bool(self.boundaries_observed.all().cpu())
+            assert bool((self.boundaries_observed == 2).all().cpu())
             assert live_rows <= self.query_indices.numel()
             layer_boundaries = {
                 name: tensor[:live_rows].cpu().clone()
@@ -292,6 +303,7 @@ class ThinkerDecisionCapture:
                 hashlib.sha256(row.view(torch.uint8).numpy().tobytes()).hexdigest()
                 for row in head_inputs
             ],
+            "inputs_before_forward": True,
         }
         with (self.directory / "steps.jsonl").open("a") as output:
             output.write(json.dumps(report) + "\n")
