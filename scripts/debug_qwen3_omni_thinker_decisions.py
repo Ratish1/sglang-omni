@@ -49,6 +49,7 @@ def main() -> None:
                 weights_only=True,
             )
             assert torch.equal(tensors["token_ids"], tensors["greedy_ids"])
+            assert bool(tensors["raw_logits_finite"].all())
             head_inputs = tensors["head_inputs"].to("cuda", torch.float64)
             expected_logits = head_inputs @ head_weight.T
             assert bool(expected_logits.isfinite().all())

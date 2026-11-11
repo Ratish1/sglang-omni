@@ -27,6 +27,9 @@ class ThinkerDecisionCapture:
         self.request_ids = set(request_ids)
         self.hidden_states = hidden_states
         self.row_count = torch.zeros((), device=hidden_states.device, dtype=torch.int64)
+        self.raw_logits_finite = torch.zeros(
+            hidden_states.shape[0], device=hidden_states.device, dtype=torch.bool
+        )
         self.step = 0
 
     def capture_hidden(
@@ -61,6 +64,7 @@ class ThinkerDecisionCapture:
         assert request_ids == [request.rid for request in schedule_batch.reqs]
         live_rows = len(requests)
         assert int(self.row_count.cpu()) >= live_rows
+        assert bool(self.raw_logits_finite[:live_rows].all().cpu())
         logits = result.logits_output.next_token_logits[:live_rows]
         token_ids = result.next_token_ids[:live_rows].cpu()
         greedy_ids = logits.argmax(-1).cpu()
@@ -78,6 +82,7 @@ class ThinkerDecisionCapture:
                 "top_ids": top_ids.cpu(),
                 "token_ids": token_ids,
                 "greedy_ids": greedy_ids,
+                "raw_logits_finite": self.raw_logits_finite[:live_rows].cpu().clone(),
             },
             self.directory / filename,
         )

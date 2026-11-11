@@ -272,13 +272,21 @@ class Qwen3OmniThinkerForCausalLM(nn.Module):
             self.decision_capture.capture_hidden(hidden_states, forward_batch)
         else:
             pass
-        return self.logits_processor(
+        result = self.logits_processor(
             input_ids,
             hidden_states,
             self.lm_head,
             forward_batch,
             aux_hidden_states=aux_hidden_states,
         )
+        if self.decision_capture is not None and result.next_token_logits is not None:
+            logits = result.next_token_logits
+            self.decision_capture.raw_logits_finite[: logits.shape[0]].copy_(
+                logits.isfinite().all(-1)
+            )
+        else:
+            pass
+        return result
 
     @torch.no_grad()
     def precompile_kernels_after_loading(self) -> None:
