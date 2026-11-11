@@ -58,7 +58,7 @@ def replay_cohort_projection(
     inputs: torch.Tensor,
     weight: torch.Tensor,
     saved_input: torch.Tensor,
-    live_rows: int,
+    tested_rows: int,
     *,
     single_rows: bool,
 ) -> CohortProjectionReplay:
@@ -70,22 +70,24 @@ def replay_cohort_projection(
     before = output.clone()
     permutation = torch.arange(inputs.shape[0], device=inputs.device)
     if single_rows:
+        # note (ratish): initialize the new BLAS shape outside graph capture.
+        F.linear(inputs[:1], weight)
         single_graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(single_graph):
             single_output = torch.cat(
-                [F.linear(inputs[row : row + 1], weight) for row in range(live_rows)]
+                [F.linear(inputs[row : row + 1], weight) for row in range(tested_rows)]
             )
         single_graph.replay()
         controlled = single_output.clone()
         single_graph.replay()
         assert torch.equal(controlled, single_output)
         graph.replay()
-        eager = eager[:live_rows]
-        before = before[:live_rows]
-        permutation = permutation[:live_rows]
-        restored = output[:live_rows].clone()
+        eager = eager[:tested_rows]
+        before = before[:tested_rows]
+        permutation = permutation[:tested_rows]
+        restored = output[:tested_rows].clone()
     else:
-        permutation[:live_rows] = permutation[:live_rows].flip(0)
+        permutation[:tested_rows] = permutation[:tested_rows].flip(0)
         inputs.copy_(inputs[permutation])
         graph.replay()
         controlled = output[permutation].clone()
@@ -140,7 +142,14 @@ def main() -> None:
     controls = parser.add_mutually_exclusive_group()
     controls.add_argument("--row-order-control", action="store_true")
     controls.add_argument("--single-row-control", action="store_true")
+    parser.add_argument(
+        "--phase", choices=("DECODE", "MIXED", "EXTEND"), default="DECODE"
+    )
     arguments = parser.parse_args()
+    if arguments.row_order_control and arguments.phase != "DECODE":
+        parser.error("Row-order control requires the DECODE phase")
+    else:
+        pass
     runtime = ProjectionRuntime.model_validate_json(
         (arguments.capture_directory / "projection-runtime.json").read_bytes()
     )
@@ -204,8 +213,14 @@ def main() -> None:
                     )
                     weight = weights[name]
                     if arguments.row_order_control or arguments.single_row_control:
-                        if metadata.phase != "DECODE" or len(metadata.request_ids) <= 1:
-                            counts["skipped_non_decode_or_single_request"] += 1
+                        tested_rows = (
+                            layout.rows
+                            if arguments.single_row_control
+                            and arguments.phase != "DECODE"
+                            else len(metadata.request_ids)
+                        )
+                        if metadata.phase != arguments.phase or tested_rows <= 1:
+                            counts["skipped_unselected_phase_or_single_row"] += 1
                             continue
                         else:
                             pass
@@ -213,12 +228,12 @@ def main() -> None:
                             inputs,
                             weight,
                             saved_input,
-                            len(metadata.request_ids),
+                            tested_rows,
                             single_rows=arguments.single_row_control,
                         )
                         order_changes = row_replay.before != row_replay.controlled
                         native_reference = (
-                            actual[: len(metadata.request_ids)]
+                            actual[:tested_rows]
                             if arguments.single_row_control
                             else actual
                         )
@@ -270,7 +285,8 @@ def main() -> None:
                                     "eager_to_graph_exact": torch.equal(
                                         row_replay.eager, row_replay.before
                                     ),
-                                    "live_rows": len(metadata.request_ids),
+                                    "live_requests": len(metadata.request_ids),
+                                    "tested_rows": tested_rows,
                                     "physical_rows": layout.rows,
                                     "changed_coordinates": int(order_changes.sum()),
                                 }
@@ -363,7 +379,12 @@ def main() -> None:
         "runtime": runtime.model_dump(),
         "row_order_control": arguments.row_order_control,
         "single_row_control": arguments.single_row_control,
-        "scope": "All actual padded matrices, original strides/offsets and checkpoint-equal loaded weights. No synthetic rows and no model generation under changed precision.",
+        "phase_filter": (
+            arguments.phase
+            if arguments.row_order_control or arguments.single_row_control
+            else None
+        ),
+        "scope": "Original captured padded matrices and checkpoint-exact weights, with source strides/offsets. Cohort controls use the selected phase. No synthetic inputs or model generation under changed precision.",
     }
     (arguments.output_directory / "summary.json").write_text(
         json.dumps(report, indent=2)
