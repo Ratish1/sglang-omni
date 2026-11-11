@@ -20,6 +20,11 @@ class ThinkerDecisionCapture:
     def __init__(self, directory: Path, hidden_states: torch.Tensor) -> None:
         self.directory = directory
         self.directory.mkdir(parents=True, exist_ok=True)
+        request_ids = json.loads((directory / "request_ids.json").read_text())
+        assert isinstance(request_ids, list) and all(
+            isinstance(request_id, str) for request_id in request_ids
+        )
+        self.request_ids = set(request_ids)
         self.hidden_states = hidden_states
         self.row_count = torch.zeros((), device=hidden_states.device, dtype=torch.int64)
         self.step = 0
@@ -45,9 +50,14 @@ class ThinkerDecisionCapture:
         schedule_batch: ScheduleBatch,
         requests: list[SchedulerRequest],
     ) -> None:
+        request_ids = [request.request_id for request in requests]
+        if not any(request_id in self.request_ids for request_id in request_ids):
+            return
+        else:
+            pass
+        assert set(request_ids) <= self.request_ids
         assert not schedule_batch.is_prefill_only
         assert forward_batch.sampling_info.is_all_greedy
-        request_ids = [request.request_id for request in requests]
         assert request_ids == [request.rid for request in schedule_batch.reqs]
         live_rows = len(requests)
         assert int(self.row_count.cpu()) >= live_rows
