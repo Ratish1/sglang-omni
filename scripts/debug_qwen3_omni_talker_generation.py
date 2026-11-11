@@ -156,6 +156,8 @@ def main() -> None:
             for order in arguments.sampling_order
             for mode in normalization_modes
         ):
+            normalization.boundary_calls = 0
+            normalization.query_key_calls = 0
             normalization.boundary_enabled = normalization_mode in (
                 "native",
                 "native-boundary",
@@ -179,6 +181,12 @@ def main() -> None:
                 (~allowed_tokens).nonzero(as_tuple=True)[0].tolist()
             )
             before = torch.load(prefill_file, map_location="cpu", weights_only=True)
+            finished_file = trace_directory / "finished.pt"
+            if finished_file.exists():
+                finished = torch.load(finished_file, weights_only=True)
+                before["trailing_text_embeds"] = finished["enqueued_text_rows"]
+            else:
+                finished = None
             prefill = before["prefill_embeds"].to(
                 device=reference.device, dtype=reference.dtype
             )
@@ -191,10 +199,20 @@ def main() -> None:
             assert torch.equal(text_rows[-1:], eos_embedding), "incomplete text queue"
             complete_text_verified = False
             conditioning_file = trace_directory / "conditioning.pt"
-            if arguments.dtype == "bfloat16" and conditioning_file.exists():
-                captured_conditioning = torch.load(
-                    conditioning_file, map_location="cpu", weights_only=True
-                )
+            if arguments.dtype == "bfloat16" and (
+                conditioning_file.exists() or finished is not None
+            ):
+                if finished is not None:
+                    captured_conditioning = torch.load(
+                        trace_directory / "prompt.pt", weights_only=True
+                    )
+                    captured_conditioning["assistant_token_ids"] = finished[
+                        "assistant_token_ids"
+                    ]
+                else:
+                    captured_conditioning = torch.load(
+                        conditioning_file, map_location="cpu", weights_only=True
+                    )
                 assistant_ids = captured_conditioning["assistant_token_ids"]
                 if int(assistant_ids[-1]) == model_config.im_end_token_id:
                     prompt_ids = captured_conditioning["prompt_input_ids"]
@@ -229,13 +247,29 @@ def main() -> None:
                     pass
             else:
                 pass
-            native_files = sorted(trace_directory.glob("*-post_*.pt"))
+            native_files = sorted(
+                trace_directory.glob(
+                    "*-output.pt" if finished is not None else "*-post_*.pt"
+                )
+            )
+            assert native_files
+            if finished is not None:
+                assert len(native_files) == len(finished["output_ids"])
+                assert [filename.name for filename in native_files] == [
+                    f"{frame:04d}-output.pt" for frame in range(len(native_files))
+                ]
+            else:
+                pass
             native_frames = []
             for filename in native_files:
                 captured = torch.load(filename, map_location="cpu", weights_only=True)
                 native_frames.append(
                     {
-                        name: captured[name]
+                        name: (
+                            captured[name].unsqueeze(0)
+                            if finished is not None
+                            else captured[name]
+                        )
                         for name in ("codec_ids", "codec_feedback", "logits")
                     }
                 )
@@ -250,6 +284,12 @@ def main() -> None:
                 sorted(trace_directory.glob("*-before_decode.pt"))
             ):
                 captured = torch.load(filename, map_location="cpu", weights_only=True)
+                if finished is not None:
+                    captured["feedback_input"] = finished["decode_input_history"][
+                        frame_index
+                    ].unsqueeze(0)
+                else:
+                    pass
                 assert captured["sampling_seed"].tolist() == [seed]
                 assert captured["positions"].tolist() == [len(prefill) + frame_index]
                 next_text = (
@@ -477,12 +517,14 @@ def main() -> None:
                         reference.device
                     )
                     same_main_code = int(native_codes[0, 0]) == int(sampled_code[0])
-                    same_codec_frame = torch.equal(native_codes, codes)
+                    same_codec_frame = (
+                        None if is_eos else torch.equal(native_codes, codes)
+                    )
                     if not same_main_code and first_main_code_divergence is None:
                         first_main_code_divergence = frame_index
                     else:
                         pass
-                    if not same_codec_frame and first_codec_divergence is None:
+                    if same_codec_frame is False and first_codec_divergence is None:
                         first_codec_divergence = frame_index
                     else:
                         pass
