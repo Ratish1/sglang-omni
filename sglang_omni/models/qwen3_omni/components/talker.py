@@ -32,7 +32,11 @@ from sglang_omni.models.qwen3_omni.hf_config import (
     Qwen3OmniMoeTalkerConfig,
     Qwen3OmniMoeTalkerTextConfig,
 )
-from sglang_omni.models.qwen3_omni.layer_operand_capture import LayerOperandRecorder
+from sglang_omni.models.qwen3_omni.layer_operand_capture import (
+    LayerOperandRecorder,
+    MoeTacticChoice,
+    observe_moe_tactics,
+)
 from sglang_omni.platforms import current_platform
 from sglang_omni.quantization import get_weight_preprocessor
 from sglang_omni.sampling.sampler_compile import (
@@ -865,10 +869,18 @@ class Qwen3OmniTalker(nn.Module):
 
         device = self.model.codec_embedding.weight.device
         self.backbone_recorders: list[LayerOperandRecorder] = []
+        self.moe_tactic_choices: list[MoeTacticChoice] = []
+        retain_moe_batches = os.environ.get("SGLANG_OMNI_DIAGNOSTIC_MOE_BATCHES") == "1"
+        if retain_moe_batches:
+            observe_moe_tactics(self.moe_tactic_choices)
+        else:
+            pass
         if os.environ.get("SGLANG_OMNI_DIAGNOSTIC_LAYER_OPERANDS") == "1":
             step_counter = torch.zeros((), dtype=torch.int64, device=device)
             for layer in self.model.layers:
-                recorder = LayerOperandRecorder(step_counter=step_counter)
+                recorder = LayerOperandRecorder(
+                    step_counter=step_counter, retain_moe_batches=retain_moe_batches
+                )
                 self.backbone_recorders.append(recorder)
                 layer.operator_recorder = recorder
                 layer.self_attn.operator_recorder = recorder

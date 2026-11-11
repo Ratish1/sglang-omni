@@ -3,13 +3,16 @@
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 import torch
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
-from sglang_omni.models.qwen3_omni.layer_operand_capture import LayerOperandRecorder
+from sglang_omni.models.qwen3_omni.layer_operand_capture import (
+    LayerOperandRecorder,
+    MoeTacticChoice,
+)
 from sglang_omni.scheduling.sglang_backend.request_data import SGLangARRequestData
 from sglang_omni.scheduling.types import SchedulerRequest
 
@@ -27,6 +30,7 @@ class TalkerConditioningRecorder:
     previous_values: dict[str, list[torch.Tensor]] = field(default_factory=dict)
     operator_recorders: list[LayerOperandRecorder] = field(default_factory=list)
     retain_moe_batches: bool = False
+    moe_tactic_choices: list[MoeTacticChoice] = field(default_factory=list)
 
     def should_capture(self, request_id: str) -> bool:
         return self.request_ids is None or request_id in self.request_ids
@@ -328,6 +332,14 @@ class TalkerConditioningRecorder:
         )
         self.previous_keys.pop(request_id)
         self.previous_values.pop(request_id)
+        if self.retain_moe_batches:
+            (self.directory / "moe-choices-final.json").write_text(
+                json.dumps(
+                    [asdict(choice) for choice in self.moe_tactic_choices], indent=2
+                )
+            )
+        else:
+            pass
 
     def record_enqueue(self, request_id: str, row: torch.Tensor) -> None:
         if self.should_capture(request_id):

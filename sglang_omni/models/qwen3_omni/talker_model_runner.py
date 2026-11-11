@@ -8,6 +8,7 @@ import json
 import logging
 import os
 from collections import deque
+from dataclasses import asdict
 from pathlib import Path
 from queue import Queue
 from typing import TYPE_CHECKING, TypeAlias
@@ -20,6 +21,7 @@ from sglang.srt.layers.moe.moe_runner.flashinfer_cutlass import (
     _cutlass_moe_tune_max_num_tokens,
 )
 from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
+from sglang.srt.runtime_context import get_disagg
 
 from sglang_omni.model_runner.base import ModelRunner
 from sglang_omni.model_runner.model_worker import ModelWorker
@@ -103,8 +105,11 @@ class QwenTalkerModelRunner(ModelRunner["SGLangARRequestData"]):
                 request_ids=frozenset(json.loads(request_ids_file.read_text())),
                 operator_recorders=self.model.backbone_recorders,
                 retain_moe_batches=retain_moe_batches,
+                moe_tactic_choices=self.model.moe_tactic_choices,
             )
             if retain_moe_batches:
+                assert self.model.backbone_recorders
+                assert get_disagg().disaggregation_mode == "null"
                 destination = Path(directory)
                 destination.mkdir(parents=True, exist_ok=True)
                 layers = self.model.model.layers
@@ -113,6 +118,8 @@ class QwenTalkerModelRunner(ModelRunner["SGLangARRequestData"]):
                 ]
                 for layer, configuration in zip(layers, configurations, strict=True):
                     assert layer.mlp.experts.runner_backend.is_flashinfer_cutlass()
+                    assert layer.mlp.experts.w13_weight.dtype == torch.bfloat16
+                    assert layer.mlp.experts.w2_weight.dtype == torch.bfloat16
                     assert configuration.is_gated and configuration.activation == "silu"
                     assert not configuration.apply_router_weight_on_input
                     assert configuration.routed_scaling_factor is None
@@ -126,6 +133,10 @@ class QwenTalkerModelRunner(ModelRunner["SGLangARRequestData"]):
                         {
                             "tune_max_num_tokens": _cutlass_moe_tune_max_num_tokens(1),
                             "use_fused_finalize": envs.SGLANG_FLASHINFER_MOE_FUSED_FINALIZE.get(),
+                            "tactic_choices": [
+                                asdict(choice)
+                                for choice in self.model.moe_tactic_choices
+                            ],
                             "layers": [
                                 {
                                     "tp_size": configuration.moe_tp_size,
