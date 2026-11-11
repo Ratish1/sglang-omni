@@ -97,6 +97,7 @@ def main() -> None:
     for filename in output_files:
         observed = torch.load(filename, weights_only=True)
         old = torch.load(previous / filename.name, weights_only=True)
+        assert bool(observed["is_extend"]) == (filename.name == "0000-output.pt")
         assert bool(observed["past_exact"]) and bool(old["past_exact"])
         for name in ("codec_ids", "hidden_states", "logits"):
             assert torch.equal(observed[name], old[name]), (filename.name, name)
@@ -162,12 +163,23 @@ def main() -> None:
     maximum_replay_error = 0.0
     with (arguments.output_directory / "layers.jsonl").open("w") as output:
         for filename in filenames:
+            frame = int(filename.name.split("-")[0])
+            phase = "before_prefill" if frame == 0 else "before_decode"
+            before = torch.load(
+                directory / f"{frame:04d}-{phase}.pt", weights_only=True
+            )
+            position = (
+                before["mrope_positions"][:, -1]
+                if frame == 0 and before["mrope_positions"].numel()
+                else before["positions"][-1]
+            )
             snapshots = torch.load(filename, weights_only=True)
             assert len(snapshots) == len(native_weights)
             for layer_index, (snapshot, (packed, down)) in enumerate(
                 zip(snapshots, native_weights, strict=True)
             ):
                 row = int(snapshot["batch_selected_row"])
+                assert (snapshot["positions"] == position).all()
                 capturing = bool(snapshot["batch_is_graph"])
                 tensors = {}
                 for name in (
