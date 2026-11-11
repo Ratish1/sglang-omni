@@ -7,6 +7,7 @@ import json
 from pathlib import Path
 
 import torch
+from sglang.srt.layers.sampler import top_k_top_p_min_p_sampling_from_probs_torch
 from transformers import Qwen3OmniMoeConfig
 
 
@@ -16,7 +17,10 @@ def main() -> None:
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--model-path", required=True)
     parser.add_argument("--model-revision", required=True)
+    parser.add_argument("--gpu", type=int, required=True)
     arguments = parser.parse_args()
+    torch.cuda.set_device(arguments.gpu)
+    device = torch.device("cuda", arguments.gpu)
     configuration = Qwen3OmniMoeConfig.from_pretrained(
         arguments.model_path, revision=arguments.model_revision, local_files_only=True
     )
@@ -54,6 +58,10 @@ def main() -> None:
         assert len(enqueued) == len(spoken_tokens)
         assert int((enqueued == eos).all(dim=-1).sum()) == 1
         frame_reports = []
+        top_k = torch.tensor([parameters["top_k"]], device=device)
+        top_p = torch.tensor([parameters["top_p"]], device=device)
+        minimum_probability = torch.tensor([parameters["min_p"]], device=device)
+        sampling_seed = torch.tensor([parameters["sampling_seed"]], device=device)
         for frame, output in enumerate(outputs):
             phase = "before_prefill" if bool(output["is_extend"]) else "before_decode"
             before = torch.load(
@@ -105,6 +113,31 @@ def main() -> None:
                 )
             else:
                 combined_exact = None
+            if frame == 0:
+                probabilities = output["logits"].unsqueeze(0).to(device)
+            else:
+                logits = output["logits"].unsqueeze(0).to(device)
+                repeated = torch.zeros_like(logits, dtype=torch.bool)
+                repeated[:, finished["output_ids"][:frame].to(device)] = True
+                penalized = torch.where(
+                    logits > 0,
+                    logits / parameters["repetition_penalty"],
+                    logits * parameters["repetition_penalty"],
+                )
+                logits = torch.where(repeated, penalized, logits)
+                logits[:, parameters["suppress_tokens"]] = float("-inf")
+                probabilities = torch.softmax(
+                    logits / parameters["temperature"], dim=-1
+                )
+            sampled = top_k_top_p_min_p_sampling_from_probs_torch(
+                probabilities,
+                top_k,
+                top_p,
+                minimum_probability,
+                False,
+                sampling_seed,
+                torch.tensor([expected_position], device=device),
+            )
             frame_reports.append(
                 {
                     "frame": frame,
@@ -116,6 +149,8 @@ def main() -> None:
                     "repetition_mask_exact": repetition_mask_exact,
                     "sampling_seed_exact": seed_exact,
                     "previous_cache_exact": bool(output["past_exact"]),
+                    "sampled_code_exact": int(sampled[0])
+                    == int(output["codec_ids"][0]),
                 }
             )
         report = {
