@@ -188,6 +188,7 @@ class TalkerConditioningRecorder:
         codes: torch.Tensor,
         feedback: torch.Tensor,
         logits: torch.Tensor,
+        hidden_states: torch.Tensor,
     ) -> None:
         for row, request in enumerate(requests):
             if not self.should_capture(request.request_id):
@@ -228,6 +229,7 @@ class TalkerConditioningRecorder:
                     "codec_ids": codes[row].detach().cpu().clone(),
                     "codec_feedback": feedback[row].detach().cpu().clone(),
                     "logits": logits[row].detach().cpu().clone(),
+                    "hidden_states": hidden_states[row].detach().cpu().clone(),
                     "keys": (
                         keys if is_extend else [tensor[-1:].clone() for tensor in keys]
                     ),

@@ -197,6 +197,7 @@ class QwenTalkerModelRunner(ModelRunner["SGLangARRequestData"]):
                 self.model.output_codes,
                 self.model.output_embeds,
                 result.logits_output.next_token_logits,
+                result.logits_output.hidden_states,
             )
         else:
             pass
@@ -227,6 +228,7 @@ class QwenTalkerModelRunner(ModelRunner["SGLangARRequestData"]):
                 self.model.output_codes,
                 self.model.output_embeds,
                 result.logits_output.next_token_logits,
+                result.logits_output.hidden_states,
             )
         else:
             pass
