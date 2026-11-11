@@ -4,20 +4,80 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 from pathlib import Path
 
 import torch
+from sglang.srt.layers.moe.topk import StandardTopKOutput
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.models.qwen3_moe import Qwen3MoeDecoderLayer
+from torch import nn
 
 from sglang_omni.scheduling.types import SchedulerRequest
 
 TOP_TOKEN_COUNT = 8
 
 
+class ThinkerBoundaryCapture:
+    def __init__(
+        self,
+        query_indices: torch.Tensor,
+        input_rows: torch.Tensor,
+        output_rows: torch.Tensor,
+    ) -> None:
+        self.query_indices = query_indices
+        self.input_rows = input_rows
+        self.output_rows = output_rows
+
+    def __call__(
+        self,
+        module: nn.Module,
+        arguments: tuple[torch.Tensor] | tuple[torch.Tensor, ForwardBatch | None],
+        output: torch.Tensor | tuple[torch.Tensor, torch.Tensor | None],
+    ) -> None:
+        tensor = output if isinstance(output, torch.Tensor) else output[0]
+        if tensor.shape[0] == 0:
+            return
+        else:
+            pass
+        assert arguments[0].dtype == self.input_rows.dtype
+        assert tensor.dtype == self.output_rows.dtype
+        self.input_rows.copy_(arguments[0][self.query_indices])
+        self.output_rows.copy_(tensor[self.query_indices])
+
+
+class ThinkerRoutingCapture:
+    def __init__(
+        self,
+        query_indices: torch.Tensor,
+        expert_ids: torch.Tensor,
+        expert_weights: torch.Tensor,
+    ) -> None:
+        self.query_indices = query_indices
+        self.expert_ids = expert_ids
+        self.expert_weights = expert_weights
+
+    def __call__(
+        self,
+        module: nn.Module,
+        arguments: tuple[torch.Tensor, torch.Tensor],
+        output: StandardTopKOutput,
+    ) -> None:
+        assert isinstance(output, StandardTopKOutput)
+        if output.topk_ids.shape[0] == 0:
+            return
+        else:
+            pass
+        self.expert_ids.copy_(output.topk_ids[self.query_indices])
+        self.expert_weights.copy_(output.topk_weights[self.query_indices])
+
+
 class ThinkerDecisionCapture:
-    def __init__(self, directory: Path, hidden_states: torch.Tensor) -> None:
+    def __init__(
+        self, directory: Path, hidden_states: torch.Tensor, layers: nn.ModuleList
+    ) -> None:
         self.directory = directory
         self.directory.mkdir(parents=True, exist_ok=True)
         request_ids = json.loads((directory / "request_ids.json").read_text())
@@ -30,7 +90,87 @@ class ThinkerDecisionCapture:
         self.raw_logits_finite = torch.zeros(
             hidden_states.shape[0], device=hidden_states.device, dtype=torch.bool
         )
+        self.layer_boundaries: dict[str, torch.Tensor] = {}
+        self.query_indices = torch.zeros(
+            len(request_ids), device=hidden_states.device, dtype=torch.long
+        )
+        if os.environ.get("SGLANG_OMNI_THINKER_CAPTURE_LAYERS") == "1":
+            for layer_index, layer in enumerate(layers):
+                assert isinstance(layer, Qwen3MoeDecoderLayer)
+                attention = layer.self_attn
+                for name, module, input_width, output_width in (
+                    (
+                        "qkv",
+                        attention.qkv_proj,
+                        attention.hidden_size,
+                        attention.q_size + 2 * attention.kv_size,
+                    ),
+                    (
+                        "attention_projection",
+                        attention.o_proj,
+                        attention.q_size,
+                        attention.hidden_size,
+                    ),
+                    (
+                        "gate",
+                        layer.mlp.gate,
+                        attention.hidden_size,
+                        layer.config.num_experts,
+                    ),
+                    ("moe", layer.mlp, attention.hidden_size, attention.hidden_size),
+                ):
+                    input_rows = hidden_states.new_zeros(
+                        (len(request_ids), input_width)
+                    )
+                    output_rows = hidden_states.new_zeros(
+                        (len(request_ids), output_width)
+                    )
+                    self.layer_boundaries[f"layer.{layer_index}.{name}.input"] = (
+                        input_rows
+                    )
+                    self.layer_boundaries[f"layer.{layer_index}.{name}.output"] = (
+                        output_rows
+                    )
+                    module.register_forward_hook(
+                        ThinkerBoundaryCapture(
+                            self.query_indices, input_rows, output_rows
+                        )
+                    )
+                expert_ids = torch.zeros(
+                    len(request_ids),
+                    layer.config.num_experts_per_tok,
+                    device=hidden_states.device,
+                    dtype=torch.long,
+                )
+                expert_weights = torch.zeros_like(expert_ids, dtype=torch.float32)
+                self.layer_boundaries[f"layer.{layer_index}.expert_ids"] = expert_ids
+                self.layer_boundaries[f"layer.{layer_index}.expert_weights"] = (
+                    expert_weights
+                )
+                layer.mlp.topk.register_forward_hook(
+                    ThinkerRoutingCapture(
+                        self.query_indices, expert_ids, expert_weights
+                    )
+                )
+        else:
+            pass
         self.step = 0
+
+    def prepare(self, forward_batch: ForwardBatch) -> None:
+        if not self.layer_boundaries:
+            return
+        else:
+            pass
+        if forward_batch.forward_mode.is_extend():
+            indices = forward_batch.extend_seq_lens.cumsum(0) - 1
+        else:
+            assert forward_batch.forward_mode.is_decode()
+            indices = torch.arange(
+                forward_batch.input_ids.shape[0], device=self.query_indices.device
+            )
+        self.query_indices.zero_()
+        row_count = min(indices.numel(), self.query_indices.numel())
+        self.query_indices[:row_count].copy_(indices[:row_count])
 
     def capture_hidden(
         self, hidden_states: torch.Tensor, forward_batch: ForwardBatch
@@ -74,6 +214,17 @@ class ThinkerDecisionCapture:
         assert torch.equal(token_ids, greedy_ids), (token_ids, greedy_ids)
         head_inputs = self.hidden_states[:live_rows].cpu().clone()
         assert bool(head_inputs.isfinite().all())
+        if self.layer_boundaries:
+            assert live_rows <= self.query_indices.numel()
+            layer_boundaries = {
+                name: tensor[:live_rows].cpu().clone()
+                for name, tensor in self.layer_boundaries.items()
+            }
+            assert all(
+                bool(tensor.isfinite().all()) for tensor in layer_boundaries.values()
+            )
+        else:
+            layer_boundaries = {}
         filename = f"step-{self.step:06d}.pt"
         torch.save(
             {
@@ -83,6 +234,7 @@ class ThinkerDecisionCapture:
                 "token_ids": token_ids,
                 "greedy_ids": greedy_ids,
                 "raw_logits_finite": self.raw_logits_finite[:live_rows].cpu().clone(),
+                "layer_boundaries": layer_boundaries,
             },
             self.directory / filename,
         )

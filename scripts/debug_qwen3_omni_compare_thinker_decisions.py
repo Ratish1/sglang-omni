@@ -12,6 +12,7 @@ from pydantic import BaseModel
 
 
 class CapturedStep(BaseModel):
+    tensor_file: str
     phase: str
     captured_graph: bool
     request_ids: list[str]

@@ -144,6 +144,7 @@ class Qwen3OmniThinkerForCausalLM(nn.Module):
                 self.lm_head.weight.new_zeros(
                     (max_prefill_buffer_tokens(), self.config.hidden_size)
                 ),
+                self.model.layers,
             )
             if decision_directory is not None
             else None
@@ -249,6 +250,10 @@ class Qwen3OmniThinkerForCausalLM(nn.Module):
             marked_live_rows.is_live_row = forward_batch.out_cache_loc != 0
         else:
             marked_live_rows = None
+        if self.decision_capture is not None:
+            self.decision_capture.prepare(forward_batch)
+        else:
+            pass
         try:
             hidden_states = self.model(
                 input_ids=input_ids,
