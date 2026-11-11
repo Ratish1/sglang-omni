@@ -9,6 +9,7 @@ from pathlib import Path
 import torch
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
+from sglang_omni.models.qwen3_omni.layer_operand_capture import LayerOperandRecorder
 from sglang_omni.scheduling.sglang_backend.request_data import SGLangARRequestData
 from sglang_omni.scheduling.types import SchedulerRequest
 
@@ -24,6 +25,7 @@ class TalkerConditioningRecorder:
     future_rows: dict[str, list[torch.Tensor]] = field(default_factory=dict)
     previous_keys: dict[str, list[torch.Tensor]] = field(default_factory=dict)
     previous_values: dict[str, list[torch.Tensor]] = field(default_factory=dict)
+    operator_recorders: list[LayerOperandRecorder] = field(default_factory=list)
 
     def should_capture(self, request_id: str) -> bool:
         return self.request_ids is None or request_id in self.request_ids
@@ -80,6 +82,10 @@ class TalkerConditioningRecorder:
         sampling_seeds: torch.Tensor | None,
         repetition_mask: torch.Tensor | None = None,
     ) -> None:
+        if self.operator_recorders:
+            self.operator_recorders[0].step_counter.add_(1)
+        else:
+            pass
         offset = 0
         for row, request in enumerate(requests):
             if not self.should_capture(request.request_id):
@@ -248,6 +254,14 @@ class TalkerConditioningRecorder:
                 },
                 destination / f"{frame_index:04d}-output.pt",
             )
+            if self.operator_recorders and not is_extend:
+                step = int(self.operator_recorders[0].step_counter)
+                torch.save(
+                    [recorder.read(step, row) for recorder in self.operator_recorders],
+                    destination / f"{frame_index:04d}-operators.pt",
+                )
+            else:
+                pass
 
     def record_text_chunk(
         self, request_data: SGLangARRequestData, token_id: int

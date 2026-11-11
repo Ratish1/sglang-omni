@@ -12,6 +12,7 @@ from torch import nn
 from transformers import PretrainedConfig
 
 from sglang_omni.models.qwen3_omni.hf_config import Qwen3OmniMoeTextConfig
+from sglang_omni.models.qwen3_omni.layer_operand_capture import LayerOperandRecorder
 from sglang_omni.models.weight_loader import default_weight_loader
 from sglang_omni.platforms import current_platform
 from sglang_omni.quantization import get_weight_preprocessor
@@ -154,6 +155,8 @@ class Qwen3OmniMoeThinkerTextAttention(nn.Module):
     Omni tailed version of qwen3_moe.py:Qwen3MoeAttention
     """
 
+    operator_recorder: LayerOperandRecorder | None = None
+
     def __init__(
         self,
         hidden_size: int,
@@ -263,6 +266,13 @@ class Qwen3OmniMoeThinkerTextAttention(nn.Module):
         forward_batch: ForwardBatch,
     ):
         qkv, _ = self.qkv_proj(hidden_states)
+        if (
+            self.operator_recorder is not None
+            and forward_batch.forward_mode.is_decode()
+        ):
+            self.operator_recorder.record("qkv", qkv)
+        else:
+            pass
 
         q, k, v = self.apply_qk_norm_rope(qkv, positions, forward_batch)
 
@@ -317,6 +327,14 @@ class Qwen3OmniMoeThinkerTextAttention(nn.Module):
                 head_dim=self.head_dim,
                 alt_stream=self.alt_stream,
             )
+            if (
+                self.operator_recorder is not None
+                and forward_batch.forward_mode.is_decode()
+            ):
+                self.operator_recorder.record("normalized_query", q)
+                self.operator_recorder.record("normalized_key", k)
+            else:
+                pass
             # note (ratish): a forced torch backend runs the rope's native
             # forward, which cannot store K and V, so attention stores them.
             use_fused_set_kv_buffer = (
@@ -368,6 +386,12 @@ class Qwen3OmniMoeThinkerTextAttention(nn.Module):
             pass
 
         q, k, v, fb = inner_state
+        if self.operator_recorder is not None and fb.forward_mode.is_decode():
+            self.operator_recorder.record("rotated_query", q)
+            self.operator_recorder.record("rotated_key", k)
+            self.operator_recorder.record("projected_value", v)
+        else:
+            pass
 
         must_save_kv = self.used_fused_qk_norm_rope_last_call
         save_kv_cache = must_save_kv or not self.used_fused_set_kv_buffer_last_call
@@ -383,6 +407,10 @@ class Qwen3OmniMoeThinkerTextAttention(nn.Module):
         # activation to the quantizer, which post1's sgl_kernel rejects.
         if attn_output.dtype != v.dtype:
             attn_output = attn_output.to(dtype=v.dtype)
+        else:
+            pass
+        if self.operator_recorder is not None and fb.forward_mode.is_decode():
+            self.operator_recorder.record("attention_values", attn_output)
         else:
             pass
         output, _ = self.o_proj(attn_output)
@@ -476,6 +504,7 @@ class Qwen3OmniMoeThinkerTextSparseMoeBlock(nn.Module):
 
 class Qwen3OmniMoeThinkerTextDecoderLayer(nn.Module):
     sparse_moe_block_cls = Qwen3OmniMoeThinkerTextSparseMoeBlock
+    operator_recorder: LayerOperandRecorder | None = None
 
     def __init__(
         self,
@@ -564,12 +593,33 @@ class Qwen3OmniMoeThinkerTextDecoderLayer(nn.Module):
         captured_last_layer_outputs: Optional[AuxHiddenStateList] = None,
         **kwargs,
     ) -> torch.Tensor:
+        record_operands = (
+            self.operator_recorder is not None
+            and forward_batch.forward_mode.is_decode()
+        )
+        if record_operands:
+            self.operator_recorder.begin(positions)
+            self.operator_recorder.record("input_contribution", hidden_states)
+            previous_residual = residual_batch.written_residual(forward_batch)
+            if previous_residual is not None:
+                self.operator_recorder.record("previous_residual", previous_residual)
+            else:
+                pass
+        else:
+            pass
         hidden_states = self.attn_boundary.prepare(
             hidden_states,
             forward_batch,
             capture_gathered=captured_last_layer_outputs,
             **kwargs,
         )
+        if record_operands:
+            self.operator_recorder.record("attention_normalized", hidden_states)
+            self.operator_recorder.record(
+                "attention_residual", residual_batch.written_residual(forward_batch)
+            )
+        else:
+            pass
 
         if hidden_states.shape[0] != 0:
             hidden_states = self.self_attn(
@@ -581,9 +631,24 @@ class Qwen3OmniMoeThinkerTextDecoderLayer(nn.Module):
             pass
 
         hidden_states = self.attn_boundary.finish(hidden_states, forward_batch)
+        if record_operands:
+            self.operator_recorder.record("attention_output", hidden_states)
+        else:
+            pass
         hidden_states = self.ffn_boundary.prepare(hidden_states, forward_batch)
+        if record_operands:
+            self.operator_recorder.record("mlp_normalized", hidden_states)
+            self.operator_recorder.record(
+                "mlp_residual", residual_batch.written_residual(forward_batch)
+            )
+        else:
+            pass
 
         hidden_states = self.mlp(hidden_states, forward_batch)
+        if record_operands:
+            self.operator_recorder.record("mlp_output", hidden_states)
+        else:
+            pass
         return self.ffn_boundary.finish(hidden_states, forward_batch)
 
 

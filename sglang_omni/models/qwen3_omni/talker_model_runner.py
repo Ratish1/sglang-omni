@@ -92,6 +92,7 @@ class QwenTalkerModelRunner(ModelRunner["SGLangARRequestData"]):
                 value_buffers=pool.v_buffer,
                 request_slots=tp_worker.model_runner.req_to_token_pool.req_to_token,
                 request_ids=frozenset(json.loads(request_ids_file.read_text())),
+                operator_recorders=self.model.backbone_recorders,
             )
         else:
             pass
