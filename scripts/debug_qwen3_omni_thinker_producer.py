@@ -10,10 +10,6 @@ from pathlib import Path
 import torch
 from huggingface_hub import hf_hub_download
 from transformers import Qwen3OmniMoeConfig
-from transformers.conversion_mapping import (
-    get_checkpoint_conversion_mapping,
-    register_checkpoint_conversion_mapping,
-)
 from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import (
     Qwen3OmniMoeThinkerForConditionalGeneration,
     Qwen3OmniMoeThinkerTextRotaryEmbedding,
@@ -64,10 +60,6 @@ def main() -> None:
     assert captured_input["extend_length"] == len(captured_input["embedded_input"])
     configuration = Qwen3OmniMoeConfig.from_pretrained(
         arguments.model_path, revision=arguments.model_revision
-    )
-    register_checkpoint_conversion_mapping(
-        configuration.thinker_config.model_type,
-        get_checkpoint_conversion_mapping("qwen3_omni_moe"),
     )
     reference, loading = Qwen3OmniMoeThinkerForConditionalGeneration.from_pretrained(
         arguments.model_path,
