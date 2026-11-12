@@ -36,7 +36,7 @@ def main() -> None:
         outgoing = handoff["outgoing_hidden"]
         assert len(positions) == len(slots) == len(outgoing) > 0
         assert handoff["writers"].shape == (len(positions), 2)
-        assert positions.dtype == slots.dtype == torch.int64
+        assert positions.dtype == torch.int64 and slots.dtype == torch.int32
         assert outgoing.dtype == torch.bfloat16 and outgoing.isfinite().all()
         assert len(slots.unique()) == len(slots)
         assert 0 < handoff["write_count"] <= len(write_files)
