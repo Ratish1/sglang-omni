@@ -1,0 +1,180 @@
+"""Measure expert rounding stages on actual native Thinker inputs and routing."""
+
+from __future__ import annotations
+
+import argparse
+import json
+from dataclasses import asdict
+from pathlib import Path
+
+import torch
+from huggingface_hub import snapshot_download
+from safetensors import safe_open
+
+from scripts.debug_qwen3_omni_feedback_audit import compare_tensors
+from scripts.qwen3_omni_checkpoint_weights import CheckpointIndex
+
+
+@torch.inference_mode()
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--delivery-directory", type=Path, required=True)
+    parser.add_argument("--request-id", required=True)
+    parser.add_argument("--model-path", required=True)
+    parser.add_argument("--model-revision", required=True)
+    parser.add_argument("--gpu", type=int, required=True)
+    parser.add_argument("--output-directory", type=Path, required=True)
+    arguments = parser.parse_args()
+    arguments.output_directory.mkdir(parents=True, exist_ok=False)
+    torch.cuda.set_device(arguments.gpu)
+    device = torch.device("cuda", arguments.gpu)
+    checkpoint_directory = Path(
+        snapshot_download(arguments.model_path, revision=arguments.model_revision)
+    )
+    index = CheckpointIndex.model_validate_json(
+        (checkpoint_directory / "model.safetensors.index.json").read_bytes()
+    )
+    selected = []
+    for path in sorted((arguments.delivery_directory / "writes").glob("*.pt")):
+        captured = torch.load(path, map_location="cpu", weights_only=True)
+        if captured["request_id"] == arguments.request_id:
+            selected.append(captured)
+        else:
+            pass
+    assert len(selected) == 1
+    captured = selected[0]
+    manifest = json.loads(
+        (arguments.delivery_directory / "native-thinker-state.json").read_text()
+    )
+    live = slice(
+        captured["batch_offset"], captured["batch_offset"] + captured["extend_length"]
+    )
+    operators = captured["operator_batches"]
+    reports = []
+    for layer_index in range(len(captured["layer_batches"]) - 1):
+        runtime = manifest["layers"][layer_index]
+        assert runtime["activation"] == "silu" and runtime["is_gated"]
+        assert not runtime["apply_router_weight_on_input"]
+        assert not runtime["no_combine"] and not runtime["w13_swiglu_interleaved"]
+        prefix = f"operator_{layer_index:02d}"
+        hidden = operators[f"{prefix}_router_input"].to(device)
+        expert_indices = operators[f"{prefix}_expert_indices"].long().to(device)
+        expert_weights = operators[f"{prefix}_expert_weights"].to(device)
+        assert hidden.dtype == torch.bfloat16
+        assert expert_weights.dtype == torch.float32
+        token_count, top_k = expert_indices.shape
+        route_shape = (token_count, top_k, hidden.shape[-1])
+        source_routes = torch.zeros(route_shape, dtype=hidden.dtype, device=device)
+        rounded_activation_routes = torch.zeros_like(source_routes)
+        rounded_down_routes = torch.zeros_like(source_routes)
+        checkpoint_output = torch.zeros_like(hidden)
+        activation_differences = 0
+        activation_values = 0
+        down_store_differences = 0
+        down_store_values = 0
+        for expert_index in expert_indices.unique(sorted=True).tolist():
+            token_indices, ranks = torch.where(expert_indices == expert_index)
+            weights: dict[str, torch.Tensor] = {}
+            for projection in ("gate_proj", "up_proj", "down_proj"):
+                name = f"thinker.model.layers.{layer_index}.mlp.experts.{expert_index}.{projection}.weight"
+                with safe_open(
+                    checkpoint_directory / index.weight_map[name],
+                    framework="pt",
+                    device="cpu",
+                ) as checkpoint:
+                    weights[projection] = checkpoint.get_tensor(name).to(device)
+                    assert weights[projection].dtype == hidden.dtype
+            gate, up = torch.nn.functional.linear(
+                hidden[token_indices],
+                torch.cat((weights["gate_proj"], weights["up_proj"])),
+            ).chunk(2, dim=-1)
+            fused_activation = (torch.nn.functional.silu(gate.float()) * up.float()).to(
+                hidden.dtype
+            )
+            rounded_activation = torch.nn.functional.silu(gate) * up
+            activation_differences += int(
+                (fused_activation != rounded_activation).sum()
+            )
+            activation_values += fused_activation.numel()
+            source_down = torch.mm(
+                fused_activation, weights["down_proj"].T, out_dtype=torch.float32
+            )
+            rounded_activation_down = torch.mm(
+                rounded_activation, weights["down_proj"].T, out_dtype=torch.float32
+            )
+            checkpoint_down = torch.nn.functional.linear(
+                rounded_activation, weights["down_proj"]
+            )
+            down_store_differences += int(
+                (rounded_activation_down.to(hidden.dtype) != checkpoint_down).sum()
+            )
+            down_store_values += checkpoint_down.numel()
+            scales = expert_weights[token_indices, ranks, None]
+            source_routes[token_indices, ranks] = (source_down * scales).to(
+                hidden.dtype
+            )
+            rounded_activation_routes[token_indices, ranks] = (
+                rounded_activation_down * scales
+            ).to(hidden.dtype)
+            rounded_down_routes[token_indices, ranks] = (
+                rounded_activation_down.to(hidden.dtype).float() * scales
+            ).to(hidden.dtype)
+            checkpoint_output.index_add_(
+                0,
+                token_indices,
+                (checkpoint_down * scales).to(hidden.dtype),
+            )
+        source_output = source_routes.float().sum(1).to(hidden.dtype)
+        rounded_activation_output = (
+            rounded_activation_routes.float().sum(1).to(hidden.dtype)
+        )
+        rounded_down_output = rounded_down_routes.float().sum(1).to(hidden.dtype)
+        actual = operators[f"{prefix}_moe_output"].to(device)
+        differences = {
+            "native_to_source_rounding_formula": compare_tensors(
+                actual[live], source_output[live]
+            ),
+            "native_to_rounded_activation": compare_tensors(
+                actual[live], rounded_activation_output[live]
+            ),
+            "native_to_rounded_activation_and_down": compare_tensors(
+                actual[live], rounded_down_output[live]
+            ),
+            "native_to_checkpoint_bf16_accumulation": compare_tensors(
+                actual[live], checkpoint_output[live]
+            ),
+            "source_to_rounded_activation": compare_tensors(
+                source_output[live], rounded_activation_output[live]
+            ),
+            "rounded_activation_to_down_store": compare_tensors(
+                rounded_activation_output[live], rounded_down_output[live]
+            ),
+            "rounded_down_to_checkpoint_accumulation": compare_tensors(
+                rounded_down_output[live], checkpoint_output[live]
+            ),
+        }
+        reports.append(
+            {
+                "layer_index": layer_index,
+                "activation_different_values": activation_differences,
+                "activation_values": activation_values,
+                "fp32_down_cast_vs_bf16_gemm_different_values": down_store_differences,
+                "down_values": down_store_values,
+                "comparisons": {
+                    name: asdict(difference) for name, difference in differences.items()
+                },
+            }
+        )
+        print(json.dumps({"completed_layer": layer_index}), flush=True)
+    report = {
+        "request_id": arguments.request_id,
+        "scope": "Held native inputs and routing with raw checkpoint weights. These source-semantic counterfactuals use per-expert cuBLAS GEMMs, not the native padded Triton GEMM geometry or its fast SiLU intrinsics. Changing a rounding stage is not a production repair or a speech-quality result. The FP32-down-cast versus BF16-GEMM comparison explicitly reports any additional matmul difference.",
+        "layers": reports,
+    }
+    (arguments.output_directory / "comparisons.json").write_text(
+        json.dumps(report, indent=2)
+    )
+
+
+if __name__ == "__main__":
+    main()
