@@ -5,6 +5,7 @@ SGLang-native Talker model for Qwen3-Omni compatiable with hf formatting.
 from __future__ import annotations
 
 import logging
+import os
 from typing import Iterable, Optional, Tuple
 
 import torch
@@ -13,7 +14,7 @@ from sglang.kernels.spec import KernelBackend
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.model_executor.runner_utils.capture_mode import get_is_capture_mode
 from sglang.srt.model_loader.weight_utils import default_weight_loader
-from sglang.srt.runtime_context import get_context, get_schedule
+from sglang.srt.runtime_context import get_context, get_exec, get_schedule
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import add_prefix
@@ -24,9 +25,17 @@ from sglang_omni.models.qwen3_omni.components.thinker_model import (
     Qwen3OmniMoeThinkerTextDecoderLayer,
     Qwen3OmniMoeThinkerTextSparseMoeBlock,
 )
+from sglang_omni.models.qwen3_omni.conditioning_capture import (
+    TalkerConditioningRecorder,
+)
 from sglang_omni.models.qwen3_omni.hf_config import (
     Qwen3OmniMoeTalkerConfig,
     Qwen3OmniMoeTalkerTextConfig,
+)
+from sglang_omni.models.qwen3_omni.layer_operand_capture import (
+    LayerOperandRecorder,
+    MoeTacticChoice,
+    observe_moe_tactics,
 )
 from sglang_omni.platforms import current_platform
 from sglang_omni.quantization import get_weight_preprocessor
@@ -294,6 +303,8 @@ class Qwen3OmniMoeTalkerSparseMoeBlock(Qwen3OmniMoeThinkerTextSparseMoeBlock):
     combined; the layer's FFN boundary completes the sum.
     """
 
+    operator_recorder: LayerOperandRecorder | None = None
+
     def __init__(
         self,
         layer_id: int,
@@ -343,11 +354,30 @@ class Qwen3OmniMoeTalkerSparseMoeBlock(Qwen3OmniMoeThinkerTextSparseMoeBlock):
         shared_output = self.shared_expert(linear_hidden_states)
         shared_gate, _ = self.shared_expert_gate(linear_hidden_states)
         shared_output = shared_output * torch.sigmoid(shared_gate)
+        record_operands = (
+            self.operator_recorder is not None
+            and self.operator_recorder.captures_mode(forward_batch.forward_mode)
+        )
+        if record_operands:
+            self.operator_recorder.record("shared_output", shared_output)
+            self.operator_recorder.record("shared_gate", shared_gate)
+        else:
+            pass
 
         # --- Routed experts (no all-reduce yet) ---
         router_logits, _ = self.gate(linear_hidden_states)
         topk_output = self.topk(linear_hidden_states, router_logits)
+        if record_operands:
+            self.operator_recorder.record("router_logits", router_logits)
+            self.operator_recorder.record("expert_indices", topk_output.topk_ids)
+            self.operator_recorder.record("expert_weights", topk_output.topk_weights)
+        else:
+            pass
         routed_output = self.experts(linear_hidden_states, topk_output)
+        if record_operands:
+            self.operator_recorder.record("routed_output", routed_output)
+        else:
+            pass
 
         final_hidden_states = routed_output + shared_output
         return final_hidden_states.view(num_tokens, hidden_dim)
@@ -775,6 +805,8 @@ class Qwen3OmniMoeTalkerCodePredictor(nn.Module):
 class Qwen3OmniTalker(nn.Module):
     """Talker: Text-to-Audio generation model."""
 
+    conditioning_recorder: TalkerConditioningRecorder | None = None
+
     def __init__(
         self,
         config,
@@ -836,6 +868,33 @@ class Qwen3OmniTalker(nn.Module):
         )
 
         device = self.model.codec_embedding.weight.device
+        self.backbone_recorders: list[LayerOperandRecorder] = []
+        self.moe_tactic_choices: list[MoeTacticChoice] = []
+        retain_moe_batches = os.environ.get("SGLANG_OMNI_DIAGNOSTIC_MOE_BATCHES") == "1"
+        if retain_moe_batches:
+            observe_moe_tactics(self.moe_tactic_choices)
+        else:
+            pass
+        if os.environ.get("SGLANG_OMNI_DIAGNOSTIC_LAYER_OPERANDS") == "1":
+            step_counter = torch.zeros((), dtype=torch.int64, device=device)
+            maximum_prefill_token_rows = (
+                max(get_exec().graph.cuda_graph_config.prefill.bs)
+                if retain_moe_batches
+                else 0
+            )
+            assert not retain_moe_batches or get_schedule().disable_overlap_schedule
+            for layer in self.model.layers:
+                recorder = LayerOperandRecorder(
+                    step_counter=step_counter,
+                    maximum_prefill_token_rows=maximum_prefill_token_rows,
+                    retain_moe_batches=retain_moe_batches,
+                )
+                self.backbone_recorders.append(recorder)
+                layer.operator_recorder = recorder
+                layer.self_attn.operator_recorder = recorder
+                layer.mlp.operator_recorder = recorder
+        else:
+            pass
         hidden_size = config.text_config.hidden_size
         predictor_len = config.num_code_groups + 1
         server_args = get_context().server_args

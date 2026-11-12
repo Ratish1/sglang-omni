@@ -156,6 +156,13 @@ def create_thinker_scheduler(
             capture_prompt_hidden_states=capture_prompt_hidden_states,
         )
 
+    delivery_recorder = model_worker.model_runner.model.delivery_recorder
+    if delivery_recorder is not None:
+        assert isinstance(model_runner, Qwen3OmniThinkerModelRunner)
+        model_runner.delivery_recorder = delivery_recorder
+    else:
+        pass
+
     tokenizer = get_tokenizer(
         model_config.model_path,
         trust_remote_code=True,
@@ -173,6 +180,7 @@ def create_thinker_scheduler(
     stream_output_builder = make_thinker_stream_output_builder(
         speech_enabled=speech_enabled,
         prompt_hidden_store=model_runner.prompt_hidden_store,
+        delivery_recorder=delivery_recorder,
     )
     if execution_mode == "request":
         session_adapter = None

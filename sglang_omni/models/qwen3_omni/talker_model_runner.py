@@ -3,17 +3,34 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
+import logging
+import os
 from collections import deque
+from dataclasses import asdict
+from pathlib import Path
 from queue import Queue
 from typing import TYPE_CHECKING, TypeAlias
 
 import torch
+from flashinfer.autotuner import AutoTuner
+from sglang.srt.environ import envs
+from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+from sglang.srt.layers.moe.moe_runner.flashinfer_cutlass import (
+    _cutlass_moe_tune_max_num_tokens,
+)
+from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
+from sglang.srt.runtime_context import get_disagg
 
 from sglang_omni.model_runner.base import ModelRunner
 from sglang_omni.model_runner.model_worker import ModelWorker
 from sglang_omni.model_runner.prefill_inputs import (
     OmniPrefillInputs,
     attach_omni_prefill_inputs,
+)
+from sglang_omni.models.qwen3_omni.conditioning_capture import (
+    TalkerConditioningRecorder,
 )
 from sglang_omni.scheduling.message import OutgoingMessage, put_messages
 from sglang_omni.scheduling.pending_text_queue import PendingTextTensorQueue
@@ -39,6 +56,8 @@ if TYPE_CHECKING:
     )
 else:
     pass
+
+logger = logging.getLogger(__name__)
 
 
 TalkerInputQueue: TypeAlias = (
@@ -70,6 +89,102 @@ class QwenTalkerModelRunner(ModelRunner["SGLangARRequestData"]):
         self.codec_coalesce_frames = max(int(codec_coalesce_frames), 0)
         self.codec_coalesce_first_frames = max(int(codec_coalesce_first_frames), 0)
         self.codec_coalesce_early_frames = max(int(codec_coalesce_early_frames), 0)
+        directory = os.environ.get("SGLANG_OMNI_DIAGNOSTIC_CONDITIONING_DIRECTORY")
+        if directory is not None:
+            retain_moe_batches = (
+                os.environ.get("SGLANG_OMNI_DIAGNOSTIC_MOE_BATCHES") == "1"
+            )
+            request_ids_file = Path(os.environ["SGLANG_OMNI_CORPUS_REQUEST_ID_FILE"])
+            pool = tp_worker.model_runner.token_to_kv_pool
+            assert isinstance(pool, MHATokenToKVPool)
+            self.model.conditioning_recorder = TalkerConditioningRecorder(
+                directory=Path(directory),
+                key_buffers=pool.k_buffer,
+                value_buffers=pool.v_buffer,
+                request_slots=tp_worker.model_runner.req_to_token_pool.req_to_token,
+                request_ids=frozenset(json.loads(request_ids_file.read_text())),
+                operator_recorders=self.model.backbone_recorders,
+                retain_moe_batches=retain_moe_batches,
+                moe_tactic_choices=self.model.moe_tactic_choices,
+            )
+            if retain_moe_batches:
+                assert self.model.backbone_recorders
+                assert get_disagg().disaggregation_mode == "null"
+                destination = Path(directory)
+                destination.mkdir(parents=True, exist_ok=True)
+                layers = self.model.model.layers
+                configurations = [
+                    layer.mlp.experts.quant_method.moe_runner_config for layer in layers
+                ]
+                for layer, configuration in zip(layers, configurations, strict=True):
+                    assert layer.mlp.experts.runner_backend.is_flashinfer_cutlass()
+                    assert layer.mlp.experts.w13_weight.dtype == torch.bfloat16
+                    assert layer.mlp.experts.w2_weight.dtype == torch.bfloat16
+                    assert configuration.is_gated and configuration.activation == "silu"
+                    assert not configuration.apply_router_weight_on_input
+                    assert configuration.routed_scaling_factor is None
+                    assert configuration.gemm1_alpha is None
+                    assert configuration.gemm1_beta is None
+                    assert configuration.gemm1_clamp_limit is None
+                    assert configuration.swiglu_limit is None
+                AutoTuner.get().save_configs(str(destination / "moe-tactics.json"))
+                (destination / "moe-runtime.json").write_text(
+                    json.dumps(
+                        {
+                            "tune_max_num_tokens": _cutlass_moe_tune_max_num_tokens(1),
+                            "use_fused_finalize": envs.SGLANG_FLASHINFER_MOE_FUSED_FINALIZE.get(),
+                            "maximum_prefill_token_rows": self.model.backbone_recorders[
+                                0
+                            ].maximum_prefill_token_rows,
+                            "prefill_buffer_bytes": sum(
+                                tensor.numel() * tensor.element_size()
+                                for recorder in self.model.backbone_recorders
+                                for tensor in recorder.prefill_buffers.values()
+                            ),
+                            "tactic_choices": [
+                                asdict(choice)
+                                for choice in self.model.moe_tactic_choices
+                            ],
+                            "layers": [
+                                {
+                                    "tp_size": configuration.moe_tp_size,
+                                    "tp_rank": configuration.moe_tp_rank,
+                                    "ep_size": configuration.moe_ep_size,
+                                    "ep_rank": configuration.moe_ep_rank,
+                                    "weights": {
+                                        name: {
+                                            "shape": list(tensor.shape),
+                                            "dtype": str(tensor.dtype),
+                                            "sha256": hashlib.sha256(
+                                                tensor.detach()
+                                                .cpu()
+                                                .contiguous()
+                                                .view(torch.uint8)
+                                                .numpy()
+                                                .tobytes()
+                                            ).hexdigest(),
+                                        }
+                                        for name, tensor in (
+                                            (
+                                                "w13_weight",
+                                                layer.mlp.experts.w13_weight,
+                                            ),
+                                            ("w2_weight", layer.mlp.experts.w2_weight),
+                                        )
+                                    },
+                                }
+                                for layer, configuration in zip(
+                                    layers, configurations, strict=True
+                                )
+                            ],
+                        },
+                        indent=2,
+                    )
+                )
+            else:
+                pass
+        else:
+            pass
 
     def execute(self, scheduler_output: SchedulerOutput) -> ModelRunnerOutput:
         return super().execute(scheduler_output)
@@ -94,6 +209,12 @@ class QwenTalkerModelRunner(ModelRunner["SGLangARRequestData"]):
                 input_embeds_are_projected=input_embeds_are_projected,
             ),
         )
+        if self.model.conditioning_recorder is not None:
+            self.model.conditioning_recorder.record_inputs(
+                forward_batch, requests, input_embeds, None
+            )
+        else:
+            pass
 
     def before_decode(
         self,
@@ -104,7 +225,6 @@ class QwenTalkerModelRunner(ModelRunner["SGLangARRequestData"]):
         is_lookahead: bool = False,
     ) -> None:
         del is_lookahead
-        del forward_batch
         del schedule_batch
         if not self.feedback_enabled:
             return
@@ -119,6 +239,16 @@ class QwenTalkerModelRunner(ModelRunner["SGLangARRequestData"]):
             pass
 
         self.model.prepare_decode_buffers(requests)
+        if self.model.conditioning_recorder is not None:
+            self.model.conditioning_recorder.record_inputs(
+                forward_batch,
+                requests,
+                None,
+                self.model.sampling_seeds,
+                self.model.repetition_mask,
+            )
+        else:
+            pass
         self.write_feedback_buffers(requests)
 
     def post_prefill(
@@ -150,6 +280,17 @@ class QwenTalkerModelRunner(ModelRunner["SGLangARRequestData"]):
         else:
             pass
         self.model.code_predictor_forward(layer0_codes, talker_hidden)
+        if self.model.conditioning_recorder is not None:
+            self.model.conditioning_recorder.record_outputs(
+                forward_batch,
+                requests,
+                self.model.output_codes,
+                self.model.output_embeds,
+                result.logits_output.next_token_logits,
+                result.logits_output.hidden_states,
+            )
+        else:
+            pass
         self.stage_token_ids(result, result.next_token_ids)
         self.emit_code_chunks_and_feedback(
             schedule_batch=schedule_batch,
@@ -170,6 +311,17 @@ class QwenTalkerModelRunner(ModelRunner["SGLangARRequestData"]):
 
         batch_size = len(requests)
         result.next_token_ids = self.model.sampled_token_ids[:batch_size].clone()
+        if self.model.conditioning_recorder is not None:
+            self.model.conditioning_recorder.record_outputs(
+                forward_batch,
+                requests,
+                self.model.output_codes,
+                self.model.output_embeds,
+                result.logits_output.next_token_logits,
+                result.logits_output.hidden_states,
+            )
+        else:
+            pass
         self.stage_token_ids(result, result.next_token_ids)
         self.emit_code_chunks_and_feedback(
             schedule_batch=schedule_batch,
@@ -188,6 +340,49 @@ class QwenTalkerModelRunner(ModelRunner["SGLangARRequestData"]):
         # in-graph write to the fixed-address _output_codes/_output_embeds.
         codes_snap = self.model.output_codes[:bs].detach().clone()
         embeds_snap = self.model.output_embeds[:bs].detach().clone()
+        if logger.isEnabledFor(logging.DEBUG):
+            with torch.no_grad():
+                reference_embeddings = [
+                    self.model.get_input_embeddings()(codes_snap[:, 0])
+                ]
+                for group_index, embedding in enumerate(
+                    self.model.code_predictor.model.codec_embedding
+                ):
+                    reference_embeddings.append(
+                        embedding(codes_snap[:, group_index + 1])
+                    )
+                expected_feedback = torch.stack(reference_embeddings, dim=1).sum(dim=1)
+                assert expected_feedback.shape == embeds_snap.shape
+                difference = embeds_snap.float() - expected_feedback.float()
+                maximum_errors = difference.abs().amax(dim=-1).cpu().tolist()
+                changed_coordinates = difference.count_nonzero(dim=-1).cpu().tolist()
+                recorded_codes = codes_snap.cpu().tolist()
+            for (
+                scheduled_request,
+                native_request,
+                codes,
+                maximum_error,
+                changed_count,
+            ) in zip(
+                requests,
+                schedule_batch.reqs,
+                recorded_codes,
+                maximum_errors,
+                changed_coordinates,
+                strict=True,
+            ):
+                assert scheduled_request.request_id == native_request.rid
+                observation = {
+                    "event": "feedback",
+                    "request_id": native_request.rid,
+                    "committed_output_token_count": len(native_request.output_ids),
+                    "codes": codes,
+                    "maximum_absolute_error": maximum_error,
+                    "changed_coordinates": changed_count,
+                }
+                logger.debug(f"speech_contract {json.dumps(observation)}")
+        else:
+            pass
         coalesce = self.codec_coalesce_frames
         code_messages: list[OutgoingMessage] = []
         for idx, sched_req in enumerate(requests):
@@ -300,6 +495,27 @@ class QwenTalkerModelRunner(ModelRunner["SGLangARRequestData"]):
     def on_request_finished(
         self, request_id: str, req_data: "SGLangARRequestData"
     ) -> None:
+        if self.model.conditioning_recorder is not None:
+            self.model.conditioning_recorder.finish(request_id, req_data)
+        else:
+            pass
+        if logger.isEnabledFor(logging.DEBUG):
+            request = req_data.req
+            assert request is not None and request.finished_reason is not None
+            observation = {
+                "event": "terminal",
+                "request_id": request_id,
+                "finish_reason": request.finished_reason.to_json(),
+                "requested_frame_limit": req_data.max_new_tokens,
+                "effective_frame_limit": request.sampling_params.max_new_tokens,
+                "prompt_token_count": len(request.origin_input_ids),
+                "output_codes": list(request.output_ids),
+                "thinker_done": req_data.thinker_chunks_done,
+                "pending_text_rows": len(req_data.pending_text_queue),
+            }
+            logger.debug(f"speech_contract {json.dumps(observation)}")
+        else:
+            pass
         pending = req_data.pending_codec_rows
         if not pending:
             return
@@ -313,6 +529,16 @@ class QwenTalkerModelRunner(ModelRunner["SGLangARRequestData"]):
         pending.append(last_row)
         self.flush_codec_rows(request_id, req_data, code_messages)
         self.put_code_messages(code_messages)
+
+    def process_sampling_logits(
+        self, logits_output: LogitsProcessorOutput, requests: list[SchedulerRequest]
+    ) -> None:
+        if self.model.conditioning_recorder is not None:
+            self.model.conditioning_recorder.record_logits(
+                requests, logits_output.next_token_logits
+            )
+        else:
+            pass
 
     def sample_before_post_prefill(
         self,

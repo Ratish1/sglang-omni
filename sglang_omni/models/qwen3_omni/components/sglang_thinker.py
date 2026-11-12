@@ -9,9 +9,12 @@ prefill, so this wrapper keeps only the text model and LM head.
 
 from __future__ import annotations
 
+import json
+import os
 import time
 from collections.abc import Mapping
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Iterable, Optional, Tuple
 
 import torch
@@ -40,6 +43,8 @@ from transformers import PretrainedConfig
 from sglang_omni.models.qwen3_omni.components.thinker_fused_rope import (
     install_thinker_fused_rope,
 )
+from sglang_omni.models.qwen3_omni.delivery_capture import ThinkerDeliveryRecorder
+from sglang_omni.models.qwen3_omni.layer_operand_capture import LayerOperandRecorder
 from sglang_omni.quantization import get_weight_preprocessor
 from sglang_omni.sampling.sampler_compile import (
     SamplerCompileForms,
@@ -135,6 +140,7 @@ class Qwen3OmniThinkerForCausalLM(nn.Module):
             )
         self.logits_processor = LogitsProcessor(self.config)
         self.fused_rope_gate = install_thinker_fused_rope(self.model)
+        self.delivery_recorder: ThinkerDeliveryRecorder | None = None
         # note (ratish): a quantized MoE can share one activation scale across rows,
         # so a padded row's experts could change the live rows' rounding.
         self.decode_live_rows: DecodeLiveRows | None = None
@@ -173,6 +179,34 @@ class Qwen3OmniThinkerForCausalLM(nn.Module):
             if accept_hidden_layer < self.config.num_hidden_layers
             else []
         )
+        directory = os.environ.get("SGLANG_OMNI_DIAGNOSTIC_DELIVERY_DIRECTORY")
+        if directory is not None:
+            assert 0 < accept_hidden_layer < self.config.num_hidden_layers
+            self.delivery_recorder = ThinkerDeliveryRecorder(
+                directory=Path(directory),
+                multimodal_token_ids=(
+                    self.thinker_config.audio_token_id,
+                    self.thinker_config.image_token_id,
+                    self.thinker_config.video_token_id,
+                ),
+                request_ids=frozenset(
+                    json.loads(
+                        Path(
+                            os.environ["SGLANG_OMNI_CORPUS_REQUEST_ID_FILE"]
+                        ).read_text()
+                    )
+                ),
+                operands=LayerOperandRecorder(
+                    step_counter=torch.zeros(
+                        (), dtype=torch.long, device=self.lm_head.weight.device
+                    ),
+                    maximum_prefill_token_rows=max_prefill_buffer_tokens(),
+                    retain_moe_batches=True,
+                ),
+            )
+            self.delivery_recorder.install(self.model.layers[accept_hidden_layer])
+        else:
+            pass
 
     def get_input_embeddings(self) -> VocabParallelEmbedding:
         return self.model.embed_tokens
