@@ -45,6 +45,9 @@ from sglang_omni.models.qwen3_omni.components.thinker_fused_rope import (
 )
 from sglang_omni.models.qwen3_omni.delivery_capture import ThinkerDeliveryRecorder
 from sglang_omni.models.qwen3_omni.layer_operand_capture import LayerOperandRecorder
+from sglang_omni.models.qwen3_omni.rotary_precision_control import (
+    RotaryPrecisionControl,
+)
 from sglang_omni.models.qwen3_omni.thinker_state_capture import record_thinker_state
 from sglang_omni.quantization import get_weight_preprocessor
 from sglang_omni.sampling.sampler_compile import (
@@ -184,6 +187,9 @@ class Qwen3OmniThinkerForCausalLM(nn.Module):
         if directory is not None:
             assert 0 < accept_hidden_layer < self.config.num_hidden_layers
             record_thinker_state(self.model, self.lm_head, Path(directory))
+            capture_token_rows = int(
+                os.environ["SGLANG_OMNI_DIAGNOSTIC_CAPTURE_TOKEN_ROWS"]
+            )
             self.delivery_recorder = ThinkerDeliveryRecorder(
                 directory=Path(directory),
                 multimodal_token_ids=(
@@ -202,10 +208,13 @@ class Qwen3OmniThinkerForCausalLM(nn.Module):
                     step_counter=torch.zeros(
                         (), dtype=torch.long, device=self.lm_head.weight.device
                     ),
-                    maximum_prefill_token_rows=int(
-                        os.environ["SGLANG_OMNI_DIAGNOSTIC_CAPTURE_TOKEN_ROWS"]
-                    ),
+                    maximum_prefill_token_rows=capture_token_rows,
                     retain_moe_batches=True,
+                ),
+                rotary_precision=RotaryPrecisionControl(
+                    enabled=os.environ.get("SGLANG_OMNI_DIAGNOSTIC_ROPE_NO_CONTRACTION")
+                    == "1",
+                    token_rows=capture_token_rows,
                 ),
             )
             for layer_index in range(accept_hidden_layer + 1):

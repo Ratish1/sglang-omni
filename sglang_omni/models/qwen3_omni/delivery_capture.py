@@ -19,6 +19,9 @@ from sglang.srt.models.qwen3_moe import Qwen3MoeDecoderLayer, Qwen3MoeSparseMoeB
 
 from sglang_omni.models.qwen3_omni.layer_operand_capture import LayerOperandRecorder
 from sglang_omni.models.qwen3_omni.producer_control import substitute_prompt_hidden
+from sglang_omni.models.qwen3_omni.rotary_precision_control import (
+    RotaryPrecisionControl,
+)
 from sglang_omni.scheduling.sglang_backend.prompt_hidden import (
     PromptHiddenRequest,
     PromptHiddenStore,
@@ -35,6 +38,7 @@ class ThinkerDeliveryRecorder:
     request_ids: frozenset[str]
     multimodal_token_ids: tuple[int, ...]
     operands: LayerOperandRecorder
+    rotary_precision: RotaryPrecisionControl
     is_prefill_active: bool = False
     write_count: int = 0
     slot_writers: dict[int, tuple[int, int]] = field(default_factory=dict)
@@ -88,7 +92,7 @@ class ThinkerDeliveryRecorder:
         layer.forward = forward
 
     def install_operators(self, layer: Qwen3MoeDecoderLayer, layer_index: int) -> None:
-        """Observe real module calls without replacing their computations."""
+        """Observe real calls with only explicitly enabled diagnostic arithmetic changes."""
         prefix = f"operator_{layer_index:02d}"
         linear_names = {
             layer.self_attn.qkv_proj: "qkv",
@@ -138,14 +142,25 @@ class ThinkerDeliveryRecorder:
             forward_batch: ForwardBatch,
         ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
             self.active_operator_prefix = prefix
+            self.rotary_precision.is_active = self.is_prefill_active
             try:
                 query, key, value = original_apply(qkv, positions, forward_batch)
             finally:
                 self.active_operator_prefix = None
+                self.rotary_precision.is_active = False
             if self.is_prefill_active:
                 self.operands.record(f"{prefix}_query_rotated", query)
                 self.operands.record(f"{prefix}_key_rotated", key)
                 self.operands.record(f"{prefix}_value", value)
+                self.operands.record(
+                    f"{prefix}_rotary_contraction_disabled",
+                    query.new_full(
+                        (len(query), 1),
+                        self.rotary_precision.enabled
+                        and len(query) == self.rotary_precision.token_rows,
+                        dtype=torch.bool,
+                    ),
+                )
                 rotary = layer.self_attn.rotary_emb
                 implementation = (
                     rotary._forward_method
@@ -179,6 +194,7 @@ class ThinkerDeliveryRecorder:
 
         rotary = layer.self_attn.rotary_emb
         if id(rotary) not in self.observed_rotaries:
+            self.rotary_precision.install(rotary)
             rotary.register_forward_pre_hook(capture_before_rotary)
             self.observed_rotaries.add(id(rotary))
         else:
