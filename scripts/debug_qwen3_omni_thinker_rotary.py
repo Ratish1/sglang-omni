@@ -21,6 +21,9 @@ from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import (
 from scripts.debug_qwen3_omni_feedback_audit import compare_tensors
 from scripts.qwen3_omni_checkpoint_weights import CheckpointIndex
 from scripts.qwen3_omni_thinker_operator_audit import fp32_norm
+from sglang_omni.models.qwen3_omni.rotary_precision_control import (
+    mrope_without_contraction,
+)
 
 
 def contracted_bf16_rotation(
@@ -181,19 +184,33 @@ def main() -> None:
         for position, row in table_rows.items():
             table[position].copy_(row)
         replay_values = []
+        separate_product_values = []
         for kind in ("query", "key"):
             name = f"{prefix}_{kind}_normalized"
             values = operators[name].to(device)
             layout = layouts[name].tolist()
-            replay = torch.empty_strided(
-                values.shape,
-                layout[values.ndim : 2 * values.ndim],
-                dtype=values.dtype,
-                device=device,
-            )
-            assert replay.data_ptr() % 16 == layout[-1]
-            replay.copy_(values)
-            replay_values.append(replay)
+            for destination in (replay_values, separate_product_values):
+                replay = torch.empty_strided(
+                    values.shape,
+                    layout[values.ndim : 2 * values.ndim],
+                    dtype=values.dtype,
+                    device=device,
+                )
+                assert replay.data_ptr() % 16 == layout[-1]
+                replay.copy_(values)
+                destination.append(replay)
+        mrope_without_contraction(
+            separate_product_values[0],
+            separate_product_values[1],
+            table,
+            positions.T.contiguous(),
+            rotary.mrope_section,
+            head_features,
+        )
+        separate_query = separate_product_values[0].reshape_as(query)
+        separate_key = separate_product_values[1].reshape_as(key)
+        assert torch.equal(separate_query[live], rounded_query[live]), layer_index
+        assert torch.equal(separate_key[live], rounded_key[live]), layer_index
         triton_mrope_fused(
             replay_values[0],
             replay_values[1],
@@ -250,6 +267,12 @@ def main() -> None:
             ),
             "key_rotation_native_kernel_replay": compare_tensors(
                 actual_key[live], replay_values[1].reshape_as(key)[live]
+            ),
+            "query_rotation_no_contraction_kernel": compare_tensors(
+                actual_query[live], separate_query[live]
+            ),
+            "key_rotation_no_contraction_kernel": compare_tensors(
+                actual_key[live], separate_key[live]
             ),
         }
         comparisons.append(
