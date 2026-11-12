@@ -11,6 +11,7 @@ import torch
 from sglang.srt.layers.aux_hidden_states import AuxHiddenStateAccumulator
 from sglang.srt.layers.linear import LinearBase
 from sglang.srt.layers.moe.topk import StandardTopKOutput, TopKOutput
+from sglang.srt.layers.rotary_embedding.mrope import MRotaryEmbedding
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -36,6 +37,8 @@ class ThinkerDeliveryRecorder:
     is_prefill_active: bool = False
     write_count: int = 0
     slot_writers: dict[int, tuple[int, int]] = field(default_factory=dict)
+    observed_rotaries: set[int] = field(default_factory=set)
+    active_operator_prefix: str | None = None
 
     def install(self, layer: torch.nn.Module, layer_index: int) -> None:
         original_forward = layer.forward
@@ -129,6 +132,7 @@ class ThinkerDeliveryRecorder:
             positions: torch.Tensor,
             forward_batch: ForwardBatch,
         ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+            self.active_operator_prefix = prefix
             query, key, value = original_apply(qkv, positions, forward_batch)
             if self.is_prefill_active:
                 self.operands.record(f"{prefix}_query_rotated", query)
@@ -145,6 +149,28 @@ class ThinkerDeliveryRecorder:
             else:
                 pass
             return query, key, value
+
+        def capture_before_rotary(
+            module: MRotaryEmbedding,
+            input_tensors: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+        ) -> None:
+            if self.is_prefill_active:
+                assert self.active_operator_prefix is not None
+                self.operands.record(
+                    f"{self.active_operator_prefix}_query_normalized", input_tensors[1]
+                )
+                self.operands.record(
+                    f"{self.active_operator_prefix}_key_normalized", input_tensors[2]
+                )
+            else:
+                pass
+
+        rotary = layer.self_attn.rotary_emb
+        if id(rotary) not in self.observed_rotaries:
+            rotary.register_forward_pre_hook(capture_before_rotary)
+            self.observed_rotaries.add(id(rotary))
+        else:
+            pass
 
         for module in linear_names:
             module.register_forward_hook(capture_linear)
