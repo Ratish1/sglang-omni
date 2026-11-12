@@ -33,7 +33,7 @@ class ThinkerDeliveryRecorder:
     write_count: int = 0
     slot_writers: dict[int, tuple[int, int]] = field(default_factory=dict)
 
-    def install(self, layer: torch.nn.Module) -> None:
+    def install(self, layer: torch.nn.Module, layer_index: int) -> None:
         original_forward = layer.forward
 
         def forward(
@@ -45,13 +45,19 @@ class ThinkerDeliveryRecorder:
             post_residual_addition: torch.Tensor | None = None,
         ) -> torch.Tensor:
             if forward_batch.forward_mode.is_extend():
-                assert capture_output is not None
 
                 def capture(hidden_rows: torch.Tensor, *, owned: bool = False) -> None:
-                    self.operands.begin(positions, is_prefill=True)
-                    self.operands.record("accepted_hidden", hidden_rows)
-                    self.operands.record("input_ids", forward_batch.input_ids)
-                    capture_output(hidden_rows, owned=owned)
+                    if layer_index == 0:
+                        self.operands.begin(positions, is_prefill=True)
+                        self.operands.record("input_ids", forward_batch.input_ids)
+                    else:
+                        pass
+                    self.operands.record(f"layer_{layer_index:02d}_hidden", hidden_rows)
+                    if capture_output is not None:
+                        self.operands.record("accepted_hidden", hidden_rows)
+                        capture_output(hidden_rows, owned=owned)
+                    else:
+                        pass
 
                 selected_capture = capture
             else:
@@ -172,6 +178,11 @@ class ThinkerDeliveryRecorder:
                         .clone(),
                         "producer_hidden": accepted,
                         "accepted_full_hidden": source["prefix_accepted_hidden"],
+                        "layer_hidden": {
+                            name.removeprefix("prefix_"): tensor
+                            for name, tensor in source.items()
+                            if name.startswith("prefix_layer_")
+                        },
                         "auxiliary_hidden": auxiliary,
                         "positions": source["prefix_positions"][relative_rows],
                         "actual_input_ids": source["prefix_input_ids"],

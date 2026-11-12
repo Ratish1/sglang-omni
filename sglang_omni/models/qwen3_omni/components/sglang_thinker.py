@@ -204,7 +204,10 @@ class Qwen3OmniThinkerForCausalLM(nn.Module):
                     retain_moe_batches=True,
                 ),
             )
-            self.delivery_recorder.install(self.model.layers[accept_hidden_layer])
+            for layer_index in range(accept_hidden_layer + 1):
+                self.delivery_recorder.install(
+                    self.model.layers[layer_index], layer_index
+                )
         else:
             pass
 
