@@ -37,7 +37,7 @@ def main() -> None:
     assert len(input_files) == 1, "this comparison requires one complete native prefill"
     captured_input = torch.load(input_files[0], weights_only=True)
     assert captured_input["request_id"] == arguments.request_id
-    prefix_length = captured_input["prefix_length"]
+    prefix_token_count = captured_input["prefix_length"]
     captured_writes = [
         torch.load(filename, weights_only=True)
         for filename in sorted((arguments.delivery_directory / "writes").glob("*.pt"))
@@ -50,7 +50,7 @@ def main() -> None:
     ]
     assert len(selected_writes) == 1
     captured_output = selected_writes[0]
-    assert captured_output["prefix_length"] == prefix_length
+    assert captured_output["prefix_length"] == prefix_token_count
     assert torch.equal(
         captured_input["actual_input_ids"], captured_output["actual_input_ids"]
     )
@@ -92,22 +92,21 @@ def main() -> None:
     embedded_input = captured_input["embedded_input"].to(reference.device)
     positions = captured_input["mrope_positions"].to(reference.device)
     assert positions.shape == (3, len(embedded_input))
-    causal_ids = captured_input["causal_token_ids"].to(reference.device)
+    causal_token_ids = captured_input["causal_token_ids"].to(reference.device)
     assert torch.equal(
-        causal_ids[prefix_length:].cpu(), captured_input["actual_input_ids"]
+        causal_token_ids[prefix_token_count:].cpu(), captured_input["actual_input_ids"]
     )
-    prefix_ids = causal_ids[:prefix_length]
-    multimodal_ids = {
+    prefix_token_ids = causal_token_ids[:prefix_token_count]
+    multimodal_token_ids = {
         configuration.thinker_config.audio_token_id,
         configuration.thinker_config.image_token_id,
         configuration.thinker_config.video_token_id,
     }
-    assert not any(token in multimodal_ids for token in prefix_ids.tolist())
-    # The cached prefix is text-only. Recompute it, rather than claiming that
-    # the native cache contents were captured or independently validated.
-    prefix_embeddings = reference.model.embed_tokens(prefix_ids)
+    assert not any(token in multimodal_token_ids for token in prefix_token_ids.tolist())
+    # note (ratish): recomputing text-only prefix embeddings does not validate native cached KV.
+    prefix_embeddings = reference.model.embed_tokens(prefix_token_ids)
     embedded_input = torch.cat((prefix_embeddings, embedded_input))
-    prefix_positions = torch.arange(prefix_length, device=reference.device).expand(
+    prefix_positions = torch.arange(prefix_token_count, device=reference.device).expand(
         3, -1
     )
     positions = torch.cat((prefix_positions, positions), dim=1)
@@ -132,7 +131,7 @@ def main() -> None:
         "native_extend": asdict(
             compare_tensors(
                 captured_output["accepted_full_hidden"].to(reference.device),
-                accepted[prefix_length:],
+                accepted[prefix_token_count:],
             )
         ),
         "multimodal_rows_comparison": asdict(
