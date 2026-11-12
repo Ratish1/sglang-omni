@@ -107,6 +107,34 @@ class QwenTalkerModelRunner(ModelRunner["SGLangARRequestData"]):
                 retain_moe_batches=retain_moe_batches,
                 moe_tactic_choices=self.model.moe_tactic_choices,
             )
+            destination = Path(directory)
+            destination.mkdir(parents=True, exist_ok=True)
+            (destination / "native-predictor-weights.json").write_text(
+                json.dumps(
+                    {
+                        "configuration": self.model.code_predictor.config.code_predictor_config.to_dict(),
+                        "weights": {
+                            name: {
+                                "shape": list(tensor.shape),
+                                "dtype": str(tensor.dtype),
+                                "sha256": hashlib.sha256(
+                                    tensor.detach()
+                                    .cpu()
+                                    .contiguous()
+                                    .view(torch.uint8)
+                                    .numpy()
+                                    .tobytes()
+                                ).hexdigest(),
+                            }
+                            for name, tensor in self.model.named_parameters()
+                            if name.startswith("code_predictor.")
+                            or name
+                            in ("model.codec_embedding.weight", "codec_head.weight")
+                        },
+                    },
+                    indent=2,
+                )
+            )
             if retain_moe_batches:
                 assert self.model.backbone_recorders
                 assert get_disagg().disaggregation_mode == "null"
