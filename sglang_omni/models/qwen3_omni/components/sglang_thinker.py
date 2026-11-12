@@ -208,6 +208,10 @@ class Qwen3OmniThinkerForCausalLM(nn.Module):
                 self.delivery_recorder.install(
                     self.model.layers[layer_index], layer_index
                 )
+            for layer_index in range(accept_hidden_layer):
+                self.delivery_recorder.install_operators(
+                    self.model.layers[layer_index], layer_index
+                )
         else:
             pass
 

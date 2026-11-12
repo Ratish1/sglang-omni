@@ -97,7 +97,9 @@ class LayerOperandRecorder:
             self.eager_snapshot = self.current_snapshot
 
     def record(self, name: str, tensor: torch.Tensor) -> None:
-        if self.retain_moe_batches and (name in MOE_BATCH_FIELDS or name == "qkv"):
+        if self.retain_moe_batches and (
+            name in MOE_BATCH_FIELDS or name == "qkv" or name.startswith("operator_")
+        ):
             self.current_snapshot[f"layout_{name}"] = torch.tensor(
                 (*tensor.shape, *tensor.stride(), tensor.data_ptr() % 16), device="cpu"
             )
@@ -127,6 +129,7 @@ class LayerOperandRecorder:
         row: int,
         *,
         retain_moe_batches: bool = False,
+        retain_operator_batches: bool = False,
         prefill_rows: slice | None = None,
     ) -> dict[str, torch.Tensor]:
         snapshots = [
@@ -188,6 +191,16 @@ class LayerOperandRecorder:
             tensors["batch_selected_row"] = torch.tensor(row)
             tensors["batch_is_graph"] = torch.tensor(
                 snapshot is not self.eager_snapshot
+            )
+        else:
+            pass
+        if retain_operator_batches:
+            tensors.update(
+                {
+                    f"batch_{name}": tensor.detach().cpu().clone()
+                    for name, tensor in snapshot.items()
+                    if name.startswith("operator_")
+                }
             )
         else:
             pass

@@ -9,9 +9,12 @@ from typing import Protocol
 
 import torch
 from sglang.srt.layers.aux_hidden_states import AuxHiddenStateAccumulator
+from sglang.srt.layers.linear import LinearBase
+from sglang.srt.layers.moe.topk import StandardTopKOutput, TopKOutput
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.models.qwen3_moe import Qwen3MoeDecoderLayer, Qwen3MoeSparseMoeBlock
 
 from sglang_omni.models.qwen3_omni.layer_operand_capture import LayerOperandRecorder
 from sglang_omni.scheduling.sglang_backend.prompt_hidden import (
@@ -30,6 +33,7 @@ class ThinkerDeliveryRecorder:
     request_ids: frozenset[str]
     multimodal_token_ids: tuple[int, ...]
     operands: LayerOperandRecorder
+    is_prefill_active: bool = False
     write_count: int = 0
     slot_writers: dict[int, tuple[int, int]] = field(default_factory=dict)
 
@@ -44,6 +48,7 @@ class ThinkerDeliveryRecorder:
             capture_output: HiddenCapture | None = None,
             post_residual_addition: torch.Tensor | None = None,
         ) -> torch.Tensor:
+            self.is_prefill_active = forward_batch.forward_mode.is_extend()
             if forward_batch.forward_mode.is_extend():
 
                 def capture(hidden_rows: torch.Tensor, *, owned: bool = False) -> None:
@@ -73,6 +78,71 @@ class ThinkerDeliveryRecorder:
             )
 
         layer.forward = forward
+
+    def install_operators(self, layer: Qwen3MoeDecoderLayer, layer_index: int) -> None:
+        """Observe real module calls without replacing their computations."""
+        prefix = f"operator_{layer_index:02d}"
+        linear_names = {
+            layer.self_attn.qkv_proj: "qkv",
+            layer.self_attn.o_proj: "attention_projection",
+            layer.mlp.gate: "router",
+        }
+
+        def capture_linear(
+            module: LinearBase,
+            input_tensors: tuple[torch.Tensor],
+            output_tensors: tuple[torch.Tensor, torch.Tensor | None],
+        ) -> None:
+            if self.is_prefill_active:
+                name = f"{prefix}_{linear_names[module]}"
+                self.operands.record(f"{name}_input", input_tensors[0])
+                self.operands.record(f"{name}_output", output_tensors[0])
+            else:
+                pass
+
+        def capture_topk(
+            module: torch.nn.Module,
+            input_tensors: tuple[torch.Tensor, torch.Tensor],
+            output: TopKOutput,
+        ) -> None:
+            if self.is_prefill_active:
+                assert isinstance(output, StandardTopKOutput)
+                self.operands.record(f"{prefix}_expert_indices", output.topk_ids)
+                self.operands.record(f"{prefix}_expert_weights", output.topk_weights)
+            else:
+                pass
+
+        def capture_moe(
+            module: Qwen3MoeSparseMoeBlock,
+            input_tensors: tuple[torch.Tensor, ForwardBatch],
+            output: torch.Tensor,
+        ) -> None:
+            if self.is_prefill_active:
+                self.operands.record(f"{prefix}_moe_output", output)
+            else:
+                pass
+
+        original_apply = layer.self_attn.apply_qk_norm_rope
+
+        def apply_qk_norm_rope(
+            qkv: torch.Tensor,
+            positions: torch.Tensor,
+            forward_batch: ForwardBatch,
+        ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+            query, key, value = original_apply(qkv, positions, forward_batch)
+            if self.is_prefill_active:
+                self.operands.record(f"{prefix}_query_rotated", query)
+                self.operands.record(f"{prefix}_key_rotated", key)
+                self.operands.record(f"{prefix}_value", value)
+            else:
+                pass
+            return query, key, value
+
+        for module in linear_names:
+            module.register_forward_hook(capture_linear)
+        layer.mlp.topk.register_forward_hook(capture_topk)
+        layer.mlp.register_forward_hook(capture_moe)
+        layer.self_attn.apply_qk_norm_rope = apply_qk_norm_rope
 
     def record_inputs(
         self,
@@ -156,6 +226,7 @@ class ThinkerDeliveryRecorder:
                     step,
                     offset + length - 1,
                     prefill_rows=slice(offset, offset + length),
+                    retain_operator_batches=True,
                 )
                 batch_rows = (relative_rows + offset).to(virtual_slots.device)
                 accepted = source["prefix_accepted_hidden"][relative_rows]
@@ -193,6 +264,16 @@ class ThinkerDeliveryRecorder:
                             name.removeprefix("prefix_"): tensor
                             for name, tensor in source.items()
                             if name.startswith("prefix_layer_")
+                        },
+                        "operator_batches": {
+                            name.removeprefix("batch_"): tensor
+                            for name, tensor in source.items()
+                            if name.startswith("batch_operator_")
+                        },
+                        "operator_layouts": {
+                            name.removeprefix("layout_"): tensor
+                            for name, tensor in source.items()
+                            if name.startswith("layout_operator_")
                         },
                         "cache_locations": cache_locations.cpu().clone(),
                         "cache_keys": [
