@@ -59,7 +59,7 @@ class NativeRuntime(BaseModel):
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--capture-directory", type=Path, required=True)
-    parser.add_argument("--previous-directory", type=Path, required=True)
+    parser.add_argument("--previous-directory", type=Path)
     parser.add_argument("--request-id", required=True)
     parser.add_argument("--model-path", required=True)
     parser.add_argument("--model-revision", required=True)
@@ -79,33 +79,41 @@ def main() -> None:
     ]
     assert choices[: len(runtime.tactic_choices)] == runtime.tactic_choices
     directory = arguments.capture_directory / arguments.request_id
-    previous = arguments.previous_directory / arguments.request_id
     finished = torch.load(directory / "finished.pt", weights_only=True)
-    earlier = torch.load(previous / "finished.pt", weights_only=True)
-    for name in ("output_ids", "decode_input_history", "enqueued_text_rows"):
-        assert torch.equal(finished[name], earlier[name]), name
     initial = torch.load(directory / "0000-before_prefill.pt", weights_only=True)
-    prior_initial = torch.load(previous / "0000-before_prefill.pt", weights_only=True)
-    assert initial.keys() == prior_initial.keys()
-    assert all(
-        torch.equal(tensor, prior_initial[name]) for name, tensor in initial.items()
-    )
     output_files = sorted(directory.glob("*-output.pt"))
     assert [filename.name for filename in output_files] == [
         f"{frame:04d}-output.pt" for frame in range(len(finished["output_ids"]))
     ]
-    for filename in output_files:
-        observed = torch.load(filename, weights_only=True)
-        old = torch.load(previous / filename.name, weights_only=True)
-        assert bool(observed["is_extend"]) == (filename.name == "0000-output.pt")
-        assert bool(observed["past_exact"]) and bool(old["past_exact"])
-        for name in ("codec_ids", "hidden_states", "logits"):
-            assert torch.equal(observed[name], old[name]), (filename.name, name)
-        for name in ("keys", "values"):
-            assert all(
-                torch.equal(current, prior)
-                for current, prior in zip(observed[name], old[name], strict=True)
-            ), (filename.name, name)
+    if arguments.previous_directory is not None:
+        previous = arguments.previous_directory / arguments.request_id
+        earlier = torch.load(previous / "finished.pt", weights_only=True)
+        for name in ("output_ids", "decode_input_history", "enqueued_text_rows"):
+            assert torch.equal(finished[name], earlier[name]), name
+        prior_initial = torch.load(
+            previous / "0000-before_prefill.pt", weights_only=True
+        )
+        assert initial.keys() == prior_initial.keys()
+        assert all(
+            torch.equal(tensor, prior_initial[name]) for name, tensor in initial.items()
+        )
+        for filename in output_files:
+            observed = torch.load(filename, weights_only=True)
+            old = torch.load(previous / filename.name, weights_only=True)
+            assert bool(observed["is_extend"]) == (filename.name == "0000-output.pt")
+            assert bool(observed["past_exact"]) and bool(old["past_exact"])
+            for name in ("codec_ids", "hidden_states", "logits"):
+                assert torch.equal(observed[name], old[name]), (filename.name, name)
+            for name in ("keys", "values"):
+                assert all(
+                    torch.equal(current, prior)
+                    for current, prior in zip(observed[name], old[name], strict=True)
+                ), (filename.name, name)
+    else:
+        for filename in output_files:
+            observed = torch.load(filename, weights_only=True)
+            assert bool(observed["is_extend"]) == (filename.name == "0000-output.pt")
+            assert bool(observed["past_exact"])
     configuration = Qwen3OmniMoeConfig.from_pretrained(
         arguments.model_path, revision=arguments.model_revision
     ).talker_config
@@ -161,6 +169,9 @@ def main() -> None:
     exact_replays = 0
     comparisons = 0
     maximum_replay_error = 0.0
+    exact_router_batches = 0
+    matching_routing_batches = 0
+    maximum_checkpoint_expert_error = 0.0
     with (arguments.output_directory / "layers.jsonl").open("w") as output:
         for filename in filenames:
             frame = int(filename.name.split("-")[0])
@@ -254,6 +265,35 @@ def main() -> None:
                     hidden_states.cpu(), snapshot["batch_mlp_normalized"]
                 )
                 difference = compare_tensors(tensors["routed_output"], replayed[0])
+                reference_layer = reference.model.layers[layer_index]
+                reference_router_logits, reference_router_weights, reference_indices = (
+                    reference_layer.mlp.gate(hidden_states)
+                )
+                router_difference = compare_tensors(
+                    tensors["router_logits"], reference_router_logits
+                )
+                matching_experts = torch.equal(
+                    indices.sort(dim=-1).values,
+                    reference_indices.to(indices.dtype).sort(dim=-1).values,
+                )
+                reference_probabilities = reference_router_logits.float().softmax(
+                    dim=-1
+                )
+                reference_native_order_weights = reference_probabilities.gather(
+                    1, indices.long()
+                )
+                if configuration.text_config.norm_topk_prob:
+                    reference_native_order_weights /= (
+                        reference_native_order_weights.sum(dim=-1, keepdim=True)
+                    )
+                else:
+                    pass
+                held_routing_expert_output = reference_layer.mlp.experts(
+                    hidden_states, indices.long(), weights
+                )
+                checkpoint_expert_difference = compare_tensors(
+                    tensors["routed_output"], held_routing_expert_output
+                )
                 record = {
                     "frame": int(filename.name.split("-")[0]),
                     "layer": layer_index,
@@ -268,6 +308,28 @@ def main() -> None:
                     "default_vs_observed": asdict(
                         compare_tensors(tensors["routed_output"], replayed[1])
                     ),
+                    "checkpoint_router": asdict(router_difference),
+                    "checkpoint_expert_membership_exact": matching_experts,
+                    "checkpoint_float32_weights_native_order": asdict(
+                        compare_tensors(weights, reference_native_order_weights)
+                    ),
+                    "checkpoint_bfloat16_weights_native_order": asdict(
+                        compare_tensors(
+                            weights,
+                            reference_native_order_weights.to(
+                                reference_router_weights.dtype
+                            ),
+                        )
+                    ),
+                    "checkpoint_experts_with_native_routing": asdict(
+                        checkpoint_expert_difference
+                    ),
+                    "selected_checkpoint_experts_with_native_routing": asdict(
+                        compare_tensors(
+                            tensors["routed_output"][row],
+                            held_routing_expert_output[row],
+                        )
+                    ),
                 }
                 output.write(json.dumps(record) + "\n")
                 output.flush()
@@ -275,6 +337,12 @@ def main() -> None:
                 comparisons += 1
                 maximum_replay_error = max(
                     maximum_replay_error, difference.maximum_absolute_error
+                )
+                exact_router_batches += router_difference.exact
+                matching_routing_batches += matching_experts
+                maximum_checkpoint_expert_error = max(
+                    maximum_checkpoint_expert_error,
+                    checkpoint_expert_difference.maximum_absolute_error,
                 )
             print(
                 json.dumps(
@@ -294,6 +362,10 @@ def main() -> None:
                 "layer_batches": comparisons,
                 "exact_native_replays": exact_replays,
                 "maximum_native_replay_error": maximum_replay_error,
+                "paired_trajectory_checked": arguments.previous_directory is not None,
+                "exact_checkpoint_router_batches": exact_router_batches,
+                "matching_checkpoint_expert_membership_batches": matching_routing_batches,
+                "maximum_checkpoint_expert_error_with_native_routing": maximum_checkpoint_expert_error,
                 "scope": "Complete original batches, native packed-weight hashes and observed per-geometry tactic choices. Fallback -1 identifies the same internal heuristic request, not a resolved tactic ID. Default replay is a numerical control, not a quality claim or backend recommendation.",
             },
             indent=2,
