@@ -202,7 +202,9 @@ class Qwen3OmniThinkerForCausalLM(nn.Module):
                     step_counter=torch.zeros(
                         (), dtype=torch.long, device=self.lm_head.weight.device
                     ),
-                    maximum_prefill_token_rows=max_prefill_buffer_tokens(),
+                    maximum_prefill_token_rows=int(
+                        os.environ["SGLANG_OMNI_DIAGNOSTIC_CAPTURE_TOKEN_ROWS"]
+                    ),
                     retain_moe_batches=True,
                 ),
             )

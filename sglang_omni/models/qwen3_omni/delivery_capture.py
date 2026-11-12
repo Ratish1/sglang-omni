@@ -52,8 +52,11 @@ class ThinkerDeliveryRecorder:
             capture_output: HiddenCapture | None = None,
             post_residual_addition: torch.Tensor | None = None,
         ) -> torch.Tensor:
-            self.is_prefill_active = forward_batch.forward_mode.is_extend()
-            if forward_batch.forward_mode.is_extend():
+            self.is_prefill_active = (
+                forward_batch.forward_mode.is_extend()
+                and positions.shape[-1] <= self.operands.maximum_prefill_token_rows
+            )
+            if self.is_prefill_active:
 
                 def capture(hidden_rows: torch.Tensor, *, owned: bool = False) -> None:
                     if layer_index == 0:
