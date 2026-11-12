@@ -73,6 +73,10 @@ class LayerOperandRecorder:
     graph_snapshots: list[dict[str, torch.Tensor]] = field(default_factory=list)
     eager_snapshot: dict[str, torch.Tensor] = field(default_factory=dict)
     current_snapshot: dict[str, torch.Tensor] = field(default_factory=dict)
+    active_snapshot_index: torch.Tensor = field(init=False)
+
+    def __post_init__(self) -> None:
+        self.active_snapshot_index = torch.full_like(self.step_counter, -1)
 
     def captures_mode(self, forward_mode: ForwardMode) -> bool:
         return forward_mode.is_decode() or (
@@ -93,8 +97,10 @@ class LayerOperandRecorder:
             pass
         if torch.cuda.is_current_stream_capturing():
             self.graph_snapshots.append(self.current_snapshot)
+            self.active_snapshot_index.fill_(len(self.graph_snapshots))
         else:
             self.eager_snapshot = self.current_snapshot
+            self.active_snapshot_index.fill_(0)
 
     def record(self, name: str, tensor: torch.Tensor) -> None:
         if self.retain_moe_batches and (
@@ -132,13 +138,19 @@ class LayerOperandRecorder:
         retain_operator_batches: bool = False,
         prefill_rows: slice | None = None,
     ) -> dict[str, torch.Tensor]:
-        snapshots = [
+        matching_steps = [
             snapshot
             for snapshot in (self.eager_snapshot, *self.graph_snapshots)
             if snapshot and int(snapshot["step"]) == expected_step
         ]
-        assert len(snapshots) == 1, (expected_step, len(snapshots))
-        snapshot = snapshots[0]
+        snapshot_index = int(self.active_snapshot_index)
+        assert 0 <= snapshot_index <= len(self.graph_snapshots), snapshot_index
+        snapshot = (
+            self.eager_snapshot
+            if snapshot_index == 0
+            else self.graph_snapshots[snapshot_index - 1]
+        )
+        assert int(snapshot["step"]) == expected_step
         for name, tensor in snapshot.items():
             if name.startswith("fresh_"):
                 assert int(tensor) == expected_step, name
@@ -201,6 +213,9 @@ class LayerOperandRecorder:
                     for name, tensor in snapshot.items()
                     if name.startswith(("operator_", "layer_")) or name == "positions"
                 }
+            )
+            tensors["batch_snapshot_identity"] = torch.tensor(
+                (snapshot_index, len(matching_steps))
             )
         else:
             pass

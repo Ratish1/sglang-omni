@@ -325,6 +325,7 @@ class ThinkerDeliveryRecorder:
                             if name.startswith("layout_operator_")
                         },
                         "rotary_implementations": dict(self.rotary_implementations),
+                        "snapshot_selection": source["batch_snapshot_identity"],
                         "cache_locations": cache_locations.cpu().clone(),
                         "cache_keys": [
                             buffer.index_select(0, cache_locations).cpu()
