@@ -16,6 +16,7 @@ def main() -> None:
     parser.add_argument("--reference-directory", type=Path, required=True)
     parser.add_argument("--request-id", required=True)
     parser.add_argument("--model-revision", required=True)
+    parser.add_argument("--hold-native-prefix-cache", action="store_true")
     parser.add_argument("--output-directory", type=Path, required=True)
     arguments = parser.parse_args()
     arguments.output_directory.mkdir(parents=True, exist_ok=False)
@@ -26,7 +27,13 @@ def main() -> None:
         (arguments.reference_directory / "weight-audit.json").read_text()
     )
     assert not weights["mismatches"] and not weights["unvisited_tensors"]
-    reference_file = arguments.reference_directory / "producer-operands.pt"
+    if arguments.hold_native_prefix_cache:
+        assert summary["native_prefix_cache_held_for_local_controls"]
+        reference_file = (
+            arguments.reference_directory / "native-prefix-chained-operands.pt"
+        )
+    else:
+        reference_file = arguments.reference_directory / "producer-operands.pt"
     reference = torch.load(reference_file, map_location="cpu", weights_only=True)
     input_files = sorted(
         (arguments.delivery_directory / "inputs").glob(f"{arguments.request_id}-*.pt")
@@ -45,9 +52,14 @@ def main() -> None:
     handoff = torch.load(handoff_file, map_location="cpu", weights_only=True)
     assert torch.equal(handoff["causal_token_ids"], inputs["causal_token_ids"])
     positions = handoff["prompt_positions"]
+    assert bool((positions >= prefix_token_count).all())
     accepted = reference[f"checkpoint_hidden_{summary['accepted_layer']}"]
-    assert len(accepted) == len(handoff["causal_token_ids"])
-    checkpoint_hidden = accepted[positions]
+    if arguments.hold_native_prefix_cache:
+        assert len(accepted) == len(handoff["causal_token_ids"]) - prefix_token_count
+        checkpoint_hidden = accepted[positions - prefix_token_count]
+    else:
+        assert len(accepted) == len(handoff["causal_token_ids"])
+        checkpoint_hidden = accepted[positions]
     native_hidden = handoff["outgoing_hidden"]
     assert checkpoint_hidden.shape == native_hidden.shape
     assert checkpoint_hidden.dtype == native_hidden.dtype == torch.bfloat16
@@ -70,7 +82,7 @@ def main() -> None:
     provenance = {
         "model_revision": arguments.model_revision,
         "accepted_layer": summary["accepted_layer"],
-        "reference_prefix_recomputed": True,
+        "reference_prefix_recomputed": not arguments.hold_native_prefix_cache,
         "native_input_sha256": hashlib.sha256(input_files[0].read_bytes()).hexdigest(),
         "reference_operands_sha256": hashlib.sha256(
             reference_file.read_bytes()

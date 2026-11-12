@@ -174,19 +174,24 @@ def main() -> None:
         native_values = captured_output["cache_values"]
         assert len(native_keys) == len(native_values) == accepted_layer + 1
         assert all(len(keys) == len(embedded_input) for keys in native_keys)
-        cache = DynamicCache(config=reference.model.config)
-        for layer_index in range(accepted_layer):
-            cache.update(
-                native_keys[layer_index][:prefix_token_count]
-                .to(reference.device)
-                .transpose(0, 1)
-                .unsqueeze(0),
-                native_values[layer_index][:prefix_token_count]
-                .to(reference.device)
-                .transpose(0, 1)
-                .unsqueeze(0),
-                layer_index,
-            )
+        caches = {
+            name: DynamicCache(config=reference.model.config)
+            for name in ("local", "chained")
+        }
+        for cache in caches.values():
+            for layer_index in range(accepted_layer):
+                cache.update(
+                    native_keys[layer_index][:prefix_token_count]
+                    .to(reference.device)
+                    .transpose(0, 1)
+                    .unsqueeze(0),
+                    native_values[layer_index][:prefix_token_count]
+                    .to(reference.device)
+                    .transpose(0, 1)
+                    .unsqueeze(0),
+                    layer_index,
+                )
+        cache = caches["local"]
         query_token_count = len(captured_input["embedded_input"])
         query_positions = prefix_token_count + torch.arange(
             query_token_count, device=reference.device
@@ -204,6 +209,9 @@ def main() -> None:
         )
         local_comparisons = []
         local_outputs: dict[str, torch.Tensor] = {}
+        chained_hidden = embedded_input[None, prefix_token_count:]
+        chained_outputs = {"checkpoint_hidden_0": chained_hidden[0].cpu()}
+        chained_comparisons = []
         for layer_index in range(accepted_layer):
             native_input = captured_output["layer_hidden"][
                 f"layer_{layer_index:02d}_hidden"
@@ -258,10 +266,57 @@ def main() -> None:
                 }
             )
             local_outputs[f"layer_{layer_index:02d}_output"] = output.cpu()
+            chained_hidden = reference.model.layers[layer_index](
+                chained_hidden,
+                attention_mask=attention_mask,
+                past_key_values=caches["chained"],
+                use_cache=True,
+                position_embeddings=position_embeddings,
+            )
+            assert chained_hidden.shape == native_input.unsqueeze(0).shape
+            chained_keys = caches["chained"].layers[layer_index].keys
+            chained_values = caches["chained"].layers[layer_index].values
+            assert chained_keys is not None and chained_values is not None
+            assert torch.equal(
+                chained_keys[0, :, :prefix_token_count].transpose(0, 1).cpu(),
+                native_keys[layer_index][:prefix_token_count],
+            )
+            assert torch.equal(
+                chained_values[0, :, :prefix_token_count].transpose(0, 1).cpu(),
+                native_values[layer_index][:prefix_token_count],
+            )
+            chained_outputs[f"checkpoint_hidden_{layer_index + 1}"] = chained_hidden[
+                0
+            ].cpu()
+            chained_comparisons.append(
+                {
+                    "layer_index": layer_index + 1,
+                    "output": asdict(
+                        compare_tensors(
+                            captured_output["layer_hidden"][
+                                f"layer_{layer_index + 1:02d}_hidden"
+                            ].to(reference.device),
+                            chained_hidden[0],
+                        )
+                    ),
+                }
+            )
         (
             arguments.output_directory / "native-prefix-local-comparisons.json"
         ).write_text(json.dumps(local_comparisons, indent=2))
         torch.save(local_outputs, arguments.output_directory / "local-layer-outputs.pt")
+        (
+            arguments.output_directory / "native-prefix-chained-comparisons.json"
+        ).write_text(json.dumps(chained_comparisons, indent=2))
+        torch.save(
+            {
+                "embedded_input": embedded_input.cpu(),
+                "mrope_positions": positions.cpu(),
+                "native_accepted_hidden": captured_output["accepted_full_hidden"],
+                **chained_outputs,
+            },
+            arguments.output_directory / "native-prefix-chained-operands.pt",
+        )
     else:
         pass
     if arguments.compare_native_operators:
