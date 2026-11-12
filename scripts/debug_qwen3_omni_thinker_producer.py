@@ -41,7 +41,7 @@ def main() -> None:
     assert len(input_files) == 1, "this comparison requires one complete native prefill"
     captured_input = torch.load(input_files[0], weights_only=True)
     assert captured_input["request_id"] == arguments.request_id
-    assert captured_input["prefix_length"] == 0, "cached prefix KV is not reconstructed"
+    prefix_length = captured_input["prefix_length"]
     captured_writes = [
         torch.load(filename, weights_only=True)
         for filename in sorted((arguments.delivery_directory / "writes").glob("*.pt"))
@@ -54,7 +54,7 @@ def main() -> None:
     ]
     assert len(selected_writes) == 1
     captured_output = selected_writes[0]
-    assert captured_output["prefix_length"] == 0
+    assert captured_output["prefix_length"] == prefix_length
     assert torch.equal(
         captured_input["actual_input_ids"], captured_output["actual_input_ids"]
     )
@@ -100,6 +100,25 @@ def main() -> None:
     embedded_input = captured_input["embedded_input"].to(reference.device)
     positions = captured_input["mrope_positions"].to(reference.device)
     assert positions.shape == (3, len(embedded_input))
+    causal_ids = captured_input["causal_token_ids"].to(reference.device)
+    assert torch.equal(
+        causal_ids[prefix_length:].cpu(), captured_input["actual_input_ids"]
+    )
+    prefix_ids = causal_ids[:prefix_length]
+    multimodal_ids = {
+        configuration.thinker_config.audio_token_id,
+        configuration.thinker_config.image_token_id,
+        configuration.thinker_config.video_token_id,
+    }
+    assert not any(token in multimodal_ids for token in prefix_ids.tolist())
+    # The cached prefix is text-only. Recompute it, rather than claiming that
+    # the native cache contents were captured or independently validated.
+    prefix_embeddings = reference.model.embed_tokens(prefix_ids)
+    embedded_input = torch.cat((prefix_embeddings, embedded_input))
+    prefix_positions = torch.arange(prefix_length, device=reference.device).expand(
+        3, -1
+    )
+    positions = torch.cat((prefix_positions, positions), dim=1)
     outputs = reference.model(
         inputs_embeds=embedded_input.unsqueeze(0),
         position_ids=positions.unsqueeze(1),
@@ -118,9 +137,10 @@ def main() -> None:
         "prompt_rows": len(embedded_input),
         "accepted_layer": accepted_layer,
         "multimodal_rows": len(selected_positions),
-        "complete_prefix": asdict(
+        "native_extend": asdict(
             compare_tensors(
-                captured_output["accepted_full_hidden"].to(reference.device), accepted
+                captured_output["accepted_full_hidden"].to(reference.device),
+                accepted[prefix_length:],
             )
         ),
         "multimodal_rows_comparison": asdict(
@@ -129,7 +149,7 @@ def main() -> None:
                 accepted[selected_positions],
             )
         ),
-        "scope": "Actual native embedded inputs and positions with zero cached prefix, independently loaded checkpoint producer. Encoder output is held. Numerical differences do not by themselves identify an invalid native operator.",
+        "scope": "Actual native extended embeddings and positions, with a text-only cached prefix recomputed from checkpoint embeddings. Native prefix KV contents are not captured. Encoder output is held. Numerical differences do not by themselves identify an invalid native operator.",
     }
     (arguments.output_directory / "summary.json").write_text(
         json.dumps(report, indent=2)
