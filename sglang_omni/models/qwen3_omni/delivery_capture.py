@@ -137,7 +137,10 @@ class ThinkerDeliveryRecorder:
             forward_batch: ForwardBatch,
         ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
             self.active_operator_prefix = prefix
-            query, key, value = original_apply(qkv, positions, forward_batch)
+            try:
+                query, key, value = original_apply(qkv, positions, forward_batch)
+            finally:
+                self.active_operator_prefix = None
             if self.is_prefill_active:
                 self.operands.record(f"{prefix}_query_rotated", query)
                 self.operands.record(f"{prefix}_key_rotated", key)
@@ -163,8 +166,7 @@ class ThinkerDeliveryRecorder:
             module: MRotaryEmbedding,
             input_tensors: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
         ) -> None:
-            if self.is_prefill_active:
-                assert self.active_operator_prefix is not None
+            if self.is_prefill_active and self.active_operator_prefix is not None:
                 self.operands.record(
                     f"{self.active_operator_prefix}_query_normalized", input_tensors[1]
                 )
