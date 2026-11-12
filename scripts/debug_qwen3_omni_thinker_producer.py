@@ -28,6 +28,7 @@ def main() -> None:
     parser.add_argument("--model-revision", required=True)
     parser.add_argument("--gpu", type=int, required=True)
     parser.add_argument("--output-directory", type=Path, required=True)
+    parser.add_argument("--compare-native-layers", action="store_true")
     arguments = parser.parse_args()
     arguments.output_directory.mkdir(exist_ok=False)
     torch.cuda.set_device(arguments.gpu)
@@ -121,6 +122,46 @@ def main() -> None:
     assert torch.equal(outputs.hidden_states[0][0], embedded_input)
     accepted = outputs.hidden_states[accepted_layer][0]
     selected_positions = captured_output["prompt_positions"].long().to(reference.device)
+    if arguments.compare_native_layers:
+        native_layers = captured_output["layer_hidden"]
+        assert set(native_layers) == {
+            f"layer_{layer_index:02d}_hidden"
+            for layer_index in range(accepted_layer + 1)
+        }
+        assert torch.equal(
+            native_layers["layer_00_hidden"], captured_input["embedded_input"]
+        )
+        assert torch.equal(
+            native_layers[f"layer_{accepted_layer:02d}_hidden"],
+            captured_output["accepted_full_hidden"],
+        )
+        layer_comparisons = [
+            {
+                "layer_index": layer_index,
+                "extended_rows": asdict(
+                    compare_tensors(
+                        native_layers[f"layer_{layer_index:02d}_hidden"].to(
+                            reference.device
+                        ),
+                        outputs.hidden_states[layer_index][0, prefix_token_count:],
+                    )
+                ),
+                "audio_rows": asdict(
+                    compare_tensors(
+                        native_layers[f"layer_{layer_index:02d}_hidden"].to(
+                            reference.device
+                        )[selected_positions - prefix_token_count],
+                        outputs.hidden_states[layer_index][0, selected_positions],
+                    )
+                ),
+            }
+            for layer_index in range(accepted_layer + 1)
+        ]
+        (arguments.output_directory / "layer-comparisons.json").write_text(
+            json.dumps(layer_comparisons, indent=2)
+        )
+    else:
+        pass
     report = {
         "request_id": arguments.request_id,
         "model_revision": arguments.model_revision,
