@@ -2,6 +2,7 @@
 
 Each phase boots a server pair on SeedTTS EN 1.7B Base and runs its cells in turn on both servers at once, every cell over
 all 1,088 prompts, warmup 1, unseeded unless a seed is named. Phases:
+  prime    main alone on card 0 with no cells, so every later boot reads one compile cache
   o1       main card 0, head card 1
   o2       head card 0, main card 1
   band     main on both cards, the same-time band for the first chunk rows
@@ -43,6 +44,7 @@ MIXED = [
 WHOLE = [("n16", [("whole", 16, None, False)]), ("n64", [("whole", 64, None, False)])]
 WHOLE_1 = [("n1", [("whole", 1, 1234, False)])]
 PHASES = {
+    "prime": ((("prime", "main", 0, []),), []),
     "o1": ((("main", "main", 0, []), ("head", "head", 1, [])), WHOLE + MIXED + STREAM_64 + WHOLE_1),
     "o2": ((("head", "head", 0, []), ("main", "main", 1, [])), WHOLE + MIXED + STREAM_64),
     "band": ((("maina", "main", 0, []), ("mainb", "main", 1, [])), MIXED + STREAM_64),
