@@ -270,6 +270,12 @@ class ThinkerDeliveryRecorder:
                             for name, tensor in source.items()
                             if name.startswith("batch_operator_")
                         },
+                        "layer_batches": {
+                            name.removeprefix("batch_"): tensor
+                            for name, tensor in source.items()
+                            if name.startswith("batch_layer_")
+                        },
+                        "operator_positions": source["batch_positions"],
                         "operator_layouts": {
                             name.removeprefix("layout_"): tensor
                             for name, tensor in source.items()

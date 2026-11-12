@@ -199,7 +199,7 @@ class LayerOperandRecorder:
                 {
                     f"batch_{name}": tensor.detach().cpu().clone()
                     for name, tensor in snapshot.items()
-                    if name.startswith("operator_")
+                    if name.startswith(("operator_", "layer_")) or name == "positions"
                 }
             )
         else:
