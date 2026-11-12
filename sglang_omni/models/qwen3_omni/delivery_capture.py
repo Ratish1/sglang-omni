@@ -129,7 +129,7 @@ class ThinkerDeliveryRecorder:
                         "positions": source["prefix_positions"][relative_rows],
                         "actual_input_ids": source["prefix_input_ids"],
                         "causal_token_ids": torch.tensor(request.origin_input_ids),
-                        "scheduled_token_ids": torch.tensor(request.fill_ids),
+                        "scheduled_token_ids": torch.tensor(request.get_fill_ids()),
                     },
                     destination / f"{self.write_count:06d}.pt",
                 )
