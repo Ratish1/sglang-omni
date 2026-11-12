@@ -10,7 +10,7 @@ prompts, so it ends inside the non-streaming client's one pass over all 1,088. P
   nograph2 the same, cards swapped
   slots    head with 16 codec state slots card 0, head with its 64 card 1
   slots2   the same, cards swapped
-  o1x      main card 0, head card 1: streaming at 16, then non-streaming one at a time
+  o1x      main card 0, head card 1: streaming at 16, non-streaming at 64 twice, then one at a time
   o2x      head card 0, main card 1: the same
 Cells: mixa to mixc 16 streaming and 48 non-streaming in flight at once; n16 and n64 non-streaming over every prompt.
 
@@ -44,6 +44,8 @@ WHOLE = [("n16", [("whole", 16, False, None)]), ("n64", [("whole", 64, False, No
 WHOLE_TWICE = WHOLE + [("n64b", [("whole", 64, False, None)])]
 STREAM_16_WHOLE_1 = [
     ("s16", [("stream", 16, True, None)]),
+    ("n64", [("whole", 64, False, None)]),
+    ("n64b", [("whole", 64, False, None)]),
     ("n1", [("whole", 1, False, None)]),
 ]
 PHASES = {
