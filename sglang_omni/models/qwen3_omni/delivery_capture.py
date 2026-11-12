@@ -18,6 +18,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.models.qwen3_moe import Qwen3MoeDecoderLayer, Qwen3MoeSparseMoeBlock
 
 from sglang_omni.models.qwen3_omni.layer_operand_capture import LayerOperandRecorder
+from sglang_omni.models.qwen3_omni.producer_control import substitute_prompt_hidden
 from sglang_omni.scheduling.sglang_backend.prompt_hidden import (
     PromptHiddenRequest,
     PromptHiddenStore,
@@ -395,3 +396,4 @@ class ThinkerDeliveryRecorder:
         (destination / "identity.json").write_text(
             json.dumps({"request_id": request.rid})
         )
+        substitute_prompt_hidden(request, store, outgoing, destination)
