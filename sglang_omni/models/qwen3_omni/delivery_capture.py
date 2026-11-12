@@ -39,6 +39,7 @@ class ThinkerDeliveryRecorder:
     slot_writers: dict[int, tuple[int, int]] = field(default_factory=dict)
     observed_rotaries: set[int] = field(default_factory=set)
     active_operator_prefix: str | None = None
+    rotary_implementations: dict[str, str] = field(default_factory=dict)
 
     def install(self, layer: torch.nn.Module, layer_index: int) -> None:
         original_forward = layer.forward
@@ -139,6 +140,11 @@ class ThinkerDeliveryRecorder:
                 self.operands.record(f"{prefix}_key_rotated", key)
                 self.operands.record(f"{prefix}_value", value)
                 rotary = layer.self_attn.rotary_emb
+                implementation = (
+                    rotary._forward_method
+                )  # noqa: leading-underscore  # Runtime dispatch attribute.
+                assert implementation is not None
+                self.rotary_implementations[prefix] = implementation.__qualname__
                 self.operands.record(
                     f"{prefix}_rotary_cache_rows", rotary.cos_sin_cache[positions.T]
                 )
@@ -315,6 +321,7 @@ class ThinkerDeliveryRecorder:
                             for name, tensor in source.items()
                             if name.startswith("layout_operator_")
                         },
+                        "rotary_implementations": dict(self.rotary_implementations),
                         "cache_locations": cache_locations.cpu().clone(),
                         "cache_keys": [
                             buffer.index_select(0, cache_locations).cpu()

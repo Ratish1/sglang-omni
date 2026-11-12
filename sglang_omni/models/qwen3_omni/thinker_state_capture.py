@@ -93,7 +93,6 @@ def record_thinker_state(
                 "silu_mul_keep_fp32": configuration.silu_mul_keep_fp32,
                 "w13_swiglu_interleaved": experts.quant_method.w13_swiglu_interleaved,
                 "rotary_type": type(rotary).__name__,
-                "rotary_implementation": rotary._forward_method.__qualname__,  # noqa: leading-underscore  # Runtime dispatch attribute.
                 "mrope_section": rotary.mrope_section,
                 "mrope_interleaved": rotary.mrope_interleaved,
                 "mrope_interleaved_glm": rotary.mrope_interleaved_glm,
