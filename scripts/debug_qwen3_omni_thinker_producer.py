@@ -9,7 +9,7 @@ from pathlib import Path
 
 import torch
 from huggingface_hub import hf_hub_download
-from transformers import Qwen3OmniMoeConfig
+from transformers import DynamicCache, Qwen3OmniMoeConfig
 from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import (
     Qwen3OmniMoeThinkerForConditionalGeneration,
     Qwen3OmniMoeThinkerTextRotaryEmbedding,
@@ -29,6 +29,7 @@ def main() -> None:
     parser.add_argument("--gpu", type=int, required=True)
     parser.add_argument("--output-directory", type=Path, required=True)
     parser.add_argument("--compare-native-layers", action="store_true")
+    parser.add_argument("--hold-native-prefix-cache", action="store_true")
     arguments = parser.parse_args()
     arguments.output_directory.mkdir(exist_ok=False)
     torch.cuda.set_device(arguments.gpu)
@@ -162,6 +163,102 @@ def main() -> None:
         )
     else:
         pass
+    if arguments.hold_native_prefix_cache:
+        assert arguments.compare_native_layers
+        native_keys = captured_output["cache_keys"]
+        native_values = captured_output["cache_values"]
+        assert len(native_keys) == len(native_values) == accepted_layer + 1
+        assert all(len(keys) == len(embedded_input) for keys in native_keys)
+        cache = DynamicCache(config=reference.model.config)
+        for layer_index in range(accepted_layer):
+            cache.update(
+                native_keys[layer_index][:prefix_token_count]
+                .to(reference.device)
+                .transpose(0, 1)
+                .unsqueeze(0),
+                native_values[layer_index][:prefix_token_count]
+                .to(reference.device)
+                .transpose(0, 1)
+                .unsqueeze(0),
+                layer_index,
+            )
+        query_token_count = len(captured_input["embedded_input"])
+        query_positions = prefix_token_count + torch.arange(
+            query_token_count, device=reference.device
+        )
+        key_positions = torch.arange(len(embedded_input), device=reference.device)
+        allowed = key_positions[None, :] <= query_positions[:, None]
+        attention_mask = torch.zeros(
+            (1, 1, query_token_count, len(embedded_input)),
+            dtype=reference.dtype,
+            device=reference.device,
+        ).masked_fill_(~allowed[None, None], float("-inf"))
+        position_embeddings = reference.model.rotary_emb(
+            embedded_input[None, prefix_token_count:],
+            positions[:, None, prefix_token_count:],
+        )
+        local_comparisons = []
+        local_outputs: dict[str, torch.Tensor] = {}
+        for layer_index in range(accepted_layer):
+            native_input = captured_output["layer_hidden"][
+                f"layer_{layer_index:02d}_hidden"
+            ].to(reference.device)
+            output = reference.model.layers[layer_index](
+                native_input.unsqueeze(0),
+                attention_mask=attention_mask,
+                past_key_values=cache,
+                use_cache=True,
+                position_embeddings=position_embeddings,
+            )[0]
+            key_states = cache.layers[layer_index].keys
+            value_states = cache.layers[layer_index].values
+            assert key_states is not None and value_states is not None
+            key_states = key_states[0].transpose(0, 1)
+            value_states = value_states[0].transpose(0, 1)
+            assert torch.equal(
+                key_states[:prefix_token_count].cpu(),
+                native_keys[layer_index][:prefix_token_count],
+            )
+            assert torch.equal(
+                value_states[:prefix_token_count].cpu(),
+                native_values[layer_index][:prefix_token_count],
+            )
+            local_comparisons.append(
+                {
+                    "layer_index": layer_index,
+                    "output": asdict(
+                        compare_tensors(
+                            captured_output["layer_hidden"][
+                                f"layer_{layer_index + 1:02d}_hidden"
+                            ].to(reference.device),
+                            output,
+                        )
+                    ),
+                    "keys": asdict(
+                        compare_tensors(
+                            native_keys[layer_index][prefix_token_count:].to(
+                                reference.device
+                            ),
+                            key_states[prefix_token_count:],
+                        )
+                    ),
+                    "values": asdict(
+                        compare_tensors(
+                            native_values[layer_index][prefix_token_count:].to(
+                                reference.device
+                            ),
+                            value_states[prefix_token_count:],
+                        )
+                    ),
+                }
+            )
+            local_outputs[f"layer_{layer_index:02d}_output"] = output.cpu()
+        (
+            arguments.output_directory / "native-prefix-local-comparisons.json"
+        ).write_text(json.dumps(local_comparisons, indent=2))
+        torch.save(local_outputs, arguments.output_directory / "local-layer-outputs.pt")
+    else:
+        pass
     report = {
         "request_id": arguments.request_id,
         "model_revision": arguments.model_revision,
@@ -169,6 +266,7 @@ def main() -> None:
         "prompt_rows": len(embedded_input),
         "accepted_layer": accepted_layer,
         "multimodal_rows": len(selected_positions),
+        "native_prefix_cache_held_for_local_controls": arguments.hold_native_prefix_cache,
         "native_extend": asdict(
             compare_tensors(
                 captured_output["accepted_full_hidden"].to(reference.device),
@@ -181,7 +279,7 @@ def main() -> None:
                 accepted[selected_positions],
             )
         ),
-        "scope": "Actual native extended embeddings and positions, with a text-only cached prefix recomputed from checkpoint embeddings. Native prefix KV contents are not captured. Encoder output is held. Numerical differences do not by themselves identify an invalid native operator.",
+        "scope": "The full-prefill comparison uses actual native extended embeddings and positions, with a text-only prefix recomputed from checkpoint embeddings rather than held native prefix KV. Optional local controls hold each native layer input and its native prefix KV. Encoder output is held. Numerical differences do not by themselves identify an invalid native operator.",
     }
     (arguments.output_directory / "summary.json").write_text(
         json.dumps(report, indent=2)
