@@ -47,7 +47,7 @@ def main() -> None:
         config=configuration,
         dtype=torch.bfloat16,
         device_map={"": arguments.gpu},
-        attn_implementation="sdpa",
+        attn_implementation="eager",
         experts_implementation="eager",
         use_kernels=False,
         output_loading_info=True,
