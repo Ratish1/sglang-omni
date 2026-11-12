@@ -23,6 +23,21 @@ from scripts.qwen3_omni_checkpoint_weights import CheckpointIndex
 from scripts.qwen3_omni_thinker_operator_audit import fp32_norm
 
 
+def contracted_bf16_rotation(
+    normalized: torch.Tensor, cosine: torch.Tensor, sine: torch.Tensor
+) -> torch.Tensor:
+    first_half, second_half = normalized.chunk(2, dim=-1)
+    half_cosine = cosine[..., : first_half.shape[-1]].to(normalized.dtype)
+    half_sine = sine[..., : first_half.shape[-1]].to(normalized.dtype)
+    first_output = (
+        first_half.double() * half_cosine.double() - (second_half * half_sine).double()
+    ).to(normalized.dtype)
+    second_output = (
+        (second_half * half_cosine).double() + first_half.double() * half_sine.double()
+    ).to(normalized.dtype)
+    return torch.cat((first_output, second_output), dim=-1)
+
+
 @torch.inference_mode()
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
@@ -221,6 +236,14 @@ def main() -> None:
             ),
             "key_rotation_checkpoint_bf16_formula": compare_tensors(
                 actual_key[live], rounded_key[live]
+            ),
+            "query_rotation_bf16_multiply_fma_formula": compare_tensors(
+                actual_query[live],
+                contracted_bf16_rotation(normalized_query, cosine, sine)[live],
+            ),
+            "key_rotation_bf16_multiply_fma_formula": compare_tensors(
+                actual_key[live],
+                contracted_bf16_rotation(normalized_key, cosine, sine)[live],
             ),
             "query_rotation_native_kernel_replay": compare_tensors(
                 actual_query[live], replay_values[0].reshape_as(query)[live]
