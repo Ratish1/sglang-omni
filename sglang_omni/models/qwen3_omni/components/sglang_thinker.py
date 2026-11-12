@@ -45,6 +45,7 @@ from sglang_omni.models.qwen3_omni.components.thinker_fused_rope import (
 )
 from sglang_omni.models.qwen3_omni.delivery_capture import ThinkerDeliveryRecorder
 from sglang_omni.models.qwen3_omni.layer_operand_capture import LayerOperandRecorder
+from sglang_omni.models.qwen3_omni.thinker_state_capture import record_thinker_state
 from sglang_omni.quantization import get_weight_preprocessor
 from sglang_omni.sampling.sampler_compile import (
     SamplerCompileForms,
@@ -182,6 +183,7 @@ class Qwen3OmniThinkerForCausalLM(nn.Module):
         directory = os.environ.get("SGLANG_OMNI_DIAGNOSTIC_DELIVERY_DIRECTORY")
         if directory is not None:
             assert 0 < accept_hidden_layer < self.config.num_hidden_layers
+            record_thinker_state(self.model, self.lm_head, Path(directory))
             self.delivery_recorder = ThinkerDeliveryRecorder(
                 directory=Path(directory),
                 multimodal_token_ids=(

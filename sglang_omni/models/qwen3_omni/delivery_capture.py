@@ -134,6 +134,14 @@ class ThinkerDeliveryRecorder:
                 self.operands.record(f"{prefix}_query_rotated", query)
                 self.operands.record(f"{prefix}_key_rotated", key)
                 self.operands.record(f"{prefix}_value", value)
+                rotary = layer.self_attn.rotary_emb
+                self.operands.record(
+                    f"{prefix}_rotary_cache_rows", rotary.cos_sin_cache[positions.T]
+                )
+                self.operands.record(
+                    f"{prefix}_rotary_axes",
+                    rotary.axis_map.expand(positions.shape[-1], -1),
+                )
             else:
                 pass
             return query, key, value
