@@ -17,6 +17,11 @@ def main() -> None:
     parser.add_argument("--request-id", required=True)
     parser.add_argument("--model-revision", required=True)
     parser.add_argument("--hold-native-prefix-cache", action="store_true")
+    parser.add_argument(
+        "--producer-precision",
+        choices=("chained", "checkpoint", "router", "experts", "router-and-experts"),
+        default="chained",
+    )
     parser.add_argument("--output-directory", type=Path, required=True)
     arguments = parser.parse_args()
     arguments.output_directory.mkdir(parents=True, exist_ok=False)
@@ -29,10 +34,19 @@ def main() -> None:
     assert not weights["mismatches"] and not weights["unvisited_tensors"]
     if arguments.hold_native_prefix_cache:
         assert summary["native_prefix_cache_held_for_local_controls"]
+        if arguments.producer_precision != "chained":
+            controls = json.loads(
+                (arguments.reference_directory / "precision-controls.json").read_text()
+            )
+            assert arguments.producer_precision in controls["variants"]
+        else:
+            pass
         reference_file = (
-            arguments.reference_directory / "native-prefix-chained-operands.pt"
+            arguments.reference_directory
+            / f"native-prefix-{arguments.producer_precision}-operands.pt"
         )
     else:
+        assert arguments.producer_precision == "chained"
         reference_file = arguments.reference_directory / "producer-operands.pt"
     reference = torch.load(reference_file, map_location="cpu", weights_only=True)
     input_files = sorted(
@@ -83,6 +97,7 @@ def main() -> None:
         "model_revision": arguments.model_revision,
         "accepted_layer": summary["accepted_layer"],
         "reference_prefix_recomputed": not arguments.hold_native_prefix_cache,
+        "producer_precision": arguments.producer_precision,
         "native_input_sha256": hashlib.sha256(input_files[0].read_bytes()).hexdigest(),
         "reference_operands_sha256": hashlib.sha256(
             reference_file.read_bytes()

@@ -21,6 +21,10 @@ from scripts.qwen3_omni_thinker_operator_audit import (
     ThinkerOperatorCapture,
     audit_thinker_operators,
 )
+from scripts.qwen3_omni_thinker_precision_control import (
+    ThinkerPrecisionInputs,
+    run_precision_controls,
+)
 
 
 @torch.inference_mode()
@@ -35,6 +39,7 @@ def main() -> None:
     parser.add_argument("--compare-native-layers", action="store_true")
     parser.add_argument("--hold-native-prefix-cache", action="store_true")
     parser.add_argument("--compare-native-operators", action="store_true")
+    parser.add_argument("--compare-native-moe-precision", action="store_true")
     arguments = parser.parse_args()
     arguments.output_directory.mkdir(exist_ok=False)
     torch.cuda.set_device(arguments.gpu)
@@ -376,6 +381,26 @@ def main() -> None:
         },
         arguments.output_directory / "producer-operands.pt",
     )
+    if arguments.compare_native_moe_precision:
+        assert arguments.hold_native_prefix_cache
+        run_precision_controls(
+            reference,
+            ThinkerPrecisionInputs(
+                embedded_input=embedded_input,
+                positions=positions,
+                prefix_token_count=prefix_token_count,
+                accepted_layer=accepted_layer,
+                keys=captured_output["cache_keys"],
+                values=captured_output["cache_values"],
+                operators=captured_output["operator_batches"],
+                native_accepted_hidden=captured_output["accepted_full_hidden"],
+                batch_offset=captured_output["batch_offset"],
+                extend_token_count=captured_output["extend_length"],
+            ),
+            arguments.output_directory,
+        )
+    else:
+        pass
     print(json.dumps(report), flush=True)
 
 
