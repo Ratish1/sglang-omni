@@ -118,6 +118,7 @@ def run_precision_controls(
         cache = DynamicCache(config=reference.model.config)
         hidden = suffix
         saved = {"checkpoint_hidden_0": suffix[0].cpu()}
+        routing: dict[str, torch.Tensor] = {}
         for layer_index in range(captured.accepted_layer):
             cache.update(
                 captured.keys[layer_index][:prefix_token_count]
@@ -144,6 +145,26 @@ def run_precision_controls(
                     )
                 else:
                     pass
+
+                def record_routing(
+                    router: Qwen3OmniMoeThinkerTextTopKRouter,
+                    inputs: tuple[torch.Tensor],
+                    output: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+                ) -> None:
+                    assert inputs[0].shape[-1] == router.hidden_dim
+                    logits, weights, indices = output
+                    for field, tensor in (
+                        ("logits", logits),
+                        ("weights", weights),
+                        ("indices", indices),
+                    ):
+                        routing[f"layer_{layer_index:02d}_{field}"] = (
+                            tensor.detach().cpu().clone()
+                        )
+
+                hooks.enter_context(
+                    layer.mlp.gate.register_forward_hook(record_routing)
+                )
                 hidden = layer(
                     hidden,
                     attention_mask=attention_mask,
@@ -180,6 +201,7 @@ def run_precision_controls(
             },
             output_directory / f"native-prefix-{name}-operands.pt",
         )
+        torch.save(routing, output_directory / f"native-prefix-{name}-routing.pt")
         print(json.dumps({"completed_precision_control": name}), flush=True)
     (output_directory / "precision-controls.json").write_text(
         json.dumps(
