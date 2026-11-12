@@ -12,6 +12,9 @@ prompts, so it ends inside the non-streaming client's one pass over all 1,088. P
   slots2   the same, cards swapped
   o1x      main card 0, head card 1: streaming at 16, non-streaming at 64 twice, then one at a time
   o2x      head card 0, main card 1: the same
+  s16o1    main card 0, head card 1: streaming at 16 three times
+  s16o2    head card 0, main card 1: the same
+  s16band  main on both cards: the same, the same-time band
 Cells: mixa to mixc 16 streaming and 48 non-streaming in flight at once; n16 and n64 non-streaming over every prompt.
 
 usage: python3 review_cells_v2.py --main TREE --head TREE --root DIR --phases o1m,o2m,bandm
@@ -42,6 +45,7 @@ MIXED = [
 STREAM_64 = [(f"s64{letter}", [("stream", 64, True, None)]) for letter in "abc"]
 WHOLE = [("n16", [("whole", 16, False, None)]), ("n64", [("whole", 64, False, None)])]
 WHOLE_TWICE = WHOLE + [("n64b", [("whole", 64, False, None)])]
+STREAM_16 = [(f"s16{letter}", [("stream", 16, True, None)]) for letter in "abc"]
 STREAM_16_WHOLE_1 = [
     ("s16", [("stream", 16, True, None)]),
     ("n64", [("whole", 64, False, None)]),
@@ -70,6 +74,9 @@ PHASES = {
     ),
     "o1x": ((("main", "main", 0, []), ("head", "head", 1, [])), STREAM_16_WHOLE_1),
     "o2x": ((("head", "head", 0, []), ("main", "main", 1, [])), STREAM_16_WHOLE_1),
+    "s16o1": ((("main", "main", 0, []), ("head", "head", 1, [])), STREAM_16),
+    "s16o2": ((("head", "head", 0, []), ("main", "main", 1, [])), STREAM_16),
+    "s16band": ((("maina", "main", 0, []), ("mainb", "main", 1, [])), STREAM_16),
 }
 
 
