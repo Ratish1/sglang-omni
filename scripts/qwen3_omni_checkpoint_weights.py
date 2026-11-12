@@ -20,6 +20,7 @@ from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import (
     Qwen3OmniMoeCode2Wav,
     Qwen3OmniMoeRotaryEmbedding,
     Qwen3OmniMoeTalkerForConditionalGeneration,
+    Qwen3OmniMoeThinkerForConditionalGeneration,
     Qwen3OmniMoeThinkerTextRotaryEmbedding,
     Qwen3OmniMoeVisionRotaryEmbedding,
     SinusoidsPositionEmbedding,
@@ -160,6 +161,7 @@ def audit_checkpoint_weights(
     model: (
         Qwen3OmniMoeForConditionalGeneration
         | Qwen3OmniMoeTalkerForConditionalGeneration
+        | Qwen3OmniMoeThinkerForConditionalGeneration
         | Qwen3OmniMoeCode2Wav
     ),
     checkpoint_directory: Path,
@@ -172,6 +174,8 @@ def audit_checkpoint_weights(
         prefix = "talker."
     elif isinstance(model, Qwen3OmniMoeCode2Wav):
         prefix = "code2wav."
+    elif isinstance(model, Qwen3OmniMoeThinkerForConditionalGeneration):
+        prefix = "thinker."
     else:
         prefix = ""
     tensors = model.state_dict(keep_vars=True)
