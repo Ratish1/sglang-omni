@@ -16,6 +16,7 @@ from sglang.srt.tokenizer.tiktoken_tokenizer import TiktokenTokenizer
 from transformers import PreTrainedTokenizerBase
 
 from sglang_omni.models.qwen3_omni.components.talker_prefill import TalkerPrefillBuilder
+from sglang_omni.models.qwen3_omni.delivery_capture import ThinkerDeliveryRecorder
 from sglang_omni.models.qwen3_omni.mrope_positions import talker_can_use_linear_mrope
 from sglang_omni.models.qwen3_omni.payload_types import (
     NO_SPEECH,
@@ -1160,7 +1161,10 @@ def apply_thinker_result(
 
 
 def make_thinker_stream_output_builder(
-    *, speech_enabled: bool, prompt_hidden_store: PromptHiddenStore | None
+    *,
+    speech_enabled: bool,
+    prompt_hidden_store: PromptHiddenStore | None,
+    delivery_recorder: ThinkerDeliveryRecorder | None = None,
 ) -> Callable[[str, SGLangARRequestData, RequestOutput], list[OutgoingMessage]]:
     def _build_stream_output(
         request_id: str, req_data: SGLangARRequestData, req_output: RequestOutput
@@ -1212,6 +1216,12 @@ def make_thinker_stream_output_builder(
                 message.data = prompt_hidden_store.read(
                     req_data.req.kv.req_pool_idx, req_data.req.prompt_hidden_positions
                 )
+                if delivery_recorder is not None:
+                    delivery_recorder.record_handoff(
+                        req_data.req, prompt_hidden_store, message.data
+                    )
+                else:
+                    pass
                 message.metadata["prompt_hidden_positions"] = (
                     req_data.req.prompt_hidden_positions.tolist()
                 )

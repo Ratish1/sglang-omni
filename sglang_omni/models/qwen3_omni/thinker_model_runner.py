@@ -19,6 +19,7 @@ from sglang_omni.model_runner.prefill_inputs import (
     get_omni_prefill_inputs,
 )
 from sglang_omni.model_runner.thinker_model_runner import ThinkerModelRunner
+from sglang_omni.models.qwen3_omni.delivery_capture import ThinkerDeliveryRecorder
 from sglang_omni.scheduling.types import SchedulerRequest
 
 _PREFILL_AUDIO_INPUT_KEYS = frozenset(
@@ -50,6 +51,7 @@ class Qwen3OmniThinkerModelRunner(ThinkerModelRunner):
     """
 
     supports_speculative_async_decode: bool = True
+    delivery_recorder: ThinkerDeliveryRecorder | None = None
 
     @staticmethod
     def origin_num_tokens(value: object) -> int | None:
@@ -355,6 +357,10 @@ class Qwen3OmniThinkerModelRunner(ThinkerModelRunner):
         schedule_batch: ScheduleBatch | None,
         requests: list[SchedulerRequest],
     ) -> None:
+        if self.delivery_recorder is not None:
+            self.delivery_recorder.operands.step_counter.add_(1)
+        else:
+            pass
         disposition = self.classify_prefill(forward_batch, schedule_batch, requests)
         if disposition.kind != _SIDECAR:
             return
@@ -390,6 +396,20 @@ class Qwen3OmniThinkerModelRunner(ThinkerModelRunner):
             forward_batch,
             OmniPrefillInputs(input_embeds=input_embeds),
         )
+
+    def post_prefill(
+        self,
+        result: GenerationBatchResult,
+        forward_batch: ForwardBatch | None,
+        schedule_batch: ScheduleBatch,
+        requests: list[SchedulerRequest],
+    ) -> None:
+        if self.delivery_recorder is not None:
+            assert forward_batch is not None
+            self.delivery_recorder.record_writes(result, forward_batch, schedule_batch)
+        else:
+            pass
+        super().post_prefill(result, forward_batch, schedule_batch, requests)
 
     def custom_prefill_forward(
         self,
