@@ -68,6 +68,52 @@ class ThinkerDeliveryRecorder:
 
         layer.forward = forward
 
+    def record_inputs(
+        self,
+        input_embeds: torch.Tensor,
+        forward_batch: ForwardBatch,
+        schedule_batch: ScheduleBatch,
+    ) -> None:
+        offset = 0
+        for request, prefix, length in zip(
+            schedule_batch.reqs,
+            schedule_batch.prefix_lens,
+            schedule_batch.extend_lens,
+            strict=True,
+        ):
+            if request.rid in self.request_ids:
+                destination = self.directory / "inputs"
+                destination.mkdir(parents=True, exist_ok=True)
+                torch.save(
+                    {
+                        "request_id": request.rid,
+                        "forward_step": int(self.operands.step_counter),
+                        "prefix_length": prefix,
+                        "extend_length": length,
+                        "batch_offset": offset,
+                        "embedded_input": input_embeds[offset : offset + length]
+                        .detach()
+                        .cpu()
+                        .clone(),
+                        "actual_input_ids": forward_batch.input_ids[
+                            offset : offset + length
+                        ]
+                        .cpu()
+                        .clone(),
+                        "mrope_positions": forward_batch.mrope_positions[
+                            :, offset : offset + length
+                        ]
+                        .cpu()
+                        .clone(),
+                        "causal_token_ids": torch.tensor(request.origin_input_ids),
+                    },
+                    destination
+                    / f"{request.rid}-{int(self.operands.step_counter):06d}.pt",
+                )
+            else:
+                pass
+            offset += length
+
     def record_writes(
         self,
         result: GenerationBatchResult,
@@ -125,6 +171,7 @@ class ThinkerDeliveryRecorder:
                         .cpu()
                         .clone(),
                         "producer_hidden": accepted,
+                        "accepted_full_hidden": source["prefix_accepted_hidden"],
                         "auxiliary_hidden": auxiliary,
                         "positions": source["prefix_positions"][relative_rows],
                         "actual_input_ids": source["prefix_input_ids"],

@@ -396,6 +396,13 @@ class Qwen3OmniThinkerModelRunner(ThinkerModelRunner):
             forward_batch,
             OmniPrefillInputs(input_embeds=input_embeds),
         )
+        if self.delivery_recorder is not None:
+            assert forward_batch is not None and schedule_batch is not None
+            self.delivery_recorder.record_inputs(
+                input_embeds, forward_batch, schedule_batch
+            )
+        else:
+            pass
 
     def post_prefill(
         self,
