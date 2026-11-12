@@ -17,6 +17,10 @@ from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import (
 
 from scripts.debug_qwen3_omni_feedback_audit import compare_tensors
 from scripts.qwen3_omni_checkpoint_weights import audit_checkpoint_weights
+from scripts.qwen3_omni_thinker_operator_audit import (
+    ThinkerOperatorCapture,
+    audit_thinker_operators,
+)
 
 
 @torch.inference_mode()
@@ -30,6 +34,7 @@ def main() -> None:
     parser.add_argument("--output-directory", type=Path, required=True)
     parser.add_argument("--compare-native-layers", action="store_true")
     parser.add_argument("--hold-native-prefix-cache", action="store_true")
+    parser.add_argument("--compare-native-operators", action="store_true")
     arguments = parser.parse_args()
     arguments.output_directory.mkdir(exist_ok=False)
     torch.cuda.set_device(arguments.gpu)
@@ -257,6 +262,24 @@ def main() -> None:
             arguments.output_directory / "native-prefix-local-comparisons.json"
         ).write_text(json.dumps(local_comparisons, indent=2))
         torch.save(local_outputs, arguments.output_directory / "local-layer-outputs.pt")
+    else:
+        pass
+    if arguments.compare_native_operators:
+        assert arguments.hold_native_prefix_cache
+        audit_thinker_operators(
+            reference,
+            ThinkerOperatorCapture(
+                layers=captured_output["layer_batches"],
+                operators=captured_output["operator_batches"],
+                positions=captured_output["operator_positions"],
+                keys=captured_output["cache_keys"],
+                values=captured_output["cache_values"],
+                batch_offset=captured_output["batch_offset"],
+                prefix_token_count=prefix_token_count,
+                extend_token_count=captured_output["extend_length"],
+            ),
+            arguments.output_directory,
+        )
     else:
         pass
     report = {
