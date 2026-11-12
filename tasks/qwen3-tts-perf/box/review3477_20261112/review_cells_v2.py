@@ -3,7 +3,7 @@
 review_cells.py's mix16_48 cell restarted its non-streaming client between passes, and for a quarter to a third of the
 stream run no non-streaming request was in flight. Here the streaming client of a mixed cell sends only the first 256
 prompts, so it ends inside the non-streaming client's one pass over all 1,088. Phases:
-  o1m      main card 0, head card 1: the mixed cell three times
+  o1m      main card 0, head card 1: the mixed cell three times, streaming at 64 three times, then n16 and n64
   o2m      head card 0, main card 1: the same
   bandm    main on both cards: the same, the same-time band
   nograph  main card 0, head card 1, both with an incremental graph headroom no card has, so no codec graph captures
@@ -34,11 +34,12 @@ STREAM_PROMPTS = 256
 NO_GRAPH = ["--vocoder.factory.incremental_codec_cuda_graph_min_free_gb", "4096"]
 SLOTS_16 = ["--vocoder.factory.codec_state_slots", "16"]
 MIXED = [(f"mix{letter}", [("stream", 16, True, STREAM_PROMPTS), ("whole", 48, False, None)]) for letter in "abc"]
+STREAM_64 = [(f"s64{letter}", [("stream", 64, True, None)]) for letter in "abc"]
 WHOLE = [("n16", [("whole", 16, False, None)]), ("n64", [("whole", 64, False, None)])]
 WHOLE_TWICE = WHOLE + [("n64b", [("whole", 64, False, None)])]
 PHASES = {
-    "o1m": ((("main", "main", 0, []), ("head", "head", 1, [])), MIXED),
-    "o2m": ((("head", "head", 0, []), ("main", "main", 1, [])), MIXED),
+    "o1m": ((("main", "main", 0, []), ("head", "head", 1, [])), MIXED + STREAM_64 + WHOLE),
+    "o2m": ((("head", "head", 0, []), ("main", "main", 1, [])), MIXED + STREAM_64 + WHOLE),
     "bandm": ((("maina", "main", 0, []), ("mainb", "main", 1, [])), MIXED),
     "nograph": ((("main", "main", 0, NO_GRAPH), ("head", "head", 1, NO_GRAPH)), WHOLE),
     "nograph2": ((("head", "head", 0, NO_GRAPH), ("main", "main", 1, NO_GRAPH)), WHOLE),
