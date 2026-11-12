@@ -125,6 +125,9 @@ class ThinkerDeliveryRecorder:
         result: GenerationBatchResult,
         forward_batch: ForwardBatch,
         schedule_batch: ScheduleBatch,
+        key_buffers: list[torch.Tensor],
+        value_buffers: list[torch.Tensor],
+        request_slots: torch.Tensor,
     ) -> None:
         if not forward_batch.capture_hidden_mode.is_full():
             return
@@ -159,6 +162,14 @@ class ThinkerDeliveryRecorder:
                 auxiliary = result.logits_output.hidden_states[batch_rows].cpu().clone()
                 assert torch.equal(accepted, auxiliary)
                 slots = virtual_slots[batch_rows].cpu().clone()
+                cache_locations = request_slots[
+                    request.kv.req_pool_idx, : prefix + length
+                ].long()
+                assert torch.equal(
+                    cache_locations[prefix:],
+                    forward_batch.out_cache_loc[offset : offset + length].long(),
+                )
+                layer_count = sum(name.startswith("prefix_layer_") for name in source)
                 self.write_count += 1
                 destination = self.directory / "writes"
                 destination.mkdir(parents=True, exist_ok=True)
@@ -183,6 +194,15 @@ class ThinkerDeliveryRecorder:
                             for name, tensor in source.items()
                             if name.startswith("prefix_layer_")
                         },
+                        "cache_locations": cache_locations.cpu().clone(),
+                        "cache_keys": [
+                            buffer.index_select(0, cache_locations).cpu()
+                            for buffer in key_buffers[:layer_count]
+                        ],
+                        "cache_values": [
+                            buffer.index_select(0, cache_locations).cpu()
+                            for buffer in value_buffers[:layer_count]
+                        ],
                         "auxiliary_hidden": auxiliary,
                         "positions": source["prefix_positions"][relative_rows],
                         "actual_input_ids": source["prefix_input_ids"],

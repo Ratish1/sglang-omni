@@ -11,6 +11,7 @@ from typing import TypeGuard
 import torch
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
+from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 from sglang_omni.model_runner.prefill_inputs import (
@@ -413,7 +414,18 @@ class Qwen3OmniThinkerModelRunner(ThinkerModelRunner):
     ) -> None:
         if self.delivery_recorder is not None:
             assert forward_batch is not None
-            self.delivery_recorder.record_writes(result, forward_batch, schedule_batch)
+            pool = self.tp_worker.model_runner.token_to_kv_pool
+            assert isinstance(pool, MHATokenToKVPool)
+            assert pool.start_layer == 0
+            assert pool.dtype == torch.bfloat16 and not pool.is_quantized_kv_cache
+            self.delivery_recorder.record_writes(
+                result,
+                forward_batch,
+                schedule_batch,
+                pool.k_buffer,
+                pool.v_buffer,
+                self.tp_worker.model_runner.req_to_token_pool.req_to_token,
+            )
         else:
             pass
         super().post_prefill(result, forward_batch, schedule_batch, requests)
