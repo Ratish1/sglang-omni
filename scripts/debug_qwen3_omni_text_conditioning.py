@@ -180,6 +180,18 @@ def main() -> None:
                 )
             ),
             "future_text": asdict(compare_tensors(native_future, future_text[0])),
+            "pad_embedding": asdict(
+                compare_tensors(
+                    finished["tts_pad_embed"].to(talker.device).reshape(-1),
+                    pad.reshape(-1),
+                )
+            ),
+            "eos_embedding": asdict(
+                compare_tensors(
+                    finished["tts_eos_embed"].to(talker.device).reshape(-1),
+                    eos.reshape(-1),
+                )
+            ),
             "scope": "Checkpoint input methods with actual native prompt hidden rows. Does not independently validate the multimodal Thinker hidden producer.",
         }
         saved_tensors = {
