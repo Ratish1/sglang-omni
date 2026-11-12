@@ -143,6 +143,12 @@ def main() -> None:
         formula_key = (
             normalized_key.float() * cosine + rotate_half(normalized_key).float() * sine
         ).to(raw.dtype)
+        rounded_query = normalized_query * cosine.to(raw.dtype) + rotate_half(
+            normalized_query
+        ) * sine.to(raw.dtype)
+        rounded_key = normalized_key * cosine.to(raw.dtype) + rotate_half(
+            normalized_key
+        ) * sine.to(raw.dtype)
         table_rows: dict[int, torch.Tensor] = {}
         for token_positions, rows in zip(
             captured["operator_positions"],
@@ -209,6 +215,12 @@ def main() -> None:
             ),
             "key_rotation_native_cache_fp32_formula": compare_tensors(
                 actual_key[live], formula_key[live]
+            ),
+            "query_rotation_checkpoint_bf16_formula": compare_tensors(
+                actual_query[live], rounded_query[live]
+            ),
+            "key_rotation_checkpoint_bf16_formula": compare_tensors(
+                actual_key[live], rounded_key[live]
             ),
             "query_rotation_native_kernel_replay": compare_tensors(
                 actual_query[live], replay_values[0].reshape_as(query)[live]
