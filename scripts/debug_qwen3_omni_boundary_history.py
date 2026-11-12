@@ -26,7 +26,9 @@ def main() -> None:
         arguments.model_path, revision=arguments.model_revision, local_files_only=True
     )
     reports = []
-    for directory in sorted(arguments.capture_directory.iterdir()):
+    for directory in sorted(
+        path for path in arguments.capture_directory.iterdir() if path.is_dir()
+    ):
         prompt = torch.load(directory / "prompt.pt", weights_only=True)
         finished = torch.load(directory / "finished.pt", weights_only=True)
         parameters = json.loads((directory / "sampling.json").read_text())
