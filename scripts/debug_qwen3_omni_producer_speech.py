@@ -9,6 +9,7 @@ import io
 import json
 import os
 import subprocess
+import time
 import wave
 from pathlib import Path
 
@@ -19,6 +20,7 @@ import torch
 from benchmarks.benchmarker.utils import stop_server, wait_for_service
 
 OWNED_PROCESS_EXIT_TIMEOUT_SECONDS = 10
+OWNED_PROCESS_POLL_SECONDS = 1
 
 
 def main() -> None:
@@ -218,20 +220,30 @@ def main() -> None:
                 if process.poll() is None
                 else []
             )
-            stop_server(process)
-            _, remaining = psutil.wait_procs(
-                owned, timeout=OWNED_PROCESS_EXIT_TIMEOUT_SECONDS
+            (output / "stop-ownership-start.json").write_text(
+                json.dumps({"owned_pids": [child.pid for child in owned]}, indent=2)
             )
-            statuses = {
-                str(child.pid): child.status()
-                for child in remaining
-                if child.is_running()
-            }
-            live = [
-                pid
-                for pid, status in statuses.items()
-                if status != psutil.STATUS_ZOMBIE
-            ]
+            stop_server(process)
+            deadline = time.monotonic() + OWNED_PROCESS_EXIT_TIMEOUT_SECONDS
+            while True:
+                statuses: dict[str, str] = {}
+                for child in owned:
+                    try:
+                        if child.is_running():
+                            statuses[str(child.pid)] = child.status()
+                        else:
+                            pass
+                    except psutil.NoSuchProcess:
+                        pass
+                live = [
+                    pid
+                    for pid, status in statuses.items()
+                    if status != psutil.STATUS_ZOMBIE
+                ]
+                if not live or time.monotonic() >= deadline:
+                    break
+                else:
+                    time.sleep(OWNED_PROCESS_POLL_SECONDS)
             (output / "stop-ownership.json").write_text(
                 json.dumps(
                     {
