@@ -117,7 +117,7 @@ def main() -> None:
                     logits = torch.where(repeated, penalized, logits)
                     logits[:, parameters.suppress_tokens] = float("-inf")
                     probabilities = (logits / parameters.temperature).softmax(-1)
-                chosen, weights, permutation, _ = (
+                chosen, weights, permutation, selected_weight = (
                     top_k_top_p_min_p_sampling_from_probs_torch(
                         probabilities,
                         top_k,
@@ -134,6 +134,10 @@ def main() -> None:
                 permutations[source] = permutation.long()
                 token_weights[source] = torch.zeros_like(weights).scatter_(
                     1, permutations[source], weights
+                )
+                assert torch.equal(
+                    selected_weight,
+                    token_weights[source].gather(1, chosen.long().view(-1, 1)).view(-1),
                 )
             assert (
                 choices["observed"]
