@@ -25,6 +25,7 @@ from scripts.qwen3_omni_checkpoint_weights import (
     CheckpointIndex,
     audit_checkpoint_weights,
 )
+from sglang_omni.utils.predictor_layers import PredictorLayerShape
 
 
 class NativeParameter(BaseModel):
@@ -49,6 +50,7 @@ class NativeRotaryModule(BaseModel):
 
 class NativeBufferRuntime(BaseModel):
     predictor_fused_layers: bool
+    predictor_layer_shape: PredictorLayerShape | None = None
     predictor_triton_attention: bool
     predictor_exact_add_norm: bool
     predictor_rope_stores_kv: bool
