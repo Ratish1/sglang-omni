@@ -1949,6 +1949,10 @@ def build_sglang_qwen3_tts_request(
     )
     sampling_params.normalize(None)
     sampling_params.verify(int(model.config.vocab_size))
+    # note (ratish): the model runner applies the penalty from per-slot device state, so
+    # SGLang's batch penalizer stays off.
+    repetition_penalty = sampling_params.repetition_penalty
+    sampling_params.repetition_penalty = 1.0
 
     req = Req(
         rid=payload.request_id,
@@ -1977,6 +1981,7 @@ def build_sglang_qwen3_tts_request(
             gen_kwargs.get("max_new_tokens", QWEN3_TTS_DEFAULT_MAX_NEW_TOKENS)
         ),
         temperature=temperature,
+        repetition_penalty=repetition_penalty,
         output_ids=req.output_ids,
         req=req,
         ref_code=prepared.ref_code,

@@ -7,8 +7,10 @@ import types
 
 import pytest
 import torch
+from sglang.srt.sampling.penaltylib.repetition_penalty import apply_scaling_penalties
 
 from sglang_omni.models.qwen3_tts.model_runner import Qwen3TTSModelRunner
+from sglang_omni.models.qwen3_tts.request_builders import Qwen3TTSSGLangRequestData
 
 
 def make_runner(
@@ -153,3 +155,92 @@ def test_qwen3_tts_logit_shaping_never_waits_on_the_device() -> None:
         torch.cuda.set_sync_debug_mode("default")
 
     assert torch.isneginf(logits[:2, codec_eos]).all()
+
+
+@pytest.mark.accelerator
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_qwen3_tts_scales_each_draw_by_the_ids_its_request_generated() -> None:
+    device = torch.device("cuda")
+    vocab_size = 1040
+    unsuppressed_tokens = 16
+    runner = make_runner(vocab_size=vocab_size, codec_eos_token_id=1030)
+    runner.device = device
+    runner.slot_repetition_scales = torch.ones(8, vocab_size, device=device)
+    runner.slot_repetition_penalties = torch.ones(8, device=device)
+    runner.model.prepare_decode_buffers = lambda requests: None
+    runner.build_prefill_input_embeds = lambda forward_batch, requests: torch.zeros(
+        len(forward_batch.input_ids), 4, device=device
+    )
+    sampled_ids = iter([[4, 6], [7], [4, 2], [9, 4], [1]])
+    sampled_logits: list[torch.Tensor] = []
+
+    def sample(logits_output, forward_batch):
+        sampled_logits.append(logits_output.next_token_logits.clone())
+        return torch.tensor(next(sampled_ids), dtype=torch.int32, device=device)
+
+    runner.tp_worker = types.SimpleNamespace(
+        model_runner=types.SimpleNamespace(sample=sample)
+    )
+    generated_ids = {"a": [], "b": []}
+
+    def scheduled(request_id, repetition_penalty, output_ids, middle_chunks):
+        return types.SimpleNamespace(
+            request_id=request_id,
+            data=Qwen3TTSSGLangRequestData(
+                repetition_penalty=repetition_penalty,
+                req=types.SimpleNamespace(
+                    output_ids=output_ids,
+                    inflight_middle_chunks=middle_chunks,
+                    sampling_params=types.SimpleNamespace(sampling_seed=None),
+                ),
+            ),
+        )
+
+    def run_step(requests, request_slots, is_extend):
+        forward_batch = types.SimpleNamespace(
+            req_pool_indices=torch.tensor(request_slots, device=device),
+            forward_mode=types.SimpleNamespace(is_extend=lambda: is_extend),
+            input_ids=torch.zeros(len(requests), dtype=torch.long),
+            replace_embeds=None,
+            sampling_info=types.SimpleNamespace(sampling_seed=None),
+        )
+        if is_extend:
+            runner.before_prefill(forward_batch, None, requests)
+        else:
+            pass
+        logits = torch.randn(len(requests), vocab_size, device=device)
+        expected = logits.clone()
+        scales = torch.ones(len(requests), vocab_size, device=device)
+        for row_index, request in enumerate(requests):
+            scales[row_index, generated_ids[request.request_id]] = (
+                request.data.repetition_penalty
+            )
+        apply_scaling_penalties(expected, scales)
+
+        token_ids = runner.sample_next_token_ids(
+            types.SimpleNamespace(next_token_logits=logits),
+            forward_batch,
+            None,
+            requests,
+        )
+
+        assert torch.equal(
+            sampled_logits[-1][:, :unsuppressed_tokens],
+            expected[:, :unsuppressed_tokens],
+        )
+        for request, token_id in zip(requests, token_ids.tolist(), strict=True):
+            if request.data.req.inflight_middle_chunks <= 0:
+                generated_ids[request.request_id].append(token_id)
+            else:
+                pass
+
+    first = scheduled("a", 1.05, [], 0)
+    second = scheduled("b", 1.2, [], 1)
+    run_step([first, second], [3, 5], True)
+    second.data.req.inflight_middle_chunks = 0
+    run_step([second], [5], True)
+    run_step([first, second], [3, 5], False)
+    run_step([first, second], [3, 5], False)
+    run_step([scheduled("a", 1.05, list(generated_ids["a"]), 0)], [7], True)
+
+    assert generated_ids == {"a": [4, 4, 9, 1], "b": [7, 2, 4]}

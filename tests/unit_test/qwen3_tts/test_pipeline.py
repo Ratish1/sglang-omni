@@ -8743,7 +8743,8 @@ def test_qwen3_tts_request_data_keeps_decode_tensors_on_prepared_device(
     assert isinstance(data.semantic_sampling_seed, int)
     assert 0 <= data.semantic_sampling_seed <= 0x7FFFFFFF
     assert data.req.sampling_params.sampling_seed is None
-    assert data.req.sampling_params.repetition_penalty == 1.1
+    assert data.repetition_penalty == 1.1
+    assert data.req.sampling_params.repetition_penalty == 1.0
     assert isinstance(data.subtalker_sampling_seed, int)
     assert 0 <= data.subtalker_sampling_seed <= 0x7FFFFFFF
 
@@ -9276,6 +9277,8 @@ def test_qwen3_tts_prefill_attaches_runner_composed_embeddings_to_sidecar(
     calls: list[str] = []
     input_embeds = torch.ones(3, 2)
     runner = Qwen3TTSModelRunner.__new__(Qwen3TTSModelRunner)
+    runner.slot_repetition_scales = torch.ones(2, 4)
+    runner.slot_repetition_penalties = torch.ones(2)
     runner.model = SimpleNamespace(
         prepare_decode_buffers=lambda requests: calls.append("prepare")
     )
@@ -9290,9 +9293,13 @@ def test_qwen3_tts_prefill_attaches_runner_composed_embeddings_to_sidecar(
         mm_inputs=mm_inputs,
         positions=torch.arange(3),
         mrope_positions=None,
+        req_pool_indices=torch.tensor([1]),
+    )
+    request = SimpleNamespace(
+        data=SimpleNamespace(repetition_penalty=1.0, req=SimpleNamespace(output_ids=[]))
     )
 
-    runner.before_prefill(forward_batch, object(), [object()])
+    runner.before_prefill(forward_batch, object(), [request])
 
     sidecar = get_omni_prefill_inputs(forward_batch)
     assert sidecar is not None
@@ -9323,6 +9330,8 @@ def test_qwen3_tts_prefill_uses_shared_late_bound_forward_transport(
             return "logits"
 
     runner = Qwen3TTSModelRunner.__new__(Qwen3TTSModelRunner)
+    runner.slot_repetition_scales = torch.ones(2, 4)
+    runner.slot_repetition_penalties = torch.ones(2)
     runner.model = FakeTalker()
     runner.build_prefill_input_embeds = lambda _batch, _requests: input_embeds
 
@@ -9347,7 +9356,14 @@ def test_qwen3_tts_prefill_uses_shared_late_bound_forward_transport(
         forward_batch_generation=forward_batch_generation,
         model_runner=SimpleNamespace(prefill_cuda_graph_runner=None),
     )
-    requests = [SimpleNamespace(request_id="request-a")]
+    requests = [
+        SimpleNamespace(
+            request_id="request-a",
+            data=SimpleNamespace(
+                repetition_penalty=1.0, req=SimpleNamespace(output_ids=[])
+            ),
+        )
+    ]
     forward_batch = SimpleNamespace(
         input_ids=torch.zeros(3, dtype=torch.long),
         input_embeds=None,
@@ -9357,6 +9373,7 @@ def test_qwen3_tts_prefill_uses_shared_late_bound_forward_transport(
         batch_size=1,
         rids=["request-a"],
         positions=torch.arange(3),
+        req_pool_indices=torch.tensor([1]),
     )
     schedule_batch = SimpleNamespace(is_prefill_only=True)
 
@@ -9406,13 +9423,16 @@ def test_qwen3_tts_sampling_installs_semantic_seeds_for_a_seeded_batch(
         config=SimpleNamespace(vocab_size=1200, codec_eos_token_id=1100),
     )
     runner.tp_worker = SimpleNamespace(model_runner=SimpleNamespace(sample=sample))
+    runner.slot_repetition_scales = torch.ones(3, 4)
+    runner.slot_repetition_penalties = torch.ones(3)
     forward_batch = SimpleNamespace(
         sampling_info=SimpleNamespace(
             sampling_seed=preset_seeds,
             need_min_p_sampling=False,
             need_top_p_sampling=False,
             need_top_k_sampling=True,
-        )
+        ),
+        req_pool_indices=torch.tensor([1, 2]),
     )
     logits_output = SimpleNamespace(next_token_logits=torch.zeros((2, 4)))
     requests = [

@@ -7,6 +7,8 @@ from types import ModuleType
 from typing import TYPE_CHECKING, TypedDict
 
 import torch
+from sglang.srt.sampling.penaltylib.repetition_penalty import apply_scaling_penalties
+from sglang.srt.utils.common import is_pin_memory_available
 
 from sglang_omni.model_runner.base import ModelRunner
 from sglang_omni.model_runner.model_worker import ModelWorker
@@ -47,6 +49,15 @@ class Qwen3TTSModelInfo(TypedDict):
     predictor_cuda_graph: PredictorGraphStats
 
 
+def stage_host_values(
+    values: list[int] | list[float], dtype: torch.dtype, device: torch.device
+) -> torch.Tensor:
+    # note (ratish): a pageable source waits for the step queued on the stream.
+    return torch.tensor(
+        values, dtype=dtype, pin_memory=is_pin_memory_available(device)
+    ).to(device, non_blocking=True)
+
+
 class Qwen3TTSModelRunner(ModelRunner):
     """Runs Qwen3-TTS AR steps and stores generated codec frames per request."""
 
@@ -74,6 +85,19 @@ class Qwen3TTSModelRunner(ModelRunner):
             if has_device_streams(self.device)
             else None
         )
+        request_slot_count = (
+            tp_worker.model_runner.req_to_token_pool.req_to_token.shape[0]
+        )
+        # note (ratish): repetition state per request slot, taken from the sampled ids at
+        # once, so a batch that gains or loses a request copies none of it.
+        self.slot_repetition_scales = torch.ones(
+            (request_slot_count, self.model.config.vocab_size),
+            dtype=torch.float32,
+            device=self.device,
+        )
+        self.slot_repetition_penalties = torch.ones(
+            request_slot_count, dtype=torch.float32, device=self.device
+        )
 
     def model_info(self) -> Qwen3TTSModelInfo:
         return {"predictor_cuda_graph": self.model.predictor_graph_stats()}
@@ -86,6 +110,43 @@ class Qwen3TTSModelRunner(ModelRunner):
     ) -> None:
         del schedule_batch
         self.model.prepare_decode_buffers(requests)
+        # note (ratish): a prefilled slot restarts from its request's committed ids, which
+        # a retracted request carries into its re-prefill.
+        request_slots = forward_batch.req_pool_indices
+        self.slot_repetition_scales.index_fill_(0, request_slots, 1.0)
+        self.slot_repetition_penalties.index_copy_(
+            0,
+            request_slots,
+            stage_host_values(
+                [sched_req.data.repetition_penalty for sched_req in requests],
+                torch.float32,
+                request_slots.device,
+            ),
+        )
+        committed_rows = [
+            row_index
+            for row_index, sched_req in enumerate(requests)
+            for _ in sched_req.data.req.output_ids
+        ]
+        if committed_rows:
+            committed_slots = request_slots[
+                stage_host_values(committed_rows, torch.long, request_slots.device)
+            ]
+            committed_token_ids = stage_host_values(
+                [
+                    token_id
+                    for sched_req in requests
+                    for token_id in sched_req.data.req.output_ids
+                ],
+                torch.long,
+                request_slots.device,
+            )
+            self.slot_repetition_scales.index_put_(
+                (committed_slots, committed_token_ids),
+                self.slot_repetition_penalties[committed_slots],
+            )
+        else:
+            pass
         attach_omni_prefill_inputs(
             forward_batch,
             OmniPrefillInputs(
@@ -205,6 +266,31 @@ class Qwen3TTSModelRunner(ModelRunner):
                     pass
         else:
             pass
+
+    def sample_next_token_ids(
+        self,
+        logits_output: LogitsProcessorOutput,
+        forward_batch: ForwardBatch,
+        schedule_batch: ScheduleBatch | None,
+        requests: list[SchedulerRequest],
+    ) -> torch.Tensor:
+        request_slots = forward_batch.req_pool_indices
+        # note (ratish): the scaling commutes with the codec suppression that follows, a
+        # masked logit stays -inf either way.
+        apply_scaling_penalties(
+            logits_output.next_token_logits[: len(requests)],
+            self.slot_repetition_scales.index_select(0, request_slots),
+        )
+        next_token_ids = super().sample_next_token_ids(
+            logits_output, forward_batch, schedule_batch, requests
+        )
+        # note (ratish): a middle prefill chunk's draw lands in its slot too; the request's
+        # next chunk resets the slot before it samples again.
+        self.slot_repetition_scales.index_put_(
+            (request_slots, next_token_ids),
+            self.slot_repetition_penalties[request_slots],
+        )
+        return next_token_ids
 
     def install_sampling_seeds(
         self,
