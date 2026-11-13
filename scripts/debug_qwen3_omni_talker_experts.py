@@ -10,10 +10,12 @@ from typing import Literal
 import torch
 from flashinfer.fused_moe import cutlass_fused_moe
 from flashinfer.fused_moe.core import ActivationType
+from sglang.srt.layers.activation import SiluAndMul
 from torch.utils.hooks import RemovableHandle
 from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import (
     Qwen3OmniMoeTalkerForConditionalGeneration,
     Qwen3OmniMoeTalkerTextExperts,
+    Qwen3OmniMoeTalkerTextMLP,
     Qwen3OmniMoeTalkerTextTopKRouter,
 )
 
@@ -32,10 +34,14 @@ class NativeTalkerExperts:
     enabled: bool = False
     calls: int = 0
     router_calls: int = 0
+    shared_enabled: bool = False
+    shared_calls: int = 0
     profiles: ObservedExpertProfiles | None = None
     used_profiles: set[tuple[int, int]] = field(default_factory=set)
     runtime: NativeRuntime = field(init=False)
     weights: list[tuple[torch.Tensor, torch.Tensor]] = field(default_factory=list)
+    shared_weights: list[torch.Tensor] = field(default_factory=list)
+    shared_activation: SiluAndMul = field(default_factory=SiluAndMul)
     handles: list[RemovableHandle] = field(default_factory=list)
 
     def install(self) -> None:
@@ -44,6 +50,22 @@ class NativeTalkerExperts:
         )
         self.weights = load_native_expert_weights(self.reference, self.runtime)
         for layer_index, layer in enumerate(self.reference.model.layers):
+            if self.shared_enabled:
+                self.shared_weights.append(
+                    torch.cat(
+                        (
+                            layer.mlp.shared_expert.gate_proj.weight,
+                            layer.mlp.shared_expert.up_proj.weight,
+                        )
+                    ).contiguous()
+                )
+                self.handles.append(
+                    layer.mlp.shared_expert.register_forward_hook(
+                        partial(self.shared_expert, layer_index=layer_index)
+                    )
+                )
+            else:
+                pass
             self.handles.extend(
                 [
                     layer.mlp.gate.register_forward_hook(self.routing),
@@ -52,6 +74,26 @@ class NativeTalkerExperts:
                     ),
                 ]
             )
+
+    def shared_expert(
+        self,
+        module: Qwen3OmniMoeTalkerTextMLP,
+        inputs: tuple[torch.Tensor],
+        output: torch.Tensor,
+        *,
+        layer_index: int,
+    ) -> torch.Tensor:
+        assert layer_index == self.shared_calls % len(self.shared_weights)
+        hidden_states = inputs[0].reshape(-1, inputs[0].shape[-1])
+        assert hidden_states.dtype == module.down_proj.weight.dtype == torch.bfloat16
+        gate_up = torch.nn.functional.linear(
+            hidden_states, self.shared_weights[layer_index]
+        )
+        activated = self.shared_activation(gate_up)
+        self.shared_calls += 1
+        return torch.nn.functional.linear(activated, module.down_proj.weight).view_as(
+            output
+        )
 
     def routing(
         self,

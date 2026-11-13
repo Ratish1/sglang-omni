@@ -76,6 +76,7 @@ def main() -> None:
     parser.add_argument("--native-predictor-capture-directory", type=Path)
     parser.add_argument("--native-expert-capture-directory", type=Path)
     parser.add_argument("--native-expert-profile-map", type=Path)
+    parser.add_argument("--native-shared-expert", action="store_true")
     parser.add_argument("--paired-native-expert-controls", action="store_true")
     parser.add_argument("--paired-native-attention-controls", action="store_true")
     parser.add_argument(
@@ -115,6 +116,7 @@ def main() -> None:
         assert arguments.dtype == "bfloat16"
     else:
         assert not arguments.paired_native_expert_controls
+        assert not arguments.native_shared_expert
     if (
         arguments.native_predictor_capture_directory is not None
         and arguments.dtype != "bfloat16"
@@ -194,6 +196,7 @@ def main() -> None:
             reference=reference,
             capture_directory=arguments.native_expert_capture_directory,
             route_precision=arguments.native_expert_route_precision,
+            shared_enabled=arguments.native_shared_expert,
         )
         expert_control.install()
     else:
@@ -288,6 +291,7 @@ def main() -> None:
                 expert_control.enabled = expert_mode == "fused"
                 expert_control.calls = 0
                 expert_control.router_calls = 0
+                expert_control.shared_calls = 0
                 expert_control.used_profiles.clear()
                 expert_control.profiles = (
                     observed_profiles.profiles[str(trace_directory.resolve())]
@@ -770,6 +774,11 @@ def main() -> None:
                 assert expert_control.router_calls == (
                     expected_calls if expert_control.route_precision == "float32" else 0
                 )
+                assert expert_control.shared_calls == (
+                    len(frame_reports) * len(reference.model.layers)
+                    if expert_control.shared_enabled
+                    else 0
+                )
             else:
                 pass
             if attention_control is not None:
@@ -828,6 +837,10 @@ def main() -> None:
                     else None
                 ),
                 "native_expert_calls": expert_control.calls if expert_control else 0,
+                "native_shared_expert": arguments.native_shared_expert,
+                "native_shared_expert_calls": (
+                    expert_control.shared_calls if expert_control else 0
+                ),
                 "native_expert_router_calls": (
                     expert_control.router_calls if expert_control else 0
                 ),
