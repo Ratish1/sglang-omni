@@ -116,11 +116,20 @@ def run(args: argparse.Namespace) -> None:
             if event.self_cpu_time_total > 0
         ]
         ops.sort(key=lambda op: -op["self_us"])
+        ops_by_name = {
+            event.key: {
+                "calls": event.count / len(profiled),
+                "self_us": event.self_cpu_time_total / len(profiled),
+            }
+            for event in profiler.key_averages()
+            if event.self_cpu_time_total > 0
+        }
         record["kinds"][kind] = {
             "requests": len(requests),
             "wall_ms": wall_ms,
             "cpu_ms": cpu_ms,
             "ops_per_request": ops[:60],
+            "ops_by_name": ops_by_name,
         }
     Path(args.out).write_text(json.dumps(record), encoding="utf-8")
 
@@ -138,31 +147,20 @@ def compare(args: argparse.Namespace) -> None:
                 f"wall mean {statistics.fmean(wall):7.2f} p50 {statistics.median(wall):7.2f} p90 {wall[int(0.9 * len(wall))]:7.2f} "
                 f"cpu mean {statistics.fmean(cpu):7.2f} ms a request"
             )
-        reference = {
-            (op["op"], op["shapes"]): op
-            for op in files[0]["kinds"][kind]["ops_per_request"]
-        }
-        for path, data in zip(args.files[1:], files[1:]):
-            mine = {
-                (op["op"], op["shapes"]): op
-                for op in data["kinds"][kind]["ops_per_request"]
-            }
-            deltas = sorted(
-                (
-                    (mine[key]["self_us"] - reference[key]["self_us"], key)
-                    for key in mine
-                    if key in reference
-                ),
-                key=lambda item: -abs(item[0]),
+        reference = files[0]["kinds"][kind].get("ops_by_name", {})
+        print(f"  op self time, us a request, {Path(args.files[0]).stem} first:")
+        names = sorted(reference, key=lambda name: -reference[name]["self_us"])[:14]
+        for name in names:
+            row = " ".join(
+                f"{data['kinds'][kind].get('ops_by_name', {}).get(name, {'self_us': 0.0})['self_us']:8.1f}"
+                for data in files
             )
-            print(
-                f"  ops against {Path(args.files[0]).stem}, {Path(path).stem}, us a request:"
-            )
-            for delta, key in deltas[:12]:
-                print(
-                    f"    {delta:+8.1f}  {key[0][:40]:40s} calls {mine[key]['calls']:5.1f} "
-                    f"{reference[key]['self_us']:8.1f} -> {mine[key]['self_us']:8.1f}  {key[1][:70]}"
-                )
+            print(f"    {name[:34]:34s} calls {reference[name]['calls']:5.1f}  {row}")
+        totals = " ".join(
+            f"{sum(op['self_us'] for op in data['kinds'][kind].get('ops_by_name', {}).values()):8.1f}"
+            for data in files
+        )
+        print(f"    {'all torch ops':34s}              {totals}")
 
 
 def main() -> None:
