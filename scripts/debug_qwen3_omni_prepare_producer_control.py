@@ -26,6 +26,8 @@ def main() -> None:
             "experts",
             "router-and-experts",
             "rotary",
+            "residual-norm",
+            "residual-norm-and-rotary",
         ),
         default="chained",
     )

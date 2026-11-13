@@ -20,6 +20,7 @@ from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import (
 )
 
 from scripts.debug_qwen3_omni_thinker_rotary import contracted_bf16_rotation
+from scripts.qwen3_omni_native_residual_control import NativeResidualControl
 
 
 @dataclass(kw_only=True)
@@ -86,7 +87,16 @@ def run_precision_controls(
     captured: ThinkerPrecisionInputs,
     output_directory: Path,
     variants: tuple[
-        Literal["checkpoint", "router", "experts", "router-and-experts", "rotary"], ...
+        Literal[
+            "checkpoint",
+            "router",
+            "experts",
+            "router-and-experts",
+            "rotary",
+            "residual-norm",
+            "residual-norm-and-rotary",
+        ],
+        ...,
     ] = ("checkpoint", "router", "experts", "router-and-experts"),
 ) -> None:
     prefix_token_count = captured.prefix_token_count
@@ -108,7 +118,8 @@ def run_precision_controls(
         captured.batch_offset, captured.batch_offset + captured.extend_token_count
     )
     rotary_table: torch.Tensor | None = None
-    if "rotary" in variants:
+    rotary_variants = ("rotary", "residual-norm-and-rotary")
+    if any(name in rotary_variants for name in variants):
         table_rows: dict[int, torch.Tensor] = {}
         suffix_positions = positions[:, prefix_token_count:].T.cpu()
         for token_positions, cache_rows in zip(
@@ -148,7 +159,7 @@ def run_precision_controls(
             expert_checks += 1
         else:
             pass
-        if "rotary" in variants:
+        if any(name in rotary_variants for name in variants):
             for kind in ("query", "key"):
                 normalized = captured.operators[f"{prefix}_{kind}_normalized"][live].to(
                     device
@@ -175,12 +186,15 @@ def run_precision_controls(
     baseline = torch.load(
         output_directory / "native-prefix-chained-operands.pt", weights_only=True
     )
+    residual_checks: dict[str, dict[str, int]] = {}
     for name in variants:
         cache = DynamicCache(config=reference.model.config)
         hidden = suffix
         saved = {"checkpoint_hidden_0": suffix[0].cpu()}
         routing: dict[str, torch.Tensor] = {}
         rotary_calls: list[int] = []
+        residual_control = NativeResidualControl()
+        use_native_residual = name in ("residual-norm", "residual-norm-and-rotary")
         for layer_index in range(captured.accepted_layer):
             cache.update(
                 captured.keys[layer_index][:prefix_token_count]
@@ -195,7 +209,7 @@ def run_precision_controls(
             )
             layer = reference.model.layers[layer_index]
             with ExitStack() as hooks:
-                if name == "rotary":
+                if name in rotary_variants:
 
                     def apply_rotary(
                         query: torch.Tensor,
@@ -256,6 +270,19 @@ def run_precision_controls(
                     )
                 else:
                     pass
+                if use_native_residual:
+                    for module, callback in (
+                        (layer.input_layernorm, residual_control.input_norm),
+                        (layer.self_attn.o_proj, residual_control.record_projection),
+                        (
+                            layer.post_attention_layernorm,
+                            residual_control.post_attention_norm,
+                        ),
+                        (layer.mlp, residual_control.record_contribution),
+                    ):
+                        hooks.enter_context(module.register_forward_hook(callback))
+                else:
+                    pass
                 if name in ("router", "router-and-experts"):
                     hooks.enter_context(
                         layer.mlp.gate.register_forward_hook(keep_fp32_route_weights)
@@ -295,6 +322,10 @@ def run_precision_controls(
                     use_cache=True,
                     position_embeddings=position_embeddings,
                 )
+                if use_native_residual:
+                    residual_control.check_layer(hidden)
+                else:
+                    pass
             keys = cache.layers[layer_index].keys
             values = cache.layers[layer_index].values
             assert keys is not None and values is not None
@@ -326,8 +357,18 @@ def run_precision_controls(
         )
         torch.save(routing, output_directory / f"native-prefix-{name}-routing.pt")
         assert rotary_calls == (
-            list(range(captured.accepted_layer)) if name == "rotary" else []
+            list(range(captured.accepted_layer)) if name in rotary_variants else []
         )
+        assert residual_control.input_norm_calls == (
+            captured.accepted_layer if use_native_residual else 0
+        )
+        assert residual_control.post_attention_norm_calls == (
+            captured.accepted_layer if use_native_residual else 0
+        )
+        residual_checks[name] = {
+            "input_norm_calls": residual_control.input_norm_calls,
+            "post_attention_norm_calls": residual_control.post_attention_norm_calls,
+        }
         print(json.dumps({"completed_precision_control": name}), flush=True)
     (output_directory / "precision-controls.json").write_text(
         json.dumps(
@@ -336,7 +377,8 @@ def run_precision_controls(
                 "source_rotary_formula_native_operand_checks": rotary_checks,
                 "checkpoint_repeated_boundaries_exact": captured.accepted_layer + 1,
                 "variants": list(variants),
-                "scope": "Only the stated arithmetic family changes in an independently loaded checkpoint producer. Prefix KV, embeddings, positions and other layer operations stay fixed. Source-style expert arithmetic uses cuBLAS rather than the native Triton kernel. The rotary control runs the actual native Triton rotary kernel with retained native tables and independently checks every resulting Q/K against the measured BF16 multiply/FMA formula before propagation. Each requested formula must reproduce every captured native operator batch first. These are causal diagnostic controls, not production repairs.",
+                "residual_control_checks": residual_checks,
+                "scope": "Only the stated arithmetic families change in an independently loaded checkpoint producer. Prefix KV, embeddings, positions and other layer operations stay fixed. Source-style expert arithmetic uses cuBLAS rather than the native Triton kernel. The rotary control runs the actual native Triton rotary kernel with retained native tables and independently checks every resulting Q/K against the measured BF16 multiply/FMA formula before propagation. Residual controls run the original FlashInfer normalization kernels, retaining the unrounded two-operand sum for normalization and the BF16 residual for the next addition. Every layer checks composed residual identity. These are causal diagnostic controls, not production repairs.",
             },
             indent=2,
         )
