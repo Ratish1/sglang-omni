@@ -6,11 +6,17 @@ import os
 import signal
 import subprocess
 import sys
+import threading
 import time
 import urllib.request
 from pathlib import Path
 
 RUN_DIRECTORY = Path("/data/pr3477-review-20261113")
+IS_MIXED = "--mixed-only" in sys.argv
+if IS_MIXED:
+    RUN_DIRECTORY = RUN_DIRECTORY / "mixed"
+else:
+    pass
 REPOSITORY = Path("/workspace/sglang-omni")
 BASE_COMMIT = "103b9fbf9a55c4f19c5c4ede569e0938d8857377"
 HEAD_COMMIT = "a0888506bff67ff1318ac7224f8697fd1d3688a1"
@@ -101,6 +107,10 @@ def main() -> None:
         ("nonstream_c1", 1, 32, False),
         ("stream_c16", 16, 256, True),
     ]
+    if IS_MIXED:
+        cells = [("mixed_stream16_whole48", 16, 256, True)]
+    else:
+        pass
     for order in (0, 1):
         servers = []
         try:
@@ -144,7 +154,7 @@ def main() -> None:
                 with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
                     futures = {
                         name: executor.submit(
-                            benchmark,
+                            mixed_benchmark if IS_MIXED else benchmark,
                             trees[name],
                             port,
                             RUN_DIRECTORY / f"order{order}/{name}/{cell}",
@@ -183,6 +193,40 @@ def main() -> None:
                 except subprocess.TimeoutExpired:
                     os.killpg(server.pid, signal.SIGKILL)
                     server.wait(timeout=15)
+
+
+def mixed_benchmark(
+    tree: Path, port: int, directory: Path, concurrency: int, samples: int, stream: bool
+) -> dict:
+    stream_finished = threading.Event()
+
+    def streaming_client() -> dict:
+        try:
+            return benchmark(
+                tree, port, directory / "stream", concurrency, samples, stream
+            )
+        finally:
+            stream_finished.set()
+
+    def whole_client() -> dict:
+        first_pass = None
+        pass_number = 0
+        while pass_number == 0 or not stream_finished.is_set():
+            summary = benchmark(
+                tree, port, directory / f"whole{pass_number}", 48, 512, False
+            )
+            if first_pass is None:
+                first_pass = summary
+            else:
+                pass
+            pass_number += 1
+        assert first_pass is not None
+        return first_pass
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+        streaming = executor.submit(streaming_client)
+        whole = executor.submit(whole_client)
+        return {"stream": streaming.result(), "whole": whole.result()}
 
 
 if __name__ == "__main__":
