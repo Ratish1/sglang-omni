@@ -5,7 +5,9 @@ import json
 import threading
 
 import pytest
+import torch
 
+from sglang_omni.models.qwen3_tts.codec_state_arena import Qwen3TTSCodecStateArena
 from tests.unit_test.qwen3_tts.test_pipeline import (
     whole_request_message,
     whole_request_scheduler,
@@ -14,7 +16,17 @@ from tests.unit_test.qwen3_tts.test_pipeline import (
 
 def main() -> None:
     with pytest.MonkeyPatch.context() as patch:
-        scheduler, _, _ = whole_request_scheduler(patch)
+        scheduler, decoder, runner = whole_request_scheduler(patch)
+        arena = Qwen3TTSCodecStateArena(
+            decoder,
+            num_slots=1,
+            reserved_slots=1,
+            device=torch.device("cpu"),
+            dtype=torch.float32,
+        )
+        scheduler.codec_arena = arena
+        runner.arena = arena
+        scheduler.idle_whole_request_slots = list(arena.reserved_slots)
         first_replay_completed = threading.Event()
         release_worker = threading.Event()
         replay = scheduler.run_whole_request_replay
@@ -53,7 +65,7 @@ def main() -> None:
             assert (
                 not scheduler.whole_requests
             ), "stopped scheduler retains whole-request state"
-            assert len(scheduler.idle_whole_request_slots) == 8
+            assert len(scheduler.idle_whole_request_slots) == 1
         finally:
             release_worker.set()
             scheduler.stop()
