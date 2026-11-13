@@ -31,6 +31,8 @@ def main() -> None:
             "source-arithmetic",
             "residual-rotary-qknorm",
             "residual-rotary-moe",
+            "residual-rotary-router",
+            "residual-rotary-experts",
             "residual-rotary-qknorm-router",
             "residual-rotary-qknorm-experts",
             "source-rounded-activation",

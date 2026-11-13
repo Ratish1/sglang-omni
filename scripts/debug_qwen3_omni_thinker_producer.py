@@ -409,9 +409,13 @@ def main() -> None:
         elif arguments.compare_native_weight_interaction:
             variants = (
                 "checkpoint",
+                "residual-norm-and-rotary",
+                "residual-rotary-router",
+                "residual-rotary-experts",
                 "residual-rotary-qknorm",
                 "residual-rotary-qknorm-router",
                 "residual-rotary-qknorm-experts",
+                "residual-rotary-moe",
                 "source-arithmetic",
             )
         elif arguments.compare_native_rounding_interaction:
