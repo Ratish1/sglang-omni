@@ -43,6 +43,7 @@ def main() -> None:
     precision.add_argument("--compare-native-moe-precision", action="store_true")
     precision.add_argument("--compare-native-rotary-precision", action="store_true")
     precision.add_argument("--compare-native-residual-precision", action="store_true")
+    precision.add_argument("--compare-native-source-precision", action="store_true")
     arguments = parser.parse_args()
     arguments.output_directory.mkdir(exist_ok=False)
     torch.cuda.set_device(arguments.gpu)
@@ -388,6 +389,7 @@ def main() -> None:
         arguments.compare_native_moe_precision
         or arguments.compare_native_rotary_precision
         or arguments.compare_native_residual_precision
+        or arguments.compare_native_source_precision
     ):
         assert arguments.hold_native_prefix_cache
         run_precision_controls(
@@ -406,12 +408,16 @@ def main() -> None:
             ),
             arguments.output_directory,
             variants=(
-                ("checkpoint", "rotary")
-                if arguments.compare_native_rotary_precision
+                ("checkpoint", "residual-norm-and-rotary", "source-arithmetic")
+                if arguments.compare_native_source_precision
                 else (
-                    ("checkpoint", "residual-norm", "residual-norm-and-rotary")
-                    if arguments.compare_native_residual_precision
-                    else ("checkpoint", "router", "experts", "router-and-experts")
+                    ("checkpoint", "rotary")
+                    if arguments.compare_native_rotary_precision
+                    else (
+                        ("checkpoint", "residual-norm", "residual-norm-and-rotary")
+                        if arguments.compare_native_residual_precision
+                        else ("checkpoint", "router", "experts", "router-and-experts")
+                    )
                 )
             ),
         )
