@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+from contextlib import nullcontext
 from dataclasses import asdict
 from pathlib import Path
 
@@ -41,6 +42,7 @@ def main() -> None:
     parser.add_argument("--gpu", type=int, required=True)
     parser.add_argument("--rounding-stages", action="store_true")
     parser.add_argument("--verify-profile-alias", type=int, nargs=2)
+    parser.add_argument("--profile-kernels", action="store_true")
     parser.add_argument("--output-directory", type=Path, required=True)
     arguments = parser.parse_args()
     arguments.output_directory.mkdir(exist_ok=False)
@@ -214,8 +216,18 @@ def main() -> None:
                 else:
                     pass
                 for selected_profiles in profile_choices:
-                    replayed.append(
-                        cutlass_fused_moe(
+                    kernel_profile = (
+                        torch.profiler.profile(
+                            activities=[
+                                torch.profiler.ProfilerActivity.CPU,
+                                torch.profiler.ProfilerActivity.CUDA,
+                            ]
+                        )
+                        if arguments.profile_kernels and frame < 2 and layer_index == 0
+                        else nullcontext()
+                    )
+                    with kernel_profile as observed_profile:
+                        replayed_output = cutlass_fused_moe(
                             input=hidden_states,
                             token_selected_experts=indices,
                             token_final_scales=weights,
@@ -228,7 +240,31 @@ def main() -> None:
                             use_fused_finalize=runtime.use_fused_finalize,
                             profile_ids=selected_profiles,
                         )[0]
-                    )
+                    replayed.append(replayed_output)
+                    if observed_profile is not None:
+                        prefix = f"frame-{frame}-profiles-{selected_profiles[0]}-{selected_profiles[1]}"
+                        observed_profile.export_chrome_trace(
+                            str(arguments.output_directory / f"{prefix}.trace.json")
+                        )
+                        (
+                            arguments.output_directory / f"{prefix}.kernels.json"
+                        ).write_text(
+                            json.dumps(
+                                {
+                                    "profiles": selected_profiles,
+                                    "batch_tokens": len(hidden_states),
+                                    "kernels": [
+                                        event.name
+                                        for event in observed_profile.events()
+                                        if event.device_type
+                                        == torch.autograd.DeviceType.CUDA
+                                    ],
+                                },
+                                indent=2,
+                            )
+                        )
+                    else:
+                        pass
                 assert torch.equal(
                     hidden_states.cpu(), snapshot["batch_mlp_normalized"]
                 )
