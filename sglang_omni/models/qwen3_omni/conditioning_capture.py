@@ -217,6 +217,20 @@ class TalkerConditioningRecorder:
                 pass
             destination = self.directory / request.request_id
             frame_index = len(request.data.req.output_ids)
+            (destination / f"{frame_index:04d}-batch.json").write_text(
+                json.dumps(
+                    {
+                        "mode": forward_batch.forward_mode.name,
+                        "active_row": row,
+                        "active_request_ids": [entry.request_id for entry in requests],
+                        "output_frame_indices": [
+                            len(entry.data.req.output_ids) for entry in requests
+                        ],
+                        "callback_sequence_lengths": forward_batch.seq_lens.cpu().tolist(),
+                    },
+                    indent=2,
+                )
+            )
             sequence_length = int(forward_batch.seq_lens[row])
             locations = self.request_slots[
                 forward_batch.req_pool_indices[row], :sequence_length

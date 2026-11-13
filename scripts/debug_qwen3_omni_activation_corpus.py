@@ -25,6 +25,7 @@ def main() -> None:
     parser.add_argument("--base-url", required=True)
     parser.add_argument("--concurrency", type=int, required=True)
     parser.add_argument("--request-id", action="append")
+    parser.add_argument("--capture-request-id", action="append")
     parser.add_argument("--capture-token-rows", type=int, default=112)
     parser.add_argument("--capture-talker-operators", action="store_true")
     parser.add_argument("--capture-all-conditioning", action="store_true")
@@ -36,10 +37,14 @@ def main() -> None:
         "--control", action="append", choices=("original", "rounded-activation")
     )
     arguments = parser.parse_args()
+    receiver_only = (
+        arguments.capture_all_conditioning or arguments.capture_request_id is not None
+    )
     if arguments.reference_predictor_mode is not None and arguments.request_id is None:
         raise ValueError("Reference predictor controls require selected request IDs")
     elif arguments.capture_all_conditioning and (
         arguments.request_id is not None
+        or arguments.capture_request_id is not None
         or arguments.capture_talker_operators
         or arguments.reference_predictor_mode is not None
         or arguments.control != ["original"]
@@ -47,6 +52,11 @@ def main() -> None:
         raise ValueError(
             "Whole-population receiver capture requires only the original control"
         )
+    elif arguments.capture_request_id is not None and (
+        arguments.control != ["original"]
+        or arguments.reference_predictor_mode is not None
+    ):
+        raise ValueError("Selected receiver capture requires only the original control")
     else:
         pass
     arguments.output_directory.mkdir(exist_ok=False)
@@ -89,17 +99,18 @@ def main() -> None:
         json.dumps(request_hashes, indent=2)
     )
     selected_ids = arguments.output_directory / "selected-request-ids.json"
-    selected_ids.write_text(
-        json.dumps(
-            [
-                request_id
-                for request_ids in workload_request_ids.values()
-                for request_id in request_ids
-            ]
-            if arguments.capture_all_conditioning
-            else arguments.request_id or []
-        )
+    traffic_request_ids = {
+        request_id
+        for request_ids in workload_request_ids.values()
+        for request_id in request_ids
+    }
+    capture_request_ids = (
+        sorted(traffic_request_ids)
+        if arguments.capture_all_conditioning
+        else arguments.capture_request_id or arguments.request_id or []
     )
+    assert set(capture_request_ids) <= traffic_request_ids
+    selected_ids.write_text(json.dumps(capture_request_ids))
     if arguments.request_id is not None:
         assert {
             request_id
@@ -122,20 +133,20 @@ def main() -> None:
                 "1" if control == "rounded-activation" else "0"
             ),
         }
-        if arguments.capture_all_conditioning:
+        if receiver_only:
             diagnostic_environment = {
                 "SGLANG_OMNI_CORPUS_REQUEST_ID_FILE": str(selected_ids),
             }
         else:
             pass
-        if arguments.request_id is not None or arguments.capture_all_conditioning:
+        if capture_request_ids:
             diagnostic_environment["SGLANG_OMNI_DIAGNOSTIC_CONDITIONING_DIRECTORY"] = (
                 str(output / "conditioning")
             )
         else:
             pass
         if arguments.capture_talker_operators:
-            assert arguments.request_id is not None
+            assert capture_request_ids
             diagnostic_environment.update(
                 {
                     "SGLANG_OMNI_DIAGNOSTIC_LAYER_OPERANDS": "1",
@@ -175,12 +186,13 @@ def main() -> None:
                     "command": server_command,
                     "diagnostic_environment": diagnostic_environment,
                     "scope": (
-                        "All original-population Talker receiver states, without Thinker operand observers."
-                        if arguments.capture_all_conditioning
+                        "Selected Talker receiver states from original traffic, without Thinker operand observers."
+                        if receiver_only
                         else "Native rounded SiLU in the first checkpoint-derived accept_hidden_layer Thinker blocks, including warmup and decode."
                     ),
                     "model_revision": arguments.model_revision,
                     "reference_predictor_mode": arguments.reference_predictor_mode,
+                    "captured_request_ids": capture_request_ids,
                     "accepted_layer": accepted_layer,
                     "timing_scope": "Bounded operator observers enabled in both arms, not production performance qualification.",
                 },
@@ -194,7 +206,7 @@ def main() -> None:
                 server_log_file=output / "server.log",
                 trust_env=False,
             )
-            if arguments.capture_all_conditioning:
+            if receiver_only:
                 pass
             else:
                 actual_state = json.loads(
