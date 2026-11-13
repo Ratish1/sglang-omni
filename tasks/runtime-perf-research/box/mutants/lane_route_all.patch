@@ -1,0 +1,5 @@
+--- a/sglang_omni/models/qwen3_omni/stages.py
++++ b/sglang_omni/models/qwen3_omni/stages.py
+@@ -1028 +1028 @@
+-        if request_has_video(msg.data):
++        if True:

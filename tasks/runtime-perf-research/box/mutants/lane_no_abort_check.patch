@@ -1,0 +1,5 @@
+--- a/sglang_omni/models/qwen3_omni/stages.py
++++ b/sglang_omni/models/qwen3_omni/stages.py
+@@ -1034 +1034 @@
+-        if self.consume_if_aborted(msg.request_id):
++        if False:
