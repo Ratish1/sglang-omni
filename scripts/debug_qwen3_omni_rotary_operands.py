@@ -8,11 +8,10 @@ from dataclasses import asdict
 from pathlib import Path
 
 import torch
-from sglang.kernels.ops.attention.rotary_triton import triton_mrope_fused
 from transformers import Qwen3OmniMoeConfig
 
 from scripts.debug_qwen3_omni_feedback_audit import compare_tensors
-from sglang_omni.models.qwen3_omni.hf_config import normalize_rope_scaling
+from scripts.qwen3_omni_talker_rotary import NativeRotaryOperation
 
 
 @torch.inference_mode()
@@ -31,45 +30,12 @@ def main() -> None:
     configuration = Qwen3OmniMoeConfig.from_pretrained(
         arguments.model_path, revision=arguments.model_revision
     ).talker_config.text_config
-    scaling = normalize_rope_scaling(configuration.rope_parameters)
-    assert scaling is not None
-    sections = scaling["mrope_section"]
-    assert isinstance(sections, list) and all(
-        isinstance(size, int) for size in sections
+    operation = NativeRotaryOperation(
+        configuration, arguments.native_buffer_directory, device
     )
-    interleaved = scaling.get("mrope_interleaved", False)
-    interleaved_glm = scaling.get("mrope_interleaved_glm", False)
-    assert isinstance(interleaved, bool) and isinstance(interleaved_glm, bool)
-    assert not interleaved_glm
-    buffers = torch.load(
-        arguments.native_buffer_directory / "native-talker-buffers.pt",
-        map_location=device,
-        weights_only=True,
-    )
-    prefix = "model.layers.0.self_attn.rotary_emb"
-    cache = buffers[f"{prefix}.cos_sin_cache"]
-    axis_map = buffers[f"{prefix}.axis_map"]
-    runtime = json.loads(
-        (
-            arguments.native_buffer_directory / "native-talker-buffer-runtime.json"
-        ).read_text()
-    )["rotary_modules"][prefix]
-    assert runtime["class"] == "MRotaryEmbedding"
-    assert runtime["is_neox_style"] and not runtime["use_fallback_kernel"]
-    assert runtime["head_size"] == runtime["rotary_dim"] == configuration.head_dim
-    assert cache.dtype == torch.bfloat16 and cache.shape[1] == configuration.head_dim
-    expected_axes = torch.zeros_like(axis_map)
-    if interleaved:
-        for axis in (1, 2):
-            expected_axes[axis : sections[axis] * 3 : 3] = axis
-    else:
-        expected_axes = torch.repeat_interleave(
-            torch.arange(3, device=device), torch.tensor(sections, device=device)
-        )
-    assert torch.equal(axis_map, expected_axes)
+    cache, axis_map = operation.cache, operation.axis_map
     query_dimensions = configuration.num_attention_heads * configuration.head_dim
     key_dimensions = configuration.num_key_value_heads * configuration.head_dim
-    packed_dimensions = query_dimensions + 2 * key_dimensions
     records = []
     with (arguments.output_directory / "layers.jsonl").open("w") as output:
         for directory in arguments.trace_directory:
@@ -113,29 +79,7 @@ def main() -> None:
                         .to(device)
                     )
                     assert positions.shape[1] == query.shape[0] == key.shape[0]
-                    packed = torch.zeros(
-                        (len(query), packed_dimensions),
-                        dtype=query.dtype,
-                        device=device,
-                    )
-                    native_query, native_key, _ = packed.split(
-                        (query_dimensions, key_dimensions, key_dimensions), dim=-1
-                    )
-                    native_query.copy_(query)
-                    native_key.copy_(key)
-                    triton_mrope_fused(
-                        native_query,
-                        native_key,
-                        cache,
-                        positions,
-                        sections,
-                        configuration.head_dim,
-                        configuration.head_dim,
-                        interleaved,
-                        interleaved_glm,
-                        True,
-                        None,
-                    )
+                    native_query, native_key = operation.apply(query, key, positions)
                     cosine, sine = cache[positions].chunk(2, dim=-1)
                     lane_axes = axis_map.reshape(1, -1).expand(len(query), -1)
                     cosine = (
@@ -227,10 +171,9 @@ def main() -> None:
                 json.dumps(
                     {
                         "records": records,
-                        "sections": sections,
-                        "interleaved": interleaved,
-                        "interleaved_glm": interleaved_glm,
-                        "runtime": runtime,
+                        "sections": operation.sections,
+                        "interleaved": operation.interleaved,
+                        "runtime": operation.runtime.model_dump(by_alias=True),
                         "scope": "Exact native rotary replay and independent formulas on captured operands, not a free-running quality repair.",
                     },
                     indent=2,

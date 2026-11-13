@@ -32,6 +32,7 @@ from scripts.qwen3_omni_attention_inputs import PROJECTION_NAMES, NativeAttentio
 from scripts.qwen3_omni_checkpoint_weights import audit_checkpoint_weights
 from scripts.qwen3_omni_talker_attention import NativeBackboneAttention
 from scripts.qwen3_omni_talker_expert_runtime import ObservedExpertProfileMap
+from scripts.qwen3_omni_talker_rotary import NativeBackboneRotary
 from sglang_omni.models.qwen3_omni.components.talker_prefill import (
     load_thinker_embedding_rows,
 )
@@ -82,6 +83,7 @@ def main() -> None:
     parser.add_argument("--paired-native-attention-controls", action="store_true")
     parser.add_argument("--native-backbone-attention", action="store_true")
     parser.add_argument("--paired-native-projection-controls", action="store_true")
+    parser.add_argument("--paired-native-rotary-controls", action="store_true")
     parser.add_argument(
         "--native-expert-route-precision",
         choices=("checkpoint", "float32"),
@@ -218,7 +220,20 @@ def main() -> None:
         )
     else:
         observed_profiles = None
-    if arguments.paired_native_projection_controls:
+    if arguments.paired_native_rotary_controls:
+        assert arguments.native_predictor_capture_directory is not None
+        assert not arguments.paired_native_projection_controls
+        assert arguments.native_backbone_attention
+        rotary_control = NativeBackboneRotary(
+            reference, arguments.native_predictor_capture_directory
+        )
+        rotary_control.install()
+    else:
+        rotary_control = None
+    if (
+        arguments.paired_native_projection_controls
+        or arguments.paired_native_rotary_controls
+    ):
         assert arguments.dtype == "bfloat16"
         projection_control = NativeAttentionInputs(reference=reference)
         projection_control.install()
@@ -286,9 +301,21 @@ def main() -> None:
             attention_modes = ("fa3",)
         else:
             attention_modes = ("unchanged",)
-        projection_modes = (
-            ("checkpoint", "merged", "paired", "merged-paired", "checkpoint-repeat")
-            if projection_control is not None
+        if arguments.paired_native_projection_controls:
+            projection_modes = (
+                "checkpoint",
+                "merged",
+                "paired",
+                "merged-paired",
+                "checkpoint-repeat",
+            )
+        elif arguments.paired_native_rotary_controls:
+            projection_modes = ("merged-paired",)
+        else:
+            projection_modes = ("checkpoint",)
+        rotary_modes = (
+            ("checkpoint", "native", "checkpoint-repeat")
+            if rotary_control is not None
             else ("checkpoint",)
         )
         for (
@@ -297,6 +324,7 @@ def main() -> None:
             normalization_mode,
             expert_mode,
             projection_mode,
+            rotary_mode,
             attention_mode,
             residual_policy_index,
             residual_policy,
@@ -307,6 +335,7 @@ def main() -> None:
                 mode,
                 expert_mode,
                 projection_mode,
+                rotary_mode,
                 attention_mode,
                 policy_index,
                 policy,
@@ -316,9 +345,20 @@ def main() -> None:
             for mode in normalization_modes
             for expert_mode in expert_modes
             for projection_mode in projection_modes
+            for rotary_mode in rotary_modes
             for attention_mode in attention_modes
             for policy_index, policy in enumerate(arguments.residual_policy)
         ):
+            if rotary_control is not None:
+                assert (
+                    rotary_control.positions is None
+                    and rotary_control.active_layer is None
+                )
+                rotary_control.enabled = rotary_mode == "native"
+                rotary_control.calls = 0
+                rotary_control.position_calls = 0
+            else:
+                pass
             if projection_control is not None:
                 assert not projection_control.projections
                 projection_control.projection_calls = 0
@@ -577,6 +617,10 @@ def main() -> None:
                 pass
             if projection_control is not None:
                 mode_directory = mode_directory / projection_mode
+            else:
+                pass
+            if rotary_control is not None:
+                mode_directory = mode_directory / f"rotary-{rotary_mode}"
             else:
                 pass
             if len(arguments.residual_policy) > 1:
@@ -861,6 +905,21 @@ def main() -> None:
                 )
             else:
                 pass
+            if rotary_control is not None:
+                assert (
+                    rotary_control.positions is None
+                    and rotary_control.active_layer is None
+                )
+                assert rotary_control.calls == (
+                    len(frame_reports) * len(reference.model.layers)
+                    if rotary_control.enabled
+                    else 0
+                )
+                assert rotary_control.position_calls == (
+                    len(frame_reports) if rotary_control.enabled else 0
+                )
+            else:
+                pass
             report = {
                 "model_revision": arguments.model_revision,
                 "frame_limit": frame_limit,
@@ -894,6 +953,8 @@ def main() -> None:
                 "expert_mode": expert_mode,
                 "attention_mode": attention_mode,
                 "attention_projection_mode": projection_mode,
+                "rotary_mode": rotary_mode,
+                "native_rotary_calls": rotary_control.calls if rotary_control else 0,
                 "native_projection_calls": (
                     projection_control.projection_calls if projection_control else 0
                 ),
