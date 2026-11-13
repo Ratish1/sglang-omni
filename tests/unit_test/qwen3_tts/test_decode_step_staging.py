@@ -19,6 +19,7 @@ import torch
 from sglang_omni.models.qwen3_tts.model_runner import Qwen3TTSModelRunner
 from sglang_omni.models.qwen3_tts.request_builders import Qwen3TTSSGLangRequestData
 from sglang_omni.scheduling.types import RequestOutput
+from tests.unit_test.fixtures.qwen3_tts_code_table import attach_code_table
 
 EOS = 42
 PREDICTOR_CYCLES = 1_000_000_000
@@ -30,7 +31,9 @@ def require_cuda_for_accelerator_tests(request: pytest.FixtureRequest):
         pytest.skip("token id staging on a stream needs CUDA")
 
 
-def make_runner(code_predictor_forward, device: torch.device) -> Qwen3TTSModelRunner:
+def make_runner(
+    code_predictor_forward, device: torch.device, requests
+) -> Qwen3TTSModelRunner:
     runner = Qwen3TTSModelRunner.__new__(Qwen3TTSModelRunner)
     runner.has_pending_code_step = False
     runner.token_id_host_bufs = None
@@ -42,8 +45,10 @@ def make_runner(code_predictor_forward, device: torch.device) -> Qwen3TTSModelRu
         code_predictor_forward=code_predictor_forward,
         output_codes=torch.zeros((4, 3), dtype=torch.long, device=device),
         output_embeds=torch.zeros((4, 2), device=device),
+        prepare_decode_buffers=lambda requests: True,
     )
     runner.slot_feedback_rows = torch.zeros((8, 2), device=device)
+    attach_code_table(runner, requests, row_frames=4, codebook_count=3, device=device)
     return runner
 
 
@@ -64,7 +69,9 @@ def step(ids: torch.Tensor):
         SimpleNamespace(
             request_id=f"r{row}",
             data=Qwen3TTSSGLangRequestData(
-                req=SimpleNamespace(inflight_middle_chunks=0)
+                req=SimpleNamespace(
+                    rid=f"r{row}", inflight_middle_chunks=0, origin_input_ids=[0] * 4
+                )
             ),
         )
         for row in range(batch_size)
@@ -84,7 +91,7 @@ def test_collect_codes_stages_the_ids_before_the_predictor_runs():
         runner.model.output_codes[:3] = layer0_codes + torch.arange(3)
         runner.model.output_embeds[:3] = layer0_codes.to(torch.float32)
 
-    runner = make_runner(code_predictor_forward, torch.device("cpu"))
+    runner = make_runner(code_predictor_forward, torch.device("cpu"), requests)
 
     runner.collect_codes(result, forward_batch, object(), requests)
 
@@ -104,9 +111,9 @@ def test_collect_codes_stages_the_ids_before_the_predictor_runs():
     runner.model.output_codes.zero_()
     runner.model.output_embeds.zero_()
 
-    assert [c.tolist() for c in requests[0].data.output_codes] == [[7, 8, 9]]
-    assert requests[1].data.output_codes == []
-    assert [c.tolist() for c in requests[2].data.output_codes] == [[9, 10, 11]]
+    assert requests[0].data.committed_codes(0, 1).tolist() == [[7, 8, 9]]
+    assert requests[1].data.frame_count == 0
+    assert requests[2].data.committed_codes(0, 1).tolist() == [[9, 10, 11]]
     assert [request.data.speech_output_tokens for request in requests] == [1, 1, 1]
 
 
@@ -119,7 +126,7 @@ def test_a_middle_prefill_chunk_adds_no_frame_or_stream_chunk():
         runner.model.output_codes[:2] = layer0_codes + torch.arange(3)
         runner.model.output_embeds[:2] = layer0_codes.to(torch.float32)
 
-    runner = make_runner(code_predictor_forward, torch.device("cpu"))
+    runner = make_runner(code_predictor_forward, torch.device("cpu"), requests)
     runner.collect_codes(result, forward_batch, object(), requests)
     outputs = {
         req.request_id: RequestOutput(req.request_id, data=int(ids[row]))
@@ -127,11 +134,66 @@ def test_a_middle_prefill_chunk_adds_no_frame_or_stream_chunk():
     }
     runner.post_process_outputs(result, SimpleNamespace(requests=requests), outputs)
 
-    assert requests[0].data.output_codes == []
+    assert requests[0].data.frame_count == 0
     assert requests[0].data.latest_stream_code_chunk is None
-    assert [c.tolist() for c in requests[1].data.output_codes] == [[9, 10, 11]]
+    assert requests[1].data.committed_codes(0, 1).tolist() == [[9, 10, 11]]
     assert requests[1].data.latest_stream_code_chunk is not None
     assert [request.data.speech_output_tokens for request in requests] == [0, 1]
+
+
+def test_a_stream_step_carries_each_request_frame_count_and_holds_an_opened_row_once():
+    ids = torch.tensor([7, 9], dtype=torch.long)
+    result, forward_batch, requests = step(ids)
+
+    def code_predictor_forward(layer0_codes, hidden, semantic_positions=None):
+        runner.model.output_codes[:2] = layer0_codes + torch.arange(3)
+
+    runner = make_runner(code_predictor_forward, torch.device("cpu"), requests)
+    runner.enable_stream_steps("vocoder")
+    for request in requests:
+        request.data.stream_codec_output = True
+        request.data.stage_payload = SimpleNamespace(
+            request=SimpleNamespace(params={"stream": True})
+        )
+    outputs = {
+        req.request_id: RequestOutput(req.request_id, data=int(ids[row]))
+        for row, req in enumerate(requests)
+    }
+    messages = []
+    for _ in range(2):
+        runner.collect_codes(result, forward_batch, object(), requests)
+        runner.post_process_outputs(result, SimpleNamespace(requests=requests), outputs)
+        messages.append(runner.take_stream_step({"r1"}, frozenset()))
+
+    rows = [request.data.code_row for request in requests]
+    assert [message.data.request_ids for message in messages] == [["r0"], ["r0"]]
+    assert [message.data.data.frame_counts for message in messages] == [[1], [2]]
+    assert [list(message.data.opened) for message in messages] == [["r0"], []]
+    assert [message.data.data.rows for message in messages] == [rows[:1]] * 2
+    assert [runner.code_table.holders[row] for row in rows] == [2, 1]
+
+
+def test_a_code_row_frees_once_its_last_holder_drops_it():
+    _, _, requests = step(torch.tensor([7], dtype=torch.long))
+    runner = make_runner(None, torch.device("cpu"), requests)
+    row = requests[0].data.code_row
+    runner.code_table.hold(row)
+
+    requests[0].data.on_detached()
+    free_after_engine = runner.code_table.free_row_count()
+    runner.code_table.drop(row)
+
+    assert free_after_engine == 1
+    assert runner.code_table.free_row_count() == 2
+
+
+def test_a_reference_as_long_as_its_prompt_cannot_open_a_row():
+    _, _, requests = step(torch.tensor([7], dtype=torch.long))
+    requests[0].data.ref_code = torch.zeros((4, 3), dtype=torch.long)
+    requests[0].data.ref_code_len = 4
+
+    with pytest.raises(AssertionError, match="4 reference frames"):
+        make_runner(None, torch.device("cpu"), requests)
 
 
 def test_a_middle_prefill_chunk_does_not_advance_its_generation_step():
@@ -167,7 +229,7 @@ def test_staged_ids_resolve_while_the_predictor_is_still_running():
     def code_predictor_forward(layer0_codes, hidden, semantic_positions=None):
         torch.cuda._sleep(PREDICTOR_CYCLES)  # noqa: leading-underscore  # upstream name
 
-    runner = make_runner(code_predictor_forward, device)
+    runner = make_runner(code_predictor_forward, device, requests)
     stream = torch.cuda.current_stream(device)
 
     runner.collect_codes(result, forward_batch, object(), requests)
@@ -188,7 +250,7 @@ def test_staged_ids_keep_the_sampled_values_when_later_stream_work_overwrites_th
     def code_predictor_forward(layer0_codes, hidden, semantic_positions=None):
         layer0_codes.fill_(-1)
 
-    runner = make_runner(code_predictor_forward, device)
+    runner = make_runner(code_predictor_forward, device, requests)
 
     runner.collect_codes(result, forward_batch, object(), requests)
 

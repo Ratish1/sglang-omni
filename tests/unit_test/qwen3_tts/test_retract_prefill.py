@@ -24,6 +24,7 @@ from sglang.srt.runtime_context import get_context
 from sglang.srt.sampling.penaltylib import BatchedRepetitionPenalizer
 from sglang.srt.sampling.sampling_params import SamplingParams
 
+from sglang_omni.models.qwen3_tts.code_table import Qwen3TTSCodeTable
 from sglang_omni.models.qwen3_tts.model_runner import Qwen3TTSModelRunner
 from sglang_omni.models.qwen3_tts.request_builders import Qwen3TTSSGLangRequestData
 from sglang_omni.platforms import current_platform
@@ -41,6 +42,7 @@ else:
 
 HIDDEN = 2
 CODEBOOKS = 3
+ROW_FRAMES = 160
 
 
 @pytest.mark.accelerator
@@ -148,24 +150,33 @@ def make_sched_req(
     text_rows: torch.Tensor | None = None,
     rid: str = "req",
 ) -> SimpleNamespace:
-    committed_codes = [torch.tensor(codes) for codes in frame_codes or []]
-    return SimpleNamespace(
-        request_id=rid,
-        data=Qwen3TTSSGLangRequestData(
-            req=SimpleNamespace(
-                rid=rid,
-                prefix_len=prefix_len,
-                extend_len=extend_len,
-                output_ids=[0] * len(committed_codes),
-            ),
-            prompt_input_embeds=prompt,
-            prefill_input_embeds=prompt,
-            output_codes=committed_codes,
-            decode_text_rows=(
-                torch.zeros(1, prompt.shape[-1]) if text_rows is None else text_rows
-            ),
+    code_table = Qwen3TTSCodeTable(
+        row_count=1,
+        row_frames=ROW_FRAMES,
+        codebook_count=CODEBOOKS,
+        device=torch.device("cpu"),
+    )
+    data = Qwen3TTSSGLangRequestData(
+        req=SimpleNamespace(
+            rid=rid, prefix_len=prefix_len, extend_len=extend_len, output_ids=[]
+        ),
+        prompt_input_embeds=prompt,
+        prefill_input_embeds=prompt,
+        code_table=code_table,
+        code_row=code_table.acquire(),
+        decode_text_rows=(
+            torch.zeros(1, prompt.shape[-1]) if text_rows is None else text_rows
         ),
     )
+    for codes in frame_codes or []:
+        commit_frame(data, codes)
+    return SimpleNamespace(request_id=rid, data=data)
+
+
+def commit_frame(data: Qwen3TTSSGLangRequestData, codes: list[int]) -> None:
+    data.code_table.codes[data.code_row, data.frame_count] = torch.tensor(codes)
+    data.frame_count += 1
+    data.req.output_ids.append(codes[0])
 
 
 def test_decode_rows_add_each_slot_feedback_to_the_text_row_of_its_frame() -> None:
@@ -336,7 +347,7 @@ def test_reprefill_without_its_committed_frames_fails_loudly() -> None:
     )
     forward_batch = SimpleNamespace(input_ids=torch.zeros(7, dtype=torch.long))
 
-    with pytest.raises(AssertionError, match="replays 3 frames, 1 are committed"):
+    with pytest.raises(AssertionError, match="reads 3 frames, 1 are committed"):
         make_runner().build_prefill_input_embeds(forward_batch, [sched_req])
 
 
@@ -351,8 +362,7 @@ def test_a_replayed_row_equals_the_row_its_decode_staged() -> None:
     )
     staged_rows = []
     for codes in frame_codes:
-        sched_req.data.output_codes.append(torch.tensor(codes))
-        sched_req.data.req.output_ids.append(codes[0])
+        commit_frame(sched_req.data, codes)
         runner.slot_feedback_rows[3] = runner.model.feedback_rows_from_codes(
             torch.tensor([codes])
         )[0]

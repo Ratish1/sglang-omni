@@ -198,6 +198,15 @@ def test_without_continuation_aware_admission_no_free_row_admits_nothing() -> No
     assert scheduler.free_rows() == 0
 
 
+def test_plain_requests_stop_at_the_runner_admission_capacity() -> None:
+    scheduler = AdmissionScheduler(request_rows=5, continuation_aware_admission=False)
+    scheduler.model_runner = SimpleNamespace(admission_capacity=lambda: 2)
+    for index in range(4):
+        scheduler.queue_request(f"plain-{index}")
+
+    assert scheduler.admit_prefill_batch() == ["plain-0", "plain-1"]
+
+
 def test_first_units_and_plain_requests_are_limited_by_free_rows() -> None:
     scheduler = AdmissionScheduler(request_rows=5)
     for session_id in ("held-a", "held-b", "held-c"):
