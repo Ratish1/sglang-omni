@@ -1940,6 +1940,24 @@ class Qwen3TTSTalker(Qwen3TTSPromptBuilderMixin, nn.Module):
                     pass
         return result_codes, summed_embeddings
 
+    def feedback_rows_from_codes(self, frame_codes: torch.Tensor) -> torch.Tensor:
+        """The feedback rows the predictor summed for (frames, codebooks) codes, added in
+        its order and dtypes, so each row equals the one its frame fed back."""
+        feedback_rows = torch.zeros(
+            (frame_codes.shape[0], self.output_embeds.shape[-1]),
+            dtype=self.output_embeds.dtype,
+            device=frame_codes.device,
+        )
+        feedback_rows.add_(
+            self.get_input_embeddings()(frame_codes[:, 0]).to(
+                dtype=self.predictor_k_cache.dtype
+            )
+        )
+        residual_rows = self.code_predictor.model.codec_embedding(frame_codes[:, 1:])
+        for codebook_rows in residual_rows.to(dtype=feedback_rows.dtype).unbind(1):
+            feedback_rows.add_(codebook_rows)
+        return feedback_rows
+
     def sample_subtalker_embedding(
         self,
         logits: torch.Tensor,

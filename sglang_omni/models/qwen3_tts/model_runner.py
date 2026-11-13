@@ -14,7 +14,6 @@ from sglang_omni.model_runner.prefill_inputs import (
     OmniPrefillInputs,
     attach_omni_prefill_inputs,
 )
-from sglang_omni.models.qwen3_omni.talker_model_runner import QwenTalkerModelRunner
 from sglang_omni.scheduling.types import (
     RequestOutput,
     SchedulerOutput,
@@ -73,6 +72,16 @@ class Qwen3TTSModelRunner(ModelRunner):
             torch.get_device_module(self.device)
             if has_device_streams(self.device)
             else None
+        )
+        # note (ratish): the predictor's feedback row is the next decode's input; kept
+        # per request slot on the device, a step reads its batch in one gather.
+        self.slot_feedback_rows = torch.zeros(
+            (
+                tp_worker.model_runner.req_to_token_pool.req_to_token.shape[0],
+                self.model.output_embeds.shape[-1],
+            ),
+            dtype=self.model.output_embeds.dtype,
+            device=self.device,
         )
 
     def model_info(self) -> Qwen3TTSModelInfo:
@@ -258,6 +267,11 @@ class Qwen3TTSModelRunner(ModelRunner):
             hidden,
             semantic_positions=semantic_positions,
         )
+        self.slot_feedback_rows.index_copy_(
+            0,
+            forward_batch.req_pool_indices,
+            self.model.output_embeds[: len(requests)],
+        )
         self.has_pending_code_step = True
 
     def post_process_outputs(
@@ -277,7 +291,6 @@ class Qwen3TTSModelRunner(ModelRunner):
         # rows must stay views of a snapshot, never of the reused graph buffers.
         batch_size = len(scheduler_output.requests)
         codes_snap = self.model.output_codes[:batch_size].detach().clone()
-        embeds_snap = self.model.output_embeds[:batch_size].detach().clone()
         codes_ready = None
         if self.codes_event_module is not None:
             codes_ready = self.codes_event_module.Event()
@@ -287,7 +300,7 @@ class Qwen3TTSModelRunner(ModelRunner):
         for row_idx, sched_req in enumerate(scheduler_output.requests):
             req_output = outputs[sched_req.request_id]
             # note (ratish): a middle prefill chunk samples at a prompt row; SGLang drops
-            # that token, so it gives no frame, feedback or stream chunk either.
+            # that token, so it gives no frame or stream chunk either.
             if sched_req.data.req.inflight_middle_chunks > 0 or req_output.data is None:
                 continue
             else:
@@ -301,7 +314,6 @@ class Qwen3TTSModelRunner(ModelRunner):
             sched_req.data.output_codes.append(code_chunk)
             sched_req.data.latest_stream_code_chunk = code_chunk
             sched_req.data.codes_ready_event = codes_ready
-            sched_req.data.pending_feedback_queue.append(embeds_snap[row_idx])
 
     def finalize_skip_rids(self, scheduler_output: SchedulerOutput) -> set[str]:
         return {
@@ -320,7 +332,7 @@ class Qwen3TTSModelRunner(ModelRunner):
             return (seq_lens - 1).clamp_min(0)
 
     def write_feedback_buffers(
-        self, forward_batch: ForwardBatch | None, requests: list[SchedulerRequest]
+        self, forward_batch: ForwardBatch, requests: list[SchedulerRequest]
     ) -> None:
         batch_size = len(requests)
         if batch_size == 0:
@@ -342,41 +354,19 @@ class Qwen3TTSModelRunner(ModelRunner):
         else:
             pass
         row_ids = self.decode_row_ids(batch_size, input_ids)
-        weight = decode_feedback_embedding.weight
-        device = weight.device
-        dtype = weight.dtype
-        feedback_rows: list[torch.Tensor] = []
-        text_rows: list[torch.Tensor] = []
-        for sched_req in requests:
-            data: Qwen3TTSSGLangRequestData = sched_req.data
-            inputs = QwenTalkerModelRunner.peek_next_decode_inputs(data)
-            if inputs is None:
-                raise RuntimeError(
-                    f"Qwen3-TTS decode for {sched_req.request_id} has no queued "
-                    "feedback embedding"
-                )
-            else:
-                pass
-            feedback, text = inputs
-            feedback_rows.append(
-                QwenTalkerModelRunner.decode_row(feedback, device=device, dtype=dtype)
-            )
-            text_rows.append(
-                QwenTalkerModelRunner.decode_row(text, device=device, dtype=dtype)
-            )
-            QwenTalkerModelRunner.pop_next_decode_inputs(data)
-
+        # note (ratish): a decode feeds back its request's newest committed frame.
+        text_rows = torch.stack(
+            [
+                sched_req.data.decode_text_row(len(sched_req.data.req.output_ids) - 1)
+                for sched_req in requests
+            ]
+        )
         with torch.no_grad():
-            target = weight[:batch_size]
-            torch.stack(feedback_rows, dim=0, out=target)
-            target.add_(torch.stack(text_rows, dim=0))
-            # note(ratish): the history outlives the buffer, a retracted request
-            # replays it in its re-prefill.
-            history = target.detach().clone()
-        for row_idx, sched_req in enumerate(requests):
-            QwenTalkerModelRunner.append_decode_input_history(
-                sched_req.data, history[row_idx]
+            target = decode_feedback_embedding.weight[:batch_size]
+            torch.index_select(
+                self.slot_feedback_rows, 0, forward_batch.req_pool_indices, out=target
             )
+            target.add_(text_rows)
         # During graph decode, input_ids carries staged embedding row ids.
         input_ids[:batch_size].copy_(row_ids)
 
@@ -417,22 +407,47 @@ class Qwen3TTSModelRunner(ModelRunner):
                 raise RuntimeError("Qwen3-TTS prefill requires prompt_input_embeds")
             else:
                 pass
-            piece = QwenTalkerModelRunner.projected_prefill_slice(
-                sched_req=sched_req,
-                prefix_len=prefix_len,
-                extend_len=req_len,
-                device=forward_batch.input_ids.device,
-            )
-            if piece is None or int(piece.shape[0]) != req_len:
-                have = 0 if piece is None else int(piece.shape[0])
-                raise RuntimeError(
-                    f"Qwen3-TTS prefill embed mismatch for {req.rid}: "
-                    f"have {have} rows, need {req_len}"
+            prompt_length = int(data.prefill_input_embeds.shape[0])
+            extend_end = prefix_len + req_len
+            if prefix_len < prompt_length:
+                pieces.append(
+                    data.prefill_input_embeds[
+                        prefix_len : min(extend_end, prompt_length)
+                    ]
                 )
             else:
                 pass
-            pieces.append(piece)
+            if extend_end > prompt_length:
+                pieces.append(
+                    self.replayed_decode_inputs(
+                        data,
+                        max(prefix_len, prompt_length) - prompt_length,
+                        extend_end - prompt_length,
+                    )
+                )
+            else:
+                pass
         return torch.cat(pieces, dim=0).to(
             device=forward_batch.input_ids.device,
             dtype=next(self.model.parameters()).dtype,
         )
+
+    def replayed_decode_inputs(
+        self, data: Qwen3TTSSGLangRequestData, first_frame: int, stop_frame: int
+    ) -> torch.Tensor:
+        """The decode inputs of generated frames [first_frame, stop_frame) that a retracted
+        request replays: each frame's feedback row plus the text row its decode read."""
+        assert stop_frame <= len(data.output_codes), (
+            f"Qwen3-TTS re-prefill of {data.req.rid} replays {stop_frame} frames, "
+            f"{len(data.output_codes)} are committed"
+        )
+        feedback_rows = self.model.feedback_rows_from_codes(
+            torch.stack(data.output_codes[first_frame:stop_frame])
+        )
+        text_rows = torch.stack(
+            [
+                data.decode_text_row(frame_index)
+                for frame_index in range(first_frame, stop_frame)
+            ]
+        )
+        return feedback_rows + text_rows
