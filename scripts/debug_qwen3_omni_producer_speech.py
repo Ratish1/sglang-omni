@@ -28,6 +28,9 @@ def main() -> None:
     parser.add_argument("--baseline-directory", type=Path, required=True)
     parser.add_argument("--request-file", type=Path, required=True)
     parser.add_argument("--fixture-directories", nargs="+", type=Path, required=True)
+    parser.add_argument(
+        "--fixture-mode", choices=("identity", "checkpoint"), default="checkpoint"
+    )
     parser.add_argument("--base-url", required=True)
     parser.add_argument("--request-timeout-seconds", type=float, required=True)
     parser.add_argument("--output-directory", type=Path, required=True)
@@ -58,8 +61,9 @@ def main() -> None:
     )
     source = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
     for fixture_directory in arguments.fixture_directories:
-        fixture_file = fixture_directory / "checkpoint.pt"
+        fixture_file = fixture_directory / f"{arguments.fixture_mode}.pt"
         fixture = torch.load(fixture_file, map_location="cpu", weights_only=True)
+        assert fixture["mode"] == arguments.fixture_mode
         name = fixture["producer_precision"]
         request_id = fixture["request_id"]
         output = arguments.output_directory / name
