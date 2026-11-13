@@ -39,7 +39,9 @@ class NativeRotaryOperation:
         assert isinstance(sections, list) and all(
             isinstance(size, int) for size in sections
         )
-        interleaved = scaling.get("mrope_interleaved", False)
+        interleaved = scaling.get(
+            "mrope_interleaved", scaling.get("interleaved", False)
+        )
         interleaved_glm = scaling.get("mrope_interleaved_glm", False)
         assert isinstance(interleaved, bool) and isinstance(interleaved_glm, bool)
         assert not interleaved_glm
