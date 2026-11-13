@@ -22,6 +22,8 @@ from sglang_omni.scheduling.types import SchedulerRequest
 class PredictorControlMode(str, Enum):
     IDENTITY = "identity"
     CHECKPOINT = "checkpoint"
+    CHECKPOINT_CODES = "checkpoint-codes"
+    CHECKPOINT_FEEDBACK = "checkpoint-feedback"
 
 
 class CheckpointPredictorControl:
@@ -170,6 +172,27 @@ class CheckpointPredictorControl:
             assert reference_codes.shape == (1, codes.shape[1])
             assert reference_feedback.shape == feedback[row : row + 1].shape
             assert reference_feedback.isfinite().all()
+            if self.mode is PredictorControlMode.CHECKPOINT:
+                selected_codes = reference_codes
+                selected_feedback = reference_feedback
+            elif self.mode is PredictorControlMode.CHECKPOINT_CODES:
+                selected_codes = reference_codes
+                selected_feedback = reference_embeddings[:, 0].clone()
+                for group in range(1, reference_embeddings.shape[1]):
+                    selected_feedback.add_(reference_embeddings[:, group])
+            elif self.mode is PredictorControlMode.CHECKPOINT_FEEDBACK:
+                selected_codes = native_codes[None]
+                native_rows = [main_embedding]
+                native_rows.extend(
+                    embedding(native_codes[group + 1 : group + 2].view(1, 1))
+                    for group, embedding in enumerate(
+                        self.predictor.model.codec_embedding
+                    )
+                )
+                selected_feedback = torch.cat(native_rows, dim=1).sum(dim=1)
+            else:
+                selected_codes = native_codes[None]
+                selected_feedback = native_feedback[None]
             destination = self.directory / request.request_id
             destination.mkdir(exist_ok=True)
             torch.save(
@@ -180,11 +203,13 @@ class CheckpointPredictorControl:
                     "reference_codes": reference_codes.cpu(),
                     "reference_feedback": reference_feedback.cpu(),
                     "reference_embedding_rows": reference_embeddings.cpu(),
+                    "selected_codes": selected_codes.cpu(),
+                    "selected_feedback": selected_feedback.cpu(),
                 },
                 destination / f"{len(request.data.req.output_ids):04d}.pt",
             )
-            if self.mode is PredictorControlMode.CHECKPOINT:
-                codes[row].copy_(reference_codes[0])
-                feedback[row].copy_(reference_feedback[0])
+            if self.mode is not PredictorControlMode.IDENTITY:
+                codes[row].copy_(selected_codes[0])
+                feedback[row].copy_(selected_feedback[0])
             else:
                 pass

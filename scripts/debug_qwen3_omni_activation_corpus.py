@@ -28,7 +28,8 @@ def main() -> None:
     parser.add_argument("--capture-token-rows", type=int, default=112)
     parser.add_argument("--capture-talker-operators", action="store_true")
     parser.add_argument(
-        "--reference-predictor-mode", choices=("identity", "checkpoint")
+        "--reference-predictor-mode",
+        choices=("identity", "checkpoint", "checkpoint-codes", "checkpoint-feedback"),
     )
     parser.add_argument(
         "--control", action="append", choices=("original", "rounded-activation")
