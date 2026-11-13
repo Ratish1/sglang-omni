@@ -195,7 +195,8 @@ def compact_decode_input_history(data: ARRequestData) -> None:
 
 def detach_request_data(req: Req) -> None:
     """Break Req -> data; async snapshots retain the one-way data -> Req edge."""
-    data = req.omni_data  # noqa: leading-underscore  # upstream spelling
+    # note (ratish): a request can be detached before the scheduler attached any data.
+    data = getattr(req, "omni_data", None)
     if isinstance(data, ARRequestData):
         data.on_detached()
     else:
