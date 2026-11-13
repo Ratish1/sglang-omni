@@ -163,12 +163,16 @@ def test_staged_ids_resolve_while_the_predictor_is_still_running():
     device = torch.device("cuda")
     ids = torch.tensor([7, 8], dtype=torch.long, device=device)
     result, forward_batch, requests = step(ids)
+    predictor_cycles = 0
 
     def code_predictor_forward(layer0_codes, hidden, semantic_positions=None):
-        torch.cuda._sleep(PREDICTOR_CYCLES)  # noqa: leading-underscore  # upstream name
+        torch.cuda._sleep(predictor_cycles)  # noqa: leading-underscore  # upstream name
 
     runner = make_runner(code_predictor_forward, device)
     stream = torch.cuda.current_stream(device)
+    runner.collect_codes(result, forward_batch, object(), requests)
+    torch.cuda.synchronize()
+    predictor_cycles = PREDICTOR_CYCLES
 
     runner.collect_codes(result, forward_batch, object(), requests)
     host_ids = runner.resolve_host_token_ids(result)
