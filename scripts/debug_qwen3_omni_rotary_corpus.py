@@ -25,6 +25,7 @@ def main() -> None:
     arguments.output_directory.mkdir(exist_ok=False)
     source = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
     template = json.loads(arguments.server_template.read_text())
+    server_command = [*template["command"], "--log-level", "debug"]
     request_hashes: dict[str, str] = {}
     for workload in ("tts", "mmsu"):
         request_files = list(
@@ -69,7 +70,7 @@ def main() -> None:
         environment.update(diagnostic_environment)
         with (output / "server.log").open("wb") as log:
             process = subprocess.Popen(
-                template["command"],
+                server_command,
                 env=environment,
                 stdout=log,
                 stderr=subprocess.STDOUT,
@@ -80,7 +81,7 @@ def main() -> None:
                 {
                     "source": source,
                     "pid": process.pid,
-                    "command": template["command"],
+                    "command": server_command,
                     "diagnostic_environment": diagnostic_environment,
                     "scope": "All shared native Thinker rotary forwards, including warmup and decode.",
                     "timing_scope": "Bounded operator observers enabled in both arms, not production performance qualification.",
