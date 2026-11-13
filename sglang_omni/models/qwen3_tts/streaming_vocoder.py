@@ -45,7 +45,12 @@ from sglang_omni.profiler.event_recorder import (
 )
 from sglang_omni.proto import StagePayload
 from sglang_omni.proto.admin import ADMIN_MODEL_INFO
-from sglang_omni.scheduling.message import IncomingMessage, OutgoingMessage, StreamStep
+from sglang_omni.scheduling.message import (
+    IncomingMessage,
+    OutgoingMessage,
+    StreamStep,
+    put_messages,
+)
 from sglang_omni.scheduling.pipeline_state import build_usage
 from sglang_omni.scheduling.streaming_vocoder import (
     INITIAL_CODEC_CHUNK_FRAMES_PARAM,
@@ -2404,6 +2409,36 @@ class Qwen3TTSStreamingVocoderScheduler(
             waveform,
         )
 
+    def cohort_samples(
+        self,
+        plans: Sequence[IncrementalDecodePlan],
+        waveform: torch.Tensor,
+        incremental: IncrementalDecodeBatch,
+    ) -> torch.Tensor | None:
+        """Every row's new samples as one [rows, samples] view of the waveform, which
+        copies out in one transfer; None when the rows' spans differ or a tail graph
+        decoded them to their own widths."""
+        if incremental.runner is not None and incremental.runner.mode == "tail":
+            return None
+        else:
+            pass
+        spans = {
+            (
+                plan.reference_trim_frames,
+                plan.generated_frames - plan.emitted_generated_frames,
+            )
+            for plan in plans
+        }
+        if len(spans) != 1:
+            return None
+        else:
+            pass
+        trim_frames, emit_frames = spans.pop()
+        start = trim_frames * self.samples_per_frame
+        return waveform.reshape(len(plans), -1)[
+            :, start : start + emit_frames * self.samples_per_frame
+        ]
+
     def decode_incremental_windows(
         self,
         gpu_input: torch.Tensor,
@@ -2507,6 +2542,7 @@ class Qwen3TTSStreamingVocoderScheduler(
         )
         gpu_input: torch.Tensor | None = None
         keepalives: list[torch.Tensor] = []
+        cohort_samples: torch.Tensor | None = None
         try:
             with self.device_module.stream(stream):
                 gpu_input = self.stage_decoder_input(
@@ -2517,6 +2553,7 @@ class Qwen3TTSStreamingVocoderScheduler(
                         gpu_input, plans, incremental, stream
                     )
                     keepalives.append(borrowed)
+                    cohort_samples = self.cohort_samples(plans, borrowed, incremental)
                 else:
                     graphs = self.runner_for_stream(
                         stream, self.initial_decode_graphs, "graphs"
@@ -2545,9 +2582,16 @@ class Qwen3TTSStreamingVocoderScheduler(
                         stream=stream,
                         incremental=incremental,
                     )
+                elif cohort_samples is not None:
+                    cohort_samples = cohort_samples.to(torch.float32)
+                    keepalives.append(cohort_samples)
+                    staged_samples = slot.output_transfer.view(
+                        int(cohort_samples.numel())
+                    ).view(cohort_samples.shape)
+                    staged_samples.copy_(cohort_samples, non_blocking=True)
+                    staged = list(staged_samples.unbind(0))
                 else:
-                    pass
-                staged = self.stage_deltas(deltas, slot)
+                    staged = self.stage_deltas(deltas, slot)
                 keepalives.append(bad_rows)
                 host_bad_rows = slot.invalid_rows.view(len(plans))
                 host_bad_rows.copy_(bad_rows, non_blocking=True)
@@ -3959,9 +4003,7 @@ class Qwen3TTSStreamingVocoderScheduler(
                 continue
             else:
                 pass
-            for entry, delta in zip(*decoded):
-                request_id, state, plan = entry
-                self.commit_followup(request_id, state, plan, delta)
+            self.commit_followups(*decoded)
 
     def pending_incremental(self) -> list[PendingIncrementalGroup]:
         pending = getattr(self.worker_ctx, "pending_incremental", None)
@@ -4007,59 +4049,79 @@ class Qwen3TTSStreamingVocoderScheduler(
                 continue
             else:
                 pass
-            for entry, delta in zip(*decoded):
-                request_id, state, plan = entry
-                self.commit_followup(request_id, state, plan, delta)
+            self.commit_followups(*decoded)
 
-    def commit_followup(
+    def commit_followups(
         self,
-        request_id: str,
-        state: Qwen3TTSStreamState,
-        plan: Qwen3TTSDecodePlan | IncrementalDecodePlan,
-        delta: torch.Tensor,
+        group: Sequence[
+            tuple[str, Qwen3TTSStreamState, Qwen3TTSDecodePlan | IncrementalDecodePlan]
+        ],
+        deltas: Sequence[torch.Tensor],
     ) -> None:
-        cleanup_abort = False
+        """Commit a cohort's follow-ups under one lock hold and hand their chunks over
+        at once; a plain stream's chunk converts before the hold."""
+        # note (ratish): a session unit's chunk advances its unit clock, so it is built under the lock.
+        prepared_messages = [
+            (
+                None
+                if request_id in self.session_appends
+                else self.stream_chunk_message(request_id, delta)
+            )
+            for (request_id, _, _), delta in zip(group, deltas)
+        ]
+        messages: list[OutgoingMessage] = []
+        aborted_request_ids: list[str] = []
         with self.state_lock:
-            if self.stream_states.get(request_id) is not state:
-                return
-            else:
-                pass
-            try:
-                delta = self.commit_decode_plan(state, plan, delta)
-            except Exception as exc:
-                self.emit_error(request_id, exc)
-                self.abort_state(request_id)
-                cleanup_abort = True
-            else:
-                if not self.is_aborted(request_id):
+            for (request_id, state, plan), delta, prepared_message in zip(
+                group, deltas, prepared_messages
+            ):
+                if self.stream_states.get(request_id) is not state:
+                    continue
+                else:
+                    pass
+                try:
+                    committed = self.commit_decode_plan(state, plan, delta)
+                except Exception as exc:
+                    self.emit_error(request_id, exc)
+                    self.abort_state(request_id)
+                    aborted_request_ids.append(request_id)
+                    continue
+                if self.is_aborted(request_id):
+                    pass
+                else:
                     self.mark_stream_emitted(request_id)
                     if get_recorder().is_active():
                         self.decode_events.capture(
                             "qwen3_tts_vocoder_decode_committed",
                             decode_event_snapshots(((request_id, state),)),
-                            {"samples": int(delta.numel())},
+                            {"samples": int(committed.numel())},
                         )
                     else:
                         pass
-                    self.outbox.put(self.stream_chunk_message(request_id, delta))
-                else:
-                    pass
+                    if prepared_message is not None and committed is delta:
+                        messages.append(prepared_message)
+                    else:
+                        messages.append(
+                            self.stream_chunk_message(request_id, committed)
+                        )
                 has_remainder = (
                     state.total_frames - state.ref_frames
                     > state.emitted_generated_frames
                 )
                 if state.final_pending and (not has_remainder):
                     state.followup_pending = False
+                    # note (ratish): the stream's last chunk goes out ahead of its terminal messages.
+                    put_messages(self.outbox, messages)
+                    messages = []
                     self.finish_async_stream(request_id, state)
                 elif state.final_pending or self.should_decode(state, is_final=False):
                     self.enqueue_followup(request_id, state)
                 else:
                     state.followup_pending = False
+            put_messages(self.outbox, messages)
         self.decode_events.flush(stage=self.event_stage_name)
-        if cleanup_abort:
+        for request_id in aborted_request_ids:
             self.cleanup_aborted_request(request_id)
-        else:
-            pass
 
     def fail_async_stream(
         self, request_id: str, state: Qwen3TTSStreamState, exc: BaseException
