@@ -181,11 +181,23 @@ def main() -> None:
                 if cache_owner == "native":
                     cache.crop(-embeddings.shape[1])
                     assert cache.get_seq_length() == previous_tokens
+                    for layer, (keys, values) in enumerate(
+                        zip(native_keys, native_values, strict=True)
+                    ):
+                        assert torch.equal(
+                            cache.layers[layer].keys.cpu(),
+                            keys.permute(1, 0, 2).unsqueeze(0),
+                        )
+                        assert torch.equal(
+                            cache.layers[layer].values.cpu(),
+                            values.permute(1, 0, 2).unsqueeze(0),
+                        )
                     repeated = reference.model(
                         inputs_embeds=embeddings,
                         position_ids=positions,
                         past_key_values=cache,
                         use_cache=True,
+                        output_hidden_states=True,
                     )
                     repeated_logits = reference.codec_head(
                         repeated.last_hidden_state[:, -1]
