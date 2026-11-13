@@ -29,6 +29,7 @@ from scripts.debug_qwen3_omni_normalization import NativeNormalization
 from scripts.debug_qwen3_omni_predictor_cache import NativePredictorReplay
 from scripts.debug_qwen3_omni_talker_experts import NativeTalkerExperts
 from scripts.qwen3_omni_checkpoint_weights import audit_checkpoint_weights
+from scripts.qwen3_omni_talker_attention import NativeBackboneAttention
 from sglang_omni.models.qwen3_omni.components.talker_prefill import (
     load_thinker_embedding_rows,
 )
@@ -74,6 +75,7 @@ def main() -> None:
     parser.add_argument("--native-predictor-capture-directory", type=Path)
     parser.add_argument("--native-expert-capture-directory", type=Path)
     parser.add_argument("--paired-native-expert-controls", action="store_true")
+    parser.add_argument("--paired-native-attention-controls", action="store_true")
     parser.add_argument(
         "--native-expert-route-precision",
         choices=("checkpoint", "float32"),
@@ -102,6 +104,11 @@ def main() -> None:
     )
     parser.add_argument("--output-directory", type=Path, required=True)
     arguments = parser.parse_args()
+    if arguments.paired_native_attention_controls:
+        assert arguments.attention_implementation == "eager"
+        assert arguments.dtype == "bfloat16"
+    else:
+        pass
     if arguments.native_expert_capture_directory is not None:
         assert arguments.dtype == "bfloat16"
     else:
@@ -189,6 +196,11 @@ def main() -> None:
         expert_control.install()
     else:
         expert_control = None
+    if arguments.paired_native_attention_controls:
+        attention_control = NativeBackboneAttention(reference=reference)
+        attention_control.install()
+    else:
+        attention_control = None
     special_embeddings = load_thinker_embedding_rows(
         str(checkpoint_directory),
         [
@@ -237,21 +249,32 @@ def main() -> None:
             if arguments.paired_native_expert_controls
             else ("fused" if expert_control is not None else "checkpoint",)
         )
+        attention_modes = (
+            ("eager", "fa3", "eager-repeat")
+            if attention_control is not None
+            else ("unchanged",)
+        )
         for (
             trace_directory,
             sampling_order,
             normalization_mode,
             expert_mode,
+            attention_mode,
             residual_policy_index,
             residual_policy,
         ) in (
-            (directory, order, mode, expert_mode, policy_index, policy)
+            (directory, order, mode, expert_mode, attention_mode, policy_index, policy)
             for directory in arguments.trace_directory
             for order in arguments.sampling_order
             for mode in normalization_modes
             for expert_mode in expert_modes
+            for attention_mode in attention_modes
             for policy_index, policy in enumerate(arguments.residual_policy)
         ):
+            if attention_control is not None:
+                attention_control.set_enabled(attention_mode == "fa3")
+            else:
+                pass
             if expert_control is not None:
                 expert_control.enabled = expert_mode == "fused"
                 expert_control.calls = 0
@@ -468,6 +491,10 @@ def main() -> None:
             )
             if arguments.paired_native_expert_controls:
                 mode_directory = mode_directory / expert_mode
+            else:
+                pass
+            if attention_control is not None:
+                mode_directory = mode_directory / attention_mode
             else:
                 pass
             if len(arguments.residual_policy) > 1:
@@ -718,8 +745,14 @@ def main() -> None:
                 )
                 assert expert_control.calls == expected_calls
                 assert expert_control.router_calls == (
-                    expected_calls
-                    if expert_control.route_precision == "float32"
+                    expected_calls if expert_control.route_precision == "float32" else 0
+                )
+            else:
+                pass
+            if attention_control is not None:
+                assert attention_control.calls == (
+                    len(frame_reports) * len(reference.model.layers)
+                    if attention_mode == "fa3"
                     else 0
                 )
             else:
@@ -755,6 +788,10 @@ def main() -> None:
                 ),
                 "normalization_semantics": normalization_mode,
                 "expert_mode": expert_mode,
+                "attention_mode": attention_mode,
+                "native_backbone_attention_calls": (
+                    attention_control.calls if attention_control is not None else 0
+                ),
                 "native_expert_route_precision": arguments.native_expert_route_precision,
                 "native_expert_calls": expert_control.calls if expert_control else 0,
                 "native_expert_router_calls": (
