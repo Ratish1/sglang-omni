@@ -23,6 +23,9 @@ class TalkerConditioningRecorder:
     key_buffers: list[torch.Tensor]
     value_buffers: list[torch.Tensor]
     request_slots: torch.Tensor
+    predictor_keys: torch.Tensor
+    predictor_values: torch.Tensor
+    predictor_counters: torch.Tensor | None
     request_ids: frozenset[str] | None = None
     assistant_tokens: dict[str, list[int]] = field(default_factory=dict)
     future_rows: dict[str, list[torch.Tensor]] = field(default_factory=dict)
@@ -264,6 +267,22 @@ class TalkerConditioningRecorder:
                     "is_extend": torch.tensor(is_extend),
                 },
                 destination / f"{frame_index:04d}-output.pt",
+            )
+            torch.save(
+                {
+                    "keys": self.predictor_keys[:, row].detach().cpu().clone(),
+                    "values": self.predictor_values[:, row].detach().cpu().clone(),
+                    **(
+                        {
+                            "fused_counters": self.predictor_counters.detach()
+                            .cpu()
+                            .clone()
+                        }
+                        if self.predictor_counters is not None
+                        else {}
+                    ),
+                },
+                destination / f"{frame_index:04d}-predictor.pt",
             )
             if self.operator_recorders and (not is_extend or self.retain_moe_batches):
                 step = int(self.operator_recorders[0].step_counter)

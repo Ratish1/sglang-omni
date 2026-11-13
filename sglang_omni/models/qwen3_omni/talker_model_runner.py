@@ -103,6 +103,13 @@ class QwenTalkerModelRunner(ModelRunner["SGLangARRequestData"]):
                 key_buffers=pool.k_buffer,
                 value_buffers=pool.v_buffer,
                 request_slots=tp_worker.model_runner.req_to_token_pool.req_to_token,
+                predictor_keys=self.model.predictor_k_cache,
+                predictor_values=self.model.predictor_v_cache,
+                predictor_counters=(
+                    self.model.predictor_fused_layers.counters
+                    if self.model.predictor_fused_layers is not None
+                    else None
+                ),
                 request_ids=frozenset(json.loads(request_ids_file.read_text())),
                 operator_recorders=self.model.backbone_recorders,
                 retain_moe_batches=retain_moe_batches,
@@ -342,6 +349,11 @@ class QwenTalkerModelRunner(ModelRunner["SGLangARRequestData"]):
                         {
                             "predictor_fused_layers": self.model.predictor_fused_layers
                             is not None,
+                            "predictor_layer_shape": (
+                                asdict(self.model.predictor_fused_layers.shape)
+                                if self.model.predictor_fused_layers is not None
+                                else None
+                            ),
                             "predictor_triton_attention": self.model.predictor_triton_attention,
                             "predictor_exact_add_norm": self.model.predictor_exact_add_norm,
                             "predictor_rope_stores_kv": self.model.predictor_rope_stores_kv,
