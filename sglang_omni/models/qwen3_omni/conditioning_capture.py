@@ -9,6 +9,9 @@ from pathlib import Path
 import torch
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 
+from sglang_omni.models.qwen3_omni.attention_layout_capture import (
+    capture_attention_layout,
+)
 from sglang_omni.models.qwen3_omni.layer_operand_capture import (
     LayerOperandRecorder,
     MoeTacticChoice,
@@ -258,8 +261,21 @@ class TalkerConditioningRecorder:
                 past_exact = True
             self.previous_keys[request.request_id] = keys
             self.previous_values[request.request_id] = values
+            attention_layout = (
+                capture_attention_layout(
+                    forward_batch,
+                    self.key_buffers,
+                    self.value_buffers,
+                    self.request_slots,
+                    row,
+                    sequence_length,
+                )
+                if self.retain_moe_batches
+                else {}
+            )
             torch.save(
                 {
+                    **attention_layout,
                     "codec_ids": codes[row].detach().cpu().clone(),
                     "codec_feedback": feedback[row].detach().cpu().clone(),
                     "logits": logits[row].detach().cpu().clone(),
