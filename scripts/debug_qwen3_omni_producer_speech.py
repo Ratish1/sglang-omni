@@ -64,7 +64,11 @@ def main() -> None:
         fixture_file = fixture_directory / f"{arguments.fixture_mode}.pt"
         fixture = torch.load(fixture_file, map_location="cpu", weights_only=True)
         assert fixture["mode"] == arguments.fixture_mode
-        name = fixture["producer_precision"]
+        name = (
+            "identity"
+            if arguments.fixture_mode == "identity"
+            else fixture["producer_precision"]
+        )
         request_id = fixture["request_id"]
         output = arguments.output_directory / name
         output.mkdir(exist_ok=False)
