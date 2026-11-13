@@ -65,6 +65,12 @@ def main() -> None:
         top_p = torch.tensor([parameters["top_p"]], device=device)
         minimum_probability = torch.tensor([parameters["min_p"]], device=device)
         sampling_seed = torch.tensor([parameters["sampling_seed"]], device=device)
+        repetition_penalty = torch.tensor(
+            [[parameters["repetition_penalty"]]], dtype=torch.float32, device=device
+        )
+        temperature = torch.tensor(
+            [[parameters["temperature"]]], dtype=torch.float32, device=device
+        )
         logit_sources = (
             ("observed", "checkpoint", "native")
             if arguments.reference_logits_directory is not None
@@ -149,14 +155,12 @@ def main() -> None:
                     repeated[:, finished["output_ids"][:frame].to(device)] = True
                     penalized = torch.where(
                         logits > 0,
-                        logits / parameters["repetition_penalty"],
-                        logits * parameters["repetition_penalty"],
+                        logits / repetition_penalty,
+                        logits * repetition_penalty,
                     )
                     logits = torch.where(repeated, penalized, logits)
                     logits[:, parameters["suppress_tokens"]] = float("-inf")
-                    probabilities = torch.softmax(
-                        logits / parameters["temperature"], dim=-1
-                    )
+                    probabilities = torch.softmax(logits / temperature, dim=-1)
                 sampled = top_k_top_p_min_p_sampling_from_probs_torch(
                     probabilities,
                     top_k,
