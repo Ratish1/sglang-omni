@@ -27,6 +27,9 @@ def main() -> None:
     parser.add_argument("--request-id", action="append")
     parser.add_argument("--capture-token-rows", type=int, default=112)
     parser.add_argument("--capture-talker-operators", action="store_true")
+    parser.add_argument(
+        "--control", action="append", choices=("original", "rounded-activation")
+    )
     arguments = parser.parse_args()
     arguments.output_directory.mkdir(exist_ok=False)
     source = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
@@ -78,7 +81,7 @@ def main() -> None:
     else:
         pass
     native_state = None
-    for control in ("original", "rounded-activation"):
+    for control in arguments.control or ("original", "rounded-activation"):
         output = arguments.output_directory / control
         output.mkdir()
         diagnostic_environment = {

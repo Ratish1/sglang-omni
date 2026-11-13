@@ -20,6 +20,7 @@ from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.moe.moe_runner.flashinfer_cutlass import (
     _cutlass_moe_tune_max_num_tokens,
 )
+from sglang.srt.layers.rotary_embedding.base import RotaryEmbedding
 from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
 from sglang.srt.runtime_context import get_disagg
 
@@ -324,6 +325,46 @@ class QwenTalkerModelRunner(ModelRunner["SGLangARRequestData"]):
                 result.logits_output.next_token_logits,
                 result.logits_output.hidden_states,
             )
+            if any(
+                self.model.conditioning_recorder.should_capture(request.request_id)
+                for request in requests
+            ):
+                destination = self.model.conditioning_recorder.directory
+                torch.save(
+                    {
+                        name: tensor.detach().cpu().clone()
+                        for name, tensor in self.model.named_buffers()
+                    },
+                    destination / "native-talker-buffers.pt",
+                )
+                (destination / "native-talker-buffer-runtime.json").write_text(
+                    json.dumps(
+                        {
+                            "predictor_fused_layers": self.model.predictor_fused_layers
+                            is not None,
+                            "predictor_triton_attention": self.model.predictor_triton_attention,
+                            "predictor_exact_add_norm": self.model.predictor_exact_add_norm,
+                            "predictor_rope_stores_kv": self.model.predictor_rope_stores_kv,
+                            "rotary_modules": {
+                                name: {
+                                    "class": type(module).__qualname__,
+                                    "base": module.base,
+                                    "rotary_dim": module.rotary_dim,
+                                    "head_size": module.head_size,
+                                    "position_start": module.position_start,
+                                    "is_neox_style": module.is_neox_style,
+                                    "use_fallback_kernel": module.use_fallback_kernel,
+                                }
+                                for name, module in self.model.named_modules()
+                                if isinstance(module, RotaryEmbedding)
+                            },
+                            "scope": "Registered buffers after the selected prefill and its residual prediction. Forward and cache contents are not replaced.",
+                        },
+                        indent=2,
+                    )
+                )
+            else:
+                pass
         else:
             pass
         self.stage_token_ids(result, result.next_token_ids)
