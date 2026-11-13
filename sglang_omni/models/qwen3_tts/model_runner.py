@@ -8,7 +8,7 @@ from typing import TYPE_CHECKING, TypedDict
 
 import torch
 from sglang.srt.sampling.penaltylib.repetition_penalty import apply_scaling_penalties
-from sglang.srt.utils.common import is_pin_memory_available
+from sglang.srt.utils.common import async_h2d
 
 from sglang_omni.model_runner.base import ModelRunner
 from sglang_omni.model_runner.model_worker import ModelWorker
@@ -47,15 +47,6 @@ QWEN3_TTS_MIN_NEW_FRAMES = 2
 
 class Qwen3TTSModelInfo(TypedDict):
     predictor_cuda_graph: PredictorGraphStats
-
-
-def stage_host_values(
-    values: list[int] | list[float], dtype: torch.dtype, device: torch.device
-) -> torch.Tensor:
-    # note (ratish): a pageable source waits for the step queued on the stream.
-    return torch.tensor(
-        values, dtype=dtype, pin_memory=is_pin_memory_available(device)
-    ).to(device, non_blocking=True)
 
 
 class Qwen3TTSModelRunner(ModelRunner):
@@ -117,10 +108,10 @@ class Qwen3TTSModelRunner(ModelRunner):
         self.slot_repetition_penalties.index_copy_(
             0,
             request_slots,
-            stage_host_values(
+            async_h2d(
                 [sched_req.data.repetition_penalty for sched_req in requests],
-                torch.float32,
-                request_slots.device,
+                dtype=torch.float32,
+                device=request_slots.device,
             ),
         )
         committed_rows = [
@@ -130,16 +121,16 @@ class Qwen3TTSModelRunner(ModelRunner):
         ]
         if committed_rows:
             committed_slots = request_slots[
-                stage_host_values(committed_rows, torch.long, request_slots.device)
+                async_h2d(committed_rows, dtype=torch.long, device=request_slots.device)
             ]
-            committed_token_ids = stage_host_values(
+            committed_token_ids = async_h2d(
                 [
                     token_id
                     for sched_req in requests
                     for token_id in sched_req.data.req.output_ids
                 ],
-                torch.long,
-                request_slots.device,
+                dtype=torch.long,
+                device=request_slots.device,
             )
             self.slot_repetition_scales.index_put_(
                 (committed_slots, committed_token_ids),
