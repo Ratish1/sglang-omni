@@ -6990,6 +6990,7 @@ def test_qwen3_tts_stream_output_prepends_reference_once(device_type: str) -> No
     )
     data = Qwen3TTSSGLangRequestData(
         ref_code=torch.tensor([[10, 11], [12, 13]]),
+        ref_code_len=2,
         latest_stream_code_chunk=torch.tensor([1, 2], device=device_type),
         stream_codec_output=True,
         stage_payload=payload,
