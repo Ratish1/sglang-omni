@@ -9,7 +9,14 @@ from typing import Literal, Protocol, runtime_checkable
 
 # A consumer that stops puts a wakeup into its own queue to release a blocked get.
 IncomingMessageType = Literal[
-    "new_request", "stream_chunk", "stream_done", "abort", "admin", "stop", "wakeup"
+    "new_request",
+    "stream_chunk",
+    "stream_step",
+    "stream_done",
+    "abort",
+    "admin",
+    "stop",
+    "wakeup",
 ]
 
 
@@ -23,10 +30,32 @@ class IncomingMessage:
 @dataclass
 class OutgoingMessage:
     request_id: str
-    type: Literal["result", "stream", "error", "kv_transfer", "admitted", "wakeup"]
+    type: Literal[
+        "result", "stream", "stream_step", "error", "kv_transfer", "admitted", "wakeup"
+    ]
     data: object = None
     target: str | None = None
     metadata: dict[str, object] | None = None
+
+
+@dataclass(eq=False, frozen=True, kw_only=True)
+class StreamStep:
+    """One scheduler step's stream output for one same-process target, as one message.
+
+    request_ids are the requests the step produced output for, opened holds the stream
+    metadata of those whose first output this is, and data is the receiver's contract.
+    """
+
+    request_ids: list[str]
+    opened: dict[str, dict[str, object]]
+    data: object
+
+
+@runtime_checkable
+class StreamStepEmitter(Protocol):
+    """A scheduler that can send one stream message a step to a same-process target."""
+
+    def enable_stream_steps(self, target: str) -> None: ...
 
 
 def put_messages(

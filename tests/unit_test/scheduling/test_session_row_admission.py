@@ -39,6 +39,7 @@ class KVAllocator:
 
 class AdmissionScheduler:
     enable_plain_fallback = False
+    model_runner = None
     get_num_allocatable_reqs = OmniScheduler.get_num_allocatable_reqs
 
     def __init__(

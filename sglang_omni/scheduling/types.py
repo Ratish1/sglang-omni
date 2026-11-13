@@ -131,6 +131,9 @@ class ARRequestData:
     prefill_input_embeds: "torch.Tensor | None" = None
     decode_input_embeds: list["torch.Tensor"] | None = field(default_factory=list)
 
+    def on_detached(self) -> None:
+        """The scheduler is done with this request; no step reads or writes it after this."""
+
 
 RequestDataT = TypeVar("RequestDataT", bound=ARRequestData, default=ARRequestData)
 RequestDataInput = TypeVar(

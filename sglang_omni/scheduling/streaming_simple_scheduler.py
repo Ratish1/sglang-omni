@@ -23,7 +23,7 @@ from typing import Callable
 
 from sglang_omni.pipeline.stage.stream_queue import StreamItem
 from sglang_omni.proto.request import StagePayload
-from sglang_omni.scheduling.message import IncomingMessage, OutgoingMessage
+from sglang_omni.scheduling.message import IncomingMessage, OutgoingMessage, StreamStep
 
 logger = logging.getLogger(__name__)
 
@@ -129,6 +129,13 @@ class StreamingSimpleScheduler:
                 self.emit_error(request_id, exc)
                 self.abort(request_id)
 
+    def accepts_stream_steps(self) -> bool:
+        """Whether a same-process sender may deliver one StreamStep a step instead of its chunks."""
+        return False
+
+    def handle_stream_step(self, step: StreamStep) -> None:
+        raise NotImplementedError(f"{type(self).__name__} does not accept stream steps")
+
     def on_stream_done(self, request_id: str) -> list[OutgoingMessage] | None:
         """Messages that complete the stream, or None to complete it later
         through complete_stream_request."""
@@ -218,6 +225,11 @@ class StreamingSimpleScheduler:
                 self.handle_stream_chunk_batch(self.collect_stream_chunk_batch(msg))
             else:
                 self.handle_stream_chunk(msg.request_id, msg.data)
+            return
+        else:
+            pass
+        if msg.type == "stream_step":
+            self.handle_stream_step(msg.data)
             return
         else:
             pass

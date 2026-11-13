@@ -19,6 +19,7 @@ import numpy as np
 import numpy.typing as npt
 import torch
 
+from sglang_omni.models.qwen3_tts.code_table import Qwen3TTSCodeTable
 from sglang_omni.models.qwen3_tts.payload_types import Qwen3TTSState
 from sglang_omni.models.qwen3_tts.reference_encoder_cuda_graph import (
     DEFAULT_QWEN3_TTS_REFERENCE_ENCODER_BUCKET_FRAMES,
@@ -155,7 +156,11 @@ class Qwen3TTSSGLangRequestData(SGLangARRequestData):
     """Qwen3-TTS scheduler-owned request state."""
 
     enforce_request_limits: bool = True
-    output_codes: list[torch.Tensor] = field(default_factory=list)
+    # note (ratish): the request's frames are code_table.codes[code_row]: ref_code_len
+    # reference frames, then frame_count generated ones.
+    code_table: Qwen3TTSCodeTable | None = None
+    code_row: int | None = None
+    frame_count: int = 0
     latest_stream_code_chunk: torch.Tensor | None = None
     codes_ready_event: torch.Event | None = None
     stream_ref_sent: bool = False
@@ -183,6 +188,33 @@ class Qwen3TTSSGLangRequestData(SGLangARRequestData):
         return self.decode_text_rows[
             min(frame_index, self.decode_text_rows.shape[0] - 1)
         ]
+
+    @property
+    def should_stream_codes(self) -> bool:
+        params = self.stage_payload.request.params
+        return (
+            self.stream_codec_output
+            and isinstance(params, dict)
+            and bool(params.get("stream"))
+        )
+
+    def committed_codes(self, first_frame: int, stop_frame: int) -> torch.Tensor:
+        """Generated frames [first_frame, stop_frame) as (frames, codebooks), a view of the table."""
+        assert stop_frame <= self.frame_count, (
+            f"Qwen3-TTS request {self.req.rid} reads {stop_frame} frames, "
+            f"{self.frame_count} are committed"
+        )
+        return self.code_table.codes[
+            self.code_row,
+            self.ref_code_len + first_frame : self.ref_code_len + stop_frame,
+        ]
+
+    def on_detached(self) -> None:
+        if self.code_row is not None:
+            self.code_table.drop(self.code_row)
+            self.code_row = None
+        else:
+            pass
 
 
 @dataclass
@@ -2007,6 +2039,17 @@ def build_sglang_qwen3_tts_request(
             (prepared.trailing_text_hidden, prepared.tts_pad_embed.reshape(1, -1))
         ),
     )
+    if ref_code_len and (
+        prepared.ref_code.ndim != 2
+        or prepared.ref_code.shape[-1] != model.config.num_code_groups
+    ):
+        raise ValueError(
+            "Qwen3-TTS reference codes must have shape [T, Q] matching "
+            f"{model.config.num_code_groups} codebooks, got "
+            f"{tuple(prepared.ref_code.shape)}"
+        )
+    else:
+        pass
     data.input_embeds_are_projected = True
     data.stage_payload = payload
     return data
@@ -2046,7 +2089,7 @@ def qwen3_tts_finish_reason(data: Qwen3TTSSGLangRequestData) -> str:
     # note (Junnan Li): the scheduler reason is absent when a stage owns the
     # terminal step, and reaching the budget there is still a length stop.
     max_new_tokens = data.max_new_tokens
-    if max_new_tokens is not None and len(data.output_codes) >= int(max_new_tokens):
+    if max_new_tokens is not None and data.frame_count >= int(max_new_tokens):
         return "length"
     else:
         pass
@@ -2057,22 +2100,10 @@ def apply_sglang_qwen3_tts_result(
     payload: StagePayload,
     data: Qwen3TTSSGLangRequestData,
 ) -> StagePayload:
-    code_parts: list[torch.Tensor] = []
-    if data.ref_code is not None and data.ref_code_len:
-        code_parts.append(data.ref_code.to(dtype=torch.long))
-    else:
-        pass
-    if data.output_codes:
-        code_parts.append(torch.stack(data.output_codes, dim=0).to(dtype=torch.long))
-    else:
-        pass
-
-    if code_parts:
-        device = code_parts[0].device
-        codes = torch.cat(
-            [part.to(device=device, dtype=torch.long) for part in code_parts],
-            dim=0,
-        )
+    frame_total = data.ref_code_len + data.frame_count
+    if frame_total:
+        # note (ratish): a copy, so the result holds no table row once the request ends.
+        codes = data.code_table.codes[data.code_row, :frame_total].clone()
         # note (ratish): the vocoder's decode and a cross-process send read these on the default stream, which waits for them as when the talker ran there.
         hand_off_to_default_stream(codes)
     else:
@@ -2082,7 +2113,7 @@ def apply_sglang_qwen3_tts_result(
         "audio_codes": codes,
         "ref_code_len": data.ref_code_len,
         "prompt_tokens": data.ref_code_len,
-        "completion_tokens": len(data.output_codes),
+        "completion_tokens": data.frame_count,
         "engine_time_s": time.perf_counter() - data.engine_start_s,
         "sample_rate": 24000,
         "finish_reason": qwen3_tts_finish_reason(data),
@@ -2097,6 +2128,30 @@ def apply_sglang_qwen3_tts_result(
         request=payload.request,
         data=result,
     )
+
+
+def first_stream_metadata(
+    data: Qwen3TTSSGLangRequestData, codebook_count: int
+) -> dict[str, object]:
+    """The stream contract the vocoder latches from a request's first frames."""
+    metadata: dict[str, object] = {
+        "modality": "audio_codes",
+        "stream": True,
+        "num_quantizers": codebook_count,
+        "ref_code_len": data.ref_code_len,
+    }
+    params = data.stage_payload.request.params
+    if INITIAL_CODEC_CHUNK_FRAMES_PARAM in params:
+        metadata[INITIAL_CODEC_CHUNK_FRAMES_PARAM] = params[
+            INITIAL_CODEC_CHUNK_FRAMES_PARAM
+        ]
+    else:
+        pass
+    if data.suppress_bootstrap_silence:
+        metadata["bootstrap_silence_suppression"] = True
+    else:
+        pass
+    return metadata
 
 
 def make_qwen3_tts_scheduler_adapters(
@@ -2127,12 +2182,7 @@ def make_qwen3_tts_scheduler_adapters(
     ) -> list[OutgoingMessage]:
         nonlocal handed_off_event
         del req_output
-        params = data.stage_payload.request.params
-        if (
-            not data.stream_codec_output
-            or not isinstance(params, dict)
-            or not params.get("stream")
-        ):
+        if not data.should_stream_codes:
             return []
         else:
             pass
@@ -2158,19 +2208,8 @@ def make_qwen3_tts_scheduler_adapters(
             "num_quantizers": int(codes.shape[-1]),
         }
         if not data.stream_ref_sent:
-            ref_code = data.ref_code
-            ref_code_len = 0
-            if ref_code is not None and ref_code.numel() > 0:
-                ref_code = ref_code.to(device=codes.device, dtype=torch.long)
-                if ref_code.ndim != 2 or ref_code.shape[-1] != codes.shape[-1]:
-                    raise ValueError(
-                        "Qwen3-TTS reference codes must have shape [T, Q] matching "
-                        f"stream codes, got {tuple(ref_code.shape)} and "
-                        f"{tuple(codes.shape)}"
-                    )
-                else:
-                    pass
-                ref_code_len = int(ref_code.shape[0])
+            if data.ref_code_len:
+                ref_code = data.ref_code.to(device=codes.device, dtype=torch.long)
                 codes = torch.cat((ref_code, codes), dim=0)
                 # note (luojiaxuan): the step's ready event was recorded before
                 # this cat, so the prefixed chunk needs its own.
@@ -2183,17 +2222,7 @@ def make_qwen3_tts_scheduler_adapters(
                     pass
             else:
                 pass
-            metadata["ref_code_len"] = ref_code_len
-            if INITIAL_CODEC_CHUNK_FRAMES_PARAM in params:
-                metadata[INITIAL_CODEC_CHUNK_FRAMES_PARAM] = params[
-                    INITIAL_CODEC_CHUNK_FRAMES_PARAM
-                ]
-            else:
-                pass
-            if data.suppress_bootstrap_silence:
-                metadata["bootstrap_silence_suppression"] = True
-            else:
-                pass
+            metadata = first_stream_metadata(data, int(codes.shape[-1]))
             data.stream_ref_sent = True
         else:
             pass

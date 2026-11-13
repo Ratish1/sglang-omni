@@ -107,6 +107,7 @@ from sglang_omni.scheduling.generation_batch_policy import (
 from sglang_omni.scheduling.message import (
     IncomingMessage,
     OutgoingMessage,
+    StreamStep,
     put_messages,
 )
 from sglang_omni.scheduling.sglang_backend.ar_session import (
@@ -194,6 +195,11 @@ def compact_decode_input_history(data: ARRequestData) -> None:
 
 def detach_request_data(req: Req) -> None:
     """Break Req -> data; async snapshots retain the one-way data -> Req edge."""
+    data = req.omni_data  # noqa: leading-underscore  # upstream spelling
+    if isinstance(data, ARRequestData):
+        data.on_detached()
+    else:
+        pass
     req.omni_data = None  # noqa: leading-underscore  # upstream spelling, or the public name is already taken
 
 
@@ -344,6 +350,7 @@ class OmniScheduler(Generic[RequestDataT]):
 
     model_runner: ModelRunner[RequestDataT] | None = None
     session_bridge: ARSessionBridge | None = None
+    stream_step_runner: ModelRunner[RequestDataT] | None = None
     scheduler_thread_id: int | None = None
     previous_pending_decode: PendingDecode | None = None
     async_decode_resolve_before_prefill: bool = False
@@ -2440,7 +2447,7 @@ class OmniScheduler(Generic[RequestDataT]):
             or beam_width is not None
             or not self.continuation_aware_admission
         ):
-            return _Upstream.get_num_allocatable_reqs(
+            allocatable = _Upstream.get_num_allocatable_reqs(
                 self,
                 running_bs,
                 beam_width=beam_width,
@@ -2454,13 +2461,22 @@ class OmniScheduler(Generic[RequestDataT]):
             )
             # note (Junnan Li): A unit whose session slot holds a request row reuses that row, so it does not count against the free rows.
             per_batch_limit = get_parallel().pp_max_micro_batch_size - running_bs
-            return min(
+            allocatable = min(
                 per_batch_limit,
                 free_request_rows
                 + bridge.count_row_reusing_requests(
                     self.waiting_queue, free_request_rows
                 ),
             )
+        runner_capacity = (
+            None
+            if self.model_runner is None
+            else self.model_runner.admission_capacity()
+        )
+        if runner_capacity is None:
+            return allocatable
+        else:
+            return min(allocatable, runner_capacity)
 
     def running_batch_admits_prefill(self) -> bool:
         """Whether the batch builder can admit a prefill beside the running batch.
@@ -2847,6 +2863,11 @@ class OmniScheduler(Generic[RequestDataT]):
         overrun) — emitting their extra chunk would corrupt the downstream
         vocoder's delayed-code stream. Aborted requests are suppressed for the
         same reason: an abort landing mid-step must not ship one more chunk."""
+        if self.stream_step_runner is not None:
+            self.emit_stream_step(skip_rids)
+            return
+        else:
+            pass
         bridge = self.session_bridge
         if self.stream_output_builder is None and bridge is None:
             return
@@ -2885,6 +2906,32 @@ class OmniScheduler(Generic[RequestDataT]):
             else:
                 self.stage_stream_messages(rid, messages, step_messages)
         put_messages(self.outbox, step_messages)
+
+    def enable_stream_steps(self, target: str) -> None:
+        """The stage found a same-process target that takes one message a step; the
+        runner opts in or keeps per-request chunks."""
+        if self.model_runner.enable_stream_steps(target):
+            self.stream_step_runner = self.model_runner
+        else:
+            pass
+
+    def emit_stream_step(self, skip_rids: Iterable[str]) -> None:
+        message = self.stream_step_runner.take_stream_step(
+            self.aborted_request_ids, frozenset(skip_rids)
+        )
+        if message is None:
+            return
+        else:
+            pass
+        step: StreamStep = message.data
+        for request_id in step.opened:
+            self.first_emit_done.add(request_id)
+            _emit_event(
+                request_id=request_id,
+                stage=None,
+                event_name="scheduler_first_emit",
+            )
+        self.outbox.put(message)
 
     def stage_stream_messages(
         self,

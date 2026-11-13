@@ -14,11 +14,13 @@ from collections import deque
 from collections.abc import Iterable, Iterator, Sequence
 from dataclasses import dataclass, field
 from itertools import count
+from operator import attrgetter
 from typing import TYPE_CHECKING, Literal, Mapping, TypedDict, TypeVar, overload
 
 import numpy as np
 import torch
 
+from sglang_omni.models.qwen3_tts.code_table import CodecFrameStep, Qwen3TTSCodeTable
 from sglang_omni.models.qwen3_tts.codec_state_arena import (
     CodecStateStats,
     Qwen3TTSCodecStateArena,
@@ -43,7 +45,7 @@ from sglang_omni.profiler.event_recorder import (
 )
 from sglang_omni.proto import StagePayload
 from sglang_omni.proto.admin import ADMIN_MODEL_INFO
-from sglang_omni.scheduling.message import IncomingMessage, OutgoingMessage
+from sglang_omni.scheduling.message import IncomingMessage, OutgoingMessage, StreamStep
 from sglang_omni.scheduling.pipeline_state import build_usage
 from sglang_omni.scheduling.streaming_vocoder import (
     INITIAL_CODEC_CHUNK_FRAMES_PARAM,
@@ -176,6 +178,10 @@ class Qwen3TTSStreamState:
     codec_slot: int | None = None
     codec_frame_position: int = 0
     suppress_bootstrap: bool = False
+    # note (ratish): a same-process stream's frames are this row of the engine's code
+    # table and code_chunks stays empty; a stream from elsewhere keeps its chunks.
+    frame_row: int | None = None
+    last_frames: CodecFrameStep | None = None
 
 
 @dataclass(eq=False)
@@ -245,16 +251,24 @@ class IncrementalDecodePlan:
 
     ``generated_frames`` and ``emitted_generated_frames`` keep the meaning they
     have on ``_Qwen3TTSDecodePlan``, so the shared commit path reads them the
-    same way for both plan kinds.
+    same way for both plan kinds. A plan on the code table has no decoder_input;
+    its cohort gathers fresh_frames from frame_row at start_frame in one read.
     """
 
-    decoder_input: torch.Tensor
+    decoder_input: torch.Tensor | None
     slot: int
     fresh_frames: int
     reference_trim_frames: int
     generated_frames: int
     emitted_generated_frames: int
     chunks: tuple[torch.Tensor, ...] = ()
+    frame_row: int | None = None
+    start_frame: int = 0
+    frames: CodecFrameStep | None = None
+
+    @property
+    def input_frames(self) -> int:
+        return self.fresh_frames
 
 
 @dataclass(eq=False)
@@ -288,6 +302,10 @@ class Qwen3TTSDecodePlan:
     window_start: int
     emitted_generated_frames: int
     chunks: tuple[torch.Tensor, ...] = ()
+
+    @property
+    def input_frames(self) -> int:
+        return int(self.decoder_input.shape[-1])
 
 
 DecodePlanT = TypeVar("DecodePlanT", Qwen3TTSDecodePlan, IncrementalDecodePlan)
@@ -934,6 +952,7 @@ class Qwen3TTSStreamingVocoderScheduler(
                 else bool(async_decode)
             )
         )
+        self.code_table: Qwen3TTSCodeTable | None = None
         # note (ratish): a whole-utterance graph runs the conv stack eagerly on every padded
         # frame; the window graphs decode the same frames with the codec's fused kernels.
         self.decodes_whole_requests = bool(
@@ -1532,6 +1551,153 @@ class Qwen3TTSStreamingVocoderScheduler(
             initial_chunk_frames=self.default_initial_chunk_frames
         )
 
+    def accepts_stream_steps(self) -> bool:
+        # note (ratish): without decode workers a stream decodes on this thread as each
+        # chunk lands, which the per-chunk path keeps.
+        return self.async_decode
+
+    def handle_stream_step(self, step: StreamStep) -> None:
+        """Move each stream of an engine step to its frame count under one lock hold; the
+        frames are already in the code table."""
+        frames = step.data
+        assert isinstance(frames, CodecFrameStep)
+        failed: list[str] = []
+        with self.state_lock:
+            self.code_table = frames.table
+            for request_id, row, frame_count in zip(
+                step.request_ids, frames.rows, frames.frame_counts, strict=True
+            ):
+                if request_id in step.opened:
+                    try:
+                        state = self.open_table_stream(
+                            request_id, row, step.opened[request_id]
+                        )
+                    except Exception as exc:
+                        self.emit_error(request_id, exc)
+                        self.abort_state(request_id)
+                        failed.append(request_id)
+                        continue
+                else:
+                    state = self.stream_states.get(request_id)
+                if state is None:
+                    continue
+                else:
+                    pass
+                state.total_frames = state.ref_frames + frame_count
+                state.last_frames = frames
+                if not self.should_decode(state, is_final=False):
+                    pass
+                elif state.decoded_chunks:
+                    self.schedule_followup(request_id, state)
+                else:
+                    self.schedule_initial(request_id, state)
+        for request_id in failed:
+            self.cleanup_aborted_request(request_id)
+
+    def open_table_stream(
+        self, request_id: str, row: int, metadata: Mapping[str, object]
+    ) -> Qwen3TTSStreamState | None:
+        """A stream's first step: the stream holds the engine's row for it until it ends,
+        and a stream that already ended gives the row straight back."""
+        state = self.get_or_create_stream_state(request_id)
+        if state is None:
+            self.code_table.drop(row)
+            return None
+        else:
+            pass
+        state.frame_row = row
+        self.latch_stream_contract(
+            request_id, state, metadata, origin="stream metadata"
+        )
+        state.ref_frames = state.pending_ref_frames
+        state.pending_ref_frames = 0
+        return state
+
+    def stream_codes(
+        self, state: Qwen3TTSStreamState, start_frame: int, end_frame: int
+    ) -> torch.Tensor:
+        """One stream's frames [start_frame, end_frame) as [1, Q, T], from its code table
+        row or its chunks; a table read is a copy, since the range screen clamps in place.
+        """
+        if state.frame_row is None:
+            self.wait_codes_ready(state)
+            codes = torch.cat(state.code_chunks, dim=0)
+            codes = codes[
+                start_frame - state.pruned_frames : end_frame - state.pruned_frames
+            ]
+        else:
+            state.last_frames.wait_written(
+                self.device_module.current_stream(self.device)
+            )
+            codes = self.code_table.codes[
+                state.frame_row, start_frame:end_frame
+            ].clone()
+        return codes.transpose(0, 1).unsqueeze(0)
+
+    def gather_table_codes(
+        self, plans: Sequence[IncrementalDecodePlan], width: int
+    ) -> torch.Tensor:
+        """A cohort's frames as [N, Q, width] in one read; a row short of width is zero
+        past its frames, as a pad leaves it."""
+        # note (ratish): the engine writes every step on one stream, so the newest step's
+        # write covers the older ones.
+        newest = max((plan.frames for plan in plans), key=attrgetter("step"))
+        newest.wait_written(self.device_module.current_stream(self.device))
+        # note (ratish): per thread, so each decode stream reads offsets it wrote itself.
+        offsets = getattr(self.decode_staging, "frame_offsets", None)
+        if offsets is None or offsets.shape[0] < width:
+            offsets = torch.arange(width, device=self.device)
+            self.decode_staging.frame_offsets = offsets
+        else:
+            pass
+        row_frames = self.code_table.row_frames
+        starts = self.codec_arena.staged(
+            "frame_starts",
+            [plan.frame_row * row_frames + plan.start_frame for plan in plans],
+        )
+        codes = self.code_table.frames[starts.unsqueeze(1) + offsets[:width]]
+        codes = codes.transpose(1, 2)
+        if any(plan.fresh_frames != width for plan in plans):
+            fresh_frames = self.codec_arena.staged(
+                "fresh_frames", [plan.fresh_frames for plan in plans]
+            )
+            codes.masked_fill_(
+                (offsets[:width] >= fresh_frames.unsqueeze(1)).unsqueeze(1), 0
+            )
+        else:
+            pass
+        return codes
+
+    def plans_decoder_input(
+        self, plans: Sequence[DecodePlanT], *, width: int | None = None
+    ) -> torch.Tensor:
+        """A batch's input [N, Q, T]: one read when every plan is on the code table, else
+        plan by plan, padded to width when one is given."""
+        if all(plan.decoder_input is None for plan in plans):
+            return self.gather_table_codes(
+                plans, plans[0].fresh_frames if width is None else width
+            )
+        else:
+            pass
+        rows = [
+            (
+                self.gather_table_codes([plan], plan.fresh_frames)
+                if plan.decoder_input is None
+                else plan.decoder_input
+            )
+            for plan in plans
+        ]
+        if width is None:
+            return torch.cat(rows, dim=0)
+        else:
+            return torch.cat(
+                [
+                    torch.nn.functional.pad(row, (0, width - plan.input_frames))
+                    for row, plan in zip(rows, plans, strict=True)
+                ],
+                dim=0,
+            )
+
     def latch_stream_contract(
         self,
         request_id: str,
@@ -1778,15 +1944,7 @@ class Qwen3TTSStreamingVocoderScheduler(
             )
         else:
             pass
-        self.wait_codes_ready(state)
-        codes = torch.cat(state.code_chunks, dim=0)
-        decoder_input = (
-            codes[
-                consumed_frames - state.pruned_frames : end_frame - state.pruned_frames
-            ]
-            .transpose(0, 1)
-            .unsqueeze(0)
-        )
+        decoder_input = self.stream_codes(state, consumed_frames, end_frame)
         bad_rows = self.screen_out_of_range_codes(decoder_input)
         raise_for_bad_rows(bad_rows, 1)
         incremental_decoder = self.incremental_decoder
@@ -1921,19 +2079,16 @@ class Qwen3TTSStreamingVocoderScheduler(
         else:
             pass
         end_frame = state.ref_frames + generated_frames
-        self.wait_codes_ready(state)
-        codes = torch.cat(state.code_chunks, dim=0)
-        decoder_input = (
-            codes[
-                consumed_frames - state.pruned_frames : end_frame - state.pruned_frames
-            ]
-            .transpose(0, 1)
-            .unsqueeze(0)
-        )
         fresh_frames = end_frame - consumed_frames
-        if fresh_frames <= 0 or int(decoder_input.shape[-1]) != fresh_frames:
+        if state.frame_row is None:
+            decoder_input = self.stream_codes(state, consumed_frames, end_frame)
+            sliced_frames = int(decoder_input.shape[-1])
+        else:
+            decoder_input = None
+            sliced_frames = fresh_frames
+        if fresh_frames <= 0 or sliced_frames != fresh_frames:
             raise RuntimeError(
-                f"Qwen3-TTS incremental codec planned {fresh_frames} fresh frames but sliced {int(decoder_input.shape[-1])}"
+                f"Qwen3-TTS incremental codec planned {fresh_frames} fresh frames but sliced {sliced_frames}"
             )
         else:
             pass
@@ -1946,6 +2101,9 @@ class Qwen3TTSStreamingVocoderScheduler(
             generated_frames=generated_frames,
             emitted_generated_frames=state.emitted_generated_frames,
             chunks=tuple(state.code_chunks),
+            frame_row=state.frame_row,
+            start_frame=consumed_frames,
+            frames=state.last_frames,
         )
 
     def extract_incremental_delta(
@@ -1996,6 +2154,13 @@ class Qwen3TTSStreamingVocoderScheduler(
     ) -> None:
         del request_id
         self.release_codec_slot(state)
+        # note (ratish): a stream ends after its last decode resolved; an aborted stream
+        # may still run one, which reads frames nobody hears and writes nothing to the row.
+        if state.frame_row is not None:
+            self.code_table.drop(state.frame_row)
+            state.frame_row = None
+        else:
+            pass
 
     def prune_incremental_codes(self, state: Qwen3TTSStreamState) -> None:
         committed_state = state.incremental_codec_state
@@ -2050,13 +2215,7 @@ class Qwen3TTSStreamingVocoderScheduler(
             and state.pruned_frames + int(state.code_chunks[0].shape[0]) <= window_start
         ):
             state.pruned_frames += int(state.code_chunks.pop(0).shape[0])
-        self.wait_codes_ready(state)
-        codes = torch.cat(state.code_chunks, dim=0)
-        decoder_input = (
-            codes[window_start - state.pruned_frames : window_end - state.pruned_frames]
-            .transpose(0, 1)
-            .unsqueeze(0)
-        )
+        decoder_input = self.stream_codes(state, window_start, window_end)
         return Qwen3TTSDecodePlan(
             decoder_input=decoder_input,
             absolute_emitted_frames=absolute_emitted,
@@ -2132,7 +2291,7 @@ class Qwen3TTSStreamingVocoderScheduler(
         else:
             pass
         if self.deterministic_inference and len(plans) > 1:
-            decoder_input = torch.cat([plan.decoder_input for plan in plans], dim=0)
+            decoder_input = self.plans_decoder_input(plans)
             bad_rows = self.screen_out_of_range_codes(decoder_input)
             raise_for_bad_rows(bad_rows, len(plans))
             deltas: list[torch.Tensor] = []
@@ -2147,18 +2306,11 @@ class Qwen3TTSStreamingVocoderScheduler(
             and incremental.runner is not None
             and incremental.runner.mode == "tail"
         ):
-            width = max(plan.fresh_frames for plan in plans)
-            decoder_input = torch.cat(
-                [
-                    torch.nn.functional.pad(
-                        plan.decoder_input, (0, width - plan.fresh_frames)
-                    )
-                    for plan in plans
-                ],
-                dim=0,
+            decoder_input = self.plans_decoder_input(
+                plans, width=max(plan.fresh_frames for plan in plans)
             )
         else:
-            decoder_input = torch.cat([plan.decoder_input for plan in plans], dim=0)
+            decoder_input = self.plans_decoder_input(plans)
         bad_rows = self.screen_out_of_range_codes(decoder_input)
         with torch.inference_mode():
             if stream is None:
@@ -3587,11 +3739,9 @@ class Qwen3TTSStreamingVocoderScheduler(
     def group_decode_plans(
         planned: list[tuple[str, Qwen3TTSStreamState, DecodePlanT]],
     ) -> list[list[tuple[str, Qwen3TTSStreamState, DecodePlanT]]]:
-        groups: dict[
-            tuple[int, ...], list[tuple[str, Qwen3TTSStreamState, DecodePlanT]]
-        ] = {}
+        groups: dict[int, list[tuple[str, Qwen3TTSStreamState, DecodePlanT]]] = {}
         for entry in planned:
-            groups.setdefault(tuple(entry[2].decoder_input.shape), []).append(entry)
+            groups.setdefault(entry[2].input_frames, []).append(entry)
         return list(groups.values())
 
     def commit_initial(

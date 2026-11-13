@@ -1247,7 +1247,9 @@ class Qwen3TTSTalker(Qwen3TTSPromptBuilderMixin, nn.Module):
         self.cached_params_dict = dict(self.named_parameters())
         self.sampler = None
 
-    def prepare_decode_buffers(self, requests: list[SchedulerRequest]) -> None:
+    def prepare_decode_buffers(self, requests: list[SchedulerRequest]) -> bool:
+        """Stage the batch's per-request sampling values; False when the batch is the one
+        last staged and nothing was written."""
         batch_size = len(requests)
         if batch_size > self.sub_temperature_tensor.shape[0]:
             raise RuntimeError("Qwen3-TTS sampling buffers are too small")
@@ -1274,7 +1276,7 @@ class Qwen3TTSTalker(Qwen3TTSPromptBuilderMixin, nn.Module):
                 pass
             rids.append((rid, data.decode_prep_epoch))
         if rids is not None and rids == self.decode_prep_rids:
-            return
+            return False
         else:
             pass
         self.decode_prep_rids = None
@@ -1337,7 +1339,7 @@ class Qwen3TTSTalker(Qwen3TTSPromptBuilderMixin, nn.Module):
 
         if batch_size == 0:
             self.decode_prep_rids = rids
-            return
+            return True
         else:
             pass
 
@@ -1356,6 +1358,7 @@ class Qwen3TTSTalker(Qwen3TTSPromptBuilderMixin, nn.Module):
                 non_blocking=True,
             )
         self.decode_prep_rids = rids
+        return True
 
     @torch.no_grad()
     def forward(
