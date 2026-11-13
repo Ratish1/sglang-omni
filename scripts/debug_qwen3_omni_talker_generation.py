@@ -61,6 +61,13 @@ def main() -> None:
         default="checkpoint",
     )
     parser.add_argument("--paired-normalization-controls", action="store_true")
+    parser.add_argument(
+        "--residual-policy",
+        choices=("greedy", "sampled"),
+        nargs="+",
+        default=("greedy",),
+        help="Free-running residual-code policies, in execution order, with repeatable request-derived Torch RNG.",
+    )
     parser.add_argument("--audit-loaded-weights", action="store_true")
     parser.add_argument(
         "--capture-layer-states",
@@ -158,12 +165,22 @@ def main() -> None:
             if arguments.paired_normalization_controls
             else (arguments.normalization_semantics,)
         )
-        for trace_directory, sampling_order, normalization_mode in (
-            (directory, order, mode)
+        for (
+            trace_directory,
+            sampling_order,
+            normalization_mode,
+            residual_policy_index,
+            residual_policy,
+        ) in (
+            (directory, order, mode, policy_index, policy)
             for directory in arguments.trace_directory
             for order in arguments.sampling_order
             for mode in normalization_modes
+            for policy_index, policy in enumerate(arguments.residual_policy)
         ):
+            reference.code_predictor.generation_config.do_sample = (
+                residual_policy == "sampled"
+            )
             normalization.boundary_calls = 0
             normalization.query_key_calls = 0
             normalization.boundary_enabled = normalization_mode in (
@@ -369,10 +386,28 @@ def main() -> None:
                 if arguments.paired_normalization_controls
                 else sampling_directory
             )
+            if len(arguments.residual_policy) > 1:
+                mode_directory = (
+                    mode_directory
+                    / f"residual-{residual_policy_index}-{residual_policy}"
+                )
+            else:
+                pass
             case_directory = (
                 mode_directory / trace_directory.parent.name / trace_directory.name
             )
             case_directory.mkdir(parents=True)
+            if residual_policy == "sampled" or len(arguments.residual_policy) > 1:
+                torch.manual_seed(seed)
+                torch.save(
+                    {
+                        "cpu": torch.get_rng_state(),
+                        "cuda": torch.cuda.get_rng_state(reference.device),
+                    },
+                    case_directory / "initial-rng-state.pt",
+                )
+            else:
+                pass
             generated_ids = before["input_ids"][None].to(reference.device)
             prepared_inputs = {
                 "inputs_embeds": prefill[None],
@@ -592,6 +627,13 @@ def main() -> None:
                 ),
                 "normalization_semantics": normalization_mode,
                 "sampling_order": sampling_order,
+                "residual_policy": residual_policy,
+                "residual_torch_seed": (
+                    seed
+                    if residual_policy == "sampled"
+                    or len(arguments.residual_policy) > 1
+                    else None
+                ),
                 "normalization_boundary_calls": normalization.boundary_calls,
                 "normalization_query_key_calls": normalization.query_key_calls,
                 "frames": frame_reports,
