@@ -28,9 +28,16 @@ def main() -> None:
     parser.add_argument("--capture-token-rows", type=int, default=112)
     parser.add_argument("--capture-talker-operators", action="store_true")
     parser.add_argument(
+        "--reference-predictor-mode", choices=("identity", "checkpoint")
+    )
+    parser.add_argument(
         "--control", action="append", choices=("original", "rounded-activation")
     )
     arguments = parser.parse_args()
+    if arguments.reference_predictor_mode is not None and arguments.request_id is None:
+        raise ValueError("Reference predictor controls require selected request IDs")
+    else:
+        pass
     arguments.output_directory.mkdir(exist_ok=False)
     source = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
     template = json.loads(arguments.server_template.read_text())
@@ -110,6 +117,16 @@ def main() -> None:
             )
         else:
             pass
+        if arguments.reference_predictor_mode is not None:
+            diagnostic_environment.update(
+                {
+                    "SGLANG_OMNI_DIAGNOSTIC_REFERENCE_PREDICTOR_MODE": arguments.reference_predictor_mode,
+                    "SGLANG_OMNI_DIAGNOSTIC_REFERENCE_MODEL_PATH": arguments.model_path,
+                    "SGLANG_OMNI_DIAGNOSTIC_REFERENCE_MODEL_REVISION": arguments.model_revision,
+                }
+            )
+        else:
+            pass
         environment = os.environ.copy()
         assert not any(
             name.startswith("SGLANG_OMNI_DIAGNOSTIC_") for name in environment
@@ -132,6 +149,7 @@ def main() -> None:
                     "diagnostic_environment": diagnostic_environment,
                     "scope": "Native rounded SiLU in the first checkpoint-derived accept_hidden_layer Thinker blocks, including warmup and decode.",
                     "model_revision": arguments.model_revision,
+                    "reference_predictor_mode": arguments.reference_predictor_mode,
                     "accepted_layer": accepted_layer,
                     "timing_scope": "Bounded operator observers enabled in both arms, not production performance qualification.",
                 },

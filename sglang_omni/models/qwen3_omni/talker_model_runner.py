@@ -33,6 +33,10 @@ from sglang_omni.model_runner.prefill_inputs import (
 from sglang_omni.models.qwen3_omni.conditioning_capture import (
     TalkerConditioningRecorder,
 )
+from sglang_omni.models.qwen3_omni.predictor_control import (
+    CheckpointPredictorControl,
+    PredictorControlMode,
+)
 from sglang_omni.scheduling.message import OutgoingMessage, put_messages
 from sglang_omni.scheduling.pending_text_queue import PendingTextTensorQueue
 from sglang_omni.scheduling.sglang_backend.request_data import (
@@ -229,6 +233,26 @@ class QwenTalkerModelRunner(ModelRunner["SGLangARRequestData"]):
         else:
             pass
 
+        self.reference_predictor_control: CheckpointPredictorControl | None = None
+        predictor_mode = os.environ.get(
+            "SGLANG_OMNI_DIAGNOSTIC_REFERENCE_PREDICTOR_MODE"
+        )
+        if predictor_mode is not None:
+            recorder = self.model.conditioning_recorder
+            assert recorder is not None and recorder.request_ids is not None
+            self.reference_predictor_control = CheckpointPredictorControl(
+                mode=PredictorControlMode(predictor_mode),
+                model_path=os.environ["SGLANG_OMNI_DIAGNOSTIC_REFERENCE_MODEL_PATH"],
+                model_revision=os.environ[
+                    "SGLANG_OMNI_DIAGNOSTIC_REFERENCE_MODEL_REVISION"
+                ],
+                main_embedding=self.model.get_input_embeddings(),
+                request_ids=recorder.request_ids,
+                directory=recorder.directory.parent / "reference-predictor-control",
+            )
+        else:
+            pass
+
     def execute(self, scheduler_output: SchedulerOutput) -> ModelRunnerOutput:
         return super().execute(scheduler_output)
 
@@ -323,6 +347,15 @@ class QwenTalkerModelRunner(ModelRunner["SGLangARRequestData"]):
         else:
             pass
         self.model.code_predictor_forward(layer0_codes, talker_hidden)
+        if self.reference_predictor_control is not None:
+            self.reference_predictor_control.apply(
+                requests,
+                self.model.output_codes,
+                self.model.output_embeds,
+                result.logits_output.hidden_states,
+            )
+        else:
+            pass
         if self.model.conditioning_recorder is not None:
             self.model.conditioning_recorder.record_outputs(
                 forward_batch,
@@ -399,6 +432,15 @@ class QwenTalkerModelRunner(ModelRunner["SGLangARRequestData"]):
 
         batch_size = len(requests)
         result.next_token_ids = self.model.sampled_token_ids[:batch_size].clone()
+        if self.reference_predictor_control is not None:
+            self.reference_predictor_control.apply(
+                requests,
+                self.model.output_codes,
+                self.model.output_embeds,
+                result.logits_output.hidden_states,
+            )
+        else:
+            pass
         if self.model.conditioning_recorder is not None:
             self.model.conditioning_recorder.record_outputs(
                 forward_batch,
