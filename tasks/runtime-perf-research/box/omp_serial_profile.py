@@ -25,7 +25,9 @@ from torch.profiler import ProfilerActivity, profile
 from benchmarks.dataset.mmsu import load_mmsu_samples
 from benchmarks.dataset.seedtts import load_seedtts_samples
 from sglang_omni.models.qwen3_omni.components.preprocessor import Qwen3OmniPreprocessor
+from sglang_omni.preprocessing.resource_connector import MEDIA_WORKERS
 from sglang_omni.proto.request import OmniRequest, StagePayload
+from sglang_omni.utils.cpu import automatic_video_decode_threads
 
 MODEL = "Qwen/Qwen3-Omni-30B-A3B-Instruct"
 SEEDTTS = "zhaochenyang20/seed-tts-eval-arrow"
@@ -74,7 +76,11 @@ def call(
 
 
 def run(args: argparse.Namespace) -> None:
-    preprocessor = Qwen3OmniPreprocessor(MODEL, max_seq_len=32768)
+    preprocessor = Qwen3OmniPreprocessor(
+        MODEL,
+        max_seq_len=32768,
+        video_decode_threads=automatic_video_decode_threads(MEDIA_WORKERS),
+    )
     kinds = build_inputs(args.speech, args.audio)
     record: dict[str, object] = {
         "omp_num_threads": os.environ.get("OMP_NUM_THREADS"),
