@@ -7,6 +7,7 @@ from __future__ import annotations
 import logging
 import os
 from dataclasses import replace
+from enum import Enum
 from typing import Iterable, Optional, Tuple
 
 import torch
@@ -391,6 +392,13 @@ class Qwen3OmniMoeTalkerSparseMoeBlock(Qwen3OmniMoeThinkerTextSparseMoeBlock):
 # ---------------------------------------------------------------------------
 
 
+class TalkerNormalizationSemantics(str, Enum):
+    NATIVE = "native"
+    CHECKPOINT = "checkpoint"
+    CHECKPOINT_BOUNDARY = "checkpoint-boundary"
+    CHECKPOINT_QUERY_KEY = "checkpoint-query-key"
+
+
 class Qwen3OmniMoeTalkerDecoderLayer(Qwen3OmniMoeThinkerTextDecoderLayer):
     """Talker decoder layer with routed and gated shared experts."""
 
@@ -404,9 +412,12 @@ class Qwen3OmniMoeTalkerDecoderLayer(Qwen3OmniMoeThinkerTextDecoderLayer):
         attention, feed_forward = Qwen3OmniMoeThinkerTextDecoderLayer.stage_facts(
             config, layer_id
         )
-        if (
-            os.environ.get("SGLANG_OMNI_DIAGNOSTIC_CHECKPOINT_TALKER_NORMALIZATION")
-            == "1"
+        normalization = TalkerNormalizationSemantics(
+            os.environ.get("SGLANG_OMNI_DIAGNOSTIC_TALKER_NORMALIZATION", "native")
+        )
+        if normalization in (
+            TalkerNormalizationSemantics.CHECKPOINT,
+            TalkerNormalizationSemantics.CHECKPOINT_BOUNDARY,
         ):
             return (
                 replace(attention, read=UNFUSED_NORM_READOUT),
@@ -436,9 +447,16 @@ class Qwen3OmniMoeTalkerTextModel(nn.Module):
         super().__init__()
         self.config = config
         self.vocab_size = config.vocab_size
-        self.checkpoint_normalization: bool = (
-            os.environ.get("SGLANG_OMNI_DIAGNOSTIC_CHECKPOINT_TALKER_NORMALIZATION")
-            == "1"
+        normalization = TalkerNormalizationSemantics(
+            os.environ.get("SGLANG_OMNI_DIAGNOSTIC_TALKER_NORMALIZATION", "native")
+        )
+        self.is_checkpoint_boundary_normalization_enabled: bool = normalization in (
+            TalkerNormalizationSemantics.CHECKPOINT,
+            TalkerNormalizationSemantics.CHECKPOINT_BOUNDARY,
+        )
+        is_checkpoint_query_key_normalization_enabled = normalization in (
+            TalkerNormalizationSemantics.CHECKPOINT,
+            TalkerNormalizationSemantics.CHECKPOINT_QUERY_KEY,
         )
 
         # Codec embedding (standard nn.Embedding, not VocabParallel - vocab is small)
@@ -467,11 +485,15 @@ class Qwen3OmniMoeTalkerTextModel(nn.Module):
         self.end_layer = config.num_hidden_layers
 
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        if self.checkpoint_normalization:
+        if self.is_checkpoint_boundary_normalization_enabled:
             self.norm.cast_x_before_out_mul = True
             for layer in self.layers:
                 layer.input_layernorm.cast_x_before_out_mul = True
                 layer.post_attention_layernorm.cast_x_before_out_mul = True
+        else:
+            pass
+        if is_checkpoint_query_key_normalization_enabled:
+            for layer in self.layers:
                 layer.self_attn.q_norm.cast_x_before_out_mul = True
                 layer.self_attn.k_norm.cast_x_before_out_mul = True
         else:
@@ -546,7 +568,7 @@ class Qwen3OmniMoeTalkerTextModel(nn.Module):
                 ),
             )
 
-        if self.checkpoint_normalization:
+        if self.is_checkpoint_boundary_normalization_enabled:
             hidden_states = residual_batch.fold(hidden_states, forward_batch)
         else:
             pass
