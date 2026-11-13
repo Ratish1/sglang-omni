@@ -135,6 +135,10 @@ def main() -> None:
         device="cuda",
         gpu_id=1,
         incremental_codec_cuda_graph_window_frames=(),
+        # note (ratish): Dynamo counts recompiles per code object, so this executor's compiles
+        # would spend the limit the whole-request executor's capture needs; main's
+        # non-streaming decode never runs the compiled kernel.
+        incremental_codec_compile=False,
         shares_engine_speech_tokenizer=False,
     )
     assert (
