@@ -190,6 +190,16 @@ class Qwen3OmniThinkerForCausalLM(nn.Module):
             capture_token_rows = int(
                 os.environ["SGLANG_OMNI_DIAGNOSTIC_CAPTURE_TOKEN_ROWS"]
             )
+            all_rotary_forwards = (
+                os.environ.get("SGLANG_OMNI_DIAGNOSTIC_ROPE_ALL_FORWARDS") == "1"
+            )
+            if all_rotary_forwards:
+                assert (
+                    len({id(layer.self_attn.rotary_emb) for layer in self.model.layers})
+                    == 1
+                )
+            else:
+                pass
             self.delivery_recorder = ThinkerDeliveryRecorder(
                 directory=Path(directory),
                 multimodal_token_ids=(
@@ -214,7 +224,8 @@ class Qwen3OmniThinkerForCausalLM(nn.Module):
                 rotary_precision=RotaryPrecisionControl(
                     enabled=os.environ.get("SGLANG_OMNI_DIAGNOSTIC_ROPE_NO_CONTRACTION")
                     == "1",
-                    token_rows=capture_token_rows,
+                    token_rows=None if all_rotary_forwards else capture_token_rows,
+                    all_forwards=all_rotary_forwards,
                 ),
             )
             for layer_index in range(accept_hidden_layer + 1):

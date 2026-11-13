@@ -49,7 +49,8 @@ def mrope_without_contraction(
 @dataclass(kw_only=True)
 class RotaryPrecisionControl:
     enabled: bool
-    token_rows: int
+    token_rows: int | None
+    all_forwards: bool
     is_active: bool = False
 
     def install(self, rotary: MRotaryEmbedding) -> None:
@@ -62,7 +63,11 @@ class RotaryPrecisionControl:
         def forward_triton(
             positions: torch.Tensor, query: torch.Tensor, key: torch.Tensor
         ) -> tuple[torch.Tensor, torch.Tensor]:
-            if self.enabled and self.is_active and len(query) == self.token_rows:
+            if (
+                self.enabled
+                and (self.all_forwards or self.is_active)
+                and (self.token_rows is None or len(query) == self.token_rows)
+            ):
                 mrope_without_contraction(
                     query,
                     key,
