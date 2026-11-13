@@ -33,17 +33,24 @@ def pass_logs(boot: Path, cell: str) -> list[Path]:
     return logs
 
 
-def read_log(path: Path) -> dict[str, float]:
+def read_log(path: Path) -> list[dict[str, float]]:
+    """One row per benchmark run in the log; a clean pass with repeats prints one summary per repeat."""
     text = path.read_text(errors="replace")
-    values = {}
-    for name, pattern in FIELDS.items():
-        found = re.findall(pattern, text)
-        if found:
-            value = float(found[-1])
-            values[name] = value if name == "rps" else value * 1e3
-        else:
-            pass
-    return values
+    found = {name: re.findall(pattern, text) for name, pattern in FIELDS.items()}
+    rows = []
+    for index in range(len(found["ttfc_ms"])):
+        rows.append(
+            {
+                name: (
+                    float(values[index])
+                    if name == "rps"
+                    else float(values[index]) * 1e3
+                )
+                for name, values in found.items()
+                if index < len(values)
+            }
+        )
+    return rows
 
 
 def main() -> None:
@@ -53,8 +60,11 @@ def main() -> None:
         arm, boots = spec.split("=")
         arm_means[arm] = []
         for boot in boots.split(","):
-            rows = [read_log(path) for path in pass_logs(run_dir / boot, cell)]
-            rows = [row for row in rows if row]
+            rows = [
+                row
+                for path in pass_logs(run_dir / boot, cell)
+                for row in read_log(path)
+            ]
             if not rows:
                 print(f"{arm} {boot}: no passes")
                 continue
