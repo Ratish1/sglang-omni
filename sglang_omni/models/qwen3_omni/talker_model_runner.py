@@ -109,24 +109,31 @@ class QwenTalkerModelRunner(ModelRunner["SGLangARRequestData"]):
             )
             destination = Path(directory)
             destination.mkdir(parents=True, exist_ok=True)
+            native_parameters = {
+                name: {
+                    "shape": list(tensor.shape),
+                    "dtype": str(tensor.dtype),
+                    "sha256": hashlib.sha256(
+                        tensor.detach()
+                        .cpu()
+                        .contiguous()
+                        .view(torch.uint8)
+                        .numpy()
+                        .tobytes()
+                    ).hexdigest(),
+                }
+                for name, tensor in self.model.named_parameters()
+            }
+            (destination / "native-talker-parameters.json").write_text(
+                json.dumps({"parameters": native_parameters}, indent=2)
+            )
             (destination / "native-predictor-weights.json").write_text(
                 json.dumps(
                     {
                         "configuration": self.model.code_predictor.config.code_predictor_config.to_dict(),
                         "weights": {
-                            name: {
-                                "shape": list(tensor.shape),
-                                "dtype": str(tensor.dtype),
-                                "sha256": hashlib.sha256(
-                                    tensor.detach()
-                                    .cpu()
-                                    .contiguous()
-                                    .view(torch.uint8)
-                                    .numpy()
-                                    .tobytes()
-                                ).hexdigest(),
-                            }
-                            for name, tensor in self.model.named_parameters()
+                            name: identity
+                            for name, identity in native_parameters.items()
                             if name.startswith("code_predictor.")
                             or name
                             in ("model.codec_embedding.weight", "codec_head.weight")
