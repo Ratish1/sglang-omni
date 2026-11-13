@@ -47,6 +47,7 @@ def main() -> None:
     precision.add_argument("--compare-native-rounding-interaction", action="store_true")
     precision.add_argument("--compare-native-weight-interaction", action="store_true")
     precision.add_argument("--compare-native-expert-stages", action="store_true")
+    precision.add_argument("--compare-native-expert-only-stages", action="store_true")
     arguments = parser.parse_args()
     arguments.output_directory.mkdir(exist_ok=False)
     torch.cuda.set_device(arguments.gpu)
@@ -396,9 +397,18 @@ def main() -> None:
         or arguments.compare_native_rounding_interaction
         or arguments.compare_native_weight_interaction
         or arguments.compare_native_expert_stages
+        or arguments.compare_native_expert_only_stages
     ):
         assert arguments.hold_native_prefix_cache
-        if arguments.compare_native_expert_stages:
+        if arguments.compare_native_expert_only_stages:
+            variants = (
+                "checkpoint",
+                "residual-rotary-experts",
+                "expert-only-rounded-activation",
+                "expert-only-rounded-down",
+                "expert-only-rounded-reduction",
+            )
+        elif arguments.compare_native_expert_stages:
             variants = (
                 "checkpoint",
                 "source-arithmetic",

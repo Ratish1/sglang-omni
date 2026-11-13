@@ -38,6 +38,9 @@ def main() -> None:
             "source-rounded-activation",
             "source-rounded-down",
             "source-rounded-reduction",
+            "expert-only-rounded-activation",
+            "expert-only-rounded-down",
+            "expert-only-rounded-reduction",
         ),
         default="chained",
     )

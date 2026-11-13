@@ -78,6 +78,9 @@ def run_precision_controls(
             "source-rounded-activation",
             "source-rounded-down",
             "source-rounded-reduction",
+            "expert-only-rounded-activation",
+            "expert-only-rounded-down",
+            "expert-only-rounded-reduction",
         ],
         ...,
     ] = ("checkpoint", "router", "experts", "router-and-experts"),
@@ -114,6 +117,9 @@ def run_precision_controls(
         "source-rounded-activation",
         "source-rounded-down",
         "source-rounded-reduction",
+        "expert-only-rounded-activation",
+        "expert-only-rounded-down",
+        "expert-only-rounded-reduction",
     )
     expert_variants = (
         "experts",
@@ -125,6 +131,9 @@ def run_precision_controls(
         "source-rounded-activation",
         "source-rounded-down",
         "source-rounded-reduction",
+        "expert-only-rounded-activation",
+        "expert-only-rounded-down",
+        "expert-only-rounded-reduction",
     )
     query_key_variants = (
         "source-arithmetic",
@@ -224,6 +233,9 @@ def run_precision_controls(
             "source-rounded-activation",
             "source-rounded-down",
             "source-rounded-reduction",
+            "expert-only-rounded-activation",
+            "expert-only-rounded-down",
+            "expert-only-rounded-reduction",
         )
         for layer_index in range(captured.accepted_layer):
             cache.update(
@@ -312,11 +324,17 @@ def run_precision_controls(
                     pass
                 if name in expert_variants:
                     rounding: Literal["source", "activation", "down", "reduction"]
-                    if name == "source-rounded-activation":
+                    if name in (
+                        "source-rounded-activation",
+                        "expert-only-rounded-activation",
+                    ):
                         rounding = "activation"
-                    elif name == "source-rounded-down":
+                    elif name in ("source-rounded-down", "expert-only-rounded-down"):
                         rounding = "down"
-                    elif name == "source-rounded-reduction":
+                    elif name in (
+                        "source-rounded-reduction",
+                        "expert-only-rounded-reduction",
+                    ):
                         rounding = "reduction"
                     else:
                         rounding = "source"
@@ -387,6 +405,14 @@ def run_precision_controls(
                 ), layer_index
             else:
                 pass
+        if name.startswith("expert-only-rounded-"):
+            assert all(
+                routing[f"layer_{layer_index:02d}_weights"].dtype == torch.bfloat16
+                and not normalization_comparisons[f"{name}_layer_{layer_index:02d}"]
+                for layer_index in range(captured.accepted_layer)
+            )
+        else:
+            pass
         torch.save(
             {
                 "embedded_input": embedded.cpu(),
@@ -425,9 +451,18 @@ def run_precision_controls(
                         "activation": "Round SiLU to BF16 before multiplying up.",
                         "down": "Round the same FP32 down-GEMM result to BF16 before router scaling.",
                         "reduction": "Accumulate weighted BF16 expert outputs in ascending expert order with a BF16 store after each addition.",
-                    }[name.removeprefix("source-rounded-")]
+                    }[name.rsplit("-", 1)[1]]
                     for name in variants
-                    if name.startswith("source-rounded-")
+                    if name.startswith(("source-rounded-", "expert-only-rounded-"))
+                },
+                "expert_stage_contexts": {
+                    name: (
+                        "Native residual/rotary, checkpoint Q/K normalization and BF16 router scales."
+                        if name.startswith("expert-only-rounded-")
+                        else "Native residual/rotary/QK normalization and FP32 router scales."
+                    )
+                    for name in variants
+                    if name.startswith(("source-rounded-", "expert-only-rounded-"))
                 },
                 "scope": "Only the stated arithmetic families change in an independently loaded checkpoint producer. Prefix KV, embeddings, positions and other layer operations stay fixed. Source-style expert arithmetic uses cuBLAS rather than the native Triton kernel. The rotary control runs the actual native Triton rotary kernel with retained native tables and independently checks every resulting Q/K against the measured BF16 multiply/FMA formula before propagation. Residual controls run the original FlashInfer normalization kernels, retaining the unrounded two-operand sum for normalization and the BF16 residual for the next addition. Every layer checks composed residual identity. Source-arithmetic also applies the real paired Q/K-normalization kernel before rotation, retains FP32 router scales and uses the already-validated source-style expert rounding. Its norm distance to an FP32 formula is measured separately, not assumed bit-identical. Attention and linear projections remain reference operations. These are causal diagnostic controls, not production repairs or a full native-backend replay.",
             },
