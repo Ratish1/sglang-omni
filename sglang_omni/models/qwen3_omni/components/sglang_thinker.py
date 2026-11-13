@@ -183,6 +183,19 @@ class Qwen3OmniThinkerForCausalLM(nn.Module):
         directory = os.environ.get("SGLANG_OMNI_DIAGNOSTIC_DELIVERY_DIRECTORY")
         if directory is not None:
             assert 0 < accept_hidden_layer < self.config.num_hidden_layers
+            if (
+                os.environ.get("SGLANG_OMNI_DIAGNOSTIC_ROUNDED_THINKER_ACTIVATION")
+                == "1"
+            ):
+                for layer in self.model.layers[:accept_hidden_layer]:
+                    experts = layer.mlp.experts
+                    assert isinstance(experts.quant_method, UnquantizedFusedMoEMethod)
+                    assert experts.runner_backend.is_triton()
+                    assert not experts.quant_method.w13_swiglu_interleaved
+                    assert experts.moe_runner_config.activation == "silu"
+                    experts.moe_runner_config.activation = "silu_rounded"
+            else:
+                pass
             record_thinker_state(self.model, self.lm_head, Path(directory))
             self.delivery_recorder = ThinkerDeliveryRecorder(
                 directory=Path(directory),
