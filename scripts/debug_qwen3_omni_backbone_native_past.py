@@ -34,15 +34,21 @@ def log_probabilities(
     allowed: torch.Tensor,
     parameters: SamplingParameters,
 ) -> torch.Tensor:
+    repetition_penalty = torch.full(
+        (1, 1), parameters.repetition_penalty, dtype=logits.dtype, device=logits.device
+    )
+    temperature = torch.full(
+        (1, 1), parameters.temperature, dtype=logits.dtype, device=logits.device
+    )
     repeated = torch.zeros_like(logits, dtype=torch.bool)
     repeated[:, history] = True
     penalties = torch.where(
         logits > 0,
-        logits / parameters.repetition_penalty,
-        logits * parameters.repetition_penalty,
+        logits / repetition_penalty,
+        logits * repetition_penalty,
     )
     processed = torch.where(repeated, penalties, logits)
-    return torch.log_softmax(processed[:, allowed] / parameters.temperature, dim=-1)
+    return torch.log_softmax(processed[:, allowed] / temperature, dim=-1)
 
 
 @torch.inference_mode()

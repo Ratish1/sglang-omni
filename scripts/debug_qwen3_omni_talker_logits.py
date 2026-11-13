@@ -49,6 +49,12 @@ def main() -> None:
     assert not loading["missing_keys"], loading["missing_keys"]
     assert not loading["mismatched_keys"], loading["mismatched_keys"]
     reference.eval()
+    repetition_penalty = torch.tensor(
+        [[arguments.repetition_penalty]], dtype=torch.float32, device=reference.device
+    )
+    temperature = torch.tensor(
+        [[arguments.temperature]], dtype=torch.float32, device=reference.device
+    )
     reports = []
     with torch.inference_mode():
         for directory in arguments.trace_directory:
@@ -119,14 +125,12 @@ def main() -> None:
                 for logits in (actual, expected):
                     penalized = torch.where(
                         logits > 0,
-                        logits / arguments.repetition_penalty,
-                        logits * arguments.repetition_penalty,
+                        logits / repetition_penalty,
+                        logits * repetition_penalty,
                     )
                     scaled = torch.where(repetition_mask, penalized, logits)
                     distributions.append(
-                        torch.log_softmax(
-                            scaled[:, allowed] / arguments.temperature, dim=-1
-                        )
+                        torch.log_softmax(scaled[:, allowed] / temperature, dim=-1)
                     )
                 native_distribution, reference_distribution = distributions
                 chosen_token = int(native["codec_ids"][0, 0])

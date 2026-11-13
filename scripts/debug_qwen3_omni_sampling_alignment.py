@@ -97,6 +97,12 @@ def main() -> None:
             top_p = torch.tensor([parameters.top_p], device="cuda")
             minimum_probability = torch.zeros(1, device="cuda")
             seed = torch.tensor([parameters.sampling_seed], device="cuda")
+            repetition_penalty = torch.tensor(
+                [[parameters.repetition_penalty]], dtype=torch.float32, device="cuda"
+            )
+            temperature = torch.tensor(
+                [[parameters.temperature]], dtype=torch.float32, device="cuda"
+            )
             counts: Counter[str] = Counter()
             assert len(request.frames) == len(logits["checkpoint"])
             for frame in request.frames:
@@ -114,8 +120,8 @@ def main() -> None:
                     ].float()
                     penalized_logits = torch.where(
                         raw_logits > 0,
-                        raw_logits / parameters.repetition_penalty,
-                        raw_logits * parameters.repetition_penalty,
+                        raw_logits / repetition_penalty,
+                        raw_logits * repetition_penalty,
                     )
                     sampling_logits = torch.where(
                         repeated, penalized_logits, raw_logits
@@ -123,7 +129,7 @@ def main() -> None:
                     probability_rows.append(
                         torch.softmax(
                             sampling_logits.masked_fill(suppressed, float("-inf"))
-                            / parameters.temperature,
+                            / temperature,
                             dim=-1,
                         )
                     )

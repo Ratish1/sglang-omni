@@ -51,6 +51,12 @@ def main() -> None:
         top_p = torch.tensor([parameters.top_p], device=device)
         minimum_probability = torch.tensor([parameters.min_p], device=device)
         seed = torch.tensor([parameters.sampling_seed], device=device)
+        repetition_penalty = torch.tensor(
+            [[parameters.repetition_penalty]], dtype=torch.float32, device=device
+        )
+        temperature = torch.tensor(
+            [[parameters.temperature]], dtype=torch.float32, device=device
+        )
         repeated = torch.zeros(
             (1, len(torch.load(files[0], weights_only=True)["logits"])),
             dtype=torch.bool,
@@ -111,12 +117,12 @@ def main() -> None:
                         pass
                     penalized = torch.where(
                         logits > 0,
-                        logits / parameters.repetition_penalty,
-                        logits * parameters.repetition_penalty,
+                        logits / repetition_penalty,
+                        logits * repetition_penalty,
                     )
                     logits = torch.where(repeated, penalized, logits)
                     logits[:, parameters.suppress_tokens] = float("-inf")
-                    probabilities = (logits / parameters.temperature).softmax(-1)
+                    probabilities = (logits / temperature).softmax(-1)
                 chosen, weights, permutation, selected_weight = (
                     top_k_top_p_min_p_sampling_from_probs_torch(
                         probabilities,

@@ -193,6 +193,14 @@ def main() -> None:
         top_k = torch.tensor([arguments.top_k], device=reference.device)
         top_p = torch.tensor([arguments.top_p], device=reference.device)
         minimum_probability = torch.zeros(1, device=reference.device)
+        repetition_penalty = torch.tensor(
+            [[arguments.repetition_penalty]],
+            dtype=torch.float32,
+            device=reference.device,
+        )
+        temperature = torch.tensor(
+            [[arguments.temperature]], dtype=torch.float32, device=reference.device
+        )
         intervention_mode = (
             "native"
             if arguments.normalization_semantics == "checkpoint"
@@ -510,16 +518,14 @@ def main() -> None:
                 logits = output.logits[:, -1].float()
                 penalized_logits = torch.where(
                     logits > 0,
-                    logits / arguments.repetition_penalty,
-                    logits * arguments.repetition_penalty,
+                    logits / repetition_penalty,
+                    logits * repetition_penalty,
                 )
                 sampling_logits = torch.where(
                     repeated_tokens, penalized_logits, logits
                 ).masked_fill(~allowed_tokens, float("-inf"))
                 sampling_position = len(prefill) - 1 + frame_index
-                probabilities = torch.softmax(
-                    sampling_logits / arguments.temperature, dim=-1
-                )
+                probabilities = torch.softmax(sampling_logits / temperature, dim=-1)
                 sampling_positions = torch.tensor(
                     [sampling_position], device=reference.device
                 )
