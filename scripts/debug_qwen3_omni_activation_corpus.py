@@ -24,6 +24,8 @@ def main() -> None:
     parser.add_argument("--output-directory", type=Path, required=True)
     parser.add_argument("--base-url", required=True)
     parser.add_argument("--concurrency", type=int, required=True)
+    parser.add_argument("--request-id", action="append")
+    parser.add_argument("--capture-token-rows", type=int, default=112)
     arguments = parser.parse_args()
     arguments.output_directory.mkdir(exist_ok=False)
     source = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
@@ -34,11 +36,13 @@ def main() -> None:
     accepted_layer = configuration.talker_config.accept_hidden_layer
     server_command = [*template["command"], "--log-level", "debug"]
     request_hashes: dict[str, str] = {}
+    workload_request_ids: dict[str, list[str]] = {}
     for workload in ("tts", "mmsu"):
         request_files = list(
             (arguments.input_directory / workload).glob("*.request.json")
         )
         assert len(request_files) == (1088 if workload == "tts" else 40)
+        workload_request_ids[workload] = []
         for request_file in request_files:
             request_bytes = request_file.read_bytes()
             payload = json.loads(request_bytes)
@@ -49,6 +53,13 @@ def main() -> None:
             assert payload["temperature"] == (0.7 if workload == "tts" else 0.0)
             assert len(payload["audios"]) == 1
             assert Path(payload["audios"][0]).is_file(), payload["audios"]
+            if (
+                arguments.request_id is None
+                or payload["request_id"] in arguments.request_id
+            ):
+                workload_request_ids[workload].append(payload["request_id"])
+            else:
+                pass
             request_hashes[str(request_file)] = hashlib.sha256(
                 request_bytes
             ).hexdigest()
@@ -56,7 +67,15 @@ def main() -> None:
         json.dumps(request_hashes, indent=2)
     )
     selected_ids = arguments.output_directory / "selected-request-ids.json"
-    selected_ids.write_text("[]\n")
+    selected_ids.write_text(json.dumps(arguments.request_id or []))
+    if arguments.request_id is not None:
+        assert {
+            request_id
+            for request_ids in workload_request_ids.values()
+            for request_id in request_ids
+        } == set(arguments.request_id)
+    else:
+        pass
     native_state = None
     for control in ("original", "rounded-activation"):
         output = arguments.output_directory / control
@@ -64,11 +83,19 @@ def main() -> None:
         diagnostic_environment = {
             "SGLANG_OMNI_DIAGNOSTIC_DELIVERY_DIRECTORY": str(output / "delivery"),
             "SGLANG_OMNI_CORPUS_REQUEST_ID_FILE": str(selected_ids),
-            "SGLANG_OMNI_DIAGNOSTIC_CAPTURE_TOKEN_ROWS": "112",
+            "SGLANG_OMNI_DIAGNOSTIC_CAPTURE_TOKEN_ROWS": str(
+                arguments.capture_token_rows
+            ),
             "SGLANG_OMNI_DIAGNOSTIC_ROUNDED_THINKER_ACTIVATION": (
                 "1" if control == "rounded-activation" else "0"
             ),
         }
+        if arguments.request_id is not None:
+            diagnostic_environment["SGLANG_OMNI_DIAGNOSTIC_CONDITIONING_DIRECTORY"] = (
+                str(output / "conditioning")
+            )
+        else:
+            pass
         environment = os.environ.copy()
         assert not any(
             name.startswith("SGLANG_OMNI_DIAGNOSTIC_") for name in environment
@@ -121,6 +148,11 @@ def main() -> None:
                         pass
                     assert actual_layer == expected_layer, actual_layer["layer_index"]
             for workload in ("tts", "mmsu"):
+                request_ids = workload_request_ids[workload]
+                if not request_ids:
+                    continue
+                else:
+                    pass
                 inputs = arguments.input_directory / workload
                 command = [
                     "python3",
@@ -149,6 +181,11 @@ def main() -> None:
                     "--output-directory",
                     str(output / workload),
                 ]
+                if arguments.request_id is not None:
+                    for request_id in request_ids:
+                        command.extend(("--request-id", request_id))
+                else:
+                    pass
                 (output / f"{workload}-command.json").write_text(
                     json.dumps(command, indent=2)
                 )
@@ -158,7 +195,7 @@ def main() -> None:
                     )
                 result = json.loads((output / workload / "results.json").read_text())
                 assert result["summary"]["failed_requests"] == 0
-                assert len(result["per_request"]) == (1088 if workload == "tts" else 40)
+                assert len(result["per_request"]) == len(request_ids)
                 assert all(
                     record["finish_reason"] == "stop"
                     for record in result["per_request"]

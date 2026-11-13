@@ -93,6 +93,13 @@ async def replay(arguments: argparse.Namespace) -> None:
     requests: dict[str, ReplayRequest] = {}
     for response_path in arguments.input_directory.glob("*.response.json"):
         record = SavedRequest.model_validate_json(response_path.read_bytes())
+        if (
+            arguments.request_id is not None
+            and record.request_id not in arguments.request_id
+        ):
+            continue
+        else:
+            pass
         request_bytes = response_path.with_name(
             response_path.name.removesuffix(".response.json") + ".request.json"
         ).read_bytes()
@@ -106,6 +113,13 @@ async def replay(arguments: argparse.Namespace) -> None:
         requests[record.sample_id] = ReplayRequest(
             record=record, request_bytes=request_bytes
         )
+    if arguments.request_id is not None:
+        assert {request.record.request_id for request in requests.values()} == set(
+            arguments.request_id
+        )
+        sample_ids = [sample_id for sample_id in sample_ids if sample_id in requests]
+    else:
+        pass
     assert len(sample_ids) == len(set(sample_ids)) == len(requests)
     assert set(sample_ids) == set(requests)
     httpx.get(f"{arguments.base_url}/health", timeout=5).raise_for_status()
@@ -344,6 +358,7 @@ def main() -> None:
     parser.add_argument("--concurrency", type=int)
     parser.add_argument("--asr-port", type=int)
     parser.add_argument("--asr-model")
+    parser.add_argument("--request-id", action="append")
     arguments = parser.parse_args()
     if arguments.mode == "replay":
         assert arguments.reference_results and arguments.base_url
