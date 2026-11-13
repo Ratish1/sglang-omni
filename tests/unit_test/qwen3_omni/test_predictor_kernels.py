@@ -681,7 +681,7 @@ def test_decode_attention_applies_to_bf16_caches_on_cuda_where_the_pair_fits_a_t
 
 @accelerator
 @pytest.mark.accelerator
-def test_codebook_step_matches_argmax_gather_and_add() -> None:
+def test_codebook_step_matches_argmax_and_gather() -> None:
     device = torch.device("cuda")
     vocab, rows, column = 2048, 8, 5
     generator = torch.Generator(device=device).manual_seed(7)
@@ -691,18 +691,14 @@ def test_codebook_step_matches_argmax_gather_and_add() -> None:
     logits[2] = float("-inf")
     logits[3, 11] = logits[3, 2047] = float("inf")
     weight = torch.randn(vocab, HIDDEN, device=device, generator=generator).to(DTYPE)
-    summed = torch.randn(rows, HIDDEN, device=device, generator=generator).to(DTYPE)
     codes = torch.full((rows, NUM_CODE_GROUPS), -1, device=device, dtype=torch.long)
     expected_codes = torch.argmax(logits, dim=-1)
     expected_matrix = codes.clone()
     expected_matrix[:, column] = expected_codes
-    expected_summed = summed.clone()
-    expected_summed.add_(weight[expected_codes])
-    codebook_input = codebook_step(logits, weight, codes[:, column], summed)
+    codebook_input = codebook_step(logits, weight, codes[:, column])
     assert expected_codes[:4].tolist() == [9, 4, 0, 11]
     assert torch.equal(codes, expected_matrix)
     assert torch.equal(codebook_input[:, 0], weight[expected_codes])
-    assert torch.equal(summed, expected_summed)
 
 
 @accelerator
@@ -763,12 +759,19 @@ def test_decode_attention_tracks_fp32_and_reads_no_slot_past_a_rows_position(
 @accelerator
 @pytest.mark.accelerator
 @pytest.mark.usefixtures("published_server_args")
+@pytest.mark.parametrize("is_fused", [True, False])
 def test_captured_predictor_step_replays_fresh_inputs_as_the_torch_codebook_ops_do(
     monkeypatch: pytest.MonkeyPatch,
+    is_fused: bool,
 ) -> None:
+    """Repeated BF16 additions caused feedback drift from the code embedding reduction."""
     device = torch.device("cuda")
     vocab, rows = 2048, 3
-    talker = fuse(build_talker(device, seed=31))
+    talker = build_talker(device, seed=31)
+    if is_fused:
+        talker = fuse(talker)
+    else:
+        pass
     talker.code_predictor.lm_head = [
         TupleLinear(HIDDEN, vocab).to(device, DTYPE) for _ in range(NUM_CODE_GROUPS - 1)
     ]
@@ -807,12 +810,10 @@ def test_captured_predictor_step_replays_fresh_inputs_as_the_torch_codebook_ops_
         logits: torch.Tensor,
         embedding_weight: torch.Tensor,
         codes: torch.Tensor,
-        summed: torch.Tensor,
     ) -> torch.Tensor:
         code = torch.argmax(logits, dim=-1)
         codes.copy_(code)
         embedding = embedding_weight[code]
-        summed.add_(embedding)
         return embedding[:, None, :]
 
     generator = torch.Generator(device=device).manual_seed(33)
@@ -825,6 +826,13 @@ def test_captured_predictor_step_replays_fresh_inputs_as_the_torch_codebook_ops_
         )
         graph.replay()
         replayed = (captured_codes.clone(), captured_embeds.clone())
+        feedback_embeddings = [layer0_embedding(replayed[0][:, 0])]
+        for group, embedding in enumerate(talker.code_predictor.model.codec_embedding):
+            feedback_embeddings.append(embedding(replayed[0][:, group + 1]))
+        expected_feedback = (
+            torch.cat(feedback_embeddings, dim=1).sum(dim=1).unsqueeze(1)
+        )
+        assert torch.equal(replayed[1], expected_feedback)
         with monkeypatch.context() as patch, torch.no_grad():
             patch.setattr(talker_module, "codebook_step", torch_codebook_ops)
             expected_codes, expected_embeds = step()
