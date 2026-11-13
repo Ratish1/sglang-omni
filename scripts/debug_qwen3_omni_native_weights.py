@@ -6,10 +6,11 @@ import argparse
 import hashlib
 import json
 from pathlib import Path
+from typing import Literal
 
 import torch
 from huggingface_hub import snapshot_download
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from safetensors import safe_open
 from transformers import Qwen3OmniMoeConfig
 from transformers.conversion_mapping import (
@@ -34,6 +35,117 @@ class NativeParameter(BaseModel):
 
 class NativeManifest(BaseModel):
     parameters: dict[str, NativeParameter]
+
+
+class NativeRotaryModule(BaseModel):
+    class_name: Literal["RotaryEmbedding", "MRotaryEmbedding"] = Field(alias="class")
+    base: float
+    rotary_dim: int
+    head_size: int
+    position_start: int
+    is_neox_style: bool
+    use_fallback_kernel: bool
+
+
+class NativeBufferRuntime(BaseModel):
+    predictor_fused_layers: bool
+    predictor_triton_attention: bool
+    predictor_exact_add_norm: bool
+    predictor_rope_stores_kv: bool
+    rotary_modules: dict[str, NativeRotaryModule]
+
+
+@torch.inference_mode()
+def audit_native_talker_buffers(
+    reference: Qwen3OmniMoeTalkerForConditionalGeneration,
+    directory: Path,
+    output_file: Path,
+) -> None:
+    runtime_bytes = (directory / "native-talker-buffer-runtime.json").read_bytes()
+    runtime = NativeBufferRuntime.model_validate_json(runtime_bytes)
+    buffer_file = directory / "native-talker-buffers.pt"
+    buffers = torch.load(buffer_file, weights_only=True)
+    visited: set[str] = set()
+    reports = []
+    for name, module in runtime.rotary_modules.items():
+        if name.startswith("code_predictor."):
+            rotary = reference.code_predictor.model.rotary_emb
+        else:
+            assert name.startswith("model.")
+            rotary = reference.model.rotary_emb
+        configuration = rotary.config
+        parameters = configuration.rope_parameters
+        assert parameters["rope_type"] == "default"
+        assert module.base == parameters["rope_theta"]
+        assert module.rotary_dim == module.head_size == configuration.head_dim
+        assert module.is_neox_style and module.position_start == 0
+        buffer_name = f"{name}.cos_sin_cache"
+        actual = buffers[buffer_name].to(reference.device)
+        assert actual.isfinite().all()
+        assert actual.ndim == 2 and actual.shape[1] == module.rotary_dim
+        expected_tables = []
+        for device in (torch.device("cpu"), reference.device):
+            inverse_frequencies = 1.0 / (
+                module.base
+                ** (
+                    torch.arange(
+                        0, module.rotary_dim, 2, dtype=torch.float32, device=device
+                    )
+                    / module.rotary_dim
+                )
+            )
+            positions = torch.arange(len(actual), dtype=torch.float32, device=device)
+            angles = torch.outer(positions, inverse_frequencies)
+            expected_tables.append(
+                torch.cat((angles.cos(), angles.sin()), dim=-1).to(
+                    device=reference.device, dtype=actual.dtype
+                )
+            )
+        exact_cpu = torch.equal(actual, expected_tables[0])
+        exact_gpu = torch.equal(actual, expected_tables[1])
+        visited.add(buffer_name)
+        if module.class_name == "MRotaryEmbedding":
+            section = parameters["mrope_section"]
+            axes = torch.zeros(module.rotary_dim // 2, dtype=torch.long)
+            if parameters.get("interleaved", False):
+                for axis in (1, 2):
+                    axes[axis : section[axis] * 3 : 3] = axis
+            else:
+                axes = torch.repeat_interleave(torch.arange(3), torch.tensor(section))
+            axis_name = f"{name}.axis_map"
+            assert torch.equal(buffers[axis_name], axes)
+            visited.add(axis_name)
+        else:
+            assert actual.dtype == torch.float32
+        reports.append(
+            {
+                "module": name,
+                "class": module.class_name,
+                "shape": list(actual.shape),
+                "dtype": str(actual.dtype),
+                "checkpoint_geometry_exact": True,
+                "cpu_table_exact": exact_cpu,
+                "gpu_table_exact": exact_gpu,
+                "maximum_gpu_table_error": float(
+                    (actual - expected_tables[1]).abs().max()
+                ),
+            }
+        )
+    unvisited = sorted(buffers.keys() - visited)
+    with buffer_file.open("rb") as source:
+        buffers_sha256 = hashlib.file_digest(source, "sha256").hexdigest()
+    report = {
+        "runtime_sha256": hashlib.sha256(runtime_bytes).hexdigest(),
+        "buffers_sha256": buffers_sha256,
+        "runtime": runtime.model_dump(by_alias=True),
+        "rotary_modules": reports,
+        "unvisited_buffers": unvisited,
+        "scope": "Actual registered buffers after native prefill and residual prediction. Checkpoint theta, dimensions and axes are checked independently, and CPU/GPU FP32 table construction is compared in the actual consumer dtype. This is not a speech-quality or every-kernel oracle.",
+    }
+    output_file.write_text(json.dumps(report, indent=2))
+    print(json.dumps(report))
+    assert reports and not unvisited
+    assert all(row["cpu_table_exact"] or row["gpu_table_exact"] for row in reports)
 
 
 @torch.inference_mode()
@@ -116,6 +228,7 @@ def main() -> None:
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--component", choices=("thinker", "talker"), default="thinker")
     parser.add_argument("--gpu", type=int)
+    parser.add_argument("--buffer-directory", type=Path)
     arguments = parser.parse_args()
     manifest_bytes = arguments.manifest.read_bytes()
     manifest = NativeManifest.model_validate_json(manifest_bytes)
@@ -158,6 +271,14 @@ def main() -> None:
             model_revision=arguments.model_revision,
             manifest_sha256=hashlib.sha256(manifest_bytes).hexdigest(),
         )
+        if arguments.buffer_directory is not None:
+            audit_native_talker_buffers(
+                reference,
+                arguments.buffer_directory,
+                arguments.output.with_name(arguments.output.stem + "-buffers.json"),
+            )
+        else:
+            pass
         return
     else:
         pass
