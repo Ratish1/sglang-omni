@@ -188,6 +188,7 @@ def test_qwen3_tts_scales_each_draw_by_the_ids_its_request_generated() -> None:
             request_id=request_id,
             data=Qwen3TTSSGLangRequestData(
                 repetition_penalty=repetition_penalty,
+                code_row=0,
                 req=types.SimpleNamespace(
                     output_ids=output_ids,
                     inflight_middle_chunks=middle_chunks,
