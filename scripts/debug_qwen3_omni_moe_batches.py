@@ -24,6 +24,7 @@ from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import (
 
 from scripts.debug_qwen3_omni_feedback_audit import compare_tensors
 from scripts.qwen3_omni_checkpoint_weights import audit_checkpoint_weights
+from scripts.qwen3_omni_talker_expert_rounding import expert_rounding_stages
 
 
 class WeightFingerprint(BaseModel):
@@ -64,6 +65,7 @@ def main() -> None:
     parser.add_argument("--model-path", required=True)
     parser.add_argument("--model-revision", required=True)
     parser.add_argument("--gpu", type=int, required=True)
+    parser.add_argument("--rounding-stages", action="store_true")
     parser.add_argument("--output-directory", type=Path, required=True)
     arguments = parser.parse_args()
     arguments.output_directory.mkdir(exist_ok=False)
@@ -174,6 +176,8 @@ def main() -> None:
     maximum_shared_gate_error = 0.0
     matching_routing_batches = 0
     maximum_checkpoint_expert_error = 0.0
+    rounding_stage_exact_batches: dict[str, int] = {}
+    rounding_stage_maximum_relative_errors: dict[str, float] = {}
     with (arguments.output_directory / "layers.jsonl").open("w") as output:
         for filename in filenames:
             frame = int(filename.name.split("-")[0])
@@ -300,6 +304,32 @@ def main() -> None:
                 checkpoint_expert_difference = compare_tensors(
                     tensors["routed_output"], held_routing_expert_output
                 )
+                if arguments.rounding_stages:
+                    stage_outputs = expert_rounding_stages(
+                        reference_layer.mlp.experts,
+                        hidden_states,
+                        indices.long(),
+                        weights,
+                    )
+                    assert torch.equal(
+                        stage_outputs["checkpoint_expert_order_bfloat16_sum"],
+                        held_routing_expert_output,
+                    )
+                    rounding_differences = {
+                        name: compare_tensors(tensors["routed_output"], value)
+                        for name, value in stage_outputs.items()
+                    }
+                    for name, stage_difference in rounding_differences.items():
+                        rounding_stage_exact_batches[name] = (
+                            rounding_stage_exact_batches.get(name, 0)
+                            + stage_difference.exact
+                        )
+                        rounding_stage_maximum_relative_errors[name] = max(
+                            rounding_stage_maximum_relative_errors.get(name, 0.0),
+                            stage_difference.relative_l2_error or 0.0,
+                        )
+                else:
+                    rounding_differences = {}
                 record = {
                     "frame": int(filename.name.split("-")[0]),
                     "layer": layer_index,
@@ -339,6 +369,10 @@ def main() -> None:
                             held_routing_expert_output[row],
                         )
                     ),
+                    "rounding_stages": {
+                        name: asdict(stage_difference)
+                        for name, stage_difference in rounding_differences.items()
+                    },
                 }
                 output.write(json.dumps(record) + "\n")
                 output.flush()
@@ -382,6 +416,9 @@ def main() -> None:
                 "maximum_shared_gate_error": maximum_shared_gate_error,
                 "matching_checkpoint_expert_membership_batches": matching_routing_batches,
                 "maximum_checkpoint_expert_error_with_native_routing": maximum_checkpoint_expert_error,
+                "rounding_stage_exact_batches": rounding_stage_exact_batches,
+                "rounding_stage_maximum_relative_errors": rounding_stage_maximum_relative_errors,
+                "rounding_scope": "Per-expert cuBLAS GEMMs preserve checkpoint row order and independently separate activation, weighted-store and reduction rounding. They are not the native grouped-GEMM geometry or a bit-exact CUTLASS SiLU implementation. Both FMA and separate multiply/add are reported. The final checkpoint stage must match the original eager expert calculation exactly; other differences are measurements, not proof of an invalid native operation.",
                 "scope": "Complete original batches, native packed-weight hashes and observed per-geometry tactic choices. Fallback -1 identifies the same internal heuristic request, not a resolved tactic ID. Default replay is a numerical control, not a quality claim or backend recommendation.",
             },
             indent=2,
