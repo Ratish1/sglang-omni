@@ -120,6 +120,7 @@ def main() -> None:
         token_count, top_k = expert_indices.shape
         route_shape = (token_count, top_k, hidden.shape[-1])
         source_routes = torch.zeros(route_shape, dtype=hidden.dtype, device=device)
+        rounded_down_only_routes = torch.zeros_like(source_routes)
         rounded_activation_routes = torch.zeros_like(source_routes)
         rounded_down_routes = torch.zeros_like(source_routes)
         checkpoint_output = torch.zeros_like(hidden)
@@ -195,6 +196,9 @@ def main() -> None:
             source_routes[token_indices, ranks] = (source_down * scales).to(
                 hidden.dtype
             )
+            rounded_down_only_routes[token_indices, ranks] = (
+                source_down.to(hidden.dtype).float() * scales
+            ).to(hidden.dtype)
             rounded_activation_routes[token_indices, ranks] = (
                 rounded_activation_down * scales
             ).to(hidden.dtype)
@@ -207,6 +211,9 @@ def main() -> None:
                 (checkpoint_down * scales).to(hidden.dtype),
             )
         source_output = source_routes.float().sum(1).to(hidden.dtype)
+        rounded_down_only_output = (
+            rounded_down_only_routes.float().sum(1).to(hidden.dtype)
+        )
         rounded_activation_output = (
             rounded_activation_routes.float().sum(1).to(hidden.dtype)
         )
@@ -215,6 +222,9 @@ def main() -> None:
         differences = {
             "native_to_source_rounding_formula": compare_tensors(
                 actual[live], source_output[live]
+            ),
+            "native_to_rounded_down_only": compare_tensors(
+                actual[live], rounded_down_only_output[live]
             ),
             "native_to_rounded_activation": compare_tensors(
                 actual[live], rounded_activation_output[live]
