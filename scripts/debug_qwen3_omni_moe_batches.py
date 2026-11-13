@@ -66,6 +66,7 @@ def main() -> None:
     parser.add_argument("--model-revision", required=True)
     parser.add_argument("--gpu", type=int, required=True)
     parser.add_argument("--rounding-stages", action="store_true")
+    parser.add_argument("--verify-profile-alias", type=int, nargs=2)
     parser.add_argument("--output-directory", type=Path, required=True)
     arguments = parser.parse_args()
     arguments.output_directory.mkdir(exist_ok=False)
@@ -171,6 +172,7 @@ def main() -> None:
     exact_replays = 0
     comparisons = 0
     maximum_replay_error = 0.0
+    exact_profile_alias_replays = 0
     exact_router_batches = 0
     exact_shared_gate_projections = 0
     maximum_shared_gate_error = 0.0
@@ -251,7 +253,13 @@ def main() -> None:
                     assert len(tactics) == 1, (shapes, capturing, operation, tactics)
                     profiles.append(tactics.pop())
                 replayed = []
-                for selected_profiles in (profiles, [-1, -1]):
+                profile_choices = [profiles, [-1, -1]]
+                if arguments.verify_profile_alias is not None:
+                    assert profiles == [-1, -1]
+                    profile_choices.append(arguments.verify_profile_alias)
+                else:
+                    pass
+                for selected_profiles in profile_choices:
                     replayed.append(
                         cutlass_fused_moe(
                             input=hidden_states,
@@ -271,6 +279,13 @@ def main() -> None:
                     hidden_states.cpu(), snapshot["batch_mlp_normalized"]
                 )
                 difference = compare_tensors(tensors["routed_output"], replayed[0])
+                if arguments.verify_profile_alias is not None:
+                    profile_alias_difference = compare_tensors(
+                        tensors["routed_output"], replayed[2]
+                    )
+                    exact_profile_alias_replays += profile_alias_difference.exact
+                else:
+                    profile_alias_difference = None
                 reference_layer = reference.model.layers[layer_index]
                 shared_gate_difference = compare_tensors(
                     snapshot["shared_gate"].to(reference.device),
@@ -338,6 +353,11 @@ def main() -> None:
                     "captured_graph": capturing,
                     "profiles": profiles,
                     "native_replay": asdict(difference),
+                    "explicit_profile_alias_replay": (
+                        asdict(profile_alias_difference)
+                        if profile_alias_difference is not None
+                        else None
+                    ),
                     "selected_row_replay": asdict(
                         compare_tensors(tensors["routed_output"][row], replayed[0][row])
                     ),
@@ -409,6 +429,8 @@ def main() -> None:
                 "frames": len(filenames),
                 "layer_batches": comparisons,
                 "exact_native_replays": exact_replays,
+                "explicit_profile_alias": arguments.verify_profile_alias,
+                "exact_profile_alias_replays": exact_profile_alias_replays,
                 "maximum_native_replay_error": maximum_replay_error,
                 "paired_trajectory_checked": arguments.previous_directory is not None,
                 "exact_checkpoint_router_batches": exact_router_batches,
@@ -424,6 +446,10 @@ def main() -> None:
             indent=2,
         )
     )
+    if arguments.verify_profile_alias is not None:
+        assert exact_profile_alias_replays == exact_replays == comparisons
+    else:
+        pass
 
 
 if __name__ == "__main__":
