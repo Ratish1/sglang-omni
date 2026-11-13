@@ -325,7 +325,9 @@ def run_pairs(
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("phase", choices=["unit", "identity", "pairs", "nonstream"])
+    parser.add_argument(
+        "phase", choices=["unit", "identity", "pairs", "nonstream", "on_m2"]
+    )
     parser.add_argument("--arms", nargs="*", default=list(ARMS))
     arguments = parser.parse_args()
     RUN_DIRECTORY.mkdir(parents=True, exist_ok=True)
@@ -335,6 +337,8 @@ def main() -> None:
         run_identity(arguments.arms)
     elif arguments.phase == "pairs":
         run_pairs(PAIRS, PAIR_CELLS)
+    elif arguments.phase == "on_m2":
+        run_pairs([("m2", "stack")], PAIR_CELLS)
     else:
         run_pairs([("main", "stack"), ("m1", "m2")], [NONSTREAM_CELL])
 
