@@ -101,6 +101,17 @@ def main() -> None:
             response.raise_for_status()
             payload = response.json()
             choice = payload["choices"][0]
+            (output / "response-summary.json").write_text(
+                json.dumps(
+                    {
+                        "status": response.status_code,
+                        "text": choice["message"]["content"],
+                        "finish_reason": choice["finish_reason"],
+                        "usage": payload["usage"],
+                    },
+                    indent=2,
+                )
+            )
             waveform = base64.b64decode(
                 choice["message"]["audio"]["data"], validate=True
             )
@@ -121,7 +132,9 @@ def main() -> None:
                 else:
                     pass
                 assert actual_layer == expected_layer, actual_layer["layer_index"]
-            request_directories = list((output / "conditioning").iterdir())
+            request_directories = [
+                path for path in (output / "conditioning").iterdir() if path.is_dir()
+            ]
             assert len(request_directories) == 1
             directory = request_directories[0]
             baseline = arguments.baseline_directory / "conditioning" / directory.name
