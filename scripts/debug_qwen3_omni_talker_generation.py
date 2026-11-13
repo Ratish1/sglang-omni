@@ -27,6 +27,7 @@ from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import (
 
 from scripts.debug_qwen3_omni_normalization import NativeNormalization
 from scripts.debug_qwen3_omni_predictor_cache import NativePredictorReplay
+from scripts.debug_qwen3_omni_talker_experts import NativeTalkerExperts
 from scripts.qwen3_omni_checkpoint_weights import audit_checkpoint_weights
 from sglang_omni.models.qwen3_omni.components.talker_prefill import (
     load_thinker_embedding_rows,
@@ -71,6 +72,13 @@ def main() -> None:
     )
     parser.add_argument("--audit-loaded-weights", action="store_true")
     parser.add_argument("--native-predictor-capture-directory", type=Path)
+    parser.add_argument("--native-expert-capture-directory", type=Path)
+    parser.add_argument("--paired-native-expert-controls", action="store_true")
+    parser.add_argument(
+        "--native-expert-route-precision",
+        choices=("checkpoint", "float32"),
+        default="checkpoint",
+    )
     parser.add_argument(
         "--native-feedback-reduction",
         choices=("sequential", "checkpoint"),
@@ -94,6 +102,10 @@ def main() -> None:
     )
     parser.add_argument("--output-directory", type=Path, required=True)
     arguments = parser.parse_args()
+    if arguments.native_expert_capture_directory is not None:
+        assert arguments.dtype == "bfloat16"
+    else:
+        assert not arguments.paired_native_expert_controls
     if (
         arguments.native_predictor_capture_directory is not None
         and arguments.dtype != "bfloat16"
@@ -168,6 +180,15 @@ def main() -> None:
         )
     else:
         native_predictor = None
+    if arguments.native_expert_capture_directory is not None:
+        expert_control = NativeTalkerExperts(
+            reference=reference,
+            capture_directory=arguments.native_expert_capture_directory,
+            route_precision=arguments.native_expert_route_precision,
+        )
+        expert_control.install()
+    else:
+        expert_control = None
     special_embeddings = load_thinker_embedding_rows(
         str(checkpoint_directory),
         [
@@ -211,19 +232,32 @@ def main() -> None:
             if arguments.paired_normalization_controls
             else (arguments.normalization_semantics,)
         )
+        expert_modes = (
+            ("checkpoint", "fused", "checkpoint-repeat")
+            if arguments.paired_native_expert_controls
+            else ("fused" if expert_control is not None else "checkpoint",)
+        )
         for (
             trace_directory,
             sampling_order,
             normalization_mode,
+            expert_mode,
             residual_policy_index,
             residual_policy,
         ) in (
-            (directory, order, mode, policy_index, policy)
+            (directory, order, mode, expert_mode, policy_index, policy)
             for directory in arguments.trace_directory
             for order in arguments.sampling_order
             for mode in normalization_modes
+            for expert_mode in expert_modes
             for policy_index, policy in enumerate(arguments.residual_policy)
         ):
+            if expert_control is not None:
+                expert_control.enabled = expert_mode == "fused"
+                expert_control.calls = 0
+                expert_control.router_calls = 0
+            else:
+                pass
             reference.code_predictor.generation_config.do_sample = (
                 residual_policy == "sampled"
             )
@@ -432,6 +466,10 @@ def main() -> None:
                 if arguments.paired_normalization_controls
                 else sampling_directory
             )
+            if arguments.paired_native_expert_controls:
+                mode_directory = mode_directory / expert_mode
+            else:
+                pass
             if len(arguments.residual_policy) > 1:
                 mode_directory = (
                     mode_directory
@@ -672,6 +710,20 @@ def main() -> None:
                     break
                 else:
                     pass
+            if expert_control is not None:
+                expected_calls = (
+                    len(frame_reports) * len(reference.model.layers)
+                    if expert_control.enabled
+                    else 0
+                )
+                assert expert_control.calls == expected_calls
+                assert expert_control.router_calls == (
+                    expected_calls
+                    if expert_control.route_precision == "float32"
+                    else 0
+                )
+            else:
+                pass
             report = {
                 "model_revision": arguments.model_revision,
                 "frame_limit": frame_limit,
@@ -702,6 +754,12 @@ def main() -> None:
                     else None
                 ),
                 "normalization_semantics": normalization_mode,
+                "expert_mode": expert_mode,
+                "native_expert_route_precision": arguments.native_expert_route_precision,
+                "native_expert_calls": expert_control.calls if expert_control else 0,
+                "native_expert_router_calls": (
+                    expert_control.router_calls if expert_control else 0
+                ),
                 "sampling_order": sampling_order,
                 "residual_policy": residual_policy,
                 "native_predictor_capture_directory": (
