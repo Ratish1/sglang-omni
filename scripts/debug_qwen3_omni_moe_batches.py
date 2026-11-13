@@ -170,6 +170,8 @@ def main() -> None:
     comparisons = 0
     maximum_replay_error = 0.0
     exact_router_batches = 0
+    exact_shared_gate_projections = 0
+    maximum_shared_gate_error = 0.0
     matching_routing_batches = 0
     maximum_checkpoint_expert_error = 0.0
     with (arguments.output_directory / "layers.jsonl").open("w") as output:
@@ -266,6 +268,10 @@ def main() -> None:
                 )
                 difference = compare_tensors(tensors["routed_output"], replayed[0])
                 reference_layer = reference.model.layers[layer_index]
+                shared_gate_difference = compare_tensors(
+                    snapshot["shared_gate"].to(reference.device),
+                    reference_layer.mlp.shared_expert_gate(hidden_states)[row],
+                )
                 reference_router_logits, reference_router_weights, reference_indices = (
                     reference_layer.mlp.gate(hidden_states)
                 )
@@ -309,6 +315,9 @@ def main() -> None:
                         compare_tensors(tensors["routed_output"], replayed[1])
                     ),
                     "checkpoint_router": asdict(router_difference),
+                    "shared_gate_captured_batch_geometry": asdict(
+                        shared_gate_difference
+                    ),
                     "checkpoint_expert_membership_exact": matching_experts,
                     "checkpoint_float32_weights_native_order": asdict(
                         compare_tensors(weights, reference_native_order_weights)
@@ -339,6 +348,11 @@ def main() -> None:
                     maximum_replay_error, difference.maximum_absolute_error
                 )
                 exact_router_batches += router_difference.exact
+                exact_shared_gate_projections += shared_gate_difference.exact
+                maximum_shared_gate_error = max(
+                    maximum_shared_gate_error,
+                    shared_gate_difference.maximum_absolute_error,
+                )
                 matching_routing_batches += matching_experts
                 maximum_checkpoint_expert_error = max(
                     maximum_checkpoint_expert_error,
@@ -364,6 +378,8 @@ def main() -> None:
                 "maximum_native_replay_error": maximum_replay_error,
                 "paired_trajectory_checked": arguments.previous_directory is not None,
                 "exact_checkpoint_router_batches": exact_router_batches,
+                "exact_shared_gate_projections": exact_shared_gate_projections,
+                "maximum_shared_gate_error": maximum_shared_gate_error,
                 "matching_checkpoint_expert_membership_batches": matching_routing_batches,
                 "maximum_checkpoint_expert_error_with_native_routing": maximum_checkpoint_expert_error,
                 "scope": "Complete original batches, native packed-weight hashes and observed per-geometry tactic choices. Fallback -1 identifies the same internal heuristic request, not a resolved tactic ID. Default replay is a numerical control, not a quality claim or backend recommendation.",
