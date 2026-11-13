@@ -7,6 +7,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 import torch
+from sglang.srt.layers.attention.flashattention_backend import FlashAttentionBackend
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 
 from sglang_omni.models.qwen3_omni.attention_layout_capture import (
@@ -26,6 +27,7 @@ class TalkerConditioningRecorder:
     key_buffers: list[torch.Tensor]
     value_buffers: list[torch.Tensor]
     request_slots: torch.Tensor
+    attention_backend: FlashAttentionBackend
     predictor_keys: torch.Tensor
     predictor_values: torch.Tensor
     predictor_counters: torch.Tensor | None
@@ -263,7 +265,7 @@ class TalkerConditioningRecorder:
             self.previous_values[request.request_id] = values
             attention_layout = (
                 capture_attention_layout(
-                    forward_batch,
+                    self.attention_backend,
                     self.key_buffers,
                     self.value_buffers,
                     self.request_slots,

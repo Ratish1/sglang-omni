@@ -4,18 +4,16 @@ from __future__ import annotations
 
 import torch
 from sglang.srt.layers.attention.flashattention_backend import FlashAttentionBackend
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 
 def capture_attention_layout(
-    forward_batch: ForwardBatch,
+    backend: FlashAttentionBackend,
     key_buffers: list[torch.Tensor],
     value_buffers: list[torch.Tensor],
     request_slots: torch.Tensor,
     row: int,
     sequence_length: int,
 ) -> dict[str, torch.Tensor]:
-    backend = forward_batch.attn_backend
     assert isinstance(backend, FlashAttentionBackend)
     metadata = backend.forward_metadata
     page_count = (sequence_length + backend.page_size - 1) // backend.page_size
