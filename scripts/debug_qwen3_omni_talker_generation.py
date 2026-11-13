@@ -26,6 +26,7 @@ from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import (
 )
 
 from scripts.debug_qwen3_omni_normalization import NativeNormalization
+from scripts.debug_qwen3_omni_predictor_cache import NativePredictorReplay
 from scripts.qwen3_omni_checkpoint_weights import audit_checkpoint_weights
 from sglang_omni.models.qwen3_omni.components.talker_prefill import (
     load_thinker_embedding_rows,
@@ -69,6 +70,7 @@ def main() -> None:
         help="Free-running residual-code policies, in execution order, with repeatable request-derived Torch RNG.",
     )
     parser.add_argument("--audit-loaded-weights", action="store_true")
+    parser.add_argument("--native-predictor-capture-directory", type=Path)
     parser.add_argument(
         "--capture-layer-states",
         action="store_true",
@@ -87,6 +89,17 @@ def main() -> None:
     )
     parser.add_argument("--output-directory", type=Path, required=True)
     arguments = parser.parse_args()
+    if (
+        arguments.native_predictor_capture_directory is not None
+        and arguments.dtype != "bfloat16"
+    ):
+        raise ValueError("Native predictor recurrence requires BF16 weights and inputs")
+    elif arguments.native_predictor_capture_directory is not None and any(
+        policy != "greedy" for policy in arguments.residual_policy
+    ):
+        raise ValueError("Native predictor recurrence requires greedy residual policy")
+    else:
+        pass
     arguments.output_directory.mkdir(exist_ok=False)
     torch.cuda.set_device(arguments.gpu)
     torch.set_float32_matmul_precision("highest")
@@ -130,6 +143,20 @@ def main() -> None:
             arguments.model_path, "config.json", revision=arguments.model_revision
         )
     ).parent
+    if arguments.native_predictor_capture_directory is not None:
+        predictor_audit_directory = (
+            arguments.output_directory / "native-predictor-audit"
+        )
+        predictor_audit_directory.mkdir()
+        native_predictor = NativePredictorReplay(
+            reference=reference,
+            capture_directory=arguments.native_predictor_capture_directory,
+            output_directory=predictor_audit_directory,
+            model_path=arguments.model_path,
+            model_revision=arguments.model_revision,
+        )
+    else:
+        native_predictor = None
     special_embeddings = load_thinker_embedding_rows(
         str(checkpoint_directory),
         [
@@ -549,6 +576,38 @@ def main() -> None:
                         use_cache=True,
                     )
                     codes = prepared_inputs["residual_codes"]
+                    if native_predictor is not None:
+                        reference_codes = codes.clone()
+                        predictor_query = output.hidden_states[0][-1][:, -1:]
+                        codes, feedback = native_predictor.generate(
+                            sampled_code, predictor_query
+                        )
+                        next_text = (
+                            text_rows[frame_index : frame_index + 1]
+                            if frame_index < len(text_rows)
+                            else pad_embedding
+                        )
+                        prepared_inputs["residual_codes"] = codes
+                        prepared_inputs["inputs_embeds"] = feedback + next_text[None]
+                        torch.save(
+                            {
+                                "query": predictor_query.cpu(),
+                                "reference_codes": reference_codes.cpu(),
+                                "native_codes": codes.cpu(),
+                                "feedback": feedback.cpu(),
+                                "text_embedding": next_text.cpu(),
+                                "next_inputs": prepared_inputs["inputs_embeds"].cpu(),
+                                "keys": native_predictor.keys[
+                                    :, :, : config.num_code_groups
+                                ].cpu(),
+                                "values": native_predictor.values[
+                                    :, :, : config.num_code_groups
+                                ].cpu(),
+                            },
+                            case_directory / f"{frame_index:04d}-predictor-handoff.pt",
+                        )
+                    else:
+                        pass
                     assert int(codes[0, 0]) == int(sampled_code[0])
                     assert prepared_inputs["inputs_embeds"].shape == (
                         1,
@@ -628,6 +687,11 @@ def main() -> None:
                 "normalization_semantics": normalization_mode,
                 "sampling_order": sampling_order,
                 "residual_policy": residual_policy,
+                "native_predictor_capture_directory": (
+                    str(arguments.native_predictor_capture_directory)
+                    if arguments.native_predictor_capture_directory is not None
+                    else None
+                ),
                 "residual_torch_seed": (
                     seed
                     if residual_policy == "sampled"
@@ -648,7 +712,7 @@ def main() -> None:
                 ),
                 flush=True,
             )
-        if arguments.audit_loaded_weights:
+        if arguments.audit_loaded_weights and native_predictor is None:
             audit_checkpoint_weights(
                 reference,
                 checkpoint_directory,
