@@ -18,10 +18,10 @@ MODEL = "Qwen/Qwen3-TTS-12Hz-1.7B-Base"
 ARMS = {
     "main": "df7bc688cd75e882ee47fd005d93777dec6cfcc0",
     "a1": "46d17389ae67dad11154830bfc65f2148a655e7d",
-    "m1": "78abe3af5f7eec60cb909ef76389343d56e5063e",
-    "m2": "76ffc18324287001e69b01800d2a4680a7da7059",
+    "m1": "c843356795309ffe881117a5a0b2c4c6e0e8cef7",
+    "m2": "4f3c2ab657a04f8ff554ea4e5c8b6a4fd1b305e6",
     "m3": "312690bd81db2e7c14bdcef2136dde7e05ee991f",
-    "stack": "3254d8151279e10feb846e6eb3ed5f777243aada",
+    "stack": "2d753d64d0279d0a579dac00704efd1d63525957",
 }
 UNIT_SUITES = [
     "tests/unit_test/qwen3_tts",
@@ -42,7 +42,7 @@ NONSTREAM_CELL = ("nonstream_c64", 64, 256, False)
 
 
 def tree_for(arm: str) -> Path:
-    tree = RUN_DIRECTORY / "trees" / arm
+    tree = RUN_DIRECTORY / "trees" / f"{arm}-{ARMS[arm][:9]}"
     if not tree.exists():
         subprocess.run(
             ["git", "worktree", "add", "--detach", str(tree), ARMS[arm]],
