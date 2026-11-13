@@ -26,6 +26,7 @@ def main() -> None:
     parser.add_argument("--concurrency", type=int, required=True)
     parser.add_argument("--request-id", action="append")
     parser.add_argument("--capture-token-rows", type=int, default=112)
+    parser.add_argument("--capture-talker-operators", action="store_true")
     arguments = parser.parse_args()
     arguments.output_directory.mkdir(exist_ok=False)
     source = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
@@ -93,6 +94,16 @@ def main() -> None:
         if arguments.request_id is not None:
             diagnostic_environment["SGLANG_OMNI_DIAGNOSTIC_CONDITIONING_DIRECTORY"] = (
                 str(output / "conditioning")
+            )
+        else:
+            pass
+        if arguments.capture_talker_operators:
+            assert arguments.request_id is not None
+            diagnostic_environment.update(
+                {
+                    "SGLANG_OMNI_DIAGNOSTIC_LAYER_OPERANDS": "1",
+                    "SGLANG_OMNI_DIAGNOSTIC_MOE_BATCHES": "1",
+                }
             )
         else:
             pass
