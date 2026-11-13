@@ -45,6 +45,7 @@ def main() -> None:
     precision.add_argument("--compare-native-residual-precision", action="store_true")
     precision.add_argument("--compare-native-source-precision", action="store_true")
     precision.add_argument("--compare-native-rounding-interaction", action="store_true")
+    precision.add_argument("--compare-native-weight-interaction", action="store_true")
     arguments = parser.parse_args()
     arguments.output_directory.mkdir(exist_ok=False)
     torch.cuda.set_device(arguments.gpu)
@@ -392,9 +393,18 @@ def main() -> None:
         or arguments.compare_native_residual_precision
         or arguments.compare_native_source_precision
         or arguments.compare_native_rounding_interaction
+        or arguments.compare_native_weight_interaction
     ):
         assert arguments.hold_native_prefix_cache
-        if arguments.compare_native_rounding_interaction:
+        if arguments.compare_native_weight_interaction:
+            variants = (
+                "checkpoint",
+                "residual-rotary-qknorm",
+                "residual-rotary-qknorm-router",
+                "residual-rotary-qknorm-experts",
+                "source-arithmetic",
+            )
+        elif arguments.compare_native_rounding_interaction:
             variants = (
                 "checkpoint",
                 "residual-norm-and-rotary",

@@ -98,6 +98,8 @@ def run_precision_controls(
             "source-arithmetic",
             "residual-rotary-qknorm",
             "residual-rotary-moe",
+            "residual-rotary-qknorm-router",
+            "residual-rotary-qknorm-experts",
         ],
         ...,
     ] = ("checkpoint", "router", "experts", "router-and-experts"),
@@ -127,14 +129,22 @@ def run_precision_controls(
         "source-arithmetic",
         "residual-rotary-qknorm",
         "residual-rotary-moe",
+        "residual-rotary-qknorm-router",
+        "residual-rotary-qknorm-experts",
     )
     expert_variants = (
         "experts",
         "router-and-experts",
         "source-arithmetic",
         "residual-rotary-moe",
+        "residual-rotary-qknorm-experts",
     )
-    query_key_variants = ("source-arithmetic", "residual-rotary-qknorm")
+    query_key_variants = (
+        "source-arithmetic",
+        "residual-rotary-qknorm",
+        "residual-rotary-qknorm-router",
+        "residual-rotary-qknorm-experts",
+    )
     if any(name in rotary_variants for name in variants):
         table_rows: dict[int, torch.Tensor] = {}
         suffix_positions = positions[:, prefix_token_count:].T.cpu()
@@ -217,6 +227,8 @@ def run_precision_controls(
             "source-arithmetic",
             "residual-rotary-qknorm",
             "residual-rotary-moe",
+            "residual-rotary-qknorm-router",
+            "residual-rotary-qknorm-experts",
         )
         for layer_index in range(captured.accepted_layer):
             cache.update(
@@ -292,6 +304,7 @@ def run_precision_controls(
                     "router-and-experts",
                     "source-arithmetic",
                     "residual-rotary-moe",
+                    "residual-rotary-qknorm-router",
                 ):
                     hooks.enter_context(
                         layer.mlp.gate.register_forward_hook(keep_fp32_route_weights)
