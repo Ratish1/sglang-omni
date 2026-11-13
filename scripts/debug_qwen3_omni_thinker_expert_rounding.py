@@ -11,6 +11,10 @@ from typing import Literal
 import torch
 from huggingface_hub import snapshot_download
 from safetensors import safe_open
+from sglang.kernels.ops.activation.activation import (
+    silu_and_mul,
+    silu_and_mul_with_activation_rounding,
+)
 from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import (
     Qwen3OmniMoeThinkerTextExperts,
 )
@@ -122,6 +126,10 @@ def main() -> None:
         activation_values = 0
         down_store_differences = 0
         down_store_values = 0
+        native_activation_differences = 0
+        native_rounded_activation_differences = 0
+        native_activation_maximum_error = 0.0
+        native_rounded_activation_maximum_error = 0.0
         for expert_index in expert_indices.unique(sorted=True).tolist():
             token_indices, ranks = torch.where(expert_indices == expert_index)
             weights: dict[str, torch.Tensor] = {}
@@ -134,14 +142,37 @@ def main() -> None:
                 ) as checkpoint:
                     weights[projection] = checkpoint.get_tensor(name).to(device)
                     assert weights[projection].dtype == hidden.dtype
-            gate, up = torch.nn.functional.linear(
+            gate_up = torch.nn.functional.linear(
                 hidden[token_indices],
                 torch.cat((weights["gate_proj"], weights["up_proj"])),
-            ).chunk(2, dim=-1)
+            )
+            gate, up = gate_up.chunk(2, dim=-1)
             fused_activation = (torch.nn.functional.silu(gate.float()) * up.float()).to(
                 hidden.dtype
             )
             rounded_activation = torch.nn.functional.silu(gate) * up
+            native_activation = silu_and_mul(gate_up)
+            native_rounded_activation = silu_and_mul_with_activation_rounding(gate_up)
+            native_activation_differences += int(
+                (native_activation != fused_activation).sum()
+            )
+            native_rounded_activation_differences += int(
+                (native_rounded_activation != rounded_activation).sum()
+            )
+            native_activation_maximum_error = max(
+                native_activation_maximum_error,
+                float(
+                    (native_activation.float() - fused_activation.float()).abs().max()
+                ),
+            )
+            native_rounded_activation_maximum_error = max(
+                native_rounded_activation_maximum_error,
+                float(
+                    (native_rounded_activation.float() - rounded_activation.float())
+                    .abs()
+                    .max()
+                ),
+            )
             activation_differences += int(
                 (fused_activation != rounded_activation).sum()
             )
@@ -208,6 +239,10 @@ def main() -> None:
                 "layer_index": layer_index,
                 "activation_different_values": activation_differences,
                 "activation_values": activation_values,
+                "native_activation_different_values": native_activation_differences,
+                "native_rounded_activation_different_values": native_rounded_activation_differences,
+                "native_activation_maximum_absolute_error": native_activation_maximum_error,
+                "native_rounded_activation_maximum_absolute_error": native_rounded_activation_maximum_error,
                 "fp32_down_cast_vs_bf16_gemm_different_values": down_store_differences,
                 "down_values": down_store_values,
                 "comparisons": {
@@ -218,7 +253,7 @@ def main() -> None:
         print(json.dumps({"completed_layer": layer_index}), flush=True)
     report = {
         "request_id": arguments.request_id,
-        "scope": "Held native inputs and routing with raw checkpoint weights. These source-semantic counterfactuals use per-expert cuBLAS GEMMs, not the native padded Triton GEMM geometry or its fast SiLU intrinsics. Changing a rounding stage is not a production repair or a speech-quality result. The FP32-down-cast versus BF16-GEMM comparison explicitly reports any additional matmul difference.",
+        "scope": "Held native inputs and routing with raw checkpoint weights. These source-semantic counterfactuals use per-expert cuBLAS GEMMs, not the native padded Triton GEMM geometry or its fast SiLU intrinsics. The native activation measurements separately execute the actual ordinary and activation-rounded SiLU kernels on the same projected operands, reporting differences rather than assuming exactness. Changing a rounding stage is not a production repair or a speech-quality result. The FP32-down-cast versus BF16-GEMM comparison explicitly reports any additional matmul difference.",
         "layers": reports,
     }
     (arguments.output_directory / "comparisons.json").write_text(
