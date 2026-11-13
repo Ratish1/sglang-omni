@@ -39,7 +39,9 @@ def main() -> None:
     parser.add_argument("--compare-native-layers", action="store_true")
     parser.add_argument("--hold-native-prefix-cache", action="store_true")
     parser.add_argument("--compare-native-operators", action="store_true")
-    parser.add_argument("--compare-native-moe-precision", action="store_true")
+    precision = parser.add_mutually_exclusive_group()
+    precision.add_argument("--compare-native-moe-precision", action="store_true")
+    precision.add_argument("--compare-native-rotary-precision", action="store_true")
     arguments = parser.parse_args()
     arguments.output_directory.mkdir(exist_ok=False)
     torch.cuda.set_device(arguments.gpu)
@@ -381,7 +383,10 @@ def main() -> None:
         },
         arguments.output_directory / "producer-operands.pt",
     )
-    if arguments.compare_native_moe_precision:
+    if (
+        arguments.compare_native_moe_precision
+        or arguments.compare_native_rotary_precision
+    ):
         assert arguments.hold_native_prefix_cache
         run_precision_controls(
             reference,
@@ -398,6 +403,11 @@ def main() -> None:
                 extend_token_count=captured_output["extend_length"],
             ),
             arguments.output_directory,
+            variants=(
+                ("checkpoint", "rotary")
+                if arguments.compare_native_rotary_precision
+                else ("checkpoint", "router", "experts", "router-and-experts")
+            ),
         )
     else:
         pass

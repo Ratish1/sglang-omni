@@ -19,7 +19,14 @@ def main() -> None:
     parser.add_argument("--hold-native-prefix-cache", action="store_true")
     parser.add_argument(
         "--producer-precision",
-        choices=("chained", "checkpoint", "router", "experts", "router-and-experts"),
+        choices=(
+            "chained",
+            "checkpoint",
+            "router",
+            "experts",
+            "router-and-experts",
+            "rotary",
+        ),
         default="chained",
     )
     parser.add_argument("--output-directory", type=Path, required=True)
