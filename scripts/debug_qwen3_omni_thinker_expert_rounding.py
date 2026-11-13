@@ -107,7 +107,8 @@ def main() -> None:
     reports = []
     for layer_index in range(len(captured["layer_batches"]) - 1):
         runtime = manifest["layers"][layer_index]
-        assert runtime["activation"] == "silu" and runtime["is_gated"]
+        assert runtime["activation"] in ("silu", "silu_rounded")
+        assert runtime["is_gated"]
         assert not runtime["apply_router_weight_on_input"]
         assert not runtime["no_combine"] and not runtime["w13_swiglu_interleaved"]
         prefix = f"operator_{layer_index:02d}"
@@ -237,6 +238,7 @@ def main() -> None:
         reports.append(
             {
                 "layer_index": layer_index,
+                "native_activation_contract": runtime["activation"],
                 "activation_different_values": activation_differences,
                 "activation_values": activation_values,
                 "native_activation_different_values": native_activation_differences,
