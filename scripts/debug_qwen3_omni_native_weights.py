@@ -103,6 +103,28 @@ def audit_native_talker_buffers(
             )
         exact_cpu = torch.equal(actual, expected_tables[0])
         exact_gpu = torch.equal(actual, expected_tables[1])
+        initial_rows = configuration.max_position_embeddings
+        assert len(actual) >= initial_rows
+        inverse_frequencies, scaling = rotary.compute_default_rope_parameters(
+            configuration
+        )
+        assert scaling == 1.0
+        extension_positions = torch.arange(
+            initial_rows, len(actual), dtype=torch.float32, device=reference.device
+        )
+        extension_angles = torch.outer(
+            extension_positions, inverse_frequencies.to(reference.device)
+        )
+        source_table = torch.cat(
+            (
+                expected_tables[1][:initial_rows],
+                torch.cat((extension_angles.cos(), extension_angles.sin()), dim=-1).to(
+                    actual.dtype
+                ),
+            ),
+            dim=0,
+        )
+        source_cache_growth_exact = torch.equal(actual, source_table)
         visited.add(buffer_name)
         if module.class_name == "MRotaryEmbedding":
             section = parameters["mrope_section"]
@@ -126,6 +148,8 @@ def audit_native_talker_buffers(
                 "checkpoint_geometry_exact": True,
                 "cpu_table_exact": exact_cpu,
                 "gpu_table_exact": exact_gpu,
+                "initial_cache_rows": initial_rows,
+                "source_cache_growth_exact": source_cache_growth_exact,
                 "maximum_gpu_table_error": float(
                     (actual - expected_tables[1]).abs().max()
                 ),
@@ -140,12 +164,12 @@ def audit_native_talker_buffers(
         "runtime": runtime.model_dump(by_alias=True),
         "rotary_modules": reports,
         "unvisited_buffers": unvisited,
-        "scope": "Actual registered buffers after native prefill and residual prediction. Checkpoint theta, dimensions and axes are checked independently, and CPU/GPU FP32 table construction is compared in the actual consumer dtype. This is not a speech-quality or every-kernel oracle.",
+        "scope": "Actual registered buffers after native prefill and residual prediction. Checkpoint theta, dimensions and axes are checked independently. Initial tables are constructed inside the loader's GPU device context. Pre-capture cache growth computes inverse frequencies in the default CPU context then moves them to the cache device, appending rows after the checkpoint-derived original limit. Both phases are reconstructed in the actual consumer dtype. Whole-table CPU/GPU comparisons remain reported, not silently treated as equivalent. This is not a speech-quality or every-kernel oracle.",
     }
     output_file.write_text(json.dumps(report, indent=2))
     print(json.dumps(report))
     assert reports and not unvisited
-    assert all(row["cpu_table_exact"] or row["gpu_table_exact"] for row in reports)
+    assert all(row["source_cache_growth_exact"] for row in reports)
 
 
 @torch.inference_mode()
