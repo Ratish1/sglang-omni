@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
 from dataclasses import dataclass, field
 from functools import partial
 from pathlib import Path
@@ -18,7 +17,10 @@ from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import (
     Qwen3OmniMoeTalkerTextTopKRouter,
 )
 
-from scripts.debug_qwen3_omni_moe_batches import NativeRuntime
+from scripts.qwen3_omni_talker_expert_runtime import (
+    NativeRuntime,
+    load_native_expert_weights,
+)
 
 
 @dataclass(kw_only=True)
@@ -37,25 +39,8 @@ class NativeTalkerExperts:
         self.runtime = NativeRuntime.model_validate_json(
             (self.capture_directory / "moe-runtime.json").read_bytes()
         )
-        for layer_index, (layer, recorded) in enumerate(
-            zip(self.reference.model.layers, self.runtime.layers, strict=True)
-        ):
-            assert recorded.tp_size == recorded.ep_size == 1
-            assert recorded.tp_rank == recorded.ep_rank == 0
-            gate, up = layer.mlp.experts.gate_up_proj.chunk(2, dim=1)
-            packed = torch.cat((up, gate), dim=1).contiguous()
-            down = layer.mlp.experts.down_proj.contiguous()
-            for name, tensor in (("w13_weight", packed), ("w2_weight", down)):
-                fingerprint = recorded.weights[name]
-                assert list(tensor.shape) == fingerprint.shape
-                assert str(tensor.dtype) == fingerprint.dtype == "torch.bfloat16"
-                assert (
-                    hashlib.sha256(
-                        tensor.detach().cpu().view(torch.uint8).numpy().tobytes()
-                    ).hexdigest()
-                    == fingerprint.sha256
-                )
-            self.weights.append((packed, down))
+        self.weights = load_native_expert_weights(self.reference, self.runtime)
+        for layer_index, layer in enumerate(self.reference.model.layers):
             self.handles.extend(
                 [
                     layer.mlp.gate.register_forward_hook(self.routing),
