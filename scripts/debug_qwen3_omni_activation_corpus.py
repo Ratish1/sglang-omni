@@ -27,6 +27,7 @@ def main() -> None:
     parser.add_argument("--request-id", action="append")
     parser.add_argument("--capture-token-rows", type=int, default=112)
     parser.add_argument("--capture-talker-operators", action="store_true")
+    parser.add_argument("--capture-all-conditioning", action="store_true")
     parser.add_argument(
         "--reference-predictor-mode",
         choices=("identity", "checkpoint", "checkpoint-codes", "checkpoint-feedback"),
@@ -37,6 +38,15 @@ def main() -> None:
     arguments = parser.parse_args()
     if arguments.reference_predictor_mode is not None and arguments.request_id is None:
         raise ValueError("Reference predictor controls require selected request IDs")
+    elif arguments.capture_all_conditioning and (
+        arguments.request_id is not None
+        or arguments.capture_talker_operators
+        or arguments.reference_predictor_mode is not None
+        or arguments.control != ["original"]
+    ):
+        raise ValueError(
+            "Whole-population receiver capture requires only the original control"
+        )
     else:
         pass
     arguments.output_directory.mkdir(exist_ok=False)
@@ -79,7 +89,17 @@ def main() -> None:
         json.dumps(request_hashes, indent=2)
     )
     selected_ids = arguments.output_directory / "selected-request-ids.json"
-    selected_ids.write_text(json.dumps(arguments.request_id or []))
+    selected_ids.write_text(
+        json.dumps(
+            [
+                request_id
+                for request_ids in workload_request_ids.values()
+                for request_id in request_ids
+            ]
+            if arguments.capture_all_conditioning
+            else arguments.request_id or []
+        )
+    )
     if arguments.request_id is not None:
         assert {
             request_id
@@ -102,7 +122,13 @@ def main() -> None:
                 "1" if control == "rounded-activation" else "0"
             ),
         }
-        if arguments.request_id is not None:
+        if arguments.capture_all_conditioning:
+            diagnostic_environment = {
+                "SGLANG_OMNI_CORPUS_REQUEST_ID_FILE": str(selected_ids),
+            }
+        else:
+            pass
+        if arguments.request_id is not None or arguments.capture_all_conditioning:
             diagnostic_environment["SGLANG_OMNI_DIAGNOSTIC_CONDITIONING_DIRECTORY"] = (
                 str(output / "conditioning")
             )
@@ -148,7 +174,11 @@ def main() -> None:
                     "pid": process.pid,
                     "command": server_command,
                     "diagnostic_environment": diagnostic_environment,
-                    "scope": "Native rounded SiLU in the first checkpoint-derived accept_hidden_layer Thinker blocks, including warmup and decode.",
+                    "scope": (
+                        "All original-population Talker receiver states, without Thinker operand observers."
+                        if arguments.capture_all_conditioning
+                        else "Native rounded SiLU in the first checkpoint-derived accept_hidden_layer Thinker blocks, including warmup and decode."
+                    ),
                     "model_revision": arguments.model_revision,
                     "reference_predictor_mode": arguments.reference_predictor_mode,
                     "accepted_layer": accepted_layer,
@@ -164,22 +194,27 @@ def main() -> None:
                 server_log_file=output / "server.log",
                 trust_env=False,
             )
-            actual_state = json.loads(
-                (output / "delivery/native-thinker-state.json").read_text()
-            )
-            if native_state is None:
-                native_state = actual_state
+            if arguments.capture_all_conditioning:
+                pass
             else:
-                assert actual_state["parameters"] == native_state["parameters"]
-                for actual_layer, original_layer in zip(
-                    actual_state["layers"], native_state["layers"], strict=True
-                ):
-                    expected_layer = original_layer.copy()
-                    if actual_layer["layer_index"] < accepted_layer:
-                        expected_layer["activation"] = "silu_rounded"
-                    else:
-                        pass
-                    assert actual_layer == expected_layer, actual_layer["layer_index"]
+                actual_state = json.loads(
+                    (output / "delivery/native-thinker-state.json").read_text()
+                )
+                if native_state is None:
+                    native_state = actual_state
+                else:
+                    assert actual_state["parameters"] == native_state["parameters"]
+                    for actual_layer, original_layer in zip(
+                        actual_state["layers"], native_state["layers"], strict=True
+                    ):
+                        expected_layer = original_layer.copy()
+                        if actual_layer["layer_index"] < accepted_layer:
+                            expected_layer["activation"] = "silu_rounded"
+                        else:
+                            pass
+                        assert actual_layer == expected_layer, actual_layer[
+                            "layer_index"
+                        ]
             for workload in ("tts", "mmsu"):
                 request_ids = workload_request_ids[workload]
                 if not request_ids:
