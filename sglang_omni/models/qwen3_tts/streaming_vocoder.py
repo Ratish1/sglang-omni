@@ -3041,7 +3041,7 @@ class Qwen3TTSStreamingVocoderScheduler(
         return first_chunks
 
     def plan_whole_request_replay(self) -> WholeRequestReplay | None:
-        """The oldest whole request's next decode and each one that replays the same graph.
+        """The oldest slot holder's next decode, or the oldest request's when none holds a slot, and each one that replays the same graph.
 
         A request past the idle slots waits, and those holding slots finish and release them.
         """
@@ -3049,7 +3049,10 @@ class Qwen3TTSStreamingVocoderScheduler(
         widths = window_runner.fresh_frames
         replay: WholeRequestReplay | None = None
         waiting: deque[Qwen3TTSWholeRequest] = deque()
-        for request in self.whole_requests:
+        # note (ratish): a request that started continues ahead of new ones, as a chunked prefill does.
+        for request in sorted(
+            self.whole_requests, key=lambda request: request.slot is None
+        ):
             if self.is_aborted(request.request_id):
                 self.release_whole_request_slot(request)
                 continue
