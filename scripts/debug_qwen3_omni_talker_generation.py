@@ -84,6 +84,7 @@ def main() -> None:
     parser.add_argument("--native-backbone-attention", action="store_true")
     parser.add_argument("--paired-native-projection-controls", action="store_true")
     parser.add_argument("--paired-native-rotary-controls", action="store_true")
+    parser.add_argument("--paired-native-routing-controls", action="store_true")
     parser.add_argument(
         "--native-expert-route-precision",
         choices=("checkpoint", "float32"),
@@ -220,10 +221,25 @@ def main() -> None:
         )
     else:
         observed_profiles = None
-    if arguments.paired_native_rotary_controls:
+    if (
+        arguments.paired_native_rotary_controls
+        or arguments.paired_native_routing_controls
+    ):
         assert arguments.native_predictor_capture_directory is not None
         assert not arguments.paired_native_projection_controls
         assert arguments.native_backbone_attention
+        assert not (
+            arguments.paired_native_rotary_controls
+            and arguments.paired_native_routing_controls
+        )
+        if arguments.paired_native_routing_controls:
+            assert (
+                expert_control is not None
+                and expert_control.route_precision == "float32"
+            )
+            assert not arguments.paired_native_expert_controls
+        else:
+            pass
         rotary_control = NativeBackboneRotary(
             reference, arguments.native_predictor_capture_directory
         )
@@ -233,6 +249,7 @@ def main() -> None:
     if (
         arguments.paired_native_projection_controls
         or arguments.paired_native_rotary_controls
+        or arguments.paired_native_routing_controls
     ):
         assert arguments.dtype == "bfloat16"
         projection_control = NativeAttentionInputs(reference=reference)
@@ -309,14 +326,23 @@ def main() -> None:
                 "merged-paired",
                 "checkpoint-repeat",
             )
-        elif arguments.paired_native_rotary_controls:
+        elif (
+            arguments.paired_native_rotary_controls
+            or arguments.paired_native_routing_controls
+        ):
             projection_modes = ("merged-paired",)
         else:
             projection_modes = ("checkpoint",)
-        rotary_modes = (
-            ("checkpoint", "native", "checkpoint-repeat")
-            if rotary_control is not None
-            else ("checkpoint",)
+        if arguments.paired_native_rotary_controls:
+            rotary_modes = ("checkpoint", "native", "checkpoint-repeat")
+        elif arguments.paired_native_routing_controls:
+            rotary_modes = ("native",)
+        else:
+            rotary_modes = ("checkpoint",)
+        routing_modes = (
+            ("reconstructed", "native", "reconstructed-repeat")
+            if arguments.paired_native_routing_controls
+            else ("reconstructed",)
         )
         for (
             trace_directory,
@@ -325,6 +351,7 @@ def main() -> None:
             expert_mode,
             projection_mode,
             rotary_mode,
+            routing_mode,
             attention_mode,
             residual_policy_index,
             residual_policy,
@@ -336,6 +363,7 @@ def main() -> None:
                 expert_mode,
                 projection_mode,
                 rotary_mode,
+                routing_mode,
                 attention_mode,
                 policy_index,
                 policy,
@@ -346,6 +374,7 @@ def main() -> None:
             for expert_mode in expert_modes
             for projection_mode in projection_modes
             for rotary_mode in rotary_modes
+            for routing_mode in routing_modes
             for attention_mode in attention_modes
             for policy_index, policy in enumerate(arguments.residual_policy)
         ):
@@ -378,6 +407,7 @@ def main() -> None:
                 expert_control.enabled = expert_mode == "fused"
                 expert_control.calls = 0
                 expert_control.router_calls = 0
+                expert_control.native_routing = routing_mode == "native"
                 expert_control.shared_calls = 0
                 expert_control.used_profiles.clear()
                 expert_control.profiles = (
@@ -621,6 +651,10 @@ def main() -> None:
                 pass
             if rotary_control is not None:
                 mode_directory = mode_directory / f"rotary-{rotary_mode}"
+            else:
+                pass
+            if arguments.paired_native_routing_controls:
+                mode_directory = mode_directory / f"routing-{routing_mode}"
             else:
                 pass
             if len(arguments.residual_policy) > 1:
@@ -954,6 +988,7 @@ def main() -> None:
                 "attention_mode": attention_mode,
                 "attention_projection_mode": projection_mode,
                 "rotary_mode": rotary_mode,
+                "routing_mode": routing_mode,
                 "native_rotary_calls": rotary_control.calls if rotary_control else 0,
                 "native_projection_calls": (
                     projection_control.projection_calls if projection_control else 0

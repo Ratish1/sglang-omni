@@ -1,4 +1,4 @@
-"""Replay native Talker rotary arithmetic over complete captured lifetimes."""
+"""Replay native Talker rotary and routing over complete captured lifetimes."""
 
 from __future__ import annotations
 
@@ -8,6 +8,7 @@ from dataclasses import asdict
 from pathlib import Path
 
 import torch
+from sglang.kernels.ops.moe.moe_fused_gate import moe_fused_gate
 from transformers import Qwen3OmniMoeConfig
 
 from scripts.debug_qwen3_omni_feedback_audit import compare_tensors
@@ -137,6 +138,61 @@ def main() -> None:
                                 )
                             ),
                         }
+                    router_logits = snapshot["batch_router_logits"].to(device)
+                    native_weights, native_indices = moe_fused_gate(
+                        router_logits,
+                        None,
+                        configuration.num_experts_per_tok,
+                        scoring_func="softmax",
+                        renormalize=configuration.norm_topk_prob,
+                    )
+                    assert torch.equal(
+                        native_weights.cpu(), snapshot["batch_expert_weights"]
+                    )
+                    assert torch.equal(
+                        native_indices.cpu(), snapshot["batch_expert_indices"]
+                    )
+                    if field_prefix:
+                        start, stop = snapshot["prefix_token_rows"].tolist()
+                    else:
+                        start = int(snapshot["batch_selected_row"])
+                        stop = start + 1
+                    selected_logits = router_logits[start:stop].contiguous()
+                    isolated_weights, isolated_indices = moe_fused_gate(
+                        selected_logits,
+                        None,
+                        configuration.num_experts_per_tok,
+                        scoring_func="softmax",
+                        renormalize=configuration.norm_topk_prob,
+                    )
+                    assert torch.equal(isolated_weights, native_weights[start:stop])
+                    assert torch.equal(isolated_indices, native_indices[start:stop])
+                    probabilities = selected_logits.float().softmax(dim=-1)
+                    _, torch_indices = probabilities.topk(
+                        configuration.num_experts_per_tok, dim=-1
+                    )
+                    reconstructed_weights = probabilities.gather(
+                        1, isolated_indices.long()
+                    )
+                    if configuration.norm_topk_prob:
+                        reconstructed_weights /= reconstructed_weights.sum(
+                            dim=-1, keepdim=True
+                        )
+                    else:
+                        pass
+                    routing = {
+                        "native_full_and_isolated_exact": True,
+                        "torch_order_exact": torch.equal(
+                            torch_indices.int(), isolated_indices
+                        ),
+                        "torch_membership_exact": torch.equal(
+                            torch_indices.sort(dim=-1).values.int(),
+                            isolated_indices.sort(dim=-1).values,
+                        ),
+                        "reconstructed_weights_native_order": asdict(
+                            compare_tensors(isolated_weights, reconstructed_weights)
+                        ),
+                    }
                     layer_steps += 1
                     token_rows += len(query)
                     output.write(
@@ -151,6 +207,7 @@ def main() -> None:
                                     and torch.equal(positions[0], positions[2])
                                 ),
                                 "differences": differences,
+                                "routing": routing,
                             }
                         )
                         + "\n"
@@ -174,7 +231,7 @@ def main() -> None:
                         "sections": operation.sections,
                         "interleaved": operation.interleaved,
                         "runtime": operation.runtime.model_dump(by_alias=True),
-                        "scope": "Exact native rotary replay and independent formulas on captured operands, not a free-running quality repair.",
+                        "scope": "Exact native rotary and full/isolated routing replay and independent formulas on captured operands, not a free-running quality repair.",
                     },
                     indent=2,
                 )

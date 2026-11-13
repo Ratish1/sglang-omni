@@ -10,6 +10,7 @@ from typing import Literal
 import torch
 from flashinfer.fused_moe import cutlass_fused_moe
 from flashinfer.fused_moe.core import ActivationType
+from sglang.kernels.ops.moe.moe_fused_gate import moe_fused_gate
 from sglang.srt.layers.activation import SiluAndMul
 from torch.utils.hooks import RemovableHandle
 from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import (
@@ -34,6 +35,7 @@ class NativeTalkerExperts:
     enabled: bool = False
     calls: int = 0
     router_calls: int = 0
+    native_routing: bool = False
     shared_enabled: bool = False
     shared_calls: int = 0
     profiles: ObservedExpertProfiles | None = None
@@ -103,12 +105,22 @@ class NativeTalkerExperts:
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         if self.enabled and self.route_precision == "float32":
             logits, _, indices = output
-            probabilities = logits.float().softmax(dim=-1)
-            weights = probabilities.gather(1, indices)
-            if module.norm_topk_prob:
-                weights = weights / weights.sum(dim=-1, keepdim=True)
+            if self.native_routing:
+                weights, indices = moe_fused_gate(
+                    logits,
+                    None,
+                    module.top_k,
+                    scoring_func="softmax",
+                    renormalize=module.norm_topk_prob,
+                )
+                indices = indices.long()
             else:
-                pass
+                probabilities = logits.float().softmax(dim=-1)
+                weights = probabilities.gather(1, indices)
+                if module.norm_topk_prob:
+                    weights = weights / weights.sum(dim=-1, keepdim=True)
+                else:
+                    pass
             self.router_calls += 1
             return logits, weights, indices
         else:
