@@ -212,8 +212,17 @@ def score(arguments: argparse.Namespace) -> None:
     asr = load_router_asr(arguments.asr_port, arguments.asr_model)
     requested_outputs: list[SampleOutput] = []
     spoken_outputs: list[SampleOutput] = []
+    scored_request_ids: set[str] = set()
     for source in sorted(arguments.input_directory.glob("*.speech.json")):
         record = CompletedSpeech.model_validate_json(source.read_bytes())
+        if (
+            arguments.request_id is not None
+            and record.request_id not in arguments.request_id
+        ):
+            continue
+        else:
+            pass
+        scored_request_ids.add(record.request_id)
         waveform = source.with_name(f"{record.request_id}.wav")
         assert (
             hashlib.sha256(waveform.read_bytes()).hexdigest() == record.waveform_sha256
@@ -250,7 +259,10 @@ def score(arguments: argparse.Namespace) -> None:
             )
         )
     expected = json.loads((arguments.input_directory / "results.json").read_text())
-    assert len(spoken_outputs) == len(expected["per_request"])
+    if arguments.request_id is None:
+        assert len(spoken_outputs) == len(expected["per_request"])
+    else:
+        assert scored_request_ids == set(arguments.request_id)
     summary = {
         "spoken_summary": calculate_wer_metrics(spoken_outputs, "en"),
         "requested_summary": (

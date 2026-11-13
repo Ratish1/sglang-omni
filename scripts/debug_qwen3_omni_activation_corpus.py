@@ -24,6 +24,9 @@ def main() -> None:
     parser.add_argument("--output-directory", type=Path, required=True)
     parser.add_argument("--base-url", required=True)
     parser.add_argument("--concurrency", type=int, required=True)
+    parser.add_argument(
+        "--workload", choices=("tts", "mmsu"), nargs="+", default=("tts", "mmsu")
+    )
     parser.add_argument("--request-id", action="append")
     parser.add_argument("--capture-request-id", action="append")
     parser.add_argument("--capture-token-rows", type=int, default=112)
@@ -74,7 +77,7 @@ def main() -> None:
     server_command = [*template["command"], "--log-level", "debug"]
     request_hashes: dict[str, str] = {}
     workload_request_ids: dict[str, list[str]] = {}
-    for workload in ("tts", "mmsu"):
+    for workload in arguments.workload:
         request_files = list(
             (arguments.input_directory / workload).glob("*.request.json")
         )
@@ -204,6 +207,7 @@ def main() -> None:
                     "model_revision": arguments.model_revision,
                     "reference_predictor_mode": arguments.reference_predictor_mode,
                     "talker_normalization": arguments.talker_normalization,
+                    "workloads": arguments.workload,
                     "captured_request_ids": capture_request_ids,
                     "accepted_layer": accepted_layer,
                     "timing_scope": "Bounded operator observers enabled in both arms, not production performance qualification.",
@@ -239,7 +243,7 @@ def main() -> None:
                         assert actual_layer == expected_layer, actual_layer[
                             "layer_index"
                         ]
-            for workload in ("tts", "mmsu"):
+            for workload in arguments.workload:
                 request_ids = workload_request_ids[workload]
                 if not request_ids:
                     continue
