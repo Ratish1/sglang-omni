@@ -11,7 +11,7 @@ import torch
 from huggingface_hub import hf_hub_download
 from safetensors import safe_open
 from torch import nn
-from transformers import Qwen3OmniMoeConfig
+from transformers import GenerationConfig, Qwen3OmniMoeConfig
 from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import (
     Qwen3OmniMoeTalkerCodePredictorModelForConditionalGeneration,
 )
@@ -52,6 +52,7 @@ class CheckpointPredictorControl:
                 model_path,
                 revision=model_revision,
                 config=configuration,
+                generation_config=GenerationConfig.from_model_config(configuration),
                 dtype=torch.bfloat16,
                 device_map={"": device.index},
                 key_mapping={r"^talker\.code_predictor\.": ""},
@@ -104,6 +105,7 @@ class CheckpointPredictorControl:
                     "model_path": model_path,
                     "model_revision": model_revision,
                     "mode": mode.value,
+                    "generation_config": self.predictor.generation_config.to_dict(),
                     "parameters": reports,
                     "derived_buffers": {
                         name: {
