@@ -245,6 +245,10 @@ class ThinkerDeliveryRecorder:
         value_buffers: list[torch.Tensor],
         request_slots: torch.Tensor,
     ) -> None:
+        if not self.request_ids:
+            return
+        else:
+            pass
         if not forward_batch.capture_hidden_mode.is_full():
             return
         else:
