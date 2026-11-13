@@ -6,13 +6,63 @@ import argparse
 import json
 from dataclasses import asdict
 from pathlib import Path
+from typing import Literal
 
 import torch
 from huggingface_hub import snapshot_download
 from safetensors import safe_open
+from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import (
+    Qwen3OmniMoeThinkerTextExperts,
+)
 
 from scripts.debug_qwen3_omni_feedback_audit import compare_tensors
 from scripts.qwen3_omni_checkpoint_weights import CheckpointIndex
+
+
+def source_rounded_experts(
+    experts: Qwen3OmniMoeThinkerTextExperts,
+    inputs: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+    output: torch.Tensor,
+    *,
+    rounding: Literal["source", "activation", "down", "reduction"] = "source",
+) -> torch.Tensor:
+    hidden, indices, weights = inputs
+    assert hidden.dtype == experts.gate_up_proj.dtype == torch.bfloat16
+    assert output.shape == hidden.shape and output.dtype == hidden.dtype
+    routes = torch.zeros(
+        (*indices.shape, hidden.shape[-1]), dtype=hidden.dtype, device=hidden.device
+    )
+    accumulated = torch.zeros_like(hidden) if rounding == "reduction" else None
+    for expert_index in indices.unique(sorted=True).tolist():
+        token_indices, ranks = torch.where(indices == expert_index)
+        gate, up = torch.nn.functional.linear(
+            hidden[token_indices], experts.gate_up_proj[expert_index]
+        ).chunk(2, dim=-1)
+        if rounding == "activation":
+            activation = torch.nn.functional.silu(gate) * up
+        else:
+            activation = (torch.nn.functional.silu(gate.float()) * up.float()).to(
+                hidden.dtype
+            )
+        projected = torch.mm(
+            activation, experts.down_proj[expert_index].T, out_dtype=torch.float32
+        )
+        if rounding == "down":
+            projected = projected.to(hidden.dtype).float()
+        else:
+            pass
+        weighted = (projected * weights[token_indices, ranks, None].float()).to(
+            hidden.dtype
+        )
+        if accumulated is not None:
+            accumulated.index_add_(0, token_indices, weighted)
+        else:
+            routes[token_indices, ranks] = weighted
+    return (
+        accumulated
+        if accumulated is not None
+        else routes.float().sum(1).to(hidden.dtype)
+    )
 
 
 @torch.inference_mode()

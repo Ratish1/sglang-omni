@@ -33,6 +33,9 @@ def main() -> None:
             "residual-rotary-moe",
             "residual-rotary-qknorm-router",
             "residual-rotary-qknorm-experts",
+            "source-rounded-activation",
+            "source-rounded-down",
+            "source-rounded-reduction",
         ),
         default="chained",
     )

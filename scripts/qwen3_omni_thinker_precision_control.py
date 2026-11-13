@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 from contextlib import ExitStack
 from dataclasses import asdict, dataclass
+from functools import partial
 from pathlib import Path
 from typing import Literal
 from unittest.mock import patch
@@ -14,10 +15,10 @@ from transformers import DynamicCache
 from transformers.models.qwen3_omni_moe import modeling_qwen3_omni_moe
 from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import (
     Qwen3OmniMoeThinkerForConditionalGeneration,
-    Qwen3OmniMoeThinkerTextExperts,
     Qwen3OmniMoeThinkerTextTopKRouter,
 )
 
+from scripts.debug_qwen3_omni_thinker_expert_rounding import source_rounded_experts
 from scripts.debug_qwen3_omni_thinker_rotary import contracted_bf16_rotation
 from scripts.qwen3_omni_native_residual_control import NativeResidualControl
 from scripts.qwen3_omni_native_rotary_control import NativeRotaryControl
@@ -53,34 +54,6 @@ def keep_fp32_route_weights(
     return logits, selected, indices
 
 
-def source_rounded_experts(
-    experts: Qwen3OmniMoeThinkerTextExperts,
-    inputs: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
-    output: torch.Tensor,
-) -> torch.Tensor:
-    hidden, indices, weights = inputs
-    assert hidden.dtype == experts.gate_up_proj.dtype == torch.bfloat16
-    assert output.shape == hidden.shape and output.dtype == hidden.dtype
-    routes = torch.zeros(
-        (*indices.shape, hidden.shape[-1]), dtype=hidden.dtype, device=hidden.device
-    )
-    for expert_index in indices.unique(sorted=True).tolist():
-        token_indices, ranks = torch.where(indices == expert_index)
-        gate, up = torch.nn.functional.linear(
-            hidden[token_indices], experts.gate_up_proj[expert_index]
-        ).chunk(2, dim=-1)
-        activation = (torch.nn.functional.silu(gate.float()) * up.float()).to(
-            hidden.dtype
-        )
-        projected = torch.mm(
-            activation, experts.down_proj[expert_index].T, out_dtype=torch.float32
-        )
-        routes[token_indices, ranks] = (
-            projected * weights[token_indices, ranks, None].float()
-        ).to(hidden.dtype)
-    return routes.float().sum(1).to(hidden.dtype)
-
-
 @torch.inference_mode()
 def run_precision_controls(
     reference: Qwen3OmniMoeThinkerForConditionalGeneration,
@@ -100,6 +73,9 @@ def run_precision_controls(
             "residual-rotary-moe",
             "residual-rotary-qknorm-router",
             "residual-rotary-qknorm-experts",
+            "source-rounded-activation",
+            "source-rounded-down",
+            "source-rounded-reduction",
         ],
         ...,
     ] = ("checkpoint", "router", "experts", "router-and-experts"),
@@ -131,6 +107,9 @@ def run_precision_controls(
         "residual-rotary-moe",
         "residual-rotary-qknorm-router",
         "residual-rotary-qknorm-experts",
+        "source-rounded-activation",
+        "source-rounded-down",
+        "source-rounded-reduction",
     )
     expert_variants = (
         "experts",
@@ -138,12 +117,18 @@ def run_precision_controls(
         "source-arithmetic",
         "residual-rotary-moe",
         "residual-rotary-qknorm-experts",
+        "source-rounded-activation",
+        "source-rounded-down",
+        "source-rounded-reduction",
     )
     query_key_variants = (
         "source-arithmetic",
         "residual-rotary-qknorm",
         "residual-rotary-qknorm-router",
         "residual-rotary-qknorm-experts",
+        "source-rounded-activation",
+        "source-rounded-down",
+        "source-rounded-reduction",
     )
     if any(name in rotary_variants for name in variants):
         table_rows: dict[int, torch.Tensor] = {}
@@ -229,6 +214,9 @@ def run_precision_controls(
             "residual-rotary-moe",
             "residual-rotary-qknorm-router",
             "residual-rotary-qknorm-experts",
+            "source-rounded-activation",
+            "source-rounded-down",
+            "source-rounded-reduction",
         )
         for layer_index in range(captured.accepted_layer):
             cache.update(
@@ -305,6 +293,9 @@ def run_precision_controls(
                     "source-arithmetic",
                     "residual-rotary-moe",
                     "residual-rotary-qknorm-router",
+                    "source-rounded-activation",
+                    "source-rounded-down",
+                    "source-rounded-reduction",
                 ):
                     hooks.enter_context(
                         layer.mlp.gate.register_forward_hook(keep_fp32_route_weights)
@@ -312,8 +303,19 @@ def run_precision_controls(
                 else:
                     pass
                 if name in expert_variants:
+                    rounding: Literal["source", "activation", "down", "reduction"]
+                    if name == "source-rounded-activation":
+                        rounding = "activation"
+                    elif name == "source-rounded-down":
+                        rounding = "down"
+                    elif name == "source-rounded-reduction":
+                        rounding = "reduction"
+                    else:
+                        rounding = "source"
                     hooks.enter_context(
-                        layer.mlp.experts.register_forward_hook(source_rounded_experts)
+                        layer.mlp.experts.register_forward_hook(
+                            partial(source_rounded_experts, rounding=rounding)
+                        )
                     )
                 else:
                     pass
@@ -410,6 +412,15 @@ def run_precision_controls(
                 "variants": list(variants),
                 "residual_control_checks": residual_checks,
                 "query_key_normalization": normalization_comparisons,
+                "expert_stage_controls": {
+                    name: {
+                        "activation": "Round SiLU to BF16 before multiplying up.",
+                        "down": "Round the same FP32 down-GEMM result to BF16 before router scaling.",
+                        "reduction": "Accumulate weighted BF16 expert outputs in ascending expert order with a BF16 store after each addition.",
+                    }[name.removeprefix("source-rounded-")]
+                    for name in variants
+                    if name.startswith("source-rounded-")
+                },
                 "scope": "Only the stated arithmetic families change in an independently loaded checkpoint producer. Prefix KV, embeddings, positions and other layer operations stay fixed. Source-style expert arithmetic uses cuBLAS rather than the native Triton kernel. The rotary control runs the actual native Triton rotary kernel with retained native tables and independently checks every resulting Q/K against the measured BF16 multiply/FMA formula before propagation. Residual controls run the original FlashInfer normalization kernels, retaining the unrounded two-operand sum for normalization and the BF16 residual for the next addition. Every layer checks composed residual identity. Source-arithmetic also applies the real paired Q/K-normalization kernel before rotation, retains FP32 router scales and uses the already-validated source-style expert rounding. Its norm distance to an FP32 formula is measured separately, not assumed bit-identical. Attention and linear projections remain reference operations. These are causal diagnostic controls, not production repairs or a full native-backend replay.",
             },
             indent=2,
