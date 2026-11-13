@@ -28,6 +28,7 @@ from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import (
 from scripts.debug_qwen3_omni_normalization import NativeNormalization
 from scripts.debug_qwen3_omni_predictor_cache import NativePredictorReplay
 from scripts.debug_qwen3_omni_talker_experts import NativeTalkerExperts
+from scripts.qwen3_omni_attention_inputs import PROJECTION_NAMES, NativeAttentionInputs
 from scripts.qwen3_omni_checkpoint_weights import audit_checkpoint_weights
 from scripts.qwen3_omni_talker_attention import NativeBackboneAttention
 from scripts.qwen3_omni_talker_expert_runtime import ObservedExpertProfileMap
@@ -79,6 +80,8 @@ def main() -> None:
     parser.add_argument("--native-shared-expert", action="store_true")
     parser.add_argument("--paired-native-expert-controls", action="store_true")
     parser.add_argument("--paired-native-attention-controls", action="store_true")
+    parser.add_argument("--native-backbone-attention", action="store_true")
+    parser.add_argument("--paired-native-projection-controls", action="store_true")
     parser.add_argument(
         "--native-expert-route-precision",
         choices=("checkpoint", "float32"),
@@ -107,9 +110,16 @@ def main() -> None:
     )
     parser.add_argument("--output-directory", type=Path, required=True)
     arguments = parser.parse_args()
-    if arguments.paired_native_attention_controls:
+    if (
+        arguments.paired_native_attention_controls
+        or arguments.native_backbone_attention
+    ):
         assert arguments.attention_implementation == "eager"
         assert arguments.dtype == "bfloat16"
+        assert not (
+            arguments.paired_native_attention_controls
+            and arguments.native_backbone_attention
+        )
     else:
         pass
     if arguments.native_expert_capture_directory is not None:
@@ -208,7 +218,16 @@ def main() -> None:
         )
     else:
         observed_profiles = None
-    if arguments.paired_native_attention_controls:
+    if arguments.paired_native_projection_controls:
+        assert arguments.dtype == "bfloat16"
+        projection_control = NativeAttentionInputs(reference=reference)
+        projection_control.install()
+    else:
+        projection_control = None
+    if (
+        arguments.paired_native_attention_controls
+        or arguments.native_backbone_attention
+    ):
         attention_control = NativeBackboneAttention(reference=reference)
         attention_control.install()
     else:
@@ -261,28 +280,56 @@ def main() -> None:
             if arguments.paired_native_expert_controls
             else ("fused" if expert_control is not None else "checkpoint",)
         )
-        attention_modes = (
-            ("eager", "fa3", "eager-repeat")
-            if attention_control is not None
-            else ("unchanged",)
+        if arguments.paired_native_attention_controls:
+            attention_modes = ("eager", "fa3", "eager-repeat")
+        elif arguments.native_backbone_attention:
+            attention_modes = ("fa3",)
+        else:
+            attention_modes = ("unchanged",)
+        projection_modes = (
+            ("checkpoint", "merged", "paired", "merged-paired", "checkpoint-repeat")
+            if projection_control is not None
+            else ("checkpoint",)
         )
         for (
             trace_directory,
             sampling_order,
             normalization_mode,
             expert_mode,
+            projection_mode,
             attention_mode,
             residual_policy_index,
             residual_policy,
         ) in (
-            (directory, order, mode, expert_mode, attention_mode, policy_index, policy)
+            (
+                directory,
+                order,
+                mode,
+                expert_mode,
+                projection_mode,
+                attention_mode,
+                policy_index,
+                policy,
+            )
             for directory in arguments.trace_directory
             for order in arguments.sampling_order
             for mode in normalization_modes
             for expert_mode in expert_modes
+            for projection_mode in projection_modes
             for attention_mode in attention_modes
             for policy_index, policy in enumerate(arguments.residual_policy)
         ):
+            if projection_control is not None:
+                assert not projection_control.projections
+                projection_control.projection_calls = 0
+                projection_control.normalization_calls = 0
+                if projection_mode in ("merged", "paired", "merged-paired"):
+                    projection_control.enabled = True
+                    projection_control.mode = projection_mode
+                else:
+                    projection_control.enabled = False
+            else:
+                pass
             if attention_control is not None:
                 attention_control.set_enabled(attention_mode == "fa3")
             else:
@@ -320,6 +367,10 @@ def main() -> None:
             normalization.query_key_enabled = normalization_mode in (
                 "native",
                 "native-query-key",
+            ) and not (
+                projection_control is not None
+                and projection_control.enabled
+                and projection_control.mode in ("paired", "merged-paired")
             )
             prefill_file = next(trace_directory.glob("*-before_prefill.pt"))
             captured_sampling = json.loads(
@@ -522,6 +573,10 @@ def main() -> None:
                 pass
             if attention_control is not None:
                 mode_directory = mode_directory / attention_mode
+            else:
+                pass
+            if projection_control is not None:
+                mode_directory = mode_directory / projection_mode
             else:
                 pass
             if len(arguments.residual_policy) > 1:
@@ -789,6 +844,23 @@ def main() -> None:
                 )
             else:
                 pass
+            if projection_control is not None:
+                expected_projection_calls = (
+                    len(frame_reports) * len(reference.model.layers)
+                    if projection_control.enabled
+                    else 0
+                )
+                assert not projection_control.projections
+                assert projection_control.projection_calls == (
+                    expected_projection_calls * len(PROJECTION_NAMES)
+                )
+                assert projection_control.normalization_calls == (
+                    expected_projection_calls * 2
+                    if projection_control.mode in ("paired", "merged-paired")
+                    else 0
+                )
+            else:
+                pass
             report = {
                 "model_revision": arguments.model_revision,
                 "frame_limit": frame_limit,
@@ -821,6 +893,13 @@ def main() -> None:
                 "normalization_semantics": normalization_mode,
                 "expert_mode": expert_mode,
                 "attention_mode": attention_mode,
+                "attention_projection_mode": projection_mode,
+                "native_projection_calls": (
+                    projection_control.projection_calls if projection_control else 0
+                ),
+                "native_paired_normalization_calls": (
+                    projection_control.normalization_calls if projection_control else 0
+                ),
                 "native_backbone_attention_calls": (
                     attention_control.calls if attention_control is not None else 0
                 ),
