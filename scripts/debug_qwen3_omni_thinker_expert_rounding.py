@@ -11,6 +11,7 @@ from typing import Literal
 import torch
 from huggingface_hub import snapshot_download
 from safetensors import safe_open
+from sgl_kernel import moe_sum_reduce
 from sglang.kernels.ops.activation.activation import (
     silu_and_mul,
     silu_and_mul_with_activation_rounding,
@@ -77,6 +78,7 @@ def main() -> None:
     parser.add_argument("--model-path", required=True)
     parser.add_argument("--model-revision", required=True)
     parser.add_argument("--gpu", type=int, required=True)
+    parser.add_argument("--layer-index", type=int)
     parser.add_argument("--output-directory", type=Path, required=True)
     arguments = parser.parse_args()
     arguments.output_directory.mkdir(parents=True, exist_ok=False)
@@ -104,8 +106,18 @@ def main() -> None:
         captured["batch_offset"], captured["batch_offset"] + captured["extend_length"]
     )
     operators = captured["operator_batches"]
+    if arguments.layer_index is not None and arguments.layer_index not in range(
+        len(captured["layer_batches"]) - 1
+    ):
+        raise ValueError("Selected layer is outside the captured expert layers")
+    else:
+        pass
     reports = []
     for layer_index in range(len(captured["layer_batches"]) - 1):
+        if arguments.layer_index is not None and layer_index != arguments.layer_index:
+            continue
+        else:
+            pass
         runtime = manifest["layers"][layer_index]
         assert runtime["activation"] in ("silu", "silu_rounded")
         assert runtime["is_gated"]
@@ -214,6 +226,11 @@ def main() -> None:
         rounded_down_only_output = (
             rounded_down_only_routes.float().sum(1).to(hidden.dtype)
         )
+        native_down_sum = torch.empty_like(hidden)
+        moe_sum_reduce(rounded_down_only_routes, native_down_sum, 1.0)
+        ordered_down_sum = torch.zeros_like(hidden, dtype=torch.float32)
+        for rank in range(top_k):
+            ordered_down_sum.add_(rounded_down_only_routes[:, rank].float())
         rounded_activation_output = (
             rounded_activation_routes.float().sum(1).to(hidden.dtype)
         )
@@ -225,6 +242,12 @@ def main() -> None:
             ),
             "native_to_rounded_down_only": compare_tensors(
                 actual[live], rounded_down_only_output[live]
+            ),
+            "native_to_rounded_down_native_sum": compare_tensors(
+                actual[live], native_down_sum[live]
+            ),
+            "native_to_rounded_down_rank_ordered_fp32_sum": compare_tensors(
+                actual[live], ordered_down_sum[live].to(hidden.dtype)
             ),
             "native_to_rounded_activation": compare_tensors(
                 actual[live], rounded_activation_output[live]
@@ -257,6 +280,41 @@ def main() -> None:
                 "native_rounded_activation_maximum_absolute_error": native_rounded_activation_maximum_error,
                 "fp32_down_cast_vs_bf16_gemm_different_values": down_store_differences,
                 "down_values": down_store_values,
+                "down_sum_disagreements": (
+                    [
+                        {
+                            "live_token_index": row,
+                            "hidden_column": column,
+                            "weighted_bf16_routes": rounded_down_only_routes[live][
+                                row, :, column
+                            ]
+                            .double()
+                            .tolist(),
+                            "native_output": float(actual[live][row, column]),
+                            "torch_sum_output": float(
+                                rounded_down_only_output[live][row, column]
+                            ),
+                            "native_reduction_output": float(
+                                native_down_sum[live][row, column]
+                            ),
+                            "rank_ordered_fp32_sum": float(
+                                ordered_down_sum[live][row, column]
+                            ),
+                            "fp64_sum": float(
+                                rounded_down_only_routes[live][row, :, column]
+                                .double()
+                                .sum()
+                            ),
+                        }
+                        for row, column in (
+                            actual[live] != rounded_down_only_output[live]
+                        )
+                        .nonzero()
+                        .tolist()
+                    ]
+                    if differences["native_to_rounded_down_native_sum"].exact
+                    else []
+                ),
                 "comparisons": {
                     name: asdict(difference) for name, difference in differences.items()
                 },
@@ -265,6 +323,7 @@ def main() -> None:
         print(json.dumps({"completed_layer": layer_index}), flush=True)
     report = {
         "request_id": arguments.request_id,
+        "down_sum_scope": "Native C++ and explicit rank-ordered FP32 reductions consume the same independently calculated BF16 routes. Disagreement coordinates are retained only when native reduction matches the entire live output. The parallel torch.sum comparison is preserved, without a widened tolerance.",
         "scope": "Held native inputs and routing with raw checkpoint weights. These source-semantic counterfactuals use per-expert cuBLAS GEMMs, not the native padded Triton GEMM geometry or its fast SiLU intrinsics. The native activation measurements separately execute the actual ordinary and activation-rounded SiLU kernels on the same projected operands, reporting differences rather than assuming exactness. Changing a rounding stage is not a production repair or a speech-quality result. The FP32-down-cast versus BF16-GEMM comparison explicitly reports any additional matmul difference.",
         "layers": reports,
     }
