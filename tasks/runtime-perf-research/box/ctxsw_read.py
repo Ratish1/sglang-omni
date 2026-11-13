@@ -148,9 +148,11 @@ def read(path: str) -> None:
             f"  {role:8s} resident {resident_s[role] / window_s:.3f} of the card, {len(residency_ms[role]) / window_s:.0f} residencies/s, ms {quantiles(residency_ms[role])}"
         )
 
-    by_correlation: dict[int, list[tuple[int, int]]] = collections.defaultdict(list)
+    by_correlation: dict[tuple[int, int], list[tuple[int, int]]] = (
+        collections.defaultdict(list)
+    )
     for start, end, global_pid, _, correlation in kernels:
-        by_correlation[correlation].append((start, end))
+        by_correlation[(pid_of(global_pid), correlation)].append((start, end))
     runtime = connection.execute(
         "select start, end, globalTid, nameId, correlationId from CUPTI_ACTIVITY_KIND_RUNTIME where start between ? and ?",
         (window_start, window_end),
@@ -162,12 +164,9 @@ def read(path: str) -> None:
         role = role_of_pid.get(pid_of(global_tid), "other")
         name = names[name_id].split("_v")[0]
         calls[(role, name)].append((end - start) / 1e6)
-        if (
-            role == "thinker"
-            and name == "cudaGraphLaunch"
-            and correlation in by_correlation
-        ):
-            graph_kernels = by_correlation[correlation]
+        key = (pid_of(global_tid), correlation)
+        if role == "thinker" and name == "cudaGraphLaunch" and key in by_correlation:
+            graph_kernels = by_correlation[key]
             first = min(kernel[0] for kernel in graph_kernels)
             last = max(kernel[1] for kernel in graph_kernels)
             others = sum(1 for stamp in restores if first < stamp < last)
