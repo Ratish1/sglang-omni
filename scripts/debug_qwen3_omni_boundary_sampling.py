@@ -23,7 +23,9 @@ from scripts.debug_qwen3_omni_sampling_alignment import (
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--capture-directory", type=Path, required=True)
-    parser.add_argument("--reference-directory", type=Path, required=True)
+    comparison = parser.add_mutually_exclusive_group(required=True)
+    comparison.add_argument("--reference-directory", type=Path)
+    comparison.add_argument("--native-only", action="store_true")
     parser.add_argument("--gpu", type=int, required=True)
     parser.add_argument("--output-directory", type=Path, required=True)
     arguments = parser.parse_args()
@@ -31,7 +33,9 @@ def main() -> None:
     torch.cuda.set_device(arguments.gpu)
     device = torch.device("cuda", arguments.gpu)
     reports = []
-    for directory in sorted(arguments.capture_directory.iterdir()):
+    for directory in sorted(
+        path for path in arguments.capture_directory.iterdir() if path.is_dir()
+    ):
         parameters = SamplingParameters.model_validate_json(
             (directory / "sampling.json").read_bytes()
         )
@@ -51,7 +55,10 @@ def main() -> None:
             dtype=torch.bool,
             device=device,
         )
-        counts = {owner: Counter() for owner in ("checkpoint", "native")}
+        counts = {
+            owner: Counter()
+            for owner in (() if arguments.native_only else ("checkpoint", "native"))
+        }
         for frame, filename in enumerate(files):
             observed = torch.load(filename, weights_only=True)
             assert bool(observed["is_extend"]) == (frame == 0)
@@ -182,6 +189,8 @@ def main() -> None:
             repeated[:, choices["observed"]] = True
         report = {
             "request_id": directory.name,
+            "native_only": arguments.native_only,
+            "native_draws_reproduced": len(files),
             "counts": {owner: dict(values) for owner, values in counts.items()},
         }
         reports.append(report)
