@@ -8293,7 +8293,47 @@ def test_qwen3_tts_async_commit_propagates_process_exit(
         if commit == "initial":
             scheduler.commit_initial("request", state, plan, torch.ones(4))
         else:
-            scheduler.commit_followup("request", state, plan, torch.ones(4))
+            scheduler.commit_followups([("request", state, plan)], [torch.ones(4)])
+
+
+@pytest.mark.parametrize(
+    ("spans", "is_one_transfer"),
+    [(((1, 4, 1), (1, 4, 1)), True), (((1, 4, 1), (0, 4, 1)), False)],
+)
+def test_qwen3_tts_cohort_samples_are_the_rows_new_samples(
+    spans: tuple[tuple[int, int, int], ...], is_one_transfer: bool
+) -> None:
+    scheduler = Qwen3TTSStreamingVocoderScheduler(
+        FakeQwen3TTSSpeechTokenizer(), device="cpu"
+    )
+    plans = [
+        IncrementalDecodePlan(
+            decoder_input=None,
+            slot=index,
+            fresh_frames=generated_frames - emitted_frames + trim_frames,
+            reference_trim_frames=trim_frames,
+            generated_frames=generated_frames,
+            emitted_generated_frames=emitted_frames,
+        )
+        for index, (trim_frames, generated_frames, emitted_frames) in enumerate(spans)
+    ]
+    waveform = torch.arange(
+        len(plans) * 4 * scheduler.samples_per_frame, dtype=torch.float32
+    ).reshape(len(plans), 1, -1)
+    incremental = IncrementalDecodeBatch(decoder=None, arena=None, slots=[])
+
+    samples = scheduler.cohort_samples(plans, waveform, incremental)
+
+    if is_one_transfer:
+        expected = [
+            scheduler.extract_incremental_delta(plan, row)
+            for plan, row in zip(
+                plans, scheduler.split_batch_waveform(waveform, len(plans))
+            )
+        ]
+        assert torch.equal(samples, torch.stack(expected))
+    else:
+        assert samples is None
 
 
 def test_qwen3_tts_async_followup_drops_late_audio_after_abort() -> None:
