@@ -27,7 +27,164 @@ from scripts.debug_qwen3_omni_native_weights import (
     audit_native_talker_parameters,
 )
 from scripts.qwen3_omni_checkpoint_weights import audit_checkpoint_weights
-from sglang_omni.utils.predictor_layers import FusedPredictorLayers
+from sglang_omni.utils.predictor_layers import FusedPredictorLayers, codebook_step
+
+
+class NativePredictorReplay:
+    """Reconstruct the observed single-request predictor from audited checkpoint weights."""
+
+    def __init__(
+        self,
+        reference: Qwen3OmniMoeTalkerForConditionalGeneration,
+        capture_directory: Path,
+        output_directory: Path,
+        model_path: str,
+        model_revision: str,
+    ) -> None:
+        runtime = NativeBufferRuntime.model_validate_json(
+            (capture_directory / "native-talker-buffer-runtime.json").read_bytes()
+        )
+        assert (
+            runtime.predictor_fused_layers and runtime.predictor_layer_shape is not None
+        )
+        checkpoint_directory = Path(
+            snapshot_download(model_path, revision=model_revision)
+        )
+        audit_checkpoint_weights(
+            reference,
+            checkpoint_directory,
+            output_directory / "raw-checkpoint-weights.json",
+        )
+        manifest_bytes = (
+            capture_directory / "native-talker-parameters.json"
+        ).read_bytes()
+        audit_native_talker_parameters(
+            reference,
+            NativeManifest.model_validate_json(manifest_bytes),
+            output_directory / "native-checkpoint-weights.json",
+            model_path=model_path,
+            model_revision=model_revision,
+            manifest_sha256=hashlib.sha256(manifest_bytes).hexdigest(),
+        )
+        configuration = reference.config
+        predictor_configuration = configuration.code_predictor_config
+        shape = runtime.predictor_layer_shape
+        assert shape.hidden_size == predictor_configuration.hidden_size
+        assert shape.head_dim == predictor_configuration.head_dim
+        assert shape.num_q_heads == predictor_configuration.num_attention_heads
+        assert shape.num_kv_heads == predictor_configuration.num_key_value_heads
+        assert shape.intermediate_size == predictor_configuration.intermediate_size
+        captured_buffers = torch.load(
+            capture_directory / "native-talker-buffers.pt", weights_only=True
+        )
+        table_name = next(
+            name
+            for name in captured_buffers
+            if name.startswith("code_predictor.") and name.endswith(".cos_sin_cache")
+        )
+        rotary_table = captured_buffers[table_name].to(reference.device)
+        assert rotary_table.dtype == torch.float32
+        self.reference: Qwen3OmniMoeTalkerForConditionalGeneration = reference
+        self.layers: nn.ModuleList = reference.code_predictor.model.layers
+        for layer in self.layers:
+            attention = layer.self_attn
+            attention.qkv_proj = nn.Linear(
+                shape.hidden_size,
+                (shape.num_q_heads + 2 * shape.num_kv_heads) * shape.head_dim,
+                bias=False,
+                device="meta",
+            )
+            attention.qkv_proj.weight = nn.Parameter(
+                torch.cat(
+                    [
+                        attention.q_proj.weight,
+                        attention.k_proj.weight,
+                        attention.v_proj.weight,
+                    ],
+                    dim=0,
+                ),
+                requires_grad=False,
+            )
+            attention.rotary_emb = nn.Module()
+            attention.rotary_emb.register_buffer(
+                "cos_sin_cache", rotary_table, persistent=False
+            )
+            layer.mlp.gate_up_proj = nn.Linear(
+                shape.hidden_size,
+                2 * shape.intermediate_size,
+                bias=False,
+                device="meta",
+            )
+            layer.mlp.gate_up_proj.weight = nn.Parameter(
+                torch.cat(
+                    [layer.mlp.gate_proj.weight, layer.mlp.up_proj.weight], dim=0
+                ),
+                requires_grad=False,
+            )
+        self.final_norm: RMSNorm = RMSNorm(
+            shape.hidden_size, eps=predictor_configuration.rms_norm_eps
+        )
+        self.final_norm.weight = reference.code_predictor.model.norm.weight
+        self.fused: FusedPredictorLayers = FusedPredictorLayers(
+            shape, 2, reference.device, torch.bfloat16
+        )
+        self.group_count: int = configuration.num_code_groups
+        self.keys: torch.Tensor = torch.zeros(
+            len(self.layers),
+            1,
+            self.group_count + 1,
+            shape.num_kv_heads,
+            shape.head_dim,
+            dtype=torch.bfloat16,
+            device=reference.device,
+        )
+        self.values: torch.Tensor = torch.zeros_like(self.keys)
+
+    def forward_tokens(
+        self, embeddings: torch.Tensor, cache_length: int
+    ) -> torch.Tensor:
+        positions = torch.arange(
+            cache_length,
+            cache_length + embeddings.shape[1],
+            dtype=torch.long,
+            device=embeddings.device,
+        )
+        return self.fused.forward(
+            layers=self.layers,
+            final_norm=self.final_norm,
+            token_embeds=embeddings,
+            batch_size=1,
+            cache_len=cache_length,
+            positions=positions,
+            k_cache=self.keys,
+            v_cache=self.values,
+        )
+
+    def generate(
+        self, main_code: torch.Tensor, talker_hidden: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        assert main_code.shape == (1,) and talker_hidden.shape[:2] == (1, 1)
+        codes = torch.empty(
+            (1, self.group_count), dtype=torch.long, device=main_code.device
+        )
+        codes[:, 0].copy_(main_code)
+        main_embedding = self.reference.model.codec_embedding(main_code[:, None])
+        feedback = main_embedding[:, 0].clone()
+        embeddings = torch.cat((talker_hidden, main_embedding), dim=1)
+        cache_length = 0
+        for group in range(self.group_count - 1):
+            output = self.forward_tokens(embeddings, cache_length)
+            cache_length += embeddings.shape[1]
+            logits = self.reference.code_predictor.lm_head[group](output[:, -1:])
+            assert logits.isfinite().all()
+            embeddings = codebook_step(
+                logits[:, -1],
+                self.reference.code_predictor.model.codec_embedding[group].weight,
+                codes[:, group + 1],
+            )
+            feedback.add_(embeddings[:, 0])
+        assert cache_length == self.group_count
+        return codes, feedback[:, None]
 
 
 @torch.inference_mode()
@@ -41,10 +198,6 @@ def main() -> None:
     arguments = parser.parse_args()
     arguments.output_directory.mkdir(exist_ok=False)
     torch.cuda.set_device(arguments.gpu)
-    runtime = NativeBufferRuntime.model_validate_json(
-        (arguments.capture_directory / "native-talker-buffer-runtime.json").read_bytes()
-    )
-    assert runtime.predictor_fused_layers and runtime.predictor_layer_shape is not None
     configuration = Qwen3OmniMoeConfig.from_pretrained(
         arguments.model_path, revision=arguments.model_revision
     ).talker_config
@@ -64,87 +217,15 @@ def main() -> None:
     )
     assert not loading["missing_keys"] and not loading["mismatched_keys"]
     reference.eval()
-    checkpoint_directory = Path(
-        snapshot_download(arguments.model_path, revision=arguments.model_revision)
-    )
-    audit_checkpoint_weights(
-        reference,
-        checkpoint_directory,
-        arguments.output_directory / "raw-checkpoint-weights.json",
-    )
-    manifest_bytes = (
-        arguments.capture_directory / "native-talker-parameters.json"
-    ).read_bytes()
-    audit_native_talker_parameters(
-        reference,
-        NativeManifest.model_validate_json(manifest_bytes),
-        arguments.output_directory / "native-checkpoint-weights.json",
+    predictor = NativePredictorReplay(
+        reference=reference,
+        capture_directory=arguments.capture_directory,
+        output_directory=arguments.output_directory,
         model_path=arguments.model_path,
         model_revision=arguments.model_revision,
-        manifest_sha256=hashlib.sha256(manifest_bytes).hexdigest(),
     )
-    predictor_configuration = configuration.code_predictor_config
-    shape = runtime.predictor_layer_shape
-    assert shape.hidden_size == predictor_configuration.hidden_size
-    assert shape.head_dim == predictor_configuration.head_dim
-    assert shape.num_q_heads == predictor_configuration.num_attention_heads
-    assert shape.num_kv_heads == predictor_configuration.num_key_value_heads
-    assert shape.intermediate_size == predictor_configuration.intermediate_size
-    captured_buffers = torch.load(
-        arguments.capture_directory / "native-talker-buffers.pt", weights_only=True
-    )
-    table_name = next(
-        name
-        for name in captured_buffers
-        if name.startswith("code_predictor.") and name.endswith(".cos_sin_cache")
-    )
-    rotary_table = captured_buffers[table_name].to(reference.device)
-    assert rotary_table.dtype == torch.float32
-    layers = reference.code_predictor.model.layers
-    for layer in layers:
-        attention = layer.self_attn
-        attention.qkv_proj = nn.Linear(
-            shape.hidden_size,
-            (shape.num_q_heads + 2 * shape.num_kv_heads) * shape.head_dim,
-            bias=False,
-            device="meta",
-        )
-        attention.qkv_proj.weight = nn.Parameter(
-            torch.cat(
-                [
-                    attention.q_proj.weight,
-                    attention.k_proj.weight,
-                    attention.v_proj.weight,
-                ],
-                dim=0,
-            ),
-            requires_grad=False,
-        )
-        attention.rotary_emb = nn.Module()
-        attention.rotary_emb.register_buffer(
-            "cos_sin_cache", rotary_table, persistent=False
-        )
-        layer.mlp.gate_up_proj = nn.Linear(
-            shape.hidden_size, 2 * shape.intermediate_size, bias=False, device="meta"
-        )
-        layer.mlp.gate_up_proj.weight = nn.Parameter(
-            torch.cat([layer.mlp.gate_proj.weight, layer.mlp.up_proj.weight], dim=0),
-            requires_grad=False,
-        )
-    final_norm = RMSNorm(shape.hidden_size, eps=predictor_configuration.rms_norm_eps)
-    final_norm.weight = reference.code_predictor.model.norm.weight
-    fused = FusedPredictorLayers(shape, 2, reference.device, torch.bfloat16)
     group_count = configuration.num_code_groups
-    keys = torch.zeros(
-        len(layers),
-        1,
-        group_count + 1,
-        shape.num_kv_heads,
-        shape.head_dim,
-        dtype=torch.bfloat16,
-        device=reference.device,
-    )
-    values = torch.zeros_like(keys)
+    keys, values = predictor.keys, predictor.values
     reports = []
     for directory in sorted(arguments.capture_directory.iterdir()):
         if not directory.is_dir():
@@ -168,7 +249,7 @@ def main() -> None:
             codes = observed["codec_ids"].to(device=reference.device, dtype=torch.long)
             assert codes.numel() == group_count
             hidden = observed["hidden_states"].to(reference.device).reshape(1, 1, -1)
-            assert hidden.shape[-1] == shape.hidden_size
+            assert hidden.shape[-1] == configuration.code_predictor_config.hidden_size
             main_embedding = reference.model.codec_embedding(codes[:1].reshape(1, 1))
             inputs = torch.cat((hidden, main_embedding), dim=1)
             feedback = main_embedding[:, 0].clone()
@@ -176,22 +257,7 @@ def main() -> None:
             cache_length = 0
             for group in range(group_count - 1):
                 token_count = inputs.shape[1]
-                positions = torch.arange(
-                    cache_length,
-                    cache_length + token_count,
-                    dtype=torch.long,
-                    device=reference.device,
-                )
-                output = fused.forward(
-                    layers=layers,
-                    final_norm=final_norm,
-                    token_embeds=inputs,
-                    batch_size=1,
-                    cache_len=cache_length,
-                    positions=positions,
-                    k_cache=keys,
-                    v_cache=values,
-                )
+                output = predictor.forward_tokens(inputs, cache_length)
                 cache_length += token_count
                 logits = reference.code_predictor.lm_head[group](output[:, -1:])
                 assert logits.isfinite().all()
@@ -216,6 +282,15 @@ def main() -> None:
                         ),
                     }
                 )
+            held_counters_zero = not bool(predictor.fused.counters.count_nonzero())
+            free_codes, free_feedback = predictor.generate(codes[:1], hidden)
+            generated_cache_exact = all(
+                torch.equal(
+                    cache[:, 0, :group_count],
+                    snapshot[name][:, :group_count].to(reference.device),
+                )
+                for name, cache in (("keys", keys), ("values", values))
+            )
             reports.append(
                 {
                     "request_id": directory.name,
@@ -224,13 +299,21 @@ def main() -> None:
                     "native_residual_codes": codes[1:].tolist(),
                     "replayed_argmax_codes": predictions,
                     "codes_exact": predictions == codes[1:].tolist(),
+                    "generated_codes_exact": torch.equal(free_codes[0], codes),
+                    "generated_cache_exact": generated_cache_exact,
+                    "generated_feedback_exact": torch.equal(
+                        free_feedback[0, 0].cpu(), observed["codec_feedback"]
+                    ),
                     "feedback_exact": torch.equal(
                         feedback[0].cpu(), observed["codec_feedback"]
                     ),
                     "native_counters_zero": not bool(
                         snapshot["fused_counters"].count_nonzero()
                     ),
-                    "replayed_counters_zero": not bool(fused.counters.count_nonzero()),
+                    "replayed_counters_zero": held_counters_zero,
+                    "generated_counters_zero": not bool(
+                        predictor.fused.counters.count_nonzero()
+                    ),
                     "cache_checks": cache_checks,
                 }
             )
@@ -248,9 +331,13 @@ def main() -> None:
     )
     assert all(
         frame["codes_exact"]
+        and frame["generated_codes_exact"]
+        and frame["generated_cache_exact"]
+        and frame["generated_feedback_exact"]
         and frame["feedback_exact"]
         and frame["native_counters_zero"]
         and frame["replayed_counters_zero"]
+        and frame["generated_counters_zero"]
         and all(cache["exact"] for cache in frame["cache_checks"])
         for frame in reports
     ), "Retained full predictor comparison differs; preserve the complete report."
