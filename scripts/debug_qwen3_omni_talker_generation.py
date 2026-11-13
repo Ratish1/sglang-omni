@@ -72,6 +72,11 @@ def main() -> None:
     parser.add_argument("--audit-loaded-weights", action="store_true")
     parser.add_argument("--native-predictor-capture-directory", type=Path)
     parser.add_argument(
+        "--native-feedback-reduction",
+        choices=("sequential", "checkpoint"),
+        default="sequential",
+    )
+    parser.add_argument(
         "--capture-layer-states",
         action="store_true",
         help="Retain layer outputs and new KV rows for every reference frame.",
@@ -98,6 +103,11 @@ def main() -> None:
         policy != "greedy" for policy in arguments.residual_policy
     ):
         raise ValueError("Native predictor recurrence requires greedy residual policy")
+    elif (
+        arguments.native_predictor_capture_directory is None
+        and arguments.native_feedback_reduction != "sequential"
+    ):
+        raise ValueError("Native feedback selection requires the native predictor")
     else:
         pass
     arguments.output_directory.mkdir(exist_ok=False)
@@ -154,6 +164,7 @@ def main() -> None:
             output_directory=predictor_audit_directory,
             model_path=arguments.model_path,
             model_revision=arguments.model_revision,
+            feedback_reduction=arguments.native_feedback_reduction,
         )
     else:
         native_predictor = None
@@ -690,6 +701,11 @@ def main() -> None:
                 "native_predictor_capture_directory": (
                     str(arguments.native_predictor_capture_directory)
                     if arguments.native_predictor_capture_directory is not None
+                    else None
+                ),
+                "native_feedback_reduction": (
+                    arguments.native_feedback_reduction
+                    if native_predictor is not None
                     else None
                 ),
                 "residual_torch_seed": (

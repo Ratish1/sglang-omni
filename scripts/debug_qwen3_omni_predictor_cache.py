@@ -7,6 +7,7 @@ import hashlib
 import inspect
 import json
 from pathlib import Path
+from typing import Literal
 
 import torch
 from huggingface_hub import snapshot_download
@@ -40,6 +41,7 @@ class NativePredictorReplay:
         output_directory: Path,
         model_path: str,
         model_revision: str,
+        feedback_reduction: Literal["sequential", "checkpoint"] = "sequential",
     ) -> None:
         runtime = NativeBufferRuntime.model_validate_json(
             (capture_directory / "native-talker-buffer-runtime.json").read_bytes()
@@ -129,6 +131,9 @@ class NativePredictorReplay:
             shape, 2, reference.device, torch.bfloat16
         )
         self.group_count: int = configuration.num_code_groups
+        self.feedback_reduction: Literal["sequential", "checkpoint"] = (
+            feedback_reduction
+        )
         self.keys: torch.Tensor = torch.zeros(
             len(self.layers),
             1,
@@ -169,6 +174,7 @@ class NativePredictorReplay:
         )
         codes[:, 0].copy_(main_code)
         main_embedding = self.reference.model.codec_embedding(main_code[:, None])
+        feedback_embeddings = [main_embedding]
         feedback = main_embedding[:, 0].clone()
         embeddings = torch.cat((talker_hidden, main_embedding), dim=1)
         cache_length = 0
@@ -183,7 +189,12 @@ class NativePredictorReplay:
                 codes[:, group + 1],
             )
             feedback.add_(embeddings[:, 0])
+            feedback_embeddings.append(embeddings)
         assert cache_length == self.group_count
+        if self.feedback_reduction == "checkpoint":
+            feedback = torch.cat(feedback_embeddings, dim=1).sum(dim=1)
+        else:
+            pass
         return codes, feedback[:, None]
 
 
@@ -195,6 +206,11 @@ def main() -> None:
     parser.add_argument("--model-revision", required=True)
     parser.add_argument("--gpu", type=int, required=True)
     parser.add_argument("--output-directory", type=Path, required=True)
+    parser.add_argument(
+        "--feedback-reduction",
+        choices=("sequential", "checkpoint"),
+        default="sequential",
+    )
     arguments = parser.parse_args()
     arguments.output_directory.mkdir(exist_ok=False)
     torch.cuda.set_device(arguments.gpu)
@@ -223,6 +239,7 @@ def main() -> None:
         output_directory=arguments.output_directory,
         model_path=arguments.model_path,
         model_revision=arguments.model_revision,
+        feedback_reduction=arguments.feedback_reduction,
     )
     group_count = configuration.num_code_groups
     keys, values = predictor.keys, predictor.values
@@ -251,6 +268,7 @@ def main() -> None:
             hidden = observed["hidden_states"].to(reference.device).reshape(1, 1, -1)
             assert hidden.shape[-1] == configuration.code_predictor_config.hidden_size
             main_embedding = reference.model.codec_embedding(codes[:1].reshape(1, 1))
+            feedback_embeddings = [main_embedding]
             inputs = torch.cat((hidden, main_embedding), dim=1)
             feedback = main_embedding[:, 0].clone()
             predictions = []
@@ -266,7 +284,12 @@ def main() -> None:
                     codes[group + 1 : group + 2].reshape(1, 1)
                 )
                 feedback.add_(inputs[:, 0])
+                feedback_embeddings.append(inputs)
             assert cache_length == group_count
+            if arguments.feedback_reduction == "checkpoint":
+                feedback = torch.cat(feedback_embeddings, dim=1).sum(dim=1)
+            else:
+                pass
             cache_checks = []
             for name, cache in (("keys", keys), ("values", values)):
                 expected = snapshot[name][:, :group_count].to(reference.device)
@@ -322,9 +345,10 @@ def main() -> None:
     report = {
         "model_path": arguments.model_path,
         "model_revision": arguments.model_revision,
+        "feedback_reduction": arguments.feedback_reduction,
         "kernel_source_sha256": hashlib.sha256(kernel_source.read_bytes()).hexdigest(),
         "frames": reports,
-        "scope": "Actual recorded native backbone queries, main codes and residual-code prefixes are held for every frame through EOS. Independently raw-audited checkpoint weights are packed for the unchanged native fused kernels, using captured rotary-table bytes and recorded split geometry. Every consumed predictor KV slot, generated residual argmax, sequential BF16 feedback and scratch-counter reset is checked. The allocated but never consumed last cache slot is excluded. This is native kernel/state reproducibility, not an independent mathematical or free-running speech-quality oracle. No new main-code sampling or waveforms.",
+        "scope": "Actual recorded native backbone queries, main codes and residual-code prefixes are held for every frame through EOS. Independently raw-audited checkpoint weights are packed for the unchanged native fused kernels, using captured rotary-table bytes and recorded split geometry. Every consumed predictor KV slot, generated residual argmax, selected feedback reduction and scratch-counter reset is checked. The allocated but never consumed last cache slot is excluded. This is native kernel/state reproducibility, not an independent mathematical or free-running speech-quality oracle. No new main-code sampling or waveforms.",
     }
     (arguments.output_directory / "summary.json").write_text(
         json.dumps(report, indent=2)
