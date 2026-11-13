@@ -29,6 +29,7 @@ def main() -> None:
     parser.add_argument("--capture-token-rows", type=int, default=112)
     parser.add_argument("--capture-talker-operators", action="store_true")
     parser.add_argument("--capture-all-conditioning", action="store_true")
+    parser.add_argument("--checkpoint-talker-normalization", action="store_true")
     parser.add_argument(
         "--reference-predictor-mode",
         choices=("identity", "checkpoint", "checkpoint-codes", "checkpoint-feedback"),
@@ -165,6 +166,12 @@ def main() -> None:
             )
         else:
             pass
+        if arguments.checkpoint_talker_normalization:
+            diagnostic_environment[
+                "SGLANG_OMNI_DIAGNOSTIC_CHECKPOINT_TALKER_NORMALIZATION"
+            ] = "1"
+        else:
+            pass
         environment = os.environ.copy()
         assert not any(
             name.startswith("SGLANG_OMNI_DIAGNOSTIC_") for name in environment
@@ -192,6 +199,7 @@ def main() -> None:
                     ),
                     "model_revision": arguments.model_revision,
                     "reference_predictor_mode": arguments.reference_predictor_mode,
+                    "checkpoint_talker_normalization": arguments.checkpoint_talker_normalization,
                     "captured_request_ids": capture_request_ids,
                     "accepted_layer": accepted_layer,
                     "timing_scope": "Bounded operator observers enabled in both arms, not production performance qualification.",
