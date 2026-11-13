@@ -17,7 +17,10 @@ prompts, so it ends inside the non-streaming client's one pass over all 1,088. P
   s16band  main on both cards: the same, the same-time band
   w1       main card 0, head card 1: non-streaming at 16, at 64 twice, then one at a time
   w2       head card 0, main card 1: the same
-Cells: mixa to mixc 16 streaming and 48 non-streaming in flight at once; n16 and n64 non-streaming over every prompt.
+  order1   tree a (--main) card 0, tree b (--head) card 1: non-streaming at 16 and 64, then open loop at 50 and 70 a second
+  order2   b card 0, a card 1: the same
+Cells: mixa to mixc 16 streaming and 48 non-streaming in flight at once; n16 and n64 non-streaming over every prompt;
+r50 and r70 Poisson arrivals at that rate from arrival seed 0, at most 256 in flight.
 
 usage: python3 review_cells_v2.py --main TREE --head TREE --root DIR --phases o1m,o2m,bandm
        --card-cpus "0=0-15,64-79;1=16-31,80-95" --client-cpus 32-63,96-127 [--port 23000]
@@ -38,22 +41,33 @@ from pair import BENCH_TIMEOUT_S, MODEL, stop_group, wait_healthy  # noqa: E402
 from seeded_tail import identity  # noqa: E402
 
 STREAM_PROMPTS = 256
+OPEN_LOOP_CONCURRENCY = 256
 NO_GRAPH = ["--vocoder.factory.incremental_codec_cuda_graph_min_free_gb", "4096"]
 SLOTS_16 = ["--vocoder.factory.codec_state_slots", "16"]
 MIXED = [
-    (f"mix{letter}", [("stream", 16, True, STREAM_PROMPTS), ("whole", 48, False, None)])
+    (
+        f"mix{letter}",
+        [("stream", 16, True, STREAM_PROMPTS, None), ("whole", 48, False, None, None)],
+    )
     for letter in "abc"
 ]
-STREAM_64 = [(f"s64{letter}", [("stream", 64, True, None)]) for letter in "abc"]
-WHOLE = [("n16", [("whole", 16, False, None)]), ("n64", [("whole", 64, False, None)])]
-WHOLE_TWICE = WHOLE + [("n64b", [("whole", 64, False, None)])]
-STREAM_16 = [(f"s16{letter}", [("stream", 16, True, None)]) for letter in "abc"]
-WHOLE_16_64_1 = WHOLE_TWICE + [("n1", [("whole", 1, False, None)])]
+STREAM_64 = [(f"s64{letter}", [("stream", 64, True, None, None)]) for letter in "abc"]
+WHOLE = [
+    ("n16", [("whole", 16, False, None, None)]),
+    ("n64", [("whole", 64, False, None, None)]),
+]
+WHOLE_TWICE = WHOLE + [("n64b", [("whole", 64, False, None, None)])]
+STREAM_16 = [(f"s16{letter}", [("stream", 16, True, None, None)]) for letter in "abc"]
+WHOLE_16_64_1 = WHOLE_TWICE + [("n1", [("whole", 1, False, None, None)])]
 STREAM_16_WHOLE_1 = [
-    ("s16", [("stream", 16, True, None)]),
-    ("n64", [("whole", 64, False, None)]),
-    ("n64b", [("whole", 64, False, None)]),
-    ("n1", [("whole", 1, False, None)]),
+    ("s16", [("stream", 16, True, None, None)]),
+    ("n64", [("whole", 64, False, None, None)]),
+    ("n64b", [("whole", 64, False, None, None)]),
+    ("n1", [("whole", 1, False, None, None)]),
+]
+WHOLE_OPEN_LOOP = WHOLE + [
+    (f"r{rate}", [("whole", OPEN_LOOP_CONCURRENCY, False, None, float(rate))])
+    for rate in (50, 70)
 ]
 PHASES = {
     "o1m": (
@@ -82,6 +96,8 @@ PHASES = {
     "s16band": ((("maina", "main", 0, []), ("mainb", "main", 1, [])), STREAM_16),
     "w1": ((("main", "main", 0, []), ("head", "head", 1, [])), WHOLE_16_64_1),
     "w2": ((("head", "head", 0, []), ("main", "main", 1, [])), WHOLE_16_64_1),
+    "order1": ((("a", "main", 0, []), ("b", "head", 1, [])), WHOLE_OPEN_LOOP),
+    "order2": ((("b", "head", 0, []), ("a", "main", 1, [])), WHOLE_OPEN_LOOP),
 }
 
 
@@ -126,6 +142,7 @@ def bench(
     concurrency: int,
     stream: bool,
     prompts: int | None,
+    rate: float | None,
     client_cpus: str,
 ) -> None:
     out.mkdir(parents=True, exist_ok=True)
@@ -152,6 +169,7 @@ def bench(
         "--max-concurrency",
         str(concurrency),
         *([] if prompts is None else ["--max-samples", str(prompts)]),
+        *([] if rate is None else ["--request-rate", str(rate), "--arrival-seed", "0"]),
         "--output-dir",
         str(out / "bench"),
     ]
@@ -255,15 +273,16 @@ def main() -> None:
                         concurrency,
                         stream,
                         prompts,
+                        rate,
                         args.client_cpus,
                     )
                     for label, tree, _, arm_port, _ in placed
-                    for name, concurrency, stream, prompts in jobs
+                    for name, concurrency, stream, prompts, rate in jobs
                 ]
                 with concurrent.futures.ThreadPoolExecutor(len(runs)) as pool:
                     list(pool.map(lambda run: bench(*run), runs))
                 for label, _, card, _, _ in placed:
-                    for name, _, _, _ in jobs:
+                    for name, _, _, _, _ in jobs:
                         print(
                             f"{phase} {cell} {label} card {card} {name}: {line(root / cell / label / name)}",
                             flush=True,
