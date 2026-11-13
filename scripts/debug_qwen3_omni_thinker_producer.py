@@ -44,6 +44,7 @@ def main() -> None:
     precision.add_argument("--compare-native-rotary-precision", action="store_true")
     precision.add_argument("--compare-native-residual-precision", action="store_true")
     precision.add_argument("--compare-native-source-precision", action="store_true")
+    precision.add_argument("--compare-native-rounding-interaction", action="store_true")
     arguments = parser.parse_args()
     arguments.output_directory.mkdir(exist_ok=False)
     torch.cuda.set_device(arguments.gpu)
@@ -390,8 +391,25 @@ def main() -> None:
         or arguments.compare_native_rotary_precision
         or arguments.compare_native_residual_precision
         or arguments.compare_native_source_precision
+        or arguments.compare_native_rounding_interaction
     ):
         assert arguments.hold_native_prefix_cache
+        if arguments.compare_native_rounding_interaction:
+            variants = (
+                "checkpoint",
+                "residual-norm-and-rotary",
+                "residual-rotary-qknorm",
+                "residual-rotary-moe",
+                "source-arithmetic",
+            )
+        elif arguments.compare_native_source_precision:
+            variants = ("checkpoint", "residual-norm-and-rotary", "source-arithmetic")
+        elif arguments.compare_native_rotary_precision:
+            variants = ("checkpoint", "rotary")
+        elif arguments.compare_native_residual_precision:
+            variants = ("checkpoint", "residual-norm", "residual-norm-and-rotary")
+        else:
+            variants = ("checkpoint", "router", "experts", "router-and-experts")
         run_precision_controls(
             reference,
             ThinkerPrecisionInputs(
@@ -407,19 +425,7 @@ def main() -> None:
                 extend_token_count=captured_output["extend_length"],
             ),
             arguments.output_directory,
-            variants=(
-                ("checkpoint", "residual-norm-and-rotary", "source-arithmetic")
-                if arguments.compare_native_source_precision
-                else (
-                    ("checkpoint", "rotary")
-                    if arguments.compare_native_rotary_precision
-                    else (
-                        ("checkpoint", "residual-norm", "residual-norm-and-rotary")
-                        if arguments.compare_native_residual_precision
-                        else ("checkpoint", "router", "experts", "router-and-experts")
-                    )
-                )
-            ),
+            variants=variants,
         )
     else:
         pass

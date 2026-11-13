@@ -29,6 +29,8 @@ def main() -> None:
             "residual-norm",
             "residual-norm-and-rotary",
             "source-arithmetic",
+            "residual-rotary-qknorm",
+            "residual-rotary-moe",
         ),
         default="chained",
     )

@@ -96,6 +96,8 @@ def run_precision_controls(
             "residual-norm",
             "residual-norm-and-rotary",
             "source-arithmetic",
+            "residual-rotary-qknorm",
+            "residual-rotary-moe",
         ],
         ...,
     ] = ("checkpoint", "router", "experts", "router-and-experts"),
@@ -119,8 +121,20 @@ def run_precision_controls(
         captured.batch_offset, captured.batch_offset + captured.extend_token_count
     )
     rotary_table: torch.Tensor | None = None
-    rotary_variants = ("rotary", "residual-norm-and-rotary", "source-arithmetic")
-    expert_variants = ("experts", "router-and-experts", "source-arithmetic")
+    rotary_variants = (
+        "rotary",
+        "residual-norm-and-rotary",
+        "source-arithmetic",
+        "residual-rotary-qknorm",
+        "residual-rotary-moe",
+    )
+    expert_variants = (
+        "experts",
+        "router-and-experts",
+        "source-arithmetic",
+        "residual-rotary-moe",
+    )
+    query_key_variants = ("source-arithmetic", "residual-rotary-qknorm")
     if any(name in rotary_variants for name in variants):
         table_rows: dict[int, torch.Tensor] = {}
         suffix_positions = positions[:, prefix_token_count:].T.cpu()
@@ -201,6 +215,8 @@ def run_precision_controls(
             "residual-norm",
             "residual-norm-and-rotary",
             "source-arithmetic",
+            "residual-rotary-qknorm",
+            "residual-rotary-moe",
         )
         for layer_index in range(captured.accepted_layer):
             cache.update(
@@ -227,12 +243,12 @@ def run_precision_controls(
                         epsilon=reference.model.config.rms_norm_eps,
                         query_norm_weight=(
                             layer.self_attn.q_norm.weight
-                            if name == "source-arithmetic"
+                            if name in query_key_variants
                             else None
                         ),
                         key_norm_weight=(
                             layer.self_attn.k_norm.weight
-                            if name == "source-arithmetic"
+                            if name in query_key_variants
                             else None
                         ),
                     )
@@ -243,7 +259,7 @@ def run_precision_controls(
                             rotary_control,
                         )
                     )
-                    if name == "source-arithmetic":
+                    if name in query_key_variants:
                         hooks.enter_context(
                             layer.self_attn.q_proj.register_forward_hook(
                                 rotary_control.record_query_projection
@@ -271,7 +287,12 @@ def run_precision_controls(
                         hooks.enter_context(module.register_forward_hook(callback))
                 else:
                     pass
-                if name in ("router", "router-and-experts", "source-arithmetic"):
+                if name in (
+                    "router",
+                    "router-and-experts",
+                    "source-arithmetic",
+                    "residual-rotary-moe",
+                ):
                     hooks.enter_context(
                         layer.mlp.gate.register_forward_hook(keep_fp32_route_weights)
                     )
