@@ -122,9 +122,13 @@ def main() -> None:
     torch.backends.cudnn.allow_tf32 = True
     del reference_tokenizer, reference_decoder
     torch.cuda.empty_cache()
-    messages = [
-        message(name, codes[name], reference) for name, (reference, _) in CASES.items()
-    ]
+
+    def messages() -> list[IncomingMessage]:
+        """Fresh messages for each run, since a decode writes its audio over the payload's codes."""
+        return [
+            message(name, codes[name], reference)
+            for name, (reference, _) in CASES.items()
+        ]
 
     main_scheduler = qwen3_stages.create_vocoder_executor(
         args.checkpoint,
@@ -137,10 +141,10 @@ def main() -> None:
         not main_scheduler.decodes_whole_requests
         and main_scheduler.full_decode_graphs.graphs
     )
-    for request in messages:
+    for request in messages():
         main_scheduler.run_non_streaming_batch([request], asyncio.new_event_loop())
     main_alone = drain(main_scheduler)
-    main_scheduler.run_non_streaming_batch(messages, asyncio.new_event_loop())
+    main_scheduler.run_non_streaming_batch(messages(), asyncio.new_event_loop())
     main_batched = drain(main_scheduler)
 
     scheduler = qwen3_stages.create_vocoder_executor(
@@ -149,7 +153,7 @@ def main() -> None:
     assert scheduler.decodes_whole_requests and not scheduler.full_decode_graphs.graphs
     assert scheduler.codec_arena.key_rings, "the bf16 arena keeps its K/V in rings"
     scheduler.activate_decode_worker(scheduler.decode_stream)
-    scheduler.run_non_streaming_batch(messages, asyncio.new_event_loop())
+    scheduler.run_non_streaming_batch(messages(), asyncio.new_event_loop())
     while not scheduler.initial_queue.empty() or scheduler.whole_requests:
         scheduler.run_initial_pass()
     whole = drain(scheduler)
