@@ -26,6 +26,7 @@ def main() -> None:
     comparison = parser.add_mutually_exclusive_group(required=True)
     comparison.add_argument("--reference-directory", type=Path)
     comparison.add_argument("--native-only", action="store_true")
+    parser.add_argument("--expect-token-coordinates", action="store_true")
     parser.add_argument("--gpu", type=int, required=True)
     parser.add_argument("--output-directory", type=Path, required=True)
     arguments = parser.parse_args()
@@ -59,6 +60,7 @@ def main() -> None:
             owner: Counter()
             for owner in (() if arguments.native_only else ("checkpoint", "native"))
         }
+        token_coordinate_checks = 0
         for frame, filename in enumerate(files):
             observed = torch.load(filename, weights_only=True)
             assert bool(observed["is_extend"]) == (frame == 0)
@@ -138,6 +140,14 @@ def main() -> None:
                 == int(observed["codec_ids"][0])
                 == int(finished["output_ids"][frame])
             )
+            if arguments.expect_token_coordinates:
+                expected = multinomial_with_seed(
+                    token_weights["observed"].double().log(), seed, position
+                )
+                assert int(expected[0, 0]) == choices["observed"], frame
+                token_coordinate_checks += 1
+            else:
+                pass
             for owner, owner_counts in counts.items():
                 aligned = sample_permuted_weights(
                     token_weights[owner], permutations["observed"], seed, position
@@ -191,6 +201,7 @@ def main() -> None:
             "request_id": directory.name,
             "native_only": arguments.native_only,
             "native_draws_reproduced": len(files),
+            "token_coordinate_checks": token_coordinate_checks,
             "counts": {owner: dict(values) for owner, values in counts.items()},
         }
         reports.append(report)
