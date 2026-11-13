@@ -210,7 +210,6 @@ def main() -> None:
                 replayed = []
                 profile_choices = [profiles, [-1, -1]]
                 if arguments.verify_profile_alias is not None:
-                    assert profiles == [-1, -1]
                     profile_choices.append(arguments.verify_profile_alias)
                 else:
                     pass
@@ -235,9 +234,7 @@ def main() -> None:
                 )
                 difference = compare_tensors(tensors["routed_output"], replayed[0])
                 if arguments.verify_profile_alias is not None:
-                    profile_alias_difference = compare_tensors(
-                        tensors["routed_output"], replayed[2]
-                    )
+                    profile_alias_difference = compare_tensors(replayed[1], replayed[2])
                     exact_profile_alias_replays += profile_alias_difference.exact
                 else:
                     profile_alias_difference = None

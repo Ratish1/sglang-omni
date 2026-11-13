@@ -30,6 +30,7 @@ from scripts.debug_qwen3_omni_predictor_cache import NativePredictorReplay
 from scripts.debug_qwen3_omni_talker_experts import NativeTalkerExperts
 from scripts.qwen3_omni_checkpoint_weights import audit_checkpoint_weights
 from scripts.qwen3_omni_talker_attention import NativeBackboneAttention
+from scripts.qwen3_omni_talker_expert_runtime import ObservedExpertProfileMap
 from sglang_omni.models.qwen3_omni.components.talker_prefill import (
     load_thinker_embedding_rows,
 )
@@ -74,6 +75,7 @@ def main() -> None:
     parser.add_argument("--audit-loaded-weights", action="store_true")
     parser.add_argument("--native-predictor-capture-directory", type=Path)
     parser.add_argument("--native-expert-capture-directory", type=Path)
+    parser.add_argument("--native-expert-profile-map", type=Path)
     parser.add_argument("--paired-native-expert-controls", action="store_true")
     parser.add_argument("--paired-native-attention-controls", action="store_true")
     parser.add_argument(
@@ -196,6 +198,13 @@ def main() -> None:
         expert_control.install()
     else:
         expert_control = None
+    if arguments.native_expert_profile_map is not None:
+        assert expert_control is not None
+        observed_profiles = ObservedExpertProfileMap.model_validate_json(
+            arguments.native_expert_profile_map.read_bytes()
+        )
+    else:
+        observed_profiles = None
     if arguments.paired_native_attention_controls:
         attention_control = NativeBackboneAttention(reference=reference)
         attention_control.install()
@@ -279,6 +288,20 @@ def main() -> None:
                 expert_control.enabled = expert_mode == "fused"
                 expert_control.calls = 0
                 expert_control.router_calls = 0
+                expert_control.used_profiles.clear()
+                expert_control.profiles = (
+                    observed_profiles.profiles[str(trace_directory.resolve())]
+                    if observed_profiles is not None
+                    else None
+                )
+                if expert_control.profiles is not None:
+                    assert (
+                        len(expert_control.profiles.prefill)
+                        == len(expert_control.profiles.decode)
+                        == len(reference.model.layers)
+                    )
+                else:
+                    pass
             else:
                 pass
             reference.code_predictor.generation_config.do_sample = (
@@ -793,6 +816,17 @@ def main() -> None:
                     attention_control.calls if attention_control is not None else 0
                 ),
                 "native_expert_route_precision": arguments.native_expert_route_precision,
+                "native_expert_used_profiles": (
+                    sorted(expert_control.used_profiles)
+                    if expert_control is not None
+                    else []
+                ),
+                "observed_expert_profiles_source": (
+                    str(expert_control.profiles.source_capture)
+                    if expert_control is not None
+                    and expert_control.profiles is not None
+                    else None
+                ),
                 "native_expert_calls": expert_control.calls if expert_control else 0,
                 "native_expert_router_calls": (
                     expert_control.router_calls if expert_control else 0

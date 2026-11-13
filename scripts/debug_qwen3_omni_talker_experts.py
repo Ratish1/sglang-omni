@@ -19,6 +19,7 @@ from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import (
 
 from scripts.qwen3_omni_talker_expert_runtime import (
     NativeRuntime,
+    ObservedExpertProfiles,
     load_native_expert_weights,
 )
 
@@ -31,6 +32,8 @@ class NativeTalkerExperts:
     enabled: bool = False
     calls: int = 0
     router_calls: int = 0
+    profiles: ObservedExpertProfiles | None = None
+    used_profiles: set[tuple[int, int]] = field(default_factory=set)
     runtime: NativeRuntime = field(init=False)
     weights: list[tuple[torch.Tensor, torch.Tensor]] = field(default_factory=list)
     handles: list[RemovableHandle] = field(default_factory=list)
@@ -88,6 +91,16 @@ class NativeTalkerExperts:
             torch.float32 if self.route_precision == "float32" else torch.bfloat16
         )
         packed, down = self.weights[layer_index]
+        assert layer_index == self.calls % len(self.weights)
+        if self.profiles is not None:
+            profiles = (
+                self.profiles.prefill[layer_index]
+                if self.calls < len(self.weights)
+                else self.profiles.decode[layer_index]
+            )
+        else:
+            profiles = (-1, -1)
+        self.used_profiles.add(profiles)
         replay_inputs = hidden_states.contiguous().clone()
         fused_output = cutlass_fused_moe(
             input=replay_inputs,
@@ -100,7 +113,7 @@ class NativeTalkerExperts:
             activation_type=ActivationType.Swiglu,
             tune_max_num_tokens=self.runtime.tune_max_num_tokens,
             use_fused_finalize=self.runtime.use_fused_finalize,
-            profile_ids=[-1, -1],
+            profile_ids=list(profiles),
         )[0]
         assert torch.equal(replay_inputs, hidden_states)
         assert fused_output.shape == output.shape

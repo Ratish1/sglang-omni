@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+from pathlib import Path
 
 import torch
 from pydantic import BaseModel
@@ -38,6 +39,18 @@ class NativeRuntime(BaseModel):
     use_fused_finalize: bool
     layers: list[LayerRuntime]
     tactic_choices: list[TacticChoice]
+
+
+class ObservedExpertProfiles(BaseModel):
+    source_capture: Path
+    prefill: list[tuple[int, int]]
+    decode: list[tuple[int, int]]
+    verified_frames: int
+
+
+class ObservedExpertProfileMap(BaseModel):
+    profiles: dict[str, ObservedExpertProfiles]
+    scope: str
 
 
 def load_native_expert_weights(
