@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""The code predictor layer as one persistent kernel: weight packing, CTA schedule and launch."""
+"""The code predictor's decoder layers as one persistent kernel: weight packing, CTA schedule and launch."""
 
 from __future__ import annotations
 
@@ -24,7 +24,8 @@ KSTEP_DEPTH = 16
 MAX_ROWS = 16
 KEY_VALUE_HEADS = 8
 SCHEDULE_TILE_BITS = 12
-PHASE_EVENTS = 4
+# One event a phase; the down phase's hands a layer's output to the next layer's qkv.
+PHASE_EVENTS = 5
 # Phases in launch order with their work item counts and weight chunks a tile.
 QKV_TILES = QKV_WIDTH // TILE_FEATURES
 OUTPUT_PROJECTION_TILES = HIDDEN_SIZE // TILE_FEATURES
@@ -34,7 +35,7 @@ DOWN_TILES = HIDDEN_SIZE // TILE_FEATURES
 
 @dataclass(frozen=True, kw_only=True)
 class PredictorLayerWeights:
-    """One layer's weights as bulk-copy chunk images and its norm weights."""
+    """Weights as bulk-copy chunk images and norm weights: of one layer, or stacked with the layer first."""
 
     qkv_chunks: torch.Tensor
     output_projection_chunks: torch.Tensor
@@ -101,6 +102,24 @@ def pack_predictor_layer(
     )
 
 
+def stack_predictor_layers(
+    layers: list[PredictorLayerWeights],
+) -> PredictorLayerWeights:
+    """The layers' weights stacked in launch order, the form the kernel takes."""
+    return PredictorLayerWeights(
+        qkv_chunks=torch.stack([layer.qkv_chunks for layer in layers]),
+        output_projection_chunks=torch.stack(
+            [layer.output_projection_chunks for layer in layers]
+        ),
+        gate_up_chunks=torch.stack([layer.gate_up_chunks for layer in layers]),
+        down_chunks=torch.stack([layer.down_chunks for layer in layers]),
+        input_norm_weight=torch.stack([layer.input_norm_weight for layer in layers]),
+        post_norm_weight=torch.stack([layer.post_norm_weight for layer in layers]),
+        query_norm_weight=torch.stack([layer.query_norm_weight for layer in layers]),
+        key_norm_weight=torch.stack([layer.key_norm_weight for layer in layers]),
+    )
+
+
 def build_predictor_schedule(
     cta_count: int, rows: int, device: torch.device
 ) -> PredictorSchedule:
@@ -130,11 +149,15 @@ def build_predictor_schedule(
     encoded = torch.zeros(cta_count, width, dtype=torch.int16)
     for cta, cta_items in enumerate(items):
         encoded[cta, : len(cta_items)] = torch.tensor(cta_items, dtype=torch.int16)
+    # Event p is waited on by the CTAs holding phase p + 1; the down event by those holding qkv.
     consumers = [
         sum(
             1
             for cta_items in items
-            if any(item >> SCHEDULE_TILE_BITS == phase + 1 for item in cta_items)
+            if any(
+                item >> SCHEDULE_TILE_BITS == (phase + 1) % PHASE_EVENTS
+                for item in cta_items
+            )
         )
         for phase in range(PHASE_EVENTS)
     ]
@@ -163,8 +186,8 @@ def load_predictor_layer_module(use_pdl: bool) -> Module:
     )
 
 
-class PersistentPredictorLayer:
-    """Launches one predictor layer for up to 16 rows; owns the phase scratch and counters, which every call reuses."""
+class PersistentPredictorLayers:
+    """Launches a stack of predictor layers for up to 16 rows as one kernel; owns the phase scratch and counters, which every call reuses."""
 
     def __init__(
         self, device: torch.device, rope_cos_sin: torch.Tensor, norm_epsilon: float
@@ -184,6 +207,10 @@ class PersistentPredictorLayer:
         )
         self.activation_scratch = torch.zeros(
             MAX_ROWS, INTERMEDIATE_SIZE, device=device, dtype=torch.bfloat16
+        )
+        # Layers hand their output to the next through alternating halves.
+        self.hidden_scratch = torch.zeros(
+            2, MAX_ROWS, HIDDEN_SIZE, device=device, dtype=torch.bfloat16
         )
         # note (ratish): the counters reset themselves each launch, so they are zeroed once here.
         self.phase_events = torch.zeros(PHASE_EVENTS, device=device, dtype=torch.uint32)
@@ -208,7 +235,10 @@ class PersistentPredictorLayer:
         key_cache: torch.Tensor,
         value_cache: torch.Tensor,
     ) -> None:
-        """output = the layer applied to hidden_states (rows, 1024) at cache slot position; the caches are (rows, slots, kv heads, head dim) views."""
+        """output = the stacked layers applied in order to hidden_states (rows, 1024) at cache slot position.
+
+        The caches are (layers, rows, slots, kv heads, head dim) views.
+        """
         schedule = self.schedule_for(hidden_states.shape[0])
         self.module.predictor_layer(
             hidden_states,
@@ -232,6 +262,7 @@ class PersistentPredictorLayer:
             schedule.items,
             schedule.lengths,
             schedule.phase_consumers,
+            self.hidden_scratch,
             position,
             self.norm_epsilon,
         )

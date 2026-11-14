@@ -109,7 +109,8 @@ inline constexpr int kPhaseAttention = 1;
 inline constexpr int kPhaseOutputProjection = 2;
 inline constexpr int kPhaseGateUp = 3;
 inline constexpr int kPhaseDown = 4;
-inline constexpr int kPhaseEvents = 4;
+// One event a phase; the down phase's hands a layer's output to the next.
+inline constexpr int kPhaseEvents = 5;
 inline constexpr int kScheduleTileBits = 12;
 inline constexpr int kScheduleTileMask = (1 << kScheduleTileBits) - 1;
 inline constexpr int kQkvTiles = kQkvWidth / kTileFeatures;
@@ -117,6 +118,16 @@ inline constexpr int kOutputProjectionTiles = kHiddenSize / kTileFeatures;
 inline constexpr int kGateUpTiles = kIntermediateSize / (kTileFeatures / 2);
 inline constexpr int kDownTiles = kHiddenSize / kTileFeatures;
 inline constexpr unsigned kComputeBarrierId = 1;
+// Elements of one layer in each stacked weight tensor.
+inline constexpr int64_t kQkvLayerElements =
+    static_cast<int64_t>(kQkvTiles) * kChunkElements;
+inline constexpr int64_t kOutputProjectionLayerElements =
+    static_cast<int64_t>(kOutputProjectionTiles) * 2 * kChunkElements;
+inline constexpr int64_t kGateUpLayerElements =
+    static_cast<int64_t>(kGateUpTiles) * kChunkElements;
+inline constexpr int64_t kDownLayerElements =
+    static_cast<int64_t>(kDownTiles) * 3 * kChunkElements;
+inline constexpr int kHiddenScratchElements = kMaxRows * kHiddenSize;
 
 // Stamp slots a CTA records in a QWEN3_TTS_PREDICTOR_STAMPS build: launch
 // points, then four points a phase, then lists indexed by item or chunk.
@@ -147,9 +158,13 @@ inline constexpr int kStampAttentionNormed =
 inline constexpr int kStampAttentionScored = kStampAttentionNormed + 1;
 inline constexpr int kStampSlots = kStampAttentionScored + 1;
 
+// Weights, norm weights and caches are stacked with the layer first; layer l
+// reads the input (l == 0) or the hidden scratch half its predecessor wrote,
+// and writes the output (the last layer) or the other half.
 struct LayerParams {
   const bf16_t *input;
   bf16_t *output;
+  bf16_t *hidden_scratch;
   const bf16_t *qkv_chunks;
   const bf16_t *output_projection_chunks;
   const bf16_t *gate_up_chunks;
@@ -161,7 +176,9 @@ struct LayerParams {
   const float *rope_cos_sin;
   bf16_t *key_cache;
   bf16_t *value_cache;
+  int64_t cache_layer_stride;
   int64_t cache_row_stride;
+  int32_t layers;
   bf16_t *qkv_scratch;
   bf16_t *attention_scratch;
   bf16_t *middle_scratch;
@@ -195,18 +212,35 @@ SGL_DEVICE int operand_row_bytes(int phase) {
   return kHiddenSize * 2 + kOperandRowPadding;
 }
 
-SGL_DEVICE const bf16_t *chunk_pointer(const LayerParams &params, int phase,
-                                       int tile, int chunk) {
-  if (phase == kPhaseQkv)
-    return params.qkv_chunks + static_cast<int64_t>(tile) * kChunkElements;
+SGL_DEVICE const bf16_t *chunk_pointer(const LayerParams &params, int layer,
+                                       int phase, int tile, int chunk) {
+  if (phase == kPhaseQkv) {
+    return params.qkv_chunks + layer * kQkvLayerElements +
+           static_cast<int64_t>(tile) * kChunkElements;
+  }
   if (phase == kPhaseOutputProjection) {
     return params.output_projection_chunks +
+           layer * kOutputProjectionLayerElements +
            static_cast<int64_t>(tile * 2 + chunk) * kChunkElements;
   }
-  if (phase == kPhaseGateUp)
-    return params.gate_up_chunks + static_cast<int64_t>(tile) * kChunkElements;
-  return params.down_chunks +
+  if (phase == kPhaseGateUp) {
+    return params.gate_up_chunks + layer * kGateUpLayerElements +
+           static_cast<int64_t>(tile) * kChunkElements;
+  }
+  return params.down_chunks + layer * kDownLayerElements +
          static_cast<int64_t>(tile * 3 + chunk) * kChunkElements;
+}
+
+SGL_DEVICE const bf16_t *layer_input(const LayerParams &params, int layer) {
+  if (layer == 0)
+    return params.input;
+  return params.hidden_scratch + ((layer - 1) % 2) * kHiddenScratchElements;
+}
+
+SGL_DEVICE bf16_t *layer_output(const LayerParams &params, int layer) {
+  if (layer == params.layers - 1)
+    return params.output;
+  return params.hidden_scratch + (layer % 2) * kHiddenScratchElements;
 }
 
 SGL_DEVICE int phase_producers(const LayerParams &params, int phase) {
@@ -216,7 +250,9 @@ SGL_DEVICE int phase_producers(const LayerParams &params, int phase) {
     return params.rows * kKeyValueHeads;
   if (phase == kPhaseOutputProjection)
     return kOutputProjectionTiles;
-  return kGateUpTiles;
+  if (phase == kPhaseGateUp)
+    return kGateUpTiles;
+  return kDownTiles;
 }
 
 SGL_DEVICE uint32_t shared_address(const void *pointer) {
@@ -254,6 +290,15 @@ SGL_DEVICE void bulk_copy_to_shared(void *shared_destination,
       "cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes [%0], "
       "[%1], %2, [%3];" ::"r"(shared_address(shared_destination)),
       "l"(global_source), "r"(bytes), "r"(shared_address(barrier))
+      : "memory");
+}
+
+// Asks L2 to fetch `bytes` from global memory, without waiting or a
+// destination.
+SGL_DEVICE void prefetch_to_l2(const void *global_source, uint32_t bytes) {
+  asm volatile(
+      "cp.async.bulk.prefetch.L2.global [%0], %1;" ::"l"(global_source),
+      "r"(bytes)
       : "memory");
 }
 
@@ -379,21 +424,24 @@ SGL_DEVICE void stage_operand(const LayerParams &params, const bf16_t *source,
   }
 }
 
-SGL_DEVICE void stage_phase_operand(const LayerParams &params, int phase,
-                                    uint8_t *operand, float *row_scales,
-                                    int warp_index, int lane_index) {
+SGL_DEVICE void stage_phase_operand(const LayerParams &params, int layer,
+                                    int phase, uint8_t *operand,
+                                    float *row_scales, int warp_index,
+                                    int lane_index) {
   if (phase == kPhaseQkv) {
-    stage_operand<kHiddenSize, true>(params, params.input,
-                                     params.input_norm_weight, operand,
-                                     row_scales, warp_index, lane_index);
+    stage_operand<kHiddenSize, true>(
+        params, layer_input(params, layer),
+        params.input_norm_weight + layer * kHiddenSize, operand, row_scales,
+        warp_index, lane_index);
   } else if (phase == kPhaseOutputProjection) {
     stage_operand<kAttentionWidth, false>(params, params.attention_scratch,
                                           nullptr, operand, row_scales,
                                           warp_index, lane_index);
   } else if (phase == kPhaseGateUp) {
-    stage_operand<kHiddenSize, true>(params, params.middle_scratch,
-                                     params.post_norm_weight, operand,
-                                     row_scales, warp_index, lane_index);
+    stage_operand<kHiddenSize, true>(
+        params, params.middle_scratch,
+        params.post_norm_weight + layer * kHiddenSize, operand, row_scales,
+        warp_index, lane_index);
   } else if (phase == kPhaseDown) {
     stage_operand<kIntermediateSize, false>(params, params.activation_scratch,
                                             nullptr, operand, row_scales,
@@ -504,11 +552,12 @@ SGL_DEVICE int epilogue_feature(int thread) {
 // latency hides behind them.
 // note (ratish): it stays bf16 until the epilogue; converting it here made the
 // MMAs wait on the load.
-SGL_DEVICE bf16_t load_residual(const LayerParams &params, int phase,
+SGL_DEVICE bf16_t load_residual(const LayerParams &params, int layer, int phase,
                                 int tile) {
   const int token = epilogue_token(threadIdx.x);
-  const bf16_t *source =
-      phase == kPhaseOutputProjection ? params.input : params.middle_scratch;
+  const bf16_t *source = phase == kPhaseOutputProjection
+                             ? layer_input(params, layer)
+                             : params.middle_scratch;
   bf16_t residual = __ushort_as_bfloat16(0);
   if ((phase == kPhaseOutputProjection || phase == kPhaseDown) &&
       token < params.rows) {
@@ -518,9 +567,9 @@ SGL_DEVICE bf16_t load_residual(const LayerParams &params, int phase,
   return residual;
 }
 
-SGL_DEVICE void finish_tile(const LayerParams &params, int phase, int tile,
-                            const float *partials, const float *row_scales,
-                            bf16_t residual) {
+SGL_DEVICE void finish_tile(const LayerParams &params, int layer, int phase,
+                            int tile, const float *partials,
+                            const float *row_scales, bf16_t residual) {
   const int thread = threadIdx.x;
   if (phase == kPhaseGateUp) {
     // Rows 0-7 of a gate/up tile are gate features, rows 8-15 the up features
@@ -561,7 +610,7 @@ SGL_DEVICE void finish_tile(const LayerParams &params, int phase, int tile,
     params.middle_scratch[hidden_index] =
         __float2bfloat16(round_bf16(total) + __bfloat162float(residual));
   } else {
-    params.output[hidden_index] =
+    layer_output(params, layer)[hidden_index] =
         __float2bfloat16(round_bf16(total) + __bfloat162float(residual));
   }
 }
@@ -601,7 +650,7 @@ SGL_DEVICE void norm_and_rotate_head(float (&values)[4],
 // slots below the position, then their values, then the query heads 2g and
 // 2g + 1, the key head g and the value head g of the new token, the query and
 // key norm weights, and the rope row at the position.
-SGL_DEVICE const uint4 *attention_source(const LayerParams &params,
+SGL_DEVICE const uint4 *attention_source(const LayerParams &params, int layer,
                                          const bf16_t *qkv_row,
                                          int64_t cache_base, int group,
                                          int cached_vectors, int vector) {
@@ -624,9 +673,9 @@ SGL_DEVICE const uint4 *attention_source(const LayerParams &params,
   } else if (head == 3) {
     row = qkv_row + kValueOffset + group * kHeadDim;
   } else if (head == 4) {
-    row = params.query_norm_weight;
+    row = params.query_norm_weight + layer * kHeadDim;
   } else if (head == 5) {
-    row = params.key_norm_weight;
+    row = params.key_norm_weight + layer * kHeadDim;
   } else {
     // The rope row is 128 fp32 values: the last two head rows of vectors.
     return reinterpret_cast<const uint4 *>(params.rope_cos_sin +
@@ -678,15 +727,19 @@ SGL_DEVICE float dot_head(const float *query, const uint8_t *key_row) {
 // then warps 0 and 1 each take one query head: they rotate it and the new key,
 // score every slot with one lane a slot, and sum the values with four head
 // dims a lane. Warp 0 writes the new key and warp 1 the new value into the
-// caches at the position. The caller's barrier ends the item.
-SGL_DEVICE void attend(const LayerParams &params, int item, int item_index,
-                       uint8_t *workspace, int warp_index, int lane_index) {
+// caches at the position. The caller's barrier ends the item. Stamps go to
+// `item_index` when it is inside the stamp list.
+SGL_DEVICE void attend(const LayerParams &params, int layer, int item,
+                       int item_index, uint8_t *workspace, int warp_index,
+                       int lane_index) {
   const int token = item / kKeyValueHeads;
   const int group = item % kKeyValueHeads;
   const int position = params.position;
+  const bool is_stamped = item_index < kStampListLength;
   const bf16_t *qkv_row =
       params.qkv_scratch + static_cast<int64_t>(token) * kQkvWidth;
   const int64_t cache_base =
+      layer * params.cache_layer_stride +
       static_cast<int64_t>(token) * params.cache_row_stride + group * kHeadDim;
   const int cached_vectors = position * kHeadVectors;
   const int vector_count = 2 * cached_vectors + kAttentionLoadedVectors;
@@ -695,8 +748,8 @@ SGL_DEVICE void attend(const LayerParams &params, int item, int item_index,
   for (int i = 0; i < kAttentionVectorsPerThread; ++i) {
     const int vector = threadIdx.x + i * kComputeThreads;
     if (vector < vector_count) {
-      packed[i] = __ldcg(attention_source(params, qkv_row, cache_base, group,
-                                          cached_vectors, vector));
+      packed[i] = __ldcg(attention_source(params, layer, qkv_row, cache_base,
+                                          group, cached_vectors, vector));
     }
   }
 #pragma unroll
@@ -753,7 +806,7 @@ SGL_DEVICE void attend(const LayerParams &params, int item, int item_index,
     }
   }
   __syncwarp();
-  if (threadIdx.x == 0)
+  if (threadIdx.x == 0 && is_stamped)
     record_clock_stamp(kStampAttentionNormed);
 
   float score = -INFINITY;
@@ -768,7 +821,7 @@ SGL_DEVICE void attend(const LayerParams &params, int item, int item_index,
   const float weight = lane_index <= position ? expf(score - best) : 0.0f;
   const float weight_sum = device::warp::reduce_sum(weight);
   const float rounded_weight = round_bf16(weight);
-  if (threadIdx.x == 0)
+  if (threadIdx.x == 0 && is_stamped)
     record_clock_stamp(kStampAttentionScored);
   float attended[4] = {};
   for (int slot = 0; slot <= position; ++slot) {
@@ -827,111 +880,142 @@ __global__ __launch_bounds__(kThreads, 1) void predictor_layer_kernel(
     asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
   }
   __syncthreads();
-  if (threadIdx.x == 0)
-    record_stamp(kStampEntry);
+  // A stamps build records the middle layer, whose weights the previous layer
+  // already prefetched.
+  const int stamped_layer = params.layers / 2;
 
   if (warp_index == kComputeWarps) {
     // Weights never depend on the previous kernel, so the producer streams
-    // before the PDL wait.
+    // before the PDL wait, layer after layer. Each chunk it copies also asks L2
+    // for the same chunk of the next layer, so that layer's copies hit L2.
     if (lane_index == 0) {
       int stage = 0;
       uint32_t empty_parity = 1u;
-      int issued_chunks = 0;
-      for (int index = 0; index < schedule_length; ++index) {
-        const int phase = schedule[index] >> kScheduleTileBits;
-        const int tile = schedule[index] & kScheduleTileMask;
-        for (int chunk = 0; chunk < chunks_per_tile(phase); ++chunk) {
-          device::ptx::mbar_wait_parity(empty_barriers + stage, empty_parity);
-          record_listed_stamp(kStampChunkIssue, issued_chunks);
-          issued_chunks += 1;
-          device::ptx::mbar_arrive_expect_tx(full_barriers + stage,
-                                             kChunkBytes);
-          bulk_copy_to_shared(ring + stage * kChunkBytes,
-                              chunk_pointer(params, phase, tile, chunk),
-                              kChunkBytes, full_barriers + stage);
-          stage += 1;
-          if (stage == kRingStages) {
-            stage = 0;
-            empty_parity ^= 1u;
+      for (int layer = 0; layer < params.layers; ++layer) {
+        int issued_chunks = layer == stamped_layer ? 0 : kStampListLength;
+        for (int index = 0; index < schedule_length; ++index) {
+          const int phase = schedule[index] >> kScheduleTileBits;
+          const int tile = schedule[index] & kScheduleTileMask;
+          for (int chunk = 0; chunk < chunks_per_tile(phase); ++chunk) {
+            device::ptx::mbar_wait_parity(empty_barriers + stage, empty_parity);
+            record_listed_stamp(kStampChunkIssue, issued_chunks);
+            issued_chunks += 1;
+            device::ptx::mbar_arrive_expect_tx(full_barriers + stage,
+                                               kChunkBytes);
+            bulk_copy_to_shared(
+                ring + stage * kChunkBytes,
+                chunk_pointer(params, layer, phase, tile, chunk), kChunkBytes,
+                full_barriers + stage);
+            if (layer + 1 < params.layers) {
+              prefetch_to_l2(
+                  chunk_pointer(params, layer + 1, phase, tile, chunk),
+                  kChunkBytes);
+            }
+            stage += 1;
+            if (stage == kRingStages) {
+              stage = 0;
+              empty_parity ^= 1u;
+            }
           }
         }
       }
     }
   } else {
     device::PDLWaitPrimary<kUsePDL>();
-    if (threadIdx.x == 0)
-      record_stamp(kStampPrimaryWaited);
     const int token_tiles = (params.rows + kTokenTileRows - 1) / kTokenTileRows;
     int stage = 0;
     uint32_t full_parity = 0u;
+    int current_layer = -1;
     int current_phase = -1;
     uint32_t phase_items = 0u;
-    int consumed_chunks = 0;
     int partial_buffer = 0;
-    for (int index = 0; index < schedule_length; ++index) {
-      const int phase = schedule[index] >> kScheduleTileBits;
-      const int tile = schedule[index] & kScheduleTileMask;
-      if (phase != current_phase) {
-        if (threadIdx.x == 0)
-          record_phase_stamp(phase, kStampPhaseReached);
-        // Orders the previous phase's stores before the signal and the
-        // staging below.
-        compute_barrier();
-        if (threadIdx.x == 0) {
-          if (current_phase >= 0) {
-            signal_phase(params, current_phase, phase_items);
-            record_phase_stamp(current_phase, kStampPhaseSignaled);
+    for (int layer = 0; layer < params.layers; ++layer) {
+      const bool is_stamped = layer == stamped_layer;
+      // Listed stamps past the list are dropped, so other layers record none.
+      const int stamp_base = is_stamped ? 0 : kStampListLength;
+      int consumed_chunks = 0;
+      for (int index = 0; index < schedule_length; ++index) {
+        const int phase = schedule[index] >> kScheduleTileBits;
+        const int tile = schedule[index] & kScheduleTileMask;
+        if (phase != current_phase || layer != current_layer) {
+          if (threadIdx.x == 0 && is_stamped && layer != current_layer) {
+            record_stamp(kStampEntry);
+            record_stamp(kStampPrimaryWaited);
           }
-          if (phase > kPhaseQkv)
-            wait_phase(params, phase - 1);
+          if (threadIdx.x == 0 && is_stamped)
+            record_phase_stamp(phase, kStampPhaseReached);
+          // Orders the previous phase's stores before the signal and the
+          // staging below.
+          compute_barrier();
+          // A phase waits on the one before; a layer's qkv waits on the
+          // previous layer's down.
+          const bool has_producers = layer > 0 || phase > kPhaseQkv;
+          if (threadIdx.x == 0) {
+            if (current_phase >= 0) {
+              signal_phase(params, current_phase, phase_items);
+              if (current_layer == stamped_layer) {
+                record_phase_stamp(current_phase, kStampPhaseSignaled);
+                if (layer != current_layer)
+                  record_stamp(kStampExit);
+              }
+            }
+            if (has_producers)
+              wait_phase(params, phase > kPhaseQkv ? phase - 1 : kPhaseDown);
+          }
+          if (has_producers) {
+            compute_barrier();
+            if (threadIdx.x == 0 && is_stamped)
+              record_phase_stamp(phase, kStampPhaseWaited);
+          }
+          stage_phase_operand(params, layer, phase, operand, row_scales,
+                              warp_index, lane_index);
+          compute_barrier();
+          if (threadIdx.x == 0 && is_stamped)
+            record_phase_stamp(phase, kStampPhaseStaged);
+          current_layer = layer;
+          current_phase = phase;
+          phase_items = 0u;
         }
-        if (phase > kPhaseQkv) {
+        if (phase == kPhaseAttention) {
+          attend(params, layer, tile, stamp_base + index, operand, warp_index,
+                 lane_index);
+          compute_barrier();
+        } else {
+          const bf16_t residual = load_residual(params, layer, phase, tile);
+          float *tile_partials = partials + partial_buffer * kPartialFloats;
+          multiply_tile(chunks_per_tile(phase), operand_row_bytes(phase),
+                        token_tiles, ring, operand, tile_partials,
+                        full_barriers, empty_barriers, stage, full_parity,
+                        stamp_base + consumed_chunks, warp_index, lane_index);
+          if (threadIdx.x == 0)
+            record_listed_stamp(kStampItemMultiplied, stamp_base + index);
+          consumed_chunks += chunks_per_tile(phase);
           compute_barrier();
           if (threadIdx.x == 0)
-            record_phase_stamp(phase, kStampPhaseWaited);
+            record_listed_stamp(kStampItemReduced, stamp_base + index);
+          finish_tile(params, layer, phase, tile, tile_partials, row_scales,
+                      residual);
+          // note (ratish): alternating the partial buffers lets the next
+          // tile's MMAs start without a barrier; its own barrier comes after
+          // every thread has finished reading this buffer.
+          partial_buffer ^= 1;
         }
-        stage_phase_operand(params, phase, operand, row_scales, warp_index,
-                            lane_index);
-        compute_barrier();
         if (threadIdx.x == 0)
-          record_phase_stamp(phase, kStampPhaseStaged);
-        current_phase = phase;
-        phase_items = 0u;
+          record_listed_stamp(kStampItemEnd, stamp_base + index);
+        phase_items += 1u;
       }
-      if (phase == kPhaseAttention) {
-        attend(params, tile, index, operand, warp_index, lane_index);
-        compute_barrier();
-      } else {
-        const bf16_t residual = load_residual(params, phase, tile);
-        float *tile_partials = partials + partial_buffer * kPartialFloats;
-        multiply_tile(chunks_per_tile(phase), operand_row_bytes(phase),
-                      token_tiles, ring, operand, tile_partials, full_barriers,
-                      empty_barriers, stage, full_parity, consumed_chunks,
-                      warp_index, lane_index);
-        if (threadIdx.x == 0)
-          record_listed_stamp(kStampItemMultiplied, index);
-        consumed_chunks += chunks_per_tile(phase);
-        compute_barrier();
-        if (threadIdx.x == 0)
-          record_listed_stamp(kStampItemReduced, index);
-        finish_tile(params, phase, tile, tile_partials, row_scales, residual);
-        // note (ratish): alternating the partial buffers lets the next tile's
-        // MMAs start without a barrier; its own barrier comes after every
-        // thread has finished reading this buffer.
-        partial_buffer ^= 1;
-      }
-      if (threadIdx.x == 0)
-        record_listed_stamp(kStampItemEnd, index);
-      phase_items += 1u;
     }
+    // The last layer's down output goes to the caller; every other last phase
+    // still has consumers.
     if (current_phase >= 0 && current_phase < kPhaseDown) {
       compute_barrier();
       if (threadIdx.x == 0) {
         signal_phase(params, current_phase, phase_items);
-        record_phase_stamp(current_phase, kStampPhaseSignaled);
+        if (current_layer == stamped_layer)
+          record_phase_stamp(current_phase, kStampPhaseSignaled);
       }
     }
-    if (threadIdx.x == 0)
+    if (threadIdx.x == 0 && current_layer == stamped_layer)
       record_stamp(kStampExit);
   }
   // note (ratish): triggered only at exit, so a dependent grid cannot take an
@@ -955,20 +1039,22 @@ template <bool kUsePDL> struct PredictorLayer {
       tvm::ffi::TensorView activation_scratch,
       tvm::ffi::TensorView phase_events, tvm::ffi::TensorView schedule,
       tvm::ffi::TensorView schedule_lengths,
-      tvm::ffi::TensorView phase_consumers, int64_t position,
-      double norm_epsilon) {
+      tvm::ffi::TensorView phase_consumers, tvm::ffi::TensorView hidden_scratch,
+      int64_t position, double norm_epsilon) {
     using namespace host;
 
     auto rows = SymbolicSize{"rows"};
+    auto layers = SymbolicSize{"layers"};
     auto cache_rows = SymbolicSize{"cache_rows"};
+    auto cache_layer_stride = SymbolicSize{"cache_layer_stride"};
     auto cache_row_stride = SymbolicSize{"cache_row_stride"};
     auto ctas = SymbolicSize{"ctas"};
     auto schedule_width = SymbolicSize{"schedule_width"};
     auto device = SymbolicDevice{};
     device.set_options<kDLCUDA>();
 
-    // The kernel reads the input, the norm weights, the rope row and the
-    // caches in 16-byte vectors.
+    // The kernel reads the input, the hidden scratch, the norm weights, the
+    // rope row and the caches in 16-byte vectors.
     TensorMatcher({rows, kHiddenSize})
         .with_dtype<bf16_t>()
         .ensure_alignment(16)
@@ -978,29 +1064,34 @@ template <bool kUsePDL> struct PredictorLayer {
         .with_dtype<bf16_t>()
         .with_device(device)
         .verify(output);
-    TensorMatcher({kQkvTiles, kChunkElements})
+    TensorMatcher({2, kMaxRows, kHiddenSize})
+        .with_dtype<bf16_t>()
+        .ensure_alignment(16)
+        .with_device(device)
+        .verify(hidden_scratch);
+    TensorMatcher({layers, kQkvTiles, kChunkElements})
         .with_dtype<bf16_t>()
         .with_device(device)
         .verify(qkv_chunks);
-    TensorMatcher({kOutputProjectionTiles * 2, kChunkElements})
+    TensorMatcher({layers, kOutputProjectionTiles * 2, kChunkElements})
         .with_dtype<bf16_t>()
         .with_device(device)
         .verify(output_projection_chunks);
-    TensorMatcher({kGateUpTiles, kChunkElements})
+    TensorMatcher({layers, kGateUpTiles, kChunkElements})
         .with_dtype<bf16_t>()
         .with_device(device)
         .verify(gate_up_chunks);
-    TensorMatcher({kDownTiles * 3, kChunkElements})
+    TensorMatcher({layers, kDownTiles * 3, kChunkElements})
         .with_dtype<bf16_t>()
         .with_device(device)
         .verify(down_chunks);
-    TensorMatcher({kHiddenSize})
+    TensorMatcher({layers, kHiddenSize})
         .with_dtype<bf16_t>()
         .ensure_alignment(16)
         .with_device(device)
         .verify(input_norm_weight)
         .verify(post_norm_weight);
-    TensorMatcher({kHeadDim})
+    TensorMatcher({layers, kHeadDim})
         .with_dtype<bf16_t>()
         .ensure_alignment(16)
         .with_device(device)
@@ -1011,9 +1102,9 @@ template <bool kUsePDL> struct PredictorLayer {
         .ensure_alignment(16)
         .with_device(device)
         .verify(rope_cos_sin);
-    TensorMatcher({cache_rows, kCacheSlots, kKeyValueHeads, kHeadDim})
-        .with_strides(
-            {cache_row_stride, kKeyValueHeads * kHeadDim, kHeadDim, 1})
+    TensorMatcher({layers, cache_rows, kCacheSlots, kKeyValueHeads, kHeadDim})
+        .with_strides({cache_layer_stride, cache_row_stride,
+                       kKeyValueHeads * kHeadDim, kHeadDim, 1})
         .with_dtype<bf16_t>()
         .ensure_alignment(16)
         .with_device(device)
@@ -1059,10 +1150,13 @@ template <bool kUsePDL> struct PredictorLayer {
                  "position must be a cache slot, got ", position);
     RuntimeCheck(schedule_width.unwrap() <= kMaxScheduleItems,
                  "a CTA's schedule holds at most 32 items");
+    RuntimeCheck(layers.unwrap() >= 1, "the weights hold no layer");
 
     LayerParams params{};
     params.input = static_cast<const bf16_t *>(input.data_ptr());
     params.output = static_cast<bf16_t *>(output.data_ptr());
+    params.hidden_scratch = static_cast<bf16_t *>(hidden_scratch.data_ptr());
+    params.layers = static_cast<int32_t>(layers.unwrap());
     params.qkv_chunks = static_cast<const bf16_t *>(qkv_chunks.data_ptr());
     params.output_projection_chunks =
         static_cast<const bf16_t *>(output_projection_chunks.data_ptr());
@@ -1080,6 +1174,7 @@ template <bool kUsePDL> struct PredictorLayer {
     params.rope_cos_sin = static_cast<const float *>(rope_cos_sin.data_ptr());
     params.key_cache = static_cast<bf16_t *>(key_cache.data_ptr());
     params.value_cache = static_cast<bf16_t *>(value_cache.data_ptr());
+    params.cache_layer_stride = cache_layer_stride.unwrap();
     params.cache_row_stride = cache_row_stride.unwrap();
     params.qkv_scratch = static_cast<bf16_t *>(qkv_scratch.data_ptr());
     params.attention_scratch =
