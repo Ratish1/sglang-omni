@@ -58,7 +58,8 @@ def main() -> None:
         assert len(speeches) == (1088 if workload == "tts" else 40)
         for source in speeches:
             speech = CompletedSpeech.model_validate_json(source.read_bytes())
-            request_path = inputs / f"{speech.request_id}.request.json"
+            filename = speech.request_id if workload == "tts" else speech.sample_id
+            request_path = inputs / f"{filename}.request.json"
             request_bytes = request_path.read_bytes()
             request = OriginalRequest.model_validate_json(request_bytes)
             assert request.request_id == speech.request_id
@@ -88,7 +89,7 @@ def main() -> None:
                     json.dumps(json.loads(request_bytes), sort_keys=True).encode()
                 ).hexdigest(),
             )
-            with (inputs / f"{speech.request_id}.response.json").open("x") as output:
+            with (inputs / f"{filename}.response.json").open("x") as output:
                 output.write(record.model_dump_json(indent=2))
         print(f"Restored {len(speeches)} {workload} inputs", flush=True)
     assert restored == fingerprints
