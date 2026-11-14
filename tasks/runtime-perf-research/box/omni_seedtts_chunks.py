@@ -11,6 +11,7 @@ chunk arrival offsets. Requests, timing and every other field are the benchmark'
 import contextvars
 import functools
 import itertools
+import os
 import sys
 
 import benchmarks.eval.benchmark_omni_seedtts as bench
@@ -67,6 +68,13 @@ def make_send_fn_with_lengths(*args, **kwargs):
 
 tts._collect_chat_streaming_audio = collect_with_lengths
 bench.make_send_fn = make_send_fn_with_lengths
+# note (ratish): OMNI_ARRIVAL_SEED gives every arm the same open-loop arrival times, which the CLI cannot set.
+if os.environ.get("OMNI_ARRIVAL_SEED"):
+    bench.RunConfig = functools.partial(
+        bench.RunConfig, arrival_seed=int(os.environ["OMNI_ARRIVAL_SEED"])
+    )
+else:
+    pass
 
 if __name__ == "__main__":
     sys.argv[0] = bench.__file__
