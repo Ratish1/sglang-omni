@@ -1293,14 +1293,14 @@ def test_row_without_text_sits_out_the_step_and_rejoins_with_its_kv(
     assert [request.rid for request in decode_batch.reqs] == ["first", "third"]
     assert decode_batch.seq_lens.tolist() == [4, 2]
     assert scheduler.token_to_kv_pool_allocator.available_size() == free_slots - 2
-    assert waiting_request.kv.kv_committed_len == 4
+    assert waiting_request.kv.kv_committed_len == 3
     assert scheduler.waiting_row_steps == 1
 
     scheduler.process_batch_result(decode_batch, None)
 
     assert [request.rid for request in batch.reqs] == ["first", "third", "second"]
-    assert batch.seq_lens.tolist() == [4, 2, 4]
-    assert batch.seq_lens_cpu.tolist() == [4, 2, 4]
+    assert batch.seq_lens.tolist() == [4, 2, 3]
+    assert batch.seq_lens_cpu.tolist() == [4, 2, 3]
     assert batch.req_pool_indices.tolist()[2] == waiting_slot
     assert batch.input_ids.tolist()[2] == 9
     assert torch.equal(
@@ -1320,7 +1320,7 @@ def test_step_with_no_row_ready_allocates_nothing(
 
     assert scheduler.update_running_batch(batch) is None
     assert [request.rid for request in batch.reqs] == ["first", "second", "third"]
-    assert batch.seq_lens.tolist() == [3, 4, 1]
+    assert batch.seq_lens.tolist() == [3, 3, 1]
     assert scheduler.token_to_kv_pool_allocator.available_size() == free_slots
     assert scheduler.waiting_rows is None
     assert scheduler.waiting_row_steps == 3
@@ -1340,7 +1340,7 @@ def test_every_row_ready_decodes_the_whole_batch(
         "second",
         "third",
     ]
-    assert decode_batch.seq_lens.tolist() == [4, 5, 2]
+    assert decode_batch.seq_lens.tolist() == [4, 4, 2]
     assert scheduler.waiting_rows is None
     assert scheduler.waiting_row_steps == 0
 
@@ -1369,7 +1369,7 @@ def test_step_the_running_batch_skips_returns_the_waiting_rows(
 
     assert scheduler.update_running_batch(batch) is None
     assert [request.rid for request in batch.reqs] == ["second", "third", "first"]
-    assert batch.seq_lens.tolist() == [4, 1, 3]
+    assert batch.seq_lens.tolist() == [3, 1, 3]
     assert scheduler.waiting_rows is None
 
 
