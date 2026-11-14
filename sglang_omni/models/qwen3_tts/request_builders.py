@@ -867,9 +867,10 @@ def qwen3_tts_token_ids(wrapper: Qwen3TTSModel, text: str) -> torch.Tensor:
 def qwen3_tts_device_token_ids(wrapper: Qwen3TTSModel, text: str) -> torch.Tensor:
     """qwen3_tts_token_ids on the wrapper's device."""
     # note (ratish): the wrapper's own tokenizer copies pageable ids, which first waits for every preprocessing thread's work queued on the shared stream.
-    return async_h2d_stack([qwen3_tts_token_ids(wrapper, text)], device=wrapper.device)[
-        0
-    ]
+    (token_ids,) = async_h2d_stack(
+        [qwen3_tts_token_ids(wrapper, text)], device=wrapper.device
+    )
+    return token_ids
 
 
 def build_instruct_id(
