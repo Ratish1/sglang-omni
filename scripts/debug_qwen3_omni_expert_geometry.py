@@ -8,8 +8,10 @@ from dataclasses import asdict
 from pathlib import Path
 
 import torch
+from flashinfer.fused_moe import core as expert_core
 from flashinfer.fused_moe import cutlass_fused_moe
 from flashinfer.fused_moe.core import ActivationType
+from flashinfer.jit.core import JitSpecNvcc
 from huggingface_hub import hf_hub_download
 from transformers import Qwen3OmniMoeConfig
 from transformers.conversion_mapping import (
@@ -20,6 +22,7 @@ from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import (
     Qwen3OmniMoeTalkerForConditionalGeneration,
 )
 
+from scripts.debug_qwen3_omni_contribution_build import contribution_build_spec
 from scripts.debug_qwen3_omni_feedback_audit import compare_tensors
 from scripts.qwen3_omni_checkpoint_weights import audit_checkpoint_weights
 from scripts.qwen3_omni_talker_expert_runtime import (
@@ -40,8 +43,25 @@ def main() -> None:
     parser.add_argument("--gpu", type=int, required=True)
     parser.add_argument("--output-directory", type=Path, required=True)
     parser.add_argument("--decompose-expert-slots", action="store_true")
+    parser.add_argument("--contribution-reference-directory", type=Path)
+    parser.add_argument("--contribution-source-directory", type=Path)
     arguments = parser.parse_args()
     arguments.output_directory.mkdir(exist_ok=False)
+    if arguments.contribution_source_directory is not None:
+        assert arguments.contribution_reference_directory is not None
+        assert not arguments.decompose_expert_slots
+        assert expert_core.get_cutlass_fused_moe_module.cache_info().currsize == 0
+
+        def diagnostic_specification(use_fast_build: bool = False) -> JitSpecNvcc:
+            assert not use_fast_build
+            return contribution_build_spec(arguments.contribution_source_directory)
+
+        expert_core.gen_cutlass_fused_moe_sm90_module = diagnostic_specification
+    elif arguments.contribution_reference_directory is not None:
+        assert not arguments.decompose_expert_slots
+        arguments.contribution_reference_directory.mkdir(exist_ok=False)
+    else:
+        pass
     torch.cuda.set_device(arguments.gpu)
     configuration = Qwen3OmniMoeConfig.from_pretrained(
         arguments.model_path, revision=arguments.model_revision
@@ -74,6 +94,13 @@ def main() -> None:
     records = []
     with (arguments.output_directory / "layers.jsonl").open("w") as output:
         for directory in arguments.trace_directory:
+            if (
+                arguments.contribution_reference_directory is not None
+                and arguments.contribution_source_directory is None
+            ):
+                (arguments.contribution_reference_directory / directory.name).mkdir()
+            else:
+                pass
             runtime = NativeRuntime.model_validate_json(
                 (directory.parent / "moe-runtime.json").read_bytes()
             )
@@ -96,6 +123,17 @@ def main() -> None:
             exact_decomposed_batches = 0
             for frame, filename in enumerate(files):
                 snapshots = torch.load(filename, weights_only=True)
+                if arguments.contribution_source_directory is not None:
+                    expected_contributions = torch.load(
+                        arguments.contribution_reference_directory
+                        / directory.name
+                        / filename.name,
+                        weights_only=True,
+                    )
+                    assert len(expected_contributions) == len(native_weights)
+                else:
+                    expected_contributions = []
+                rounded_outputs = []
                 assert len(snapshots) == len(native_weights)
                 for layer_index, (snapshot, (packed, down)) in enumerate(
                     zip(snapshots, native_weights, strict=True)
@@ -183,6 +221,12 @@ def main() -> None:
                         )
                         for selected in (slice(None), slice(start, stop))
                     ]
+                    if arguments.contribution_source_directory is not None:
+                        expected = expected_contributions[layer_index].to(
+                            reference.device
+                        )
+                    else:
+                        pass
                     assert torch.equal(replayed[0], expected), (
                         directory.name,
                         frame,
@@ -191,6 +235,31 @@ def main() -> None:
                     difference = compare_tensors(expected[start:stop], replayed[1])
                     exact_isolated_batches += difference.exact
                     comparisons += 1
+                    if (
+                        arguments.contribution_reference_directory is not None
+                        and arguments.contribution_source_directory is None
+                    ):
+                        contributions = native_expert_contributions(
+                            hidden_states,
+                            indices,
+                            packed,
+                            down,
+                            runtime,
+                            (profiles[0], profiles[1]),
+                        )
+                        assert torch.equal(
+                            combine_expert_contributions(
+                                contributions, indices, weights, "native"
+                            ),
+                            expected,
+                        )
+                        rounded_outputs.append(
+                            combine_expert_contributions(
+                                contributions, indices, weights, "rounded-contributions"
+                            ).cpu()
+                        )
+                    else:
+                        pass
                     if arguments.decompose_expert_slots:
                         selected_weights = weights[start:stop]
                         assert torch.equal(
@@ -225,13 +294,22 @@ def main() -> None:
                                 "batch_tokens": len(hidden_states),
                                 "request_tokens": stop - start,
                                 "profiles": profiles,
-                                "whole_native_replay_exact": True,
+                                "whole_profiled_replay_exact": True,
                                 "isolated_vs_whole": asdict(difference),
                                 "separate_experts_vs_whole": decomposed,
                             }
                         )
                         + "\n"
                     )
+                if rounded_outputs:
+                    torch.save(
+                        rounded_outputs,
+                        arguments.contribution_reference_directory
+                        / directory.name
+                        / filename.name,
+                    )
+                else:
+                    pass
                 print(
                     json.dumps(
                         {
@@ -248,7 +326,9 @@ def main() -> None:
                     "request_id": directory.name,
                     "frames": len(files),
                     "layer_batches": comparisons,
-                    "exact_whole_native_batches": comparisons,
+                    "exact_whole_profiled_batches": comparisons,
+                    "contribution_library": arguments.contribution_source_directory
+                    is not None,
                     "exact_isolated_request_batches": exact_isolated_batches,
                     "exact_decomposed_batches": (
                         exact_decomposed_batches
@@ -261,7 +341,11 @@ def main() -> None:
                 json.dumps(
                     {
                         "records": records,
-                        "scope": "Same native weights, held routing ids and FP32 scales, same observed algorithm IDs. Only grouping the selected request alone versus the original whole native batch changes. Complete lifetimes and all captured prefill rows, no free-running quality or invalid-kernel claim.",
+                        "scope": (
+                            "Diagnostic library versus independently saved BF16-contribution expectations from the original native library, every actual batch and original algorithm ID. No free-running quality or invalid-kernel claim."
+                            if arguments.contribution_source_directory is not None
+                            else "Original native library, actual held routing and algorithms, complete lifetimes and prefill rows. Optional contribution expectations must first reconstruct every original output exactly. No free-running quality or invalid-kernel claim."
+                        ),
                     },
                     indent=2,
                 )
