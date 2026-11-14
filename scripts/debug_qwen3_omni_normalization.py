@@ -9,12 +9,68 @@ import torch
 from sgl_kernel import fused_add_rmsnorm, rmsnorm
 from torch.utils.hooks import RemovableHandle
 from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import (
+    Qwen3OmniMoeRMSNorm,
     Qwen3OmniMoeTalkerForConditionalGeneration,
     Qwen3OmniMoeTalkerTextSparseMoeBlock,
     Qwen3OmniMoeTextRMSNorm,
     Qwen3OmniMoeThinkerTextAttention,
     Qwen3OmniMoeThinkerTextRMSNorm,
 )
+
+
+@dataclass(kw_only=True)
+class PredictorProjectionNorm:
+    norm: Qwen3OmniMoeRMSNorm
+    projections: tuple[torch.nn.Linear, ...]
+    is_folded: bool
+    source_inputs: torch.Tensor | None = None
+    normalized_inputs: torch.Tensor | None = None
+    calls: int = 0
+    handles: list[RemovableHandle] = field(default_factory=list)
+
+    def install(self) -> None:
+        self.handles.append(self.norm.register_forward_hook(self.capture_norm))
+        for projection in self.projections:
+            assert projection.bias is None
+            self.handles.append(projection.register_forward_hook(self.project))
+
+    def capture_norm(
+        self,
+        module: Qwen3OmniMoeRMSNorm,
+        inputs: tuple[torch.Tensor],
+        output: torch.Tensor,
+    ) -> None:
+        assert module is self.norm
+        self.source_inputs = inputs[0]
+        self.normalized_inputs = output
+
+    def project(
+        self,
+        module: torch.nn.Linear,
+        inputs: tuple[torch.Tensor],
+        output: torch.Tensor,
+    ) -> torch.Tensor:
+        assert self.source_inputs is not None and self.normalized_inputs is not None
+        assert torch.equal(inputs[0], self.normalized_inputs)
+        if self.is_folded:
+            inverse_rms = torch.rsqrt(
+                self.source_inputs.float().square().mean(-1, keepdim=True)
+                + self.norm.variance_epsilon
+            )
+            preweighted = (self.source_inputs.float() * self.norm.weight.float()).to(
+                torch.bfloat16
+            )
+            projected = (
+                torch.nn.functional.linear(preweighted.float(), module.weight.float())
+                * inverse_rms
+            ).to(output.dtype)
+        else:
+            projected = torch.nn.functional.linear(
+                inputs[0].float(), module.weight.float()
+            ).to(output.dtype)
+        assert projected.shape == output.shape and projected.isfinite().all()
+        self.calls += 1
+        return projected
 
 
 @dataclass(kw_only=True)

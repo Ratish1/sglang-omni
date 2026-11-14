@@ -25,7 +25,10 @@ from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import (
     Qwen3OmniMoeTalkerForConditionalGeneration,
 )
 
-from scripts.debug_qwen3_omni_normalization import NativeNormalization
+from scripts.debug_qwen3_omni_normalization import (
+    NativeNormalization,
+    PredictorProjectionNorm,
+)
 from scripts.debug_qwen3_omni_predictor_cache import NativePredictorReplay
 from scripts.debug_qwen3_omni_talker_experts import NativeTalkerExperts
 from scripts.qwen3_omni_attention_inputs import PROJECTION_NAMES, NativeAttentionInputs
@@ -80,6 +83,16 @@ def main() -> None:
     parser.add_argument("--audit-loaded-weights", action="store_true")
     parser.add_argument("--native-predictor-capture-directory", type=Path)
     parser.add_argument("--checkpoint-residual-predictor", action="store_true")
+    parser.add_argument(
+        "--predictor-projection-normalization",
+        choices=("checkpoint", "materialized", "folded"),
+        default="checkpoint",
+    )
+    parser.add_argument(
+        "--predictor-projection-sites",
+        choices=("attention", "mlp", "both"),
+        default="both",
+    )
     parser.add_argument("--native-expert-capture-directory", type=Path)
     parser.add_argument("--native-expert-profile-map", type=Path)
     parser.add_argument("--expert-gemm1-profile", type=int)
@@ -161,6 +174,13 @@ def main() -> None:
     )
     parser.add_argument("--output-directory", type=Path, required=True)
     arguments = parser.parse_args()
+    if arguments.predictor_projection_normalization != "checkpoint":
+        assert (
+            arguments.native_predictor_capture_directory is None
+            or arguments.checkpoint_residual_predictor
+        )
+    else:
+        pass
     if arguments.checkpoint_residual_predictor:
         assert arguments.native_predictor_capture_directory is not None
         assert arguments.native_feedback_reduction == "sequential"
@@ -284,6 +304,40 @@ def main() -> None:
             arguments.model_path, "config.json", revision=arguments.model_revision
         )
     ).parent
+    predictor_projection_controls: list[PredictorProjectionNorm] = []
+    for layer in reference.code_predictor.model.layers:
+        if (
+            arguments.predictor_projection_normalization != "checkpoint"
+            and arguments.predictor_projection_sites in ("attention", "both")
+        ):
+            predictor_projection_controls.append(
+                PredictorProjectionNorm(
+                    norm=layer.input_layernorm,
+                    projections=(
+                        layer.self_attn.q_proj,
+                        layer.self_attn.k_proj,
+                        layer.self_attn.v_proj,
+                    ),
+                    is_folded=arguments.predictor_projection_normalization == "folded",
+                )
+            )
+        else:
+            pass
+        if (
+            arguments.predictor_projection_normalization != "checkpoint"
+            and arguments.predictor_projection_sites in ("mlp", "both")
+        ):
+            predictor_projection_controls.append(
+                PredictorProjectionNorm(
+                    norm=layer.post_attention_layernorm,
+                    projections=(layer.mlp.gate_proj, layer.mlp.up_proj),
+                    is_folded=arguments.predictor_projection_normalization == "folded",
+                )
+            )
+        else:
+            pass
+    for control in predictor_projection_controls:
+        control.install()
     if (
         arguments.native_predictor_capture_directory is not None
         and not arguments.checkpoint_residual_predictor
@@ -555,6 +609,8 @@ def main() -> None:
                 residual_policy == "sampled"
             )
             normalization.boundary_calls = 0
+            for control in predictor_projection_controls:
+                control.calls = 0
             normalization.query_key_calls = 0
             normalization.boundary_enabled = normalization_mode in (
                 "native",
@@ -1095,6 +1151,17 @@ def main() -> None:
                 )
             else:
                 pass
+            assert sum(control.calls for control in predictor_projection_controls) == (
+                sum(
+                    frame["main_code"] != config.codec_eos_token_id
+                    for frame in frame_reports
+                )
+                * (config.num_code_groups - 1)
+                * sum(
+                    len(control.projections)
+                    for control in predictor_projection_controls
+                )
+            )
             report = {
                 "model_revision": arguments.model_revision,
                 "frame_limit": frame_limit,
@@ -1183,6 +1250,11 @@ def main() -> None:
                 "sampling_order": sampling_order,
                 "residual_policy": residual_policy,
                 "checkpoint_residual_predictor": arguments.checkpoint_residual_predictor,
+                "predictor_projection_normalization": arguments.predictor_projection_normalization,
+                "predictor_projection_sites": arguments.predictor_projection_sites,
+                "predictor_projection_control_calls": sum(
+                    control.calls for control in predictor_projection_controls
+                ),
                 "native_predictor_capture_directory": (
                     str(arguments.native_predictor_capture_directory)
                     if arguments.native_predictor_capture_directory is not None
