@@ -254,6 +254,7 @@ def serving(
     process = subprocess.Popen(
         arguments, stdout=log, stderr=subprocess.STDOUT, start_new_session=True
     )
+    event_directory = DIRECTORY / f"events-{process.pid}"
     base = f"http://127.0.0.1:{port}"
     results = {"priority": priority, "policy": policy, "pid": process.pid}
     try:
@@ -304,7 +305,7 @@ def serving(
                 f"{base}/start_request_profile",
                 json={
                     "run_id": "pr3553-events",
-                    "event_dir": str(DIRECTORY / "events"),
+                    "event_dir": str(event_directory),
                 },
                 timeout=30,
             )
@@ -314,6 +315,15 @@ def serving(
             results["off"] = send(request_body(73, "off"))
             response = httpx.post(f"{base}/stop_request_profile", json={}, timeout=30)
             response.raise_for_status()
+            deadline = time.monotonic() + 15
+            while time.monotonic() < deadline:
+                statuses = list(event_directory.glob("run_status_*.json"))
+                if len(statuses) == 3:
+                    break
+                time.sleep(0.1)
+            results["profile_statuses"] = {
+                path.name: json.loads(path.read_text()) for path in statuses
+            }
             return
         if pressure:
             bodies = [request_body(seed) for seed in range(60, 66)]
@@ -366,7 +376,7 @@ def serving(
         results["server_exit"] = process.returncode
         if events:
             intervals = {}
-            for path in (DIRECTORY / "events").glob("events_*.jsonl"):
+            for path in event_directory.glob("events_*.jsonl"):
                 for line in path.read_text().splitlines():
                     event = json.loads(line)
                     if event["event_name"] in {"model_path_start", "model_path_end"}:
