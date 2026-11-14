@@ -332,7 +332,9 @@ SGL_DEVICE void stage_operand(const LayerParams &params, const bf16_t *source,
                               int lane_index) {
   constexpr int kVectorsPerLane = kDepth / 8 / 32;
   constexpr int kRowBytes = kDepth * 2 + kOperandRowPadding;
-  uint4 packed[kRowsPerWarp][kVectorsPerLane];
+  // note (ratish): zeroed so a row past params.rows holds no value across loop
+  // iterations; left unset, the compiler carries it and spills to the stack.
+  uint4 packed[kRowsPerWarp][kVectorsPerLane] = {};
 #pragma unroll
   for (int row_slot = 0; row_slot < kRowsPerWarp; ++row_slot) {
     const int token = warp_index + row_slot * kComputeWarps;
@@ -684,7 +686,7 @@ SGL_DEVICE void attend(const LayerParams &params, int item, uint8_t *workspace,
       static_cast<int64_t>(token) * params.cache_row_stride + group * kHeadDim;
   const int cached_vectors = position * kHeadVectors;
   const int vector_count = 2 * cached_vectors + kAttentionHeads * kHeadVectors;
-  uint4 packed[kAttentionVectorsPerThread];
+  uint4 packed[kAttentionVectorsPerThread] = {};
 #pragma unroll
   for (int i = 0; i < kAttentionVectorsPerThread; ++i) {
     const int vector = threadIdx.x + i * kComputeThreads;
