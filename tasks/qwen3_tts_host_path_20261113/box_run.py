@@ -15,8 +15,16 @@ from pathlib import Path
 
 RUN_DIRECTORY = Path("/data/qwen3-tts-host-path-20261113")
 REPOSITORY = Path("/workspace/sglang-omni")
+PROBE_DIRECTORY = Path(__file__).resolve().parent / "probe"
+ABORT_CLIENT = Path(__file__).resolve().parent / "abort_client.py"
 MODEL = "Qwen/Qwen3-TTS-12Hz-1.7B-Base"
 ASR_MODEL = "Qwen/Qwen3-ASR-1.7B"
+S2PRO_MODEL = "fishaudio/s2-pro"
+QWEN3_TTS_STAGES = ("tts_engine", "vocoder")
+S2PRO_STAGES = ("preprocessing", "tts_engine", "vocoder")
+S2PRO_CONFIG = ["--config", "examples/configs/s2pro_tts.yaml"]
+EVENT_BUFFER_CAPACITY = 2_000_000
+QUIET_S = 15
 # Same Poisson arrival schedule for both arms of a fixed-rate cell.
 ARRIVAL_SEED = 7
 REQUEST_RATE_BY_CELL = {"stream_rate55": 55.0}
@@ -27,6 +35,8 @@ ARMS = {
     "m2": "4f3c2ab657a04f8ff554ea4e5c8b6a4fd1b305e6",
     "m3": "312690bd81db2e7c14bdcef2136dde7e05ee991f",
     "stack": "2d753d64d0279d0a579dac00704efd1d63525957",
+    "main13": "13364eb45fd2ff09393fb0031576b2783a0edcf8",
+    "pr": "2395d08957d87301e0fdd1284154051caba2cf79",
 }
 UNIT_SUITES = [
     "tests/unit_test/qwen3_tts",
@@ -89,9 +99,21 @@ def run_unit_suites(arms: list[str]) -> None:
         print(json.dumps({"unit": arm, "returncode": completed.returncode}), flush=True)
 
 
-def start_server(arm: str, card: int, log_path: Path) -> tuple[subprocess.Popen, int]:
+def start_server(
+    arm: str,
+    card: int,
+    log_path: Path,
+    *,
+    model: str = MODEL,
+    stages: tuple[str, ...] = QWEN3_TTS_STAGES,
+    extra_args: tuple[str, ...] = (),
+    extra_env: dict[str, str] | None = None,
+) -> tuple[subprocess.Popen, int]:
     port = 23600 + card
     log_path.parent.mkdir(parents=True, exist_ok=True)
+    stage_gpus = [
+        argument for stage in stages for argument in (f"--{stage}.gpu", str(card))
+    ]
     with log_path.open("w") as log:
         server = subprocess.Popen(
             [
@@ -100,21 +122,20 @@ def start_server(arm: str, card: int, log_path: Path) -> tuple[subprocess.Popen,
                 "sglang_omni.cli",
                 "serve",
                 "--model-path",
-                MODEL,
+                model,
                 "--host",
                 "127.0.0.1",
                 "--port",
                 str(port),
-                "--tts_engine.gpu",
-                str(card),
-                "--vocoder.gpu",
-                str(card),
+                *stage_gpus,
+                *extra_args,
             ],
             cwd=tree_for(arm),
             env={
                 **os.environ,
                 "PYTHONPATH": str(tree_for(arm)),
                 "SGLANG_OMNI_STRICT_PORT": "1",
+                **(extra_env or {}),
             },
             stdout=log,
             stderr=subprocess.STDOUT,
@@ -163,6 +184,7 @@ def benchmark(
     seed: int | None,
     warmup: int | None = None,
     request_rate: float | None = None,
+    model: str = MODEL,
 ) -> dict:
     directory.mkdir(parents=True, exist_ok=True)
     command = [
@@ -170,7 +192,7 @@ def benchmark(
         "-m",
         "benchmarks.eval.benchmark_tts_seedtts",
         "--model",
-        MODEL,
+        model,
         "--use-existing-server",
         "--host",
         "127.0.0.1",
@@ -257,6 +279,292 @@ def probe_step_path(
     print(json.dumps({"step_probe": counts}), flush=True)
 
 
+def probe_env(arm: str, **values: str) -> dict[str, str]:
+    """The arm's tree first, then the boot probe, whose switches are values."""
+    return {"PYTHONPATH": f"{tree_for(arm)}:{PROBE_DIRECTORY}", **values}
+
+
+def post_json(port: int, path: str, body: dict) -> dict:
+    request = urllib.request.Request(
+        f"http://127.0.0.1:{port}{path}",
+        data=json.dumps(body).encode(),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    with urllib.request.urlopen(request, timeout=60) as response:
+        return json.loads(response.read())
+
+
+def run_event_pairs(
+    base: str, head: str, root: str, cells: list[tuple[str, int, int | None, bool]]
+) -> None:
+    """Same-time pairs in both card orders, each request's first events recorded on both servers."""
+    for order in (0, 1):
+        directory = RUN_DIRECTORY / root / f"order{order}"
+        servers = []
+        try:
+            ports = {}
+            for side, arm in (("base", base), ("head", head)):
+                card = order if side == "base" else 1 - order
+                server, port = start_server(
+                    arm,
+                    card,
+                    directory / f"serve_{side}.log",
+                    extra_env=probe_env(arm, QWEN3_TTS_FIRST_EVENTS="1"),
+                )
+                servers.append(server)
+                ports[side] = (arm, port, server)
+            for arm, port, server in ports.values():
+                wait_healthy(port, server)
+            for cell, concurrency, samples, stream in cells:
+                for side, (arm, port, _) in ports.items():
+                    post_json(
+                        port,
+                        "/start_request_profile",
+                        {
+                            "run_id": f"{root}-order{order}-{side}-{cell}",
+                            "event_dir": str(directory / side / cell / "events"),
+                            "event_buffer_capacity": EVENT_BUFFER_CAPACITY,
+                        },
+                    )
+                with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+                    futures = {
+                        side: executor.submit(
+                            benchmark,
+                            arm,
+                            port,
+                            directory / side / cell,
+                            concurrency,
+                            samples,
+                            stream,
+                            None,
+                            1,
+                        )
+                        for side, (arm, port, _) in ports.items()
+                    }
+                    for side, future in futures.items():
+                        key = f"{root}/order{order}/{side}/{cell}"
+                        print(json.dumps({key: future.result()}), flush=True)
+                for arm, port, _ in ports.values():
+                    post_json(port, "/stop_request_profile", {})
+                time.sleep(QUIET_S)
+        finally:
+            stop_servers(servers)
+
+
+def run_abort_rows(arms: list[str], root: str) -> None:
+    """Drop most streams at set points on every arm at once, then a full c64 pass; the probe
+    samples the code table's rows throughout and after."""
+    directory = RUN_DIRECTORY / root
+    probe = directory / "probe"
+    probe.mkdir(parents=True, exist_ok=True)
+    servers = []
+    try:
+        ports = {}
+        for card, arm in enumerate(arms):
+            server, port = start_server(
+                arm,
+                card,
+                directory / arm / "serve.log",
+                extra_env=probe_env(arm, QWEN3_TTS_PROBE_DIR=str(probe)),
+            )
+            servers.append(server)
+            ports[arm] = (port, server)
+        for port, server in ports.values():
+            wait_healthy(port, server)
+
+        def drop_then_serve(arm: str) -> None:
+            port = ports[arm][0]
+            with (directory / arm / "aborts.log").open("w") as log:
+                subprocess.run(
+                    [
+                        sys.executable,
+                        str(ABORT_CLIENT),
+                        "--port",
+                        str(port),
+                        "--model",
+                        MODEL,
+                        "--output",
+                        str(directory / arm / "aborts.json"),
+                    ],
+                    cwd=tree_for(arm),
+                    env={**os.environ, "PYTHONPATH": str(tree_for(arm))},
+                    stdout=log,
+                    stderr=subprocess.STDOUT,
+                    check=True,
+                    timeout=3600,
+                )
+            print(
+                json.dumps(
+                    {
+                        f"{root}/{arm}/aborts": json.loads(
+                            (directory / arm / "aborts.json").read_text()
+                        )
+                    }
+                ),
+                flush=True,
+            )
+            time.sleep(QUIET_S)
+            summary = benchmark(
+                arm, port, directory / arm / "after_aborts", 64, None, True, None, 1
+            )
+            print(json.dumps({f"{root}/{arm}/after_aborts": summary}), flush=True)
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+            for future in [executor.submit(drop_then_serve, arm) for arm in arms]:
+                future.result()
+        time.sleep(QUIET_S)
+    finally:
+        stop_servers(servers)
+    for path in sorted(probe.glob("rows_*.jsonl")):
+        samples = [json.loads(line) for line in path.read_text().splitlines()]
+        print(
+            json.dumps(
+                {
+                    "rows_probe": path.name,
+                    "samples": len(samples),
+                    "min_free": min(sample["free"] for sample in samples),
+                    "last": samples[-1],
+                }
+            ),
+            flush=True,
+        )
+
+
+CACHE_SAMPLES = 64
+CACHE_PASSES = (("whole_a", False), ("whole_b", False), ("stream_a", True))
+
+
+def run_cache_history(arm: str, root: str) -> None:
+    """Seeded c1 whole, whole again, then stream, on a server with the engine's prefix cache
+    (card 0) and one without (card 1)."""
+    variants = {
+        "radix": (),
+        "no_radix": ("--tts_engine.engine.disable_radix_cache", "true"),
+    }
+    servers = []
+    try:
+        ports = {}
+        for card, (name, extra_args) in enumerate(variants.items()):
+            server, port = start_server(
+                arm,
+                card,
+                RUN_DIRECTORY / root / name / "serve.log",
+                extra_args=extra_args,
+            )
+            servers.append(server)
+            ports[name] = (port, server)
+        for port, server in ports.values():
+            wait_healthy(port, server)
+
+        def run_passes(name: str) -> None:
+            for label, stream in CACHE_PASSES:
+                benchmark(
+                    arm,
+                    ports[name][0],
+                    RUN_DIRECTORY / root / name / label,
+                    1,
+                    CACHE_SAMPLES,
+                    stream,
+                    1234,
+                    1,
+                )
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+            for future in [executor.submit(run_passes, name) for name in variants]:
+                future.result()
+    finally:
+        stop_servers(servers)
+    report = {}
+    for name in variants:
+        digests = {
+            label: audio_digests(RUN_DIRECTORY / root / name / label)
+            for label, _ in CACHE_PASSES
+        }
+        frames = {
+            label: {
+                record["id"]: record["completion_tokens"]
+                for record in json.loads(
+                    (
+                        RUN_DIRECTORY / root / name / label / "bench/speed_results.json"
+                    ).read_text()
+                )["per_request"]
+            }
+            for label, _ in CACHE_PASSES
+        }
+        report[name] = {
+            "whole_a_vs_whole_b_bytes": sum(
+                digests["whole_b"].get(file) == digest
+                for file, digest in digests["whole_a"].items()
+            ),
+            "whole_a_vs_stream_a_frames": sum(
+                frames["stream_a"][key] == count
+                for key, count in frames["whole_a"].items()
+            ),
+            "whole_b_vs_stream_a_frames": sum(
+                frames["stream_a"][key] == count
+                for key, count in frames["whole_b"].items()
+            ),
+            "samples": len(digests["whole_a"]),
+        }
+    (RUN_DIRECTORY / root / "report.json").write_text(json.dumps(report, indent=2))
+    print(json.dumps({"cache_history": report}), flush=True)
+
+
+def run_other_model_identity(arms: list[str], root: str) -> None:
+    """Seeded c1 stream over the full corpus on S2-Pro; each arm boots after the previous is
+    healthy, so both read one warm inductor cache."""
+    servers = []
+    try:
+        ports = {}
+        for card, arm in enumerate(arms):
+            server, port = start_server(
+                arm,
+                card,
+                RUN_DIRECTORY / root / arm / "serve.log",
+                model=S2PRO_MODEL,
+                stages=S2PRO_STAGES,
+                extra_args=tuple(S2PRO_CONFIG),
+            )
+            servers.append(server)
+            ports[arm] = port
+            wait_healthy(port, server)
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+            futures = {
+                arm: executor.submit(
+                    benchmark,
+                    arm,
+                    ports[arm],
+                    RUN_DIRECTORY / root / arm / "stream",
+                    1,
+                    None,
+                    True,
+                    1234,
+                    1,
+                    None,
+                    S2PRO_MODEL,
+                )
+                for arm in arms
+            }
+            for arm, future in futures.items():
+                print(json.dumps({f"{root}/{arm}": future.result()}), flush=True)
+    finally:
+        stop_servers(servers)
+    reference = audio_digests(RUN_DIRECTORY / root / arms[0] / "stream")
+    report = {
+        arm: {
+            "files": len(audio_digests(RUN_DIRECTORY / root / arm / "stream")),
+            "equal_to_first": sum(
+                audio_digests(RUN_DIRECTORY / root / arm / "stream").get(name) == digest
+                for name, digest in reference.items()
+            ),
+        }
+        for arm in arms
+    }
+    (RUN_DIRECTORY / root / "identity.json").write_text(json.dumps(report, indent=2))
+    print(json.dumps({"other_model_identity": report}), flush=True)
+
+
 def audio_digests(directory: Path) -> dict[str, str]:
     return {
         path.name: hashlib.sha256(path.read_bytes()).hexdigest()
@@ -323,6 +631,7 @@ def run_pairs(
     root: str = "pairs",
     warmup: int | None = None,
     probe_arm: str | None = None,
+    server_env: dict[str, str] | None = None,
 ) -> None:
     summaries_path = RUN_DIRECTORY / root / "summary.json"
     summaries_path.parent.mkdir(parents=True, exist_ok=True)
@@ -346,6 +655,9 @@ def run_pairs(
                         / pair
                         / f"order{order}"
                         / f"serve_{side}.log",
+                        extra_env=(
+                            None if server_env is None else probe_env(arm, **server_env)
+                        ),
                     )
                     servers.append(server)
                     ports[side] = (arm, port)
@@ -566,6 +878,11 @@ def main() -> None:
             "score_draws",
             "quality_draws_c64",
             "rate_probe",
+            "events_c64",
+            "retract",
+            "abort_rows",
+            "cache_history",
+            "other_model",
         ],
     )
     parser.add_argument("--arms", nargs="*", default=list(ARMS))
@@ -627,6 +944,26 @@ def main() -> None:
                 warmup=1,
             )
         score_generated(["quality_draws_c64"])
+    elif arguments.phase == "events_c64":
+        run_event_pairs("main13", "pr", "events_c64", [("stream_c64", 64, None, True)])
+    elif arguments.phase == "retract":
+        run_pairs(
+            [("main13", "pr")],
+            [("stream_c16", 16, None, True), ("nonstream_c16", 16, None, False)],
+            root="retract",
+            warmup=1,
+            server_env={
+                "SGLANG_TEST_RETRACT": "1",
+                "QWEN3_TTS_PROBE_DIR": str(RUN_DIRECTORY / "retract" / "probe"),
+            },
+        )
+        score_generated(["retract"])
+    elif arguments.phase == "abort_rows":
+        run_abort_rows(["main13", "pr"], "abort_rows")
+    elif arguments.phase == "cache_history":
+        run_cache_history("main13", "cache_history")
+    elif arguments.phase == "other_model":
+        run_other_model_identity(["main13", "pr"], "other_model")
     else:
         run_pairs([("main", "stack"), ("m1", "m2")], [NONSTREAM_CELL])
 
