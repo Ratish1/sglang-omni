@@ -90,6 +90,11 @@ def main() -> None:
     )
     parser.add_argument("--native-shared-expert", action="store_true")
     parser.add_argument(
+        "--shared-activation-semantics",
+        choices=("native", "checkpoint"),
+        default="native",
+    )
+    parser.add_argument(
         "--expert-output-arithmetic",
         choices=(
             "native",
@@ -155,6 +160,10 @@ def main() -> None:
     )
     parser.add_argument("--output-directory", type=Path, required=True)
     arguments = parser.parse_args()
+    if arguments.shared_activation_semantics != "native":
+        assert arguments.native_shared_expert
+    else:
+        pass
     if arguments.contribution_source_directory is not None:
         assert arguments.native_expert_capture_directory is not None
         install_contribution_provider(arguments.contribution_source_directory)
@@ -289,6 +298,7 @@ def main() -> None:
             reference=reference,
             capture_directory=arguments.native_expert_capture_directory,
             route_precision=arguments.native_expert_route_precision,
+            shared_activation_semantics=arguments.shared_activation_semantics,
             output_arithmetic=arguments.expert_output_arithmetic,
             native_output_arithmetic=arguments.native_output_arithmetic,
             shared_enabled=arguments.native_shared_expert,
@@ -1147,6 +1157,7 @@ def main() -> None:
                 ),
                 "native_expert_calls": expert_control.calls if expert_control else 0,
                 "native_shared_expert": arguments.native_shared_expert,
+                "shared_activation_semantics": arguments.shared_activation_semantics,
                 "native_shared_gate_batches": arguments.native_shared_gate_batches,
                 "shared_gate_decode_rows": arguments.shared_gate_decode_rows,
                 "native_shared_gate_exact_input_calls": (

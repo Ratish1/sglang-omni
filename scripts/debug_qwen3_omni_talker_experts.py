@@ -35,6 +35,7 @@ class NativeTalkerExperts:
     reference: Qwen3OmniMoeTalkerForConditionalGeneration
     capture_directory: Path
     route_precision: Literal["checkpoint", "float32"]
+    shared_activation_semantics: Literal["native", "checkpoint"]
     output_arithmetic: Literal[
         "native",
         "native-reduction",
@@ -168,7 +169,10 @@ class NativeTalkerExperts:
         gate_up = torch.nn.functional.linear(
             hidden_states, self.shared_weights[layer_index]
         )
-        activated = self.shared_activation(gate_up)
+        if self.shared_activation_semantics == "checkpoint":
+            activated = self.shared_activation.forward_native(gate_up)
+        else:
+            activated = self.shared_activation(gate_up)
         self.shared_calls += 1
         return torch.nn.functional.linear(activated, module.down_proj.weight).view_as(
             output
