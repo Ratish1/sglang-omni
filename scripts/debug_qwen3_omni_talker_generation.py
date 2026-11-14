@@ -1005,7 +1005,10 @@ def main() -> None:
                 assert expert_control.calls == expected_calls
                 if arguments.expert_output_arithmetic == "native":
                     expected_kernel_calls = expected_calls
-                elif arguments.expert_output_arithmetic == "checkpoint":
+                elif arguments.expert_output_arithmetic in (
+                    "checkpoint",
+                    "fused-activation-checkpoint-reduction",
+                ):
                     expected_kernel_calls = 0
                 else:
                     expected_kernel_calls = expected_calls * (
