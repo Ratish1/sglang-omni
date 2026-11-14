@@ -55,10 +55,11 @@ def main() -> None:
             "Whole-population receiver capture requires only the original control"
         )
     elif arguments.capture_request_id is not None and (
-        arguments.control not in (["original"], ["rounded-routing"])
+        arguments.control
+        not in (["original"], ["rounded-routing"], ["original", "rounded-routing"])
         or arguments.reference_predictor_mode is not None
     ):
-        raise ValueError("Selected receiver capture requires one native Talker control")
+        raise ValueError("Selected receiver capture requires native Talker controls")
     else:
         pass
     arguments.output_directory.mkdir(exist_ok=False)
@@ -190,6 +191,7 @@ def main() -> None:
             json.dumps(
                 {
                     "source": source,
+                    "control": control,
                     "pid": process.pid,
                     "command": server_command,
                     "diagnostic_environment": diagnostic_environment,
