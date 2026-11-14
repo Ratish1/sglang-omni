@@ -32,7 +32,9 @@ ITEM_REDUCED = ITEM_MULTIPLIED + LIST_LENGTH
 CHUNK_WAIT = ITEM_REDUCED + LIST_LENGTH
 CHUNK_READY = CHUNK_WAIT + LIST_LENGTH
 CHUNK_ISSUE = CHUNK_READY + LIST_LENGTH
-SLOTS_PER_CTA = CHUNK_ISSUE + LIST_LENGTH
+ATTENTION_NORMED = CHUNK_ISSUE + LIST_LENGTH
+ATTENTION_SCORED = ATTENTION_NORMED + 1
+SLOTS_PER_CTA = ATTENTION_SCORED + 1
 PHASES = ("qkv", "attention", "o_proj", "gate_up", "down")
 ATTENTION = 1
 CHUNKS_PER_TILE = (1, 0, 2, 1, 3)
@@ -130,6 +132,14 @@ def analyse_launch(stamps, item_phases, batch_tiles):
                     chunk_waits.append(between(CHUNK_WAIT + chunk + offset, CHUNK_READY + chunk + offset))
                 chunk += CHUNKS_PER_TILE[phase] * len(group)
                 item_start = ITEM_END + group[0]
+            if phase == ATTENTION:
+                last = indices[-1]
+                for part, (first, second) in {
+                    "norm and rope": (ITEM_MULTIPLIED + last, ATTENTION_NORMED),
+                    "scores and softmax": (ATTENTION_NORMED, ATTENTION_SCORED),
+                    "values and store": (ATTENTION_SCORED, ITEM_REDUCED + last),
+                }.items():
+                    parts.setdefault(part, []).append(between(first, second))
             if phase < len(PHASES) - 1:
                 signal_costs.append(between(ITEM_END + groups[-1][0], phase_slot(phase, SIGNALED)))
         prefix = f"{name} "
