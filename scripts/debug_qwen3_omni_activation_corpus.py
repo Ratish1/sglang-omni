@@ -35,6 +35,7 @@ def main() -> None:
     )
     parser.add_argument("--no-capture", dest="is_capture_disabled", action="store_true")
     parser.add_argument("--contribution-source-directory", type=Path)
+    parser.add_argument("--gemm1-profile", type=int)
     parser.add_argument(
         "--reference-predictor-mode",
         choices=("identity", "checkpoint", "checkpoint-codes", "checkpoint-feedback"),
@@ -52,6 +53,12 @@ def main() -> None:
         ),
     )
     arguments = parser.parse_args()
+    if arguments.gemm1_profile is not None and (
+        arguments.gemm1_profile < 0 or arguments.control != ["checkpoint-reduction"]
+    ):
+        raise ValueError("A GEMM1 profile requires only checkpoint-reduction control")
+    else:
+        pass
     if arguments.is_capture_disabled and (
         arguments.capture_all_conditioning
         or arguments.capture_request_id is not None
@@ -220,6 +227,12 @@ def main() -> None:
         ):
             diagnostic_environment["SGLANG_OMNI_DIAGNOSTIC_CONTRIBUTION_SOURCE"] = str(
                 arguments.contribution_source_directory
+            )
+        else:
+            pass
+        if arguments.gemm1_profile is not None:
+            diagnostic_environment["SGLANG_OMNI_DIAGNOSTIC_GEMM1_PROFILE"] = str(
+                arguments.gemm1_profile
             )
         else:
             pass

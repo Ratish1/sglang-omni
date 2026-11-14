@@ -843,7 +843,11 @@ class Qwen3OmniTalker(nn.Module):
         )
         if contribution_source_directory is not None:
             assert quant_config is None
-            install_contribution_provider(Path(contribution_source_directory))
+            gemm1_profile = os.environ.get("SGLANG_OMNI_DIAGNOSTIC_GEMM1_PROFILE")
+            install_contribution_provider(
+                Path(contribution_source_directory),
+                int(gemm1_profile) if gemm1_profile is not None else None,
+            )
         else:
             pass
 
