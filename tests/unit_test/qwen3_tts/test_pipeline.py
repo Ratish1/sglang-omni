@@ -1452,8 +1452,14 @@ def test_qwen3_tts_preprocessing_does_not_mutate_global_rng(
             assert ref_audio == ["voice.wav"]
             return [(np.zeros(32, dtype=np.float32), 24000)]
 
-        def _tokenize_texts(self, texts):
-            return [torch.arange(1, len(texts[0]) + 1, dtype=torch.long).unsqueeze(0)]
+        device = torch.device("cpu")
+
+        def processor(self, *, text, return_tensors, padding):
+            return {
+                "input_ids": torch.arange(1, len(text) + 1, dtype=torch.long).unsqueeze(
+                    0
+                )
+            }
 
         def _build_assistant_text(self, text):
             return text
@@ -1525,8 +1531,10 @@ def test_qwen3_tts_budgets_generation_by_the_target_text(
         def _normalize_audio_inputs(self, ref_audio):
             return [(np.zeros(32, dtype=np.float32), 24000)]
 
-        def _tokenize_texts(self, texts):
-            return [torch.arange(len(texts[0]), dtype=torch.long).unsqueeze(0)]
+        device = torch.device("cpu")
+
+        def processor(self, *, text, return_tensors, padding):
+            return {"input_ids": torch.arange(len(text), dtype=torch.long).unsqueeze(0)}
 
         def _build_assistant_text(self, text):
             return text
@@ -1601,8 +1609,10 @@ def test_qwen3_tts_custom_voice_and_voice_design_take_the_checkpoint_limit(
         def _build_instruct_text(self, text):
             return text
 
-        def _tokenize_texts(self, texts):
-            return [torch.arange(8, dtype=torch.long).unsqueeze(0) for _ in texts]
+        device = torch.device("cpu")
+
+        def processor(self, *, text, return_tensors, padding):
+            return {"input_ids": torch.arange(8, dtype=torch.long).unsqueeze(0)}
 
         def _merge_generate_kwargs(self, **kwargs):
             return {"max_new_tokens": 8192, **kwargs}
@@ -1649,8 +1659,10 @@ class EmbeddingPromptWrapper:
     ):
         raise AssertionError("reference audio must not load for an embedding")
 
-    def _tokenize_texts(self, texts):  # noqa: leading-underscore  # production name
-        return [torch.arange(len(texts[0]), dtype=torch.long).unsqueeze(0)]
+    device = torch.device("cpu")
+
+    def processor(self, *, text, return_tensors, padding):
+        return {"input_ids": torch.arange(len(text), dtype=torch.long).unsqueeze(0)}
 
     def _build_assistant_text(  # noqa: leading-underscore  # production name
         self, text
@@ -1756,8 +1768,10 @@ def test_qwen3_tts_uploaded_voice_clone_prompt_uses_shared_cache(
             assert ref_audio == ["voice.wav"]
             return [(np.zeros(32, dtype=np.float32), 24000)]
 
-        def _tokenize_texts(self, texts):
-            return [torch.arange(len(texts[0]), dtype=torch.long).unsqueeze(0)]
+        device = torch.device("cpu")
+
+        def processor(self, *, text, return_tensors, padding):
+            return {"input_ids": torch.arange(len(text), dtype=torch.long).unsqueeze(0)}
 
         def _build_assistant_text(self, text):
             return text
@@ -1875,8 +1889,10 @@ def test_qwen3_tts_adhoc_voice_clone_prompt_uses_reference_service(
             assert ref_audio == [data_uri]
             return [(np.zeros(32, dtype=np.float32), 24000)]
 
-        def _tokenize_texts(self, texts):
-            return [torch.arange(len(texts[0]), dtype=torch.long).unsqueeze(0)]
+        device = torch.device("cpu")
+
+        def processor(self, *, text, return_tensors, padding):
+            return {"input_ids": torch.arange(len(text), dtype=torch.long).unsqueeze(0)}
 
         def _build_assistant_text(self, text):
             return text
@@ -2046,8 +2062,10 @@ def test_qwen3_tts_preprocess_payload_batches_reference_codes_across_requests(
             both_normalizing.wait(timeout=5.0)
             return [(np.zeros(32, dtype=np.float32), 24000)]
 
-        def _tokenize_texts(self, texts):
-            return [torch.arange(len(texts[0]), dtype=torch.long).unsqueeze(0)]
+        device = torch.device("cpu")
+
+        def processor(self, *, text, return_tensors, padding):
+            return {"input_ids": torch.arange(len(text), dtype=torch.long).unsqueeze(0)}
 
         def _build_assistant_text(self, text):
             return text
@@ -2475,8 +2493,10 @@ def test_qwen3_tts_uploaded_voice_x_vector_cache_omits_ref_code(
             assert ref_audio == ["voice.wav"]
             return [(np.zeros(32, dtype=np.float32), 24000)]
 
-        def _tokenize_texts(self, texts):
-            return [torch.arange(len(texts[0]), dtype=torch.long).unsqueeze(0)]
+        device = torch.device("cpu")
+
+        def processor(self, *, text, return_tensors, padding):
+            return {"input_ids": torch.arange(len(text), dtype=torch.long).unsqueeze(0)}
 
         def _build_assistant_text(self, text):
             return text
@@ -8969,10 +8989,10 @@ def test_qwen3_tts_prepare_custom_voice_uses_speaker_path(
         def _build_instruct_text(self, text):
             return f"instruct:{text}"
 
-        def _tokenize_texts(self, texts):
-            return [
-                torch.arange(len(text), dtype=torch.long).unsqueeze(0) for text in texts
-            ]
+        device = torch.device("cpu")
+
+        def processor(self, *, text, return_tensors, padding):
+            return {"input_ids": torch.arange(len(text), dtype=torch.long).unsqueeze(0)}
 
         def _merge_generate_kwargs(self, **kwargs):
             return kwargs
@@ -9034,8 +9054,10 @@ def test_qwen3_tts_prepare_voice_design_uses_instruction_path(
         def _build_instruct_text(self, text):
             return f"instruct:{text}"
 
-        def _tokenize_texts(self, texts):
-            return [torch.arange(8, dtype=torch.long).unsqueeze(0) for _ in texts]
+        device = torch.device("cpu")
+
+        def processor(self, *, text, return_tensors, padding):
+            return {"input_ids": torch.arange(8, dtype=torch.long).unsqueeze(0)}
 
         def _merge_generate_kwargs(self, **kwargs):
             return kwargs
@@ -11031,8 +11053,10 @@ def test_qwen3_tts_standalone_preprocessing_ships_tensors_without_registry(
     qwen3_request_builders.clear_qwen3_tts_preprocessing_context()
 
     class FakeWrapper:
-        def _tokenize_texts(self, texts):
-            return [torch.arange(len(texts[0]), dtype=torch.long).unsqueeze(0)]
+        device = torch.device("cpu")
+
+        def processor(self, *, text, return_tensors, padding):
+            return {"input_ids": torch.arange(len(text), dtype=torch.long).unsqueeze(0)}
 
         def _build_assistant_text(self, text):
             return text
