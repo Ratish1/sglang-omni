@@ -37,6 +37,7 @@ class NativeTalkerExperts:
     route_precision: Literal["checkpoint", "float32"]
     output_arithmetic: Literal[
         "native",
+        "native-reduction",
         "checkpoint",
         "rounded-contributions",
         "bf16-reduction",
@@ -280,6 +281,7 @@ class NativeTalkerExperts:
         assert torch.equal(replay_inputs, hidden_states)
         assert fused_output.shape == output.shape
         if self.output_arithmetic in (
+            "native-reduction",
             "rounded-contributions",
             "bf16-reduction",
             "checkpoint-reduction",
@@ -295,7 +297,14 @@ class NativeTalkerExperts:
                 fused_output.contiguous().view(torch.uint8),
             ), (layer_index, self.calls)
             fused_output = combine_expert_contributions(
-                contributions, indices, weights, self.output_arithmetic
+                contributions,
+                indices,
+                weights,
+                (
+                    "native"
+                    if self.output_arithmetic == "native-reduction"
+                    else self.output_arithmetic
+                ),
             )
             self.kernel_calls += len(contributions)
         else:

@@ -93,6 +93,7 @@ def main() -> None:
         "--expert-output-arithmetic",
         choices=(
             "native",
+            "native-reduction",
             "checkpoint",
             "rounded-contributions",
             "bf16-reduction",
@@ -174,7 +175,7 @@ def main() -> None:
         pass
     if arguments.expert_gemm1_profile is not None:
         assert arguments.native_expert_capture_directory is not None
-        assert arguments.expert_output_arithmetic == "native"
+        assert arguments.expert_output_arithmetic in ("native", "native-reduction")
     else:
         pass
     if arguments.native_shared_gate_batches:
