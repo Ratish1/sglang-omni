@@ -20,6 +20,7 @@ from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import (
     Qwen3OmniMoeTalkerTextTopKRouter,
 )
 
+from scripts.qwen3_omni_talker_expert_rounding import expert_rounding_stages
 from scripts.qwen3_omni_talker_expert_runtime import (
     NativeRuntime,
     ObservedExpertProfiles,
@@ -40,6 +41,7 @@ class NativeTalkerExperts:
         "rounded-contributions",
         "bf16-reduction",
         "checkpoint-reduction",
+        "fused-activation-checkpoint-reduction",
     ] = "native"
     native_output_arithmetic: Literal[
         "native", "rounded-contributions", "checkpoint-reduction"
@@ -234,6 +236,17 @@ class NativeTalkerExperts:
         if self.output_arithmetic == "checkpoint":
             self.calls += 1
             return output
+        elif self.output_arithmetic == "fused-activation-checkpoint-reduction":
+            assert torch.equal(weights, weights.bfloat16().float())
+            stages = expert_rounding_stages(module, hidden_states, indices, weights)
+            assert torch.equal(
+                stages["checkpoint_expert_order_bfloat16_sum"]
+                .contiguous()
+                .view(torch.uint8),
+                output.contiguous().view(torch.uint8),
+            ), (layer_index, self.calls, "checkpoint expert baseline")
+            self.calls += 1
+            return stages["fused_activation_checkpoint_sum"]
         else:
             pass
         if self.profiles is not None:

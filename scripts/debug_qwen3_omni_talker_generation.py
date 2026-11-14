@@ -96,6 +96,7 @@ def main() -> None:
             "rounded-contributions",
             "bf16-reduction",
             "checkpoint-reduction",
+            "fused-activation-checkpoint-reduction",
         ),
         default="native",
     )

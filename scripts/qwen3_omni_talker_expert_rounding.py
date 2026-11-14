@@ -23,6 +23,7 @@ def expert_rounding_stages(
     rounded_activation_routes = torch.zeros_like(fused_activation_routes)
     rounded_weighted_routes = torch.zeros_like(fused_activation_routes)
     checkpoint_output = torch.zeros_like(hidden_states)
+    fused_activation_checkpoint_output = torch.zeros_like(hidden_states)
     for expert_index in expert_indices.unique(sorted=True).tolist():
         ranks, token_indices = torch.where(expert_indices.T == expert_index)
         gate, up = torch.nn.functional.linear(
@@ -45,6 +46,13 @@ def expert_rounding_stages(
         rounded_activation_routes[token_indices, ranks] = rounded_down
         rounded_weighted_routes[token_indices, ranks] = weighted
         checkpoint_output.index_add_(0, token_indices, weighted)
+        fused_activation_checkpoint_output.index_add_(
+            0,
+            token_indices,
+            (fused_down * expert_weights[token_indices, ranks, None]).to(
+                hidden_states.dtype
+            ),
+        )
     stage_outputs = {}
     for name, routes in (
         ("flashinfer_fma", fused_activation_routes),
@@ -74,4 +82,7 @@ def expert_rounding_stages(
         hidden_states.dtype
     )
     stage_outputs["checkpoint_expert_order_bfloat16_sum"] = checkpoint_output
+    stage_outputs["fused_activation_checkpoint_sum"] = (
+        fused_activation_checkpoint_output
+    )
     return stage_outputs
