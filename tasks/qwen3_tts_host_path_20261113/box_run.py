@@ -15,6 +15,7 @@ from pathlib import Path
 RUN_DIRECTORY = Path("/data/qwen3-tts-host-path-20261113")
 REPOSITORY = Path("/workspace/sglang-omni")
 MODEL = "Qwen/Qwen3-TTS-12Hz-1.7B-Base"
+ASR_MODEL = "Qwen/Qwen3-ASR-1.7B"
 ARMS = {
     "main": "df7bc688cd75e882ee47fd005d93777dec6cfcc0",
     "a1": "46d17389ae67dad11154830bfc65f2148a655e7d",
@@ -153,9 +154,10 @@ def benchmark(
     port: int,
     directory: Path,
     concurrency: int,
-    samples: int,
+    samples: int | None,
     stream: bool,
     seed: int | None,
+    warmup: int | None = None,
 ) -> dict:
     directory.mkdir(parents=True, exist_ok=True)
     command = [
@@ -173,14 +175,16 @@ def benchmark(
         "--lang",
         "en",
         "--warmup",
-        str(concurrency),
+        str(concurrency if warmup is None else warmup),
         "--max-concurrency",
         str(concurrency),
-        "--max-samples",
-        str(samples),
         "--output-dir",
         str(directory / "bench"),
     ]
+    if samples is not None:
+        command.extend(["--max-samples", str(samples)])
+    else:
+        pass
     if seed is not None:
         command.extend(["--seed", str(seed)])
     else:
@@ -197,9 +201,48 @@ def benchmark(
             stdout=log,
             stderr=subprocess.STDOUT,
             check=True,
-            timeout=1800,
+            timeout=7200,
         )
     return json.loads((directory / "bench/speed_results.json").read_text())["summary"]
+
+
+def probe_step_path(server: subprocess.Popen, directory: Path) -> None:
+    """py-spy the server's stage process through the cell's steady state."""
+    time.sleep(45)
+    listing = subprocess.check_output(["ps", "-eo", "pid,ppid,args"], text=True)
+    stage_pid = next(
+        line.split()[0]
+        for line in listing.splitlines()[1:]
+        if line.split()[1] == str(server.pid) and "spawn_main" in line
+    )
+    dumps = []
+    for _ in range(90):
+        dumps.append(
+            subprocess.run(
+                ["py-spy", "dump", "--pid", stage_pid, "--nonblocking"],
+                capture_output=True,
+                text=True,
+            ).stdout
+        )
+        time.sleep(1)
+    text = "\n".join(dumps)
+    (directory / "step_probe_dumps.txt").write_text(text)
+    counts = {
+        name: text.count(f" {name} (")
+        for name in (
+            "handle_stream_step",
+            "take_stream_step",
+            "emit_stream_step",
+            "write_step_frames",
+            "gather_table_codes",
+            "handle_stream_chunk",
+            "stream_output_builder",
+            "post_process_outputs",
+            "sleep_during_idle",
+        )
+    }
+    (directory / "step_probe.json").write_text(json.dumps(counts, indent=2))
+    print(json.dumps({"step_probe": counts}), flush=True)
 
 
 def audio_digests(directory: Path) -> dict[str, str]:
@@ -263,9 +306,13 @@ def run_identity(arms: list[str]) -> None:
 
 
 def run_pairs(
-    pairs: list[tuple[str, str]], cells: list[tuple[str, int, int, bool]]
+    pairs: list[tuple[str, str]],
+    cells: list[tuple[str, int, int | None, bool]],
+    root: str = "pairs",
+    warmup: int | None = None,
+    probe_arm: str | None = None,
 ) -> None:
-    summaries_path = RUN_DIRECTORY / "pairs" / "summary.json"
+    summaries_path = RUN_DIRECTORY / root / "summary.json"
     summaries_path.parent.mkdir(parents=True, exist_ok=True)
     summaries = (
         json.loads(summaries_path.read_text()) if summaries_path.exists() else {}
@@ -276,32 +323,43 @@ def run_pairs(
             servers = []
             try:
                 ports = {}
+                processes = {}
                 for side, arm in (("base", base), ("head", head)):
                     card = order if side == "base" else 1 - order
                     server, port = start_server(
                         arm,
                         card,
                         RUN_DIRECTORY
-                        / "pairs"
+                        / root
                         / pair
                         / f"order{order}"
                         / f"serve_{side}.log",
                     )
                     servers.append(server)
                     ports[side] = (arm, port)
+                    processes[side] = server
                 for (arm, port), server in zip(ports.values(), servers):
                     wait_healthy(port, server)
                 for cell, concurrency, samples, stream in cells:
                     with concurrent.futures.ThreadPoolExecutor(
-                        max_workers=2
+                        max_workers=3
                     ) as executor:
+                        for side, (arm, _) in ports.items():
+                            if arm == probe_arm and cell == "stream_c64":
+                                executor.submit(
+                                    probe_step_path,
+                                    processes[side],
+                                    RUN_DIRECTORY / root / pair / f"order{order}",
+                                )
+                            else:
+                                pass
                         futures = {
                             side: executor.submit(
                                 benchmark,
                                 arm,
                                 port,
                                 RUN_DIRECTORY
-                                / "pairs"
+                                / root
                                 / pair
                                 / f"order{order}"
                                 / side
@@ -310,6 +368,7 @@ def run_pairs(
                                 samples,
                                 stream,
                                 None,
+                                warmup,
                             )
                             for side, (arm, port) in ports.items()
                         }
@@ -323,10 +382,168 @@ def run_pairs(
                 stop_servers(servers)
 
 
+def run_seedtts_c1(arms: list[str]) -> None:
+    """Seeded c1 over the full SeedTTS EN corpus, each arm on its own card, whole then stream."""
+    servers = []
+    try:
+        ports = {}
+        for card, arm in enumerate(arms):
+            server, port = start_server(
+                arm, card, RUN_DIRECTORY / "seedtts_c1" / arm / "serve.log"
+            )
+            servers.append(server)
+            ports[arm] = port
+        for arm, server in zip(arms, servers):
+            wait_healthy(ports[arm], server)
+
+        def run_modes(arm: str) -> None:
+            for mode, stream in (("whole", False), ("stream", True)):
+                summary = benchmark(
+                    arm,
+                    ports[arm],
+                    RUN_DIRECTORY / "seedtts_c1" / arm / mode,
+                    1,
+                    None,
+                    stream,
+                    1234,
+                    1,
+                )
+                print(json.dumps({f"seedtts_c1/{arm}/{mode}": summary}), flush=True)
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+            for future in [executor.submit(run_modes, arm) for arm in arms]:
+                future.result()
+    finally:
+        stop_servers(servers)
+    report = {}
+    for mode in ("whole", "stream"):
+        reference = audio_digests(RUN_DIRECTORY / "seedtts_c1" / arms[0] / mode)
+        for arm in arms:
+            digests = audio_digests(RUN_DIRECTORY / "seedtts_c1" / arm / mode)
+            report[f"{arm}/{mode}"] = {
+                "files": len(digests),
+                "equal_to_first": sum(
+                    digests.get(name) == digest for name, digest in reference.items()
+                ),
+            }
+    (RUN_DIRECTORY / "seedtts_c1" / "identity.json").write_text(
+        json.dumps(report, indent=2)
+    )
+    print(json.dumps({"seedtts_identity": report}), flush=True)
+
+
+def score_generated(roots: list[str]) -> None:
+    """WER on a Qwen3-ASR server on card 0 and SIM on card 1, for every generated run."""
+    directories = sorted(
+        path.parent
+        for root in roots
+        for path in (RUN_DIRECTORY / root).rglob("generated.json")
+    )
+    log_path = RUN_DIRECTORY / "score" / "asr_serve.log"
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    port = 23700
+    with log_path.open("w") as log:
+        asr_server = subprocess.Popen(
+            [
+                sys.executable,
+                "-m",
+                "sglang_omni.cli",
+                "serve",
+                "--model-path",
+                ASR_MODEL,
+                "--host",
+                "127.0.0.1",
+                "--port",
+                str(port),
+            ],
+            cwd=tree_for("main"),
+            env={
+                **os.environ,
+                "PYTHONPATH": str(tree_for("main")),
+                "SGLANG_OMNI_STRICT_PORT": "1",
+            },
+            stdout=log,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+        )
+    (log_path.parent / "asr_serve.pgid").write_text(str(asr_server.pid))
+
+    def score_one(directory: Path, scorer: list[str], log_name: str) -> None:
+        with (directory / log_name).open("w") as log:
+            subprocess.run(
+                [
+                    sys.executable,
+                    "-m",
+                    "benchmarks.eval.benchmark_tts_seedtts",
+                    "--model",
+                    MODEL,
+                    "--lang",
+                    "en",
+                    "--output-dir",
+                    str(directory),
+                    *scorer,
+                ],
+                cwd=tree_for("main"),
+                env={**os.environ, "PYTHONPATH": str(tree_for("main"))},
+                stdout=log,
+                stderr=subprocess.STDOUT,
+                check=True,
+                timeout=7200,
+            )
+        print(json.dumps({"scored": str(directory), "by": log_name}), flush=True)
+
+    try:
+        wait_healthy(port, asr_server)
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+            transcription = executor.submit(
+                lambda: [
+                    score_one(
+                        directory,
+                        [
+                            "--transcribe-only",
+                            "--use-existing-server",
+                            "--host",
+                            "127.0.0.1",
+                            "--port",
+                            str(port),
+                            "--asr-concurrency",
+                            "64",
+                        ],
+                        "transcribe.log",
+                    )
+                    for directory in directories
+                ]
+            )
+            similarity = executor.submit(
+                lambda: [
+                    score_one(
+                        directory,
+                        ["--similarity-only", "--device", "cuda:1"],
+                        "similarity.log",
+                    )
+                    for directory in directories
+                ]
+            )
+            transcription.result()
+            similarity.result()
+    finally:
+        stop_servers([asr_server])
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument(
-        "phase", choices=["unit", "identity", "pairs", "nonstream", "on_m2"]
+        "phase",
+        choices=[
+            "unit",
+            "identity",
+            "pairs",
+            "nonstream",
+            "on_m2",
+            "seedtts_c1",
+            "seedtts_pairs",
+            "score",
+        ],
     )
     parser.add_argument("--arms", nargs="*", default=list(ARMS))
     arguments = parser.parse_args()
@@ -338,7 +555,22 @@ def main() -> None:
     elif arguments.phase == "pairs":
         run_pairs(PAIRS, PAIR_CELLS)
     elif arguments.phase == "on_m2":
-        run_pairs([("m2", "stack")], PAIR_CELLS)
+        run_pairs([("m2", "stack")], PAIR_CELLS, probe_arm="stack")
+    elif arguments.phase == "seedtts_c1":
+        run_seedtts_c1(["main", "m2"])
+    elif arguments.phase == "seedtts_pairs":
+        run_pairs(
+            [("main", "m2")],
+            [
+                ("stream_c16", 16, None, True),
+                ("stream_c64", 64, None, True),
+                ("nonstream_c16", 16, None, False),
+            ],
+            root="seedtts_pairs",
+            warmup=1,
+        )
+    elif arguments.phase == "score":
+        score_generated(["seedtts_c1", "seedtts_pairs"])
     else:
         run_pairs([("main", "stack"), ("m1", "m2")], [NONSTREAM_CELL])
 
