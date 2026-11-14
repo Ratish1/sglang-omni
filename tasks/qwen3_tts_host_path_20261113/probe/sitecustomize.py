@@ -22,6 +22,7 @@ TIME_PREPROCESSING = os.environ.get("QWEN3_TTS_TIME_PREPROCESSING") == "1"
 PREPROCESSING_PRIORITY = os.environ.get("QWEN3_TTS_PREPROCESSING_PRIORITY")
 SAMPLE_INTERVAL_S = 1.0
 TIMING_DUMP_INTERVAL_S = 5.0
+GIL_GAUGE_SLEEP_S = 0.001
 TIMED_REQUEST_BUILDER_FUNCTIONS = (
     "preprocess_qwen3_tts_payload",
     "prepare_qwen3_tts_request",
@@ -151,10 +152,40 @@ def time_cache_keys(module):
     keys_type.key_ids = timed("key_ids", keys_type.key_ids)
 
 
+def time_reference_service(module):
+    service_type = module.ReferenceEncodeService
+    service_type.get_or_encode = timed("get_or_encode", service_type.get_or_encode)
+
+
+def time_prompt_builder(module):
+    builder_type = module.Qwen3TTSPromptBuilderMixin
+    builder_type.build_voice_clone_inputs = timed(
+        "build_voice_clone_inputs", builder_type.build_voice_clone_inputs
+    )
+
+
+def gauge_gil():
+    """How long a thread waits for the GIL after a 1 ms sleep, kept per second as
+    'gil_wait' entries of (second start, mean wait ns, p90 wait ns)."""
+    sleep_ns = int(GIL_GAUGE_SLEEP_S * 1e9)
+    while True:
+        started = time.time()
+        waits = []
+        while time.time() - started < 1.0:
+            wall = time.perf_counter_ns()
+            time.sleep(GIL_GAUGE_SLEEP_S)
+            waits.append(time.perf_counter_ns() - wall - sleep_ns)
+        waits.sort()
+        timings["gil_wait"].append(
+            (started, sum(waits) // len(waits), waits[int(len(waits) * 0.9)])
+        )
+
+
 def patch_request_builders(module):
     if TIME_PREPROCESSING:
         for name in TIMED_REQUEST_BUILDER_FUNCTIONS:
             setattr(module, name, timed(name, getattr(module, name)))
+        threading.Thread(target=gauge_gil, name="gil-gauge", daemon=True).start()
     else:
         pass
     if PREPROCESSING_PRIORITY == "greatest":
@@ -236,6 +267,8 @@ else:
     pass
 if TIME_PREPROCESSING:
     PATCHES["sglang_omni.preprocessing.cache_key"] = time_cache_keys
+    PATCHES["sglang_omni.scheduling.reference_encoder"] = time_reference_service
+    PATCHES["sglang_omni.models.qwen3_tts.sglang_model"] = time_prompt_builder
 else:
     pass
 if PATCHES:

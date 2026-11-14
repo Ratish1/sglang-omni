@@ -900,6 +900,7 @@ def main() -> None:
             "other_model_eager",
             "events_c64_timed",
             "events_c64_priority",
+            "events_c64_gil",
         ],
     )
     parser.add_argument("--arms", nargs="*", default=list(ARMS))
@@ -992,6 +993,14 @@ def main() -> None:
             "main13",
             "pr",
             "events_c64_timed",
+            [("stream_c64", 64, None, True)],
+            server_env={"QWEN3_TTS_TIME_PREPROCESSING": "1"},
+        )
+    elif arguments.phase == "events_c64_gil":
+        run_event_pairs(
+            "main13",
+            "pr",
+            "events_c64_gil",
             [("stream_c64", 64, None, True)],
             server_env={"QWEN3_TTS_TIME_PREPROCESSING": "1"},
         )

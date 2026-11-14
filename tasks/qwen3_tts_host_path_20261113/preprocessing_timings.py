@@ -11,6 +11,9 @@ import json
 import statistics
 from pathlib import Path
 
+GIL_WAIT = "gil_wait"
+STEADY_REFERENCE = "preprocess_qwen3_tts_payload"
+
 
 def calls_by_step(probe: Path) -> dict[str, list[tuple[float, int, int]]]:
     merged: dict[str, list[tuple[float, int, int]]] = {}
@@ -51,6 +54,10 @@ def main() -> None:
             f"{'wall p90':>10s}{'cpu mean':>10s}"
         )
         for name in sorted(steps["base"]):
+            if name == GIL_WAIT:
+                continue
+            else:
+                pass
             for side in ("base", "head"):
                 if name not in steps[side]:
                     continue
@@ -62,6 +69,21 @@ def main() -> None:
                 print(
                     f"  {name:32s}{side:>6s}{count:7d}{mean:11.2f}{median:10.2f}{p90:10.2f}{cpu:10.2f}"
                 )
+        for side in ("base", "head"):
+            if GIL_WAIT not in steps[side]:
+                continue
+            else:
+                pass
+            calls = sorted(steps[side][STEADY_REFERENCE])[arguments.skip :]
+            first, last = calls[0][0], calls[-1][0]
+            seconds = [
+                entry for entry in steps[side][GIL_WAIT] if first <= entry[0] <= last
+            ]
+            print(
+                f"  gil wait after a 1 ms sleep, {side}: {len(seconds)} s, mean "
+                f"{statistics.fmean(entry[1] for entry in seconds) / 1e3:.0f} us, p90 "
+                f"{statistics.fmean(entry[2] for entry in seconds) / 1e3:.0f} us"
+            )
 
 
 if __name__ == "__main__":
