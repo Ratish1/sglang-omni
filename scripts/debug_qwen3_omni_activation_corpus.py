@@ -207,11 +207,7 @@ def main() -> None:
             )
         else:
             pass
-        if control in (
-            "rounded-routing",
-            "rounded-contributions",
-            "checkpoint-reduction",
-        ):
+        if control in ("rounded-routing", "rounded-contributions"):
             diagnostic_environment[
                 "SGLANG_OMNI_DIAGNOSTIC_CHECKPOINT_ROUTING_WEIGHTS"
             ] = "1"

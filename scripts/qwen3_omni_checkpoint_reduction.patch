@@ -55,7 +55,21 @@
        int64_t const k_offset = original_row * experts_per_token + k_idx;
        int64_t const expert_id = token_selected_experts[k_offset] - start_expert_id;
        if (expert_id < 0 || expert_id >= num_experts_per_node) {
-@@ -2027,7 +2059,16 @@
+@@ -2016,7 +2048,12 @@
+         continue;
+       }
+
+-      float const row_scale = (SCALE_MODE == ScaleMode::NO_SCALE) ? 1.f : scales[k_offset];
++      float row_scale = (SCALE_MODE == ScaleMode::NO_SCALE) ? 1.f : scales[k_offset];
++      if constexpr (std::is_same_v<OutputType, __nv_bfloat16> &&
++                    std::is_same_v<GemmOutputType, __nv_bfloat16> &&
++                    SCALE_MODE == ScaleMode::DEFAULT) {
++        row_scale = __bfloat162float(__float2bfloat16_rn(row_scale));
++      }
+
+       auto const* expanded_permuted_rows_row_ptr =
+           expanded_permuted_rows_v + expanded_permuted_row * num_elems_in_padded_col;
+@@ -2027,7 +2064,16 @@
          expert_result = expert_result + arrayConvert<BiasElem, ComputeElem>(bias_ptr[elem_index]);
        }
 
@@ -73,7 +87,7 @@
      }
 
      OutputElem output_elem = arrayConvert<ComputeElem, OutputElem>(thread_output);
-@@ -2107,7 +2148,16 @@
+@@ -2107,7 +2153,16 @@
 
        ComputeElem thread_output;
        thread_output.fill(0);
@@ -91,7 +105,21 @@
          int64_t const k_offset = source_row * experts_per_token + k_idx;
          int64_t const expert_id = token_selected_experts[k_offset] - start_expert_id;
          if (expert_id < 0 || expert_id >= num_experts_per_node) {
-@@ -2130,7 +2180,16 @@
+@@ -2119,7 +2174,12 @@
+         int64_t const expanded_permuted_row_from_k_idx =
+             unpermuted_row_to_permuted_row[source_row + k_idx * num_rows];
+
+-        float const row_scale = (SCALE_MODE == ScaleMode::NO_SCALE) ? 1.f : scales[k_offset];
++        float row_scale = (SCALE_MODE == ScaleMode::NO_SCALE) ? 1.f : scales[k_offset];
++        if constexpr (std::is_same_v<OutputType, __nv_bfloat16> &&
++                      std::is_same_v<GemmOutputType, __nv_bfloat16> &&
++                      SCALE_MODE == ScaleMode::DEFAULT) {
++          row_scale = __bfloat162float(__float2bfloat16_rn(row_scale));
++        }
+
+         auto const* expanded_permuted_rows_row_ptr =
+             expanded_permuted_rows_v + expanded_permuted_row_from_k_idx * num_elems_in_padded_col;
+@@ -2130,7 +2190,16 @@
            expert_result = expert_result + arrayConvert<BiasElem, ComputeElem>(bias_ptr[elem_index]);
          }
 
