@@ -19,6 +19,7 @@ BLOCKING_CALLS = (
     "stream synchronize",
     "device synchronize",
     "event synchronize",
+    "pageable host to device copy",
     "device to host read",
 )
 
@@ -41,6 +42,9 @@ def block_in(kind: str, stream: torch.cuda.Stream) -> None:
         event = torch.cuda.Event()
         event.record(stream)
         event.synchronize()
+    elif kind == "pageable host to device copy":
+        with torch.cuda.stream(stream):
+            torch.tensor([1, 2, 3], device=DEVICE)
     else:
         with torch.cuda.stream(stream):
             torch.ones(1, device=DEVICE).tolist()
