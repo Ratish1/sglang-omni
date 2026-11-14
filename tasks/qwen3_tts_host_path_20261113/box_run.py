@@ -985,6 +985,7 @@ def main() -> None:
             "events_c64_priority",
             "events_c64_gil",
             "gil_owners_c64",
+            "events_c64_encoder_priority",
         ],
     )
     parser.add_argument("--arms", nargs="*", default=list(ARMS))
@@ -1082,6 +1083,17 @@ def main() -> None:
         )
     elif arguments.phase == "gil_owners_c64":
         run_gil_owner_pairs("main13", "pr", "gil_owners_c64")
+    elif arguments.phase == "events_c64_encoder_priority":
+        run_event_pairs(
+            "main13",
+            "pr",
+            "events_c64_encoder_priority",
+            [("stream_c64", 64, None, True)],
+            server_env={
+                "QWEN3_TTS_TIME_PREPROCESSING": "1",
+                "QWEN3_TTS_PREPROCESSING_PRIORITY": "greatest_with_encoder",
+            },
+        )
     elif arguments.phase == "events_c64_gil":
         run_event_pairs(
             "main13",

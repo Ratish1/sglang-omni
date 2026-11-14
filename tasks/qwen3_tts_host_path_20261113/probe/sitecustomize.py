@@ -188,10 +188,30 @@ def patch_request_builders(module):
         threading.Thread(target=gauge_gil, name="gil-gauge", daemon=True).start()
     else:
         pass
-    if PREPROCESSING_PRIORITY == "greatest":
+    if PREPROCESSING_PRIORITY in ("greatest", "greatest_with_encoder"):
         raise_preprocessing_priority(module)
     else:
         pass
+    if PREPROCESSING_PRIORITY == "greatest_with_encoder":
+        raise_encoder_priority(module)
+    else:
+        pass
+
+
+def raise_encoder_priority(module):
+    """The reference encoder's stream at the device's greatest priority."""
+    import torch
+
+    def new_encode_stream_raised(device):
+        if not module.supports_device_streams(device):
+            return None
+        else:
+            pass
+        device_module = torch.get_device_module(device)
+        _, greatest = device_module.Stream.priority_range()
+        return device_module.Stream(device=device, priority=greatest)
+
+    module.new_encode_stream = new_encode_stream_raised
 
 
 def raise_preprocessing_priority(module):
@@ -261,7 +281,7 @@ if PROBE_DIRECTORY:
     PATCHES["sglang_omni.models.qwen3_tts.model_runner"] = count_replays
 else:
     pass
-if TIME_PREPROCESSING or PREPROCESSING_PRIORITY == "greatest":
+if TIME_PREPROCESSING or PREPROCESSING_PRIORITY is not None:
     PATCHES["sglang_omni.models.qwen3_tts.request_builders"] = patch_request_builders
 else:
     pass
