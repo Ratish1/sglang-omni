@@ -201,6 +201,24 @@ def main() -> None:
     except Exception as exc:
         print("cutedsl unavailable:", repr(exc))
         cute_layers = None
+    try:
+        from sglang_omni.models.qwen3_tts import predictor_persistent
+
+        packed_layers = [
+            predictor_persistent.pack_predictor_layer(
+                qkv_weight=layer.qkv, output_projection_weight=layer.o, gate_up_weight=layer.gate_up,
+                down_weight=layer.down, input_norm_weight=layer.input_norm, post_norm_weight=layer.post_norm,
+                query_norm_weight=layer.q_norm, key_norm_weight=layer.k_norm,
+            )
+            for layer in model.layers
+        ]
+        persistent_stack = predictor_persistent.stack_predictor_layers(packed_layers)
+        persistent_single = [predictor_persistent.stack_predictor_layers([each]) for each in packed_layers]
+        persistent_layers = predictor_persistent.PersistentPredictorLayers(device, cos_sin, EPS)
+        persistent_max_rows = predictor_persistent.MAX_ROWS
+    except ImportError as exc:
+        print("persistent layers unavailable:", repr(exc))
+        persistent_layers = None
     results = {"split_qkv": shape.split_qkv, "split_hidden": shape.split_hidden, "batches": {}}
     layer = model.layers[0]
     module = layer_modules[0]
@@ -357,6 +375,45 @@ def main() -> None:
 
             cell["substep cutedsl (5 layers, norm, lm_head, sampler)"] = time_call(cute_full)
             cell["cutedsl vs fp32 max abs"] = (cute_substep(k_work, v_work).float() - reference).abs().max().item()
+        else:
+            pass
+        if persistent_layers is not None and rows <= persistent_max_rows:
+            persistent_out = torch.empty(rows, HIDDEN, device=device, dtype=torch.bfloat16)
+            layer_buffers = [torch.empty_like(persistent_out), torch.empty_like(persistent_out)]
+
+            def persistent_substep(is_one_launch, k_store=k_cache, v_store=v_cache):
+                hidden_states = token.view(rows, HIDDEN)
+                if is_one_launch:
+                    persistent_layers.forward(
+                        persistent_stack, hidden_states, persistent_out, CACHED, k_store[:, :rows], v_store[:, :rows]
+                    )
+                    return final_norm(persistent_out)
+                for index in range(LAYERS):
+                    persistent_layers.forward(
+                        persistent_single[index], hidden_states, layer_buffers[index % 2], CACHED,
+                        k_store[index : index + 1, :rows], v_store[index : index + 1, :rows],
+                    )
+                    hidden_states = layer_buffers[index % 2]
+                return final_norm(hidden_states)
+
+            def persistent_full(is_one_launch):
+                hidden = persistent_substep(is_one_launch)
+                torch.mm(hidden, model.lm_head.t(), out=logits)
+                sample_codes_and_gather_codec_embedding(
+                    logits, temperatures, top_ks, top_ps, seeds, positions, max_top_k=TOP_K, has_top_p=False,
+                    codes=codes, embedding_weight=model.codec_table, gathered=gathered, accumulated=accumulated,
+                    projected_weight=model.projected_table, projected=projected,
+                )
+
+            cell["substep persistent one launch (5 layers, norm, lm_head, sampler)"] = time_call(
+                lambda: persistent_full(True)
+            )
+            cell["substep persistent per-layer launches (5 layers, norm, lm_head, sampler)"] = time_call(
+                lambda: persistent_full(False)
+            )
+            cell["persistent vs fp32 max abs"] = (
+                persistent_substep(True, k_cache.clone(), v_cache.clone()).float() - reference
+            ).abs().max().item()
         else:
             pass
         cell["floors us"] = {name: size / HBM_BYTES_PER_S * 1e6 for name, size in floors.items()}
