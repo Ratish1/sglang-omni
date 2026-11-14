@@ -219,6 +219,7 @@ def talker_stage(
     gpu: int,
     process: str,
     enable_partial_start: bool,
+    enable_talker_start_topology: bool,
 ) -> StageConfig:
     return EngineStageConfig(
         name="talker_ar",
@@ -231,6 +232,7 @@ def talker_stage(
         factory=FactoryArgs(
             enable_partial_start=enable_partial_start,
             partial_start_min_chunks=5,
+            enable_talker_start_topology=enable_talker_start_topology,
             # Note (wenyao): Match the default serial Code2Wav window so later
             # 10-row messages keep the captured 10/20/30/35-frame graph shapes.
             codec_coalesce_frames=10,
@@ -276,6 +278,7 @@ def speech_stages(
     talker_gpu: int,
     process_by_stage: dict[str, str],
     enable_partial_start: bool,
+    enable_talker_start_topology: bool,
 ) -> list[StageConfig]:
     return [
         preprocessing_stage(
@@ -302,6 +305,7 @@ def speech_stages(
             gpu=talker_gpu,
             process=process_by_stage["talker_ar"],
             enable_partial_start=enable_partial_start,
+            enable_talker_start_topology=enable_talker_start_topology,
         ),
         code2wav_stage(gpu=thinker_gpu, process=process_by_stage["code2wav"]),
     ]
@@ -453,6 +457,7 @@ class Qwen3OmniSpeechPipelineConfig(Qwen3OmniBasePipelineConfig):
             talker_gpu=1,
             process_by_stage=SPEECH_DEFAULT_PROCESSES,
             enable_partial_start=True,
+            enable_talker_start_topology=False,
         )
     )
 
@@ -520,7 +525,9 @@ class Qwen3OmniSpeechColocatedPipelineConfig(Qwen3OmniSpeechPipelineConfig):
             thinker_gpu=0,
             talker_gpu=0,
             process_by_stage=COLOCATED_SPEECH_PROCESSES,
-            enable_partial_start=False,
+            # note (ratish): a talker row without its next text sits out a step, so the talker starts at the prompt's one-chunk minimum.
+            enable_partial_start=True,
+            enable_talker_start_topology=True,
         )
     )
 
