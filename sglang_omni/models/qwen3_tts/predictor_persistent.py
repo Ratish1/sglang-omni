@@ -104,7 +104,9 @@ def pack_predictor_layer(
 def build_predictor_schedule(
     cta_count: int, rows: int, device: torch.device
 ) -> PredictorSchedule:
-    """Assign every tile to the CTA holding the fewest weight chunks so far, phase by phase."""
+    """Balance each phase on its own, since every phase waits for the last CTA of the one before:
+    a tile goes to the CTA with the least work in that phase, then the fewest weight chunks so far.
+    """
     phases = (
         (QKV_TILES, 1),
         (rows * KEY_VALUE_HEADS, 0),
@@ -115,11 +117,13 @@ def build_predictor_schedule(
     chunk_loads = [0] * cta_count
     items: list[list[int]] = [[] for _ in range(cta_count)]
     for phase, (tile_count, chunks_per_tile) in enumerate(phases):
+        phase_loads = [0] * cta_count
         for tile in range(tile_count):
-            if chunks_per_tile == 0:
-                cta = tile % cta_count
-            else:
-                cta = min(range(cta_count), key=chunk_loads.__getitem__)
+            cta = min(
+                range(cta_count),
+                key=lambda index: (phase_loads[index], chunk_loads[index]),
+            )
+            phase_loads[cta] += max(chunks_per_tile, 1)
             chunk_loads[cta] += chunks_per_tile
             items[cta].append((phase << SCHEDULE_TILE_BITS) | tile)
     width = max(len(cta_items) for cta_items in items)

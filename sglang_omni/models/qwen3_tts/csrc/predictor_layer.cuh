@@ -67,9 +67,11 @@ inline constexpr int kPartialFloats =
     kComputeWarps * kMaxTokenTiles * kTileFeatures * kTokenTileRows;
 inline constexpr int kPartialBuffers = 2;
 
+inline constexpr int kMaxScheduleItems = 32;
 inline constexpr int kSharedBytes = kRingStages * kChunkBytes + kOperandBytes +
                                     kPartialBuffers * kPartialFloats * 4 +
-                                    kMaxRows * 4 + 2 * kRingStages * 8;
+                                    kMaxRows * 4 + 2 * kRingStages * 8 +
+                                    kMaxScheduleItems * 2;
 
 // One attention item's shared memory, inside the operand buffer: the cached
 // keys and values in 272-byte rows so lanes reading different slots hit
@@ -794,12 +796,19 @@ __global__ __launch_bounds__(kThreads, 1) void predictor_layer_kernel(
   float *row_scales = partials + kPartialBuffers * kPartialFloats;
   uint64_t *full_barriers = reinterpret_cast<uint64_t *>(row_scales + kMaxRows);
   uint64_t *empty_barriers = full_barriers + kRingStages;
+  auto *schedule = reinterpret_cast<int16_t *>(empty_barriers + kRingStages);
 
   const int warp_index = threadIdx.x / 32;
   const int lane_index = threadIdx.x % 32;
-  const int16_t *schedule = params.schedule + static_cast<int64_t>(blockIdx.x) *
-                                                  params.schedule_width;
   const int schedule_length = params.schedule_lengths[blockIdx.x];
+  // The CTA's work list is read once into shared memory; a global read an
+  // item cost a round trip after every acquire's L1 invalidation.
+  if (threadIdx.x < schedule_length) {
+    schedule[threadIdx.x] =
+        params
+            .schedule[static_cast<int64_t>(blockIdx.x) * params.schedule_width +
+                      threadIdx.x];
+  }
 
   if (threadIdx.x == 0) {
     for (int stage = 0; stage < kRingStages; ++stage) {
@@ -1039,6 +1048,8 @@ template <bool kUsePDL> struct PredictorLayer {
                  "the caches hold fewer rows than the input");
     RuntimeCheck(position >= 0 && position < kCacheSlots,
                  "position must be a cache slot, got ", position);
+    RuntimeCheck(schedule_width.unwrap() <= kMaxScheduleItems,
+                 "a CTA's schedule holds at most 32 items");
 
     LayerParams params{};
     params.input = static_cast<const bf16_t *>(input.data_ptr());
