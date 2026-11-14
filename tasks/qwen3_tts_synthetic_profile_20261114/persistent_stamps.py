@@ -23,9 +23,9 @@ from sglang.kernels.jit.utils import load_jit, make_cpp_args
 from sglang_omni.models.qwen3_tts import predictor_persistent as persistent
 
 STAMP_CTAS = 160
-ENTRY, PRIMARY_WAITED, EXIT = 0, 1, 2
+ENTRY, EXIT = 0, 2
 PHASE_BASE, PHASE_POINTS = 4, 4
-REACHED, SIGNALED, WAITED, STAGED = 0, 1, 2, 3
+REACHED, STAGED = 0, 3
 LIST_LENGTH = 16
 ITEM_END = 24
 ITEM_MULTIPLIED = ITEM_END + LIST_LENGTH
@@ -109,21 +109,19 @@ def analyse_launch(stamps, item_phases, batch_tiles):
     row = {
         "sm clock GHz": rate,
         "span": max(at(cta, EXIT) for cta in range(ctas)),
-        "primary wait median": statistics.median(clock_between(cta)(ENTRY, PRIMARY_WAITED) for cta in range(ctas)),
     }
-    previous_last_signal = None
     for phase, name in enumerate(PHASES):
         members = [cta for cta in range(ctas) if phase in item_phases[cta]]
-        start_point = WAITED if phase > 0 else REACHED
-        released = [at(cta, phase_slot(phase, start_point)) for cta in members]
-        staging, work, signal_costs, chunk_waits = [], [], [], []
+        reached = [at(cta, phase_slot(phase, REACHED)) for cta in members]
+        staged = [at(cta, phase_slot(phase, STAGED)) for cta in members]
+        staging, work, chunk_waits = [], [], []
         parts = {}
         for cta in members:
             between = clock_between(cta)
             indices = [index for index, item_phase in enumerate(item_phases[cta]) if item_phase == phase]
             chunk = sum(CHUNKS_PER_TILE[item_phase] for item_phase in item_phases[cta][: indices[0]])
             groups = stamped_groups(phase, indices, batch_tiles)
-            staging.append(between(phase_slot(phase, start_point), phase_slot(phase, STAGED)))
+            staging.append(between(phase_slot(phase, REACHED), phase_slot(phase, STAGED)))
             work.append(between(phase_slot(phase, STAGED), ITEM_END + groups[-1][0]))
             item_start = phase_slot(phase, STAGED)
             for group in groups:
@@ -141,12 +139,13 @@ def analyse_launch(stamps, item_phases, batch_tiles):
                     "values and store": (ATTENTION_SCORED, ITEM_REDUCED + last),
                 }.items():
                     parts.setdefault(part, []).append(between(first, second))
-            if phase < len(PHASES) - 1:
-                signal_costs.append(between(ITEM_END + groups[-1][0], phase_slot(phase, SIGNALED)))
         prefix = f"{name} "
-        row[prefix + "released first"] = min(released)
-        if previous_last_signal is not None:
-            row[prefix + "handoff"] = min(released) - previous_last_signal
+        # Staging reads the previous phase's words until they are current, so it includes the
+        # wait for that phase's last producer.
+        row[prefix + "reached first"] = min(reached)
+        row[prefix + "reached last"] = max(reached)
+        row[prefix + "staged first"] = min(staged)
+        row[prefix + "staged last"] = max(staged)
         row[prefix + "staging median"] = statistics.median(staging)
         row[prefix + "items median"] = statistics.median(work)
         row[prefix + "items max"] = max(work)
@@ -154,12 +153,7 @@ def analyse_launch(stamps, item_phases, batch_tiles):
             row[prefix + f"item {part} median"] = statistics.median(values)
         if chunk_waits:
             row[prefix + "chunk wait median"] = statistics.median(chunk_waits)
-        if signal_costs:
-            row[prefix + "signal median"] = statistics.median(signal_costs)
-            previous_last_signal = max(at(cta, phase_slot(phase, SIGNALED)) for cta in members)
-            row[prefix + "last signal"] = previous_last_signal
-        else:
-            row[prefix + "last exit"] = max(at(cta, EXIT) for cta in members)
+    row["last exit"] = max(at(cta, EXIT) for cta in range(ctas))
     return row
 
 
