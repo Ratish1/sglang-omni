@@ -7,6 +7,8 @@ from pathlib import Path
 from typing import Literal
 
 import torch
+import triton
+import triton.language as tl
 from flashinfer.fused_moe import cutlass_fused_moe
 from flashinfer.fused_moe.core import ActivationType
 from pydantic import BaseModel
@@ -56,6 +58,35 @@ class ObservedExpertProfileMap(BaseModel):
     scope: str
 
 
+@triton.jit
+def native_expert_sum(
+    contributions: tl.tensor,
+    weights: tl.tensor,
+    output: tl.tensor,
+    HIDDEN_CHANNELS: tl.constexpr,
+    EXPERTS_PER_TOKEN: tl.constexpr,
+    BLOCK_CHANNELS: tl.constexpr,
+) -> None:
+    token_index = tl.program_id(0)
+    channels = tl.arange(0, BLOCK_CHANNELS)
+    accumulated = tl.full((BLOCK_CHANNELS,), 0.0, tl.float32)
+    for expert_index in range(EXPERTS_PER_TOKEN):
+        expert_output = tl.load(
+            contributions
+            + (token_index * EXPERTS_PER_TOKEN + expert_index) * HIDDEN_CHANNELS
+            + channels,
+            mask=channels < HIDDEN_CHANNELS,
+            other=0.0,
+        ).to(tl.float32)
+        scale = tl.load(weights + token_index * EXPERTS_PER_TOKEN + expert_index)
+        accumulated = tl.fma(scale, expert_output, accumulated)
+    tl.store(
+        output + token_index * HIDDEN_CHANNELS + channels,
+        accumulated,
+        mask=channels < HIDDEN_CHANNELS,
+    )
+
+
 def native_expert_contributions(
     hidden_states: torch.Tensor,
     indices: torch.Tensor,
@@ -102,8 +133,20 @@ def combine_expert_contributions(
     ],
 ) -> torch.Tensor:
     assert len(contributions) == indices.shape[1] == weights.shape[1]
-    assert torch.equal(weights, weights.bfloat16().float())
     selected = torch.stack(contributions, dim=1)
+    if semantics == "native" and not torch.equal(weights, weights.bfloat16().float()):
+        output = torch.empty_like(contributions[0])
+        native_expert_sum[(len(output),)](
+            selected,
+            weights,
+            output,
+            output.shape[1],
+            len(contributions),
+            triton.next_power_of_2(output.shape[1]),
+        )
+        return output
+    else:
+        pass
     if semantics == "checkpoint-reduction":
         order = indices.argsort(dim=1)
         selected = selected.gather(1, order[:, :, None].expand_as(selected))

@@ -226,6 +226,10 @@ def main() -> None:
                         frame,
                         layer_index,
                     )
+                    assert torch.equal(
+                        replayed[0].contiguous().view(torch.uint8),
+                        expected.contiguous().view(torch.uint8),
+                    ), (directory.name, frame, layer_index, "output bytes")
                     difference = compare_tensors(expected[start:stop], replayed[1])
                     exact_isolated_batches += difference.exact
                     comparisons += 1
@@ -241,12 +245,13 @@ def main() -> None:
                             runtime,
                             (profiles[0], profiles[1]),
                         )
-                        assert torch.equal(
-                            combine_expert_contributions(
-                                contributions, indices, weights, "native"
-                            ),
-                            expected,
+                        reconstructed = combine_expert_contributions(
+                            contributions, indices, weights, "native"
                         )
+                        assert torch.equal(
+                            reconstructed.contiguous().view(torch.uint8),
+                            expected.contiguous().view(torch.uint8),
+                        ), (directory.name, frame, layer_index, "decomposed bytes")
                         rounded_outputs.append(
                             combine_expert_contributions(
                                 contributions, indices, weights, "rounded-contributions"
