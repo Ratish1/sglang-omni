@@ -25,6 +25,7 @@ Same check, with Triton timed in the same run as a contention reference (129 to 
 | `2a28ee342` no prefetch | - / 98.2 / 95.5 | - / 107.7 / 105.7 | - / 119.6 / 118.9 | signals still 1.1 to 1.4 us beside ring refills; 0.61 us where none |
 | `9b6ef40cc` flagged-word handoff, no fences | - / 84.9 / 79.2 | - / 104.4 / 100.3 | - / 138.8 / 131.7 | numerics unchanged; flags double staged bytes |
 | `83b9060d8` 256 ns poll back-off | - / 84.4 / 84.4 | - / 102.5 / 99.7 | - / 135.4 / 130.9 | no gain: polling pressure is not the 16-row cost |
+| `94c7595fa` flagged up to 8 rows, counted above | 16.6 / 86.6 / 82.6 | - / 106.4 / 102.9 | - / 120.6 / 119.4 | each mode where it measured best; numerics unchanged |
 
 Codebook step (5 layers, final norm, lm_head, seeded sampler), `predictor_bench.py`, us:
 
@@ -34,6 +35,7 @@ Codebook step (5 layers, final norm, lm_head, seeded sampler), `predictor_bench.
 | CuTe DSL | 128.3 | 132.0 |
 | `2a28ee342` one launch / per-layer launches | 112.4 / 109.6 | 132.1 / 132.5 |
 | `9b6ef40cc` one launch / per-layer launches | 104.9 / 101.5 | 154.5 / 148.5 |
+| `94c7595fa` one launch / per-layer launches | 105.3 / 107.7 | 134.1 / 133.7 |
 
 Error of the step against fp32 at 1 row: persistent 0.162, Triton and CuTe 0.193.
 
