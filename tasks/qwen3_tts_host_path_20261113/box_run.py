@@ -645,13 +645,15 @@ def run_other_model_identity(
                 print(json.dumps({f"{root}/{arm}": future.result()}), flush=True)
     finally:
         stop_servers(servers)
-    reference = audio_digests(RUN_DIRECTORY / root / arms[0] / "stream")
+    digests = {
+        arm: audio_digests(RUN_DIRECTORY / root / arm / "stream") for arm in arms
+    }
     report = {
         arm: {
-            "files": len(audio_digests(RUN_DIRECTORY / root / arm / "stream")),
+            "files": len(digests[arm]),
             "equal_to_first": sum(
-                audio_digests(RUN_DIRECTORY / root / arm / "stream").get(name) == digest
-                for name, digest in reference.items()
+                digests[arm].get(name) == digest
+                for name, digest in digests[arms[0]].items()
             ),
         }
         for arm in arms
