@@ -38,6 +38,11 @@ REFERENCE_TEXT = " ".join(["the"] * 40)
 PREFILL_TEXT = " ".join(["the"] * 20)
 DECODE_TEXT = "the"
 LAUNCH_OPTIONS = {
+    "light": [
+        "--trace=cuda,nvtx",
+        "--cuda-graph-trace=graph",
+        f"--python-functions-trace={HERE / 'marks.json'}",
+    ],
     "timing": [
         "--trace=cuda,nvtx,osrt",
         "--cuda-graph-trace=graph",
@@ -54,6 +59,7 @@ LAUNCH_OPTIONS = {
     ],
 }
 START_OPTIONS = {
+    "light": ["--sample=none", "--cpuctxsw=none"],
     "timing": [
         "--sample=none",
         "--cpuctxsw=process-tree",
@@ -322,6 +328,7 @@ def main() -> None:
     parser.add_argument("--mode", choices=[*sorted(LAUNCH_OPTIONS), "none"], required=True)
     parser.add_argument("--port", type=int, default=24100)
     parser.add_argument("--batch-sizes", type=int, nargs="+", default=list(BATCH_SIZES))
+    parser.add_argument("--regimes", nargs="+", choices=["prefill", "decode"], default=["prefill", "decode"])
     args = parser.parse_args()
     args.out.mkdir(parents=True, exist_ok=True)
     references = References(args.out / "references")
@@ -334,25 +341,24 @@ def main() -> None:
         for batch_size in args.batch_sizes:
             run_prefill_cell(args.port, references, batch_size, None, f"warm_prefill_bs{batch_size}")
             run_decode_cell(args.port, references, batch_size, 64, None, f"warm_decode_bs{batch_size}")
+        sessions = [None] if args.mode == "none" else [None, session]
         for batch_size in args.batch_sizes:
-            results.append(
-                run_prefill_cell(args.port, references, batch_size, None, f"plain_prefill_bs{batch_size}")
-            )
-            results.append(
-                run_decode_cell(args.port, references, batch_size, DECODE_FRAMES, None, f"plain_decode_bs{batch_size}")
-            )
-            if args.mode == "none":
-                continue
-            else:
-                pass
-            results.append(
-                run_prefill_cell(args.port, references, batch_size, session, f"prefill_bs{batch_size}")
-            )
-            print(json.dumps(results[-1]["cell"]), flush=True)
-            results.append(
-                run_decode_cell(args.port, references, batch_size, DECODE_FRAMES, session, f"decode_bs{batch_size}")
-            )
-            print(json.dumps(results[-1]["cell"]), flush=True)
+            for cell_session in sessions:
+                prefix = "plain_" if cell_session is None else ""
+                if "prefill" in args.regimes:
+                    results.append(
+                        run_prefill_cell(args.port, references, batch_size, cell_session, f"{prefix}prefill_bs{batch_size}")
+                    )
+                    print(json.dumps(results[-1]["cell"]), flush=True)
+                else:
+                    pass
+                if "decode" in args.regimes:
+                    results.append(
+                        run_decode_cell(args.port, references, batch_size, DECODE_FRAMES, cell_session, f"{prefix}decode_bs{batch_size}")
+                    )
+                    print(json.dumps(results[-1]["cell"]), flush=True)
+                else:
+                    pass
     finally:
         (args.out / "cells.json").write_text(json.dumps(results, indent=1))
         if server.poll() is None:
