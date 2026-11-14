@@ -61,8 +61,15 @@ def main() -> None:
         "--attention-implementation", choices=("eager", "sdpa"), default="sdpa"
     )
     parser.add_argument("--gpu", type=int, required=True)
+    parser.add_argument(
+        "--cache-owners",
+        choices=("checkpoint", "native"),
+        nargs="+",
+        default=("checkpoint", "native"),
+    )
     parser.add_argument("--output-directory", type=Path, required=True)
     arguments = parser.parse_args()
+    assert len(arguments.cache_owners) == len(set(arguments.cache_owners))
     arguments.output_directory.mkdir(exist_ok=False)
     torch.cuda.set_device(arguments.gpu)
     configuration = Qwen3OmniMoeConfig.from_pretrained(
@@ -122,7 +129,11 @@ def main() -> None:
         )
         allowed[parameters.suppress_tokens] = False
         allowed_ids = torch.arange(len(allowed), device=reference.device)[allowed]
-        for cache_owner in ("checkpoint", "native"):
+        eos_column = (allowed_ids == configuration.codec_eos_token_id).nonzero(
+            as_tuple=True
+        )[0]
+        assert len(eos_column) == 1
+        for cache_owner in arguments.cache_owners:
             destination = arguments.output_directory / directory.name / cache_owner
             destination.mkdir(parents=True)
             cache = DynamicCache(config=configuration.text_config)
@@ -272,6 +283,22 @@ def main() -> None:
                     "frame": frame,
                     "position": int(positions[0, 0, -1]),
                     "main_code": chosen,
+                    "native_eos_pretruncation_probability": float(
+                        native_distribution[0, eos_column].exp()
+                    ),
+                    "reference_eos_pretruncation_probability": float(
+                        expected_distribution[0, eos_column].exp()
+                    ),
+                    "native_eos_rank": int(
+                        (native_distribution > native_distribution[0, eos_column]).sum()
+                    )
+                    + 1,
+                    "reference_eos_rank": int(
+                        (
+                            expected_distribution > expected_distribution[0, eos_column]
+                        ).sum()
+                    )
+                    + 1,
                     "maximum_absolute_logit_error": float(difference.abs().max()),
                     "relative_logit_error": float(
                         difference.norm() / expected[:, allowed].norm()
