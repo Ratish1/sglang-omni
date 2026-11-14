@@ -41,7 +41,9 @@ class NativeTalkerExperts:
         "bf16-reduction",
         "checkpoint-reduction",
     ] = "native"
-    native_output_arithmetic: Literal["native", "rounded-contributions"] = "native"
+    native_output_arithmetic: Literal[
+        "native", "rounded-contributions", "checkpoint-reduction"
+    ] = "native"
     enabled: bool = False
     calls: int = 0
     router_calls: int = 0
