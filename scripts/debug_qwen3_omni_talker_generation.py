@@ -79,6 +79,7 @@ def main() -> None:
     parser.add_argument("--native-expert-capture-directory", type=Path)
     parser.add_argument("--native-expert-profile-map", type=Path)
     parser.add_argument("--native-shared-expert", action="store_true")
+    parser.add_argument("--native-shared-gate-batches", action="store_true")
     parser.add_argument("--paired-native-expert-controls", action="store_true")
     parser.add_argument("--paired-native-attention-controls", action="store_true")
     parser.add_argument("--native-backbone-attention", action="store_true")
@@ -89,6 +90,18 @@ def main() -> None:
         "--paired-native-routing-controls",
         action="store_true",
         help="Separate native indices, weight normalization, both checkpoint-rounded weight paths, and an exact baseline repeat.",
+    )
+    parser.add_argument(
+        "--routing-controls",
+        choices=(
+            "reconstructed",
+            "indices",
+            "native",
+            "rounded",
+            "indices-rounded",
+            "reconstructed-repeat",
+        ),
+        nargs="+",
     )
     parser.add_argument(
         "--native-expert-route-precision",
@@ -118,6 +131,16 @@ def main() -> None:
     )
     parser.add_argument("--output-directory", type=Path, required=True)
     arguments = parser.parse_args()
+    if arguments.native_shared_gate_batches:
+        assert arguments.native_expert_profile_map is not None
+        assert arguments.native_shared_expert
+        assert not arguments.paired_native_expert_controls
+    else:
+        pass
+    if arguments.routing_controls is not None:
+        assert arguments.paired_native_routing_controls
+    else:
+        pass
     if arguments.decode_page_table_tokens is not None:
         assert arguments.native_backbone_attention
         assert arguments.decode_page_table_tokens > 0
@@ -220,6 +243,7 @@ def main() -> None:
             capture_directory=arguments.native_expert_capture_directory,
             route_precision=arguments.native_expert_route_precision,
             shared_enabled=arguments.native_shared_expert,
+            is_shared_gate_batch_replay_enabled=arguments.native_shared_gate_batches,
         )
         expert_control.install()
     else:
@@ -364,6 +388,10 @@ def main() -> None:
             if arguments.paired_native_routing_controls
             else ("reconstructed",)
         )
+        if arguments.routing_controls is not None:
+            routing_modes = tuple(arguments.routing_controls)
+        else:
+            pass
         for (
             trace_directory,
             sampling_order,
@@ -433,6 +461,9 @@ def main() -> None:
                     else routing_mode
                 )
                 expert_control.shared_calls = 0
+                expert_control.shared_gate_calls = 0
+                expert_control.shared_gate_exact_input_calls = 0
+                expert_control.shared_gate_snapshots.clear()
                 expert_control.used_profiles.clear()
                 expert_control.profiles = (
                     observed_profiles.profiles[str(trace_directory.resolve())]
@@ -936,6 +967,9 @@ def main() -> None:
                     if expert_control.shared_enabled
                     else 0
                 )
+                assert expert_control.shared_gate_calls == (
+                    expected_calls if arguments.native_shared_gate_batches else 0
+                )
             else:
                 pass
             if attention_control is not None:
@@ -1038,6 +1072,12 @@ def main() -> None:
                 ),
                 "native_expert_calls": expert_control.calls if expert_control else 0,
                 "native_shared_expert": arguments.native_shared_expert,
+                "native_shared_gate_batches": arguments.native_shared_gate_batches,
+                "native_shared_gate_exact_input_calls": (
+                    expert_control.shared_gate_exact_input_calls
+                    if expert_control
+                    else 0
+                ),
                 "native_shared_expert_calls": (
                     expert_control.shared_calls if expert_control else 0
                 ),

@@ -40,6 +40,10 @@ class NativeTalkerExperts:
     ] = "reconstructed"
     shared_enabled: bool = False
     shared_calls: int = 0
+    is_shared_gate_batch_replay_enabled: bool = False
+    shared_gate_calls: int = 0
+    shared_gate_exact_input_calls: int = 0
+    shared_gate_snapshots: list[dict[str, torch.Tensor]] = field(default_factory=list)
     profiles: ObservedExpertProfiles | None = None
     used_profiles: set[tuple[int, int]] = field(default_factory=set)
     runtime: NativeRuntime = field(init=False)
@@ -70,6 +74,14 @@ class NativeTalkerExperts:
                 )
             else:
                 pass
+            if self.is_shared_gate_batch_replay_enabled:
+                self.handles.append(
+                    layer.mlp.shared_expert_gate.register_forward_hook(
+                        partial(self.shared_gate, layer_index=layer_index)
+                    )
+                )
+            else:
+                pass
             self.handles.extend(
                 [
                     layer.mlp.gate.register_forward_hook(self.routing),
@@ -78,6 +90,44 @@ class NativeTalkerExperts:
                     ),
                 ]
             )
+
+    def shared_gate(
+        self,
+        module: torch.nn.Linear,
+        inputs: tuple[torch.Tensor],
+        output: torch.Tensor,
+        *,
+        layer_index: int,
+    ) -> torch.Tensor:
+        assert self.profiles is not None
+        layer_count = len(self.reference.model.layers)
+        assert layer_index == self.shared_gate_calls % layer_count
+        frame = self.shared_gate_calls // layer_count
+        if layer_index == 0:
+            self.shared_gate_snapshots = torch.load(
+                self.profiles.source_capture / f"{frame:04d}-operators.pt",
+                weights_only=True,
+            )
+        else:
+            pass
+        snapshot = self.shared_gate_snapshots[layer_index]
+        hidden_states = inputs[0].reshape(-1, inputs[0].shape[-1])
+        batch_hidden_states = snapshot["batch_mlp_normalized"].to(hidden_states.device)
+        if frame == 0:
+            start, stop = snapshot["prefix_token_rows"].tolist()
+        else:
+            start = int(snapshot["batch_selected_row"])
+            stop = start + 1
+        assert batch_hidden_states[start:stop].shape == hidden_states.shape
+        assert module.bias is None
+        assert batch_hidden_states.dtype == hidden_states.dtype == module.weight.dtype
+        self.shared_gate_exact_input_calls += torch.equal(
+            batch_hidden_states[start:stop], hidden_states
+        )
+        batch_hidden_states[start:stop] = hidden_states
+        gate = torch.nn.functional.linear(batch_hidden_states, module.weight)
+        self.shared_gate_calls += 1
+        return gate[start:stop].view_as(output)
 
     def shared_expert(
         self,
