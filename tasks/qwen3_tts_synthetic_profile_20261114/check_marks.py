@@ -1,11 +1,12 @@
-"""Resolve every function in marks.json against the tree on PYTHONPATH; exit 1 if any is missing."""
+"""Resolve every function in the mark lists against the tree on PYTHONPATH; exit 1 if any is missing."""
 
 import importlib
 import json
 import sys
 from pathlib import Path
 
-MARKS = Path(__file__).resolve().parent / "marks.json"
+HERE = Path(__file__).resolve().parent
+MARK_LISTS = (HERE / "marks.json", HERE / "marks_capture.json")
 
 
 def resolve(module_name: str, qualified_name: str) -> bool:
@@ -21,7 +22,7 @@ def resolve(module_name: str, qualified_name: str) -> bool:
 def main() -> int:
     missing = []
     total = 0
-    for entry in json.loads(MARKS.read_text()):
+    for entry in [entry for path in MARK_LISTS for entry in json.loads(path.read_text())]:
         for function in entry["functions"]:
             name = function if isinstance(function, str) else function["function"]
             total += 1

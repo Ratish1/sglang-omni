@@ -47,8 +47,7 @@ LAUNCH_OPTIONS = {
     "attribution": [
         "--trace=cuda,nvtx,osrt,python-gil",
         "--cuda-graph-trace=node:nvtx-precapture",
-        "--pytorch=functions-trace",
-        f"--python-functions-trace={HERE / 'marks.json'}",
+        "--pytorch=autograd-nvtx",
         "--cudabacktrace=sync:1000,memory:1000",
         "--python-backtrace=cuda",
         "--python-sampling=true",
@@ -208,6 +207,22 @@ def launch_server(tree: Path, mode: str, session: str, port: int, log: Path) -> 
     }
     if mode == "none":
         profiler = []
+    elif mode == "attribution":
+        # note (ratish): nsys takes one function list, and graph nodes take the names of the ranges open when they were captured.
+        merged = log.parent / "marks_attribution.json"
+        merged.write_text(
+            json.dumps(
+                json.loads((HERE / "marks.json").read_text())
+                + json.loads((HERE / "marks_capture.json").read_text())
+            )
+        )
+        profiler = [
+            "nsys",
+            "launch",
+            f"--session-new={session}",
+            *LAUNCH_OPTIONS[mode],
+            f"--python-functions-trace={merged}",
+        ]
     else:
         profiler = ["nsys", "launch", f"--session-new={session}", *LAUNCH_OPTIONS[mode]]
     command = [

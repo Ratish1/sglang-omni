@@ -93,13 +93,15 @@ def host_waits(db, strings, thread_names, rows):
     )
 
 
-def copies(db, thread_names, rows):
+def copies(db, thread_names, rows, window_start):
     kinds = {value: label for value, _, label in db.execute("select * from ENUM_CUDA_MEMCPY_OPER")}
     memory = {value: label for value, _, label in db.execute("select * from ENUM_CUDA_MEM_KIND")}
     callers = dict(db.execute("select correlationId, globalTid from CUPTI_ACTIVITY_KIND_RUNTIME"))
     groups = collections.defaultdict(lambda: [0, 0, 0])
     for start, end, size, kind, source, target, correlation in db.execute(
-        "select start, end, bytes, copyKind, srcKind, dstKind, correlationId from CUPTI_ACTIVITY_KIND_MEMCPY"
+        "select start, end, bytes, copyKind, srcKind, dstKind, correlationId from CUPTI_ACTIVITY_KIND_MEMCPY "
+        "where start >= ?",
+        (window_start,),
     ):
         thread = thread_names.get(callers.get(correlation), "graph or unknown")
         group = groups[(kinds.get(kind, kind), memory.get(source, source), memory.get(target, target), thread)]
@@ -117,13 +119,15 @@ def copies(db, thread_names, rows):
     )
 
 
-def graphs_and_kernels(db, strings, thread_names, rows):
+def graphs_and_kernels(db, strings, thread_names, rows, window_start):
     callers = dict(db.execute("select correlationId, globalTid from CUPTI_ACTIVITY_KIND_RUNTIME"))
     graph_groups = collections.defaultdict(list)
     intervals = []
     if table_exists(db, "CUPTI_ACTIVITY_KIND_GRAPH_TRACE"):
         for start, end, graph_id, stream, correlation in db.execute(
-            "select start, end, graphId, streamId, correlationId from CUPTI_ACTIVITY_KIND_GRAPH_TRACE"
+            "select start, end, graphId, streamId, correlationId from CUPTI_ACTIVITY_KIND_GRAPH_TRACE "
+            "where start >= ?",
+            (window_start,),
         ):
             thread = thread_names.get(callers.get(correlation), "?")
             graph_groups[(graph_id, stream, thread)].append(end - start)
@@ -141,7 +145,8 @@ def graphs_and_kernels(db, strings, thread_names, rows):
     )
     kernel_groups = collections.defaultdict(list)
     for start, end, stream, correlation, graph_node in db.execute(
-        "select start, end, streamId, correlationId, graphNodeId from CUPTI_ACTIVITY_KIND_KERNEL"
+        "select start, end, streamId, correlationId, graphNodeId from CUPTI_ACTIVITY_KIND_KERNEL where start >= ?",
+        (window_start,),
     ):
         origin = "graph node" if graph_node else "eager"
         thread = thread_names.get(callers.get(correlation), "graph" if graph_node else "?")
@@ -155,15 +160,12 @@ def graphs_and_kernels(db, strings, thread_names, rows):
             for (origin, stream, thread), d in sorted(kernel_groups.items(), key=lambda item: -sum(item[1]))[:rows]
         ],
     )
-    for start, end in db.execute("select start, end from CUPTI_ACTIVITY_KIND_MEMCPY"):
+    for start, end in db.execute("select start, end from CUPTI_ACTIVITY_KIND_MEMCPY where start >= ?", (window_start,)):
         intervals.append((start, end))
     return intervals
 
 
-def device_busy(db, intervals):
-    window_start, window_end = db.execute(
-        "select min(start), max(end) from CUPTI_ACTIVITY_KIND_RUNTIME"
-    ).fetchone()
+def device_busy(intervals, window_start, window_end):
     busy = 0
     gaps = []
     cursor = window_start
@@ -193,11 +195,15 @@ def main() -> None:
     db = sqlite3.connect(args.database)
     strings = dict(db.execute("select id, value from StringIds"))
     thread_names = {tid: strings.get(name_id, str(tid)) for name_id, tid in db.execute("select nameId, globalTid from ThreadNames")}
+    # note (ratish): the graph trace also holds replays stamped before the capture opened; the CUDA API calls bound the window.
+    window_start, window_end = db.execute(
+        "select min(start), max(end) from CUPTI_ACTIVITY_KIND_RUNTIME"
+    ).fetchone()
     nvtx_ranges(db, strings, thread_names, args.rows)
     host_waits(db, strings, thread_names, args.rows)
-    copies(db, thread_names, args.rows)
-    intervals = graphs_and_kernels(db, strings, thread_names, args.rows)
-    device_busy(db, intervals)
+    copies(db, thread_names, args.rows, window_start)
+    intervals = graphs_and_kernels(db, strings, thread_names, args.rows, window_start)
+    device_busy(intervals, window_start, window_end)
 
 
 if __name__ == "__main__":
