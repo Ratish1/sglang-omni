@@ -33,7 +33,8 @@ def reference_module(filename: str):
     directory = Path(__file__).parent / "reference"
     if "pr3553_reference" not in sys.modules:
         specification = importlib.util.spec_from_file_location(
-            "pr3553_reference", directory / "__init__.py",
+            "pr3553_reference",
+            directory / "__init__.py",
             submodule_search_locations=[str(directory)],
         )
         module = importlib.util.module_from_spec(specification)
@@ -123,7 +124,9 @@ def numerical() -> None:
     latent = torch.randn(16, 64, device="cuda", dtype=torch.bfloat16)
     chunk = AcousticChunk(runtime.model, conditioning, latent.cpu().float())
     nar = reference_module("nar.py")
-    cached_reference = nar.CachedNAR(reference, nar.Chunk(conditioning, latent.cpu().float()))
+    cached_reference = nar.CachedNAR(
+        reference, nar.Chunk(conditioning, latent.cpu().float())
+    )
     tokens = torch.tensor(
         [conditioning + [184621] + [184623] * 16 + [184622]], device="cuda"
     )
@@ -149,7 +152,10 @@ def numerical() -> None:
         }
         cached_expected = cached_reference.velocity(latent, raw_time)
         results[f"cached_nar_time_{raw_time}"] = {
-            "relative_rms": float((actual.float() - cached_expected.float()).square().mean().sqrt() / cached_expected.float().square().mean().sqrt()),
+            "relative_rms": float(
+                (actual.float() - cached_expected.float()).square().mean().sqrt()
+                / cached_expected.float().square().mean().sqrt()
+            ),
             "max_absolute_error": float((actual - cached_expected).abs().max()),
         }
         print(json.dumps(results, indent=2), flush=True)
@@ -186,7 +192,15 @@ def request_body(seed: int, cot: str = "off") -> dict:
     }
 
 
-def serving(priority: bool, policy: str, kv_cache_bytes: str | None = None, prefill_max_requests: int | None = None, natural_stop: bool = False, pressure: bool = False) -> None:
+def serving(
+    priority: bool,
+    policy: str,
+    kv_cache_bytes: str | None = None,
+    prefill_max_requests: int | None = None,
+    natural_stop: bool = False,
+    pressure: bool = False,
+    events: bool = False,
+) -> None:
     port = 18353
     arguments = [
         sys.executable,
@@ -211,13 +225,31 @@ def serving(priority: bool, policy: str, kv_cache_bytes: str | None = None, pref
     if kv_cache_bytes is not None:
         arguments += ["--yue2_ar.engine.kv_cache_bytes", kv_cache_bytes]
     if prefill_max_requests is not None:
-        arguments += ["--yue2_ar.engine.prefill_max_requests", str(prefill_max_requests)]
-    label = "priority" if priority else ("bytes" if kv_cache_bytes is not None else ("prefill" if prefill_max_requests is not None else policy))
+        arguments += [
+            "--yue2_ar.engine.prefill_max_requests",
+            str(prefill_max_requests),
+        ]
+    label = (
+        "priority"
+        if priority
+        else (
+            "bytes"
+            if kv_cache_bytes is not None
+            else ("prefill" if prefill_max_requests is not None else policy)
+        )
+    )
     if natural_stop:
         label = "natural-stop"
+    if events:
+        label = "events"
     if pressure:
         label = "pressure"
-        arguments += ["--yue2_ar.engine.max_total_tokens", "4096", "--yue2_ar.engine.max_running_requests", "16"]
+        arguments += [
+            "--yue2_ar.engine.max_total_tokens",
+            "4096",
+            "--yue2_ar.engine.max_running_requests",
+            "16",
+        ]
     log = (DIRECTORY / f"server-{label}.log").open("w")
     process = subprocess.Popen(
         arguments, stdout=log, stderr=subprocess.STDOUT, start_new_session=True
@@ -243,7 +275,11 @@ def serving(priority: bool, policy: str, kv_cache_bytes: str | None = None, pref
         def send(body: dict) -> dict:
             started = time.monotonic()
             try:
-                response = httpx.post(f"{base}/v1/audio/speech", json=body, timeout=600 if natural_stop or pressure else 30)
+                response = httpx.post(
+                    f"{base}/v1/audio/speech",
+                    json=body,
+                    timeout=600 if natural_stop or pressure else 30,
+                )
             except httpx.TimeoutException:
                 return {"status": "timeout", "seconds": time.monotonic() - started}
             result = {
@@ -263,6 +299,22 @@ def serving(priority: bool, policy: str, kv_cache_bytes: str | None = None, pref
                 result["body"] = response.text[:1500]
             return result
 
+        if events:
+            response = httpx.post(
+                f"{base}/start_request_profile",
+                json={
+                    "run_id": "pr3553-events",
+                    "event_dir": str(DIRECTORY / "events"),
+                },
+                timeout=30,
+            )
+            response.raise_for_status()
+            time.sleep(1)
+            results["full"] = send(request_body(72, "full"))
+            results["off"] = send(request_body(73, "off"))
+            response = httpx.post(f"{base}/stop_request_profile", json={}, timeout=30)
+            response.raise_for_status()
+            return
         if pressure:
             bodies = [request_body(seed) for seed in range(60, 66)]
             for body in bodies:
@@ -312,6 +364,17 @@ def serving(priority: bool, policy: str, kv_cache_bytes: str | None = None, pref
             process.wait(timeout=15)
         log.close()
         results["server_exit"] = process.returncode
+        if events:
+            intervals = {}
+            for path in (DIRECTORY / "events").glob("events_*.jsonl"):
+                for line in path.read_text().splitlines():
+                    event = json.loads(line)
+                    if event["event_name"] in {"model_path_start", "model_path_end"}:
+                        row = intervals.setdefault(
+                            event["request_id"], {"stage": event["stage"], "events": []}
+                        )
+                        row["events"].append(event["event_name"])
+            results["intervals"] = intervals
         (DIRECTORY / f"http-{label}.json").write_text(json.dumps(results, indent=2))
         print(json.dumps(results, indent=2), flush=True)
 
@@ -325,9 +388,18 @@ if __name__ == "__main__":
     parser.add_argument("--prefill-max-requests", type=int)
     parser.add_argument("--natural-stop", action="store_true")
     parser.add_argument("--pressure", action="store_true")
+    parser.add_argument("--events", action="store_true")
     options = parser.parse_args()
     DIRECTORY.mkdir(exist_ok=True, parents=True)
     if options.mode == "numerical":
         numerical()
     else:
-        serving(options.priority, options.policy, options.kv_cache_bytes, options.prefill_max_requests, options.natural_stop, options.pressure)
+        serving(
+            options.priority,
+            options.policy,
+            options.kv_cache_bytes,
+            options.prefill_max_requests,
+            options.natural_stop,
+            options.pressure,
+            options.events,
+        )
