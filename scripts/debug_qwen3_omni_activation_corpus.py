@@ -34,7 +34,9 @@ def main() -> None:
         choices=("identity", "checkpoint", "checkpoint-codes", "checkpoint-feedback"),
     )
     parser.add_argument(
-        "--control", action="append", choices=("original", "rounded-activation")
+        "--control",
+        action="append",
+        choices=("original", "rounded-activation", "rounded-routing"),
     )
     arguments = parser.parse_args()
     receiver_only = (
@@ -53,10 +55,10 @@ def main() -> None:
             "Whole-population receiver capture requires only the original control"
         )
     elif arguments.capture_request_id is not None and (
-        arguments.control != ["original"]
+        arguments.control not in (["original"], ["rounded-routing"])
         or arguments.reference_predictor_mode is not None
     ):
-        raise ValueError("Selected receiver capture requires only the original control")
+        raise ValueError("Selected receiver capture requires one native Talker control")
     else:
         pass
     arguments.output_directory.mkdir(exist_ok=False)
@@ -139,6 +141,12 @@ def main() -> None:
             }
         else:
             pass
+        if control == "rounded-routing":
+            diagnostic_environment[
+                "SGLANG_OMNI_DIAGNOSTIC_CHECKPOINT_ROUTING_WEIGHTS"
+            ] = "1"
+        else:
+            pass
         if capture_request_ids:
             diagnostic_environment["SGLANG_OMNI_DIAGNOSTIC_CONDITIONING_DIRECTORY"] = (
                 str(output / "conditioning")
@@ -186,7 +194,7 @@ def main() -> None:
                     "command": server_command,
                     "diagnostic_environment": diagnostic_environment,
                     "scope": (
-                        "Selected Talker receiver states from original traffic, without Thinker operand observers."
+                        "Native Talker control on original traffic, without Thinker operand observers."
                         if receiver_only
                         else "Native rounded SiLU in the first checkpoint-derived accept_hidden_layer Thinker blocks, including warmup and decode."
                     ),
