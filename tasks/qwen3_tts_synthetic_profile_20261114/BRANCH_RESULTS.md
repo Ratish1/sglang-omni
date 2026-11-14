@@ -9,6 +9,36 @@ Branch `dev/qwen3-tts-predictor-persistent-20261114`, measured on host-62 (H100)
 | `a6900d3de` zeroed staged vectors | `54784df1` | 18.8 / 107.5 / 139.1 | 20.0 / 111.9 / 145.2 | 22.9 / 125.9 / 146.5 | same as stage 1 | No stack, 125 registers. Faster than Triton at every row count. Misses 12 us a layer |
 | `1881c0af2` norms and rope in phase loads, raw residual | `ea038190` | not run: the lease ended | | | | |
 
+## H200 (node-radixark-16-0001), 11-14 and 11-15
+
+Same check, with Triton timed in the same run as a contention reference (129 to 131 us at 1 row when the card is ours alone). Runs whose Triton reference was 154 to 166 us overlapped another session's jobs and are not listed. From `c9e61be0e` on, "5 layers" is one launch over the stacked layers; "5 launches" runs the same kernel once a layer.
+
+| Head | 1 row: one layer / 5 layers / 5 launches | 8 rows | 16 rows | Read |
+|---|---|---|---|---|
+| `1881c0af2` | 17.79 / 99.1 | 19.38 / 107.3 | 22.33 / 120.8 | baseline on H200 |
+| `c9eede580` finer stamps | 17.80 / 99.1 | 19.41 / 107.4 | 22.34 / 120.9 | repeat run: same within 0.1 us |
+| `3f0cd624f` per-phase balance, schedule in shared memory | 16.70 / 97.9 | 18.13 / 105.0 | 20.93 / 117.5 | gate_up max 3.79 to 2.57 us |
+| `0f02a0203` attention value loop unrolled | 17.15 / 99.3 | 18.30 / 105.9 | 21.24 / 118.7 | attention compute 1.60 to 1.85 us: regression |
+| `1e8c34fca` phase tiles batched | 17.31 / 104.1 | 18.52 / 110.2 | 21.29 / 121.4 | gate_up items faster, every fixed cost slower: regression |
+| `42093246a` back to `3f0cd624f` plus attention stamps | 16.77 / 97.9 | 18.16 / 105.4 | 20.95 / 117.7 | |
+| `c9e61be0e` 5 layers one launch, next-layer L2 prefetch | 16.66 / 116.1 / 94.6 | 17.98 / 123.7 / 105.7 | 21.12 / 136.0 / 118.9 | MMA-phase signals 1.4 to 3.0 us under the prefetch traffic |
+| `2a28ee342` no prefetch | - / 98.2 / 95.5 | - / 107.7 / 105.7 | - / 119.6 / 118.9 | signals still 1.1 to 1.4 us beside ring refills; 0.61 us where none |
+| `9b6ef40cc` flagged-word handoff, no fences | - / 84.9 / 79.2 | - / 104.4 / 100.3 | - / 138.8 / 131.7 | numerics unchanged; flags double staged bytes |
+| `83b9060d8` 256 ns poll back-off | - / 84.4 / 84.4 | - / 102.5 / 99.7 | - / 135.4 / 130.9 | no gain: polling pressure is not the 16-row cost |
+
+Codebook step (5 layers, final norm, lm_head, seeded sampler), `predictor_bench.py`, us:
+
+| | 1 row | 16 rows |
+|---|---|---|
+| Triton | 147.0 | 155.2 |
+| CuTe DSL | 128.3 | 132.0 |
+| `2a28ee342` one launch / per-layer launches | 112.4 / 109.6 | 132.1 / 132.5 |
+| `9b6ef40cc` one launch / per-layer launches | 104.9 / 101.5 | 154.5 / 148.5 |
+
+Error of the step against fp32 at 1 row: persistent 0.162, Triton and CuTe 0.193.
+
+Primitive latencies on this H200 (`latency_probe.py`, cycles): chained MMA 24, independent MMA 7, chained ldmatrix 34, L2 round trip 288, store and gpu fence 415, 256-thread barrier 27, clock64 and globaltimer reads 24 each.
+
 ## Stamp timeline, 1 row, L2-warm (us from the first CTA entry)
 
 | Point | stage 1 | `a6900d3de` |
