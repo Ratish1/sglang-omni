@@ -2,10 +2,11 @@
 
 Builds the layer with QWEN3_TTS_PREDICTOR_STAMPS and launches layer 0 alone at 1 and 16 rows,
 L2-warm (the same layer again) and HBM-cold (after a 256 MB write), each launch after a full
-synchronize. Every CTA's global timer and SM clock at the stamp points give, per phase: when its
-consumers were released, the operand staging, the items, the counter signal, the weight-chunk
-waits, and the handoff from the last producer's signal to the first consumer's release. Medians
-over launches. Run with PYTHONPATH on the tree that holds predictor_persistent.py.
+synchronize. Phase points carry the global timer and the SM clock; item and chunk points carry the
+SM clock only. Per phase: when its consumers were released, the operand staging, the items, the
+counter signal, the handoff from the last producer's signal to the first consumer's release, and
+each item split into its parts. Medians over launches. Run with PYTHONPATH on the tree that holds
+predictor_persistent.py.
 
 Usage: python3 persistent_stamps.py --out <json>
 """
@@ -26,11 +27,14 @@ PHASE_BASE, PHASE_POINTS = 4, 4
 REACHED, SIGNALED, WAITED, STAGED = 0, 1, 2, 3
 LIST_LENGTH = 16
 ITEM_END = 24
-CHUNK_WAIT = ITEM_END + LIST_LENGTH
+ITEM_MULTIPLIED = ITEM_END + LIST_LENGTH
+ITEM_REDUCED = ITEM_MULTIPLIED + LIST_LENGTH
+CHUNK_WAIT = ITEM_REDUCED + LIST_LENGTH
 CHUNK_READY = CHUNK_WAIT + LIST_LENGTH
 CHUNK_ISSUE = CHUNK_READY + LIST_LENGTH
 SLOTS_PER_CTA = CHUNK_ISSUE + LIST_LENGTH
 PHASES = ("qkv", "attention", "o_proj", "gate_up", "down")
+ATTENTION = 1
 CHUNKS_PER_TILE = (1, 0, 2, 1, 3)
 WARMUP_LAUNCHES = 5
 LAUNCHES = 30
@@ -61,6 +65,22 @@ def cta_items(schedule, cta_count):
     return [[item >> 12 for item in items[cta][: lengths[cta]]] for cta in range(cta_count)]
 
 
+def item_parts(phase, index, first_chunk, item_start, between):
+    """An item's parts in us, by the SM clock of its CTA."""
+    if phase == ATTENTION:
+        return {
+            "load": between(item_start, ITEM_MULTIPLIED + index),
+            "compute": between(ITEM_MULTIPLIED + index, ITEM_REDUCED + index),
+            "end barrier": between(ITEM_REDUCED + index, ITEM_END + index),
+        }
+    return {
+        "to first chunk": between(item_start, CHUNK_READY + first_chunk),
+        "warp 0 mma": between(CHUNK_READY + first_chunk, ITEM_MULTIPLIED + index),
+        "other warps": between(ITEM_MULTIPLIED + index, ITEM_REDUCED + index),
+        "epilogue": between(ITEM_REDUCED + index, ITEM_END + index),
+    }
+
+
 def analyse_launch(stamps, item_phases):
     """Named intervals of one launch in microseconds; times are from the earliest CTA entry."""
     timer = stamps[..., 0].double()
@@ -74,60 +94,54 @@ def analyse_launch(stamps, item_phases):
     def at(cta, slot):
         return (timer[cta, slot].item() - t0) / 1000
 
-    def between(cta, first, second):
-        return (clock[cta, second] - clock[cta, first]).item() / rate / 1000
+    def clock_between(cta):
+        return lambda first, second: (clock[cta, second] - clock[cta, first]).item() / rate / 1000
 
-    distinct = sorted(set(timer[:ctas][timer[:ctas] > 0].tolist()))
-    steps = [b - a for a, b in zip(distinct, distinct[1:]) if b > a]
     row = {
-        "timer resolution ns": min(steps) if steps else 0.0,
         "sm clock GHz": rate,
         "span": max(at(cta, EXIT) for cta in range(ctas)),
-        "entry skew": max(at(cta, ENTRY) for cta in range(ctas)),
-        "primary wait median": statistics.median(between(cta, ENTRY, PRIMARY_WAITED) for cta in range(ctas)),
+        "primary wait median": statistics.median(clock_between(cta)(ENTRY, PRIMARY_WAITED) for cta in range(ctas)),
     }
     previous_last_signal = None
     for phase, name in enumerate(PHASES):
         members = [cta for cta in range(ctas) if phase in item_phases[cta]]
         start_point = WAITED if phase > 0 else REACHED
         released = [at(cta, phase_slot(phase, start_point)) for cta in members]
-        staging = [between(cta, phase_slot(phase, start_point), phase_slot(phase, STAGED)) for cta in members]
-        work, chunk_waits, signal_costs = [], [], []
+        staging, work, signal_costs, chunk_waits = [], [], [], []
+        parts = {}
         for cta in members:
+            between = clock_between(cta)
             indices = [index for index, item_phase in enumerate(item_phases[cta]) if item_phase == phase]
-            last = indices[-1]
-            work.append(between(cta, phase_slot(phase, STAGED), ITEM_END + last))
-            chunk_base = sum(CHUNKS_PER_TILE[item_phase] for item_phase in item_phases[cta][: indices[0]])
-            for chunk in range(chunk_base, chunk_base + CHUNKS_PER_TILE[phase] * len(indices)):
-                chunk_waits.append(between(cta, CHUNK_WAIT + chunk, CHUNK_READY + chunk))
+            chunk = sum(CHUNKS_PER_TILE[item_phase] for item_phase in item_phases[cta][: indices[0]])
+            staging.append(between(phase_slot(phase, start_point), phase_slot(phase, STAGED)))
+            work.append(between(phase_slot(phase, STAGED), ITEM_END + indices[-1]))
+            item_start = phase_slot(phase, STAGED)
+            for index in indices:
+                for part, value in item_parts(phase, index, chunk, item_start, between).items():
+                    parts.setdefault(part, []).append(value)
+                for offset in range(CHUNKS_PER_TILE[phase]):
+                    chunk_waits.append(between(CHUNK_WAIT + chunk + offset, CHUNK_READY + chunk + offset))
+                chunk += CHUNKS_PER_TILE[phase]
+                item_start = ITEM_END + index
             if phase < len(PHASES) - 1:
-                signal_costs.append(between(cta, ITEM_END + last, phase_slot(phase, SIGNALED)))
+                signal_costs.append(between(ITEM_END + indices[-1], phase_slot(phase, SIGNALED)))
         prefix = f"{name} "
         row[prefix + "released first"] = min(released)
-        row[prefix + "released last"] = max(released)
         if previous_last_signal is not None:
             row[prefix + "handoff"] = min(released) - previous_last_signal
         row[prefix + "staging median"] = statistics.median(staging)
-        row[prefix + "staging max"] = max(staging)
         row[prefix + "items median"] = statistics.median(work)
         row[prefix + "items max"] = max(work)
+        for part, values in parts.items():
+            row[prefix + f"item {part} median"] = statistics.median(values)
         if chunk_waits:
             row[prefix + "chunk wait median"] = statistics.median(chunk_waits)
-            row[prefix + "chunk wait max"] = max(chunk_waits)
         if signal_costs:
             row[prefix + "signal median"] = statistics.median(signal_costs)
-            signals = [at(cta, phase_slot(phase, SIGNALED)) for cta in members]
-            row[prefix + "last signal"] = max(signals)
-            previous_last_signal = max(signals)
+            previous_last_signal = max(at(cta, phase_slot(phase, SIGNALED)) for cta in members)
+            row[prefix + "last signal"] = previous_last_signal
         else:
             row[prefix + "last exit"] = max(at(cta, EXIT) for cta in members)
-    first_issue = [between(cta, ENTRY, CHUNK_ISSUE) for cta in range(ctas)]
-    first_ready = [
-        (clock[cta, CHUNK_READY] - clock[cta, CHUNK_ISSUE]).item() / rate / 1000 for cta in range(ctas)
-    ]
-    row["first chunk issue median"] = statistics.median(first_issue)
-    row["first chunk issue to ready median"] = statistics.median(first_ready)
-    row["first chunk issue to ready max"] = max(first_ready)
     return row
 
 
