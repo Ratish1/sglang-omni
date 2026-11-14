@@ -77,7 +77,11 @@ def single_token_words(model_path: str) -> list[str]:
             and 3 <= len(token) <= 8
         ):
             word = token[1:]
-            if len(tokenizer.encode(f" {word}", add_special_tokens=False)) == 1:
+            # note (ratish): the prompt's first word has no leading space, so both forms must be one token.
+            if all(
+                len(tokenizer.encode(form, add_special_tokens=False)) == 1
+                for form in (f" {word}", word)
+            ):
                 words.append(word)
             else:
                 pass
