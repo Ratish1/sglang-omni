@@ -1,18 +1,21 @@
 """Per-call wall and thread CPU time of each probed preprocessing step, base against head, per order.
 
-Reads <root>/order<k>/<side>/probe/timings_*.json written by the boot probe; the first calls of each
-step (warmup and the opening burst) are dropped.
+Reads <root>/order<k>/<side>/probe/timings_*.json written by the boot probe. With --cell, only calls
+inside that cell's admission window (from its request events) count. The first calls of each step
+(warmup and the opening burst) are dropped.
 
-usage: python3 preprocessing_timings.py --root /data/.../events_c64_timed
+usage: python3 preprocessing_timings.py --root /data/.../events_c64_timed [--cell stream_c64]
 """
 
 import argparse
+import glob
 import json
 import statistics
 from pathlib import Path
 
 GIL_WAIT = "gil_wait"
 STEADY_REFERENCE = "preprocess_qwen3_tts_payload"
+ADMISSION = "request_admission"
 
 
 def calls_by_step(probe: Path) -> dict[str, list[tuple[float, int, int]]]:
@@ -21,6 +24,28 @@ def calls_by_step(probe: Path) -> dict[str, list[tuple[float, int, int]]]:
         for name, calls in json.loads(path.read_text()).items():
             merged.setdefault(name, []).extend(tuple(call) for call in calls)
     return merged
+
+
+def admission_window(cell_directory: Path) -> tuple[float, float]:
+    stamps = []
+    for path in glob.glob(str(cell_directory / "events" / "*.jsonl")):
+        with open(path) as source:
+            for line in source:
+                record = json.loads(line)
+                if record.get("event_name") == ADMISSION:
+                    stamps.append(record["timestamp_ns"] / 1e9)
+                else:
+                    pass
+    return min(stamps), max(stamps) + 1.0
+
+
+def in_window(
+    calls: list[tuple[float, int, int]], window: tuple[float, float] | None
+) -> list[tuple[float, int, int]]:
+    if window is None:
+        return calls
+    else:
+        return [call for call in calls if window[0] <= call[0] <= window[1]]
 
 
 def summary(
@@ -41,11 +66,25 @@ def summary(
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--root", required=True)
+    parser.add_argument("--cell", default=None)
     parser.add_argument("--skip", type=int, default=65)
     arguments = parser.parse_args()
     for order_directory in sorted(Path(arguments.root).glob("order*")):
+        windows = {
+            side: (
+                None
+                if arguments.cell is None
+                else admission_window(order_directory / side / arguments.cell)
+            )
+            for side in ("base", "head")
+        }
         steps = {
-            side: calls_by_step(order_directory / side / "probe")
+            side: {
+                name: in_window(calls, windows[side])
+                for name, calls in calls_by_step(
+                    order_directory / side / "probe"
+                ).items()
+            }
             for side in ("base", "head")
         }
         print(order_directory.name)
@@ -59,7 +98,7 @@ def main() -> None:
             else:
                 pass
             for side in ("base", "head"):
-                if name not in steps[side]:
+                if not steps[side].get(name):
                     continue
                 else:
                     pass
@@ -70,7 +109,7 @@ def main() -> None:
                     f"  {name:32s}{side:>6s}{count:7d}{mean:11.2f}{median:10.2f}{p90:10.2f}{cpu:10.2f}"
                 )
         for side in ("base", "head"):
-            if GIL_WAIT not in steps[side]:
+            if not steps[side].get(GIL_WAIT):
                 continue
             else:
                 pass

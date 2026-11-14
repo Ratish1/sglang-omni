@@ -27,7 +27,7 @@ EVENT_BUFFER_CAPACITY = 2_000_000
 QUIET_S = 15
 # Same Poisson arrival schedule for both arms of a fixed-rate cell.
 ARRIVAL_SEED = 7
-REQUEST_RATE_BY_CELL = {"stream_rate55": 55.0}
+REQUEST_RATE_BY_CELL = {"stream_rate55": 55.0, "stream_rate45": 45.0}
 ARMS = {
     "main": "df7bc688cd75e882ee47fd005d93777dec6cfcc0",
     "a1": "46d17389ae67dad11154830bfc65f2148a655e7d",
@@ -420,24 +420,38 @@ def run_event_pairs(
                             "event_buffer_capacity": EVENT_BUFFER_CAPACITY,
                         },
                     )
-                with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
-                    futures = {
-                        side: executor.submit(
-                            benchmark,
-                            arm,
-                            port,
-                            directory / side / cell,
-                            concurrency,
-                            samples,
-                            stream,
-                            None,
-                            1,
-                        )
-                        for side, (arm, port, _) in ports.items()
-                    }
-                    for side, future in futures.items():
-                        key = f"{root}/order{order}/{side}/{cell}"
-                        print(json.dumps({key: future.result()}), flush=True)
+                with (directory / f"{cell}_dmon.txt").open("w") as dmon_log:
+                    dmon = subprocess.Popen(
+                        ["nvidia-smi", "dmon", "-s", "u", "-d", "1", "-o", "T"],
+                        stdout=dmon_log,
+                        stderr=subprocess.STDOUT,
+                        start_new_session=True,
+                    )
+                try:
+                    with concurrent.futures.ThreadPoolExecutor(
+                        max_workers=2
+                    ) as executor:
+                        futures = {
+                            side: executor.submit(
+                                benchmark,
+                                arm,
+                                port,
+                                directory / side / cell,
+                                concurrency,
+                                samples,
+                                stream,
+                                None,
+                                1,
+                                REQUEST_RATE_BY_CELL.get(cell),
+                            )
+                            for side, (arm, port, _) in ports.items()
+                        }
+                        for side, future in futures.items():
+                            key = f"{root}/order{order}/{side}/{cell}"
+                            print(json.dumps({key: future.result()}), flush=True)
+                finally:
+                    os.killpg(dmon.pid, signal.SIGTERM)
+                    dmon.wait(timeout=15)
                 for arm, port, _ in ports.values():
                     post_json(port, "/stop_request_profile", {})
                 time.sleep(QUIET_S)
@@ -986,6 +1000,7 @@ def main() -> None:
             "events_c64_gil",
             "gil_owners_c64",
             "events_c64_encoder_priority",
+            "events_rate45",
         ],
     )
     parser.add_argument("--arms", nargs="*", default=list(ARMS))
@@ -1083,6 +1098,14 @@ def main() -> None:
         )
     elif arguments.phase == "gil_owners_c64":
         run_gil_owner_pairs("main13", "pr", "gil_owners_c64")
+    elif arguments.phase == "events_rate45":
+        run_event_pairs(
+            "main13",
+            "pr",
+            "events_rate45",
+            [("stream_rate45", 128, None, True), ("stream_c64", 64, None, True)],
+            server_env={"QWEN3_TTS_TIME_PREPROCESSING": "1"},
+        )
     elif arguments.phase == "events_c64_encoder_priority":
         run_event_pairs(
             "main13",
