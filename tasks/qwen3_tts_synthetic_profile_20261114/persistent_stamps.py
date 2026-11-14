@@ -66,7 +66,7 @@ def cta_items(schedule, cta_count):
 
 
 def item_parts(phase, index, first_chunk, item_start, between):
-    """An item's parts in us, by the SM clock of its CTA."""
+    """An item's (attention) or a batch's (MMA phases) parts in us, by the SM clock of its CTA."""
     if phase == ATTENTION:
         return {
             "load": between(item_start, ITEM_MULTIPLIED + index),
@@ -81,7 +81,13 @@ def item_parts(phase, index, first_chunk, item_start, between):
     }
 
 
-def analyse_launch(stamps, item_phases):
+def stamped_groups(phase, indices, batch_tiles):
+    """The item groups that carry stamps: one attention item, or one batch of an MMA phase's tiles."""
+    size = 1 if phase == ATTENTION else batch_tiles
+    return [indices[start : start + size] for start in range(0, len(indices), size)]
+
+
+def analyse_launch(stamps, item_phases, batch_tiles):
     """Named intervals of one launch in microseconds; times are from the earliest CTA entry."""
     timer = stamps[..., 0].double()
     clock = stamps[..., 1].double()
@@ -113,18 +119,19 @@ def analyse_launch(stamps, item_phases):
             between = clock_between(cta)
             indices = [index for index, item_phase in enumerate(item_phases[cta]) if item_phase == phase]
             chunk = sum(CHUNKS_PER_TILE[item_phase] for item_phase in item_phases[cta][: indices[0]])
+            groups = stamped_groups(phase, indices, batch_tiles)
             staging.append(between(phase_slot(phase, start_point), phase_slot(phase, STAGED)))
-            work.append(between(phase_slot(phase, STAGED), ITEM_END + indices[-1]))
+            work.append(between(phase_slot(phase, STAGED), ITEM_END + groups[-1][0]))
             item_start = phase_slot(phase, STAGED)
-            for index in indices:
-                for part, value in item_parts(phase, index, chunk, item_start, between).items():
+            for group in groups:
+                for part, value in item_parts(phase, group[0], chunk, item_start, between).items():
                     parts.setdefault(part, []).append(value)
-                for offset in range(CHUNKS_PER_TILE[phase]):
+                for offset in range(CHUNKS_PER_TILE[phase] * len(group)):
                     chunk_waits.append(between(CHUNK_WAIT + chunk + offset, CHUNK_READY + chunk + offset))
-                chunk += CHUNKS_PER_TILE[phase]
-                item_start = ITEM_END + index
+                chunk += CHUNKS_PER_TILE[phase] * len(group)
+                item_start = ITEM_END + group[0]
             if phase < len(PHASES) - 1:
-                signal_costs.append(between(ITEM_END + indices[-1], phase_slot(phase, SIGNALED)))
+                signal_costs.append(between(ITEM_END + groups[-1][0], phase_slot(phase, SIGNALED)))
         prefix = f"{name} "
         row[prefix + "released first"] = min(released)
         if previous_last_signal is not None:
@@ -152,6 +159,7 @@ def median_rows(rows):
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--out", required=True)
+    parser.add_argument("--batch-tiles", type=int, default=3, help="1 for heads that stamp every tile")
     args = parser.parse_args()
     device = torch.device("cuda")
     torch.manual_seed(0)
@@ -194,7 +202,7 @@ def main() -> None:
                 torch.cuda.synchronize()
                 stamped_module.read_stamps(host_stamps)
                 if index >= WARMUP_LAUNCHES:
-                    launch_rows.append(analyse_launch(host_stamps, item_phases))
+                    launch_rows.append(analyse_launch(host_stamps, item_phases, args.batch_tiles))
             cell[condition] = median_rows(launch_rows)
         results[rows] = cell
         print(json.dumps({rows: cell}, indent=1), flush=True)
