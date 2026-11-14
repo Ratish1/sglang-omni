@@ -523,7 +523,9 @@ def run_cache_history(arm: str, root: str) -> None:
     print(json.dumps({"cache_history": report}), flush=True)
 
 
-def run_other_model_identity(arms: list[str], root: str) -> None:
+def run_other_model_identity(
+    arms: list[str], root: str, extra_args: tuple[str, ...] = ()
+) -> None:
     """Seeded c1 stream over the full corpus on S2-Pro; each arm boots after the previous is
     healthy, so both read one warm inductor cache."""
     servers = []
@@ -536,7 +538,7 @@ def run_other_model_identity(arms: list[str], root: str) -> None:
                 RUN_DIRECTORY / root / arm / "serve.log",
                 model=S2PRO_MODEL,
                 stages=S2PRO_STAGES,
-                extra_args=tuple(S2PRO_CONFIG),
+                extra_args=(*S2PRO_CONFIG, *extra_args),
             )
             servers.append(server)
             ports[arm] = port
@@ -895,6 +897,7 @@ def main() -> None:
             "abort_rows",
             "cache_history",
             "other_model",
+            "other_model_eager",
             "events_c64_timed",
             "events_c64_priority",
         ],
@@ -978,6 +981,12 @@ def main() -> None:
         run_cache_history("main13", "cache_history")
     elif arguments.phase == "other_model":
         run_other_model_identity(["main13", "pr"], "other_model")
+    elif arguments.phase == "other_model_eager":
+        run_other_model_identity(
+            ["main13", "pr"],
+            "other_model_eager",
+            ("--tts_engine.engine.enable_torch_compile", "false"),
+        )
     elif arguments.phase == "events_c64_timed":
         run_event_pairs(
             "main13",
