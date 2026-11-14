@@ -52,6 +52,8 @@ def main() -> None:
                 logits = layer["batch_router_logits"].to(device)
                 observed_indices = layer["batch_expert_indices"].to(device)
                 observed_weights = layer["batch_expert_weights"].to(device)
+                assert logits.dtype == torch.bfloat16
+                assert observed_weights.dtype == torch.float32
                 native_weights, native_indices = moe_fused_gate(
                     logits,
                     None,
@@ -82,6 +84,8 @@ def main() -> None:
                 layer_batches += 1
                 graph_layer_batches += int(layer["batch_is_graph"])
                 prefill_layer_batches += int(layer["layout_is_prefill"])
+        assert graph_layer_batches > 0 and prefill_layer_batches > 0
+        assert changed_native_weights > 0
         record = {
             "request_id": directory.name,
             "frames": len(snapshots),
