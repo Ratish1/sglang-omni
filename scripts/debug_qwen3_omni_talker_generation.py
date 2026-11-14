@@ -86,7 +86,9 @@ def main() -> None:
     parser.add_argument("--audit-loaded-weights", action="store_true")
     parser.add_argument("--native-predictor-capture-directory", type=Path)
     parser.add_argument("--checkpoint-residual-predictor", action="store_true")
-    parser.add_argument("--restore-prefill-state", choices=("query", "cache", "both"))
+    parser.add_argument(
+        "--restore-prefill-state", choices=("query", "keys", "values", "cache", "both")
+    )
     parser.add_argument(
         "--predictor-attention-implementation",
         choices=("checkpoint", "native"),
@@ -933,7 +935,12 @@ def main() -> None:
                     captured_prefill = torch.load(native_files[0], weights_only=True)
                     assert int(before["extend_prefix_length"]) == 0
                     assert isinstance(output.past_key_values, DynamicCache)
-                    if arguments.restore_prefill_state in ("cache", "both"):
+                    if arguments.restore_prefill_state in (
+                        "keys",
+                        "values",
+                        "cache",
+                        "both",
+                    ):
                         assert (
                             len(output.past_key_values.layers)
                             == len(captured_prefill["keys"])
@@ -957,8 +964,14 @@ def main() -> None:
                             assert layer.values.shape == values.shape
                             assert layer.keys.dtype == keys.dtype == torch.bfloat16
                             assert layer.values.dtype == values.dtype == torch.bfloat16
-                            layer.keys.copy_(keys)
-                            layer.values.copy_(values)
+                            if arguments.restore_prefill_state != "values":
+                                layer.keys.copy_(keys)
+                            else:
+                                pass
+                            if arguments.restore_prefill_state != "keys":
+                                layer.values.copy_(values)
+                            else:
+                                pass
                             restored_prefill_cache_layers += 1
                     else:
                         pass
