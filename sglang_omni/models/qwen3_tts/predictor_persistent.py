@@ -25,6 +25,11 @@ MAX_ROWS = 16
 KEY_VALUE_HEADS = 8
 SCHEDULE_TILE_BITS = 12
 PHASE_QKV = 0
+# Counted handoff: one event a phase; the down phase's hands a layer's output to the next layer.
+PHASE_EVENTS = 5
+# Up to one token tile of rows, phases hand off through epoch-flagged words: no fences, at twice
+# the bytes each consumer stages. Past it, the bytes cost more than the fences they save.
+FLAGGED_MAX_ROWS = 8
 # Phases in launch order with their work item counts and weight chunks a tile.
 QKV_TILES = QKV_WIDTH // TILE_FEATURES
 OUTPUT_PROJECTION_TILES = HIDDEN_SIZE // TILE_FEATURES
@@ -48,10 +53,12 @@ class PredictorLayerWeights:
 
 @dataclass(frozen=True, kw_only=True)
 class PredictorSchedule:
-    """Each CTA's work items in launch order, encoded phase << 12 | tile."""
+    """Each CTA's work items in launch order, encoded phase << 12 | tile, and the number of CTAs
+    that wait on each phase's counter in counted mode."""
 
     items: torch.Tensor
     lengths: torch.Tensor
+    phase_consumers: torch.Tensor
 
 
 def pack_weight_chunks(weight: torch.Tensor) -> torch.Tensor:
@@ -154,17 +161,30 @@ def build_predictor_schedule(
     encoded = torch.zeros(cta_count, width, dtype=torch.int16)
     for cta, cta_items in enumerate(items):
         encoded[cta, : len(cta_items)] = torch.tensor(cta_items, dtype=torch.int16)
+    # Event p is waited on by the CTAs holding phase p + 1; the down event by those holding qkv.
+    consumers = [
+        sum(
+            1
+            for cta_items in items
+            if any(
+                item >> SCHEDULE_TILE_BITS == (phase + 1) % PHASE_EVENTS
+                for item in cta_items
+            )
+        )
+        for phase in range(PHASE_EVENTS)
+    ]
     return PredictorSchedule(
         items=encoded.to(device),
         lengths=torch.tensor(
             [len(cta_items) for cta_items in items], dtype=torch.int32, device=device
         ),
+        phase_consumers=torch.tensor(consumers, dtype=torch.int32),
     )
 
 
 @functools.cache
-def load_predictor_layer_module(use_pdl: bool) -> Module:
-    template_arguments = make_cpp_args(use_pdl)
+def load_predictor_layer_module(use_pdl: bool, is_flagged: bool) -> Module:
+    template_arguments = make_cpp_args(use_pdl, is_flagged)
     return load_jit(
         "qwen3_tts_predictor_layer",
         *template_arguments,
@@ -179,8 +199,8 @@ def load_predictor_layer_module(use_pdl: bool) -> Module:
 
 
 class PersistentPredictorLayers:
-    """Launches a stack of predictor layers for up to 16 rows as one kernel; owns the handoff words and
-    the epoch counter, which every call reuses."""
+    """Launches a stack of predictor layers for up to 16 rows as one kernel; owns the handoff
+    buffers, the epoch counter and the phase counters, which every call reuses."""
 
     def __init__(
         self, device: torch.device, rope_cos_sin: torch.Tensor, norm_epsilon: float
@@ -189,8 +209,9 @@ class PersistentPredictorLayers:
         self.rope_cos_sin = rope_cos_sin.contiguous()
         self.norm_epsilon = norm_epsilon
         self.cta_count = torch.cuda.get_device_properties(device).multi_processor_count
-        # Each word holds two bf16 values and the epoch of the layer that wrote them; zeroed words
-        # carry epoch 0, which no layer writes.
+        # A flagged word holds two bf16 values and the epoch of the layer that wrote them; zeroed
+        # words carry epoch 0, which no layer writes. Counted mode keeps plain bf16 rows in the
+        # first half of each buffer.
         self.qkv_words = torch.zeros(
             MAX_ROWS, QKV_WIDTH // 2, device=device, dtype=torch.uint64
         )
@@ -209,8 +230,14 @@ class PersistentPredictorLayers:
         )
         # The kernel advances it by the layer count every launch, so epochs never repeat.
         self.epoch_counter = torch.zeros(1, device=device, dtype=torch.uint32)
+        # note (ratish): the counters reset themselves each launch, so they are zeroed once here.
+        self.phase_events = torch.zeros(PHASE_EVENTS, device=device, dtype=torch.uint32)
         self.schedules: dict[int, PredictorSchedule] = {}
-        self.module = load_predictor_layer_module(is_arch_support_pdl())
+        use_pdl = is_arch_support_pdl()
+        self.modules = {
+            is_flagged: load_predictor_layer_module(use_pdl, is_flagged)
+            for is_flagged in (False, True)
+        }
 
     def schedule_for(self, rows: int) -> PredictorSchedule:
         schedule = self.schedules.get(rows)
@@ -234,8 +261,9 @@ class PersistentPredictorLayers:
 
         The caches are (layers, rows, slots, kv heads, head dim) views.
         """
-        schedule = self.schedule_for(hidden_states.shape[0])
-        self.module.predictor_layer(
+        rows = hidden_states.shape[0]
+        schedule = self.schedule_for(rows)
+        self.modules[rows <= FLAGGED_MAX_ROWS].predictor_layer(
             hidden_states,
             output,
             weights.qkv_chunks,
@@ -255,8 +283,10 @@ class PersistentPredictorLayers:
             self.activation_words,
             self.hidden_words,
             self.epoch_counter,
+            self.phase_events,
             schedule.items,
             schedule.lengths,
+            schedule.phase_consumers,
             position,
             self.norm_epsilon,
         )
