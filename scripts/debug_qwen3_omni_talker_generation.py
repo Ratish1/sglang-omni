@@ -84,7 +84,11 @@ def main() -> None:
     parser.add_argument("--native-backbone-attention", action="store_true")
     parser.add_argument("--paired-native-projection-controls", action="store_true")
     parser.add_argument("--paired-native-rotary-controls", action="store_true")
-    parser.add_argument("--paired-native-routing-controls", action="store_true")
+    parser.add_argument(
+        "--paired-native-routing-controls",
+        action="store_true",
+        help="Separate native expert indices, native weight normalization, checkpoint weight rounding, and an exact baseline repeat.",
+    )
     parser.add_argument(
         "--native-expert-route-precision",
         choices=("checkpoint", "float32"),
@@ -340,7 +344,7 @@ def main() -> None:
         else:
             rotary_modes = ("checkpoint",)
         routing_modes = (
-            ("reconstructed", "native", "reconstructed-repeat")
+            ("reconstructed", "indices", "native", "rounded", "reconstructed-repeat")
             if arguments.paired_native_routing_controls
             else ("reconstructed",)
         )
@@ -407,7 +411,11 @@ def main() -> None:
                 expert_control.enabled = expert_mode == "fused"
                 expert_control.calls = 0
                 expert_control.router_calls = 0
-                expert_control.native_routing = routing_mode == "native"
+                expert_control.routing_semantics = (
+                    "reconstructed"
+                    if routing_mode == "reconstructed-repeat"
+                    else routing_mode
+                )
                 expert_control.shared_calls = 0
                 expert_control.used_profiles.clear()
                 expert_control.profiles = (
