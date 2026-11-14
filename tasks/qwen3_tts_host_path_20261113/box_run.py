@@ -37,12 +37,16 @@ ARMS = {
     "stack": "2d753d64d0279d0a579dac00704efd1d63525957",
     "main13": "13364eb45fd2ff09393fb0031576b2783a0edcf8",
     "pr": "2395d08957d87301e0fdd1284154051caba2cf79",
+    "waits": "50fb3e3a8d5a86a9d55c73c4fc6cf987c86c45a0",
+    "table_on_waits": "3a1c5b27948da1c211818132b02b17ee9d0209b9",
 }
 UNIT_SUITES = [
     "tests/unit_test/qwen3_tts",
+    "tests/unit_test/preprocessing/test_cache_key.py",
     "tests/unit_test/scheduling/test_session_row_admission.py",
     "tests/unit_test/pipeline/test_scheduler.py",
 ]
+WAITS_CELLS = [("stream_c64", 64, None, True), ("stream_c16", 16, None, True)]
 IDENTITY_SAMPLES = 24
 PAIRS = [
     ("main", "main"),
@@ -1001,6 +1005,9 @@ def main() -> None:
             "gil_owners_c64",
             "events_c64_encoder_priority",
             "events_rate45",
+            "identity_waits",
+            "events_waits",
+            "events_table_on_waits",
         ],
     )
     parser.add_argument("--arms", nargs="*", default=list(ARMS))
@@ -1098,6 +1105,24 @@ def main() -> None:
         )
     elif arguments.phase == "gil_owners_c64":
         run_gil_owner_pairs("main13", "pr", "gil_owners_c64")
+    elif arguments.phase == "identity_waits":
+        run_seedtts_c1(["main13", "waits"], "identity_waits")
+    elif arguments.phase == "events_waits":
+        run_event_pairs(
+            "main13",
+            "waits",
+            "events_waits",
+            WAITS_CELLS,
+            server_env={"QWEN3_TTS_TIME_PREPROCESSING": "1"},
+        )
+    elif arguments.phase == "events_table_on_waits":
+        run_event_pairs(
+            "waits",
+            "table_on_waits",
+            "events_table_on_waits",
+            WAITS_CELLS,
+            server_env={"QWEN3_TTS_TIME_PREPROCESSING": "1"},
+        )
     elif arguments.phase == "events_rate45":
         run_event_pairs(
             "main13",
