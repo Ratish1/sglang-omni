@@ -12,6 +12,7 @@ import torch
 from sglang.kernels.fused_op import get_fused_op_backend
 from sglang.kernels.spec import KernelBackend
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+from sglang.srt.layers.moe.topk import StandardTopKOutput
 from sglang.srt.model_executor.runner_utils.capture_mode import get_is_capture_mode
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.runtime_context import get_context, get_exec, get_schedule
@@ -334,6 +335,9 @@ class Qwen3OmniMoeTalkerSparseMoeBlock(Qwen3OmniMoeThinkerTextSparseMoeBlock):
             quant_config=None,
             prefix=add_prefix("shared_expert_gate", prefix),
         )
+        self.is_checkpoint_routing_control_enabled: bool = (
+            os.environ.get("SGLANG_OMNI_DIAGNOSTIC_CHECKPOINT_ROUTING_WEIGHTS") == "1"
+        )
 
     def forward(
         self,
@@ -367,6 +371,15 @@ class Qwen3OmniMoeTalkerSparseMoeBlock(Qwen3OmniMoeThinkerTextSparseMoeBlock):
         # --- Routed experts (no all-reduce yet) ---
         router_logits, _ = self.gate(linear_hidden_states)
         topk_output = self.topk(linear_hidden_states, router_logits)
+        if self.is_checkpoint_routing_control_enabled:
+            assert isinstance(topk_output, StandardTopKOutput)
+            topk_output = StandardTopKOutput(
+                topk_weights=topk_output.topk_weights.to(router_logits.dtype).float(),
+                topk_ids=topk_output.topk_ids,
+                router_logits=topk_output.router_logits,
+            )
+        else:
+            pass
         if record_operands:
             self.operator_recorder.record("router_logits", router_logits)
             self.operator_recorder.record("expert_indices", topk_output.topk_ids)
