@@ -391,14 +391,14 @@ def run_pairs(
                 stop_servers(servers)
 
 
-def run_seedtts_c1(arms: list[str]) -> None:
-    """Seeded c1 over the full SeedTTS EN corpus, each arm on its own card, whole then stream."""
+def run_seedtts_c1(arms: list[str], root: str) -> None:
+    """Seeded c1 over the full SeedTTS EN corpus, arm i on card i, whole then stream."""
     servers = []
     try:
         ports = {}
         for card, arm in enumerate(arms):
             server, port = start_server(
-                arm, card, RUN_DIRECTORY / "seedtts_c1" / arm / "serve.log"
+                arm, card, RUN_DIRECTORY / root / arm / "serve.log"
             )
             servers.append(server)
             ports[arm] = port
@@ -410,14 +410,14 @@ def run_seedtts_c1(arms: list[str]) -> None:
                 summary = benchmark(
                     arm,
                     ports[arm],
-                    RUN_DIRECTORY / "seedtts_c1" / arm / mode,
+                    RUN_DIRECTORY / root / arm / mode,
                     1,
                     None,
                     stream,
                     1234,
                     1,
                 )
-                print(json.dumps({f"seedtts_c1/{arm}/{mode}": summary}), flush=True)
+                print(json.dumps({f"{root}/{arm}/{mode}": summary}), flush=True)
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
             for future in [executor.submit(run_modes, arm) for arm in arms]:
@@ -426,18 +426,16 @@ def run_seedtts_c1(arms: list[str]) -> None:
         stop_servers(servers)
     report = {}
     for mode in ("whole", "stream"):
-        reference = audio_digests(RUN_DIRECTORY / "seedtts_c1" / arms[0] / mode)
+        reference = audio_digests(RUN_DIRECTORY / root / arms[0] / mode)
         for arm in arms:
-            digests = audio_digests(RUN_DIRECTORY / "seedtts_c1" / arm / mode)
+            digests = audio_digests(RUN_DIRECTORY / root / arm / mode)
             report[f"{arm}/{mode}"] = {
                 "files": len(digests),
                 "equal_to_first": sum(
                     digests.get(name) == digest for name, digest in reference.items()
                 ),
             }
-    (RUN_DIRECTORY / "seedtts_c1" / "identity.json").write_text(
-        json.dumps(report, indent=2)
-    )
+    (RUN_DIRECTORY / root / "identity.json").write_text(json.dumps(report, indent=2))
     print(json.dumps({"seedtts_identity": report}), flush=True)
 
 
@@ -550,6 +548,7 @@ def main() -> None:
             "nonstream",
             "on_m2",
             "seedtts_c1",
+            "seedtts_c1_swapped",
             "seedtts_pairs",
             "score",
         ],
@@ -566,7 +565,9 @@ def main() -> None:
     elif arguments.phase == "on_m2":
         run_pairs([("m2", "stack")], PAIR_CELLS, probe_arm="stack")
     elif arguments.phase == "seedtts_c1":
-        run_seedtts_c1(["main", "m2"])
+        run_seedtts_c1(["main", "m2"], "seedtts_c1")
+    elif arguments.phase == "seedtts_c1_swapped":
+        run_seedtts_c1(["m2", "main"], "seedtts_c1_swapped")
     elif arguments.phase == "seedtts_pairs":
         run_pairs(
             [("main", "m2")],
