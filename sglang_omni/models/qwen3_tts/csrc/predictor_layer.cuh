@@ -130,7 +130,12 @@ inline constexpr int kStampPhaseStaged = 3;
 inline constexpr int kStampPhasePoints = 4;
 inline constexpr int kStampListLength = 16;
 inline constexpr int kStampItemEnd = 24;
-inline constexpr int kStampChunkWait = kStampItemEnd + kStampListLength;
+// Per item: warp 0's MMAs done (an attention item: its loads staged), then the
+// barrier after every warp's MMAs (an attention item: its output stored).
+inline constexpr int kStampItemMultiplied = kStampItemEnd + kStampListLength;
+inline constexpr int kStampItemReduced =
+    kStampItemMultiplied + kStampListLength;
+inline constexpr int kStampChunkWait = kStampItemReduced + kStampListLength;
 inline constexpr int kStampChunkReady = kStampChunkWait + kStampListLength;
 inline constexpr int kStampChunkIssue = kStampChunkReady + kStampListLength;
 inline constexpr int kStampSlots = kStampChunkIssue + kStampListLength;
@@ -250,8 +255,8 @@ SGL_DEVICE float round_bf16(float value) {
 }
 
 #ifdef QWEN3_TTS_PREDICTOR_STAMPS
-// note (ratish): Nsight Compute cannot replay a launch whose CTAs wait on each
-// other, so a debug build records the global timer and the SM clock instead.
+// A debug build records, per CTA, the global timer (comparable across SMs) and
+// the SM clock at fixed points of the launch.
 __device__ int64_t predictor_stamps[kStampCtas * kStampSlots * 2];
 
 SGL_DEVICE void record_stamp(int slot) {
@@ -263,13 +268,22 @@ SGL_DEVICE void record_stamp(int slot) {
   stamp[0] = static_cast<int64_t>(global_time);
   stamp[1] = clock64();
 }
+
+// Listed stamps only time intervals inside one CTA, so they take the SM clock
+// alone.
+SGL_DEVICE void record_clock_stamp(int slot) {
+  if (blockIdx.x >= kStampCtas)
+    return;
+  predictor_stamps[(blockIdx.x * kStampSlots + slot) * 2 + 1] = clock64();
+}
 #else
 SGL_DEVICE void record_stamp(int) {}
+SGL_DEVICE void record_clock_stamp(int) {}
 #endif
 
 SGL_DEVICE void record_listed_stamp(int list, int index) {
   if (index < kStampListLength)
-    record_stamp(list + index);
+    record_clock_stamp(list + index);
 }
 
 SGL_DEVICE void record_phase_stamp(int phase, int point) {
@@ -658,8 +672,8 @@ SGL_DEVICE float dot_head(const float *query, const uint8_t *key_row) {
 // score every slot with one lane a slot, and sum the values with four head
 // dims a lane. Warp 0 writes the new key and warp 1 the new value into the
 // caches at the position. The caller's barrier ends the item.
-SGL_DEVICE void attend(const LayerParams &params, int item, uint8_t *workspace,
-                       int warp_index, int lane_index) {
+SGL_DEVICE void attend(const LayerParams &params, int item, int item_index,
+                       uint8_t *workspace, int warp_index, int lane_index) {
   const int token = item / kKeyValueHeads;
   const int group = item % kKeyValueHeads;
   const int position = params.position;
@@ -687,6 +701,8 @@ SGL_DEVICE void attend(const LayerParams &params, int item, uint8_t *workspace,
     }
   }
   compute_barrier();
+  if (threadIdx.x == 0)
+    record_listed_stamp(kStampItemMultiplied, item_index);
   if (warp_index >= 2)
     return;
 
@@ -764,6 +780,8 @@ SGL_DEVICE void attend(const LayerParams &params, int item, uint8_t *workspace,
                              head * kHeadDim + lane_index + 32 * i] =
         __float2bfloat16(attended[i] / weight_sum);
   }
+  if (threadIdx.x == 0)
+    record_listed_stamp(kStampItemReduced, item_index);
 }
 
 template <bool kUsePDL>
@@ -863,7 +881,7 @@ __global__ __launch_bounds__(kThreads, 1) void predictor_layer_kernel(
         phase_items = 0u;
       }
       if (phase == kPhaseAttention) {
-        attend(params, tile, operand, warp_index, lane_index);
+        attend(params, tile, index, operand, warp_index, lane_index);
         compute_barrier();
       } else {
         const bf16_t residual = load_residual(params, phase, tile);
@@ -872,8 +890,12 @@ __global__ __launch_bounds__(kThreads, 1) void predictor_layer_kernel(
                       token_tiles, ring, operand, tile_partials, full_barriers,
                       empty_barriers, stage, full_parity, consumed_chunks,
                       warp_index, lane_index);
+        if (threadIdx.x == 0)
+          record_listed_stamp(kStampItemMultiplied, index);
         consumed_chunks += chunks_per_tile(phase);
         compute_barrier();
+        if (threadIdx.x == 0)
+          record_listed_stamp(kStampItemReduced, index);
         finish_tile(params, phase, tile, tile_partials, row_scales, residual);
         // note (ratish): alternating the partial buffers lets the next tile's
         // MMAs start without a barrier; its own barrier comes after every
