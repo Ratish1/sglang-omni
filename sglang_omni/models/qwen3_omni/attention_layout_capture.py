@@ -48,6 +48,10 @@ def capture_attention_layout(
         "attention_key_head_count": layer.tp_k_head_num,
         "attention_query_head_dimensions": layer.head_dim,
         "attention_value_head_dimensions": layer.v_head_dim,
+        "attention_scheduler_query_head_count": backend.num_attention_heads,
+        "attention_scheduler_key_head_count": backend.num_kv_heads,
+        "attention_scheduler_head_dimensions": backend.head_dim,
+        "attention_context_tokens": backend.max_context_len,
     }
     return {
         "attention_page_ids": metadata.page_table[row, :sequence_length].cpu().clone(),
@@ -59,6 +63,9 @@ def capture_attention_layout(
             metadata.scheduler_metadata.cpu().clone()
             if metadata.scheduler_metadata is not None
             else torch.empty(0, dtype=torch.int32, device="cpu")
+        ),
+        "attention_scheduler_has_softcap": torch.tensor(
+            backend.has_softcap, device="cpu"
         ),
         **{
             name: torch.tensor(value, device="cpu")
