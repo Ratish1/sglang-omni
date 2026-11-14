@@ -551,6 +551,8 @@ def main() -> None:
             "seedtts_c1_swapped",
             "seedtts_pairs",
             "score",
+            "quality_draws",
+            "score_draws",
         ],
     )
     parser.add_argument("--arms", nargs="*", default=list(ARMS))
@@ -582,6 +584,19 @@ def main() -> None:
         )
     elif arguments.phase == "score":
         score_generated(["seedtts_c1", "seedtts_pairs"])
+    elif arguments.phase == "quality_draws":
+        for round_index in range(3):
+            run_pairs(
+                [("main", "m2")],
+                [
+                    ("stream_c16", 16, None, True),
+                    ("nonstream_c16", 16, None, False),
+                ],
+                root=f"quality_draws/round{round_index}",
+                warmup=1,
+            )
+    elif arguments.phase == "score_draws":
+        score_generated(["quality_draws"])
     else:
         run_pairs([("main", "stack"), ("m1", "m2")], [NONSTREAM_CELL])
 
