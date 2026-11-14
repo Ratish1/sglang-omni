@@ -279,6 +279,87 @@ def probe_step_path(
     print(json.dumps({"step_probe": counts}), flush=True)
 
 
+GIL_RECORD_DELAY_S = 8
+GIL_RECORD_DURATION_S = 12
+
+
+def stage_process_id(server: subprocess.Popen) -> str:
+    listing = subprocess.check_output(["ps", "-eo", "pid,ppid,args"], text=True)
+    return next(
+        line.split()[0]
+        for line in listing.splitlines()[1:]
+        if line.split()[1] == str(server.pid) and "spawn_main" in line
+    )
+
+
+def record_gil_owners(server: subprocess.Popen, path: Path) -> None:
+    """py-spy the stage process's GIL holders, by thread, from past the opening burst."""
+    time.sleep(GIL_RECORD_DELAY_S)
+    subprocess.run(
+        [
+            "py-spy",
+            "record",
+            "--pid",
+            stage_process_id(server),
+            "--gil",
+            "--nonblocking",
+            "--threads",
+            "--format",
+            "raw",
+            "--duration",
+            str(GIL_RECORD_DURATION_S),
+            "--output",
+            str(path),
+        ],
+        capture_output=True,
+        check=True,
+    )
+
+
+def run_gil_owner_pairs(base: str, head: str, root: str) -> None:
+    """Same-time stream c64 pairs in both card orders, recording each stage process's GIL holders."""
+    for order in (0, 1):
+        directory = RUN_DIRECTORY / root / f"order{order}"
+        servers = []
+        try:
+            ports = {}
+            for side, arm in (("base", base), ("head", head)):
+                card = order if side == "base" else 1 - order
+                server, port = start_server(arm, card, directory / f"serve_{side}.log")
+                servers.append(server)
+                ports[side] = (arm, port, server)
+            for arm, port, server in ports.values():
+                wait_healthy(port, server)
+            with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
+                recordings = [
+                    executor.submit(
+                        record_gil_owners, server, directory / f"gil_{side}.txt"
+                    )
+                    for side, (_, _, server) in ports.items()
+                ]
+                futures = {
+                    side: executor.submit(
+                        benchmark,
+                        arm,
+                        port,
+                        directory / side / "stream_c64",
+                        64,
+                        None,
+                        True,
+                        None,
+                        1,
+                    )
+                    for side, (arm, port, _) in ports.items()
+                }
+                for side, future in futures.items():
+                    key = f"{root}/order{order}/{side}/stream_c64"
+                    print(json.dumps({key: future.result()}), flush=True)
+                for recording in recordings:
+                    recording.result()
+        finally:
+            stop_servers(servers)
+
+
 def probe_env(arm: str, **values: str) -> dict[str, str]:
     """The arm's tree first, then the boot probe, whose switches are values."""
     return {"PYTHONPATH": f"{tree_for(arm)}:{PROBE_DIRECTORY}", **values}
@@ -901,6 +982,7 @@ def main() -> None:
             "events_c64_timed",
             "events_c64_priority",
             "events_c64_gil",
+            "gil_owners_c64",
         ],
     )
     parser.add_argument("--arms", nargs="*", default=list(ARMS))
@@ -996,6 +1078,8 @@ def main() -> None:
             [("stream_c64", 64, None, True)],
             server_env={"QWEN3_TTS_TIME_PREPROCESSING": "1"},
         )
+    elif arguments.phase == "gil_owners_c64":
+        run_gil_owner_pairs("main13", "pr", "gil_owners_c64")
     elif arguments.phase == "events_c64_gil":
         run_event_pairs(
             "main13",
