@@ -18,6 +18,7 @@ from scripts.debug_qwen3_omni_producer_speech import stop_owned_server
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--server-template", type=Path, required=True)
+    parser.add_argument("--server-working-directory", type=Path)
     parser.add_argument("--model-path", required=True)
     parser.add_argument("--model-revision", required=True)
     parser.add_argument("--input-directory", type=Path, required=True)
@@ -82,7 +83,17 @@ def main() -> None:
     else:
         pass
     arguments.output_directory.mkdir(exist_ok=False)
-    source = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
+    driver_source = subprocess.check_output(
+        ["git", "rev-parse", "HEAD"], text=True
+    ).strip()
+    if arguments.server_working_directory is None:
+        source = driver_source
+    else:
+        source = subprocess.check_output(
+            ["git", "rev-parse", "HEAD"],
+            cwd=arguments.server_working_directory,
+            text=True,
+        ).strip()
     template = json.loads(arguments.server_template.read_text())
     configuration = Qwen3OmniMoeConfig.from_pretrained(
         arguments.model_path, revision=arguments.model_revision
@@ -207,6 +218,7 @@ def main() -> None:
         with (output / "server.log").open("wb") as log:
             process = subprocess.Popen(
                 server_command,
+                cwd=arguments.server_working_directory,
                 env=environment,
                 stdout=log,
                 stderr=subprocess.STDOUT,
@@ -216,6 +228,10 @@ def main() -> None:
             json.dumps(
                 {
                     "source": source,
+                    "driver_source": driver_source,
+                    "server_working_directory": str(
+                        arguments.server_working_directory or Path.cwd()
+                    ),
                     "control": control,
                     "pid": process.pid,
                     "command": server_command,
@@ -229,7 +245,7 @@ def main() -> None:
                     "reference_predictor_mode": arguments.reference_predictor_mode,
                     "captured_request_ids": capture_request_ids,
                     "accepted_layer": accepted_layer,
-                    "timing_scope": "Bounded operator observers enabled in both arms, not production performance qualification.",
+                    "timing_scope": "Diagnostic capture requested, not production performance qualification.",
                 },
                 indent=2,
             )
