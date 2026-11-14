@@ -30,6 +30,9 @@ def main() -> None:
     parser.add_argument("--capture-token-rows", type=int, default=112)
     parser.add_argument("--capture-talker-operators", action="store_true")
     parser.add_argument("--capture-all-conditioning", action="store_true")
+    parser.add_argument(
+        "--capture-log-level", choices=("info", "debug"), default="debug"
+    )
     parser.add_argument("--no-capture", dest="is_capture_disabled", action="store_true")
     parser.add_argument("--contribution-source-directory", type=Path)
     parser.add_argument(
@@ -117,7 +120,7 @@ def main() -> None:
     server_command = [
         *template["command"],
         "--log-level",
-        "info" if arguments.is_capture_disabled else "debug",
+        "info" if arguments.is_capture_disabled else arguments.capture_log_level,
     ]
     request_hashes: dict[str, str] = {}
     workload_request_ids: dict[str, list[str]] = {}
