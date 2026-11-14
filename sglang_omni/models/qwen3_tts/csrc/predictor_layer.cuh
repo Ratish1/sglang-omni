@@ -65,7 +65,10 @@ inline constexpr int kOperandBytes =
     kMaxRows * (kIntermediateSize * 2 + kOperandRowPadding);
 inline constexpr int kPartialFloats =
     kComputeWarps * kMaxTokenTiles * kTileFeatures * kTokenTileRows;
-inline constexpr int kPartialBuffers = 2;
+// A CTA multiplies at most this many tiles of one phase before one barrier
+// and one epilogue; per-phase balance gives at most 3 on 132 SMs.
+inline constexpr int kMaxBatchTiles = 3;
+inline constexpr int kPartialBuffers = kMaxBatchTiles;
 
 inline constexpr int kMaxScheduleItems = 32;
 inline constexpr int kSharedBytes = kRingStages * kChunkBytes + kOperandBytes +
@@ -396,60 +399,82 @@ SGL_DEVICE void stage_phase_operand(const LayerParams &params, int phase,
   }
 }
 
-// Multiplies one 16-feature weight tile, streamed through the ring, by the
-// staged rows. Warp w takes k-steps [8w, 8w + 8) of every chunk and alternates
-// two accumulators, so consecutive MMAs do not wait on each other; the warps'
-// partial sums land in `partials` as [warp][token tile][feature 16][token 8].
-SGL_DEVICE void multiply_tile(int chunks, int row_bytes, int token_tiles,
-                              uint8_t *ring, const uint8_t *operand,
-                              float *partials, uint64_t *full_barriers,
-                              uint64_t *empty_barriers, int &stage,
-                              uint32_t &full_parity, int first_chunk,
-                              int warp_index, int lane_index) {
-  float accumulator[2][kMaxTokenTiles][4] = {};
+// Multiplies one weight chunk from the ring by the staged rows into one tile's
+// accumulators. Warp w takes k-steps [8w, 8w + 8) and alternates two
+// accumulators, so consecutive MMAs do not wait on each other.
+SGL_DEVICE void multiply_chunk(float (&accumulator)[2][kMaxTokenTiles][4],
+                               int chunk, int row_bytes, int token_tiles,
+                               uint8_t *ring, uint32_t operand_address,
+                               uint64_t *full_barriers,
+                               uint64_t *empty_barriers, int &stage,
+                               uint32_t &full_parity, int stamp_chunk,
+                               int warp_index, int lane_index) {
+  if (threadIdx.x == 0)
+    record_listed_stamp(kStampChunkWait, stamp_chunk);
+  device::ptx::mbar_wait_parity(full_barriers + stage, full_parity);
+  if (threadIdx.x == 0)
+    record_listed_stamp(kStampChunkReady, stamp_chunk);
+  const uint32_t chunk_address =
+      shared_address(ring + stage * kChunkBytes) + lane_index * 16;
+#pragma unroll
+  for (int pair = 0; pair < kKStepsPerWarp / 2; ++pair) {
+    const int kstep = warp_index * kKStepsPerWarp + pair * 2;
+    const int operand_kstep = chunk * kKStepsPerChunk + kstep;
+    uint32_t first_weights[4];
+    uint32_t second_weights[4];
+    load_matrix_x4(chunk_address + kstep * kKStepBytes, first_weights);
+    load_matrix_x4(chunk_address + (kstep + 1) * kKStepBytes, second_weights);
+#pragma unroll
+    for (int token_tile = 0; token_tile < kMaxTokenTiles; ++token_tile) {
+      if (token_tile < token_tiles) {
+        uint32_t tokens[4];
+        load_matrix_x4(operand_address +
+                           token_tile * kTokenTileRows * row_bytes +
+                           operand_kstep * kKStepDepth * 2,
+                       tokens);
+        mma_bf16(accumulator[0][token_tile], first_weights, tokens[0],
+                 tokens[1]);
+        mma_bf16(accumulator[1][token_tile], second_weights, tokens[2],
+                 tokens[3]);
+      }
+    }
+  }
+  __syncwarp();
+  if (lane_index == 0)
+    device::ptx::mbar_arrive(empty_barriers + stage);
+  stage += 1;
+  if (stage == kRingStages) {
+    stage = 0;
+    full_parity ^= 1u;
+  }
+}
+
+// Multiplies up to kMaxBatchTiles 16-feature tiles of one phase, whose chunks
+// arrive through the ring in schedule order, by the staged rows. Tile t's warp
+// partial sums land in `partials` + t * kPartialFloats as [warp][token
+// tile][feature 16][token 8], so one barrier and one epilogue serve the batch.
+SGL_DEVICE void multiply_tiles(int tiles, int chunks, int row_bytes,
+                               int token_tiles, uint8_t *ring,
+                               const uint8_t *operand, float *partials,
+                               uint64_t *full_barriers,
+                               uint64_t *empty_barriers, int &stage,
+                               uint32_t &full_parity, int first_chunk,
+                               int warp_index, int lane_index) {
+  float accumulator[kMaxBatchTiles][2][kMaxTokenTiles][4] = {};
   // ldmatrix lane l gives the address of token row l % 8 of matrix l / 8:
   // matrices 0 and 1 are the two 8-value halves of a k-step, 2 and 3 the next.
   const uint32_t operand_address = shared_address(operand) +
                                    (lane_index % 8) * row_bytes +
                                    (lane_index / 8) * 16;
-  for (int chunk = 0; chunk < chunks; ++chunk) {
-    if (threadIdx.x == 0)
-      record_listed_stamp(kStampChunkWait, first_chunk + chunk);
-    device::ptx::mbar_wait_parity(full_barriers + stage, full_parity);
-    if (threadIdx.x == 0)
-      record_listed_stamp(kStampChunkReady, first_chunk + chunk);
-    const uint32_t chunk_address =
-        shared_address(ring + stage * kChunkBytes) + lane_index * 16;
 #pragma unroll
-    for (int pair = 0; pair < kKStepsPerWarp / 2; ++pair) {
-      const int kstep = warp_index * kKStepsPerWarp + pair * 2;
-      const int operand_kstep = chunk * kKStepsPerChunk + kstep;
-      uint32_t first_weights[4];
-      uint32_t second_weights[4];
-      load_matrix_x4(chunk_address + kstep * kKStepBytes, first_weights);
-      load_matrix_x4(chunk_address + (kstep + 1) * kKStepBytes, second_weights);
-#pragma unroll
-      for (int token_tile = 0; token_tile < kMaxTokenTiles; ++token_tile) {
-        if (token_tile < token_tiles) {
-          uint32_t tokens[4];
-          load_matrix_x4(operand_address +
-                             token_tile * kTokenTileRows * row_bytes +
-                             operand_kstep * kKStepDepth * 2,
-                         tokens);
-          mma_bf16(accumulator[0][token_tile], first_weights, tokens[0],
-                   tokens[1]);
-          mma_bf16(accumulator[1][token_tile], second_weights, tokens[2],
-                   tokens[3]);
-        }
+  for (int slot = 0; slot < kMaxBatchTiles; ++slot) {
+    if (slot < tiles) {
+      for (int chunk = 0; chunk < chunks; ++chunk) {
+        multiply_chunk(accumulator[slot], chunk, row_bytes, token_tiles, ring,
+                       operand_address, full_barriers, empty_barriers, stage,
+                       full_parity, first_chunk + slot * chunks + chunk,
+                       warp_index, lane_index);
       }
-    }
-    __syncwarp();
-    if (lane_index == 0)
-      device::ptx::mbar_arrive(empty_barriers + stage);
-    stage += 1;
-    if (stage == kRingStages) {
-      stage = 0;
-      full_parity ^= 1u;
     }
   }
   // C fragment of m16n8k16: features lane / 4 and lane / 4 + 8, tokens 2 (lane
@@ -457,16 +482,22 @@ SGL_DEVICE void multiply_tile(int chunks, int row_bytes, int token_tiles,
   const int feature = lane_index / 4;
   const int token = 2 * (lane_index % 4);
 #pragma unroll
-  for (int token_tile = 0; token_tile < kMaxTokenTiles; ++token_tile) {
-    const float(&even)[4] = accumulator[0][token_tile];
-    const float(&odd)[4] = accumulator[1][token_tile];
-    float *block = partials + ((warp_index * kMaxTokenTiles + token_tile) *
-                               kTileFeatures) *
-                                  kTokenTileRows;
-    block[feature * kTokenTileRows + token] = even[0] + odd[0];
-    block[feature * kTokenTileRows + token + 1] = even[1] + odd[1];
-    block[(feature + 8) * kTokenTileRows + token] = even[2] + odd[2];
-    block[(feature + 8) * kTokenTileRows + token + 1] = even[3] + odd[3];
+  for (int slot = 0; slot < kMaxBatchTiles; ++slot) {
+    if (slot < tiles) {
+#pragma unroll
+      for (int token_tile = 0; token_tile < kMaxTokenTiles; ++token_tile) {
+        const float(&even)[4] = accumulator[slot][0][token_tile];
+        const float(&odd)[4] = accumulator[slot][1][token_tile];
+        float *block =
+            partials + slot * kPartialFloats +
+            ((warp_index * kMaxTokenTiles + token_tile) * kTileFeatures) *
+                kTokenTileRows;
+        block[feature * kTokenTileRows + token] = even[0] + odd[0];
+        block[feature * kTokenTileRows + token + 1] = even[1] + odd[1];
+        block[(feature + 8) * kTokenTileRows + token] = even[2] + odd[2];
+        block[(feature + 8) * kTokenTileRows + token + 1] = even[3] + odd[3];
+      }
+    }
   }
 }
 
@@ -875,62 +906,88 @@ __global__ __launch_bounds__(kThreads, 1) void predictor_layer_kernel(
     int current_phase = -1;
     uint32_t phase_items = 0u;
     int consumed_chunks = 0;
-    int partial_buffer = 0;
-    for (int index = 0; index < schedule_length; ++index) {
-      const int phase = schedule[index] >> kScheduleTileBits;
-      const int tile = schedule[index] & kScheduleTileMask;
-      if (phase != current_phase) {
-        if (threadIdx.x == 0)
-          record_phase_stamp(phase, kStampPhaseReached);
-        // Orders the previous phase's stores before the signal and the
-        // staging below.
-        compute_barrier();
-        if (threadIdx.x == 0) {
-          if (current_phase >= 0) {
-            signal_phase(params, current_phase, phase_items);
-            record_phase_stamp(current_phase, kStampPhaseSignaled);
-          }
-          if (phase > kPhaseQkv)
-            wait_phase(params, phase - 1);
-        }
-        if (phase > kPhaseQkv) {
-          compute_barrier();
-          if (threadIdx.x == 0)
-            record_phase_stamp(phase, kStampPhaseWaited);
-        }
-        stage_phase_operand(params, phase, operand, row_scales, warp_index,
-                            lane_index);
-        compute_barrier();
-        if (threadIdx.x == 0)
-          record_phase_stamp(phase, kStampPhaseStaged);
-        current_phase = phase;
-        phase_items = 0u;
-      }
-      if (phase == kPhaseAttention) {
-        attend(params, tile, index, operand, warp_index, lane_index);
-        compute_barrier();
-      } else {
-        const bf16_t residual = load_residual(params, phase, tile);
-        float *tile_partials = partials + partial_buffer * kPartialFloats;
-        multiply_tile(chunks_per_tile(phase), operand_row_bytes(phase),
-                      token_tiles, ring, operand, tile_partials, full_barriers,
-                      empty_barriers, stage, full_parity, consumed_chunks,
-                      warp_index, lane_index);
-        if (threadIdx.x == 0)
-          record_listed_stamp(kStampItemMultiplied, index);
-        consumed_chunks += chunks_per_tile(phase);
-        compute_barrier();
-        if (threadIdx.x == 0)
-          record_listed_stamp(kStampItemReduced, index);
-        finish_tile(params, phase, tile, tile_partials, row_scales, residual);
-        // note (ratish): alternating the partial buffers lets the next tile's
-        // MMAs start without a barrier; its own barrier comes after every
-        // thread has finished reading this buffer.
-        partial_buffer ^= 1;
+    int phase_start = 0;
+    while (phase_start < schedule_length) {
+      // A phase's items are contiguous in the schedule.
+      const int phase = schedule[phase_start] >> kScheduleTileBits;
+      int phase_end = phase_start + 1;
+      while (phase_end < schedule_length &&
+             schedule[phase_end] >> kScheduleTileBits == phase) {
+        phase_end += 1;
       }
       if (threadIdx.x == 0)
-        record_listed_stamp(kStampItemEnd, index);
-      phase_items += 1u;
+        record_phase_stamp(phase, kStampPhaseReached);
+      // Orders the previous phase's stores before the signal and the staging
+      // below.
+      compute_barrier();
+      if (threadIdx.x == 0) {
+        if (current_phase >= 0) {
+          signal_phase(params, current_phase, phase_items);
+          record_phase_stamp(current_phase, kStampPhaseSignaled);
+        }
+        if (phase > kPhaseQkv)
+          wait_phase(params, phase - 1);
+      }
+      if (phase > kPhaseQkv) {
+        compute_barrier();
+        if (threadIdx.x == 0)
+          record_phase_stamp(phase, kStampPhaseWaited);
+      }
+      stage_phase_operand(params, phase, operand, row_scales, warp_index,
+                          lane_index);
+      compute_barrier();
+      if (threadIdx.x == 0)
+        record_phase_stamp(phase, kStampPhaseStaged);
+      if (phase == kPhaseAttention) {
+        for (int item = phase_start; item < phase_end; ++item) {
+          attend(params, schedule[item] & kScheduleTileMask, item, operand,
+                 warp_index, lane_index);
+          compute_barrier();
+          if (threadIdx.x == 0)
+            record_listed_stamp(kStampItemEnd, item);
+        }
+      } else {
+        for (int batch = phase_start; batch < phase_end;
+             batch += kMaxBatchTiles) {
+          const int tiles = min(kMaxBatchTiles, phase_end - batch);
+          bf16_t residuals[kMaxBatchTiles];
+#pragma unroll
+          for (int slot = 0; slot < kMaxBatchTiles; ++slot) {
+            residuals[slot] =
+                slot < tiles
+                    ? load_residual(params, phase,
+                                    schedule[batch + slot] & kScheduleTileMask)
+                    : __ushort_as_bfloat16(0);
+          }
+          multiply_tiles(tiles, chunks_per_tile(phase),
+                         operand_row_bytes(phase), token_tiles, ring, operand,
+                         partials, full_barriers, empty_barriers, stage,
+                         full_parity, consumed_chunks, warp_index, lane_index);
+          if (threadIdx.x == 0)
+            record_listed_stamp(kStampItemMultiplied, batch);
+          consumed_chunks += tiles * chunks_per_tile(phase);
+          compute_barrier();
+          if (threadIdx.x == 0)
+            record_listed_stamp(kStampItemReduced, batch);
+#pragma unroll
+          for (int slot = 0; slot < kMaxBatchTiles; ++slot) {
+            if (slot < tiles) {
+              finish_tile(params, phase,
+                          schedule[batch + slot] & kScheduleTileMask,
+                          partials + slot * kPartialFloats, row_scales,
+                          residuals[slot]);
+            }
+          }
+          if (threadIdx.x == 0)
+            record_listed_stamp(kStampItemEnd, batch);
+          // A further batch reuses the partial buffers.
+          if (batch + kMaxBatchTiles < phase_end)
+            compute_barrier();
+        }
+      }
+      current_phase = phase;
+      phase_items = static_cast<uint32_t>(phase_end - phase_start);
+      phase_start = phase_end;
     }
     if (current_phase >= 0 && current_phase < kPhaseDown) {
       compute_barrier();
