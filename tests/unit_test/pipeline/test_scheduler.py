@@ -311,6 +311,7 @@ def make_abortable_req(request_id: str, **attributes):
         "_omni_terminal_claimed": False,
         "return_logprob": False,
         "grammar": None,
+        "omni_data": None,
     }
     values.update(attributes)
     req = SimpleNamespace(**values)
@@ -1601,6 +1602,7 @@ def test_omni_scheduler_abort_marks_running_request_for_finish(monkeypatch) -> N
         is_retracted=False,
         finished=lambda: False,
         _omni_terminal_claimed=False,
+        omni_data=None,
     )
     batch = SimpleNamespace(reqs=[req], batch_is_full=True)
     scheduler.running_batch = batch
