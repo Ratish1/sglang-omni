@@ -49,6 +49,7 @@ def main() -> None:
     parser.add_argument("--profile-map", type=Path, required=True)
     parser.add_argument("--contribution-source-directory", type=Path, required=True)
     parser.add_argument("--layout-source-sha256", required=True)
+    parser.add_argument("--gemm1-profile", type=int)
     parser.add_argument("--gpu", type=int, required=True)
     parser.add_argument("--output-directory", type=Path, required=True)
     arguments = parser.parse_args()
@@ -142,6 +143,15 @@ def main() -> None:
                         workspace_bytes, dtype=torch.uint8, device=hidden.device
                     )
                     replay_inputs = hidden.clone()
+                    actual_profiles = list(
+                        profiles.prefill[layer_index]
+                        if frame == 0
+                        else profiles.decode[layer_index]
+                    )
+                    if arguments.gemm1_profile is not None:
+                        actual_profiles[0] = arguments.gemm1_profile
+                    else:
+                        pass
                     profiler = (
                         torch.profiler.profile(
                             activities=[
@@ -164,11 +174,7 @@ def main() -> None:
                             activation_type=ActivationType.Swiglu,
                             use_fused_finalize=False,
                             tune_max_num_tokens=runtime.tune_max_num_tokens,
-                            profile_ids=list(
-                                profiles.prefill[layer_index]
-                                if frame == 0
-                                else profiles.decode[layer_index]
-                            ),
+                            profile_ids=actual_profiles,
                             workspace_buffer=workspace,
                         )[0]
                     if observed_profile is not None:
@@ -193,9 +199,13 @@ def main() -> None:
                     assert torch.equal(
                         replay_inputs.view(torch.uint8), hidden.view(torch.uint8)
                     )
-                    assert torch.equal(
+                    same_captured_output = torch.equal(
                         output.view(torch.uint8), expected.view(torch.uint8)
                     )
+                    if arguments.gemm1_profile is None:
+                        assert same_captured_output
+                    else:
+                        pass
                     expanded_tokens = tokens * ranks
                     source_rows = workspace_view(
                         workspace,
@@ -315,9 +325,10 @@ def main() -> None:
                                 "frame": frame,
                                 "layer": layer_index,
                                 "batch_tokens": tokens,
-                                "whole_output_bytes_exact": True,
+                                "whole_output_matches_capture_bytes": same_captured_output,
                                 "workspace_down_reduction_bytes_exact": True,
                                 "has_glu_intermediate": stages.has_glu_intermediate,
+                                "profiles": actual_profiles,
                                 "differences": {
                                     name: asdict(value)
                                     for name, value in differences.items()
@@ -352,6 +363,7 @@ def main() -> None:
                     {
                         "records": records,
                         "layout_source_sha256": source_hash,
+                        "gemm1_profile_override": arguments.gemm1_profile,
                         "scope": "Pinned unquantized single-GPU BF16 non-fused-finalizer workspace. Actual native activation/down buffers, complete map validation and full output-byte reconstruction precede comparisons. FP64 is a higher-precision numerical reference, not a speech-quality oracle. GEMM1 operands are overwritten by GEMM2, so an activation difference alone does not separate first-GEMM and SiLU implementation.",
                     },
                     indent=2,

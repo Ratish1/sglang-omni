@@ -81,6 +81,7 @@ def main() -> None:
     parser.add_argument("--native-predictor-capture-directory", type=Path)
     parser.add_argument("--native-expert-capture-directory", type=Path)
     parser.add_argument("--native-expert-profile-map", type=Path)
+    parser.add_argument("--expert-gemm1-profile", type=int)
     parser.add_argument("--contribution-source-directory", type=Path)
     parser.add_argument(
         "--native-output-arithmetic",
@@ -169,6 +170,11 @@ def main() -> None:
         pass
     if arguments.expert_output_arithmetic != "native":
         assert arguments.native_expert_capture_directory is not None
+    else:
+        pass
+    if arguments.expert_gemm1_profile is not None:
+        assert arguments.native_expert_capture_directory is not None
+        assert arguments.expert_output_arithmetic == "native"
     else:
         pass
     if arguments.native_shared_gate_batches:
@@ -287,6 +293,7 @@ def main() -> None:
             shared_enabled=arguments.native_shared_expert,
             is_shared_gate_batch_replay_enabled=arguments.native_shared_gate_batches,
             shared_gate_decode_rows=arguments.shared_gate_decode_rows,
+            gemm1_profile=arguments.expert_gemm1_profile,
         )
         expert_control.install()
     else:
@@ -1130,6 +1137,7 @@ def main() -> None:
                     if expert_control is not None
                     else []
                 ),
+                "expert_gemm1_profile_override": arguments.expert_gemm1_profile,
                 "observed_expert_profiles_source": (
                     str(expert_control.profiles.source_capture)
                     if expert_control is not None

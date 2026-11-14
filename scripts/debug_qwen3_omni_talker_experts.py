@@ -61,6 +61,7 @@ class NativeTalkerExperts:
     shared_gate_exact_input_calls: int = 0
     shared_gate_snapshots: list[dict[str, torch.Tensor]] = field(default_factory=list)
     profiles: ObservedExpertProfiles | None = None
+    gemm1_profile: int | None = None
     used_profiles: set[tuple[int, int]] = field(default_factory=set)
     runtime: NativeRuntime = field(init=False)
     weights: list[tuple[torch.Tensor, torch.Tensor]] = field(default_factory=list)
@@ -257,6 +258,10 @@ class NativeTalkerExperts:
             )
         else:
             profiles = (-1, -1)
+        if self.gemm1_profile is not None:
+            profiles = (self.gemm1_profile, profiles[1])
+        else:
+            pass
         self.used_profiles.add(profiles)
         replay_inputs = hidden_states.contiguous().clone()
         fused_output = cutlass_fused_moe(
