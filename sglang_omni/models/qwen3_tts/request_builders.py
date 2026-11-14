@@ -18,6 +18,7 @@ from typing import TYPE_CHECKING, Literal, TypedDict, overload
 import numpy as np
 import numpy.typing as npt
 import torch
+from sglang.srt.utils.common import async_d2h, async_h2d_stack
 
 from sglang_omni.models.qwen3_tts.code_table import Qwen3TTSCodeTable
 from sglang_omni.models.qwen3_tts.payload_types import Qwen3TTSState
@@ -898,6 +899,26 @@ def build_generation_kwargs(
     return generation_kwargs
 
 
+def qwen3_tts_token_ids(wrapper: Qwen3TTSModel, text: str) -> torch.Tensor:
+    """Token ids (1, tokens) of text on the host, tokenized as the wrapper does."""
+    token_ids = wrapper.processor(text=text, return_tensors="pt", padding=True)[
+        "input_ids"
+    ]
+    if token_ids.dim() == 1:
+        return token_ids.unsqueeze(0)
+    else:
+        return token_ids
+
+
+def qwen3_tts_device_token_ids(wrapper: Qwen3TTSModel, text: str) -> torch.Tensor:
+    """qwen3_tts_token_ids on the wrapper's device."""
+    # note (ratish): the wrapper's own tokenizer copies pageable ids, which first waits for every preprocessing thread's work queued on the shared stream.
+    (token_ids,) = async_h2d_stack(
+        [qwen3_tts_token_ids(wrapper, text)], device=wrapper.device
+    )
+    return token_ids
+
+
 def build_instruct_id(
     wrapper: "Qwen3TTSModel", instructions: str | None
 ) -> torch.Tensor | None:
@@ -911,9 +932,7 @@ def build_instruct_id(
         )  # noqa: leading-underscore  # upstream spelling, or the public name is already taken
     else:
         instruct_text = f"<|im_start|>user\n{instructions}<|im_end|>\n"
-    return wrapper._tokenize_texts([instruct_text])[
-        0
-    ]  # noqa: leading-underscore  # upstream spelling, or the public name is already taken
+    return qwen3_tts_device_token_ids(wrapper, instruct_text)
 
 
 def qwen3_tts_uploaded_voice_cache_key(state: Qwen3TTSState) -> SpeakerCacheKey | None:
@@ -984,36 +1003,45 @@ def cacheable_qwen3_tts_voice_prompt(
 
 
 def cacheable_qwen3_tts_tensor(value: torch.Tensor) -> torch.Tensor:
-    return value.detach().to(device="cpu").clone()
+    # note (ratish): the host copy lands in stream order, and a load copies it back on the same preprocessing stream without reading it on the host.
+    if value.is_cpu:
+        return value.detach().clone()
+    else:
+        return async_d2h(value.detach())
 
 
 @overload
 def qwen3_tts_voice_prompt_from_cache(
-    artifact: CachedVoicePrompt,
+    artifact: CachedVoicePrompt, *, device: torch.device
 ) -> tuple[VoicePrompt, str | None] | None: ...
 
 
 @overload
 def qwen3_tts_voice_prompt_from_cache(
-    artifact: Mapping[str, object],
+    artifact: Mapping[str, object], *, device: torch.device
 ) -> tuple[dict[str, list[object]], str | None] | None: ...
 
 
 def qwen3_tts_voice_prompt_from_cache(
-    artifact: Mapping[str, object],
+    artifact: Mapping[str, object], *, device: torch.device
 ) -> tuple[VoicePrompt | dict[str, list[object]], str | None] | None:
+    """The cached prompt's tensors copied to device."""
     if artifact.get("artifact_type") != "qwen3_tts_voice_clone_prompt":
         return None
     else:
         pass
     prompt: dict[str, list[object]] = {
         "ref_spk_embedding": [
-            embedding.detach().clone() for embedding in artifact["ref_spk_embedding"]
+            embedding.to(device=device, non_blocking=True, copy=True)
+            for embedding in artifact["ref_spk_embedding"]
         ],
         "icl_mode": list(artifact["icl_mode"]),
     }
     if "ref_code" in artifact:
-        prompt["ref_code"] = [code.detach().clone() for code in artifact["ref_code"]]
+        prompt["ref_code"] = [
+            code.to(device=device, non_blocking=True, copy=True)
+            for code in artifact["ref_code"]
+        ]
     else:
         pass
     if "reference_audio_frame_count" in artifact:
@@ -1385,7 +1413,9 @@ class Qwen3TTSAdhocReferenceHook(
     def load_artifact(
         self, stored: CachedVoicePrompt
     ) -> tuple[VoicePrompt, str | None]:
-        cached_prompt = qwen3_tts_voice_prompt_from_cache(stored)
+        cached_prompt = qwen3_tts_voice_prompt_from_cache(
+            stored, device=self.model.model.codec_embedding.weight.device
+        )
         if cached_prompt is None:
             raise RuntimeError("Qwen3-TTS ad-hoc reference cache entry is invalid")
         else:
@@ -1556,7 +1586,9 @@ def prepare_qwen3_tts_base_request(
     cache_key = qwen3_tts_uploaded_voice_cache_key(state)
     cached_artifact = speaker_cache.get(cache_key) if cache_key is not None else None
     cached_prompt = (
-        qwen3_tts_voice_prompt_from_cache(cached_artifact)
+        qwen3_tts_voice_prompt_from_cache(
+            cached_artifact, device=model.model.codec_embedding.weight.device
+        )
         if isinstance(cached_artifact, dict)
         else None
     )
@@ -1605,16 +1637,21 @@ def prepare_qwen3_tts_base_request(
     else:
         pass
 
-    input_id = wrapper._tokenize_texts([wrapper._build_assistant_text(state.text)])[
-        0
-    ]  # noqa: leading-underscore  # upstream spelling, or the public name is already taken
-    ref_id = (
-        wrapper._tokenize_texts([wrapper._build_ref_text(ref_text)])[
-            0
-        ]  # noqa: leading-underscore  # upstream spelling, or the public name is already taken
-        if ref_text
-        else None
+    input_id = qwen3_tts_device_token_ids(
+        wrapper,
+        wrapper._build_assistant_text(  # noqa: leading-underscore  # upstream spelling, or the public name is already taken
+            state.text
+        ),
     )
+    if ref_text:
+        ref_id = qwen3_tts_device_token_ids(
+            wrapper,
+            wrapper._build_ref_text(  # noqa: leading-underscore  # upstream spelling, or the public name is already taken
+                ref_text
+            ),
+        )
+    else:
+        ref_id = None
     instruct_id = build_instruct_id(wrapper, state.instructions)
     with torch.no_grad():
         return model.build_voice_clone_inputs(
@@ -1635,9 +1672,12 @@ def prepare_qwen3_tts_custom_voice_request(
     wrapper: "Qwen3TTSModel",
     prompt_constants: Qwen3TTSPromptConstants,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
-    input_id = wrapper._tokenize_texts([wrapper._build_assistant_text(state.text)])[
-        0
-    ]  # noqa: leading-underscore  # upstream spelling, or the public name is already taken
+    input_id = qwen3_tts_device_token_ids(
+        wrapper,
+        wrapper._build_assistant_text(  # noqa: leading-underscore  # upstream spelling, or the public name is already taken
+            state.text
+        ),
+    )
     # Note(yzxiao): QwenLM/Qwen3-TTS (qwen-tts 0.1.1) drops 0.6B instructions
     # in its wrapper. Preserve this path's existing prompt passthrough for both
     # sizes; accepting an instruction does not guarantee 0.6B style control.
@@ -1660,9 +1700,12 @@ def prepare_qwen3_tts_voice_design_request(
     wrapper: "Qwen3TTSModel",
     prompt_constants: Qwen3TTSPromptConstants,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
-    input_id = wrapper._tokenize_texts([wrapper._build_assistant_text(state.text)])[
-        0
-    ]  # noqa: leading-underscore  # upstream spelling, or the public name is already taken
+    input_id = qwen3_tts_device_token_ids(
+        wrapper,
+        wrapper._build_assistant_text(  # noqa: leading-underscore  # upstream spelling, or the public name is already taken
+            state.text
+        ),
+    )
     instruct_id = build_instruct_id(wrapper, state.instructions)
     with torch.no_grad():
         return model.build_voice_design_inputs(
@@ -1688,9 +1731,7 @@ def prepare_qwen3_tts_request(
     )
 
     validate_qwen3_tts_model_task(model, state)
-    target_ids = wrapper._tokenize_texts([state.text])[
-        0
-    ]  # noqa: leading-underscore  # The model wrapper owns text tokenization.
+    target_ids = qwen3_tts_token_ids(wrapper, state.text)
     state.speech_input_tokens = int(target_ids.numel()) if state.text else 0
     tts_params = payload.request.metadata.get("tts_params") or {}
     if not isinstance(tts_params, dict):
@@ -1704,9 +1745,7 @@ def prepare_qwen3_tts_request(
         or payload.request.params.get("instruct")
     )
     if isinstance(instructions, str) and instructions.strip():
-        instruction_ids = wrapper._tokenize_texts([instructions])[
-            0
-        ]  # noqa: leading-underscore  # The model wrapper owns text tokenization.
+        instruction_ids = qwen3_tts_token_ids(wrapper, instructions)
         state.speech_input_tokens += int(instruction_ids.numel())
     else:
         pass

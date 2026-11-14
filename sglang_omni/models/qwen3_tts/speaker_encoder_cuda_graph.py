@@ -12,6 +12,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from librosa.filters import mel as librosa_mel_fn
+from sglang.srt.utils.common import async_h2d_stack
 
 from sglang_omni.models.qwen3_tts.reference_encoder_cuda_graph import (
     ReferenceEncoderGraphStats,
@@ -293,6 +294,7 @@ class Qwen3TTSSpeakerEncoderCudaGraphRunner:
         assert frames > max(self.pads)
         param = next(self.encoder.parameters())
         bucket = smallest_bucket(frames, self.graphs)
+        # note (ratish): host inputs go through pinned memory, since a pageable copy first waits for every preprocessing thread's work queued on the shared stream.
         if bucket is None and self.device_mel_basis is not None:
             # note (ratish): past the graphs the CPU mel sets a long clip's preprocessing, so
             # the same mel runs on the device, zero padded after its reflect pad to a width
@@ -300,7 +302,7 @@ class Qwen3TTSSpeakerEncoderCudaGraphRunner:
             largest_frames = max(self.graphs)
             padded_frames = -(-frames // largest_frames) * largest_frames
             mels = log_mel(
-                samples.to(param.device),
+                async_h2d_stack([samples], device=param.device)[0],
                 self.device_mel_window,
                 self.device_mel_basis,
                 padded_frames,
@@ -314,14 +316,18 @@ class Qwen3TTSSpeakerEncoderCudaGraphRunner:
                 self.pads,
             )
         elif bucket is None:
-            mels = self.mel(samples).to(param.device).to(param.dtype)
+            mels = async_h2d_stack([self.mel(samples)], device=param.device)[0].to(
+                param.dtype
+            )
             # note (Haoling Pu): preprocessing threads embed concurrently, and
             # model_info reports this count.
             with self.lock:
                 self.misses += 1
             return self.encoder(mels.transpose(1, 2))[0]
         else:
-            mels = self.mel(samples).to(param.device).to(param.dtype)
+            mels = async_h2d_stack([self.mel(samples)], device=param.device)[0].to(
+                param.dtype
+            )
         captured = self.graphs[bucket]
         # note(ratish): every worker enqueues on one shared stream, so the lock only
         # orders the enqueue and the clone lands before the next replay.

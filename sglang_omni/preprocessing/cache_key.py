@@ -10,6 +10,7 @@ import numpy as np
 import torch
 import xxhash
 from PIL import Image
+from sglang.srt.utils.common import async_d2h
 
 
 def is_url_like(s: str) -> bool:
@@ -340,4 +341,13 @@ class PromptRowCacheKeys:
             .sum(dim=2)
             .remainder(PROMPT_ROW_KEY_MODULUS)
         )
-        return ((lanes[:, 0] << 31) | lanes[:, 1]).tolist()
+        key_ids = (lanes[:, 0] << 31) | lanes[:, 1]
+        if key_ids.is_cpu:
+            return key_ids.tolist()
+        else:
+            # note (ratish): a blocking device-to-host read holds up other threads' first event record until it returns; an enqueued copy and a stream wait do not.
+            host_key_ids = async_d2h(key_ids)
+            torch.get_device_module(key_ids.device).current_stream(
+                key_ids.device
+            ).synchronize()
+            return host_key_ids.tolist()
