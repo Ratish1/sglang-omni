@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # 11-14, node-0000, after q1114_fix2. Speech c16 beside a looping Video-MME client (4 in flight):
-# mx3_f, #3451 with the sync-free build alone (FIX), the landing base #3452's own pair is read on (mx3_f against mx3_x);
+# mx3_f, #3451 with the sync-free build alone (FIX 053a02a6f), the landing base #3452's own pair is read on (mx3_f against
+# mx3_x2, the lane on it, STACKFIX 2b4257fcf);
 # mxr_m, mxr_f, mxr_x, speech at a fixed 9 requests a second (16 in flight at most), so every arm serves the same speech
 # load and the video client's latency is read at equal offered load. Main has no fixed-rate cell on file, so it runs once.
 set -u
@@ -41,6 +42,7 @@ mixed() {
   wait $looper
 }
 mixed mx3_f $FIX ""
+mixed mx3_x2 $STACKFIX ""
 RATE="--bench-extra=--request-rate=9"
 mixed mxr_m $MAIN "$RATE"
 mixed mxr_f $FIX "$RATE"
