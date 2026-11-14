@@ -65,7 +65,7 @@ class QwenTalkerScheduler(OmniScheduler[SGLangARRequestData]):
     talker_start_topology: bool = ENABLE_TALKER_START_TOPOLOGY
     waiting_row_steps: int = 0
     waiting_row_last_log_s: float = 0.0
-    waiting_rows: ScheduleBatch | None = None
+    waiting_batch: ScheduleBatch | None = None
 
     def __init__(
         self,
@@ -93,7 +93,7 @@ class QwenTalkerScheduler(OmniScheduler[SGLangARRequestData]):
         )
         self.waiting_row_steps = 0
         self.waiting_row_last_log_s = 0.0
-        self.waiting_rows = None
+        self.waiting_batch = None
         if self.talker_start_topology:
             logger.info(
                 "talker-start topology on: building at %d thinker chunk(s); later chunks gate decode per step (partial_start_min_chunks=%d applies to the legacy path only)",
@@ -176,7 +176,7 @@ class QwenTalkerScheduler(OmniScheduler[SGLangARRequestData]):
             return None
         else:
             pass
-        self.waiting_rows = self.take_rows(batch, waiting_row_indices)
+        self.waiting_batch = self.take_rows(batch, waiting_row_indices)
         decode_batch = super().update_running_batch(batch)
         if decode_batch is None or decode_batch.is_empty():
             self.return_waiting_rows(batch)
@@ -186,7 +186,7 @@ class QwenTalkerScheduler(OmniScheduler[SGLangARRequestData]):
 
     def take_rows(self, batch: ScheduleBatch, row_indices: list[int]) -> ScheduleBatch:
         """Move rows out of the batch with their KV slot, length and next input id; no KV is freed."""
-        rows = ScheduleBatch.init_new(
+        taken_batch = ScheduleBatch.init_new(
             reqs=[batch.reqs[row_index] for row_index in row_indices],
             req_to_token_pool=self.req_to_token_pool,
             token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
@@ -197,23 +197,23 @@ class QwenTalkerScheduler(OmniScheduler[SGLangARRequestData]):
         )
         host_indices = torch.tensor(row_indices, dtype=torch.int64)
         device_indices = async_h2d(row_indices, dtype=torch.int64, device=batch.device)
-        rows.forward_mode = ForwardMode.DECODE
-        rows.req_pool_indices = batch.req_pool_indices[device_indices]
-        rows.req_pool_indices_cpu = batch.req_pool_indices_cpu[host_indices]
-        rows.seq_lens = batch.seq_lens[device_indices]
-        rows.seq_lens_cpu = batch.seq_lens_cpu[host_indices]
-        rows.orig_seq_lens = batch.orig_seq_lens[device_indices]
-        rows.input_ids = (
+        taken_batch.forward_mode = ForwardMode.DECODE
+        taken_batch.req_pool_indices = batch.req_pool_indices[device_indices]
+        taken_batch.req_pool_indices_cpu = batch.req_pool_indices_cpu[host_indices]
+        taken_batch.seq_lens = batch.seq_lens[device_indices]
+        taken_batch.seq_lens_cpu = batch.seq_lens_cpu[host_indices]
+        taken_batch.orig_seq_lens = batch.orig_seq_lens[device_indices]
+        taken_batch.input_ids = (
             None if batch.input_ids is None else batch.input_ids[device_indices]
         )
-        rows.multimodal_inputs = (
+        taken_batch.multimodal_inputs = (
             None
             if batch.multimodal_inputs is None
             else [batch.multimodal_inputs[row_index] for row_index in row_indices]
         )
         # note (ratish): the talker samples from its own buffers, so these rows get fresh sampling state, as a batch built for rows already holding KV does.
-        rows.sampling_info = SamplingBatchInfo.from_schedule_batch(
-            rows, self.model_config.vocab_size
+        taken_batch.sampling_info = SamplingBatchInfo.from_schedule_batch(
+            taken_batch, self.model_config.vocab_size
         )
         taken = set(row_indices)
         batch.filter_batch(
@@ -223,16 +223,16 @@ class QwenTalkerScheduler(OmniScheduler[SGLangARRequestData]):
                 if row_index not in taken
             ]
         )
-        return rows
+        return taken_batch
 
     def return_waiting_rows(self, batch: ScheduleBatch) -> None:
-        rows = self.waiting_rows
-        if rows is None:
+        waiting_batch = self.waiting_batch
+        if waiting_batch is None:
             return
         else:
             pass
-        self.waiting_rows = None
-        batch.merge_batch(rows)
+        self.waiting_batch = None
+        batch.merge_batch(waiting_batch)
 
     def process_batch_result(
         self, batch: ScheduleBatch, result: GenerationBatchResult
@@ -244,8 +244,8 @@ class QwenTalkerScheduler(OmniScheduler[SGLangARRequestData]):
         super().handle_batch_failure(batch, error)
         self.return_waiting_rows(batch)
 
-    def note_waiting_rows(self, waiting_rows: int, batch_rows: int) -> None:
-        self.waiting_row_steps += waiting_rows
+    def note_waiting_rows(self, waiting_row_count: int, batch_row_count: int) -> None:
+        self.waiting_row_steps += waiting_row_count
         now = time.monotonic()
         if now - self.waiting_row_last_log_s < WAITING_ROW_LOG_INTERVAL_S:
             return
@@ -255,8 +255,8 @@ class QwenTalkerScheduler(OmniScheduler[SGLangARRequestData]):
         logger.info(
             "talker rows waiting for thinker text: %d row steps so far (now %d of %d rows)",
             self.waiting_row_steps,
-            waiting_rows,
-            batch_rows,
+            waiting_row_count,
+            batch_row_count,
         )
 
     def self_check_during_idle(self) -> None:

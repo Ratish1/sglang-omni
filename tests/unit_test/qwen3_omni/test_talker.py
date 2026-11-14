@@ -1202,7 +1202,7 @@ def row_readiness_scheduler(
             if request.rid in waiting_request_ids
         ]
     )
-    scheduler.waiting_rows = None
+    scheduler.waiting_batch = None
     scheduler.waiting_row_steps = 0
     scheduler.waiting_row_last_log_s = 0.0
 
@@ -1307,7 +1307,7 @@ def test_row_without_text_sits_out_the_step_and_rejoins_with_its_kv(
         scheduler.req_to_token_pool.req_to_token[waiting_slot, :4], waiting_kv
     )
     assert batch.sampling_info.temperatures.shape[0] == 3
-    assert scheduler.waiting_rows is None
+    assert scheduler.waiting_batch is None
 
 
 @pytest.mark.usefixtures("talker_server_args")
@@ -1322,7 +1322,7 @@ def test_step_with_no_row_ready_allocates_nothing(
     assert [request.rid for request in batch.reqs] == ["first", "second", "third"]
     assert batch.seq_lens.tolist() == [3, 3, 1]
     assert scheduler.token_to_kv_pool_allocator.available_size() == free_slots
-    assert scheduler.waiting_rows is None
+    assert scheduler.waiting_batch is None
     assert scheduler.waiting_row_steps == 3
 
 
@@ -1341,7 +1341,7 @@ def test_every_row_ready_decodes_the_whole_batch(
         "third",
     ]
     assert decode_batch.seq_lens.tolist() == [4, 4, 2]
-    assert scheduler.waiting_rows is None
+    assert scheduler.waiting_batch is None
     assert scheduler.waiting_row_steps == 0
 
 
@@ -1356,7 +1356,7 @@ def test_failed_step_returns_the_waiting_rows(
     scheduler.handle_batch_failure(batch, RuntimeError("forward failed"))
 
     assert [request.rid for request in batch.reqs] == ["first", "second", "third"]
-    assert scheduler.waiting_rows is None
+    assert scheduler.waiting_batch is None
 
 
 @pytest.mark.usefixtures("talker_server_args")
@@ -1370,7 +1370,7 @@ def test_step_the_running_batch_skips_returns_the_waiting_rows(
     assert scheduler.update_running_batch(batch) is None
     assert [request.rid for request in batch.reqs] == ["second", "third", "first"]
     assert batch.seq_lens.tolist() == [3, 1, 3]
-    assert scheduler.waiting_rows is None
+    assert scheduler.waiting_batch is None
 
 
 def test_rows_without_next_decode_input_names_rows_waiting_for_text() -> None:
