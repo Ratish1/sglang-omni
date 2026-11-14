@@ -73,6 +73,15 @@ SYNC = ("cudaStreamSynchronize", "cudaEventSynchronize", "cudaDeviceSynchronize"
 COPY_KINDS = {1: "h2d", 2: "d2h", 8: "d2d"}
 CAPTURE_KINDS = ("cap", "op", "compiled")
 IN_TREE_PREFIX = "omni.pipeline:"
+OS_STAGES = (
+    "thinker",
+    "talker_ar",
+    "code2wav",
+    "decode",
+    "preprocessing",
+    "image_encoder",
+    "audio_encoder",
+)
 RESTORE_START = 8
 SAVE_END = 7
 # a gap between two residency slices up to this long is the context switch itself
@@ -244,6 +253,7 @@ class Report:
         }
         self.t0, self.t1 = session_window(self.db, window)
         self.load_nvtx()
+        self.load_os_thread_names()
         self.load_api()
         self.load_device()
         self.load_residency()
@@ -252,6 +262,28 @@ class Report:
 
     def text(self, text, text_id):
         return text if text is not None else self.strings.get(text_id, "")
+
+    def load_os_thread_names(self):
+        # note (ratish): a capture range opened after startup misses the once per thread and per stage marks;
+        # the OS names (15 bytes, natively set) still name every scheduler thread and so its stage.
+        if "ThreadNames" not in self.tables:
+            return
+        else:
+            pass
+        rows = self.db.execute("select globalTid, nameId from ThreadNames")
+        for tid, name_id in rows:
+            if tid in self.thread_names:
+                continue
+            else:
+                pass
+            name = self.strings.get(name_id, "")
+            short = name[len("scheduler-") :] if name.startswith("scheduler-") else ""
+            stage = next((s for s in OS_STAGES if short and s.startswith(short)), "")
+            self.thread_names[tid] = f"scheduler-{stage}" if stage else name
+            if stage and stage not in self.stages_of_pid[pid_of(tid)]:
+                self.stages_of_pid[pid_of(tid)].append(stage)
+            else:
+                pass
 
     def load_nvtx(self):
         self.ranges: dict[int, list[Range]] = collections.defaultdict(list)
