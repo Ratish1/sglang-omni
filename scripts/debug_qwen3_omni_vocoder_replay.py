@@ -105,10 +105,12 @@ def main() -> None:
             waveform = reference(codes).float().reshape(-1).cpu().numpy()
             assert torch.isfinite(torch.from_numpy(waveform)).all()
             wav_bytes = encode_wav(waveform, arguments.sample_rate)
+            trace_digest = hashlib.sha256(
+                str(trace_directory.resolve()).encode()
+            ).hexdigest()
+            waveform_filename = f"{trace_directory.parent.name}-{trace_digest}.wav"
             if arguments.targets_file is None:
-                destination = (
-                    arguments.output_directory / f"{trace_directory.parent.name}.wav"
-                )
+                destination = arguments.output_directory / waveform_filename
                 target_text = arguments.target_text
             else:
                 case_directory = (
@@ -117,7 +119,7 @@ def main() -> None:
                     / trace_directory.parent.parent.name
                 )
                 case_directory.mkdir(parents=True, exist_ok=True)
-                destination = case_directory / f"{trace_directory.parent.name}.wav"
+                destination = case_directory / waveform_filename
                 target_text = target_text_by_request[trace_directory.name]
             destination.write_bytes(wav_bytes)
             hypothesis = transcribe(
