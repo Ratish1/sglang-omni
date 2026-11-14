@@ -8659,6 +8659,24 @@ def test_qwen3_tts_result_adapter_infers_length_at_generation_budget() -> None:
     assert result.data["finish_reason"] == "length"
 
 
+def test_qwen3_tts_admission_takes_no_free_row_for_queued_requests_holding_one() -> (
+    None
+):
+    runner = object.__new__(Qwen3TTSModelRunner)
+    runner.code_table = Qwen3TTSCodeTable(
+        row_count=3, row_frames=4, codebook_count=2, device=torch.device("cpu")
+    )
+    held_rows = [runner.code_table.acquire(), runner.code_table.acquire()]
+    waiting_queue = [
+        SimpleNamespace(omni_data=SimpleNamespace(code_row=held_rows[0])),
+        SimpleNamespace(omni_data=SimpleNamespace(code_row=None)),
+        SimpleNamespace(omni_data=SimpleNamespace(code_row=held_rows[1])),
+        SimpleNamespace(omni_data=SimpleNamespace(code_row=None)),
+    ]
+
+    assert runner.admission_capacity(waiting_queue) == 3
+
+
 def test_qwen3_tts_vocoder_steps_take_a_stream_to_its_carried_frame_count() -> None:
     scheduler = Qwen3TTSStreamingVocoderScheduler(
         FakeQwen3TTSSpeechTokenizer(), device="cpu", initial_chunk_frames=8

@@ -2465,7 +2465,7 @@ class OmniScheduler(Generic[RequestDataT]):
         runner_capacity = (
             None
             if self.model_runner is None
-            else self.model_runner.admission_capacity()
+            else self.model_runner.admission_capacity(self.waiting_queue)
         )
         if runner_capacity is None:
             return allocatable
