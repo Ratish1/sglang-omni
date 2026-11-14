@@ -30,6 +30,7 @@ def main() -> None:
     parser.add_argument("--capture-token-rows", type=int, default=112)
     parser.add_argument("--capture-talker-operators", action="store_true")
     parser.add_argument("--capture-all-conditioning", action="store_true")
+    parser.add_argument("--no-capture", dest="is_capture_disabled", action="store_true")
     parser.add_argument("--contribution-source-directory", type=Path)
     parser.add_argument(
         "--reference-predictor-mode",
@@ -46,6 +47,15 @@ def main() -> None:
         ),
     )
     arguments = parser.parse_args()
+    if arguments.is_capture_disabled and (
+        arguments.capture_all_conditioning
+        or arguments.capture_request_id is not None
+        or arguments.capture_talker_operators
+        or arguments.reference_predictor_mode is not None
+    ):
+        raise ValueError("No-capture mode cannot request tensor or predictor capture")
+    else:
+        pass
     if "rounded-contributions" in (arguments.control or ()):
         assert arguments.contribution_source_directory is not None
     elif arguments.contribution_source_directory is not None:
@@ -55,7 +65,9 @@ def main() -> None:
     else:
         pass
     receiver_only = (
-        arguments.capture_all_conditioning or arguments.capture_request_id is not None
+        arguments.is_capture_disabled
+        or arguments.capture_all_conditioning
+        or arguments.capture_request_id is not None
     )
     if arguments.reference_predictor_mode is not None and arguments.request_id is None:
         raise ValueError("Reference predictor controls require selected request IDs")
@@ -99,7 +111,11 @@ def main() -> None:
         arguments.model_path, revision=arguments.model_revision
     )
     accepted_layer = configuration.talker_config.accept_hidden_layer
-    server_command = [*template["command"], "--log-level", "debug"]
+    server_command = [
+        *template["command"],
+        "--log-level",
+        "info" if arguments.is_capture_disabled else "debug",
+    ]
     request_hashes: dict[str, str] = {}
     workload_request_ids: dict[str, list[str]] = {}
     for workload in ("tts", "mmsu"):
@@ -138,9 +154,13 @@ def main() -> None:
         for request_id in request_ids
     }
     capture_request_ids = (
-        sorted(traffic_request_ids)
-        if arguments.capture_all_conditioning
-        else arguments.capture_request_id or arguments.request_id or []
+        []
+        if arguments.is_capture_disabled
+        else (
+            sorted(traffic_request_ids)
+            if arguments.capture_all_conditioning
+            else arguments.capture_request_id or arguments.request_id or []
+        )
     )
     assert set(capture_request_ids) <= traffic_request_ids
     selected_ids.write_text(json.dumps(capture_request_ids))
@@ -167,9 +187,11 @@ def main() -> None:
             ),
         }
         if receiver_only:
-            diagnostic_environment = {
-                "SGLANG_OMNI_CORPUS_REQUEST_ID_FILE": str(selected_ids),
-            }
+            diagnostic_environment = (
+                {}
+                if arguments.is_capture_disabled
+                else {"SGLANG_OMNI_CORPUS_REQUEST_ID_FILE": str(selected_ids)}
+            )
         else:
             pass
         if control in ("rounded-routing", "rounded-contributions"):
@@ -245,7 +267,12 @@ def main() -> None:
                     "reference_predictor_mode": arguments.reference_predictor_mode,
                     "captured_request_ids": capture_request_ids,
                     "accepted_layer": accepted_layer,
-                    "timing_scope": "Diagnostic capture requested, not production performance qualification.",
+                    "is_capture_disabled": arguments.is_capture_disabled,
+                    "timing_scope": (
+                        "No tensor/operator capture, ordinary INFO logging."
+                        if arguments.is_capture_disabled
+                        else "Diagnostic capture requested, not production performance qualification."
+                    ),
                 },
                 indent=2,
             )
