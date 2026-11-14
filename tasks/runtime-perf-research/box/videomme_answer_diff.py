@@ -2,7 +2,7 @@
 
 usage: python3 videomme_answer_diff.py <run dir> main=boot,boot pr=boot,boot [--show N]
 
-A pass is every videomme_results.json under a boot. Input identity is the prompt token count per question,
+A pass is every videomme_results.json or videoamme_results.json under a boot. Input identity is the prompt token count per question,
 which covers the frames the preprocessor produced. A flip is a question whose predicted letter differs
 between passes; flips inside one arm bound what batching alone moves.
 """
@@ -16,7 +16,7 @@ from pathlib import Path
 def passes(run_dir: Path, boots: list[str]) -> list[tuple[str, dict]]:
     found = []
     for boot in boots:
-        for path in sorted((run_dir / boot).rglob("videomme_results.json")):
+        for path in sorted((run_dir / boot).rglob("video*me_results.json")):
             label = f"{boot}/{path.parent.relative_to(run_dir / boot)}"
             found.append((label, json.loads(path.read_text(encoding="utf-8"))))
     return found
