@@ -23,6 +23,7 @@ def main() -> None:
     parser.add_argument("--trace-directory", type=Path, action="append", required=True)
     parser.add_argument("--native-buffer-directory", type=Path, required=True)
     parser.add_argument("--gpu", type=int, required=True)
+    parser.add_argument("--rounded-routing", action="store_true")
     parser.add_argument("--output-directory", type=Path, required=True)
     arguments = parser.parse_args()
     arguments.output_directory.mkdir(exist_ok=False)
@@ -146,8 +147,13 @@ def main() -> None:
                         scoring_func="softmax",
                         renormalize=configuration.norm_topk_prob,
                     )
+                    recorded_weights = (
+                        native_weights.to(router_logits.dtype).float()
+                        if arguments.rounded_routing
+                        else native_weights
+                    )
                     assert torch.equal(
-                        native_weights.cpu(), snapshot["batch_expert_weights"]
+                        recorded_weights.cpu(), snapshot["batch_expert_weights"]
                     )
                     assert torch.equal(
                         native_indices.cpu(), snapshot["batch_expert_indices"]
@@ -231,6 +237,7 @@ def main() -> None:
                         "sections": operation.sections,
                         "interleaved": operation.interleaved,
                         "runtime": operation.runtime.model_dump(by_alias=True),
+                        "rounded_routing": arguments.rounded_routing,
                         "scope": "Exact native rotary and full/isolated routing replay and independent formulas on captured operands, not a free-running quality repair.",
                     },
                     indent=2,
