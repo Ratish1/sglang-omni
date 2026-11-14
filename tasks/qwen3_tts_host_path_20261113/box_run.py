@@ -8,6 +8,7 @@ import os
 import signal
 import subprocess
 import sys
+import threading
 import time
 import urllib.request
 from pathlib import Path
@@ -206,9 +207,10 @@ def benchmark(
     return json.loads((directory / "bench/speed_results.json").read_text())["summary"]
 
 
-def probe_step_path(server: subprocess.Popen, directory: Path) -> None:
-    """py-spy the server's stage process through the cell's steady state."""
-    time.sleep(45)
+def probe_step_path(
+    server: subprocess.Popen, directory: Path, stop: threading.Event
+) -> None:
+    """py-spy the server's stage process from the cell's start until its benchmarks end."""
     listing = subprocess.check_output(["ps", "-eo", "pid,ppid,args"], text=True)
     stage_pid = next(
         line.split()[0]
@@ -216,7 +218,7 @@ def probe_step_path(server: subprocess.Popen, directory: Path) -> None:
         if line.split()[1] == str(server.pid) and "spawn_main" in line
     )
     dumps = []
-    for _ in range(90):
+    while not stop.is_set():
         dumps.append(
             subprocess.run(
                 ["py-spy", "dump", "--pid", stage_pid, "--nonblocking"],
@@ -224,7 +226,7 @@ def probe_step_path(server: subprocess.Popen, directory: Path) -> None:
                 text=True,
             ).stdout
         )
-        time.sleep(1)
+        time.sleep(0.2)
     text = "\n".join(dumps)
     (directory / "step_probe_dumps.txt").write_text(text)
     counts = {
@@ -344,12 +346,14 @@ def run_pairs(
                     with concurrent.futures.ThreadPoolExecutor(
                         max_workers=3
                     ) as executor:
+                        probe_stop = threading.Event()
                         for side, (arm, _) in ports.items():
                             if arm == probe_arm and cell == "stream_c64":
                                 executor.submit(
                                     probe_step_path,
                                     processes[side],
                                     RUN_DIRECTORY / root / pair / f"order{order}",
+                                    probe_stop,
                                 )
                             else:
                                 pass
@@ -372,12 +376,17 @@ def run_pairs(
                             )
                             for side, (arm, port) in ports.items()
                         }
-                        for side, future in futures.items():
-                            summary = future.result()
-                            key = f"{pair}/order{order}/{side}/{cell}"
-                            summaries[key] = summary
-                            print(json.dumps({key: summary}), flush=True)
-                            summaries_path.write_text(json.dumps(summaries, indent=2))
+                        try:
+                            for side, future in futures.items():
+                                summary = future.result()
+                                key = f"{pair}/order{order}/{side}/{cell}"
+                                summaries[key] = summary
+                                print(json.dumps({key: summary}), flush=True)
+                                summaries_path.write_text(
+                                    json.dumps(summaries, indent=2)
+                                )
+                        finally:
+                            probe_stop.set()
             finally:
                 stop_servers(servers)
 
@@ -568,6 +577,7 @@ def main() -> None:
             ],
             root="seedtts_pairs",
             warmup=1,
+            probe_arm="m2",
         )
     elif arguments.phase == "score":
         score_generated(["seedtts_c1", "seedtts_pairs"])
