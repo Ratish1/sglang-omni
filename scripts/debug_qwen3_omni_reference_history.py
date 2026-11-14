@@ -16,6 +16,10 @@ def compare_tensors(
     assert actual.dtype == expected.dtype, (actual.dtype, expected.dtype)
     return {
         "exact": torch.equal(actual, expected),
+        "bytes_exact": torch.equal(
+            actual.contiguous().reshape(-1).view(torch.uint8),
+            expected.contiguous().reshape(-1).view(torch.uint8),
+        ),
         "changed_values": int(torch.count_nonzero(actual != expected)),
         "maximum_absolute_error": float(
             (actual.float() - expected.float()).abs().max()
@@ -42,6 +46,7 @@ def main() -> None:
     reference_files = sorted(arguments.reference_directory.glob("*-post_*.pt"))
     assert len(reference_files) == expected_frames
     exact_counts: dict[str, int] = {}
+    byte_exact_counts: dict[str, int] = {}
     comparisons: dict[str, int] = {}
     with (arguments.output_directory / "frames.jsonl").open("x") as destination:
         for frame, reference_file in enumerate(reference_files):
@@ -123,6 +128,9 @@ def main() -> None:
                     exact_counts[name] = exact_counts.get(name, 0) + int(
                         comparison["exact"]
                     )
+                    byte_exact_counts[name] = byte_exact_counts.get(name, 0) + int(
+                        comparison["bytes_exact"]
+                    )
             destination.write(
                 json.dumps(
                     {
@@ -138,7 +146,9 @@ def main() -> None:
         "frames_including_eos": expected_frames,
         "comparisons": comparisons,
         "exact_counts": exact_counts,
+        "byte_exact_counts": byte_exact_counts,
         "all_exact": comparisons == exact_counts,
+        "all_bytes_exact": comparisons == byte_exact_counts,
         "scope": "Every consumed input, composed layer residual, new KV row (complete prefill), final hidden, audio-bearing full code frame and EOS main code. Unconsumed EOS residual codes are excluded. Does not substitute captured outputs into generation.",
     }
     (arguments.output_directory / "summary.json").write_text(
