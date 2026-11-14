@@ -59,9 +59,10 @@ def main() -> None:
     )
     arguments = parser.parse_args()
     if arguments.gemm1_profile is not None and (
-        arguments.gemm1_profile < 0 or arguments.control != ["checkpoint-reduction"]
+        arguments.gemm1_profile < 0
+        or arguments.control not in (["original"], ["checkpoint-reduction"])
     ):
-        raise ValueError("A GEMM1 profile requires only checkpoint-reduction control")
+        raise ValueError("A GEMM1 profile requires one native routed-expert control")
     else:
         pass
     if arguments.is_capture_disabled and (

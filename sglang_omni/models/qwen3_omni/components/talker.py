@@ -33,6 +33,7 @@ from sglang_omni.models.qwen3_omni.conditioning_capture import (
 )
 from sglang_omni.models.qwen3_omni.contribution_rounding import (
     install_contribution_provider,
+    install_gemm1_profile,
     shared_activation_fake,
 )
 from sglang_omni.models.qwen3_omni.hf_config import (
@@ -843,13 +844,16 @@ class Qwen3OmniTalker(nn.Module):
         contribution_source_directory = os.environ.get(
             "SGLANG_OMNI_DIAGNOSTIC_CONTRIBUTION_SOURCE"
         )
+        gemm1_profile = os.environ.get("SGLANG_OMNI_DIAGNOSTIC_GEMM1_PROFILE")
         if contribution_source_directory is not None:
             assert quant_config is None
-            gemm1_profile = os.environ.get("SGLANG_OMNI_DIAGNOSTIC_GEMM1_PROFILE")
             install_contribution_provider(
                 Path(contribution_source_directory),
                 int(gemm1_profile) if gemm1_profile is not None else None,
             )
+        elif gemm1_profile is not None:
+            assert quant_config is None
+            install_gemm1_profile(int(gemm1_profile))
         else:
             pass
 

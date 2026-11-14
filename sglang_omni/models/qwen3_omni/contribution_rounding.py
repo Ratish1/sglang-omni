@@ -70,22 +70,26 @@ def install_contribution_provider(
     if gemm1_profile is None:
         pass
     else:
-        tuner = AutoTuner.get()
-        original_choose_one = tuner.choose_one
+        install_gemm1_profile(gemm1_profile)
 
-        def choose_one(
-            custom_op: str,
-            runners: list[TunableRunner],
-            tuning_config: TuningConfig,
-            inputs: list[torch.Tensor | None],
-            **kernel_arguments: int,
-        ) -> tuple[TunableRunner, int | tuple[int, ...]]:
-            runner, tactic = original_choose_one(
-                custom_op, runners, tuning_config, inputs, **kernel_arguments
-            )
-            if custom_op == "trtllm::fused_moe::gemm1":
-                return runner, gemm1_profile
-            else:
-                return runner, tactic
 
-        tuner.choose_one = choose_one
+def install_gemm1_profile(gemm1_profile: int) -> None:
+    tuner = AutoTuner.get()
+    original_choose_one = tuner.choose_one
+
+    def choose_one(
+        custom_op: str,
+        runners: list[TunableRunner],
+        tuning_config: TuningConfig,
+        inputs: list[torch.Tensor | None],
+        **kernel_arguments: int,
+    ) -> tuple[TunableRunner, int | tuple[int, ...]]:
+        runner, tactic = original_choose_one(
+            custom_op, runners, tuning_config, inputs, **kernel_arguments
+        )
+        if custom_op == "trtllm::fused_moe::gemm1":
+            return runner, gemm1_profile
+        else:
+            return runner, tactic
+
+    tuner.choose_one = choose_one
