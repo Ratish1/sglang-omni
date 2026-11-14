@@ -57,6 +57,9 @@ def main() -> None:
     parser.add_argument("--capture-directory", type=Path, required=True)
     parser.add_argument("--model-path", required=True)
     parser.add_argument("--model-revision", required=True)
+    parser.add_argument(
+        "--attention-implementation", choices=("eager", "sdpa"), default="sdpa"
+    )
     parser.add_argument("--gpu", type=int, required=True)
     parser.add_argument("--output-directory", type=Path, required=True)
     arguments = parser.parse_args()
@@ -74,13 +77,17 @@ def main() -> None:
         config=configuration,
         dtype=torch.bfloat16,
         device_map={"": arguments.gpu},
-        attn_implementation="sdpa",
+        attn_implementation=arguments.attention_implementation,
         experts_implementation="eager",
         use_kernels=False,
         output_loading_info=True,
     )
     assert not loading["missing_keys"] and not loading["mismatched_keys"]
     reference.eval()
+    assert (
+        reference.model.config._attn_implementation
+        == arguments.attention_implementation
+    )
     audit_checkpoint_weights(
         reference,
         Path(
@@ -296,6 +303,7 @@ def main() -> None:
                     trace.write(json.dumps(row) + "\n")
             report = {
                 "request_id": directory.name,
+                "attention_implementation": reference.model.config._attn_implementation,
                 "cache_owner": cache_owner,
                 "frames": len(frames),
                 "maximum_pretruncation_kl": max(
