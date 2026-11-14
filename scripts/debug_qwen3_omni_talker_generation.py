@@ -175,6 +175,7 @@ def main() -> None:
     parser.add_argument("--output-directory", type=Path, required=True)
     arguments = parser.parse_args()
     if arguments.predictor_projection_normalization != "checkpoint":
+        assert arguments.dtype == "bfloat16"
         assert (
             arguments.native_predictor_capture_directory is None
             or arguments.checkpoint_residual_predictor
