@@ -80,6 +80,25 @@ inline constexpr int kGateUpTiles = kIntermediateSize / (kTileFeatures / 2);
 inline constexpr int kDownTiles = kHiddenSize / kTileFeatures;
 inline constexpr unsigned kComputeBarrierId = 1;
 
+// Stamp slots a CTA records in a QWEN3_TTS_PREDICTOR_STAMPS build: launch
+// points, then four points a phase, then lists indexed by item or chunk.
+inline constexpr int kStampCtas = 160;
+inline constexpr int kStampEntry = 0;
+inline constexpr int kStampPrimaryWaited = 1;
+inline constexpr int kStampExit = 2;
+inline constexpr int kStampPhaseBase = 4;
+inline constexpr int kStampPhaseReached = 0;
+inline constexpr int kStampPhaseSignaled = 1;
+inline constexpr int kStampPhaseWaited = 2;
+inline constexpr int kStampPhaseStaged = 3;
+inline constexpr int kStampPhasePoints = 4;
+inline constexpr int kStampListLength = 16;
+inline constexpr int kStampItemEnd = 24;
+inline constexpr int kStampChunkWait = kStampItemEnd + kStampListLength;
+inline constexpr int kStampChunkReady = kStampChunkWait + kStampListLength;
+inline constexpr int kStampChunkIssue = kStampChunkReady + kStampListLength;
+inline constexpr int kStampSlots = kStampChunkIssue + kStampListLength;
+
 struct LayerParams {
   const bf16_t *input;
   bf16_t *output;
@@ -202,6 +221,33 @@ SGL_DEVICE float round_bf16(float value) {
   return __bfloat162float(__float2bfloat16(value));
 }
 
+#ifdef QWEN3_TTS_PREDICTOR_STAMPS
+// note (ratish): Nsight Compute cannot replay a launch whose CTAs wait on each
+// other, so a debug build records the global timer and the SM clock instead.
+__device__ int64_t predictor_stamps[kStampCtas * kStampSlots * 2];
+
+SGL_DEVICE void record_stamp(int slot) {
+  if (blockIdx.x >= kStampCtas)
+    return;
+  uint64_t global_time;
+  asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(global_time));
+  int64_t *stamp = predictor_stamps + (blockIdx.x * kStampSlots + slot) * 2;
+  stamp[0] = static_cast<int64_t>(global_time);
+  stamp[1] = clock64();
+}
+#else
+SGL_DEVICE void record_stamp(int) {}
+#endif
+
+SGL_DEVICE void record_listed_stamp(int list, int index) {
+  if (index < kStampListLength)
+    record_stamp(list + index);
+}
+
+SGL_DEVICE void record_phase_stamp(int phase, int point) {
+  record_stamp(kStampPhaseBase + phase * kStampPhasePoints + point);
+}
+
 // note (ratish): the fence publishes what the other compute threads wrote
 // before the barrier that precedes this call, as a split-K arrive does.
 SGL_DEVICE void signal_phase(const LayerParams &params, int phase,
@@ -279,12 +325,16 @@ SGL_DEVICE void multiply_tile(int chunks, int operand_ksteps, int token_tiles,
                               uint8_t *ring, const uint8_t *operand,
                               float *partials, uint64_t *full_barriers,
                               uint64_t *empty_barriers, int &stage,
-                              uint32_t &full_parity, int warp_index,
-                              int lane_index) {
+                              uint32_t &full_parity, int first_chunk,
+                              int warp_index, int lane_index) {
   float accumulator[kMaxTokenTiles][4] = {};
   const uint32_t operand_address = shared_address(operand) + lane_index * 16;
   for (int chunk = 0; chunk < chunks; ++chunk) {
+    if (threadIdx.x == 0)
+      record_listed_stamp(kStampChunkWait, first_chunk + chunk);
     device::ptx::mbar_wait_parity(full_barriers + stage, full_parity);
+    if (threadIdx.x == 0)
+      record_listed_stamp(kStampChunkReady, first_chunk + chunk);
     const uint32_t chunk_address =
         shared_address(ring + stage * kChunkBytes) + lane_index * 16;
 #pragma unroll
@@ -553,6 +603,8 @@ __global__ __launch_bounds__(kThreads, 1) void predictor_layer_kernel(
     asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
   }
   __syncthreads();
+  if (threadIdx.x == 0)
+    record_stamp(kStampEntry);
 
   if (warp_index == kComputeWarps) {
     // Weights never depend on the previous kernel, so the producer streams
@@ -560,11 +612,14 @@ __global__ __launch_bounds__(kThreads, 1) void predictor_layer_kernel(
     if (lane_index == 0) {
       int stage = 0;
       uint32_t empty_parity = 1u;
+      int issued_chunks = 0;
       for (int index = 0; index < schedule_length; ++index) {
         const int phase = schedule[index] >> kScheduleTileBits;
         const int tile = schedule[index] & kScheduleTileMask;
         for (int chunk = 0; chunk < chunks_per_tile(phase); ++chunk) {
           device::ptx::mbar_wait_parity(empty_barriers + stage, empty_parity);
+          record_listed_stamp(kStampChunkIssue, issued_chunks);
+          issued_chunks += 1;
           device::ptx::mbar_arrive_expect_tx(full_barriers + stage,
                                              kChunkBytes);
           bulk_copy_to_shared(ring + stage * kChunkBytes,
@@ -580,21 +635,30 @@ __global__ __launch_bounds__(kThreads, 1) void predictor_layer_kernel(
     }
   } else {
     device::PDLWaitPrimary<kUsePDL>();
+    if (threadIdx.x == 0)
+      record_stamp(kStampPrimaryWaited);
     const int token_tiles = (params.rows + kTokenTileRows - 1) / kTokenTileRows;
     int stage = 0;
     uint32_t full_parity = 0u;
     int current_phase = -1;
     uint32_t phase_items = 0u;
+    int consumed_chunks = 0;
     for (int index = 0; index < schedule_length; ++index) {
       const int phase = schedule[index] >> kScheduleTileBits;
       const int tile = schedule[index] & kScheduleTileMask;
       if (phase != current_phase) {
-        if (current_phase >= 0 && threadIdx.x == 0)
+        if (threadIdx.x == 0)
+          record_phase_stamp(phase, kStampPhaseReached);
+        if (current_phase >= 0 && threadIdx.x == 0) {
           signal_phase(params, current_phase, phase_items);
+          record_phase_stamp(current_phase, kStampPhaseSignaled);
+        }
         if (phase > kPhaseQkv) {
           if (threadIdx.x == 0)
             wait_phase(params, phase - 1);
           compute_barrier();
+          if (threadIdx.x == 0)
+            record_phase_stamp(phase, kStampPhaseWaited);
         }
         if (phase == kPhaseQkv) {
           stage_operand(params, params.input, kHiddenSize,
@@ -614,6 +678,8 @@ __global__ __launch_bounds__(kThreads, 1) void predictor_layer_kernel(
                         lane_index);
         }
         compute_barrier();
+        if (threadIdx.x == 0)
+          record_phase_stamp(phase, kStampPhaseStaged);
         current_phase = phase;
         phase_items = 0u;
       }
@@ -624,18 +690,24 @@ __global__ __launch_bounds__(kThreads, 1) void predictor_layer_kernel(
         multiply_tile(chunks_per_tile(phase),
                       operand_depth(phase) / kKStepDepth, token_tiles, ring,
                       operand, partials, full_barriers, empty_barriers, stage,
-                      full_parity, warp_index, lane_index);
+                      full_parity, consumed_chunks, warp_index, lane_index);
+        consumed_chunks += chunks_per_tile(phase);
         compute_barrier();
         finish_tile(params, phase, tile, token_tiles, partials, row_scales);
       }
       // Every item ends on this barrier, so a signal after it covers all of the
       // item's stores.
       compute_barrier();
+      if (threadIdx.x == 0)
+        record_listed_stamp(kStampItemEnd, index);
       phase_items += 1u;
     }
     if (current_phase >= 0 && current_phase < kPhaseDown && threadIdx.x == 0) {
       signal_phase(params, current_phase, phase_items);
+      record_phase_stamp(current_phase, kStampPhaseSignaled);
     }
+    if (threadIdx.x == 0)
+      record_stamp(kStampExit);
   }
   // note (ratish): triggered only at exit, so a dependent grid cannot take an
   // SM that one of this grid's waiting producers still needs.
@@ -802,6 +874,25 @@ template <bool kUsePDL> struct PredictorLayer {
         .enable_pdl(kUsePDL)(kernel, params);
   }
 };
+
+#ifdef QWEN3_TTS_PREDICTOR_STAMPS
+struct PredictorStamps {
+  // Copies the stamps into a host int64 (ctas, slots, 2) tensor of global timer
+  // and SM clock pairs, then zeroes them for the next launch.
+  static void read(tvm::ffi::TensorView stamps) {
+    using namespace host;
+    TensorMatcher({kStampCtas, kStampSlots, 2})
+        .with_dtype<int64_t>()
+        .with_device<kDLCPU>()
+        .verify(stamps);
+    RuntimeDeviceCheck(cudaMemcpyFromSymbol(stamps.data_ptr(), predictor_stamps,
+                                            sizeof(predictor_stamps)));
+    void *device_stamps = nullptr;
+    RuntimeDeviceCheck(cudaGetSymbolAddress(&device_stamps, predictor_stamps));
+    RuntimeDeviceCheck(cudaMemset(device_stamps, 0, sizeof(predictor_stamps)));
+  }
+};
+#endif
 
 } // namespace qwen3_tts_predictor
 
