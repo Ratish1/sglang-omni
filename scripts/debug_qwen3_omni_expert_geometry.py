@@ -45,6 +45,11 @@ def main() -> None:
     parser.add_argument("--decompose-expert-slots", action="store_true")
     parser.add_argument("--contribution-reference-directory", type=Path)
     parser.add_argument("--contribution-source-directory", type=Path)
+    parser.add_argument(
+        "--contribution-arithmetic",
+        choices=("rounded-contributions", "checkpoint-reduction"),
+        default="rounded-contributions",
+    )
     arguments = parser.parse_args()
     arguments.output_directory.mkdir(exist_ok=False)
     if arguments.contribution_source_directory is not None:
@@ -257,7 +262,10 @@ def main() -> None:
                         ), (directory.name, frame, layer_index, "decomposed bytes")
                         rounded_outputs.append(
                             combine_expert_contributions(
-                                contributions, indices, weights, "rounded-contributions"
+                                contributions,
+                                indices,
+                                weights,
+                                arguments.contribution_arithmetic,
                             ).cpu()
                         )
                     else:
@@ -344,7 +352,7 @@ def main() -> None:
                     {
                         "records": records,
                         "scope": (
-                            "Diagnostic library versus independently saved BF16-contribution expectations from the original native library, every actual batch and original algorithm ID. No free-running quality or invalid-kernel claim."
+                            "Diagnostic library versus independently saved selected-arithmetic expectations from the original native library, every actual batch and original algorithm ID. No free-running quality or invalid-kernel claim."
                             if has_contribution_expectations
                             else "Captured native outputs, selected provider and actual held routing/algorithms, complete lifetimes and prefill rows. Optional contribution expectations must first reconstruct every original output exactly. No free-running quality or invalid-kernel claim."
                         ),
@@ -353,6 +361,7 @@ def main() -> None:
                             if arguments.contribution_source_directory is not None
                             else None
                         ),
+                        "contribution_arithmetic": arguments.contribution_arithmetic,
                     },
                     indent=2,
                 )
