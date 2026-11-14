@@ -79,6 +79,9 @@ def main() -> None:
     parser.add_argument("--native-expert-capture-directory", type=Path)
     parser.add_argument("--native-expert-profile-map", type=Path)
     parser.add_argument("--native-shared-expert", action="store_true")
+    parser.add_argument(
+        "--expert-output-arithmetic", choices=("native", "checkpoint"), default="native"
+    )
     parser.add_argument("--native-shared-gate-batches", action="store_true")
     parser.add_argument("--paired-native-expert-controls", action="store_true")
     parser.add_argument("--paired-native-attention-controls", action="store_true")
@@ -131,6 +134,10 @@ def main() -> None:
     )
     parser.add_argument("--output-directory", type=Path, required=True)
     arguments = parser.parse_args()
+    if arguments.expert_output_arithmetic == "checkpoint":
+        assert arguments.native_expert_capture_directory is not None
+    else:
+        pass
     if arguments.native_shared_gate_batches:
         assert arguments.native_expert_profile_map is not None
         assert arguments.native_shared_expert
@@ -242,6 +249,7 @@ def main() -> None:
             reference=reference,
             capture_directory=arguments.native_expert_capture_directory,
             route_precision=arguments.native_expert_route_precision,
+            output_arithmetic=arguments.expert_output_arithmetic,
             shared_enabled=arguments.native_shared_expert,
             is_shared_gate_batch_replay_enabled=arguments.native_shared_gate_batches,
         )
@@ -454,6 +462,7 @@ def main() -> None:
             if expert_control is not None:
                 expert_control.enabled = expert_mode == "fused"
                 expert_control.calls = 0
+                expert_control.kernel_calls = 0
                 expert_control.router_calls = 0
                 expert_control.routing_semantics = (
                     "reconstructed"
@@ -959,6 +968,11 @@ def main() -> None:
                     else 0
                 )
                 assert expert_control.calls == expected_calls
+                assert expert_control.kernel_calls == (
+                    expected_calls
+                    if arguments.expert_output_arithmetic == "native"
+                    else 0
+                )
                 assert expert_control.router_calls == (
                     expected_calls if expert_control.route_precision == "float32" else 0
                 )
@@ -1059,6 +1073,10 @@ def main() -> None:
                     attention_control.calls if attention_control is not None else 0
                 ),
                 "native_expert_route_precision": arguments.native_expert_route_precision,
+                "expert_output_arithmetic": arguments.expert_output_arithmetic,
+                "native_expert_kernel_calls": (
+                    expert_control.kernel_calls if expert_control else 0
+                ),
                 "native_expert_used_profiles": (
                     sorted(expert_control.used_profiles)
                     if expert_control is not None

@@ -32,9 +32,11 @@ class NativeTalkerExperts:
     reference: Qwen3OmniMoeTalkerForConditionalGeneration
     capture_directory: Path
     route_precision: Literal["checkpoint", "float32"]
+    output_arithmetic: Literal["native", "checkpoint"] = "native"
     enabled: bool = False
     calls: int = 0
     router_calls: int = 0
+    kernel_calls: int = 0
     routing_semantics: Literal[
         "reconstructed", "indices", "native", "rounded", "indices-rounded"
     ] = "reconstructed"
@@ -210,6 +212,11 @@ class NativeTalkerExperts:
         )
         packed, down = self.weights[layer_index]
         assert layer_index == self.calls % len(self.weights)
+        if self.output_arithmetic == "checkpoint":
+            self.calls += 1
+            return output
+        else:
+            pass
         if self.profiles is not None:
             profiles = (
                 self.profiles.prefill[layer_index]
@@ -236,4 +243,5 @@ class NativeTalkerExperts:
         assert torch.equal(replay_inputs, hidden_states)
         assert fused_output.shape == output.shape
         self.calls += 1
+        self.kernel_calls += 1
         return fused_output
