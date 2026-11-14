@@ -1,0 +1,125 @@
+[
+    {
+        "domain": "preprocessing",
+        "color": "0x1f77b4",
+        "module": "sglang_omni.models.qwen3_tts.request_builders",
+        "functions": [
+            "preprocess_qwen3_tts_payload",
+            "prepare_qwen3_tts_request",
+            "prepare_qwen3_tts_base_request",
+            "store_prepared_qwen3_tts_payload",
+            "Qwen3TTSRefCodeBatcher.encode",
+            "Qwen3TTSRefCodeBatcher.submit"
+        ]
+    },
+    {
+        "domain": "preprocessing",
+        "color": "0x1f77b4",
+        "module": "sglang_omni.models.qwen3_tts.speaker_encoder_cuda_graph",
+        "functions": [
+            "Qwen3TTSSpeakerEncoderCudaGraphRunner.embed",
+            "Qwen3TTSSpeakerEncoderCudaGraphRunner.mel"
+        ]
+    },
+    {
+        "domain": "preprocessing",
+        "color": "0x1f77b4",
+        "module": "sglang_omni.models.qwen3_tts.reference_encoder_cuda_graph",
+        "functions": [
+            "Qwen3TTSReferenceEncoderCudaGraphRunner.encode"
+        ]
+    },
+    {
+        "domain": "preprocessing",
+        "color": "0x1f77b4",
+        "module": "sglang_omni.models.qwen3_tts.sglang_model",
+        "functions": [
+            "Qwen3TTSPromptBuilderMixin.extract_speaker_embedding"
+        ]
+    },
+    {
+        "domain": "talker",
+        "color": "0xd62728",
+        "module": "sglang_omni.scheduling.omni_scheduler",
+        "functions": [
+            "OmniScheduler.recv_requests",
+            "OmniScheduler.process_input_requests",
+            "OmniScheduler.drain_request_build_results",
+            "OmniScheduler.enqueue_built_request",
+            "OmniScheduler.get_next_batch_to_run",
+            "OmniScheduler.process_batch_result",
+            "OmniScheduler.emit_stream_output",
+            "OmniScheduler.put_stream_messages",
+            "OmniScheduler.stream_output"
+        ]
+    },
+    {
+        "domain": "talker",
+        "color": "0xd62728",
+        "module": "sglang_omni.model_runner.base",
+        "functions": [
+            "ModelRunner.execute",
+            "ModelRunner.build_forward_batch",
+            "ModelRunner.prepare_and_forward",
+            "ModelRunner.ensure_next_token_ids",
+            "ModelRunner.publish_next_tokens",
+            "ModelRunner.finalize"
+        ]
+    },
+    {
+        "domain": "talker",
+        "color": "0xd62728",
+        "module": "sglang_omni.models.qwen3_tts.model_runner",
+        "functions": [
+            "Qwen3TTSModelRunner.before_prefill",
+            "Qwen3TTSModelRunner.before_decode",
+            "Qwen3TTSModelRunner.build_prefill_input_embeds",
+            "Qwen3TTSModelRunner.write_feedback_buffers",
+            "Qwen3TTSModelRunner.apply_codec_suppress_tokens",
+            "Qwen3TTSModelRunner.collect_codes",
+            "Qwen3TTSModelRunner.post_process_outputs"
+        ]
+    },
+    {
+        "domain": "talker",
+        "color": "0xd62728",
+        "module": "sglang_omni.models.qwen3_tts.sglang_model",
+        "functions": [
+            "Qwen3TTSTalker.prepare_decode_buffers",
+            "Qwen3TTSTalker.code_predictor_forward",
+            "Qwen3TTSTalker.forward"
+        ]
+    },
+    {
+        "domain": "talker",
+        "color": "0xd62728",
+        "module": "sglang_omni.models.qwen3_tts.request_builders",
+        "functions": [
+            "load_prepared_qwen3_tts_request",
+            "build_sglang_qwen3_tts_request",
+            "apply_sglang_qwen3_tts_result"
+        ]
+    },
+    {
+        "domain": "vocoder",
+        "color": "0x2ca02c",
+        "module": "sglang_omni.models.qwen3_tts.streaming_vocoder",
+        "functions": [
+            "Qwen3TTSStreamingVocoderScheduler.handle_message",
+            "Qwen3TTSStreamingVocoderScheduler.ingest",
+            "Qwen3TTSStreamingVocoderScheduler.handle_stream_done",
+            "Qwen3TTSStreamingVocoderScheduler.wait_for_first_chunks",
+            "Qwen3TTSStreamingVocoderScheduler.collect_followup_batch",
+            "Qwen3TTSStreamingVocoderScheduler.build_decode_plan",
+            "Qwen3TTSStreamingVocoderScheduler.wait_codes_ready",
+            "Qwen3TTSStreamingVocoderScheduler.launch_decode_plans",
+            "Qwen3TTSStreamingVocoderScheduler.launch_incremental_group",
+            "Qwen3TTSStreamingVocoderScheduler.finish_incremental_group",
+            "Qwen3TTSStreamingVocoderScheduler.commit_initial",
+            "Qwen3TTSStreamingVocoderScheduler.commit_followup",
+            "Qwen3TTSStreamingVocoderScheduler.finish_async_stream",
+            "Qwen3TTSDecodeHandle.resolve",
+            "Qwen3TTSDecodeHandle.wait_and_release"
+        ]
+    }
+]
