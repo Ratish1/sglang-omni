@@ -29,6 +29,7 @@ def main() -> None:
     parser.add_argument("--capture-token-rows", type=int, default=112)
     parser.add_argument("--capture-talker-operators", action="store_true")
     parser.add_argument("--capture-all-conditioning", action="store_true")
+    parser.add_argument("--contribution-source-directory", type=Path)
     parser.add_argument(
         "--reference-predictor-mode",
         choices=("identity", "checkpoint", "checkpoint-codes", "checkpoint-feedback"),
@@ -36,9 +37,22 @@ def main() -> None:
     parser.add_argument(
         "--control",
         action="append",
-        choices=("original", "rounded-activation", "rounded-routing"),
+        choices=(
+            "original",
+            "rounded-activation",
+            "rounded-routing",
+            "rounded-contributions",
+        ),
     )
     arguments = parser.parse_args()
+    if "rounded-contributions" in (arguments.control or ()):
+        assert arguments.contribution_source_directory is not None
+    elif arguments.contribution_source_directory is not None:
+        raise ValueError(
+            "Contribution source requires the rounded-contributions control"
+        )
+    else:
+        pass
     receiver_only = (
         arguments.capture_all_conditioning or arguments.capture_request_id is not None
     )
@@ -56,7 +70,12 @@ def main() -> None:
         )
     elif arguments.capture_request_id is not None and (
         arguments.control
-        not in (["original"], ["rounded-routing"], ["original", "rounded-routing"])
+        not in (
+            ["original"],
+            ["rounded-routing"],
+            ["rounded-contributions"],
+            ["original", "rounded-routing"],
+        )
         or arguments.reference_predictor_mode is not None
     ):
         raise ValueError("Selected receiver capture requires native Talker controls")
@@ -142,10 +161,16 @@ def main() -> None:
             }
         else:
             pass
-        if control == "rounded-routing":
+        if control in ("rounded-routing", "rounded-contributions"):
             diagnostic_environment[
                 "SGLANG_OMNI_DIAGNOSTIC_CHECKPOINT_ROUTING_WEIGHTS"
             ] = "1"
+        else:
+            pass
+        if control == "rounded-contributions":
+            diagnostic_environment["SGLANG_OMNI_DIAGNOSTIC_CONTRIBUTION_SOURCE"] = str(
+                arguments.contribution_source_directory
+            )
         else:
             pass
         if capture_request_ids:

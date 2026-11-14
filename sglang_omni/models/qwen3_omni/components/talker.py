@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import logging
 import os
+from pathlib import Path
 from typing import Iterable, Optional, Tuple
 
 import torch
@@ -28,6 +29,9 @@ from sglang_omni.models.qwen3_omni.components.thinker_model import (
 )
 from sglang_omni.models.qwen3_omni.conditioning_capture import (
     TalkerConditioningRecorder,
+)
+from sglang_omni.models.qwen3_omni.contribution_rounding import (
+    install_contribution_provider,
 )
 from sglang_omni.models.qwen3_omni.hf_config import (
     Qwen3OmniMoeTalkerConfig,
@@ -833,6 +837,15 @@ class Qwen3OmniTalker(nn.Module):
         else:
             self.root_config = config
         self.config = config
+
+        contribution_source_directory = os.environ.get(
+            "SGLANG_OMNI_DIAGNOSTIC_CONTRIBUTION_SOURCE"
+        )
+        if contribution_source_directory is not None:
+            assert quant_config is None
+            install_contribution_provider(Path(contribution_source_directory))
+        else:
+            pass
 
         # Projection MLPs (thinker hidden -> talker hidden)
         self.text_projection = ResizeMLP(
