@@ -213,7 +213,16 @@ class NsysSession:
         subprocess.run(["nsys", "stop", f"--session={self.name}"], check=True)
 
 
-def launch_server(tree: Path, mode: str, session: str, port: int, log: Path, profile_step: str | None) -> subprocess.Popen:
+def launch_server(
+    tree: Path,
+    mode: str,
+    session: str,
+    port: int,
+    log: Path,
+    profile_step: str | None,
+    ncu_filter: list[str],
+    server_args: list[str],
+) -> subprocess.Popen:
     environment = {
         **os.environ,
         "PYTHONPATH": f"{HERE / 'probe'}:{tree}",
@@ -234,6 +243,7 @@ def launch_server(tree: Path, mode: str, session: str, port: int, log: Path, pro
             "--graph-profiling",
             "node",
             *[f"--section={section}" for section in NCU_SECTIONS],
+            *ncu_filter,
             f"--export={log.parent / ('ncu_' + profile_step.replace(':', '_'))}",
             "--force-overwrite",
         ]
@@ -271,6 +281,7 @@ def launch_server(tree: Path, mode: str, session: str, port: int, log: Path, pro
         "0",
         "--vocoder.gpu",
         "0",
+        *server_args,
     ]
     with log.open("w") as handle:
         server = subprocess.Popen(
@@ -351,6 +362,9 @@ def main() -> None:
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--mode", choices=[*sorted(LAUNCH_OPTIONS), "none", "ncu"], required=True)
     parser.add_argument("--profile-step", help="MODE:BATCH:INDEX of the talker step Nsight Compute profiles")
+    parser.add_argument("--ncu-kernel-regex", help="profile only kernels whose name matches")
+    parser.add_argument("--ncu-launch-count", type=int, help="profile at most this many matching kernels")
+    parser.add_argument("--server-arg", action="append", default=[], help="extra serve argument, repeatable")
     parser.add_argument("--port", type=int, default=24100)
     parser.add_argument("--batch-sizes", type=int, nargs="+", default=list(BATCH_SIZES))
     parser.add_argument("--regimes", nargs="+", choices=["prefill", "decode"], default=["prefill", "decode"])
@@ -358,7 +372,25 @@ def main() -> None:
     args.out.mkdir(parents=True, exist_ok=True)
     references = References(args.out / "references")
     session_name = f"qwen3tts-{args.mode}"
-    server = launch_server(args.tree, args.mode, session_name, args.port, args.out / "server.log", args.profile_step)
+    ncu_filter = []
+    if args.ncu_kernel_regex is not None:
+        ncu_filter.append(f"--kernel-name=regex:{args.ncu_kernel_regex}")
+    else:
+        pass
+    if args.ncu_launch_count is not None:
+        ncu_filter.append(f"--launch-count={args.ncu_launch_count}")
+    else:
+        pass
+    server = launch_server(
+        args.tree,
+        args.mode,
+        session_name,
+        args.port,
+        args.out / "server.log",
+        args.profile_step,
+        ncu_filter,
+        args.server_arg,
+    )
     results = []
     try:
         wait_healthy(args.port, server)
