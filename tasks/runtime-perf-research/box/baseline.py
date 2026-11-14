@@ -836,8 +836,10 @@ def main() -> None:
         (out / "processes.txt").write_text(process_table(server.pid), encoding="utf-8")
         (out / "gpu_healthy.txt").write_text(gpu_snapshot(), encoding="utf-8")
         first = True
+        # note (ratish): --passes none boots the server for the --after command alone.
+        kinds = [] if args.passes == "none" else args.passes.split(",")
         for load in (int(item) for item in args.loads.split(",")):
-            for kind in args.passes.split(","):
+            for kind in kinds:
                 run_pass(args, server, load, kind, warmup=first)
                 first = False
         if args.after:
