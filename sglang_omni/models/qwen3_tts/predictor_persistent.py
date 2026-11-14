@@ -24,8 +24,7 @@ KSTEP_DEPTH = 16
 MAX_ROWS = 16
 KEY_VALUE_HEADS = 8
 SCHEDULE_TILE_BITS = 12
-# One event a phase; the down phase's hands a layer's output to the next layer's qkv.
-PHASE_EVENTS = 5
+PHASE_QKV = 0
 # Phases in launch order with their work item counts and weight chunks a tile.
 QKV_TILES = QKV_WIDTH // TILE_FEATURES
 OUTPUT_PROJECTION_TILES = HIDDEN_SIZE // TILE_FEATURES
@@ -49,11 +48,10 @@ class PredictorLayerWeights:
 
 @dataclass(frozen=True, kw_only=True)
 class PredictorSchedule:
-    """Each CTA's work items in launch order, encoded phase << 12 | tile, and the number of CTAs that wait on each phase."""
+    """Each CTA's work items in launch order, encoded phase << 12 | tile."""
 
     items: torch.Tensor
     lengths: torch.Tensor
-    phase_consumers: torch.Tensor
 
 
 def pack_weight_chunks(weight: torch.Tensor) -> torch.Tensor:
@@ -145,28 +143,22 @@ def build_predictor_schedule(
             phase_loads[cta] += max(chunks_per_tile, 1)
             chunk_loads[cta] += chunks_per_tile
             items[cta].append((phase << SCHEDULE_TILE_BITS) | tile)
+    # The kernel's epoch counter moves on after CTA 0's last item, which must depend on every
+    # CTA's qkv output so that every CTA has read the counter by then.
+    assert all(
+        any(item >> SCHEDULE_TILE_BITS == PHASE_QKV for item in cta_items)
+        for cta_items in items
+    ), "every CTA needs a qkv tile"
+    assert items[0][-1] >> SCHEDULE_TILE_BITS != PHASE_QKV, "CTA 0 must end past qkv"
     width = max(len(cta_items) for cta_items in items)
     encoded = torch.zeros(cta_count, width, dtype=torch.int16)
     for cta, cta_items in enumerate(items):
         encoded[cta, : len(cta_items)] = torch.tensor(cta_items, dtype=torch.int16)
-    # Event p is waited on by the CTAs holding phase p + 1; the down event by those holding qkv.
-    consumers = [
-        sum(
-            1
-            for cta_items in items
-            if any(
-                item >> SCHEDULE_TILE_BITS == (phase + 1) % PHASE_EVENTS
-                for item in cta_items
-            )
-        )
-        for phase in range(PHASE_EVENTS)
-    ]
     return PredictorSchedule(
         items=encoded.to(device),
         lengths=torch.tensor(
             [len(cta_items) for cta_items in items], dtype=torch.int32, device=device
         ),
-        phase_consumers=torch.tensor(consumers, dtype=torch.int32),
     )
 
 
@@ -187,7 +179,8 @@ def load_predictor_layer_module(use_pdl: bool) -> Module:
 
 
 class PersistentPredictorLayers:
-    """Launches a stack of predictor layers for up to 16 rows as one kernel; owns the phase scratch and counters, which every call reuses."""
+    """Launches a stack of predictor layers for up to 16 rows as one kernel; owns the handoff words and
+    the epoch counter, which every call reuses."""
 
     def __init__(
         self, device: torch.device, rope_cos_sin: torch.Tensor, norm_epsilon: float
@@ -196,24 +189,26 @@ class PersistentPredictorLayers:
         self.rope_cos_sin = rope_cos_sin.contiguous()
         self.norm_epsilon = norm_epsilon
         self.cta_count = torch.cuda.get_device_properties(device).multi_processor_count
-        self.qkv_scratch = torch.zeros(
-            MAX_ROWS, QKV_WIDTH, device=device, dtype=torch.bfloat16
+        # Each word holds two bf16 values and the epoch of the layer that wrote them; zeroed words
+        # carry epoch 0, which no layer writes.
+        self.qkv_words = torch.zeros(
+            MAX_ROWS, QKV_WIDTH // 2, device=device, dtype=torch.uint64
         )
-        self.attention_scratch = torch.zeros(
-            MAX_ROWS, ATTENTION_WIDTH, device=device, dtype=torch.bfloat16
+        self.attention_words = torch.zeros(
+            MAX_ROWS, ATTENTION_WIDTH // 2, device=device, dtype=torch.uint64
         )
-        self.middle_scratch = torch.zeros(
-            MAX_ROWS, HIDDEN_SIZE, device=device, dtype=torch.bfloat16
+        self.middle_words = torch.zeros(
+            MAX_ROWS, HIDDEN_SIZE // 2, device=device, dtype=torch.uint64
         )
-        self.activation_scratch = torch.zeros(
-            MAX_ROWS, INTERMEDIATE_SIZE, device=device, dtype=torch.bfloat16
+        self.activation_words = torch.zeros(
+            MAX_ROWS, INTERMEDIATE_SIZE // 2, device=device, dtype=torch.uint64
         )
         # Layers hand their output to the next through alternating halves.
-        self.hidden_scratch = torch.zeros(
-            2, MAX_ROWS, HIDDEN_SIZE, device=device, dtype=torch.bfloat16
+        self.hidden_words = torch.zeros(
+            2, MAX_ROWS, HIDDEN_SIZE // 2, device=device, dtype=torch.uint64
         )
-        # note (ratish): the counters reset themselves each launch, so they are zeroed once here.
-        self.phase_events = torch.zeros(PHASE_EVENTS, device=device, dtype=torch.uint32)
+        # The kernel advances it by the layer count every launch, so epochs never repeat.
+        self.epoch_counter = torch.zeros(1, device=device, dtype=torch.uint32)
         self.schedules: dict[int, PredictorSchedule] = {}
         self.module = load_predictor_layer_module(is_arch_support_pdl())
 
@@ -254,15 +249,14 @@ class PersistentPredictorLayers:
             self.rope_cos_sin,
             key_cache,
             value_cache,
-            self.qkv_scratch,
-            self.attention_scratch,
-            self.middle_scratch,
-            self.activation_scratch,
-            self.phase_events,
+            self.qkv_words,
+            self.attention_words,
+            self.middle_words,
+            self.activation_words,
+            self.hidden_words,
+            self.epoch_counter,
             schedule.items,
             schedule.lengths,
-            schedule.phase_consumers,
-            self.hidden_scratch,
             position,
             self.norm_epsilon,
         )
