@@ -296,9 +296,15 @@ def post_json(port: int, path: str, body: dict) -> dict:
 
 
 def run_event_pairs(
-    base: str, head: str, root: str, cells: list[tuple[str, int, int | None, bool]]
+    base: str,
+    head: str,
+    root: str,
+    cells: list[tuple[str, int, int | None, bool]],
+    server_env: dict[str, str] | None = None,
 ) -> None:
-    """Same-time pairs in both card orders, each request's first events recorded on both servers."""
+    """Same-time pairs in both card orders, each request's first events recorded on both
+    servers; server_env switches the boot probe on both, with a probe directory per side.
+    """
     for order in (0, 1):
         directory = RUN_DIRECTORY / root / f"order{order}"
         servers = []
@@ -306,11 +312,17 @@ def run_event_pairs(
             ports = {}
             for side, arm in (("base", base), ("head", head)):
                 card = order if side == "base" else 1 - order
+                switches = {"QWEN3_TTS_FIRST_EVENTS": "1"}
+                if server_env is not None:
+                    switches.update(server_env)
+                    switches["QWEN3_TTS_PROBE_DIR"] = str(directory / side / "probe")
+                else:
+                    pass
                 server, port = start_server(
                     arm,
                     card,
                     directory / f"serve_{side}.log",
-                    extra_env=probe_env(arm, QWEN3_TTS_FIRST_EVENTS="1"),
+                    extra_env=probe_env(arm, **switches),
                 )
                 servers.append(server)
                 ports[side] = (arm, port, server)
@@ -883,6 +895,8 @@ def main() -> None:
             "abort_rows",
             "cache_history",
             "other_model",
+            "events_c64_timed",
+            "events_c64_priority",
         ],
     )
     parser.add_argument("--arms", nargs="*", default=list(ARMS))
@@ -964,6 +978,25 @@ def main() -> None:
         run_cache_history("main13", "cache_history")
     elif arguments.phase == "other_model":
         run_other_model_identity(["main13", "pr"], "other_model")
+    elif arguments.phase == "events_c64_timed":
+        run_event_pairs(
+            "main13",
+            "pr",
+            "events_c64_timed",
+            [("stream_c64", 64, None, True)],
+            server_env={"QWEN3_TTS_TIME_PREPROCESSING": "1"},
+        )
+    elif arguments.phase == "events_c64_priority":
+        run_event_pairs(
+            "main13",
+            "pr",
+            "events_c64_priority",
+            [("stream_c64", 64, None, True)],
+            server_env={
+                "QWEN3_TTS_TIME_PREPROCESSING": "1",
+                "QWEN3_TTS_PREPROCESSING_PRIORITY": "greatest",
+            },
+        )
     else:
         run_pairs([("main", "stack"), ("m1", "m2")], [NONSTREAM_CELL])
 

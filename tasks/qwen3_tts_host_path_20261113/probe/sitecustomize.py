@@ -3,6 +3,9 @@
 QWEN3_TTS_FIRST_EVENTS=1 keeps one request event per request, stage and name: main sends a stream chunk
 per request per step where the step table sends one message, so recording every chunk would slow main more.
 QWEN3_TTS_PROBE_DIR samples the code table's free rows and holders and counts retraction replays.
+QWEN3_TTS_TIME_PREPROCESSING=1 records each preprocessing step's wall and thread CPU time per call.
+QWEN3_TTS_PREPROCESSING_PRIORITY=greatest moves in-process preprocessing to the device's greatest
+stream priority, the talker's.
 """
 
 import importlib.abc
@@ -11,14 +14,25 @@ import os
 import sys
 import threading
 import time
+from collections import defaultdict
 
 FIRST_EVENTS = os.environ.get("QWEN3_TTS_FIRST_EVENTS") == "1"
 PROBE_DIRECTORY = os.environ.get("QWEN3_TTS_PROBE_DIR")
+TIME_PREPROCESSING = os.environ.get("QWEN3_TTS_TIME_PREPROCESSING") == "1"
+PREPROCESSING_PRIORITY = os.environ.get("QWEN3_TTS_PREPROCESSING_PRIORITY")
 SAMPLE_INTERVAL_S = 1.0
+TIMING_DUMP_INTERVAL_S = 5.0
+TIMED_REQUEST_BUILDER_FUNCTIONS = (
+    "preprocess_qwen3_tts_payload",
+    "prepare_qwen3_tts_request",
+    "prepare_qwen3_tts_base_request",
+)
 
 tables = []
 replays = {"calls": 0, "frames": 0}
 sampler_started = threading.Event()
+timings = defaultdict(list)
+timing_dump_started = threading.Event()
 
 
 def keep_first_events(module):
@@ -93,6 +107,85 @@ def count_replays(module):
     runner_type.replayed_decode_inputs = replayed_counted
 
 
+def dump_timings():
+    os.makedirs(PROBE_DIRECTORY, exist_ok=True)
+    path = os.path.join(PROBE_DIRECTORY, f"timings_{os.getpid()}.json")
+    while True:
+        time.sleep(TIMING_DUMP_INTERVAL_S)
+        snapshot = {name: list(calls) for name, calls in list(timings.items())}
+        with open(path + ".tmp", "w") as sink:
+            json.dump(snapshot, sink)
+        os.replace(path + ".tmp", path)
+
+
+def timed(name, function):
+    """function, recording (start time, wall ns, thread CPU ns) per call under name."""
+
+    def run(*args, **kwargs):
+        if not timing_dump_started.is_set():
+            timing_dump_started.set()
+            threading.Thread(
+                target=dump_timings, name="timing-probe", daemon=True
+            ).start()
+        else:
+            pass
+        started = time.time()
+        wall = time.perf_counter_ns()
+        cpu = time.thread_time_ns()
+        try:
+            return function(*args, **kwargs)
+        finally:
+            timings[name].append(
+                (
+                    started,
+                    time.perf_counter_ns() - wall,
+                    time.thread_time_ns() - cpu,
+                )
+            )
+
+    return run
+
+
+def time_cache_keys(module):
+    keys_type = module.PromptRowCacheKeys
+    keys_type.key_ids = timed("key_ids", keys_type.key_ids)
+
+
+def patch_request_builders(module):
+    if TIME_PREPROCESSING:
+        for name in TIMED_REQUEST_BUILDER_FUNCTIONS:
+            setattr(module, name, timed(name, getattr(module, name)))
+    else:
+        pass
+    if PREPROCESSING_PRIORITY == "greatest":
+        raise_preprocessing_priority(module)
+    else:
+        pass
+
+
+def raise_preprocessing_priority(module):
+    import dataclasses
+
+    import torch
+
+    set_context = module.set_qwen3_tts_preprocessing_context
+
+    def set_context_raised(*args, **kwargs):
+        set_context(*args, **kwargs)
+        context = module._PREPROCESSING_CONTEXT
+        if context is None or context.stream is None:
+            return
+        else:
+            pass
+        device_module = torch.get_device_module(context.stream.device)
+        _, greatest = device_module.Stream.priority_range()
+        raised = device_module.Stream(device=context.stream.device, priority=greatest)
+        raised.wait_stream(context.stream)
+        module._PREPROCESSING_CONTEXT = dataclasses.replace(context, stream=raised)
+
+    module.set_qwen3_tts_preprocessing_context = set_context_raised
+
+
 class PatchAfterImport(importlib.abc.MetaPathFinder):
     """Runs a patch on a module right after its first import."""
 
@@ -135,6 +228,14 @@ else:
 if PROBE_DIRECTORY:
     PATCHES["sglang_omni.models.qwen3_tts.code_table"] = register_tables
     PATCHES["sglang_omni.models.qwen3_tts.model_runner"] = count_replays
+else:
+    pass
+if TIME_PREPROCESSING or PREPROCESSING_PRIORITY == "greatest":
+    PATCHES["sglang_omni.models.qwen3_tts.request_builders"] = patch_request_builders
+else:
+    pass
+if TIME_PREPROCESSING:
+    PATCHES["sglang_omni.preprocessing.cache_key"] = time_cache_keys
 else:
     pass
 if PATCHES:
