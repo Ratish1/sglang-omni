@@ -58,6 +58,15 @@ LAUNCH_OPTIONS = {
         "--python-sampling=true",
     ],
 }
+NCU_SECTIONS = (
+    "SpeedOfLight",
+    "MemoryWorkloadAnalysis",
+    "ComputeWorkloadAnalysis",
+    "LaunchStats",
+    "Occupancy",
+    "SchedulerStats",
+    "WarpStateStats",
+)
 START_OPTIONS = {
     "light": ["--sample=none", "--cpuctxsw=none"],
     "timing": [
@@ -204,7 +213,7 @@ class NsysSession:
         subprocess.run(["nsys", "stop", f"--session={self.name}"], check=True)
 
 
-def launch_server(tree: Path, mode: str, session: str, port: int, log: Path) -> subprocess.Popen:
+def launch_server(tree: Path, mode: str, session: str, port: int, log: Path, profile_step: str | None) -> subprocess.Popen:
     environment = {
         **os.environ,
         "PYTHONPATH": f"{HERE / 'probe'}:{tree}",
@@ -213,6 +222,21 @@ def launch_server(tree: Path, mode: str, session: str, port: int, log: Path) -> 
     }
     if mode == "none":
         profiler = []
+    elif mode == "ncu":
+        assert profile_step is not None, "ncu mode profiles one step named by --profile-step"
+        environment["QWEN3_TTS_PROFILE_STEP"] = profile_step
+        profiler = [
+            "ncu",
+            "--profile-from-start",
+            "off",
+            "--target-processes",
+            "all",
+            "--graph-profiling",
+            "node",
+            *[f"--section={section}" for section in NCU_SECTIONS],
+            f"--export={log.parent / ('ncu_' + profile_step.replace(':', '_'))}",
+            "--force-overwrite",
+        ]
     elif mode == "attribution":
         # note (ratish): nsys takes one function list, and graph nodes take the names of the ranges open when they were captured.
         merged = log.parent / "marks_attribution.json"
@@ -325,7 +349,8 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--tree", type=Path, required=True)
     parser.add_argument("--out", type=Path, required=True)
-    parser.add_argument("--mode", choices=[*sorted(LAUNCH_OPTIONS), "none"], required=True)
+    parser.add_argument("--mode", choices=[*sorted(LAUNCH_OPTIONS), "none", "ncu"], required=True)
+    parser.add_argument("--profile-step", help="MODE:BATCH:INDEX of the talker step Nsight Compute profiles")
     parser.add_argument("--port", type=int, default=24100)
     parser.add_argument("--batch-sizes", type=int, nargs="+", default=list(BATCH_SIZES))
     parser.add_argument("--regimes", nargs="+", choices=["prefill", "decode"], default=["prefill", "decode"])
@@ -333,7 +358,7 @@ def main() -> None:
     args.out.mkdir(parents=True, exist_ok=True)
     references = References(args.out / "references")
     session_name = f"qwen3tts-{args.mode}"
-    server = launch_server(args.tree, args.mode, session_name, args.port, args.out / "server.log")
+    server = launch_server(args.tree, args.mode, session_name, args.port, args.out / "server.log", args.profile_step)
     results = []
     try:
         wait_healthy(args.port, server)
@@ -341,7 +366,7 @@ def main() -> None:
         for batch_size in args.batch_sizes:
             run_prefill_cell(args.port, references, batch_size, None, f"warm_prefill_bs{batch_size}")
             run_decode_cell(args.port, references, batch_size, 64, None, f"warm_decode_bs{batch_size}")
-        sessions = [None] if args.mode == "none" else [None, session]
+        sessions = [None] if args.mode in ("none", "ncu") else [None, session]
         for batch_size in args.batch_sizes:
             for cell_session in sessions:
                 prefix = "plain_" if cell_session is None else ""
