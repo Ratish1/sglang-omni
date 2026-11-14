@@ -23,7 +23,9 @@ from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import (
 from scripts.qwen3_omni_talker_expert_runtime import (
     NativeRuntime,
     ObservedExpertProfiles,
+    combine_expert_contributions,
     load_native_expert_weights,
+    native_expert_contributions,
 )
 
 
@@ -32,7 +34,13 @@ class NativeTalkerExperts:
     reference: Qwen3OmniMoeTalkerForConditionalGeneration
     capture_directory: Path
     route_precision: Literal["checkpoint", "float32"]
-    output_arithmetic: Literal["native", "checkpoint"] = "native"
+    output_arithmetic: Literal[
+        "native",
+        "checkpoint",
+        "rounded-contributions",
+        "bf16-reduction",
+        "checkpoint-reduction",
+    ] = "native"
     enabled: bool = False
     calls: int = 0
     router_calls: int = 0
@@ -242,6 +250,24 @@ class NativeTalkerExperts:
         )[0]
         assert torch.equal(replay_inputs, hidden_states)
         assert fused_output.shape == output.shape
+        if self.output_arithmetic in (
+            "rounded-contributions",
+            "bf16-reduction",
+            "checkpoint-reduction",
+        ):
+            contributions = native_expert_contributions(
+                hidden_states, indices, packed, down, self.runtime, profiles
+            )
+            reproduced = combine_expert_contributions(
+                contributions, indices, weights, "native"
+            )
+            assert torch.equal(reproduced, fused_output), (layer_index, self.calls)
+            fused_output = combine_expert_contributions(
+                contributions, indices, weights, self.output_arithmetic
+            )
+            self.kernel_calls += len(contributions)
+        else:
+            pass
         self.calls += 1
         self.kernel_calls += 1
         return fused_output

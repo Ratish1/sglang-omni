@@ -25,7 +25,9 @@ from scripts.qwen3_omni_checkpoint_weights import audit_checkpoint_weights
 from scripts.qwen3_omni_talker_expert_runtime import (
     NativeRuntime,
     TacticChoice,
+    combine_expert_contributions,
     load_native_expert_weights,
+    native_expert_contributions,
 )
 
 
@@ -194,19 +196,20 @@ def main() -> None:
                         assert torch.equal(
                             selected_weights, selected_weights.bfloat16().float()
                         )
-                        combined = torch.zeros_like(
-                            expected[start:stop], dtype=torch.float32
+                        contributions = native_expert_contributions(
+                            hidden_states[start:stop],
+                            indices[start:stop],
+                            packed,
+                            down,
+                            runtime,
+                            (profiles[0], profiles[1]),
                         )
-                        for slot in range(indices.shape[1]):
-                            contribution = replay_experts(
-                                hidden_states[start:stop],
-                                indices[start:stop, slot : slot + 1],
-                                torch.ones_like(selected_weights[:, slot : slot + 1]),
-                            )
-                            combined += (
-                                contribution.float()
-                                * selected_weights[:, slot : slot + 1]
-                            )
+                        combined = combine_expert_contributions(
+                            contributions,
+                            indices[start:stop],
+                            selected_weights,
+                            "native",
+                        )
                         decomposed = asdict(
                             compare_tensors(expected[start:stop], combined.bfloat16())
                         )

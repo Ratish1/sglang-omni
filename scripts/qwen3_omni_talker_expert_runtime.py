@@ -4,8 +4,11 @@ from __future__ import annotations
 
 import hashlib
 from pathlib import Path
+from typing import Literal
 
 import torch
+from flashinfer.fused_moe import cutlass_fused_moe
+from flashinfer.fused_moe.core import ActivationType
 from pydantic import BaseModel
 from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import (
     Qwen3OmniMoeTalkerForConditionalGeneration,
@@ -51,6 +54,75 @@ class ObservedExpertProfiles(BaseModel):
 class ObservedExpertProfileMap(BaseModel):
     profiles: dict[str, ObservedExpertProfiles]
     scope: str
+
+
+def native_expert_contributions(
+    hidden_states: torch.Tensor,
+    indices: torch.Tensor,
+    packed_weights: torch.Tensor,
+    down_weights: torch.Tensor,
+    runtime: NativeRuntime,
+    profiles: tuple[int, int],
+) -> list[torch.Tensor]:
+    assert not runtime.use_fused_finalize
+    contributions = []
+    for slot in range(indices.shape[1]):
+        replay_inputs = hidden_states.contiguous().clone()
+        contributions.append(
+            cutlass_fused_moe(
+                input=replay_inputs,
+                token_selected_experts=indices[:, slot : slot + 1]
+                .to(torch.int32)
+                .contiguous(),
+                token_final_scales=torch.ones(
+                    (len(hidden_states), 1),
+                    dtype=torch.float32,
+                    device=hidden_states.device,
+                ),
+                fc1_expert_weights=packed_weights,
+                fc2_expert_weights=down_weights,
+                output_dtype=torch.bfloat16,
+                quant_scales=None,
+                activation_type=ActivationType.Swiglu,
+                tune_max_num_tokens=runtime.tune_max_num_tokens,
+                use_fused_finalize=runtime.use_fused_finalize,
+                profile_ids=list(profiles),
+            )[0]
+        )
+        assert torch.equal(replay_inputs, hidden_states)
+    return contributions
+
+
+def combine_expert_contributions(
+    contributions: list[torch.Tensor],
+    indices: torch.Tensor,
+    weights: torch.Tensor,
+    semantics: Literal[
+        "native", "rounded-contributions", "bf16-reduction", "checkpoint-reduction"
+    ],
+) -> torch.Tensor:
+    assert len(contributions) == indices.shape[1] == weights.shape[1]
+    assert torch.equal(weights, weights.bfloat16().float())
+    selected = torch.stack(contributions, dim=1)
+    if semantics == "checkpoint-reduction":
+        order = indices.argsort(dim=1)
+        selected = selected.gather(1, order[:, :, None].expand_as(selected))
+        weights = weights.gather(1, order)
+    else:
+        pass
+    dtype = (
+        torch.float32
+        if semantics in ("native", "rounded-contributions")
+        else torch.bfloat16
+    )
+    combined = torch.zeros_like(contributions[0], dtype=dtype)
+    for slot in range(len(contributions)):
+        weighted = selected[:, slot].float() * weights[:, slot : slot + 1]
+        if semantics == "native":
+            combined += weighted
+        else:
+            combined += weighted.bfloat16().to(dtype)
+    return combined.bfloat16()
 
 
 def load_native_expert_weights(

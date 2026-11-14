@@ -80,7 +80,15 @@ def main() -> None:
     parser.add_argument("--native-expert-profile-map", type=Path)
     parser.add_argument("--native-shared-expert", action="store_true")
     parser.add_argument(
-        "--expert-output-arithmetic", choices=("native", "checkpoint"), default="native"
+        "--expert-output-arithmetic",
+        choices=(
+            "native",
+            "checkpoint",
+            "rounded-contributions",
+            "bf16-reduction",
+            "checkpoint-reduction",
+        ),
+        default="native",
     )
     parser.add_argument("--native-shared-gate-batches", action="store_true")
     parser.add_argument("--paired-native-expert-controls", action="store_true")
@@ -134,7 +142,7 @@ def main() -> None:
     )
     parser.add_argument("--output-directory", type=Path, required=True)
     arguments = parser.parse_args()
-    if arguments.expert_output_arithmetic == "checkpoint":
+    if arguments.expert_output_arithmetic != "native":
         assert arguments.native_expert_capture_directory is not None
     else:
         pass
@@ -968,11 +976,15 @@ def main() -> None:
                     else 0
                 )
                 assert expert_control.calls == expected_calls
-                assert expert_control.kernel_calls == (
-                    expected_calls
-                    if arguments.expert_output_arithmetic == "native"
-                    else 0
-                )
+                if arguments.expert_output_arithmetic == "native":
+                    expected_kernel_calls = expected_calls
+                elif arguments.expert_output_arithmetic == "checkpoint":
+                    expected_kernel_calls = 0
+                else:
+                    expected_kernel_calls = expected_calls * (
+                        1 + config.text_config.num_experts_per_tok
+                    )
+                assert expert_control.kernel_calls == expected_kernel_calls
                 assert expert_control.router_calls == (
                     expected_calls if expert_control.route_precision == "float32" else 0
                 )
