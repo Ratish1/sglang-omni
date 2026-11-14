@@ -28,6 +28,7 @@ TIMED_REQUEST_BUILDER_FUNCTIONS = (
     "prepare_qwen3_tts_request",
     "prepare_qwen3_tts_base_request",
 )
+TIMED_BATCHER_METHODS = ("encode", "encode_waveform", "synchronize_outcomes")
 
 tables = []
 replays = {"calls": 0, "frames": 0}
@@ -162,6 +163,9 @@ def time_prompt_builder(module):
     builder_type.build_voice_clone_inputs = timed(
         "build_voice_clone_inputs", builder_type.build_voice_clone_inputs
     )
+    builder_type.extract_speaker_embedding = timed(
+        "extract_speaker_embedding", builder_type.extract_speaker_embedding
+    )
 
 
 def gauge_gil():
@@ -185,6 +189,15 @@ def patch_request_builders(module):
     if TIME_PREPROCESSING:
         for name in TIMED_REQUEST_BUILDER_FUNCTIONS:
             setattr(module, name, timed(name, getattr(module, name)))
+        batcher_type = module.Qwen3TTSRefCodeBatcher
+        for name in TIMED_BATCHER_METHODS:
+            setattr(
+                batcher_type,
+                name,
+                timed(f"batcher.{name}", getattr(batcher_type, name)),
+            )
+        hook_type = module.Qwen3TTSAdhocReferenceHook
+        hook_type.encode_one = timed("hook.encode_one", hook_type.encode_one)
         threading.Thread(target=gauge_gil, name="gil-gauge", daemon=True).start()
     else:
         pass
