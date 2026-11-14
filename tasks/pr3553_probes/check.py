@@ -30,11 +30,16 @@ DIRECTORY = Path("/data/pr3553-review-20261114")
 
 
 def reference_module(filename: str):
-    path = Path(__file__).parent / "reference" / filename
-    specification = importlib.util.spec_from_file_location(path.stem, path)
-    module = importlib.util.module_from_spec(specification)
-    specification.loader.exec_module(module)
-    return module
+    directory = Path(__file__).parent / "reference"
+    if "pr3553_reference" not in sys.modules:
+        specification = importlib.util.spec_from_file_location(
+            "pr3553_reference", directory / "__init__.py",
+            submodule_search_locations=[str(directory)],
+        )
+        module = importlib.util.module_from_spec(specification)
+        sys.modules["pr3553_reference"] = module
+        specification.loader.exec_module(module)
+    return importlib.import_module(f"pr3553_reference.{Path(filename).stem}")
 
 
 @torch.inference_mode()
@@ -117,6 +122,8 @@ def numerical() -> None:
     conditioning = prefix + codec + [151852]
     latent = torch.randn(16, 64, device="cuda", dtype=torch.bfloat16)
     chunk = AcousticChunk(runtime.model, conditioning, latent.cpu().float())
+    nar = reference_module("nar.py")
+    cached_reference = nar.CachedNAR(reference, nar.Chunk(conditioning, latent.cpu().float()))
     tokens = torch.tensor(
         [conditioning + [184621] + [184623] * 16 + [184622]], device="cuda"
     )
@@ -140,7 +147,13 @@ def numerical() -> None:
             "relative_rms": relative,
             "max_absolute_error": float((actual - expected).abs().max()),
         }
-        assert relative < 0.01
+        cached_expected = cached_reference.velocity(latent, raw_time)
+        results[f"cached_nar_time_{raw_time}"] = {
+            "relative_rms": float((actual.float() - cached_expected.float()).square().mean().sqrt() / cached_expected.float().square().mean().sqrt()),
+            "max_absolute_error": float((actual - cached_expected).abs().max()),
+        }
+        print(json.dumps(results, indent=2), flush=True)
+        torch.testing.assert_close(actual, cached_expected, rtol=0, atol=0)
     reference_vae = reference_module("modeling_vae.py")
     with torch.device("meta"):
         decoder = reference_vae.OobleckDecoder(
