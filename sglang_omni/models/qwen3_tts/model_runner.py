@@ -31,7 +31,7 @@ from sglang_omni.utils.device import has_device_streams
 
 if TYPE_CHECKING:
     from sglang.srt.layers.logits_processor import LogitsProcessorOutput
-    from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
+    from sglang.srt.managers.schedule_batch import ScheduleBatch
     from sglang.srt.managers.scheduler import GenerationBatchResult
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
@@ -112,20 +112,10 @@ class Qwen3TTSModelRunner(ModelRunner):
     def model_info(self) -> Qwen3TTSModelInfo:
         return {"predictor_cuda_graph": self.model.predictor_graph_stats()}
 
-    def admission_capacity(self, waiting_queue: list[Req]) -> int:
-        # note (ratish): a retracted request keeps its row, which its stream and result
-        # still read, so like SGLang's held rows it takes no free one.
-        free_row_count = self.code_table.free_row_count()
-        new_request_count = 0
-        row_holding_count = 0
-        for queued_request in waiting_queue:
-            if queued_request.omni_data.code_row is not None:
-                row_holding_count += 1
-            elif new_request_count < free_row_count:
-                new_request_count += 1
-            else:
-                break
-        return new_request_count + row_holding_count
+    def admission_capacity(self) -> int:
+        # note (ratish): as SGLang caps admission by free request rows; a request that keeps
+        # its row (retracted, a later chunk) counts too, which only makes admission stricter.
+        return self.code_table.free_row_count()
 
     def enable_stream_steps(self, target: str) -> bool:
         self.stream_step_target = target

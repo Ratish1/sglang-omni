@@ -1006,10 +1006,8 @@ class ModelRunner(Generic[RequestDataInput]):
         """Model-specific entries the model_info admin action adds to the worker's."""
         return {}
 
-    def admission_capacity(self, waiting_queue: list[Req]) -> int | None:
-        """How many queued requests, in queue order, the runner's own per-request state
-        can take: those already holding theirs, and new ones while it lasts; or None."""
-        del waiting_queue
+    def admission_capacity(self) -> int | None:
+        """How many more requests the runner's own per-request state can take, or None."""
         return None
 
     def enable_stream_steps(self, target: str) -> bool:

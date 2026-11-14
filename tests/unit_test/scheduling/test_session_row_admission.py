@@ -200,7 +200,7 @@ def test_without_continuation_aware_admission_no_free_row_admits_nothing() -> No
 
 def test_plain_requests_stop_at_the_runner_admission_capacity() -> None:
     scheduler = AdmissionScheduler(request_rows=5, continuation_aware_admission=False)
-    scheduler.model_runner = SimpleNamespace(admission_capacity=lambda waiting_queue: 2)
+    scheduler.model_runner = SimpleNamespace(admission_capacity=lambda: 2)
     for index in range(4):
         scheduler.queue_request(f"plain-{index}")
 
