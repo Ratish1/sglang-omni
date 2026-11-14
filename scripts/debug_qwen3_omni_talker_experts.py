@@ -41,6 +41,7 @@ class NativeTalkerExperts:
         "bf16-reduction",
         "checkpoint-reduction",
     ] = "native"
+    native_output_arithmetic: Literal["native", "rounded-contributions"] = "native"
     enabled: bool = False
     calls: int = 0
     router_calls: int = 0
@@ -267,9 +268,12 @@ class NativeTalkerExperts:
                 hidden_states, indices, packed, down, self.runtime, profiles
             )
             reproduced = combine_expert_contributions(
-                contributions, indices, weights, "native"
+                contributions, indices, weights, self.native_output_arithmetic
             )
-            assert torch.equal(reproduced, fused_output), (layer_index, self.calls)
+            assert torch.equal(
+                reproduced.contiguous().view(torch.uint8),
+                fused_output.contiguous().view(torch.uint8),
+            ), (layer_index, self.calls)
             fused_output = combine_expert_contributions(
                 contributions, indices, weights, self.output_arithmetic
             )

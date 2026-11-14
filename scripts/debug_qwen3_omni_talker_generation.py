@@ -36,6 +36,9 @@ from scripts.qwen3_omni_talker_rotary import NativeBackboneRotary
 from sglang_omni.models.qwen3_omni.components.talker_prefill import (
     load_thinker_embedding_rows,
 )
+from sglang_omni.models.qwen3_omni.contribution_rounding import (
+    install_contribution_provider,
+)
 from sglang_omni.sampling.seed import SAMPLING_SEED_MASK
 
 
@@ -78,6 +81,12 @@ def main() -> None:
     parser.add_argument("--native-predictor-capture-directory", type=Path)
     parser.add_argument("--native-expert-capture-directory", type=Path)
     parser.add_argument("--native-expert-profile-map", type=Path)
+    parser.add_argument("--contribution-source-directory", type=Path)
+    parser.add_argument(
+        "--native-output-arithmetic",
+        choices=("native", "rounded-contributions"),
+        default="native",
+    )
     parser.add_argument("--native-shared-expert", action="store_true")
     parser.add_argument(
         "--expert-output-arithmetic",
@@ -143,6 +152,15 @@ def main() -> None:
     )
     parser.add_argument("--output-directory", type=Path, required=True)
     arguments = parser.parse_args()
+    if arguments.contribution_source_directory is not None:
+        assert arguments.native_expert_capture_directory is not None
+        install_contribution_provider(arguments.contribution_source_directory)
+    elif arguments.native_output_arithmetic != "native":
+        raise ValueError(
+            "Captured contribution arithmetic requires its native provider"
+        )
+    else:
+        pass
     if arguments.shared_gate_decode_rows is not None:
         assert arguments.native_shared_gate_batches
         assert arguments.shared_gate_decode_rows > 0
@@ -264,6 +282,7 @@ def main() -> None:
             capture_directory=arguments.native_expert_capture_directory,
             route_precision=arguments.native_expert_route_precision,
             output_arithmetic=arguments.expert_output_arithmetic,
+            native_output_arithmetic=arguments.native_output_arithmetic,
             shared_enabled=arguments.native_shared_expert,
             is_shared_gate_batch_replay_enabled=arguments.native_shared_gate_batches,
             shared_gate_decode_rows=arguments.shared_gate_decode_rows,
@@ -1093,6 +1112,12 @@ def main() -> None:
                 ),
                 "native_expert_route_precision": arguments.native_expert_route_precision,
                 "expert_output_arithmetic": arguments.expert_output_arithmetic,
+                "native_output_arithmetic": arguments.native_output_arithmetic,
+                "contribution_source_directory": (
+                    str(arguments.contribution_source_directory)
+                    if arguments.contribution_source_directory is not None
+                    else None
+                ),
                 "native_expert_kernel_calls": (
                     expert_control.kernel_calls if expert_control else 0
                 ),
