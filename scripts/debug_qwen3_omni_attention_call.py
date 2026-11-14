@@ -125,6 +125,8 @@ def main() -> None:
                 "trimmed-page-table",
                 "single-full-page-table",
                 "single-trimmed-page-table",
+                "full-page-table-one-split",
+                "trimmed-page-table-two-splits",
                 "retained-repeat",
             ):
                 is_single = name.startswith("single-")
@@ -168,7 +170,15 @@ def main() -> None:
                     causal=True,
                     window_size=(-1, -1),
                     softcap=float(observed["attention_logit_cap"]),
-                    num_splits=int(observed["attention_decode_split_count"]),
+                    num_splits=(
+                        1
+                        if name == "full-page-table-one-split"
+                        else (
+                            2
+                            if name == "trimmed-page-table-two-splits"
+                            else int(observed["attention_decode_split_count"])
+                        )
+                    ),
                     scheduler_metadata=scheduler_metadata,
                     ver=int(observed["attention_version"]),
                 )
