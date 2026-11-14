@@ -979,7 +979,15 @@ def main() -> None:
                             .unsqueeze(0)
                             .to(reference.device)
                         )
-                        assert torch.equal(restored_logits.float(), expected_logits)
+                        assert torch.equal(
+                            expected_logits.isneginf(), ~allowed_tokens[None]
+                        )
+                        assert torch.equal(
+                            restored_logits.float().masked_fill(
+                                ~allowed_tokens[None], float("-inf")
+                            ),
+                            expected_logits,
+                        )
                         output.hidden_states[0][-1][:, -1].copy_(hidden)
                         output.logits[:, -1].copy_(restored_logits)
                         restored_prefill_query = True
