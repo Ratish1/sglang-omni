@@ -51,6 +51,8 @@ class NativeTalkerExperts:
     enabled: bool = False
     calls: int = 0
     router_calls: int = 0
+    is_routing_capture_enabled: bool = False
+    routing_snapshots: list[dict[str, torch.Tensor]] = field(default_factory=list)
     kernel_calls: int = 0
     routing_semantics: Literal[
         "reconstructed", "indices", "native", "rounded", "indices-rounded"
@@ -215,6 +217,17 @@ class NativeTalkerExperts:
             else:
                 pass
             self.router_calls += 1
+            if self.is_routing_capture_enabled:
+                self.routing_snapshots.append(
+                    {
+                        "normalized_inputs": inputs[0].detach().cpu().clone(),
+                        "logits": logits.detach().cpu().clone(),
+                        "weights": weights.detach().cpu().clone(),
+                        "indices": indices.detach().cpu().clone(),
+                    }
+                )
+            else:
+                pass
             return logits, weights, indices
         else:
             return output

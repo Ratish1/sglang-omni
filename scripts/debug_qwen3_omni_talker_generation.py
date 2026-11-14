@@ -403,6 +403,7 @@ def main() -> None:
             is_shared_gate_batch_replay_enabled=arguments.native_shared_gate_batches,
             shared_gate_decode_rows=arguments.shared_gate_decode_rows,
             gemm1_profile=arguments.expert_gemm1_profile,
+            is_routing_capture_enabled=arguments.capture_layer_states,
         )
         expert_control.install()
     else:
@@ -922,6 +923,10 @@ def main() -> None:
                 if arguments.capture_layer_states:
                     captured_inputs = prepared_inputs["inputs_embeds"].detach().cpu()
                     captured_positions = prepared_inputs["position_ids"].detach().cpu()
+                    if expert_control is not None:
+                        expert_control.routing_snapshots.clear()
+                    else:
+                        pass
                 else:
                     pass
                 output = reference(**prepared_inputs)
@@ -1036,6 +1041,11 @@ def main() -> None:
                             ],
                             "keys": keys,
                             "values": values,
+                            "routed_experts": (
+                                expert_control.routing_snapshots
+                                if expert_control is not None
+                                else []
+                            ),
                         },
                         case_directory / f"{frame_index:04d}-layers.pt",
                     )
