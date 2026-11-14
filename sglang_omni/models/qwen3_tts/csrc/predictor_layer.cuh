@@ -561,20 +561,23 @@ SGL_DEVICE void finish_tile(const LayerParams &params, int phase, int tile,
   }
 }
 
-// RMS norm over one head held four values a lane (dims lane + 32 i), then neox
-// rope at the cache position, each step rounded to bf16 where the fused Triton
-// layer rounds.
-SGL_DEVICE void norm_and_rotate_head(float (&values)[4],
+SGL_DEVICE float sum_of_squares(const float (&values)[4]) {
+  float total = 0.0f;
+#pragma unroll
+  for (int i = 0; i < 4; ++i) {
+    total += values[i] * values[i];
+  }
+  return total;
+}
+
+// RMS norm with the head's summed squares, then neox rope at the cache
+// position, over one head held four values a lane (dims lane + 32 i), each step
+// rounded to bf16 where the fused Triton layer rounds.
+SGL_DEVICE void norm_and_rotate_head(float (&values)[4], float head_sum,
                                      const bf16_t *norm_weight,
                                      const float *angles, float norm_epsilon,
                                      int lane_index) {
-  float sum_of_squares = 0.0f;
-#pragma unroll
-  for (int i = 0; i < 4; ++i) {
-    sum_of_squares += values[i] * values[i];
-  }
-  const float scale = rsqrtf(
-      device::warp::reduce_sum(sum_of_squares) / kHeadDim + norm_epsilon);
+  const float scale = rsqrtf(head_sum / kHeadDim + norm_epsilon);
 #pragma unroll
   for (int i = 0; i < 4; ++i) {
     values[i] = round_bf16(values[i] * scale *
@@ -720,12 +723,21 @@ SGL_DEVICE void attend(const LayerParams &params, int item, int item_index,
     query[i] = __bfloat162float(heads[warp_index * kHeadDim + dim]);
     key[i] = __bfloat162float(heads[2 * kHeadDim + dim]);
   }
+  // The query and key reductions share one butterfly so their shuffles
+  // overlap; each keeps reduce_sum's order.
+  float query_sum = sum_of_squares(query);
+  float key_sum = sum_of_squares(key);
+#pragma unroll
+  for (int offset = 16; offset > 0; offset /= 2) {
+    query_sum += __shfl_xor_sync(0xffffffffu, query_sum, offset);
+    key_sum += __shfl_xor_sync(0xffffffffu, key_sum, offset);
+  }
   norm_and_rotate_head(
-      query,
+      query, query_sum,
       reinterpret_cast<const bf16_t *>(workspace + kAttentionQueryNormOffset),
       angles, params.norm_epsilon, lane_index);
   norm_and_rotate_head(
-      key,
+      key, key_sum,
       reinterpret_cast<const bf16_t *>(workspace + kAttentionKeyNormOffset),
       angles, params.norm_epsilon, lane_index);
   uint8_t *rotated_key_row =
@@ -762,7 +774,10 @@ SGL_DEVICE void attend(const LayerParams &params, int item, int item_index,
   const float weight_sum = device::warp::reduce_sum(weight);
   const float rounded_weight = round_bf16(weight);
   float attended[4] = {};
-  for (int slot = 0; slot <= position; ++slot) {
+  // Unrolled over every slot so the shuffles and loads issue ahead of the
+  // sums; slots past the position add zero, in the same slot order.
+#pragma unroll
+  for (int slot = 0; slot < kCacheSlots; ++slot) {
     const float slot_weight = __shfl_sync(0xffffffffu, rounded_weight, slot);
     const bf16_t *value_row =
         slot < position
@@ -771,8 +786,10 @@ SGL_DEVICE void attend(const LayerParams &params, int item, int item_index,
             : heads + 3 * kHeadDim;
 #pragma unroll
     for (int i = 0; i < 4; ++i) {
-      attended[i] +=
-          slot_weight * __bfloat162float(value_row[lane_index + 32 * i]);
+      const float value = slot <= position
+                              ? __bfloat162float(value_row[lane_index + 32 * i])
+                              : 0.0f;
+      attended[i] += slot_weight * value;
     }
   }
   const int head = group * 2 + warp_index;
