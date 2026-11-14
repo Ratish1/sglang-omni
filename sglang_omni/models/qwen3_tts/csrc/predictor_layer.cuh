@@ -67,23 +67,14 @@ inline constexpr int kPartialFloats =
     kComputeWarps * kMaxTokenTiles * kTileFeatures * kTokenTileRows;
 inline constexpr int kPartialBuffers = 2;
 
-// Weights every launch reads in full, staged once: both layer norms, the query
-// and key norms, and the rope cos/sin row at the position.
-inline constexpr int kInputNormOffset = 0;
-inline constexpr int kPostNormOffset = kInputNormOffset + kHiddenSize * 2;
-inline constexpr int kQueryNormOffset = kPostNormOffset + kHiddenSize * 2;
-inline constexpr int kKeyNormOffset = kQueryNormOffset + kHeadDim * 2;
-inline constexpr int kRopeOffset = kKeyNormOffset + kHeadDim * 2;
-inline constexpr int kConstantBytes = kRopeOffset + kHeadDim * 4;
-
 inline constexpr int kSharedBytes = kRingStages * kChunkBytes + kOperandBytes +
                                     kPartialBuffers * kPartialFloats * 4 +
-                                    kConstantBytes + kMaxRows * 4 +
-                                    2 * kRingStages * 8;
+                                    kMaxRows * 4 + 2 * kRingStages * 8;
 
 // One attention item's shared memory, inside the operand buffer: the cached
 // keys and values in 272-byte rows so lanes reading different slots hit
-// different banks, the raw query, key and value heads of the group, and each
+// different banks, the raw query, key and value heads of the group, the query
+// and key norm weights and the rope cos/sin row at the position, then each
 // query warp's rotated key and fp32 query.
 inline constexpr int kHeadVectors = kHeadDim / 8;
 inline constexpr int kHeadRowBytes = kHeadDim * 2 + 16;
@@ -91,14 +82,22 @@ inline constexpr int kAttentionHeads = 4;
 inline constexpr int kAttentionKeysOffset = 0;
 inline constexpr int kAttentionValuesOffset = kCacheSlots * kHeadRowBytes;
 inline constexpr int kAttentionHeadsOffset = 2 * kCacheSlots * kHeadRowBytes;
-inline constexpr int kAttentionRotatedKeysOffset =
+inline constexpr int kAttentionQueryNormOffset =
     kAttentionHeadsOffset + kAttentionHeads * kHeadDim * 2;
+inline constexpr int kAttentionKeyNormOffset =
+    kAttentionQueryNormOffset + kHeadDim * 2;
+inline constexpr int kAttentionRopeOffset =
+    kAttentionKeyNormOffset + kHeadDim * 2;
+inline constexpr int kAttentionRotatedKeysOffset =
+    kAttentionRopeOffset + kHeadDim * 4;
 inline constexpr int kAttentionQueriesOffset =
     kAttentionRotatedKeysOffset + 2 * kHeadRowBytes;
 inline constexpr int kAttentionBytes =
     kAttentionQueriesOffset + 2 * kHeadDim * 4;
+inline constexpr int kAttentionLoadedVectors =
+    (kAttentionRotatedKeysOffset - kAttentionHeadsOffset) / 16;
 inline constexpr int kAttentionVectors =
-    (2 * (kCacheSlots - 1) + kAttentionHeads) * kHeadVectors;
+    2 * (kCacheSlots - 1) * kHeadVectors + kAttentionLoadedVectors;
 inline constexpr int kAttentionVectorsPerThread =
     (kAttentionVectors + kComputeThreads - 1) / kComputeThreads;
 static_assert(kAttentionBytes <= kOperandBytes);
@@ -291,40 +290,12 @@ SGL_DEVICE void wait_phase(const LayerParams &params, int phase) {
                    params.phase_consumers[phase]);
 }
 
-// Norm weights and the rope row never depend on the previous kernel, so they
-// are staged before the PDL wait.
-SGL_DEVICE void stage_constants(const LayerParams &params, uint8_t *constants) {
-  for (int offset = threadIdx.x * 16; offset < kConstantBytes;
-       offset += kComputeThreads * 16) {
-    const uint8_t *source;
-    if (offset < kPostNormOffset) {
-      source = reinterpret_cast<const uint8_t *>(params.input_norm_weight) +
-               (offset - kInputNormOffset);
-    } else if (offset < kQueryNormOffset) {
-      source = reinterpret_cast<const uint8_t *>(params.post_norm_weight) +
-               (offset - kPostNormOffset);
-    } else if (offset < kKeyNormOffset) {
-      source = reinterpret_cast<const uint8_t *>(params.query_norm_weight) +
-               (offset - kQueryNormOffset);
-    } else if (offset < kRopeOffset) {
-      source = reinterpret_cast<const uint8_t *>(params.key_norm_weight) +
-               (offset - kKeyNormOffset);
-    } else {
-      source = reinterpret_cast<const uint8_t *>(params.rope_cos_sin +
-                                                 params.position * kHeadDim) +
-               (offset - kRopeOffset);
-    }
-    *reinterpret_cast<uint4 *>(constants + offset) =
-        __ldg(reinterpret_cast<const uint4 *>(source));
-  }
-}
-
 // Stages the phase's input rows as the MMA B operand, one row a warp, with all
-// of a warp's loads issued before any is used so they cost one round trip. A
-// normalized phase multiplies by the norm weight and rounds to bf16 before the
-// product and keeps each row's rstd for the epilogue, the order of the fused
-// Triton layer. Rows past params.rows keep stale values: their columns are
-// never stored.
+// of a warp's loads, the norm weight's included, issued before any is used so
+// they cost one round trip. A normalized phase multiplies by the norm weight
+// and rounds to bf16 before the product and keeps each row's rstd for the
+// epilogue, the order of the fused Triton layer. Rows past params.rows keep
+// stale values: their columns are never stored.
 template <int kDepth, bool kNormalized>
 SGL_DEVICE void stage_operand(const LayerParams &params, const bf16_t *source,
                               const bf16_t *norm_weight, uint8_t *operand,
@@ -335,6 +306,14 @@ SGL_DEVICE void stage_operand(const LayerParams &params, const bf16_t *source,
   // note (ratish): zeroed so a row past params.rows holds no value across loop
   // iterations; left unset, the compiler carries it and spills to the stack.
   uint4 packed[kRowsPerWarp][kVectorsPerLane] = {};
+  uint4 weight_packed[kVectorsPerLane] = {};
+  if constexpr (kNormalized) {
+#pragma unroll
+    for (int i = 0; i < kVectorsPerLane; ++i) {
+      weight_packed[i] = __ldg(reinterpret_cast<const uint4 *>(norm_weight) +
+                               lane_index + 32 * i);
+    }
+  }
 #pragma unroll
   for (int row_slot = 0; row_slot < kRowsPerWarp; ++row_slot) {
     const int token = warp_index + row_slot * kComputeWarps;
@@ -357,11 +336,9 @@ SGL_DEVICE void stage_operand(const LayerParams &params, const bf16_t *source,
     for (int i = 0; i < kVectorsPerLane; ++i) {
       const int vector = lane_index + 32 * i;
       if constexpr (kNormalized) {
-        const uint4 weight_packed =
-            *reinterpret_cast<const uint4 *>(norm_weight + vector * 8);
         bf16_t *values = reinterpret_cast<bf16_t *>(&packed[row_slot][i]);
         const bf16_t *weights =
-            reinterpret_cast<const bf16_t *>(&weight_packed);
+            reinterpret_cast<const bf16_t *>(&weight_packed[i]);
 #pragma unroll
         for (int j = 0; j < 8; ++j) {
           const float value = __bfloat162float(values[j]);
@@ -382,24 +359,20 @@ SGL_DEVICE void stage_operand(const LayerParams &params, const bf16_t *source,
 }
 
 SGL_DEVICE void stage_phase_operand(const LayerParams &params, int phase,
-                                    const uint8_t *constants, uint8_t *operand,
-                                    float *row_scales, int warp_index,
-                                    int lane_index) {
-  const auto *input_norm =
-      reinterpret_cast<const bf16_t *>(constants + kInputNormOffset);
-  const auto *post_norm =
-      reinterpret_cast<const bf16_t *>(constants + kPostNormOffset);
+                                    uint8_t *operand, float *row_scales,
+                                    int warp_index, int lane_index) {
   if (phase == kPhaseQkv) {
-    stage_operand<kHiddenSize, true>(params, params.input, input_norm, operand,
+    stage_operand<kHiddenSize, true>(params, params.input,
+                                     params.input_norm_weight, operand,
                                      row_scales, warp_index, lane_index);
   } else if (phase == kPhaseOutputProjection) {
     stage_operand<kAttentionWidth, false>(params, params.attention_scratch,
                                           nullptr, operand, row_scales,
                                           warp_index, lane_index);
   } else if (phase == kPhaseGateUp) {
-    stage_operand<kHiddenSize, true>(params, params.middle_scratch, post_norm,
-                                     operand, row_scales, warp_index,
-                                     lane_index);
+    stage_operand<kHiddenSize, true>(params, params.middle_scratch,
+                                     params.post_norm_weight, operand,
+                                     row_scales, warp_index, lane_index);
   } else if (phase == kPhaseDown) {
     stage_operand<kIntermediateSize, false>(params, params.activation_scratch,
                                             nullptr, operand, row_scales,
@@ -508,23 +481,25 @@ SGL_DEVICE int epilogue_feature(int thread) {
 
 // The residual this thread's epilogue adds, read before the tile's MMAs so its
 // latency hides behind them.
-SGL_DEVICE float load_residual(const LayerParams &params, int phase, int tile) {
+// note (ratish): it stays bf16 until the epilogue; converting it here made the
+// MMAs wait on the load.
+SGL_DEVICE bf16_t load_residual(const LayerParams &params, int phase,
+                                int tile) {
   const int token = epilogue_token(threadIdx.x);
-  if (token >= params.rows)
-    return 0.0f;
-  const int64_t hidden_index = static_cast<int64_t>(token) * kHiddenSize +
-                               tile * kTileFeatures +
-                               epilogue_feature(threadIdx.x);
-  if (phase == kPhaseOutputProjection)
-    return __bfloat162float(params.input[hidden_index]);
-  if (phase == kPhaseDown)
-    return __bfloat162float(__ldcg(params.middle_scratch + hidden_index));
-  return 0.0f;
+  const bf16_t *source =
+      phase == kPhaseOutputProjection ? params.input : params.middle_scratch;
+  bf16_t residual = __ushort_as_bfloat16(0);
+  if ((phase == kPhaseOutputProjection || phase == kPhaseDown) &&
+      token < params.rows) {
+    residual = __ldcg(source + static_cast<int64_t>(token) * kHiddenSize +
+                      tile * kTileFeatures + epilogue_feature(threadIdx.x));
+  }
+  return residual;
 }
 
 SGL_DEVICE void finish_tile(const LayerParams &params, int phase, int tile,
                             const float *partials, const float *row_scales,
-                            float residual) {
+                            bf16_t residual) {
   const int thread = threadIdx.x;
   if (phase == kPhaseGateUp) {
     // Rows 0-7 of a gate/up tile are gate features, rows 8-15 the up features
@@ -563,10 +538,10 @@ SGL_DEVICE void finish_tile(const LayerParams &params, int phase, int tile,
         __float2bfloat16(total * row_scales[token]);
   } else if (phase == kPhaseOutputProjection) {
     params.middle_scratch[hidden_index] =
-        __float2bfloat16(round_bf16(total) + residual);
+        __float2bfloat16(round_bf16(total) + __bfloat162float(residual));
   } else {
     params.output[hidden_index] =
-        __float2bfloat16(round_bf16(total) + residual);
+        __float2bfloat16(round_bf16(total) + __bfloat162float(residual));
   }
 }
 
@@ -603,7 +578,8 @@ SGL_DEVICE void norm_and_rotate_head(float (&values)[4],
 
 // Global source of attention vector `vector` (16 bytes): the cached keys of
 // slots below the position, then their values, then the query heads 2g and
-// 2g + 1, the key head g and the value head g of the new token.
+// 2g + 1, the key head g and the value head g of the new token, the query and
+// key norm weights, and the rope row at the position.
 SGL_DEVICE const uint4 *attention_source(const LayerParams &params,
                                          const bf16_t *qkv_row,
                                          int64_t cache_base, int group,
@@ -617,18 +593,26 @@ SGL_DEVICE const uint4 *attention_source(const LayerParams &params,
         cache + cache_base + (cached / kHeadVectors) * kSlotStride +
         (cached % kHeadVectors) * 8);
   }
-  const int head_vector = vector - 2 * cached_vectors;
-  const int head = head_vector / kHeadVectors;
-  int head_offset;
+  const int loaded = vector - 2 * cached_vectors;
+  const int head = loaded / kHeadVectors;
+  const bf16_t *row;
   if (head < 2) {
-    head_offset = (group * 2 + head) * kHeadDim;
+    row = qkv_row + (group * 2 + head) * kHeadDim;
   } else if (head == 2) {
-    head_offset = kKeyOffset + group * kHeadDim;
+    row = qkv_row + kKeyOffset + group * kHeadDim;
+  } else if (head == 3) {
+    row = qkv_row + kValueOffset + group * kHeadDim;
+  } else if (head == 4) {
+    row = params.query_norm_weight;
+  } else if (head == 5) {
+    row = params.key_norm_weight;
   } else {
-    head_offset = kValueOffset + group * kHeadDim;
+    // The rope row is 128 fp32 values: the last two head rows of vectors.
+    return reinterpret_cast<const uint4 *>(params.rope_cos_sin +
+                                           params.position * kHeadDim) +
+           (loaded - 6 * kHeadVectors);
   }
-  return reinterpret_cast<const uint4 *>(qkv_row + head_offset +
-                                         (head_vector % kHeadVectors) * 8);
+  return reinterpret_cast<const uint4 *>(row) + loaded % kHeadVectors;
 }
 
 SGL_DEVICE int attention_offset(int cached_vectors, int vector) {
@@ -675,8 +659,7 @@ SGL_DEVICE float dot_head(const float *query, const uint8_t *key_row) {
 // dims a lane. Warp 0 writes the new key and warp 1 the new value into the
 // caches at the position. The caller's barrier ends the item.
 SGL_DEVICE void attend(const LayerParams &params, int item, uint8_t *workspace,
-                       const uint8_t *constants, int warp_index,
-                       int lane_index) {
+                       int warp_index, int lane_index) {
   const int token = item / kKeyValueHeads;
   const int group = item % kKeyValueHeads;
   const int position = params.position;
@@ -685,7 +668,7 @@ SGL_DEVICE void attend(const LayerParams &params, int item, uint8_t *workspace,
   const int64_t cache_base =
       static_cast<int64_t>(token) * params.cache_row_stride + group * kHeadDim;
   const int cached_vectors = position * kHeadVectors;
-  const int vector_count = 2 * cached_vectors + kAttentionHeads * kHeadVectors;
+  const int vector_count = 2 * cached_vectors + kAttentionLoadedVectors;
   uint4 packed[kAttentionVectorsPerThread] = {};
 #pragma unroll
   for (int i = 0; i < kAttentionVectorsPerThread; ++i) {
@@ -709,7 +692,8 @@ SGL_DEVICE void attend(const LayerParams &params, int item, uint8_t *workspace,
 
   const auto *heads =
       reinterpret_cast<const bf16_t *>(workspace + kAttentionHeadsOffset);
-  const auto *angles = reinterpret_cast<const float *>(constants + kRopeOffset);
+  const auto *angles =
+      reinterpret_cast<const float *>(workspace + kAttentionRopeOffset);
   float query[4];
   float key[4];
 #pragma unroll
@@ -719,11 +703,13 @@ SGL_DEVICE void attend(const LayerParams &params, int item, uint8_t *workspace,
     key[i] = __bfloat162float(heads[2 * kHeadDim + dim]);
   }
   norm_and_rotate_head(
-      query, reinterpret_cast<const bf16_t *>(constants + kQueryNormOffset),
+      query,
+      reinterpret_cast<const bf16_t *>(workspace + kAttentionQueryNormOffset),
       angles, params.norm_epsilon, lane_index);
   norm_and_rotate_head(
-      key, reinterpret_cast<const bf16_t *>(constants + kKeyNormOffset), angles,
-      params.norm_epsilon, lane_index);
+      key,
+      reinterpret_cast<const bf16_t *>(workspace + kAttentionKeyNormOffset),
+      angles, params.norm_epsilon, lane_index);
   uint8_t *rotated_key_row =
       workspace + kAttentionRotatedKeysOffset + warp_index * kHeadRowBytes;
   auto *rotated_key = reinterpret_cast<bf16_t *>(rotated_key_row);
@@ -787,9 +773,7 @@ __global__ __launch_bounds__(kThreads, 1) void predictor_layer_kernel(
   uint8_t *ring = shared_memory;
   uint8_t *operand = ring + kRingStages * kChunkBytes;
   float *partials = reinterpret_cast<float *>(operand + kOperandBytes);
-  uint8_t *constants =
-      reinterpret_cast<uint8_t *>(partials + kPartialBuffers * kPartialFloats);
-  float *row_scales = reinterpret_cast<float *>(constants + kConstantBytes);
+  float *row_scales = partials + kPartialBuffers * kPartialFloats;
   uint64_t *full_barriers = reinterpret_cast<uint64_t *>(row_scales + kMaxRows);
   uint64_t *empty_barriers = full_barriers + kRingStages;
 
@@ -838,7 +822,6 @@ __global__ __launch_bounds__(kThreads, 1) void predictor_layer_kernel(
       }
     }
   } else {
-    stage_constants(params, constants);
     device::PDLWaitPrimary<kUsePDL>();
     if (threadIdx.x == 0)
       record_stamp(kStampPrimaryWaited);
@@ -855,8 +838,8 @@ __global__ __launch_bounds__(kThreads, 1) void predictor_layer_kernel(
       if (phase != current_phase) {
         if (threadIdx.x == 0)
           record_phase_stamp(phase, kStampPhaseReached);
-        // Orders the previous phase's stores (the constants on the first
-        // pass) before the signal and the staging below.
+        // Orders the previous phase's stores before the signal and the
+        // staging below.
         compute_barrier();
         if (threadIdx.x == 0) {
           if (current_phase >= 0) {
@@ -871,8 +854,8 @@ __global__ __launch_bounds__(kThreads, 1) void predictor_layer_kernel(
           if (threadIdx.x == 0)
             record_phase_stamp(phase, kStampPhaseWaited);
         }
-        stage_phase_operand(params, phase, constants, operand, row_scales,
-                            warp_index, lane_index);
+        stage_phase_operand(params, phase, operand, row_scales, warp_index,
+                            lane_index);
         compute_barrier();
         if (threadIdx.x == 0)
           record_phase_stamp(phase, kStampPhaseStaged);
@@ -880,10 +863,10 @@ __global__ __launch_bounds__(kThreads, 1) void predictor_layer_kernel(
         phase_items = 0u;
       }
       if (phase == kPhaseAttention) {
-        attend(params, tile, operand, constants, warp_index, lane_index);
+        attend(params, tile, operand, warp_index, lane_index);
         compute_barrier();
       } else {
-        const float residual = load_residual(params, phase, tile);
+        const bf16_t residual = load_residual(params, phase, tile);
         float *tile_partials = partials + partial_buffer * kPartialFloats;
         multiply_tile(chunks_per_tile(phase), operand_row_bytes(phase),
                       token_tiles, ring, operand, tile_partials, full_barriers,
