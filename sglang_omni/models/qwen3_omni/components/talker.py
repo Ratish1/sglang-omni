@@ -20,6 +20,7 @@ from sglang.srt.runtime_context import get_context, get_exec, get_schedule
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import add_prefix
+from sglang.srt.utils.custom_op import register_custom_op_from_extern
 from torch import nn
 
 from sglang_omni.models.qwen3_omni.components.thinker_model import (
@@ -32,6 +33,7 @@ from sglang_omni.models.qwen3_omni.conditioning_capture import (
 )
 from sglang_omni.models.qwen3_omni.contribution_rounding import (
     install_contribution_provider,
+    shared_activation_fake,
 )
 from sglang_omni.models.qwen3_omni.hf_config import (
     Qwen3OmniMoeTalkerConfig,
@@ -873,6 +875,18 @@ class Qwen3OmniTalker(nn.Module):
             quant_config=quant_config,
             prefix=add_prefix("model", prefix),
         )
+        if os.environ.get("SGLANG_OMNI_DIAGNOSTIC_CHECKPOINT_SHARED_ACTIVATION") == "1":
+            for layer in self.model.layers:
+                activation = layer.mlp.shared_expert.act_fn
+                # note (ratish): retain the BF16 SiLU store across prefill compilation.
+                activation.forward = register_custom_op_from_extern(
+                    activation.forward_native,
+                    op_name="qwen3_omni_diagnostic_checkpoint_shared_activation",
+                    mutates_args=[],
+                    fake_impl=shared_activation_fake,
+                )
+        else:
+            pass
         # True only if the backbone uses MRotaryEmbedding (3D positions).
         # Otherwise it uses a plain RotaryEmbedding that needs 1D positions.
         self.uses_mrope = any(

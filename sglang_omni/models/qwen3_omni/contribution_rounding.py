@@ -17,6 +17,10 @@ from flashinfer.jit.fused_moe import gen_cutlass_fused_moe_sm90_module
 FINALIZER_PATH = Path("fused_moe/cutlass_backend/cutlass_fused_moe_kernels.cuh")
 
 
+def shared_activation_fake(x: torch.Tensor) -> torch.Tensor:
+    return x.new_empty((*x.shape[:-1], x.shape[-1] // 2))
+
+
 def contribution_build_spec(
     source_directory: Path, use_fast_build: bool = False
 ) -> JitSpecNvcc:
