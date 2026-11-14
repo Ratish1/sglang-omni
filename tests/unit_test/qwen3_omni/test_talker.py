@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import threading
 from collections import deque
+from collections.abc import Iterator
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import Mock
@@ -1137,6 +1138,12 @@ def test_process_input_requests_builds_at_one_chunk_under_topology() -> None:
     assert "rid-topo" not in scheduler.deferred_request_payloads
 
 
+@pytest.fixture
+def talker_server_args() -> Iterator[None]:
+    with get_context().override_server_args():
+        yield
+
+
 def decoding_talker_request(
     allocator: TokenToKVPoolAllocator,
     req_to_token_pool: ReqToTokenPool,
@@ -1214,8 +1221,7 @@ def row_readiness_scheduler(
     def prepare_decode(
         self: OmniScheduler, batch: ScheduleBatch
     ) -> ScheduleBatch | None:
-        with get_context().override_server_args():
-            batch.prepare_for_decode()
+        batch.prepare_for_decode()
         return batch
 
     monkeypatch.setattr(
@@ -1270,6 +1276,7 @@ def running_talker_batch(scheduler: QwenTalkerScheduler) -> ScheduleBatch:
     return batch
 
 
+@pytest.mark.usefixtures("talker_server_args")
 def test_row_without_text_sits_out_the_step_and_rejoins_with_its_kv(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1303,6 +1310,7 @@ def test_row_without_text_sits_out_the_step_and_rejoins_with_its_kv(
     assert scheduler.waiting_rows is None
 
 
+@pytest.mark.usefixtures("talker_server_args")
 def test_step_with_no_row_ready_allocates_nothing(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1318,6 +1326,7 @@ def test_step_with_no_row_ready_allocates_nothing(
     assert scheduler.waiting_row_steps == 3
 
 
+@pytest.mark.usefixtures("talker_server_args")
 def test_every_row_ready_decodes_the_whole_batch(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1336,6 +1345,7 @@ def test_every_row_ready_decodes_the_whole_batch(
     assert scheduler.waiting_row_steps == 0
 
 
+@pytest.mark.usefixtures("talker_server_args")
 def test_failed_step_returns_the_waiting_rows(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1349,6 +1359,7 @@ def test_failed_step_returns_the_waiting_rows(
     assert scheduler.waiting_rows is None
 
 
+@pytest.mark.usefixtures("talker_server_args")
 def test_step_the_running_batch_skips_returns_the_waiting_rows(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
