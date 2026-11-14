@@ -190,7 +190,14 @@ def main() -> None:
                     "filtered_distribution_total_variation": float(
                         0.5 * (normalized[0] - normalized[1]).abs().sum()
                     ),
+                    "observed_choice_native_probability": float(
+                        normalized[0][0, choices["observed"]]
+                    ),
+                    "observed_choice_reference_probability": float(
+                        normalized[1][0, choices["observed"]]
+                    ),
                 }
+                assert row["observed_choice_native_probability"] > 0
                 with (arguments.output_directory / "frames.jsonl").open("a") as output:
                     output.write(json.dumps(row) + "\n")
                 owner_counts["frames"] += 1
