@@ -50,8 +50,18 @@ def main() -> None:
             gate_up = torch.mm(out, layer.gate_up.t())
             return torch.mm(gate_up[:, :3072], layer.down.t())
 
+        def small_layers():
+            source = hidden
+            for each in model.layers:
+                qkv = torch.ops.sglang.jit_dsv3_fused_a_gemm(source, each.qkv.t())
+                out = torch.ops.sglang.jit_dsv3_fused_a_gemm(qkv[:, :2048].contiguous(), each.o.t())
+                gate_up = torch.ops.sglang.jit_dsv3_fused_a_gemm(out, each.gate_up.t())
+                source = torch.ops.sglang.jit_dsv3_fused_a_gemm(gate_up[:, :3072].contiguous(), each.down.t())
+            return source
+
         cell["layer projections chain, small-batch gemm"] = time_call(small_chain)
         cell["layer projections chain, cublas"] = time_call(cublas_chain)
+        cell["five layers projections chain, small-batch gemm"] = time_call(small_layers)
         cell["layer projections floor"] = sum(w.numel() for w in (layer.qkv, layer.o, layer.gate_up, layer.down)) * 2 / HBM_BYTES_PER_S * 1e6
         results[rows] = cell
         print(json.dumps({rows: cell}, indent=1), flush=True)
