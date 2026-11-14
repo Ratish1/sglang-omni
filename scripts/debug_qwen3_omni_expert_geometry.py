@@ -37,6 +37,7 @@ def main() -> None:
     parser.add_argument("--trace-directory", type=Path, action="append", required=True)
     parser.add_argument("--gpu", type=int, required=True)
     parser.add_argument("--output-directory", type=Path, required=True)
+    parser.add_argument("--decompose-expert-slots", action="store_true")
     arguments = parser.parse_args()
     arguments.output_directory.mkdir(exist_ok=False)
     torch.cuda.set_device(arguments.gpu)
@@ -90,6 +91,7 @@ def main() -> None:
             ]
             exact_isolated_batches = 0
             comparisons = 0
+            exact_decomposed_batches = 0
             for frame, filename in enumerate(files):
                 snapshots = torch.load(filename, weights_only=True)
                 assert len(snapshots) == len(native_weights)
@@ -148,25 +150,37 @@ def main() -> None:
                             operation,
                         )
                         profiles.append(tactics.pop())
-                    replayed = []
-                    for selected in (slice(None), slice(start, stop)):
-                        replay_inputs = hidden_states[selected].contiguous().clone()
-                        replayed.append(
-                            cutlass_fused_moe(
-                                input=replay_inputs,
-                                token_selected_experts=indices[selected].contiguous(),
-                                token_final_scales=weights[selected].contiguous(),
-                                fc1_expert_weights=packed,
-                                fc2_expert_weights=down,
-                                output_dtype=torch.bfloat16,
-                                quant_scales=None,
-                                activation_type=ActivationType.Swiglu,
-                                tune_max_num_tokens=runtime.tune_max_num_tokens,
-                                use_fused_finalize=runtime.use_fused_finalize,
-                                profile_ids=profiles,
-                            )[0]
+
+                    def replay_experts(
+                        selected_hidden_states: torch.Tensor,
+                        selected_indices: torch.Tensor,
+                        selected_weights: torch.Tensor,
+                    ) -> torch.Tensor:
+                        replay_inputs = selected_hidden_states.contiguous().clone()
+                        result = cutlass_fused_moe(
+                            input=replay_inputs,
+                            token_selected_experts=selected_indices.contiguous(),
+                            token_final_scales=selected_weights.contiguous(),
+                            fc1_expert_weights=packed,
+                            fc2_expert_weights=down,
+                            output_dtype=torch.bfloat16,
+                            quant_scales=None,
+                            activation_type=ActivationType.Swiglu,
+                            tune_max_num_tokens=runtime.tune_max_num_tokens,
+                            use_fused_finalize=runtime.use_fused_finalize,
+                            profile_ids=profiles,
+                        )[0]
+                        assert torch.equal(replay_inputs, selected_hidden_states)
+                        return result
+
+                    replayed = [
+                        replay_experts(
+                            hidden_states[selected],
+                            indices[selected],
+                            weights[selected],
                         )
-                        assert torch.equal(replay_inputs, hidden_states[selected])
+                        for selected in (slice(None), slice(start, stop))
+                    ]
                     assert torch.equal(replayed[0], expected), (
                         directory.name,
                         frame,
@@ -175,6 +189,30 @@ def main() -> None:
                     difference = compare_tensors(expected[start:stop], replayed[1])
                     exact_isolated_batches += difference.exact
                     comparisons += 1
+                    if arguments.decompose_expert_slots:
+                        selected_weights = weights[start:stop]
+                        assert torch.equal(
+                            selected_weights, selected_weights.bfloat16().float()
+                        )
+                        combined = torch.zeros_like(
+                            expected[start:stop], dtype=torch.float32
+                        )
+                        for slot in range(indices.shape[1]):
+                            contribution = replay_experts(
+                                hidden_states[start:stop],
+                                indices[start:stop, slot : slot + 1],
+                                torch.ones_like(selected_weights[:, slot : slot + 1]),
+                            )
+                            combined += (
+                                contribution.float()
+                                * selected_weights[:, slot : slot + 1]
+                            )
+                        decomposed = asdict(
+                            compare_tensors(expected[start:stop], combined.bfloat16())
+                        )
+                        exact_decomposed_batches += decomposed["exact"]
+                    else:
+                        decomposed = None
                     output.write(
                         json.dumps(
                             {
@@ -186,6 +224,7 @@ def main() -> None:
                                 "profiles": profiles,
                                 "whole_native_replay_exact": True,
                                 "isolated_vs_whole": asdict(difference),
+                                "separate_experts_vs_whole": decomposed,
                             }
                         )
                         + "\n"
@@ -208,6 +247,11 @@ def main() -> None:
                     "layer_batches": comparisons,
                     "exact_whole_native_batches": comparisons,
                     "exact_isolated_request_batches": exact_isolated_batches,
+                    "exact_decomposed_batches": (
+                        exact_decomposed_batches
+                        if arguments.decompose_expert_slots
+                        else None
+                    ),
                 }
             )
             (arguments.output_directory / "summary.json").write_text(
