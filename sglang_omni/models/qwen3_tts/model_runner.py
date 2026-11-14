@@ -90,9 +90,9 @@ class Qwen3TTSModelRunner(ModelRunner):
             dtype=self.model.output_embeds.dtype,
             device=self.device,
         )
-        # note (ratish): a request's frames stay under its positions, which the context
-        # length bounds. The engine's requests hold at most one row a slot, and as many
-        # streams the vocoder is still finishing; past that a new request waits.
+        # note (ratish): a row holds a request's frames under its positions, which the context
+        # length bounds. Running requests hold one row a slot, as many again are left for
+        # streams the vocoder is still finishing, and admission waits for a free row past that.
         self.code_table = Qwen3TTSCodeTable(
             row_count=2 * request_slot_count,
             row_frames=context_length,
@@ -447,8 +447,8 @@ class Qwen3TTSModelRunner(ModelRunner):
         self.code_step += 1
         if self.codes_event_module is not None:
             if not self.frames_written_events:
-                # note (ratish): an event's first record waits while another thread is in
-                # the device runtime, so the two are made once.
+                # note (ratish): a new event's first record waits out another thread's
+                # blocking device-to-host read, such as preprocessing's, so the two are made once.
                 self.frames_written_events = [
                     self.codes_event_module.Event() for _ in range(2)
                 ]
