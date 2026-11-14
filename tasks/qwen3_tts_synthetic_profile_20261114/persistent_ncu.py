@@ -1,9 +1,10 @@
-"""One persistent predictor layer launch inside a cudaProfilerStart/Stop window, for Nsight Compute.
+"""One persistent predictor launch inside a cudaProfilerStart/Stop window, for Nsight Compute.
 
-The layer is built with -lineinfo so source counters map to predictor_layer.cuh lines. Run with
-PYTHONPATH on the tree that holds predictor_persistent.py.
+The kernel is built with -lineinfo so source counters map to predictor_layer.cuh lines, and runs
+the first --layers predictor layers in one launch. Run with PYTHONPATH on the tree that holds
+predictor_persistent.py.
 
-Usage: ncu --profile-from-start off ... python3 persistent_ncu.py --rows N
+Usage: ncu --profile-from-start off ... python3 persistent_ncu.py --rows N --layers L
 """
 
 import argparse
@@ -20,17 +21,22 @@ WARMUP_LAUNCHES = 10
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--rows", type=int, default=1)
+    parser.add_argument("--layers", type=int, default=1)
     args = parser.parse_args()
     device = torch.device("cuda")
     torch.manual_seed(0)
     model = load_predictor(device)
-    first = model.layers[0]
-    weights = persistent.pack_predictor_layer(
-        qkv_weight=first.qkv, output_projection_weight=first.o, gate_up_weight=first.gate_up,
-        down_weight=first.down, input_norm_weight=first.input_norm, post_norm_weight=first.post_norm,
-        query_norm_weight=first.q_norm, key_norm_weight=first.k_norm,
+    weights = persistent.stack_predictor_layers(
+        [
+            persistent.pack_predictor_layer(
+                qkv_weight=each.qkv, output_projection_weight=each.o, gate_up_weight=each.gate_up,
+                down_weight=each.down, input_norm_weight=each.input_norm, post_norm_weight=each.post_norm,
+                query_norm_weight=each.q_norm, key_norm_weight=each.k_norm,
+            )
+            for each in model.layers[: args.layers]
+        ]
     )
-    layer = persistent.PersistentPredictorLayer(device, rope_cache(device), EPS)
+    layer = persistent.PersistentPredictorLayers(device, rope_cache(device), EPS)
     template_arguments = make_cpp_args(True)
     layer.module = load_jit(
         "qwen3_tts_predictor_layer_lineinfo",
@@ -39,7 +45,7 @@ def main() -> None:
         cuda_wrappers=[("predictor_layer", f"qwen3_tts_predictor::PredictorLayer<{template_arguments}>::run")],
         extra_cuda_cflags=["-lineinfo"],
     )
-    key_cache = torch.randn(64, SLOTS, KV_HEADS, HEAD_DIM, device=device, dtype=torch.bfloat16)
+    key_cache = torch.randn(args.layers, 64, SLOTS, KV_HEADS, HEAD_DIM, device=device, dtype=torch.bfloat16)
     value_cache = torch.randn_like(key_cache)
     x = torch.randn(args.rows, HIDDEN, device=device, dtype=torch.bfloat16)
     out = torch.empty_like(x)

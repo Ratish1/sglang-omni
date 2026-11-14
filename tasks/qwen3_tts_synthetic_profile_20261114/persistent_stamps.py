@@ -1,11 +1,12 @@
-"""Where a persistent predictor layer launch spends its time, from in-kernel stamps.
+"""Where a persistent predictor layer spends its time, from in-kernel stamps.
 
-Builds the layer with QWEN3_TTS_PREDICTOR_STAMPS and launches layer 0 alone at 1 and 16 rows,
-L2-warm (the same layer again) and HBM-cold (after a 256 MB write), each launch after a full
-synchronize. Phase points carry the global timer and the SM clock; item and chunk points carry the
-SM clock only. Per phase: when its consumers were released, the operand staging, the items, the
-counter signal, the handoff from the last producer's signal to the first consumer's release, and
-each item split into its parts. Medians over launches. Run with PYTHONPATH on the tree that holds
+Builds the kernel with QWEN3_TTS_PREDICTOR_STAMPS and launches the 5-layer stack at 1 and 16 rows,
+with the previous launch's weights in L2 and after a 256 MB write, each launch after a full
+synchronize. The kernel stamps its middle layer (layer 2), whose weights layer 1 prefetched.
+Phase points carry the global timer and the SM clock; item and chunk points carry the SM clock
+only. Per phase: when its consumers were released, the operand staging, the items, the counter
+signal, the handoff from the last producer's signal to the first consumer's release, and each item
+split into its parts. Medians over launches. Run with PYTHONPATH on the tree that holds
 predictor_persistent.py.
 
 Usage: python3 persistent_stamps.py --out <json>
@@ -16,7 +17,7 @@ import json
 import statistics
 
 import torch
-from predictor_bench import CACHED, EPS, HEAD_DIM, HIDDEN, KV_HEADS, SLOTS, load_predictor, rope_cache, time_call
+from predictor_bench import CACHED, EPS, HEAD_DIM, HIDDEN, KV_HEADS, LAYERS, SLOTS, load_predictor, rope_cache, time_call
 from sglang.kernels.jit.utils import load_jit, make_cpp_args
 
 from sglang_omni.models.qwen3_tts import predictor_persistent as persistent
@@ -175,16 +176,20 @@ def main() -> None:
     torch.manual_seed(0)
     model = load_predictor(device)
     cos_sin = rope_cache(device)
-    first = model.layers[0]
-    weights = persistent.pack_predictor_layer(
-        qkv_weight=first.qkv, output_projection_weight=first.o, gate_up_weight=first.gate_up,
-        down_weight=first.down, input_norm_weight=first.input_norm, post_norm_weight=first.post_norm,
-        query_norm_weight=first.q_norm, key_norm_weight=first.k_norm,
+    weights = persistent.stack_predictor_layers(
+        [
+            persistent.pack_predictor_layer(
+                qkv_weight=each.qkv, output_projection_weight=each.o, gate_up_weight=each.gate_up,
+                down_weight=each.down, input_norm_weight=each.input_norm, post_norm_weight=each.post_norm,
+                query_norm_weight=each.q_norm, key_norm_weight=each.k_norm,
+            )
+            for each in model.layers
+        ]
     )
-    layer = persistent.PersistentPredictorLayer(device, cos_sin, EPS)
+    layer = persistent.PersistentPredictorLayers(device, cos_sin, EPS)
     production_module = layer.module
     stamped_module = load_stamped_module()
-    key_cache = torch.randn(64, SLOTS, KV_HEADS, HEAD_DIM, device=device, dtype=torch.bfloat16)
+    key_cache = torch.randn(LAYERS, 64, SLOTS, KV_HEADS, HEAD_DIM, device=device, dtype=torch.bfloat16)
     value_cache = torch.randn_like(key_cache)
     flush = torch.empty(FLUSH_BYTES // 4, device=device, dtype=torch.float32)
     host_stamps = torch.zeros(STAMP_CTAS, SLOTS_PER_CTA, 2, dtype=torch.int64)
@@ -198,9 +203,9 @@ def main() -> None:
 
         cell = {}
         layer.module = production_module
-        cell["production one layer us"] = time_call(launch)
+        cell["production 5 layers us"] = time_call(launch)
         layer.module = stamped_module
-        cell["stamped one layer us"] = time_call(launch)
+        cell["stamped 5 layers us"] = time_call(launch)
         item_phases = cta_items(layer.schedule_for(rows), layer.cta_count)
         for condition in ("l2_warm", "hbm"):
             launch_rows = []
