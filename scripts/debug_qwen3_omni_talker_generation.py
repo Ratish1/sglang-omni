@@ -33,7 +33,10 @@ from scripts.debug_qwen3_omni_predictor_cache import NativePredictorReplay
 from scripts.debug_qwen3_omni_talker_experts import NativeTalkerExperts
 from scripts.qwen3_omni_attention_inputs import PROJECTION_NAMES, NativeAttentionInputs
 from scripts.qwen3_omni_checkpoint_weights import audit_checkpoint_weights
-from scripts.qwen3_omni_talker_attention import NativeBackboneAttention
+from scripts.qwen3_omni_talker_attention import (
+    NativeBackboneAttention,
+    NativePredictorAttention,
+)
 from scripts.qwen3_omni_talker_expert_runtime import ObservedExpertProfileMap
 from scripts.qwen3_omni_talker_rotary import NativeBackboneRotary
 from sglang_omni.models.qwen3_omni.components.talker_prefill import (
@@ -83,6 +86,11 @@ def main() -> None:
     parser.add_argument("--audit-loaded-weights", action="store_true")
     parser.add_argument("--native-predictor-capture-directory", type=Path)
     parser.add_argument("--checkpoint-residual-predictor", action="store_true")
+    parser.add_argument(
+        "--predictor-attention-implementation",
+        choices=("checkpoint", "native"),
+        default="checkpoint",
+    )
     parser.add_argument(
         "--predictor-projection-normalization",
         choices=("checkpoint", "materialized", "folded"),
@@ -174,6 +182,18 @@ def main() -> None:
     )
     parser.add_argument("--output-directory", type=Path, required=True)
     arguments = parser.parse_args()
+    if arguments.predictor_attention_implementation == "native":
+        assert (
+            arguments.dtype == "bfloat16"
+            and arguments.attention_implementation == "eager"
+        )
+        assert arguments.native_predictor_capture_directory is None
+        assert not (
+            arguments.paired_native_attention_controls
+            or arguments.native_backbone_attention
+        )
+    else:
+        pass
     if arguments.predictor_projection_normalization != "checkpoint":
         assert arguments.dtype == "bfloat16"
         assert (
@@ -339,6 +359,11 @@ def main() -> None:
             pass
     for control in predictor_projection_controls:
         control.install()
+    if arguments.predictor_attention_implementation == "native":
+        predictor_attention = NativePredictorAttention(reference=reference)
+        predictor_attention.install()
+    else:
+        predictor_attention = None
     if (
         arguments.native_predictor_capture_directory is not None
         and not arguments.checkpoint_residual_predictor
@@ -610,6 +635,10 @@ def main() -> None:
                 residual_policy == "sampled"
             )
             normalization.boundary_calls = 0
+            if predictor_attention is not None:
+                predictor_attention.enable()
+            else:
+                pass
             for control in predictor_projection_controls:
                 control.calls = 0
             normalization.query_key_calls = 0
@@ -1163,6 +1192,17 @@ def main() -> None:
                     for control in predictor_projection_controls
                 )
             )
+            if predictor_attention is not None:
+                assert predictor_attention.calls == (
+                    sum(
+                        frame["main_code"] != config.codec_eos_token_id
+                        for frame in frame_reports
+                    )
+                    * (config.num_code_groups - 1)
+                    * len(reference.code_predictor.model.layers)
+                )
+            else:
+                pass
             report = {
                 "model_revision": arguments.model_revision,
                 "frame_limit": frame_limit,
@@ -1251,6 +1291,15 @@ def main() -> None:
                 "sampling_order": sampling_order,
                 "residual_policy": residual_policy,
                 "checkpoint_residual_predictor": arguments.checkpoint_residual_predictor,
+                "predictor_attention_implementation": arguments.predictor_attention_implementation,
+                "predictor_native_attention_calls": (
+                    predictor_attention.calls if predictor_attention is not None else 0
+                ),
+                "predictor_native_attention_maximum_error": (
+                    predictor_attention.maximum_absolute_error
+                    if predictor_attention is not None
+                    else None
+                ),
                 "predictor_projection_normalization": arguments.predictor_projection_normalization,
                 "predictor_projection_sites": arguments.predictor_projection_sites,
                 "predictor_projection_control_calls": sum(
