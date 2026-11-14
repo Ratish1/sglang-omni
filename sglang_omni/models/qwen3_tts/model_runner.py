@@ -632,10 +632,4 @@ class Qwen3TTSModelRunner(ModelRunner):
         feedback_rows = self.model.feedback_rows_from_codes(
             data.committed_codes(first_frame, stop_frame)
         )
-        text_rows = torch.stack(
-            [
-                data.decode_text_row(frame_index)
-                for frame_index in range(first_frame, stop_frame)
-            ]
-        )
-        return feedback_rows + text_rows
+        return feedback_rows + data.decode_text_row_span(first_frame, stop_frame)

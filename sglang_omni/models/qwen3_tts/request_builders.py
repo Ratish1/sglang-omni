@@ -189,6 +189,13 @@ class Qwen3TTSSGLangRequestData(SGLangARRequestData):
             min(frame_index, self.decode_text_rows.shape[0] - 1)
         ]
 
+    def decode_text_row_span(self, first_frame: int, stop_frame: int) -> torch.Tensor:
+        """The text rows of the decodes that fed back frames [first_frame, stop_frame)."""
+        frame_indices = torch.arange(
+            first_frame, stop_frame, device=self.decode_text_rows.device
+        ).clamp_max_(self.decode_text_rows.shape[0] - 1)
+        return self.decode_text_rows.index_select(0, frame_indices)
+
     @property
     def should_stream_codes(self) -> bool:
         params = self.stage_payload.request.params
