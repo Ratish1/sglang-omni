@@ -15,6 +15,12 @@ import torch
 
 DEVICE = torch.device("cuda:0")
 BLOCK_MS = 50.0
+BLOCKING_CALLS = (
+    "stream synchronize",
+    "device synchronize",
+    "event synchronize",
+    "device to host read",
+)
 
 
 def cycles_per_ms() -> float:
@@ -26,7 +32,21 @@ def cycles_per_ms() -> float:
     return probe / ((time.perf_counter() - start) * 1000)
 
 
-def record_while_blocked(event_factory, cycles: int) -> float:
+def block_in(kind: str, stream: torch.cuda.Stream) -> None:
+    if kind == "stream synchronize":
+        stream.synchronize()
+    elif kind == "device synchronize":
+        torch.cuda.synchronize()
+    elif kind == "event synchronize":
+        event = torch.cuda.Event()
+        event.record(stream)
+        event.synchronize()
+    else:
+        with torch.cuda.stream(stream):
+            torch.ones(1, device=DEVICE).tolist()
+
+
+def record_while_blocked(event_factory, cycles: int, kind: str) -> float:
     blocked_stream = torch.cuda.Stream()
     own_stream = torch.cuda.Stream()
     event = event_factory()
@@ -38,7 +58,7 @@ def record_while_blocked(event_factory, cycles: int) -> float:
         with torch.cuda.stream(blocked_stream):
             torch.cuda._sleep(cycles)
         entered.set()
-        blocked_stream.synchronize()
+        block_in(kind, blocked_stream)
 
     thread = threading.Thread(target=blocker)
     thread.start()
@@ -63,14 +83,15 @@ def recorded_once() -> torch.cuda.Event:
 def main() -> None:
     torch.cuda.set_device(DEVICE)
     cycles = int(cycles_per_ms() * BLOCK_MS)
-    results = {
-        "fresh event, first record": [
-            round(record_while_blocked(torch.cuda.Event, cycles), 3) for _ in range(3)
-        ],
-        "event recorded before, record again": [
-            round(record_while_blocked(recorded_once, cycles), 3) for _ in range(3)
-        ],
-    }
+    results = {}
+    for kind in BLOCKING_CALLS:
+        for label, factory in (
+            ("fresh event, first record", torch.cuda.Event),
+            ("event recorded before, record again", recorded_once),
+        ):
+            results[f"{kind}: {label}"] = [
+                round(record_while_blocked(factory, cycles, kind), 3) for _ in range(3)
+            ]
     print(json.dumps({"block_ms": BLOCK_MS, "record_host_ms": results}, indent=2))
 
 
