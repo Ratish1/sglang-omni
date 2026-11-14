@@ -244,18 +244,23 @@ def main() -> None:
                     native_activation = stages.activated[selected]
                     native_down = stages.projected[selected]
                     ideal_activated = []
+                    unrounded_activated = []
                     rounded_activated = []
                     ideal_down = []
                     torch_down = []
                     for rank, expert_index in enumerate(indices[row].tolist()):
                         expert = reference.model.layers[layer_index].mlp.experts
-                        gate, up = (
-                            torch.nn.functional.linear(
-                                hidden[row : row + 1].double(),
-                                expert.gate_up_proj[expert_index].double(),
-                            )
-                            .bfloat16()
-                            .chunk(2, dim=-1)
+                        gate_projection, up_projection = torch.nn.functional.linear(
+                            hidden[row : row + 1].double(),
+                            expert.gate_up_proj[expert_index].double(),
+                        ).chunk(2, dim=-1)
+                        gate = gate_projection.bfloat16()
+                        up = up_projection.bfloat16()
+                        unrounded_activated.append(
+                            (
+                                torch.nn.functional.silu(gate_projection)
+                                * up_projection
+                            ).bfloat16()
                         )
                         ideal_activated.append(
                             (
@@ -280,6 +285,9 @@ def main() -> None:
                             )
                         )
                     differences = {
+                        "activation_vs_fp64_without_gemm_store": compare_tensors(
+                            native_activation, torch.cat(unrounded_activated)
+                        ),
                         "activation_vs_fp64_gemm_bf16_store_fp64_silu": compare_tensors(
                             native_activation, torch.cat(ideal_activated)
                         ),
