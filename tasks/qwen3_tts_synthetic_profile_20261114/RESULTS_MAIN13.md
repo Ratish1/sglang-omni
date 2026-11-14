@@ -93,4 +93,34 @@ First audio:
 3. **Pageable copies and stream syncs** on the shared preprocessing stream.
 4. **Talker prefill and vocoder first chunk** that include the reference context.
 
-Nsight Compute per-kernel results: `ncu2_*` (see below).
+## Nsight Compute, one decode step (`ncu2_*`)
+
+Setup:
+- The probe opens a `cudaProfilerStart/Stop` window around one talker step: the 200th at bs 1, the 100th at bs 64. `ncu --profile-from-start off --graph-profiling node` profiles that step's graph nodes, filtered by kernel name, 12 launches each.
+- `mem_fraction_static` is 0.35, so replay backups stay on the device.
+- Each kernel runs alone under replay, with no vocoder beside it.
+- The bs 64 step is the 100th, so its attention reads a shorter KV than the nsys window (frames 263 to 767).
+
+| Kernel | bs | Time | DRAM % of peak | Issue % | Occupancy % | Grid x block | Top stall |
+|---|---|---|---|---|---|---|---|
+| predictor `gemv_add` | 64 | 9.2 us | 18.7 | 5.5 | 6.2 | 128 x 128 (0.3 waves) | long scoreboard |
+| predictor `norm_qkv_rope_store` | 64 | 16.5 us | 15.6 | 7.4 | 6.2 | 128 x 128 | long scoreboard |
+| predictor `norm_gate_up_silu` | 64 | 12.2 us | 31.3 | 10.2 | 6.2 | 96 x 128 | long scoreboard |
+| predictor `decode_attention` | 64 | 5.6 us | 5.7 | 18.2 | 23.7 | 512 x 128 | short scoreboard |
+| predictor `norm_qkv_rope_store` | 1 | 12.0 us | 21.0 | 3.7 | 3.1 | 128 x 64 | long scoreboard |
+| predictor `gemv_add` | 1 | 8.1 us | 19.5 | 3.9 | 6.1 | 128 x 128 | long scoreboard |
+| predictor `norm_gate_up_silu` | 1 | 9.4 us | 40.2 | 6.7 | 6.0 | 96 x 128 | long scoreboard |
+| predictor `decode_attention` | 1 | 4.4 us | 0.2 | 0.3 | 6.2 | 8 x 128 | barrier |
+| talker GEMM `nvjet 64x8` | 1 | 14.1 us | 55.3 | 7.1 | 14.7 | 89 x 384 | long scoreboard |
+| talker GEMM `nvjet 64x8 splitK` | 1 | 13.4 us | 57.0 | 8.9 | 14.3 | 128 x 384 | long scoreboard |
+| talker FA3 decode attention | 1 | 10.6 us | 0.8 | 2.0 | 12.3 | 132 x 256 | barrier |
+| talker RMSNorm, fused add RMSNorm | 1 | 3.9, 4.1 us | 0.2 | 0.1 | 5 to 6 | 1 x 128 | barrier |
+| talker rope, qk norm, act and mul, FA3 combine | 1 | 2.8 to 3.5 us each | 0.1 to 0.4 | 0 to 2 | 6 to 14 | 2 to 64 CTAs | no instruction, long scoreboard |
+| talker GEMM `nvjet 96x64` | 64 | 22.4 us | 71.3 | 6.5 | 14.9 | 128 x 384 | long scoreboard |
+| talker GEMM `nvjet 32x64`, `48x64`, `64x32` | 64 | 17.5, 10.3, 8.9 us | 45.5, 49.6, 29.2 | 8 to 10 | 14 | 64 to 88 x 384 | long scoreboard |
+| talker FA3 decode attention | 64 | 23.4 us | 13.9 | 21.1 | 12.4 | 132 x 256 | barrier |
+
+What the kernels show:
+- **Predictor kernels at both batch sizes.** They launch about one CTA of 64 to 128 threads per SM. Occupancy is 3 to 6 %, warps wait on memory, and DRAM sits at 16 to 40 % of peak, so the predictor is latency-bound by its launch shape, not by bandwidth.
+- **Talker at bs 1.** The GEMMs reach 55 to 57 % of peak. Each layer's other eight kernels (two norms with one CTA each, rope, qk norm, act and mul, the attention and its combine) take about 35 us together while moving almost no data, about 1.0 of the 1.8 ms of talker kernel time.
+- **Talker at bs 64.** The GEMMs reach 29 to 71 % of peak, and the narrower ones fill half a wave.
