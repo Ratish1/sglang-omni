@@ -44,8 +44,8 @@ LAUNCHES = 30
 FLUSH_BYTES = 256 * 2**20
 
 
-def load_stamped_module():
-    template_arguments = make_cpp_args(True)
+def load_stamped_module(is_flagged):
+    template_arguments = make_cpp_args(True, is_flagged)
     return load_jit(
         "qwen3_tts_predictor_layer_stamps",
         *template_arguments,
@@ -181,8 +181,8 @@ def main() -> None:
         ]
     )
     layer = persistent.PersistentPredictorLayers(device, cos_sin, EPS)
-    production_module = layer.module
-    stamped_module = load_stamped_module()
+    production_modules = layer.modules
+    stamped_modules = {is_flagged: load_stamped_module(is_flagged) for is_flagged in (False, True)}
     key_cache = torch.randn(LAYERS, 64, SLOTS, KV_HEADS, HEAD_DIM, device=device, dtype=torch.bfloat16)
     value_cache = torch.randn_like(key_cache)
     flush = torch.empty(FLUSH_BYTES // 4, device=device, dtype=torch.float32)
@@ -196,10 +196,11 @@ def main() -> None:
             layer.forward(weights, x, out, CACHED, key_cache, value_cache)
 
         cell = {}
-        layer.module = production_module
+        layer.modules = production_modules
         cell["production 5 layers us"] = time_call(launch)
-        layer.module = stamped_module
+        layer.modules = stamped_modules
         cell["stamped 5 layers us"] = time_call(launch)
+        stamped_module = stamped_modules[rows <= persistent.FLAGGED_MAX_ROWS]
         item_phases = cta_items(layer.schedule_for(rows), layer.cta_count)
         for condition in ("l2_warm", "hbm"):
             launch_rows = []

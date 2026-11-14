@@ -37,14 +37,17 @@ def main() -> None:
         ]
     )
     layer = persistent.PersistentPredictorLayers(device, rope_cache(device), EPS)
-    template_arguments = make_cpp_args(True)
-    layer.module = load_jit(
-        "qwen3_tts_predictor_layer_lineinfo",
-        *template_arguments,
-        cuda_files=[str(persistent.PREDICTOR_LAYER_SOURCE)],
-        cuda_wrappers=[("predictor_layer", f"qwen3_tts_predictor::PredictorLayer<{template_arguments}>::run")],
-        extra_cuda_cflags=["-lineinfo"],
-    )
+    is_flagged = args.rows <= persistent.FLAGGED_MAX_ROWS
+    template_arguments = make_cpp_args(True, is_flagged)
+    layer.modules = {
+        is_flagged: load_jit(
+            "qwen3_tts_predictor_layer_lineinfo",
+            *template_arguments,
+            cuda_files=[str(persistent.PREDICTOR_LAYER_SOURCE)],
+            cuda_wrappers=[("predictor_layer", f"qwen3_tts_predictor::PredictorLayer<{template_arguments}>::run")],
+            extra_cuda_cflags=["-lineinfo"],
+        )
+    }
     key_cache = torch.randn(args.layers, 64, SLOTS, KV_HEADS, HEAD_DIM, device=device, dtype=torch.bfloat16)
     value_cache = torch.randn_like(key_cache)
     x = torch.randn(args.rows, HIDDEN, device=device, dtype=torch.bfloat16)
