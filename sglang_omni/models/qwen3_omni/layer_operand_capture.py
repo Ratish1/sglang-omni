@@ -211,7 +211,8 @@ class LayerOperandRecorder:
                 {
                     f"batch_{name}": tensor.detach().cpu().clone()
                     for name, tensor in snapshot.items()
-                    if name.startswith(("operator_", "layer_")) or name == "positions"
+                    if name.startswith(("operator_", "layer_"))
+                    or name in ("positions", "rotated_query", "attention_values")
                 }
             )
             tensors["batch_snapshot_identity"] = torch.tensor(

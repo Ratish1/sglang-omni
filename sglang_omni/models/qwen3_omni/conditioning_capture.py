@@ -7,8 +7,13 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 import torch
+from sglang.srt.layers.attention.flashattention_backend import FlashAttentionBackend
+from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 
+from sglang_omni.models.qwen3_omni.attention_layout_capture import (
+    capture_attention_layout,
+)
 from sglang_omni.models.qwen3_omni.layer_operand_capture import (
     LayerOperandRecorder,
     MoeTacticChoice,
@@ -23,6 +28,8 @@ class TalkerConditioningRecorder:
     key_buffers: list[torch.Tensor]
     value_buffers: list[torch.Tensor]
     request_slots: torch.Tensor
+    attention_backend: FlashAttentionBackend
+    attention_layer: RadixAttention
     predictor_keys: torch.Tensor
     predictor_values: torch.Tensor
     predictor_counters: torch.Tensor | None
@@ -258,8 +265,23 @@ class TalkerConditioningRecorder:
                 past_exact = True
             self.previous_keys[request.request_id] = keys
             self.previous_values[request.request_id] = values
+            attention_layout = (
+                capture_attention_layout(
+                    self.attention_backend,
+                    self.attention_layer,
+                    self.key_buffers,
+                    self.value_buffers,
+                    self.request_slots,
+                    row,
+                    sequence_length,
+                    len(requests),
+                )
+                if self.retain_moe_batches
+                else {}
+            )
             torch.save(
                 {
+                    **attention_layout,
                     "codec_ids": codes[row].detach().cpu().clone(),
                     "codec_feedback": feedback[row].detach().cpu().clone(),
                     "logits": logits[row].detach().cpu().clone(),
@@ -317,6 +339,7 @@ class TalkerConditioningRecorder:
                             step,
                             operand_row,
                             retain_moe_batches=self.retain_moe_batches,
+                            retain_operator_batches=self.retain_moe_batches,
                             prefill_rows=(
                                 slice(
                                     operand_row

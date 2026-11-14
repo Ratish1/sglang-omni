@@ -107,6 +107,8 @@ class QwenTalkerModelRunner(ModelRunner["SGLangARRequestData"]):
                 key_buffers=pool.k_buffer,
                 value_buffers=pool.v_buffer,
                 request_slots=tp_worker.model_runner.req_to_token_pool.req_to_token,
+                attention_backend=tp_worker.model_runner.attn_backend,
+                attention_layer=self.model.model.layers[0].self_attn.attn,
                 predictor_keys=self.model.predictor_k_cache,
                 predictor_values=self.model.predictor_v_cache,
                 predictor_counters=(
