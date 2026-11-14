@@ -18,7 +18,7 @@ from typing import TYPE_CHECKING, Literal, TypedDict, overload
 import numpy as np
 import numpy.typing as npt
 import torch
-from sglang.srt.utils.common import async_h2d_stack
+from sglang.srt.utils.common import async_d2h, async_h2d_stack
 
 from sglang_omni.models.qwen3_tts.payload_types import Qwen3TTSState
 from sglang_omni.models.qwen3_tts.reference_encoder_cuda_graph import (
@@ -957,36 +957,45 @@ def cacheable_qwen3_tts_voice_prompt(
 
 
 def cacheable_qwen3_tts_tensor(value: torch.Tensor) -> torch.Tensor:
-    return value.detach().to(device="cpu").clone()
+    # note (ratish): the host copy lands in stream order, and a load copies it back on the same preprocessing stream without reading it on the host.
+    if value.is_cpu:
+        return value.detach().clone()
+    else:
+        return async_d2h(value.detach())
 
 
 @overload
 def qwen3_tts_voice_prompt_from_cache(
-    artifact: CachedVoicePrompt,
+    artifact: CachedVoicePrompt, *, device: torch.device
 ) -> tuple[VoicePrompt, str | None] | None: ...
 
 
 @overload
 def qwen3_tts_voice_prompt_from_cache(
-    artifact: Mapping[str, object],
+    artifact: Mapping[str, object], *, device: torch.device
 ) -> tuple[dict[str, list[object]], str | None] | None: ...
 
 
 def qwen3_tts_voice_prompt_from_cache(
-    artifact: Mapping[str, object],
+    artifact: Mapping[str, object], *, device: torch.device
 ) -> tuple[VoicePrompt | dict[str, list[object]], str | None] | None:
+    """The cached prompt's tensors copied to device."""
     if artifact.get("artifact_type") != "qwen3_tts_voice_clone_prompt":
         return None
     else:
         pass
     prompt: dict[str, list[object]] = {
         "ref_spk_embedding": [
-            embedding.detach().clone() for embedding in artifact["ref_spk_embedding"]
+            embedding.to(device=device, non_blocking=True, copy=True)
+            for embedding in artifact["ref_spk_embedding"]
         ],
         "icl_mode": list(artifact["icl_mode"]),
     }
     if "ref_code" in artifact:
-        prompt["ref_code"] = [code.detach().clone() for code in artifact["ref_code"]]
+        prompt["ref_code"] = [
+            code.to(device=device, non_blocking=True, copy=True)
+            for code in artifact["ref_code"]
+        ]
     else:
         pass
     if "reference_audio_frame_count" in artifact:
@@ -1358,7 +1367,9 @@ class Qwen3TTSAdhocReferenceHook(
     def load_artifact(
         self, stored: CachedVoicePrompt
     ) -> tuple[VoicePrompt, str | None]:
-        cached_prompt = qwen3_tts_voice_prompt_from_cache(stored)
+        cached_prompt = qwen3_tts_voice_prompt_from_cache(
+            stored, device=self.model.model.codec_embedding.weight.device
+        )
         if cached_prompt is None:
             raise RuntimeError("Qwen3-TTS ad-hoc reference cache entry is invalid")
         else:
@@ -1529,7 +1540,9 @@ def prepare_qwen3_tts_base_request(
     cache_key = qwen3_tts_uploaded_voice_cache_key(state)
     cached_artifact = speaker_cache.get(cache_key) if cache_key is not None else None
     cached_prompt = (
-        qwen3_tts_voice_prompt_from_cache(cached_artifact)
+        qwen3_tts_voice_prompt_from_cache(
+            cached_artifact, device=model.model.codec_embedding.weight.device
+        )
         if isinstance(cached_artifact, dict)
         else None
     )

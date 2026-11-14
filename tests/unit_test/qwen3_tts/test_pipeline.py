@@ -2571,6 +2571,27 @@ def test_qwen3_tts_uploaded_voice_x_vector_cache_omits_ref_code(
     qwen3_request_builders.clear_qwen3_tts_preprocessing_context()
 
 
+@pytest.mark.accelerator
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_qwen3_tts_cached_voice_prompt_loads_after_its_pending_host_copy() -> None:
+    device = torch.device("cuda", torch.cuda.current_device())
+    embedding = torch.arange(4, dtype=torch.float32, device=device)
+    ref_code = torch.arange(8, dtype=torch.long, device=device).view(4, 2)
+    torch.cuda._sleep(300_000_000)  # noqa: leading-underscore  # upstream name
+    artifact = qwen3_request_builders.cacheable_qwen3_tts_voice_prompt(
+        {"ref_spk_embedding": [embedding], "ref_code": [ref_code], "icl_mode": [True]},
+        ref_text="reference",
+    )
+    loaded = qwen3_request_builders.qwen3_tts_voice_prompt_from_cache(
+        artifact, device=device
+    )
+
+    assert loaded is not None
+    prompt, _ = loaded
+    assert torch.equal(prompt["ref_spk_embedding"][0].cpu(), embedding.cpu())
+    assert torch.equal(prompt["ref_code"][0].cpu(), ref_code.cpu())
+
+
 def test_qwen3_tts_public_seed_derivation_is_stable() -> None:
     first = derive_qwen3_tts_sampling_seeds(123)
     second = derive_qwen3_tts_sampling_seeds(123)
