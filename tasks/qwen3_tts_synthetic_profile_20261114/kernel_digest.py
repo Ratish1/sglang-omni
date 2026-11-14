@@ -16,6 +16,7 @@ from pathlib import Path
 MARKED_DOMAINS = {"talker", "vocoder", "preprocessing", "capture"}
 SMALL_KERNEL_NS = 5000
 NS_PER_MS = 1e6
+WAIT_APIS = ("cudaEventSynchronize", "cudaStreamSynchronize", "cudaDeviceSynchronize", "cudaMemcpy")
 
 
 class MarkedRanges:
@@ -109,6 +110,36 @@ def main() -> None:
                 f"    {100 * sum(durations) / busy:5.1f} % | {len(durations) / replay_count:6.1f} a replay | "
                 f"{sum(durations) / len(durations) / 1e3:7.2f} us | {name[:100]}"
             )
+    print("## Host waits and copies by marked call site")
+    waits = collections.defaultdict(list)
+    for start, end, name_id, tid in db.execute(
+        "select start, end, nameId, globalTid from CUPTI_ACTIVITY_KIND_RUNTIME where start >= ?",
+        (window_start,),
+    ):
+        name = strings.get(name_id, "?").split("_v")[0]
+        if name.startswith(WAIT_APIS):
+            waits[(name, marks.at(tid, start))].append(end - start)
+        else:
+            pass
+    for (name, site), durations in sorted(waits.items(), key=lambda item: -sum(item[1]))[: 2 * args.rows]:
+        print(
+            f"{sum(durations) / NS_PER_MS:8.2f} ms | {len(durations):6d} | mean {sum(durations) / len(durations) / 1e3:7.1f} us | "
+            f"max {max(durations) / 1e3:8.1f} us | {name} | {site}"
+        )
+    kinds = {value: label for value, _, label in db.execute("select * from ENUM_CUDA_MEMCPY_OPER")}
+    memory = {value: label for value, _, label in db.execute("select * from ENUM_CUDA_MEM_KIND")}
+    copy_sites = collections.defaultdict(lambda: [0, 0])
+    for size, kind, source, target, correlation in db.execute(
+        "select bytes, copyKind, srcKind, dstKind, correlationId from CUPTI_ACTIVITY_KIND_MEMCPY where start >= ?",
+        (window_start,),
+    ):
+        launch = launches.get(correlation)
+        site = "graph or unknown" if launch is None else marks.at(launch[1], launch[0])
+        group = copy_sites[(f"{kinds.get(kind)} {memory.get(source)}->{memory.get(target)}", site)]
+        group[0] += 1
+        group[1] += size
+    for (kind, site), (count, size) in sorted(copy_sites.items(), key=lambda item: -item[1][0])[: 2 * args.rows]:
+        print(f"copies {count:6d} | {size / 1e6:9.3f} MB | {kind} | {site}")
     print("## Eager kernels by marked launch site")
     for site, names in sorted(eager.items(), key=lambda item: -sum(sum(d) for d in item[1].values()))[: args.rows]:
         total = sum(sum(d) for d in names.values())
