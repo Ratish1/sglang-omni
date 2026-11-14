@@ -7,49 +7,18 @@ import hashlib
 import json
 import shutil
 import subprocess
-from dataclasses import asdict, replace
+from dataclasses import asdict
 from pathlib import Path
 
 from flashinfer.jit import env as jit_environment
-from flashinfer.jit.core import JitSpecNvcc
 from flashinfer.jit.cpp_ext import run_ninja
-from flashinfer.jit.fused_moe import gen_cutlass_fused_moe_sm90_module
 
-FINALIZER_PATH = Path("fused_moe/cutlass_backend/cutlass_fused_moe_kernels.cuh")
+from sglang_omni.models.qwen3_omni.contribution_rounding import (
+    FINALIZER_PATH,
+    contribution_build_spec,
+)
+
 FINALIZER_SHA256 = "7566fe479fc7f34f3e92e1be6941f34d9c343b8e8df996e4b3b3fd960999c604"
-
-
-def contribution_build_spec(source_directory: Path) -> JitSpecNvcc:
-    """Preserve native code generation while selecting the diagnostic source tree."""
-    original_specification = gen_cutlass_fused_moe_sm90_module(False)
-    assert isinstance(original_specification, JitSpecNvcc)
-    assert original_specification.extra_include_dirs is not None
-    installed_directory = jit_environment.FLASHINFER_CSRC_DIR
-    source_files = [
-        (
-            source_directory / filename.relative_to(installed_directory)
-            if filename.is_relative_to(installed_directory)
-            else filename
-        )
-        for filename in original_specification.sources
-    ]
-    include_directories = [
-        (
-            source_directory / directory.relative_to(installed_directory)
-            if directory.is_relative_to(installed_directory)
-            else directory
-        )
-        for directory in original_specification.extra_include_dirs
-    ]
-    finalizer_digest = hashlib.sha256(
-        (source_directory / FINALIZER_PATH).read_bytes()
-    ).hexdigest()
-    return replace(
-        original_specification,
-        name=f"fused_moe_90_contributions_{finalizer_digest[:16]}",
-        sources=source_files,
-        extra_include_dirs=[source_directory, *include_directories],
-    )
 
 
 def main() -> None:
