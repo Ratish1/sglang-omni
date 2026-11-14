@@ -491,6 +491,35 @@ class Report:
             while item is not None:
                 item.kernels.append((start, end))
                 item = item.parent
+        # note (ratish): a graph-level trace keeps each replay only in GRAPH_TRACE, one interval for all its kernels.
+        if not self.node_mode and "CUPTI_ACTIVITY_KIND_GRAPH_TRACE" in self.tables:
+            for start, end, corr, graph, stream, global_pid in self.db.execute(
+                "select start, end, correlationId, graphId, streamId, globalPid from CUPTI_ACTIVITY_KIND_GRAPH_TRACE "
+                "where end > ? and start < ?",
+                (self.t0, self.t1),
+            ):
+                pid = pid_of(global_pid)
+                key = (pid, corr)
+                item = self.owner.get(key)
+                name = f"graph {graph}"
+                self.device.append(
+                    (
+                        start,
+                        end,
+                        self.owner_name(key),
+                        name,
+                        stream,
+                        (name,),
+                        key,
+                        None,
+                        pid,
+                    )
+                )
+                while item is not None:
+                    item.kernels.append((start, end))
+                    item = item.parent
+        else:
+            pass
         self.copies_by_stream: dict[tuple[int, int], list] = collections.defaultdict(
             list
         )
@@ -1479,7 +1508,8 @@ def section_k(
 
 def section_l(r: Report):
     """Every gap between a request's consecutive chunks at the coordinator, with what ran inside it on each engine
-    (overlap of the gap with each range kind, and the ranges starting in it), by gap band."""
+    (overlap of the gap with each range kind, and the ranges starting in it), by gap band.
+    """
     print(
         "\n## L. inter-chunk gaps by what ran inside them (ms per gap; gaps between a request's chunks at the coordinator)"
     )
@@ -1491,9 +1521,7 @@ def section_l(r: Report):
     gaps = []
     for times in arrivals.values():
         times.sort()
-        gaps.extend(
-            (a, b) for a, b in zip(times, times[1:]) if r.t0 <= a and b <= r.t1
-        )
+        gaps.extend((a, b) for a, b in zip(times, times[1:]) if r.t0 <= a and b <= r.t1)
     if not gaps:
         print("  no chunk gaps in this report's window")
         return
@@ -1502,14 +1530,23 @@ def section_l(r: Report):
         "talker extend": ("talker_ar", ("sched.batch extend",)),
         "talker wait d2h": ("talker_ar", ("mr.wait_d2h",)),
         "talker build": ("talker_ar", ("tk.build",)),
-        "thinker mixed/extend": ("thinker", ("sched.batch mixed", "sched.batch extend")),
+        "thinker mixed/extend": (
+            "thinker",
+            ("sched.batch mixed", "sched.batch extend"),
+        ),
         "thinker decode": ("thinker", ("sched.batch decode",)),
         "code2wav decode": ("code2wav", ("c2w.decode",)),
     }
     series = {}
     for name, (stage, kinds) in wanted.items():
         items = sorted(
-            (x for tid, xs in r.ranges.items() if r.stage_of_tid(tid) == stage for x in xs if x.kind in kinds),
+            (
+                x
+                for tid, xs in r.ranges.items()
+                if r.stage_of_tid(tid) == stage
+                for x in xs
+                if x.kind in kinds
+            ),
             key=lambda x: x.start,
         )
         series[name] = (items, [x.start for x in items])
@@ -1533,9 +1570,18 @@ def section_l(r: Report):
         per_gap.append((b - a, cells))
     per_gap.sort(key=lambda item: item[0])
     n = len(per_gap)
-    bands = (("<= p50", 0, n // 2), ("p50-p90", n // 2, int(n * 0.9)), ("p90-p99", int(n * 0.9), int(n * 0.99)), ("> p99", int(n * 0.99), n))
-    print(f"  {n} gaps; per band: gap mean, then per kind the mean overlap (ms) and the mean count of ranges starting in the gap")
-    print(f"  {'band':<9}{'n':>6}{'gap':>8}" + "".join(f"{name:>24}" for name in wanted))
+    bands = (
+        ("<= p50", 0, n // 2),
+        ("p50-p90", n // 2, int(n * 0.9)),
+        ("p90-p99", int(n * 0.9), int(n * 0.99)),
+        ("> p99", int(n * 0.99), n),
+    )
+    print(
+        f"  {n} gaps; per band: gap mean, then per kind the mean overlap (ms) and the mean count of ranges starting in the gap"
+    )
+    print(
+        f"  {'band':<9}{'n':>6}{'gap':>8}" + "".join(f"{name:>24}" for name in wanted)
+    )
     for band, low, high in bands:
         chosen = per_gap[low:high]
         if not chosen:
@@ -1550,7 +1596,11 @@ def section_l(r: Report):
         chosen = per_gap[low:high]
         decode_rows = [row for _, c in chosen for row in c["talker decode"][2]]
         steps = [c["talker decode"][1] for _, c in chosen]
-        walls = [c["talker decode"][0] / c["talker decode"][1] for _, c in chosen if c["talker decode"][1]]
+        walls = [
+            c["talker decode"][0] / c["talker decode"][1]
+            for _, c in chosen
+            if c["talker decode"][1]
+        ]
         if decode_rows and walls:
             print(
                 f"  {band:<9} talker decode steps per gap {statistics.fmean(steps):.2f}, rows per step {statistics.fmean(decode_rows):.2f}, "
@@ -1605,7 +1655,11 @@ def section_m(r: Report):
         groups.items(), key=lambda pair: -sum(x.wall for x in pair[1])
     ):
         print(f"  {thread[:36]:<36}{kind[:34]:<34}{row(items)}")
-    bands = ((0, 2e6, "< 2 ms"), (2e6, 10e6, "2 to 10 ms"), (10e6, float("inf"), "> 10 ms"))
+    bands = (
+        (0, 2e6, "< 2 ms"),
+        (2e6, 10e6, "2 to 10 ms"),
+        (10e6, float("inf"), "> 10 ms"),
+    )
     for (thread, kind), items in sorted(groups.items()):
         if kind not in (
             "code2wav.decode_delta",
