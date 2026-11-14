@@ -91,6 +91,7 @@ def main() -> None:
         default="native",
     )
     parser.add_argument("--native-shared-gate-batches", action="store_true")
+    parser.add_argument("--shared-gate-decode-rows", type=int)
     parser.add_argument("--paired-native-expert-controls", action="store_true")
     parser.add_argument("--paired-native-attention-controls", action="store_true")
     parser.add_argument("--native-backbone-attention", action="store_true")
@@ -142,6 +143,11 @@ def main() -> None:
     )
     parser.add_argument("--output-directory", type=Path, required=True)
     arguments = parser.parse_args()
+    if arguments.shared_gate_decode_rows is not None:
+        assert arguments.native_shared_gate_batches
+        assert arguments.shared_gate_decode_rows > 0
+    else:
+        pass
     if arguments.expert_output_arithmetic != "native":
         assert arguments.native_expert_capture_directory is not None
     else:
@@ -260,6 +266,7 @@ def main() -> None:
             output_arithmetic=arguments.expert_output_arithmetic,
             shared_enabled=arguments.native_shared_expert,
             is_shared_gate_batch_replay_enabled=arguments.native_shared_gate_batches,
+            shared_gate_decode_rows=arguments.shared_gate_decode_rows,
         )
         expert_control.install()
     else:
@@ -1103,6 +1110,7 @@ def main() -> None:
                 "native_expert_calls": expert_control.calls if expert_control else 0,
                 "native_shared_expert": arguments.native_shared_expert,
                 "native_shared_gate_batches": arguments.native_shared_gate_batches,
+                "shared_gate_decode_rows": arguments.shared_gate_decode_rows,
                 "native_shared_gate_exact_input_calls": (
                     expert_control.shared_gate_exact_input_calls
                     if expert_control
