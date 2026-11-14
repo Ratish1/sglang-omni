@@ -692,6 +692,11 @@ def main() -> None:
         "--serve-env", default="", help="KEY=VALUE pairs for the server only"
     )
     parser.add_argument(
+        "--after",
+        default="",
+        help="shell command run from the tree after the passes, server still up (<out>/after.log)",
+    )
+    parser.add_argument(
         "--bench",
         default="seedtts",
         choices=(
@@ -822,6 +827,19 @@ def main() -> None:
             for kind in args.passes.split(","):
                 run_pass(args, server, load, kind, warmup=first)
                 first = False
+        if args.after:
+            with open(out / "after.log", "w", encoding="utf-8") as after_log:
+                subprocess.run(
+                    args.after,
+                    shell=True,
+                    cwd=TREE,
+                    env=dict(os.environ, PYTHONPATH=str(TREE)),
+                    stdout=after_log,
+                    stderr=subprocess.STDOUT,
+                    check=False,
+                )
+        else:
+            pass
         (out / "model_info.json").write_text(
             httpx.get(
                 f"http://127.0.0.1:{args.port}/model_info", timeout=30, trust_env=False
