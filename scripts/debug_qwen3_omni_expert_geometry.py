@@ -8,10 +8,8 @@ from dataclasses import asdict
 from pathlib import Path
 
 import torch
-from flashinfer.fused_moe import core as expert_core
 from flashinfer.fused_moe import cutlass_fused_moe
 from flashinfer.fused_moe.core import ActivationType
-from flashinfer.jit.core import JitSpecNvcc
 from huggingface_hub import hf_hub_download
 from transformers import Qwen3OmniMoeConfig
 from transformers.conversion_mapping import (
@@ -22,7 +20,6 @@ from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import (
     Qwen3OmniMoeTalkerForConditionalGeneration,
 )
 
-from scripts.debug_qwen3_omni_contribution_build import contribution_build_spec
 from scripts.debug_qwen3_omni_feedback_audit import compare_tensors
 from scripts.qwen3_omni_checkpoint_weights import audit_checkpoint_weights
 from scripts.qwen3_omni_talker_expert_runtime import (
@@ -31,6 +28,9 @@ from scripts.qwen3_omni_talker_expert_runtime import (
     combine_expert_contributions,
     load_native_expert_weights,
     native_expert_contributions,
+)
+from sglang_omni.models.qwen3_omni.contribution_rounding import (
+    install_contribution_provider,
 )
 
 
@@ -50,13 +50,7 @@ def main() -> None:
     if arguments.contribution_source_directory is not None:
         assert arguments.contribution_reference_directory is not None
         assert not arguments.decompose_expert_slots
-        assert expert_core.get_cutlass_fused_moe_module.cache_info().currsize == 0
-
-        def diagnostic_specification(use_fast_build: bool = False) -> JitSpecNvcc:
-            assert not use_fast_build
-            return contribution_build_spec(arguments.contribution_source_directory)
-
-        expert_core.gen_cutlass_fused_moe_sm90_module = diagnostic_specification
+        install_contribution_provider(arguments.contribution_source_directory)
     elif arguments.contribution_reference_directory is not None:
         assert not arguments.decompose_expert_slots
         arguments.contribution_reference_directory.mkdir(exist_ok=False)
