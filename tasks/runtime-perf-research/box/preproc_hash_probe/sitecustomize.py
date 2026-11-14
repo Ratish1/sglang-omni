@@ -3,7 +3,8 @@
 Enabled by OMNI_PREPROC_HASH=<output prefix>. A watcher thread waits for the preprocessor module to load, then wraps
 Qwen3OmniPreprocessor.finalize_state. Each call writes the request id, a hash of its input ids (the key that names the
 question across servers), and the shape and sha256 of every tensor in its multimodal and encoder inputs, to
-<prefix>.<pid>.jsonl. The wrapper reads only; the state it returns is the original's.
+<prefix>.<pid>.jsonl. The wrapper reads only; the state it returns is the original's. OMNI_PREPROC_DUMP_KEYS=<key,key>
+also saves those requests' input ids, attention mask and multimodal inputs to <prefix>.<key>.pt.
 """
 
 import dataclasses
@@ -15,6 +16,7 @@ import threading
 import time
 
 PREFIX = os.environ.get("OMNI_PREPROC_HASH")
+DUMP_KEYS = set(filter(None, os.environ.get("OMNI_PREPROC_DUMP_KEYS", "").split(",")))
 MODULE = "sglang_omni.models.qwen3_omni.components.preprocessor"
 
 
@@ -65,6 +67,18 @@ def install(module) -> None:
         with lock:
             with open(path, "a", encoding="utf-8") as handle:
                 handle.write(json.dumps(record) + "\n")
+        if record["key"] in DUMP_KEYS:
+            torch.save(
+                {
+                    "input_ids": kwargs["input_ids"],
+                    "attention_mask": kwargs["attention_mask"],
+                    "full_mm_inputs": kwargs["full_mm_inputs"],
+                    "record": record,
+                },
+                f"{PREFIX}.{record['key']}.pt",
+            )
+        else:
+            pass
         return original(self, payload, **kwargs)
 
     module.Qwen3OmniPreprocessor.finalize_state = finalize_state

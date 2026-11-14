@@ -85,6 +85,9 @@ MODELS = {
 }
 
 
+OMNI_SEEDTTS_CLIENT = ["-m", "benchmarks.eval.benchmark_omni_seedtts"]
+
+
 def bench_command(
     model: str,
     port: int,
@@ -266,8 +269,7 @@ def bench_command(
     else:
         return [
             sys.executable,
-            "-m",
-            "benchmarks.eval.benchmark_omni_seedtts",
+            *OMNI_SEEDTTS_CLIENT,
             "--host",
             "127.0.0.1",
             "--port",
@@ -697,6 +699,11 @@ def main() -> None:
         help="shell command run from the tree after the passes, server still up (<out>/after.log)",
     )
     parser.add_argument(
+        "--omni-chunk-audio",
+        action="store_true",
+        help="Omni SeedTTS through omni_seedtts_chunks.py, which records each chunk's audio length and the underrun",
+    )
+    parser.add_argument(
         "--bench",
         default="seedtts",
         choices=(
@@ -738,6 +745,12 @@ def main() -> None:
     )
     args = parser.parse_args()
     TREE = Path(args.tree)
+    if args.omni_chunk_audio:
+        OMNI_SEEDTTS_CLIENT[:] = [
+            str(Path(__file__).resolve().parent / "omni_seedtts_chunks.py")
+        ]
+    else:
+        pass
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
     spec = MODELS[args.model]
