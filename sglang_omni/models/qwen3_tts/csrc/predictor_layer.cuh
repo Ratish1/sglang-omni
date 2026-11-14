@@ -143,7 +143,12 @@ inline constexpr int kStampItemReduced =
 inline constexpr int kStampChunkWait = kStampItemReduced + kStampListLength;
 inline constexpr int kStampChunkReady = kStampChunkWait + kStampListLength;
 inline constexpr int kStampChunkIssue = kStampChunkReady + kStampListLength;
-inline constexpr int kStampSlots = kStampChunkIssue + kStampListLength;
+// Inside a CTA's last attention item, on warp 0: heads normed and rotated,
+// then the softmax weights ready.
+inline constexpr int kStampAttentionNormed =
+    kStampChunkIssue + kStampListLength;
+inline constexpr int kStampAttentionScored = kStampAttentionNormed + 1;
+inline constexpr int kStampSlots = kStampAttentionScored + 1;
 
 struct LayerParams {
   const bf16_t *input;
@@ -791,6 +796,8 @@ SGL_DEVICE void attend(const LayerParams &params, int item, int item_index,
     }
   }
   __syncwarp();
+  if (threadIdx.x == 0)
+    record_clock_stamp(kStampAttentionNormed);
 
   float score = -INFINITY;
   if (lane_index <= position) {
@@ -804,6 +811,8 @@ SGL_DEVICE void attend(const LayerParams &params, int item, int item_index,
   const float weight = lane_index <= position ? expf(score - best) : 0.0f;
   const float weight_sum = device::warp::reduce_sum(weight);
   const float rounded_weight = round_bf16(weight);
+  if (threadIdx.x == 0)
+    record_clock_stamp(kStampAttentionScored);
   float attended[4] = {};
   // Unrolled over every slot so the shuffles and loads issue ahead of the
   // sums; slots past the position add zero, in the same slot order.
