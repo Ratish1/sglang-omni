@@ -79,6 +79,7 @@ def main() -> None:
     )
     parser.add_argument("--audit-loaded-weights", action="store_true")
     parser.add_argument("--native-predictor-capture-directory", type=Path)
+    parser.add_argument("--checkpoint-residual-predictor", action="store_true")
     parser.add_argument("--native-expert-capture-directory", type=Path)
     parser.add_argument("--native-expert-profile-map", type=Path)
     parser.add_argument("--expert-gemm1-profile", type=int)
@@ -160,6 +161,11 @@ def main() -> None:
     )
     parser.add_argument("--output-directory", type=Path, required=True)
     arguments = parser.parse_args()
+    if arguments.checkpoint_residual_predictor:
+        assert arguments.native_predictor_capture_directory is not None
+        assert arguments.native_feedback_reduction == "sequential"
+    else:
+        pass
     if arguments.shared_activation_semantics != "native":
         assert arguments.native_shared_expert
     else:
@@ -278,7 +284,10 @@ def main() -> None:
             arguments.model_path, "config.json", revision=arguments.model_revision
         )
     ).parent
-    if arguments.native_predictor_capture_directory is not None:
+    if (
+        arguments.native_predictor_capture_directory is not None
+        and not arguments.checkpoint_residual_predictor
+    ):
         predictor_audit_directory = (
             arguments.output_directory / "native-predictor-audit"
         )
@@ -1173,6 +1182,7 @@ def main() -> None:
                 ),
                 "sampling_order": sampling_order,
                 "residual_policy": residual_policy,
+                "checkpoint_residual_predictor": arguments.checkpoint_residual_predictor,
                 "native_predictor_capture_directory": (
                     str(arguments.native_predictor_capture_directory)
                     if arguments.native_predictor_capture_directory is not None
