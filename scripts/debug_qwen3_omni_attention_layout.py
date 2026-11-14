@@ -19,6 +19,7 @@ def main() -> None:
     parser.add_argument("--model-revision", required=True)
     parser.add_argument("--gpu", type=int, required=True)
     parser.add_argument("--output-directory", type=Path, required=True)
+    parser.add_argument("--decode-page-table-tokens", type=int, required=True)
     arguments = parser.parse_args()
     arguments.output_directory.mkdir(exist_ok=False)
     torch.cuda.set_device(arguments.gpu)
@@ -70,7 +71,7 @@ def main() -> None:
                 recorded_batch_size = len(snapshot["batch_mlp_normalized"])
                 selected_row = int(snapshot["batch_selected_row"])
                 comparisons = {}
-                for layout in ("dense", "paged", "shared-prefix-batch"):
+                for layout in ("dense", "paged", "shared-prefix-batch", "native-width"):
                     batch_size = (
                         recorded_batch_size if layout == "shared-prefix-batch" else 1
                     )
@@ -80,6 +81,14 @@ def main() -> None:
                     page_table = torch.arange(
                         len(key), dtype=torch.int32, device=device
                     ).repeat(batch_size, 1)
+                    if layout == "native-width":
+                        assert arguments.decode_page_table_tokens >= len(key)
+                        page_table = torch.nn.functional.pad(
+                            page_table,
+                            (0, arguments.decode_page_table_tokens - len(key)),
+                        )
+                    else:
+                        pass
                     cumulative_query_lengths = torch.arange(
                         batch_size + 1, dtype=torch.int32, device=device
                     )
@@ -144,6 +153,7 @@ def main() -> None:
         "layer_steps": (len(finished["output_ids"]) - 1) * len(keys),
         "exact_counts": counts,
         "maximum_absolute_errors": maximum_errors,
+        "decode_page_table_tokens": arguments.decode_page_table_tokens,
         "scope": "Same recorded query and complete native KV prefix. Dense versus paged API, automatic versus one split, and duplicated read-only shared-prefix requests at the recorded padded batch size. Not a replay of uncaptured peer requests or scheduler metadata, and not a production policy change.",
     }
     (arguments.output_directory / "summary.json").write_text(

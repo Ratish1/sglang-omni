@@ -82,6 +82,7 @@ def main() -> None:
     parser.add_argument("--paired-native-expert-controls", action="store_true")
     parser.add_argument("--paired-native-attention-controls", action="store_true")
     parser.add_argument("--native-backbone-attention", action="store_true")
+    parser.add_argument("--decode-page-table-tokens", type=int)
     parser.add_argument("--paired-native-projection-controls", action="store_true")
     parser.add_argument("--paired-native-rotary-controls", action="store_true")
     parser.add_argument(
@@ -117,6 +118,11 @@ def main() -> None:
     )
     parser.add_argument("--output-directory", type=Path, required=True)
     arguments = parser.parse_args()
+    if arguments.decode_page_table_tokens is not None:
+        assert arguments.native_backbone_attention
+        assert arguments.decode_page_table_tokens > 0
+    else:
+        pass
     if (
         arguments.paired_native_attention_controls
         or arguments.native_backbone_attention
@@ -264,7 +270,10 @@ def main() -> None:
         arguments.paired_native_attention_controls
         or arguments.native_backbone_attention
     ):
-        attention_control = NativeBackboneAttention(reference=reference)
+        attention_control = NativeBackboneAttention(
+            reference=reference,
+            decode_page_table_tokens=arguments.decode_page_table_tokens,
+        )
         attention_control.install()
     else:
         attention_control = None
@@ -1001,6 +1010,7 @@ def main() -> None:
                 "normalization_semantics": normalization_mode,
                 "expert_mode": expert_mode,
                 "attention_mode": attention_mode,
+                "decode_page_table_tokens": arguments.decode_page_table_tokens,
                 "attention_projection_mode": projection_mode,
                 "rotary_mode": rotary_mode,
                 "routing_mode": routing_mode,

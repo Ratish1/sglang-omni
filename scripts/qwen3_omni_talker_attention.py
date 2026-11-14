@@ -21,6 +21,7 @@ ATTENTION_IMPLEMENTATION = "diagnostic_qwen3_omni_fa3"
 @dataclass(kw_only=True)
 class NativeBackboneAttention:
     reference: Qwen3OmniMoeTalkerForConditionalGeneration
+    decode_page_table_tokens: int | None = None
     calls: int = 0
 
     def install(self) -> None:
@@ -79,15 +80,38 @@ class NativeBackboneAttention:
         cache_lengths = torch.tensor(
             [key_tokens], dtype=torch.int32, device=query.device
         )
-        output = flash_attn_with_kvcache(
-            query.transpose(1, 2).contiguous(),
-            key.transpose(1, 2).contiguous(),
-            value.transpose(1, 2).contiguous(),
-            cache_seqlens=cache_lengths,
-            softmax_scale=scaling,
-            causal=True,
-            ver=3,
-        )
+        if self.decode_page_table_tokens is not None and query_tokens == 1:
+            assert key_tokens <= self.decode_page_table_tokens
+            page_table = torch.zeros(
+                (1, self.decode_page_table_tokens),
+                dtype=torch.int32,
+                device=query.device,
+            )
+            page_table[0, :key_tokens] = torch.arange(
+                key_tokens, dtype=torch.int32, device=query.device
+            )
+            output = flash_attn_with_kvcache(
+                query.transpose(1, 2).contiguous().squeeze(0),
+                key.transpose(1, 2).contiguous().squeeze(0).unsqueeze(1),
+                value.transpose(1, 2).contiguous().squeeze(0).unsqueeze(1),
+                page_table=page_table,
+                cache_seqlens=cache_lengths,
+                cu_seqlens_q=torch.arange(2, dtype=torch.int32, device=query.device),
+                max_seqlen_q=1,
+                softmax_scale=scaling,
+                causal=True,
+                ver=3,
+            ).unsqueeze(0)
+        else:
+            output = flash_attn_with_kvcache(
+                query.transpose(1, 2).contiguous(),
+                key.transpose(1, 2).contiguous(),
+                value.transpose(1, 2).contiguous(),
+                cache_seqlens=cache_lengths,
+                softmax_scale=scaling,
+                causal=True,
+                ver=3,
+            )
         assert output.shape == (1, query_tokens, query.shape[1], query.shape[-1])
         assert torch.isfinite(output).all()
         self.calls += 1
