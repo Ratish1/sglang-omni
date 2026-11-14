@@ -186,7 +186,7 @@ def request_body(seed: int, cot: str = "off") -> dict:
     }
 
 
-def serving(priority: bool, policy: str, kv_cache_bytes: str | None = None, prefill_max_requests: int | None = None, natural_stop: bool = False) -> None:
+def serving(priority: bool, policy: str, kv_cache_bytes: str | None = None, prefill_max_requests: int | None = None, natural_stop: bool = False, pressure: bool = False) -> None:
     port = 18353
     arguments = [
         sys.executable,
@@ -215,6 +215,9 @@ def serving(priority: bool, policy: str, kv_cache_bytes: str | None = None, pref
     label = "priority" if priority else ("bytes" if kv_cache_bytes is not None else ("prefill" if prefill_max_requests is not None else policy))
     if natural_stop:
         label = "natural-stop"
+    if pressure:
+        label = "pressure"
+        arguments += ["--yue2_ar.engine.max_total_tokens", "4096", "--yue2_ar.engine.max_running_requests", "16"]
     log = (DIRECTORY / f"server-{label}.log").open("w")
     process = subprocess.Popen(
         arguments, stdout=log, stderr=subprocess.STDOUT, start_new_session=True
@@ -240,7 +243,7 @@ def serving(priority: bool, policy: str, kv_cache_bytes: str | None = None, pref
         def send(body: dict) -> dict:
             started = time.monotonic()
             try:
-                response = httpx.post(f"{base}/v1/audio/speech", json=body, timeout=600 if natural_stop else 30)
+                response = httpx.post(f"{base}/v1/audio/speech", json=body, timeout=600 if natural_stop or pressure else 30)
             except httpx.TimeoutException:
                 return {"status": "timeout", "seconds": time.monotonic() - started}
             result = {
@@ -260,6 +263,13 @@ def serving(priority: bool, policy: str, kv_cache_bytes: str | None = None, pref
                 result["body"] = response.text[:1500]
             return result
 
+        if pressure:
+            bodies = [request_body(seed) for seed in range(60, 66)]
+            for body in bodies:
+                body["max_new_tokens"] = 512
+            with concurrent.futures.ThreadPoolExecutor(max_workers=6) as executor:
+                results["pressure"] = list(executor.map(send, bodies))
+            return
         body = request_body(42)
         if natural_stop:
             body["max_new_tokens"] = 9000
@@ -314,9 +324,10 @@ if __name__ == "__main__":
     parser.add_argument("--kv-cache-bytes")
     parser.add_argument("--prefill-max-requests", type=int)
     parser.add_argument("--natural-stop", action="store_true")
+    parser.add_argument("--pressure", action="store_true")
     options = parser.parse_args()
     DIRECTORY.mkdir(exist_ok=True, parents=True)
     if options.mode == "numerical":
         numerical()
     else:
-        serving(options.priority, options.policy, options.kv_cache_bytes, options.prefill_max_requests, options.natural_stop)
+        serving(options.priority, options.policy, options.kv_cache_bytes, options.prefill_max_requests, options.natural_stop, options.pressure)
