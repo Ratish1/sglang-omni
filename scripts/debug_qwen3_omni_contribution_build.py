@@ -25,6 +25,11 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output-directory", type=Path, required=True)
     parser.add_argument("--build-jobs", type=int, required=True)
+    parser.add_argument(
+        "--output-arithmetic",
+        choices=("rounded-contributions", "checkpoint-reduction"),
+        default="rounded-contributions",
+    )
     arguments = parser.parse_args()
     if arguments.build_jobs < 1:
         raise ValueError("Build jobs must be positive")
@@ -37,6 +42,11 @@ def main() -> None:
     )
     source_directory = arguments.output_directory.resolve() / "csrc"
     shutil.copytree(jit_environment.FLASHINFER_CSRC_DIR, source_directory)
+    patch_filename = (
+        "qwen3_omni_checkpoint_reduction.patch"
+        if arguments.output_arithmetic == "checkpoint-reduction"
+        else "qwen3_omni_bf16_contributions.patch"
+    )
     subprocess.run(
         [
             "patch",
@@ -46,7 +56,7 @@ def main() -> None:
             "-d",
             str(source_directory),
             "-i",
-            str(Path(__file__).with_name("qwen3_omni_bf16_contributions.patch")),
+            str(Path(__file__).with_name(patch_filename)),
         ],
         check=True,
     )
@@ -76,7 +86,8 @@ def main() -> None:
                 "patched_finalizer_sha256": hashlib.sha256(
                     (source_directory / FINALIZER_PATH).read_bytes()
                 ).hexdigest(),
-                "scope": "Separate diagnostic module. BF16 weighted contributions round before the existing FP32 accumulation. Original installed sources and AOT module are unchanged. Numerical equivalence is not established by compilation.",
+                "output_arithmetic": arguments.output_arithmetic,
+                "scope": "Separate diagnostic module with the explicitly selected output arithmetic. Original installed sources and AOT module are unchanged. Numerical equivalence is not established by compilation.",
             },
             indent=2,
         )

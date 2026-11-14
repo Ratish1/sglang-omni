@@ -48,6 +48,7 @@ def main() -> None:
             "rounded-routing",
             "rounded-contributions",
             "native-weight-contributions",
+            "checkpoint-reduction",
         ),
     )
     arguments = parser.parse_args()
@@ -61,7 +62,12 @@ def main() -> None:
     else:
         pass
     if any(
-        control in ("rounded-contributions", "native-weight-contributions")
+        control
+        in (
+            "rounded-contributions",
+            "native-weight-contributions",
+            "checkpoint-reduction",
+        )
         for control in arguments.control or ()
     ):
         assert arguments.contribution_source_directory is not None
@@ -93,6 +99,7 @@ def main() -> None:
             ["rounded-routing"],
             ["rounded-contributions"],
             ["native-weight-contributions"],
+            ["checkpoint-reduction"],
             ["original", "rounded-routing"],
         )
         or arguments.reference_predictor_mode is not None
@@ -200,13 +207,21 @@ def main() -> None:
             )
         else:
             pass
-        if control in ("rounded-routing", "rounded-contributions"):
+        if control in (
+            "rounded-routing",
+            "rounded-contributions",
+            "checkpoint-reduction",
+        ):
             diagnostic_environment[
                 "SGLANG_OMNI_DIAGNOSTIC_CHECKPOINT_ROUTING_WEIGHTS"
             ] = "1"
         else:
             pass
-        if control in ("rounded-contributions", "native-weight-contributions"):
+        if control in (
+            "rounded-contributions",
+            "native-weight-contributions",
+            "checkpoint-reduction",
+        ):
             diagnostic_environment["SGLANG_OMNI_DIAGNOSTIC_CONTRIBUTION_SOURCE"] = str(
                 arguments.contribution_source_directory
             )

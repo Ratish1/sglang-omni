@@ -1,0 +1,111 @@
+--- a/fused_moe/cutlass_backend/cutlass_fused_moe_kernels.cuh
++++ b/fused_moe/cutlass_backend/cutlass_fused_moe_kernels.cuh
+@@ -23,6 +23,7 @@
+ #include <algorithm>
+ #include <cstdint>
++#include <limits>
+ #include <memory>
+ #include <numeric>
+ #include <random>
+ #include <sstream>
+@@ -1958,6 +1959,28 @@
+
+ constexpr static int FINALIZE_THREADS_PER_BLOCK = 256;
+
++__device__ __forceinline__ int nextExpertRankInOrder(int const* selected_experts,
++                                                   int64_t experts_per_token,
++                                                   int& previous_expert_id, int& previous_rank) {
++  int next_expert_id = std::numeric_limits<int>::max();
++  int next_rank = std::numeric_limits<int>::max();
++  for (int rank = 0; rank < experts_per_token; ++rank) {
++    int const expert_id = selected_experts[rank];
++    bool const follows_previous = expert_id > previous_expert_id ||
++                                  (expert_id == previous_expert_id && rank > previous_rank);
++    bool const precedes_next =
++        expert_id < next_expert_id || (expert_id == next_expert_id && rank < next_rank);
++    if (follows_previous && precedes_next) {
++      next_expert_id = expert_id;
++      next_rank = rank;
++    }
++  }
++  assert(next_rank < experts_per_token);
++  previous_expert_id = next_expert_id;
++  previous_rank = next_rank;
++  return next_rank;
++}
++
+ // Final kernel to unpermute and scale
+ // This kernel unpermutes the original data, does the k-way reduction and performs the final skip
+ // connection.
+@@ -2000,7 +2023,16 @@
+   for (int elem_index = start_offset; elem_index < num_elems_in_orig_col; elem_index += stride) {
+     ComputeElem thread_output;
+     thread_output.fill(0);
+-    for (int k_idx = 0; k_idx < experts_per_token; ++k_idx) {
++    int previous_expert_id = std::numeric_limits<int>::min();
++    int previous_rank = -1;
++    for (int expert_order = 0; expert_order < experts_per_token; ++expert_order) {
++      int k_idx = expert_order;
++      if constexpr (std::is_same_v<OutputType, __nv_bfloat16> &&
++                    std::is_same_v<GemmOutputType, __nv_bfloat16> &&
++                    SCALE_MODE == ScaleMode::DEFAULT) {
++        k_idx = nextExpertRankInOrder(token_selected_experts + original_row * experts_per_token,
++                                     experts_per_token, previous_expert_id, previous_rank);
++      }
+       int64_t const k_offset = original_row * experts_per_token + k_idx;
+       int64_t const expert_id = token_selected_experts[k_offset] - start_expert_id;
+       if (expert_id < 0 || expert_id >= num_experts_per_node) {
+@@ -2027,7 +2059,16 @@
+         expert_result = expert_result + arrayConvert<BiasElem, ComputeElem>(bias_ptr[elem_index]);
+       }
+
+-      thread_output = thread_output + row_scale * expert_result;
++      if constexpr (std::is_same_v<OutputType, __nv_bfloat16> &&
++                    std::is_same_v<GemmOutputType, __nv_bfloat16> &&
++                    SCALE_MODE == ScaleMode::DEFAULT) {
++        auto contribution = arrayConvert<ComputeElem, OutputElem>(row_scale * expert_result);
++        auto partial_sum = thread_output + arrayConvert<OutputElem, ComputeElem>(contribution);
++        thread_output =
++            arrayConvert<OutputElem, ComputeElem>(arrayConvert<ComputeElem, OutputElem>(partial_sum));
++      } else {
++        thread_output = thread_output + row_scale * expert_result;
++      }
+     }
+
+     OutputElem output_elem = arrayConvert<ComputeElem, OutputElem>(thread_output);
+@@ -2107,7 +2148,16 @@
+
+       ComputeElem thread_output;
+       thread_output.fill(0);
+-      for (int k_idx = 0; k_idx < experts_per_token; ++k_idx) {
++      int previous_expert_id = std::numeric_limits<int>::min();
++      int previous_rank = -1;
++      for (int expert_order = 0; expert_order < experts_per_token; ++expert_order) {
++        int k_idx = expert_order;
++        if constexpr (std::is_same_v<OutputType, __nv_bfloat16> &&
++                      std::is_same_v<GemmOutputType, __nv_bfloat16> &&
++                      SCALE_MODE == ScaleMode::DEFAULT) {
++          k_idx = nextExpertRankInOrder(token_selected_experts + source_row * experts_per_token,
++                                       experts_per_token, previous_expert_id, previous_rank);
++        }
+         int64_t const k_offset = source_row * experts_per_token + k_idx;
+         int64_t const expert_id = token_selected_experts[k_offset] - start_expert_id;
+         if (expert_id < 0 || expert_id >= num_experts_per_node) {
+@@ -2130,7 +2180,16 @@
+           expert_result = expert_result + arrayConvert<BiasElem, ComputeElem>(bias_ptr[elem_index]);
+         }
+
+-        thread_output = thread_output + row_scale * expert_result;
++        if constexpr (std::is_same_v<OutputType, __nv_bfloat16> &&
++                      std::is_same_v<GemmOutputType, __nv_bfloat16> &&
++                      SCALE_MODE == ScaleMode::DEFAULT) {
++          auto contribution = arrayConvert<ComputeElem, OutputElem>(row_scale * expert_result);
++          auto partial_sum = thread_output + arrayConvert<OutputElem, ComputeElem>(contribution);
++          thread_output = arrayConvert<OutputElem, ComputeElem>(
++              arrayConvert<ComputeElem, OutputElem>(partial_sum));
++        } else {
++          thread_output = thread_output + row_scale * expert_result;
++        }
+       }
+       OutputElem output_elem = arrayConvert<ComputeElem, OutputElem>(thread_output);
+       reduced_row_ptr_v[elem_index] = output_elem;
