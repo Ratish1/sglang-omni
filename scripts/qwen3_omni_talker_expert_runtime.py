@@ -148,6 +148,7 @@ def combine_expert_contributions(
     else:
         pass
     if semantics == "checkpoint-reduction":
+        weights = weights.bfloat16().float()
         order = indices.argsort(dim=1)
         selected = selected.gather(1, order[:, :, None].expand_as(selected))
         weights = weights.gather(1, order)
