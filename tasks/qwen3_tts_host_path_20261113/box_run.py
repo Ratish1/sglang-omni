@@ -17,6 +17,9 @@ RUN_DIRECTORY = Path("/data/qwen3-tts-host-path-20261113")
 REPOSITORY = Path("/workspace/sglang-omni")
 MODEL = "Qwen/Qwen3-TTS-12Hz-1.7B-Base"
 ASR_MODEL = "Qwen/Qwen3-ASR-1.7B"
+# Same Poisson arrival schedule for both arms of a fixed-rate cell.
+ARRIVAL_SEED = 7
+REQUEST_RATE_BY_CELL = {"stream_rate55": 55.0}
 ARMS = {
     "main": "df7bc688cd75e882ee47fd005d93777dec6cfcc0",
     "a1": "46d17389ae67dad11154830bfc65f2148a655e7d",
@@ -159,6 +162,7 @@ def benchmark(
     stream: bool,
     seed: int | None,
     warmup: int | None = None,
+    request_rate: float | None = None,
 ) -> dict:
     directory.mkdir(parents=True, exist_ok=True)
     command = [
@@ -184,6 +188,12 @@ def benchmark(
     ]
     if samples is not None:
         command.extend(["--max-samples", str(samples)])
+    else:
+        pass
+    if request_rate is not None:
+        command.extend(
+            ["--request-rate", str(request_rate), "--arrival-seed", str(ARRIVAL_SEED)]
+        )
     else:
         pass
     if seed is not None:
@@ -373,6 +383,7 @@ def run_pairs(
                                 stream,
                                 None,
                                 warmup,
+                                REQUEST_RATE_BY_CELL.get(cell),
                             )
                             for side, (arm, port) in ports.items()
                         }
@@ -554,6 +565,7 @@ def main() -> None:
             "quality_draws",
             "score_draws",
             "quality_draws_c64",
+            "rate_probe",
         ],
     )
     parser.add_argument("--arms", nargs="*", default=list(ARMS))
@@ -598,6 +610,14 @@ def main() -> None:
             )
     elif arguments.phase == "score_draws":
         score_generated(["quality_draws"])
+    elif arguments.phase == "rate_probe":
+        for round_index in range(2):
+            run_pairs(
+                [("main", "m2")],
+                [("stream_rate55", 128, None, True)],
+                root=f"rate_probe/round{round_index}",
+                warmup=1,
+            )
     elif arguments.phase == "quality_draws_c64":
         for round_index in range(3):
             run_pairs(
