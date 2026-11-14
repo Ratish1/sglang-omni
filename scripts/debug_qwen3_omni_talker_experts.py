@@ -35,9 +35,9 @@ class NativeTalkerExperts:
     enabled: bool = False
     calls: int = 0
     router_calls: int = 0
-    routing_semantics: Literal["reconstructed", "indices", "native", "rounded"] = (
-        "reconstructed"
-    )
+    routing_semantics: Literal[
+        "reconstructed", "indices", "native", "rounded", "indices-rounded"
+    ] = "reconstructed"
     shared_enabled: bool = False
     shared_calls: int = 0
     profiles: ObservedExpertProfiles | None = None
@@ -118,14 +118,20 @@ class NativeTalkerExperts:
                 indices = indices.long()
             else:
                 pass
-            if self.routing_semantics in ("reconstructed", "indices"):
+            if self.routing_semantics in (
+                "reconstructed",
+                "indices",
+                "indices-rounded",
+            ):
                 probabilities = logits.float().softmax(dim=-1)
                 weights = probabilities.gather(1, indices)
                 if module.norm_topk_prob:
                     weights = weights / weights.sum(dim=-1, keepdim=True)
                 else:
                     pass
-            elif self.routing_semantics == "rounded":
+            else:
+                pass
+            if self.routing_semantics in ("rounded", "indices-rounded"):
                 weights = weights.to(logits.dtype).float()
             else:
                 pass

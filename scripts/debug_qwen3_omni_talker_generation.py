@@ -87,7 +87,7 @@ def main() -> None:
     parser.add_argument(
         "--paired-native-routing-controls",
         action="store_true",
-        help="Separate native expert indices, native weight normalization, checkpoint weight rounding, and an exact baseline repeat.",
+        help="Separate native indices, weight normalization, both checkpoint-rounded weight paths, and an exact baseline repeat.",
     )
     parser.add_argument(
         "--native-expert-route-precision",
@@ -344,7 +344,14 @@ def main() -> None:
         else:
             rotary_modes = ("checkpoint",)
         routing_modes = (
-            ("reconstructed", "indices", "native", "rounded", "reconstructed-repeat")
+            (
+                "reconstructed",
+                "indices",
+                "native",
+                "rounded",
+                "indices-rounded",
+                "reconstructed-repeat",
+            )
             if arguments.paired_native_routing_controls
             else ("reconstructed",)
         )
