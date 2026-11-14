@@ -86,6 +86,7 @@ def main() -> None:
     parser.add_argument("--audit-loaded-weights", action="store_true")
     parser.add_argument("--native-predictor-capture-directory", type=Path)
     parser.add_argument("--checkpoint-residual-predictor", action="store_true")
+    parser.add_argument("--restore-prefill-state", choices=("query", "cache", "both"))
     parser.add_argument(
         "--predictor-attention-implementation",
         choices=("checkpoint", "native"),
@@ -205,6 +206,12 @@ def main() -> None:
     if arguments.checkpoint_residual_predictor:
         assert arguments.native_predictor_capture_directory is not None
         assert arguments.native_feedback_reduction == "sequential"
+    else:
+        pass
+    if arguments.restore_prefill_state is not None:
+        assert arguments.native_predictor_capture_directory is not None
+        assert arguments.native_backbone_attention
+        assert not arguments.checkpoint_residual_predictor
     else:
         pass
     if arguments.shared_activation_semantics != "native":
@@ -906,6 +913,8 @@ def main() -> None:
             first_main_code_divergence = None
             frame_reports = []
             termination = "frame_limit"
+            restored_prefill_cache_layers = 0
+            restored_prefill_query = False
             frame_limit = min(arguments.max_frames, captured_sampling["max_new_tokens"])
             for frame_index in range(frame_limit):
                 if arguments.capture_layer_states:
@@ -919,6 +928,65 @@ def main() -> None:
                     == len(prefill) + frame_index
                 )
                 assert output.generation_step == frame_index
+                if frame_index == 0 and arguments.restore_prefill_state is not None:
+                    assert finished is not None
+                    captured_prefill = torch.load(native_files[0], weights_only=True)
+                    assert int(before["extend_prefix_length"]) == 0
+                    assert isinstance(output.past_key_values, DynamicCache)
+                    if arguments.restore_prefill_state in ("cache", "both"):
+                        assert (
+                            len(output.past_key_values.layers)
+                            == len(captured_prefill["keys"])
+                            == len(captured_prefill["values"])
+                        )
+                        for layer, keys, values in zip(
+                            output.past_key_values.layers,
+                            captured_prefill["keys"],
+                            captured_prefill["values"],
+                            strict=True,
+                        ):
+                            keys = (
+                                keys.permute(1, 0, 2).unsqueeze(0).to(reference.device)
+                            )
+                            values = (
+                                values.permute(1, 0, 2)
+                                .unsqueeze(0)
+                                .to(reference.device)
+                            )
+                            assert layer.keys.shape == keys.shape
+                            assert layer.values.shape == values.shape
+                            assert layer.keys.dtype == keys.dtype == torch.bfloat16
+                            assert layer.values.dtype == values.dtype == torch.bfloat16
+                            layer.keys.copy_(keys)
+                            layer.values.copy_(values)
+                            restored_prefill_cache_layers += 1
+                    else:
+                        pass
+                    if arguments.restore_prefill_state in ("query", "both"):
+                        hidden = (
+                            captured_prefill["hidden_states"]
+                            .unsqueeze(0)
+                            .to(reference.device)
+                        )
+                        assert hidden.shape == output.hidden_states[0][-1][:, -1].shape
+                        assert hidden.dtype == output.hidden_states[0][-1].dtype
+                        restored_logits = reference.codec_head(hidden)
+                        expected_logits = (
+                            torch.load(
+                                trace_directory / "0000-prefill-logits.pt",
+                                weights_only=True,
+                            )
+                            .unsqueeze(0)
+                            .to(reference.device)
+                        )
+                        assert torch.equal(restored_logits.float(), expected_logits)
+                        output.hidden_states[0][-1][:, -1].copy_(hidden)
+                        output.logits[:, -1].copy_(restored_logits)
+                        restored_prefill_query = True
+                    else:
+                        pass
+                else:
+                    pass
                 if arguments.capture_layer_states:
                     assert isinstance(output.past_key_values, DynamicCache)
                     tokens = captured_inputs.shape[1]
@@ -1291,6 +1359,9 @@ def main() -> None:
                 "sampling_order": sampling_order,
                 "residual_policy": residual_policy,
                 "checkpoint_residual_predictor": arguments.checkpoint_residual_predictor,
+                "restored_prefill_state": arguments.restore_prefill_state,
+                "restored_prefill_cache_layers": restored_prefill_cache_layers,
+                "restored_prefill_query": restored_prefill_query,
                 "predictor_attention_implementation": arguments.predictor_attention_implementation,
                 "predictor_native_attention_calls": (
                     predictor_attention.calls if predictor_attention is not None else 0
