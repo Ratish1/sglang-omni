@@ -80,6 +80,9 @@ inline constexpr int kQkvWords = kQkvWidth / 2;
 inline constexpr int kAttentionWords = kAttentionWidth / 2;
 inline constexpr int kIntermediateWords = kIntermediateSize / 2;
 inline constexpr int kHiddenScratchWords = kMaxRows * kHiddenWords;
+// A consumer that finds stale words sleeps this long before reading again, so
+// many CTAs polling one buffer leave its producers' stores room.
+inline constexpr unsigned kPollBackoffNanoseconds = 256;
 
 // One attention item's shared memory, inside the operand buffer: the cached
 // keys and values in 272-byte rows so lanes reading different slots hit
@@ -396,6 +399,8 @@ SGL_DEVICE void load_current_row(const uint64_t *row, uint32_t epoch,
       if (is_current(words[i][0], epoch) && is_current(words[i][1], epoch))
         pending &= ~(1u << i);
     }
+    if (pending != 0u)
+      __nanosleep(kPollBackoffNanoseconds);
   } while (pending != 0u);
 #pragma unroll
   for (int i = 0; i < kVectorsPerLane; ++i) {
@@ -649,8 +654,10 @@ SGL_DEVICE float residual_value(const LayerParams &params, int layer, int phase,
                              : layer_epoch(epoch_base, layer);
   const uint64_t *address =
       residual_address(params, layer, phase, token, feature);
-  while (word_epoch(residual) != epoch)
+  while (word_epoch(residual) != epoch) {
+    __nanosleep(kPollBackoffNanoseconds);
     residual = load_flagged(address);
+  }
   return __bfloat162float(__ushort_as_bfloat16(
       static_cast<uint16_t>(residual >> (16 * (feature % 2)))));
 }
@@ -894,8 +901,10 @@ SGL_DEVICE void attend(const LayerParams &params, int layer, int item,
   if (has_head_pair) {
     const uint64_t *source = head_words(params, token, group, head) + pair * 2;
     head_pair = load_flagged_pair(source);
-    while (!is_current(head_pair, epoch))
+    while (!is_current(head_pair, epoch)) {
+      __nanosleep(kPollBackoffNanoseconds);
       head_pair = load_flagged_pair(source);
+    }
   }
 #pragma unroll
   for (int i = 0; i < kAttentionVectorsPerThread; ++i) {
