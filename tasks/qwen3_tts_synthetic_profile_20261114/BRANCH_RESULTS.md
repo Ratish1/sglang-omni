@@ -39,6 +39,18 @@ Codebook step (5 layers, final norm, lm_head, seeded sampler), `predictor_bench.
 
 Error of the step against fp32 at 1 row: persistent 0.162, Triton and CuTe 0.193.
 
+## H100 (host-62, cards 4 and 5), 11-14
+
+`94c7595fa`, check and step bench, each run alone on its card:
+
+| | 1 row | 8 rows | 16 rows |
+|---|---|---|---|
+| 5 layers one launch / 5 launches / Triton | 100.3 / 90.7 / 138.9 | 115.5 / 108.5 / 144.7 | 129.7 / 125.3 / 146.4 |
+| Step: Triton / CuTe DSL / persistent one launch / per-layer | 172.7 / 148.8 / 126.2 / 128.4 | | 178.4 / 151.3 / 156.5 / 154.3 |
+
+- The step bench gave the same numbers alone and beside the check, so the two cards did not disturb each other.
+- The 11-13 study measured Triton's step at 157.4 us and CuTe's at 137.4 us on this host's other cards. Today's cards run every backend about 10 % slower, so compare backends within one run only.
+
 Primitive latencies on this H200 (`latency_probe.py`, cycles): chained MMA 24, independent MMA 7, chained ldmatrix 34, L2 round trip 288, store and gpu fence 415, 256-thread barrier 27, clock64 and globaltimer reads 24 each.
 
 ## Stamp timeline, 1 row, L2-warm (us from the first CTA entry)
