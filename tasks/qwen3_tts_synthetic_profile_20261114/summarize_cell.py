@@ -31,6 +31,20 @@ def run(command: list[str]) -> None:
         print(f"## FAILED {' '.join(command[:3])}: {completed.stderr.strip()[-400:]}")
     else:
         pass
+    for line in (completed.stdout + completed.stderr).splitlines():
+        if "no data was found" in line or "No output generated" in line:
+            print(f"## {' '.join(command[1:3])}: {line.strip()}")
+        else:
+            pass
+
+
+def print_parquet(path: Path, rows: int) -> None:
+    import pandas
+
+    frame = pandas.read_parquet(path)
+    print(f"## {path.parent.name}/{path.name} ({len(frame)} rows)")
+    with pandas.option_context("display.width", 250, "display.max_columns", 30):
+        print(frame.head(rows).to_string(max_colwidth=90))
 
 
 def print_csv(path: Path, rows: int) -> None:
@@ -65,6 +79,11 @@ def main() -> None:
         print_csv(path, args.rows)
     for path in sorted(stem.parent.glob(f"{stem.name}_*/*.csv")):
         print_csv(path, args.rows)
+    for path in sorted(stem.parent.glob(f"{stem.name}_*/*.parquet")):
+        if path.name != "files.parquet" and not path.with_suffix(".csv").exists():
+            print_parquet(path, args.rows)
+        else:
+            pass
 
 
 if __name__ == "__main__":

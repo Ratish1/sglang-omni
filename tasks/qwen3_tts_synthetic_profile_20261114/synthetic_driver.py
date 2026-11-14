@@ -39,13 +39,13 @@ PREFILL_TEXT = " ".join(["the"] * 20)
 DECODE_TEXT = "the"
 LAUNCH_OPTIONS = {
     "timing": [
-        "--trace=cuda,nvtx,osrt,python-gil",
+        "--trace=cuda,nvtx,osrt",
         "--cuda-graph-trace=graph",
         "--cuda-event-trace=true",
         f"--python-functions-trace={HERE / 'marks.json'}",
     ],
     "attribution": [
-        "--trace=cuda,nvtx,osrt",
+        "--trace=cuda,nvtx,osrt,python-gil",
         "--cuda-graph-trace=node:nvtx-precapture",
         "--pytorch=functions-trace",
         f"--python-functions-trace={HERE / 'marks.json'}",
@@ -206,11 +206,12 @@ def launch_server(tree: Path, mode: str, session: str, port: int, log: Path) -> 
         "QWEN3_TTS_SYNTHETIC": "1",
         "SGLANG_OMNI_STRICT_PORT": "1",
     }
+    if mode == "none":
+        profiler = []
+    else:
+        profiler = ["nsys", "launch", f"--session-new={session}", *LAUNCH_OPTIONS[mode]]
     command = [
-        "nsys",
-        "launch",
-        f"--session-new={session}",
-        *LAUNCH_OPTIONS[mode],
+        *profiler,
         sys.executable,
         "-m",
         "sglang_omni.cli",
@@ -303,7 +304,7 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--tree", type=Path, required=True)
     parser.add_argument("--out", type=Path, required=True)
-    parser.add_argument("--mode", choices=sorted(LAUNCH_OPTIONS), required=True)
+    parser.add_argument("--mode", choices=[*sorted(LAUNCH_OPTIONS), "none"], required=True)
     parser.add_argument("--port", type=int, default=24100)
     parser.add_argument("--batch-sizes", type=int, nargs="+", default=list(BATCH_SIZES))
     args = parser.parse_args()
@@ -319,6 +320,16 @@ def main() -> None:
             run_prefill_cell(args.port, references, batch_size, None, f"warm_prefill_bs{batch_size}")
             run_decode_cell(args.port, references, batch_size, 64, None, f"warm_decode_bs{batch_size}")
         for batch_size in args.batch_sizes:
+            results.append(
+                run_prefill_cell(args.port, references, batch_size, None, f"plain_prefill_bs{batch_size}")
+            )
+            results.append(
+                run_decode_cell(args.port, references, batch_size, DECODE_FRAMES, None, f"plain_decode_bs{batch_size}")
+            )
+            if args.mode == "none":
+                continue
+            else:
+                pass
             results.append(
                 run_prefill_cell(args.port, references, batch_size, session, f"prefill_bs{batch_size}")
             )
