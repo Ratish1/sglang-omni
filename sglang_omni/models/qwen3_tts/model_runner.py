@@ -427,19 +427,20 @@ class Qwen3TTSModelRunner(ModelRunner):
         output_codes = self.model.output_codes[: len(requests)]
         frame_indices = semantic_positions + self.frame_index_bases
         # note (ratish): a middle prefill chunk samples at a prompt row, so it has no frame.
-        recorded = (
-            None
-            if forward_batch.forward_mode.is_decode()
-            else [
-                row_index
-                for row_index, sched_req in enumerate(requests)
-                if sched_req.data.req.inflight_middle_chunks <= 0
-            ]
-        )
-        if recorded is None or len(recorded) == len(requests):
+        if forward_batch.forward_mode.is_decode() or all(
+            sched_req.data.req.inflight_middle_chunks <= 0 for sched_req in requests
+        ):
             self.code_table.frames.index_copy_(0, frame_indices, output_codes)
         else:
-            recorded_rows = async_h2d(recorded, dtype=torch.long, device=self.device)
+            recorded_rows = async_h2d(
+                [
+                    row_index
+                    for row_index, sched_req in enumerate(requests)
+                    if sched_req.data.req.inflight_middle_chunks <= 0
+                ],
+                dtype=torch.long,
+                device=self.device,
+            )
             self.code_table.frames.index_copy_(
                 0, frame_indices[recorded_rows], output_codes[recorded_rows]
             )
