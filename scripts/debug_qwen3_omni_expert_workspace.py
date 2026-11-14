@@ -5,7 +5,8 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
-from dataclasses import asdict, dataclass
+from contextlib import nullcontext
+from dataclasses import asdict
 from pathlib import Path
 
 import torch
@@ -23,82 +24,20 @@ from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import (
 
 from scripts.debug_qwen3_omni_feedback_audit import compare_tensors
 from scripts.qwen3_omni_checkpoint_weights import audit_checkpoint_weights
+from scripts.qwen3_omni_expert_workspace_runtime import (
+    read_workspace_stages,
+    workspace_prefix,
+    workspace_view,
+)
 from scripts.qwen3_omni_talker_expert_runtime import (
     NativeRuntime,
     ObservedExpertProfileMap,
-    combine_expert_contributions,
     load_native_expert_weights,
 )
 from sglang_omni.models.qwen3_omni.contribution_rounding import (
     FINALIZER_PATH,
     install_contribution_provider,
 )
-
-# note (ratish): these are the pinned workspace.h alignment and prologue block bounds.
-WORKSPACE_ALIGNMENT_BYTES = 128
-MINIMUM_BLOCK_TOKENS = 32
-MAXIMUM_BLOCK_TOKENS = 1024
-
-
-@dataclass(kw_only=True, frozen=True)
-class WorkspaceBuffer:
-    offset_bytes: int
-    size_bytes: int
-
-
-def workspace_prefix(
-    tokens: int,
-    hidden_channels: int,
-    intermediate_channels: int,
-    experts: int,
-    ranks: int,
-) -> dict[str, WorkspaceBuffer]:
-    block_tokens = MINIMUM_BLOCK_TOKENS
-    while (
-        block_tokens < MAXIMUM_BLOCK_TOKENS
-        and ((tokens + block_tokens - 1) // block_tokens) * experts > block_tokens
-    ):
-        block_tokens *= 2
-    blocks = (tokens + block_tokens - 1) // block_tokens
-    expanded_tokens = tokens * ranks
-    sizes = {
-        "permuted_row_to_unpermuted_row": expanded_tokens * 4,
-        "permuted_token_selected_experts": expanded_tokens * 4,
-        "blocked_expert_counts": experts * blocks * 4,
-        "blocked_expert_counts_cumsum": experts * blocks * 4,
-        "blocked_row_to_unpermuted_row": experts * tokens * 4,
-        "expert_first_token_offset": (experts + 1) * 8,
-        "permuted_token_final_scales": 0,
-        "overlapped_gemm1_gemm2_inputs": expanded_tokens
-        * max(hidden_channels, intermediate_channels)
-        * 2,
-        "overlapped_gemm1_gemm2_outputs": expanded_tokens
-        * max(hidden_channels, 2 * intermediate_channels)
-        * 2,
-    }
-    buffers = {}
-    offset_bytes = 0
-    for name, size_bytes in sizes.items():
-        buffers[name] = WorkspaceBuffer(
-            offset_bytes=offset_bytes, size_bytes=size_bytes
-        )
-        offset_bytes += (
-            (size_bytes + WORKSPACE_ALIGNMENT_BYTES - 1)
-            // WORKSPACE_ALIGNMENT_BYTES
-            * WORKSPACE_ALIGNMENT_BYTES
-        )
-    return buffers
-
-
-def workspace_view(
-    workspace: torch.Tensor,
-    buffer: WorkspaceBuffer,
-    dtype: torch.dtype,
-    shape: tuple[int, ...],
-) -> torch.Tensor:
-    stop_bytes = buffer.offset_bytes + buffer.size_bytes
-    assert stop_bytes <= workspace.numel()
-    return workspace[buffer.offset_bytes : stop_bytes].view(dtype).reshape(shape)
 
 
 @torch.inference_mode()
@@ -203,24 +142,54 @@ def main() -> None:
                         workspace_bytes, dtype=torch.uint8, device=hidden.device
                     )
                     replay_inputs = hidden.clone()
-                    output = cutlass_fused_moe(
-                        input=replay_inputs,
-                        token_selected_experts=indices,
-                        token_final_scales=scales,
-                        fc1_expert_weights=packed,
-                        fc2_expert_weights=down,
-                        output_dtype=torch.bfloat16,
-                        quant_scales=None,
-                        activation_type=ActivationType.Swiglu,
-                        use_fused_finalize=False,
-                        tune_max_num_tokens=runtime.tune_max_num_tokens,
-                        profile_ids=list(
-                            profiles.prefill[layer_index]
-                            if frame == 0
-                            else profiles.decode[layer_index]
-                        ),
-                        workspace_buffer=workspace,
-                    )[0]
+                    profiler = (
+                        torch.profiler.profile(
+                            activities=[
+                                torch.profiler.ProfilerActivity.CPU,
+                                torch.profiler.ProfilerActivity.CUDA,
+                            ]
+                        )
+                        if frame < 2 and layer_index == 0
+                        else nullcontext()
+                    )
+                    with profiler as observed_profile:
+                        output = cutlass_fused_moe(
+                            input=replay_inputs,
+                            token_selected_experts=indices,
+                            token_final_scales=scales,
+                            fc1_expert_weights=packed,
+                            fc2_expert_weights=down,
+                            output_dtype=torch.bfloat16,
+                            quant_scales=None,
+                            activation_type=ActivationType.Swiglu,
+                            use_fused_finalize=False,
+                            tune_max_num_tokens=runtime.tune_max_num_tokens,
+                            profile_ids=list(
+                                profiles.prefill[layer_index]
+                                if frame == 0
+                                else profiles.decode[layer_index]
+                            ),
+                            workspace_buffer=workspace,
+                        )[0]
+                    if observed_profile is not None:
+                        (
+                            arguments.output_directory
+                            / f"{directory.name}-{frame}-kernels.json"
+                        ).write_text(
+                            json.dumps(
+                                {
+                                    "kernels": [
+                                        event.name
+                                        for event in observed_profile.events()
+                                        if event.device_type
+                                        == torch.autograd.DeviceType.CUDA
+                                    ]
+                                },
+                                indent=2,
+                            )
+                        )
+                    else:
+                        pass
                     assert torch.equal(
                         replay_inputs.view(torch.uint8), hidden.view(torch.uint8)
                     )
@@ -254,40 +223,15 @@ def main() -> None:
                     assert torch.equal(
                         indices[token_rows, expert_ranks], expected_experts
                     )
-                    activation_buffer = buffers["overlapped_gemm1_gemm2_inputs"]
-                    down_buffer = buffers["overlapped_gemm1_gemm2_outputs"]
-                    activated = workspace_view(
+                    stages = read_workspace_stages(
                         workspace,
-                        WorkspaceBuffer(
-                            offset_bytes=activation_buffer.offset_bytes,
-                            size_bytes=expanded_tokens * intermediate_channels * 2,
-                        ),
-                        torch.bfloat16,
-                        (expanded_tokens, intermediate_channels),
-                    )
-                    projected = workspace_view(
-                        workspace,
-                        WorkspaceBuffer(
-                            offset_bytes=down_buffer.offset_bytes,
-                            size_bytes=expanded_tokens * hidden_channels * 2,
-                        ),
-                        torch.bfloat16,
-                        (expanded_tokens, hidden_channels),
-                    )
-                    routed = torch.empty(
-                        (tokens, ranks, hidden_channels),
-                        dtype=hidden.dtype,
-                        device=hidden.device,
-                    )
-                    routed[token_rows, expert_ranks] = projected
-                    reconstructed = combine_expert_contributions(
-                        list(routed.unbind(dim=1)),
+                        buffers,
                         indices,
                         scales,
-                        "checkpoint-reduction",
-                    )
-                    assert torch.equal(
-                        reconstructed.view(torch.uint8), output.view(torch.uint8)
+                        token_rows,
+                        expert_ranks,
+                        intermediate_channels,
+                        output,
                     )
                     inverse_rows = torch.empty_like(source_rows)
                     inverse_rows[source_rows] = torch.arange(
@@ -297,8 +241,8 @@ def main() -> None:
                     selected = inverse_rows[
                         row + torch.arange(ranks, device=hidden.device) * tokens
                     ]
-                    native_activation = activated[selected]
-                    native_down = projected[selected]
+                    native_activation = stages.activated[selected]
+                    native_down = stages.projected[selected]
                     ideal_activated = []
                     rounded_activated = []
                     ideal_down = []
@@ -365,6 +309,7 @@ def main() -> None:
                                 "batch_tokens": tokens,
                                 "whole_output_bytes_exact": True,
                                 "workspace_down_reduction_bytes_exact": True,
+                                "has_glu_intermediate": stages.has_glu_intermediate,
                                 "differences": {
                                     name: asdict(value)
                                     for name, value in differences.items()
