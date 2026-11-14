@@ -41,7 +41,7 @@ mixed() {
   wait $looper
 }
 mixed mx3_f $FIX ""
-RATE="--bench-extra=--request-rate 9"
+RATE="--bench-extra=--request-rate=9"
 mixed mxr_m $MAIN "$RATE"
 mixed mxr_f $FIX "$RATE"
 mixed mxr_x $STACKFIX "$RATE"
