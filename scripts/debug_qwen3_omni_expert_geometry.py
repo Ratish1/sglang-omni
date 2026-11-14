@@ -48,7 +48,6 @@ def main() -> None:
     arguments = parser.parse_args()
     arguments.output_directory.mkdir(exist_ok=False)
     if arguments.contribution_source_directory is not None:
-        assert arguments.contribution_reference_directory is not None
         assert not arguments.decompose_expert_slots
         install_contribution_provider(arguments.contribution_source_directory)
     elif arguments.contribution_reference_directory is not None:
@@ -56,6 +55,10 @@ def main() -> None:
         arguments.contribution_reference_directory.mkdir(exist_ok=False)
     else:
         pass
+    has_contribution_expectations = (
+        arguments.contribution_source_directory is not None
+        and arguments.contribution_reference_directory is not None
+    )
     torch.cuda.set_device(arguments.gpu)
     configuration = Qwen3OmniMoeConfig.from_pretrained(
         arguments.model_path, revision=arguments.model_revision
@@ -117,7 +120,7 @@ def main() -> None:
             exact_decomposed_batches = 0
             for frame, filename in enumerate(files):
                 snapshots = torch.load(filename, weights_only=True)
-                if arguments.contribution_source_directory is not None:
+                if has_contribution_expectations:
                     expected_contributions = torch.load(
                         arguments.contribution_reference_directory
                         / directory.name
@@ -215,7 +218,7 @@ def main() -> None:
                         )
                         for selected in (slice(None), slice(start, stop))
                     ]
-                    if arguments.contribution_source_directory is not None:
+                    if has_contribution_expectations:
                         expected = expected_contributions[layer_index].to(
                             reference.device
                         )
@@ -342,8 +345,13 @@ def main() -> None:
                         "records": records,
                         "scope": (
                             "Diagnostic library versus independently saved BF16-contribution expectations from the original native library, every actual batch and original algorithm ID. No free-running quality or invalid-kernel claim."
+                            if has_contribution_expectations
+                            else "Captured native outputs, selected provider and actual held routing/algorithms, complete lifetimes and prefill rows. Optional contribution expectations must first reconstruct every original output exactly. No free-running quality or invalid-kernel claim."
+                        ),
+                        "contribution_source_directory": (
+                            str(arguments.contribution_source_directory)
                             if arguments.contribution_source_directory is not None
-                            else "Original native library, actual held routing and algorithms, complete lifetimes and prefill rows. Optional contribution expectations must first reconstruct every original output exactly. No free-running quality or invalid-kernel claim."
+                            else None
                         ),
                     },
                     indent=2,
