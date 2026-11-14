@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
 # guarded_queue.sh <card> <head>...: on the host, runs each head with run_head.sh once no other
-# session holds a GPU, and repeats a head whose Triton reference shows contention.
+# session holds a GPU, and repeats a head whose Triton reference at 1 row is slower than
+# TRITON_CEILING_US (135 on H200, where a lone card measures 129 to 131; 145 on H100, 139).
 CARD=$1
 shift
+CEILING=${TRITON_CEILING_US:-135}
 C=sglang-omni-qwen3-tts-predictor-20261114
 R=$HOME/qwen3-tts-synthetic-20261114/predictor_bench
 BOX=/data/qwen3-tts-synthetic-20261114/kit/tasks/qwen3_tts_synthetic_profile_20261114/box
@@ -21,7 +23,7 @@ for HEAD in "$@"; do
     TRITON=$(podman exec $C python3 -c "import json; print(json.load(open('/data/qwen3-tts-synthetic-20261114/predictor_bench/h200_${HEAD}_check.json'))['1']['triton 5 layers us'])" 2>/dev/null)
     echo "$(date +%H:%M:%S) done $HEAD triton reference ${TRITON:-missing}"
     [ -z "$TRITON" ] && break
-    python3 -c "import sys; sys.exit(0 if float('$TRITON') <= 135 else 1)" && break
+    python3 -c "import sys; sys.exit(0 if float('$TRITON') <= $CEILING else 1)" && break
     echo "$(date +%H:%M:%S) contended, repeating $HEAD"
   done
 done
