@@ -186,7 +186,7 @@ def request_body(seed: int, cot: str = "off") -> dict:
     }
 
 
-def serving(priority: bool, policy: str) -> None:
+def serving(priority: bool, policy: str, kv_cache_bytes: str | None = None, prefill_max_requests: int | None = None) -> None:
     port = 18353
     arguments = [
         sys.executable,
@@ -208,7 +208,11 @@ def serving(priority: bool, policy: str) -> None:
         arguments += ["--yue2_ar.engine.enable_priority_scheduling", "true"]
     if policy != "default":
         arguments += ["--yue2_ar.engine.schedule_policy", policy]
-    label = "priority" if priority else policy
+    if kv_cache_bytes is not None:
+        arguments += ["--yue2_ar.engine.kv_cache_bytes", kv_cache_bytes]
+    if prefill_max_requests is not None:
+        arguments += ["--yue2_ar.engine.prefill_max_requests", str(prefill_max_requests)]
+    label = "priority" if priority else ("bytes" if kv_cache_bytes is not None else ("prefill" if prefill_max_requests is not None else policy))
     log = (DIRECTORY / f"server-{label}.log").open("w")
     process = subprocess.Popen(
         arguments, stdout=log, stderr=subprocess.STDOUT, start_new_session=True
@@ -233,7 +237,10 @@ def serving(priority: bool, policy: str) -> None:
 
         def send(body: dict) -> dict:
             started = time.monotonic()
-            response = httpx.post(f"{base}/v1/audio/speech", json=body, timeout=240)
+            try:
+                response = httpx.post(f"{base}/v1/audio/speech", json=body, timeout=30)
+            except httpx.TimeoutException:
+                return {"status": "timeout", "seconds": time.monotonic() - started}
             result = {
                 "status": response.status_code,
                 "seconds": time.monotonic() - started,
@@ -296,9 +303,11 @@ if __name__ == "__main__":
     parser.add_argument("mode", choices=["numerical", "serving"])
     parser.add_argument("--priority", action="store_true")
     parser.add_argument("--policy", default="default")
+    parser.add_argument("--kv-cache-bytes")
+    parser.add_argument("--prefill-max-requests", type=int)
     options = parser.parse_args()
     DIRECTORY.mkdir(exist_ok=True, parents=True)
     if options.mode == "numerical":
         numerical()
     else:
-        serving(options.priority, options.policy)
+        serving(options.priority, options.policy, options.kv_cache_bytes, options.prefill_max_requests)
