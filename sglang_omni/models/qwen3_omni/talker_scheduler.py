@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import time
 from collections import deque
+from collections.abc import Iterator
 from dataclasses import replace
 
 import torch
@@ -24,7 +25,11 @@ from sglang_omni.models.qwen3_omni.config import (
 from sglang_omni.models.qwen3_omni.payload_types import NO_SPEECH
 from sglang_omni.pipeline.stage.stream_queue import StreamItem
 from sglang_omni.proto.request import StagePayload
-from sglang_omni.scheduling.omni_scheduler import OmniScheduler, OmniSchedulerArguments
+from sglang_omni.scheduling.omni_scheduler import (
+    OmniScheduler,
+    OmniSchedulerArguments,
+    detach_request_data,
+)
 from sglang_omni.scheduling.sglang_backend.ar_session import SessionUnit
 from sglang_omni.scheduling.sglang_backend.request_data import SGLangARRequestData
 from sglang_omni.vendor.sglang.server_args import override_server_args
@@ -166,6 +171,11 @@ class QwenTalkerScheduler(OmniScheduler[SGLangARRequestData]):
 
     def update_running_batch(self, batch: ScheduleBatch) -> ScheduleBatch | None:
         """Decode the rows whose next input has arrived; the others sit out the step with their KV."""
+        self.finish_aborted_rows_without_input(batch)
+        if batch.is_empty():
+            return None
+        else:
+            pass
         waiting_row_indices = self.model_runner.rows_without_next_decode_input(batch)
         if not waiting_row_indices:
             return super().update_running_batch(batch)
@@ -224,6 +234,35 @@ class QwenTalkerScheduler(OmniScheduler[SGLangARRequestData]):
             ]
         )
         return taken_batch
+
+    def finish_aborted_rows_without_input(self, batch: ScheduleBatch) -> None:
+        """An aborted row whose thinker text has stopped can take no step, so it finishes here."""
+        aborted_requests = [
+            batch.reqs[row_index]
+            for row_index in self.model_runner.rows_without_next_decode_input(batch)
+            if batch.reqs[row_index].to_finish is not None
+        ]
+        if not aborted_requests:
+            return
+        else:
+            pass
+        with self.request_admission_lock:
+            for request in aborted_requests:
+                request.update_finish_state()
+                self.run_abort_callback(request.rid)
+                self.emit_model_path_end_once(request.rid, status="aborted")
+                self.release_request_kv_cache(request)
+                detach_request_data(request)
+        batch.filter_batch()
+        batch.batch_is_full = False
+
+    def pending_batches(self) -> Iterator[ScheduleBatch]:
+        """Rows sitting out the current step stay visible to request lookup and cancellation."""
+        yield from super().pending_batches()
+        if self.waiting_batch is not None:
+            yield self.waiting_batch
+        else:
+            pass
 
     def return_waiting_rows(self, batch: ScheduleBatch) -> None:
         waiting_batch = self.waiting_batch

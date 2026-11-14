@@ -12,7 +12,7 @@ from unittest.mock import Mock
 import pytest
 import sglang.srt.managers.schedule_batch as schedule_batch_module
 import torch
-from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
+from sglang.srt.managers.schedule_batch import FINISH_ABORT, Req, ScheduleBatch
 from sglang.srt.mem_cache.allocator.token import TokenToKVPoolAllocator
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool, ReqToTokenPool
@@ -1161,6 +1161,8 @@ def decoding_talker_request(
     request.kv.kv_allocated_len = kv_length
     request.kv.kv_committed_len = kv_length
     request.output_ids = list(output_ids)
+    request.omni_data = SimpleNamespace()
+    request._omni_terminal_claimed = False  # noqa: leading-underscore  # upstream spelling, or the public name is already taken
     return request
 
 
@@ -1205,6 +1207,15 @@ def row_readiness_scheduler(
     scheduler.waiting_batch = None
     scheduler.waiting_row_steps = 0
     scheduler.waiting_row_last_log_s = 0.0
+    scheduler.request_admission_lock = threading.RLock()
+    scheduler.abort_callback = None
+    scheduler.prefill_start_done = set()
+    scheduler.decode_batch_states = {}
+    scheduler.previous_pending_decode = None
+    scheduler.async_pending = None
+    scheduler.result_queue = deque()
+    scheduler.cur_batch = None
+    scheduler.last_batch = None
 
     def allocate_one_slot_per_row(
         batch: ScheduleBatch, token_per_req: int
@@ -1370,6 +1381,41 @@ def test_step_the_running_batch_skips_returns_the_waiting_rows(
     assert scheduler.update_running_batch(batch) is None
     assert [request.rid for request in batch.reqs] == ["second", "third", "first"]
     assert batch.seq_lens.tolist() == [3, 1, 3]
+    assert scheduler.waiting_batch is None
+
+
+@pytest.mark.usefixtures("talker_server_args")
+def test_abort_during_the_step_marks_the_row_sitting_out(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scheduler = row_readiness_scheduler(monkeypatch, {"second"})
+    batch = running_talker_batch(scheduler)
+    scheduler.running_batch = batch
+    waiting_request = batch.reqs[1]
+
+    scheduler.update_running_batch(batch)
+
+    assert scheduler.mark_running_request_aborted("second")
+    assert isinstance(waiting_request.to_finish, FINISH_ABORT)
+
+
+@pytest.mark.usefixtures("talker_server_args")
+def test_aborted_row_without_text_finishes_at_the_step_boundary(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scheduler = row_readiness_scheduler(monkeypatch, {"second"})
+    batch = running_talker_batch(scheduler)
+    aborted_request = batch.reqs[1]
+    aborted_request.to_finish = FINISH_ABORT()
+    free_slots = scheduler.token_to_kv_pool_allocator.available_size()
+
+    decode_batch = scheduler.update_running_batch(batch)
+
+    assert [request.rid for request in decode_batch.reqs] == ["first", "third"]
+    assert aborted_request.finished()
+    assert aborted_request.omni_data is None
+    assert not aborted_request.kv.holds_kv
+    assert scheduler.token_to_kv_pool_allocator.available_size() == free_slots + 3 - 2
     assert scheduler.waiting_batch is None
 
 
