@@ -886,8 +886,7 @@ __global__ __launch_bounds__(kThreads, 1) void predictor_layer_kernel(
 
   if (warp_index == kComputeWarps) {
     // Weights never depend on the previous kernel, so the producer streams
-    // before the PDL wait, layer after layer. Each chunk it copies also asks L2
-    // for the same chunk of the next layer, so that layer's copies hit L2.
+    // before the PDL wait, layer after layer.
     if (lane_index == 0) {
       int stage = 0;
       uint32_t empty_parity = 1u;
@@ -906,11 +905,6 @@ __global__ __launch_bounds__(kThreads, 1) void predictor_layer_kernel(
                 ring + stage * kChunkBytes,
                 chunk_pointer(params, layer, phase, tile, chunk), kChunkBytes,
                 full_barriers + stage);
-            if (layer + 1 < params.layers) {
-              prefetch_to_l2(
-                  chunk_pointer(params, layer + 1, phase, tile, chunk),
-                  kChunkBytes);
-            }
             stage += 1;
             if (stage == kRingStages) {
               stage = 0;
