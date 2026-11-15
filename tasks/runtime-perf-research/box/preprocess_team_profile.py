@@ -6,7 +6,8 @@ configuration: the pass's seconds, the mean wall of one request, and the mean of
 call, timed by wrapping the preprocessor module's loader and the processor in place.
 
 usage: PYTHONPATH=<tree> taskset -c <cpus> python3 preprocess_team_profile.py --configs 8:14:14:16,8:112:16:16,... --out t.json
-       a configuration is video_threads:omp:decode_threads:concurrency
+       a configuration is video_threads:omp:decode_threads:concurrency[:video_team]; video_team sizes each video
+       thread's own OpenMP team as the thread starts, the process team (omp) staying with every other thread
 """
 
 import argparse
@@ -21,12 +22,28 @@ import time
 from preprocess_stage_bench import MODEL, VIDEO_SETTINGS, VIDEOMME_CI
 
 
-def run_one(threads: int, decode_threads: int, concurrency: int) -> dict[str, float]:
+def run_one(
+    threads: int, decode_threads: int, concurrency: int, video_team: int
+) -> dict[str, float]:
+    import torch
+
     import sglang_omni.models.qwen3_omni.components.preprocessor as preprocessor_mod
     import sglang_omni.models.qwen3_omni.stages as qwen_stages
     from benchmarks.dataset.videomme import load_videomme_samples
     from sglang_omni.proto.request import OmniRequest, StagePayload
     from sglang_omni.scheduling.message import IncomingMessage
+
+    if video_team:
+        name_thread = qwen_stages.name_native_thread
+
+        def start_video_thread() -> None:
+            name_thread()
+            torch.get_num_threads()
+            torch.set_num_threads(video_team)
+
+        qwen_stages.name_native_thread = start_video_thread
+    else:
+        pass
 
     spans: dict[str, list[float]] = {"load": [], "processor": []}
     load_video = preprocessor_mod.ensure_video_list_async
@@ -118,16 +135,22 @@ def main() -> None:
     parser.add_argument("--one")
     args = parser.parse_args()
     if args.one is not None:
-        threads, decode_threads, concurrency = (
+        threads, decode_threads, concurrency, video_team = (
             int(item) for item in args.one.split(":")
         )
-        print(json.dumps(run_one(threads, decode_threads, concurrency)), flush=True)
+        print(
+            json.dumps(run_one(threads, decode_threads, concurrency, video_team)),
+            flush=True,
+        )
         return
     else:
         pass
     rows = []
     for config in args.configs.split(","):
-        threads, omp_threads, decode_threads, concurrency = config.split(":")
+        threads, omp_threads, decode_threads, concurrency, *video_team = config.split(
+            ":"
+        )
+        video_team = video_team[0] if video_team else "0"
         completed = subprocess.run(
             [
                 sys.executable,
@@ -137,7 +160,7 @@ def main() -> None:
                 "--out",
                 "-",
                 "--one",
-                f"{threads}:{decode_threads}:{concurrency}",
+                f"{threads}:{decode_threads}:{concurrency}:{video_team}",
             ],
             env=dict(os.environ, OMP_NUM_THREADS=omp_threads),
             capture_output=True,
@@ -148,7 +171,7 @@ def main() -> None:
         row["config"] = config
         rows.append(row)
         print(
-            f"threads {threads} omp {omp_threads} decode {decode_threads} c{concurrency}: "
+            f"threads {threads} omp {omp_threads} video team {video_team} decode {decode_threads} c{concurrency}: "
             f"{row['seconds']:.2f} s, request {row['request_ms']:.0f} ms, load {row['load_ms']:.0f} ms, "
             f"processor {row['processor_ms']:.0f} ms",
             flush=True,
