@@ -110,6 +110,11 @@ class Qwen3TTSCodecStateArena:
             dtype=dtype,
             has_key_value_buffers=not self.key_rings,
         )
+        # note (ratish): the storage tensors live as long as the arena, so each slot's views of
+        # them are built once and an acquire resets its slot without building any.
+        self.slot_buffers: list[list[torch.Tensor]] = [
+            self.slot_views(slot) for slot in range(self.num_slots)
+        ]
         self.lock = threading.Lock()
         self.staging = threading.local()
         self.release_events: dict[int, torch.Event] = {}
@@ -218,15 +223,18 @@ class Qwen3TTSCodecStateArena:
             *state.transformer_values.values(),
         ]
 
+    def slot_views(self, slot: int) -> list[torch.Tensor]:
+        """The slot's rows of every state buffer and K/V ring."""
+        return [buffer[slot] for buffer in self._buffers(self.storage)] + [
+            ring.view(-1, self.ring_frames, ring.shape[1])[slot]
+            for ring in (*self.key_rings, *self.value_rings)
+        ]
+
     def zero_slot(self, slot: int) -> None:
         # note (ratish): one multi-tensor launch for the slot's buffers: an initial decode resets
         # a fresh slot per row, and every row of its batch waits for all the resets before launch.
         torch._foreach_zero_(  # noqa: leading-underscore  # upstream spelling, or the public name is already taken
-            [buffer[slot] for buffer in self._buffers(self.storage)]
-            + [
-                ring.view(-1, self.ring_frames, ring.shape[1])[slot]
-                for ring in (*self.key_rings, *self.value_rings)
-            ]
+            self.slot_buffers[slot]
         )
         self.storage.frame_positions[slot].zero_()
 
