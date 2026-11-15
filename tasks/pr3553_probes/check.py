@@ -200,6 +200,7 @@ def serving(
     natural_stop: bool = False,
     pressure: bool = False,
     events: bool = False,
+    pair_burst: bool = False,
 ) -> None:
     port = 18353
     arguments = [
@@ -250,6 +251,9 @@ def serving(
             "--yue2_ar.engine.max_running_requests",
             "16",
         ]
+    if pair_burst:
+        label = f"pairs-{policy}"
+        arguments += ["--yue2_ar.engine.max_running_requests", "16"]
     log = (DIRECTORY / f"server-{label}.log").open("w")
     process = subprocess.Popen(
         arguments, stdout=log, stderr=subprocess.STDOUT, start_new_session=True
@@ -325,12 +329,14 @@ def serving(
                 path.name: json.loads(path.read_text()) for path in statuses
             }
             return
-        if pressure:
+        if pressure or pair_burst:
             bodies = [request_body(seed) for seed in range(60, 66)]
             for body in bodies:
-                body["max_new_tokens"] = 512
+                body["max_new_tokens"] = 64 if pair_burst else 512
             with concurrent.futures.ThreadPoolExecutor(max_workers=6) as executor:
-                results["pressure"] = list(executor.map(send, bodies))
+                results["pairs" if pair_burst else "pressure"] = list(
+                    executor.map(send, bodies)
+                )
             return
         body = request_body(42)
         if natural_stop:
@@ -407,6 +413,7 @@ if __name__ == "__main__":
     parser.add_argument("--natural-stop", action="store_true")
     parser.add_argument("--pressure", action="store_true")
     parser.add_argument("--events", action="store_true")
+    parser.add_argument("--pair-burst", action="store_true")
     options = parser.parse_args()
     DIRECTORY.mkdir(exist_ok=True, parents=True)
     if options.mode == "numerical":
@@ -420,4 +427,5 @@ if __name__ == "__main__":
             options.natural_stop,
             options.pressure,
             options.events,
+            options.pair_burst,
         )
