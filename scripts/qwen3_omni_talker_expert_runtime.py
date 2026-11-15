@@ -51,6 +51,7 @@ class ObservedExpertProfiles(BaseModel):
     prefill: list[tuple[int, int]]
     decode: list[tuple[int, int]]
     verified_frames: int
+    frame_profiles: list[list[tuple[int, int]]] | None = None
 
 
 class ObservedExpertProfileMap(BaseModel):

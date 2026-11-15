@@ -617,6 +617,8 @@ def main() -> None:
                 expert_control.enabled = expert_mode == "fused"
                 expert_control.calls = 0
                 expert_control.kernel_calls = 0
+                expert_control.observed_profile_calls = 0
+                expert_control.continuation_profile_calls = 0
                 expert_control.router_calls = 0
                 expert_control.routing_semantics = (
                     "reconstructed"
@@ -639,6 +641,16 @@ def main() -> None:
                         == len(expert_control.profiles.decode)
                         == len(reference.model.layers)
                     )
+                    if expert_control.profiles.frame_profiles is not None:
+                        assert len(expert_control.profiles.frame_profiles) == (
+                            expert_control.profiles.verified_frames
+                        )
+                        assert all(
+                            len(profiles) == len(reference.model.layers)
+                            for profiles in expert_control.profiles.frame_profiles
+                        )
+                    else:
+                        pass
                 else:
                     pass
             else:
@@ -1402,6 +1414,12 @@ def main() -> None:
                     sorted(expert_control.used_profiles)
                     if expert_control is not None
                     else []
+                ),
+                "observed_profile_calls": (
+                    expert_control.observed_profile_calls if expert_control else 0
+                ),
+                "continuation_profile_calls": (
+                    expert_control.continuation_profile_calls if expert_control else 0
                 ),
                 "expert_gemm1_profile_override": arguments.expert_gemm1_profile,
                 "observed_expert_profiles_source": (
