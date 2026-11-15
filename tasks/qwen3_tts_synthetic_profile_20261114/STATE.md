@@ -88,6 +88,26 @@ Decode step:
   - `handle_message` 64 times a step at 8.9 µs, 0.57 ms a step;
   - `vocoder.followup[streams=8]` about 0.95 ms a batch, about 0.48 ms of it in `launch_decode_plans`.
 
+**Served SeedTTS on main `bac76771a`, Base streaming** (`served_profile.py --mode attribution`, `served_profile_main/attribution`, 3 s windows during steady load). The profiler inflates Python, so read shares, not absolute times.
+
+| Per talker step | c1 | c16 | c64 |
+|---|---|---|---|
+| Step (window / steps) | 5.3 ms (580) | 7.3 ms (419) | 13.0 ms (112, of which 46 prefills) |
+| Scheduler holds the GIL | 1.44 ms | 2.33 ms | 3.68 ms |
+| Scheduler waits for it | 0.23 ms | 1.51 ms | 4.36 ms |
+| Other pipeline threads hold it | 0.29 ms | 1.75 ms | 4.61 ms |
+
+At c64 the other holders, per step:
+- vocoder follow-up and initial workers 1.79 ms;
+- preprocessing pool 1.24 ms, that is 1.6 to 1.9 ms per request in `preprocess_qwen3_tts_payload`, at 68 req/s;
+- unnamed threads 1.05 ms;
+- vocoder message thread 0.52 ms (4,186 messages at 11 µs).
+
+Other readings:
+- **Talker stream at c64:** its kernels total 826 ms over 112 steps, about 7.4 ms a step against a 13.0 ms step, so it waits on the host about 40 % of the time.
+- **The fp32 reference encoder** adds 170 ms of kernels on its own stream in the c64 window.
+- **At c1** the scheduler's own Python is the whole host cost. The first vocoder chunk holds the GIL 0.65 ms (`vocoder.initial[streams=1]`), and a one-stream follow-up 0.3 to 0.37 ms.
+
 First audio (Base, 20 s references):
 
 | | c1 | c64 |
