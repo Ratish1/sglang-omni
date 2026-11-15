@@ -6,7 +6,8 @@ resident peak, the size after the pass, the size after malloc_trim (what the all
 the bytes of pixel values one video carries (the resized frames hold as many float32 values), so the peak's growth
 per video in flight reads against what a video has to hold.
 
-usage: PYTHONPATH=<tree> taskset -c <cpus> python3 preprocess_memory.py --threads 1,2,4,8 --concurrency 16 --out mem.json
+usage: PYTHONPATH=<tree> taskset -c <cpus> python3 preprocess_memory.py --threads 1,2,4,8 --concurrency 16 --out mem.json \
+           [--video-cpus N]   (passes the factory the CPUs videos share, as the config does when it splits the team)
 """
 
 import argparse
@@ -34,7 +35,7 @@ def status_mib(field: str) -> float:
     raise KeyError(field)
 
 
-def run_one(threads: int, concurrency: int) -> dict[str, object]:
+def run_one(threads: int, concurrency: int, video_cpus: int) -> dict[str, object]:
     import sglang_omni.models.qwen3_omni.stages as qwen_stages
     from benchmarks.dataset.videomme import load_videomme_samples
     from sglang_omni.proto.request import OmniRequest, StagePayload
@@ -42,7 +43,10 @@ def run_one(threads: int, concurrency: int) -> dict[str, object]:
 
     samples = load_videomme_samples(50, repo_id=VIDEOMME_CI)
     scheduler = qwen_stages.create_preprocessing_executor(
-        MODEL, max_concurrency=threads, max_seq_len=32768
+        MODEL,
+        max_concurrency=threads,
+        max_seq_len=32768,
+        **({"video_cpus": video_cpus} if video_cpus and threads > 1 else {}),
     )
     worker = threading.Thread(target=scheduler.start, daemon=True)
     worker.start()
@@ -117,9 +121,13 @@ def main() -> None:
     parser.add_argument("--concurrency", type=int, default=16)
     parser.add_argument("--out", required=True)
     parser.add_argument("--one", type=int)
+    parser.add_argument("--video-cpus", type=int, default=0)
     args = parser.parse_args()
     if args.one is not None:
-        print(json.dumps(run_one(args.one, args.concurrency)), flush=True)
+        print(
+            json.dumps(run_one(args.one, args.concurrency, args.video_cpus)),
+            flush=True,
+        )
         return
     else:
         pass
@@ -134,6 +142,8 @@ def main() -> None:
                 str(threads),
                 "--concurrency",
                 str(args.concurrency),
+                "--video-cpus",
+                str(args.video_cpus),
                 "--out",
                 "-",
             ],
