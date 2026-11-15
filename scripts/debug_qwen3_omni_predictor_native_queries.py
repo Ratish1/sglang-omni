@@ -31,6 +31,12 @@ def main() -> None:
     parser.add_argument("--gpu", type=int, required=True)
     parser.add_argument("--output-directory", type=Path, required=True)
     parser.add_argument("--regenerate-residuals", action="store_true")
+    parser.add_argument(
+        "--residual-policy",
+        choices=("greedy", "sampled"),
+        nargs="+",
+        default=("greedy", "sampled"),
+    )
     parser.add_argument("--native-past-query-directory", type=Path)
     arguments = parser.parse_args()
     arguments.output_directory.mkdir(exist_ok=False)
@@ -217,10 +223,10 @@ def main() -> None:
                 assert cache.get_seq_length() == configuration.num_code_groups
             if arguments.regenerate_residuals:
                 regenerated: dict[str, torch.Tensor] = {"native": codes.clone()}
+                sampled_repeat_exact = None
                 if is_eos:
-                    regenerated["greedy"] = torch.zeros_like(codes)
-                    regenerated["sampled"] = torch.zeros_like(codes)
-                    sampled_repeat_exact = None
+                    for policy in arguments.residual_policy:
+                        regenerated[policy] = torch.zeros_like(codes)
                 else:
                     opening = torch.cat(
                         (
@@ -229,46 +235,48 @@ def main() -> None:
                         ),
                         dim=1,
                     )
-                    greedy = reference.code_predictor.generate(
-                        inputs_embeds=opening,
-                        max_new_tokens=configuration.num_code_groups - 1,
-                        do_sample=False,
-                        output_hidden_states=True,
-                        return_dict_in_generate=True,
-                    ).sequences
-                    rng_before = torch.cuda.get_rng_state(reference.device)
-                    sampled = reference.code_predictor.generate(
-                        inputs_embeds=opening,
-                        max_new_tokens=configuration.num_code_groups - 1,
-                        do_sample=True,
-                        top_k=50,
-                        top_p=0.8,
-                        output_hidden_states=True,
-                        return_dict_in_generate=True,
-                    ).sequences
-                    rng_after = torch.cuda.get_rng_state(reference.device)
-                    torch.cuda.set_rng_state(rng_before, reference.device)
-                    repeated_sampled = reference.code_predictor.generate(
-                        inputs_embeds=opening,
-                        max_new_tokens=configuration.num_code_groups - 1,
-                        do_sample=True,
-                        top_k=50,
-                        top_p=0.8,
-                        output_hidden_states=True,
-                        return_dict_in_generate=True,
-                    ).sequences
-                    torch.cuda.set_rng_state(rng_after, reference.device)
-                    sampled_repeat_exact = torch.equal(sampled, repeated_sampled)
-                    assert (
-                        greedy.shape
-                        == sampled.shape
-                        == (
+                    for policy in arguments.residual_policy:
+                        if policy == "greedy":
+                            residual_codes = reference.code_predictor.generate(
+                                inputs_embeds=opening,
+                                max_new_tokens=configuration.num_code_groups - 1,
+                                do_sample=False,
+                                output_hidden_states=True,
+                                return_dict_in_generate=True,
+                            ).sequences
+                        else:
+                            rng_before = torch.cuda.get_rng_state(reference.device)
+                            residual_codes = reference.code_predictor.generate(
+                                inputs_embeds=opening,
+                                max_new_tokens=configuration.num_code_groups - 1,
+                                do_sample=True,
+                                top_k=50,
+                                top_p=0.8,
+                                output_hidden_states=True,
+                                return_dict_in_generate=True,
+                            ).sequences
+                            rng_after = torch.cuda.get_rng_state(reference.device)
+                            torch.cuda.set_rng_state(rng_before, reference.device)
+                            repeated_sampled = reference.code_predictor.generate(
+                                inputs_embeds=opening,
+                                max_new_tokens=configuration.num_code_groups - 1,
+                                do_sample=True,
+                                top_k=50,
+                                top_p=0.8,
+                                output_hidden_states=True,
+                                return_dict_in_generate=True,
+                            ).sequences
+                            torch.cuda.set_rng_state(rng_after, reference.device)
+                            sampled_repeat_exact = torch.equal(
+                                residual_codes, repeated_sampled
+                            )
+                        assert residual_codes.shape == (
                             1,
                             configuration.num_code_groups - 1,
                         )
-                    )
-                    regenerated["greedy"] = torch.cat((codes[:, :1], greedy), dim=1)
-                    regenerated["sampled"] = torch.cat((codes[:, :1], sampled), dim=1)
+                        regenerated[policy] = torch.cat(
+                            (codes[:, :1], residual_codes), dim=1
+                        )
                 for policy, regenerated_codes in regenerated.items():
                     regenerated_codes[:, 0] = codes[:, 0]
                     policy_directory = (
@@ -309,6 +317,11 @@ def main() -> None:
             ),
             "residual_choices": sum(len(row["groups"]) for row in rows),
             "regenerated_residuals": arguments.regenerate_residuals,
+            "residual_policies": (
+                list(arguments.residual_policy)
+                if arguments.regenerate_residuals
+                else []
+            ),
             "native_past_query_directory": (
                 str(arguments.native_past_query_directory)
                 if arguments.native_past_query_directory is not None
@@ -321,7 +334,7 @@ def main() -> None:
             "sampled_repeat_failures": sum(
                 row["sampled_residual_repeat_exact"] is False for row in rows
             ),
-            "transplant_scope": "Regenerated residuals retain native main codes, frame boundaries and EOS. Query source is explicitly recorded; replacement queries require exactly matching captured native inputs and use the independently audited native-past reference. Neither form updates native feedback or future KV. Sampled uses checkpoint top-k 50/top-p 0.8 with one request-seeded CUDA stream and same-state repeats, not a full-pipeline RNG reconstruction.",
+            "transplant_scope": "Regenerated residuals retain native main codes, frame boundaries and EOS. Query source is explicitly recorded; replacement queries require exactly matching captured native inputs and use the independently audited native-past reference. Neither form updates native feedback or future KV. When selected, sampled uses checkpoint top-k 50/top-p 0.8 with one request-seeded CUDA stream and same-state repeats, not a full-pipeline RNG reconstruction.",
             "scope": "The recorded query source and complete native residual-code prefixes are independently replayed as full prefill and incremental checkpoint execution. Head reprojection always checks the original native query. Full-prefill repeats measure reference nonrepeatability. Not numerical gold or free-running generation. EOS residuals are excluded from speech.",
         }
         reports.append(report)
