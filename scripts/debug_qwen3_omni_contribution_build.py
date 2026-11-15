@@ -84,6 +84,7 @@ def main() -> None:
                 "patch",
                 "--batch",
                 "--fuzz=0",
+                "--no-backup-if-mismatch",
                 "-p1",
                 "-d",
                 str(source_directory),

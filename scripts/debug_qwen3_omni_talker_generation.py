@@ -119,7 +119,12 @@ def main() -> None:
     parser.add_argument("--contribution-source-directory", type=Path)
     parser.add_argument(
         "--native-output-arithmetic",
-        choices=("native", "rounded-contributions", "checkpoint-reduction"),
+        choices=(
+            "native",
+            "rounded-contributions",
+            "checkpoint-reduction",
+            "expert-order-bfloat16-sum",
+        ),
         default="native",
     )
     parser.add_argument("--native-shared-expert", action="store_true")

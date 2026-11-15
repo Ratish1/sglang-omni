@@ -9,7 +9,7 @@ from pathlib import Path
 
 import torch
 from flashinfer.fused_moe import cutlass_fused_moe
-from flashinfer.fused_moe.core import ActivationType
+from flashinfer.fused_moe.core import ActivationType, cutlass_fused_moe_workspace_size
 from huggingface_hub import hf_hub_download
 from transformers import Qwen3OmniMoeConfig
 from transformers.conversion_mapping import (
@@ -22,8 +22,10 @@ from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import (
 
 from scripts.debug_qwen3_omni_feedback_audit import compare_tensors
 from scripts.qwen3_omni_checkpoint_weights import audit_checkpoint_weights
+from scripts.qwen3_omni_expert_workspace_runtime import checkpoint_reduce_workspace
 from scripts.qwen3_omni_talker_expert_runtime import (
     NativeRuntime,
+    ObservedExpertProfileMap,
     TacticChoice,
     combine_expert_contributions,
     load_native_expert_weights,
@@ -45,9 +47,14 @@ def main() -> None:
     parser.add_argument("--decompose-expert-slots", action="store_true")
     parser.add_argument("--contribution-reference-directory", type=Path)
     parser.add_argument("--contribution-source-directory", type=Path)
+    parser.add_argument("--profile-map", type=Path)
     parser.add_argument(
         "--contribution-arithmetic",
-        choices=("rounded-contributions", "checkpoint-reduction"),
+        choices=(
+            "rounded-contributions",
+            "checkpoint-reduction",
+            "expert-order-bfloat16-sum",
+        ),
         default="rounded-contributions",
     )
     arguments = parser.parse_args()
@@ -63,6 +70,11 @@ def main() -> None:
     has_contribution_expectations = (
         arguments.contribution_source_directory is not None
         and arguments.contribution_reference_directory is not None
+    )
+    profile_map = (
+        ObservedExpertProfileMap.model_validate_json(arguments.profile_map.read_bytes())
+        if arguments.profile_map is not None
+        else None
     )
     torch.cuda.set_device(arguments.gpu)
     configuration = Qwen3OmniMoeConfig.from_pretrained(
@@ -172,31 +184,63 @@ def main() -> None:
                         list(down.shape),
                         [],
                     ]
-                    profiles = []
-                    for operation in (
-                        "trtllm::fused_moe::gemm1",
-                        "trtllm::fused_moe::gemm2",
+                    if profile_map is not None:
+                        observed = profile_map.profiles[str(directory.resolve())]
+                        assert observed.source_capture == directory.resolve()
+                        assert observed.verified_frames == len(files)
+                        assert observed.frame_profiles is not None
+                        profiles = list(observed.frame_profiles[frame][layer_index])
+                    else:
+                        profiles = []
+                        for operation in (
+                            "trtllm::fused_moe::gemm1",
+                            "trtllm::fused_moe::gemm2",
+                        ):
+                            tactics = {
+                                choice.tactic
+                                for choice in choices
+                                if choice.operation == operation
+                                and choice.tensor_shapes == shapes
+                                and choice.capturing == bool(snapshot["batch_is_graph"])
+                                and not choice.tuning
+                            }
+                            assert len(tactics) == 1, (
+                                directory.name,
+                                frame,
+                                layer_index,
+                                operation,
+                            )
+                            profiles.append(tactics.pop())
+                    if (
+                        arguments.contribution_reference_directory is not None
+                        and arguments.contribution_source_directory is None
+                        and arguments.contribution_arithmetic
+                        == "expert-order-bfloat16-sum"
                     ):
-                        tactics = {
-                            choice.tactic
-                            for choice in choices
-                            if choice.operation == operation
-                            and choice.tensor_shapes == shapes
-                            and choice.capturing == bool(snapshot["batch_is_graph"])
-                            and not choice.tuning
-                        }
-                        assert len(tactics) == 1, (
-                            directory.name,
-                            frame,
-                            layer_index,
-                            operation,
+                        assert not runtime.use_fused_finalize
+                        workspace = torch.empty(
+                            cutlass_fused_moe_workspace_size(
+                                len(hidden_states),
+                                hidden_states.shape[-1],
+                                down.shape[-1],
+                                len(down),
+                                indices.shape[1],
+                                x_dtype=hidden_states.dtype,
+                                weight_dtype=packed.dtype,
+                                use_fused_finalize=False,
+                                device=hidden_states.device,
+                            ),
+                            dtype=torch.uint8,
+                            device=hidden_states.device,
                         )
-                        profiles.append(tactics.pop())
+                    else:
+                        workspace = None
 
                     def replay_experts(
                         selected_hidden_states: torch.Tensor,
                         selected_indices: torch.Tensor,
                         selected_weights: torch.Tensor,
+                        workspace_buffer: torch.Tensor | None,
                     ) -> torch.Tensor:
                         replay_inputs = selected_hidden_states.contiguous().clone()
                         result = cutlass_fused_moe(
@@ -211,6 +255,7 @@ def main() -> None:
                             tune_max_num_tokens=runtime.tune_max_num_tokens,
                             use_fused_finalize=runtime.use_fused_finalize,
                             profile_ids=profiles,
+                            workspace_buffer=workspace_buffer,
                         )[0]
                         assert torch.equal(replay_inputs, selected_hidden_states)
                         return result
@@ -220,8 +265,12 @@ def main() -> None:
                             hidden_states[selected],
                             indices[selected],
                             weights[selected],
+                            buffer,
                         )
-                        for selected in (slice(None), slice(start, stop))
+                        for selected, buffer in (
+                            (slice(None), workspace),
+                            (slice(start, stop), None),
+                        )
                     ]
                     if has_contribution_expectations:
                         expected = expected_contributions[layer_index].to(
@@ -245,29 +294,39 @@ def main() -> None:
                         arguments.contribution_reference_directory is not None
                         and arguments.contribution_source_directory is None
                     ):
-                        contributions = native_expert_contributions(
-                            hidden_states,
-                            indices,
-                            packed,
-                            down,
-                            runtime,
-                            (profiles[0], profiles[1]),
-                        )
-                        reconstructed = combine_expert_contributions(
-                            contributions, indices, weights, "native"
-                        )
-                        assert torch.equal(
-                            reconstructed.contiguous().view(torch.uint8),
-                            expected.contiguous().view(torch.uint8),
-                        ), (directory.name, frame, layer_index, "decomposed bytes")
-                        rounded_outputs.append(
-                            combine_expert_contributions(
+                        if workspace is not None:
+                            rounded = checkpoint_reduce_workspace(
+                                workspace,
+                                indices,
+                                weights,
+                                down.shape[-1],
+                                len(down),
+                                replayed[0],
+                                "expert-order-bfloat16-sum",
+                            )
+                        else:
+                            contributions = native_expert_contributions(
+                                hidden_states,
+                                indices,
+                                packed,
+                                down,
+                                runtime,
+                                (profiles[0], profiles[1]),
+                            )
+                            reconstructed = combine_expert_contributions(
+                                contributions, indices, weights, "native"
+                            )
+                            assert torch.equal(
+                                reconstructed.contiguous().view(torch.uint8),
+                                expected.contiguous().view(torch.uint8),
+                            ), (directory.name, frame, layer_index, "decomposed bytes")
+                            rounded = combine_expert_contributions(
                                 contributions,
                                 indices,
                                 weights,
                                 arguments.contribution_arithmetic,
-                            ).cpu()
-                        )
+                            )
+                        rounded_outputs.append(rounded.cpu())
                     else:
                         pass
                     if arguments.decompose_expert_slots:

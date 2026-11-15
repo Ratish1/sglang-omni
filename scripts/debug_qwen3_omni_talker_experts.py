@@ -49,7 +49,10 @@ class NativeTalkerExperts:
         "workspace-bfloat16-reduction",
     ] = "native"
     native_output_arithmetic: Literal[
-        "native", "rounded-contributions", "checkpoint-reduction"
+        "native",
+        "rounded-contributions",
+        "checkpoint-reduction",
+        "expert-order-bfloat16-sum",
     ] = "native"
     enabled: bool = False
     calls: int = 0
