@@ -119,6 +119,23 @@ First audio (Base, 20 s references):
 
 - SeedTTS references are a few seconds long, so Base's c1 first audio is about 18 ms. The 12 ms CPU speaker mel of the 20 s synthetic references does not appear at this length.
 
+**Pipeshift's bar on main `bac76771a`**, seed 0 (`baseline_main/bar/main_s0`). Every request succeeded, with no underrun.
+
+| req/s | 1 | 4 | 8 | 12 | 20 | 30 | 40 |
+|---|---|---|---|---|---|---|---|
+| Audible p95 | 21.9 | 29.6 | 30.7 | 31.8 | 32.4 | 37.0 | 100.1 |
+| Pipeshift p95 | 24.6 | 24.6 | 25.7 | 26.0 | 28.4 | 30.7 | 33.7 |
+| Audible p50 | 18.7 | 19.3 | 20.5 | 20.8 | 21.2 | 22.6 | 25.2 |
+| Pipeshift p50 | 12.7 | 13.6 | 14.2 | 14.6 | 15.8 | 18.1 | 20.2 |
+
+- **At 40 req/s** the leading silence p95 is 80 ms and the first-byte p95 is 30.8 ms. The 24-stream gate is the whole gap.
+- **Why Nari's client sees a later first byte than the SeedTTS client** (18.6 against 11.8 ms at c1): its request sends `language: "English"`, so the bootstrap trim applies to Ryan. That holds the first chunk for one more frame, one more talker and predictor step, about 4.5 ms at c1. The SeedTTS client sends no language, so the trim stays off.
+- **The audible floor** is prefill, two decode steps and the first vocoder chunk. On top of it (10-27 split):
+  - the 2 ms first-chunk wait;
+  - 3.2 ms of host work in the first vocoder decode;
+  - preprocessing and admission, about 3 ms.
+- A faster c1 decode step counts twice in audible first audio.
+
 ## Order of work
 
 1. Baseline of upstream main `bac76771a` on one H100:
