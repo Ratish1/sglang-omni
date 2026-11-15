@@ -22,7 +22,17 @@ import json
 import os
 import statistics
 
-ROW_BUCKETS = ((1, 4), (5, 8), (9, 12), (13, 16), (17, 24), (25, 64))
+ROW_BUCKETS = (
+    (1, 8),
+    (9, 10),
+    (11, 12),
+    (13, 13),
+    (14, 14),
+    (15, 15),
+    (16, 16),
+    (17, 32),
+    (33, 64),
+)
 
 
 def load_records(boot: str, cell: str) -> tuple[list[dict], list[list], float, float]:
