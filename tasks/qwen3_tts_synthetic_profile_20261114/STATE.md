@@ -163,6 +163,17 @@ The same branch on Pipeshift's bar, seeds 0 to 2, median of seeds, main → bran
 | First byte p95 | 21.5 → 21.2 | 22.7 → 21.8 | 23.5 → 22.8 | 24.2 → 24.3 | 26.3 → 25.7 | 29.2 → 28.7 | 30.8 → 30.7 |
 | Audible p95 | 24.7 → 29.0 | 31.5 → 30.1 | 30.9 → 30.2 | 31.1 → 30.5 | 32.4 → 31.4 | 37.0 → 38.2 | 100.1 → 99.0 |
 
+**Same-card drift band.** The opening branch runs CustomVoice SeedTTS cells where its mechanism cannot act: the SeedTTS client sends no language, so the Ryan and English trim never engages. These cells are therefore an A/A of main's behaviour about 2.5 h apart.
+
+| CustomVoice cell | First audio mean / median / p95, main → same behaviour | RTF | Throughput |
+|---|---|---|---|
+| c1 | 12.0 / 11.8 / 13.2 → 11.6 / 11.5 / 12.2 | 0.0636 → 0.0635 | 3.383 → 3.388 |
+| c16 | 18.2 / 17.9 / 21.9 → 17.8 / 17.7 / 21.3 | 0.0927 → 0.0923 | 36.55 → 36.72 |
+| c64 | 28.4 / 21.8 / 121.2 → 28.7 / 22.3 / 119.8 | 0.1790 → 0.1800 | 74.72 → 74.27 |
+
+- **The band:** first audio within 0.5 ms on median, RTF and throughput within 0.6 %.
+- **Against it, the first-chunk branch:** its first-audio drops of 0.9 to 3.2 ms on mean clear the band. Its c64 RTF changes (Base −2.9 %, CustomVoice +1.6 %) go both ways and need a repeat before either is read.
+
 - The audible p95 at 1 req/s comes from 136 requests. Main's own seeds gave 21.9, 29.3 and 24.7.
 - Its tail there is the model's 10 ms opening quiet (leading silence p95 0 → 10 ms), which unseeded sampling varies. The first-byte p95 at that rate fell.
 
