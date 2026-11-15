@@ -119,14 +119,16 @@ First audio (Base, 20 s references):
 
 - SeedTTS references are a few seconds long, so Base's c1 first audio is about 18 ms. The 12 ms CPU speaker mel of the 20 s synthetic references does not appear at this length.
 
-**Pipeshift's bar on main `bac76771a`**, seed 0 (`baseline_main/bar/main_s0`). Every request succeeded, with no underrun.
+**Pipeshift's bar on main `bac76771a`**: seeds 0, 1 and 2 (`baseline_main/bar/main_s{0,1,2}`), median of seeds, ms. Every request succeeded, with no underrun. Seeds agree within 1 ms except the p95 at 1 req/s (21.9, 29.3, 24.7).
 
 | req/s | 1 | 4 | 8 | 12 | 20 | 30 | 40 |
 |---|---|---|---|---|---|---|---|
-| Audible p95 | 21.9 | 29.6 | 30.7 | 31.8 | 32.4 | 37.0 | 100.1 |
+| Audible p95 | 24.7 | 31.5 | 30.9 | 31.1 | 32.4 | 37.0 | 100.1 |
 | Pipeshift p95 | 24.6 | 24.6 | 25.7 | 26.0 | 28.4 | 30.7 | 33.7 |
-| Audible p50 | 18.7 | 19.3 | 20.5 | 20.8 | 21.2 | 22.6 | 25.2 |
+| Audible p50 | 19.5 | 19.5 | 20.5 | 20.4 | 21.3 | 22.6 | 25.4 |
 | Pipeshift p50 | 12.7 | 13.6 | 14.2 | 14.6 | 15.8 | 18.1 | 20.2 |
+| First byte p95 | 21.5 | 22.7 | 23.5 | 24.2 | 26.3 | 29.2 | 30.8 |
+| Leading silence p95 | 0 | 10 | 10 | 10 | 10 | 10 | 80 |
 
 - **At 40 req/s** the leading silence p95 is 80 ms and the first-byte p95 is 30.8 ms. The 24-stream gate is the whole gap.
 - **Why Nari's client sees a later first byte than the SeedTTS client** (18.6 against 11.8 ms at c1): its request sends `language: "English"`, so the bootstrap trim applies to Ryan. That holds the first chunk for one more frame, one more talker and predictor step, about 4.5 ms at c1. The SeedTTS client sends no language, so the trim stays off.
