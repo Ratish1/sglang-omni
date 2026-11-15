@@ -135,6 +135,28 @@ The hottest innermost frames are per-row: the stream output builder, `decode_row
 
 The API process is separate (217 samples on its own GIL): HTTP streaming and PCM encoding.
 
+**Unseeded repeat** (`served_profile_main/pyspy`, kit `6fe6d831b`; the seeded capture above moved to `pyspy_seeded`). The pipeline process holds the lock for 1,072 samples:
+
+| Holder | Share |
+|---|---|
+| Scheduler | 50 % |
+| Vocoder workers and scheduler | 23 % |
+| Preprocessing pool | 21 % |
+| Main-thread routing | 5 % |
+
+Within the scheduler:
+
+| Part | Share |
+|---|---|
+| `before_decode` | 16 % |
+| Forward host side | 11 % |
+| Sampling and logit shaping | 9 % |
+| `emit_stream_output` | 7 % |
+| Coalesced prefill pick | 7 % |
+| `update_running_batch` | 3 % |
+
+The innermost per-row frames are the same as seeded: `decode_row`, `stream_output_builder:2195`, `prepare_decode_buffers:1354`.
+
 First audio (Base, 20 s references):
 
 | | c1 | c64 |
