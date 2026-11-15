@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Isolate native normalization arithmetic in checkpoint Talker generation."""
+"""Isolate BF16 residual materialization in checkpoint Talker generation."""
 
 from __future__ import annotations
 
@@ -112,10 +112,20 @@ class NativeNormalization:
         weight: torch.Tensor,
         epsilon: float,
     ) -> torch.Tensor:
-        normalized = contribution.reshape(-1, weight.numel()).clone()
-        updated_residual = residual.reshape_as(normalized).clone()
+        assert (
+            contribution.dtype == residual.dtype == rounded_sum.dtype == torch.bfloat16
+        )
+        normalized = (contribution + residual).reshape(-1, weight.numel())
+        assert torch.equal(
+            normalized.view_as(rounded_sum).view(torch.uint8),
+            rounded_sum.view(torch.uint8),
+        )
+        updated_residual = torch.zeros_like(normalized)
         fused_add_rmsnorm(normalized, updated_residual, weight, epsilon)
-        assert torch.equal(updated_residual.view_as(rounded_sum), rounded_sum)
+        assert torch.equal(
+            updated_residual.view_as(rounded_sum).view(torch.uint8),
+            rounded_sum.view(torch.uint8),
+        )
         self.boundary_calls += 1
         return normalized.view_as(rounded_sum)
 
