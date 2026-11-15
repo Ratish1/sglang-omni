@@ -68,6 +68,26 @@ Decode step:
 - **Host at c64:** `write_feedback_buffers` 1.3 ms mean, `get_next_batch_to_run` 1.2 ms, and 64 vocoder messages a step.
 - **Vocoder:** beside vocoder follow-ups, the talker runs +99 % and the predictor +177 % at c64 (10-24 ledger).
 
+**The GIL at c64** (`gil_owners.py` on `main13/attribution/decode_bs64`; main `13364eb45`, which is today's Qwen3-TTS code; under the profiler, 294 steps over 3,061 ms, about 10.4 ms a step):
+
+| Pipeline process thread | Holds, ms a step | Waits, ms a step |
+|---|---|---|
+| Talker scheduler | 3.01 | 2.75 |
+| Vocoder follow-up workers (2) | 1.37 | 3.98 |
+| Unnamed threads | 0.78 | 1.31 |
+| Vocoder message thread | 0.71 | 0.72 |
+
+- The lock is held 56 % of the window. Other threads hold it 2.86 ms a step, and that is time the talker scheduler waits.
+- **The scheduler's own hold**, 2.14 ms a step under `execute`:
+  - `prepare_and_forward` 1.34, of which `write_feedback_buffers` 0.57 (a Python loop over rows);
+  - `finalize` 0.45;
+  - `post_process_outputs` 0.37;
+  - `emit_stream_output` 0.33 (64 stream messages);
+  - `get_next_batch_to_run` and `process_batch_result` 0.22 each.
+- **The vocoder's hold:**
+  - `handle_message` 64 times a step at 8.9 µs, 0.57 ms a step;
+  - `vocoder.followup[streams=8]` about 0.95 ms a batch, about 0.48 ms of it in `launch_decode_plans`.
+
 First audio (Base, 20 s references):
 
 | | c1 | c64 |
