@@ -155,6 +155,9 @@ class ObservedPredictorLayers(FusedPredictorLayers):
             checkpoint_activation = (F.silu(gate.float()) * up.float()).to(
                 torch.bfloat16
             )
+            checkpoint_activation_stores = (F.silu(gate).float() * up.float()).to(
+                torch.bfloat16
+            )
             inverse_rms = torch.rsqrt(
                 after_attention.double().square().mean(-1, keepdim=True)
                 + norm.variance_epsilon
@@ -167,6 +170,9 @@ class ObservedPredictorLayers(FusedPredictorLayers):
             ).to(torch.bfloat16)
             gate, up = products.float().chunk(2, dim=-1)
             folded_activation = (F.silu(gate) * up).to(torch.bfloat16)
+            folded_activation_stores = (
+                F.silu(gate).to(torch.bfloat16).float() * up
+            ).to(torch.bfloat16)
             gate, up = (
                 F.linear(
                     after_attention.double() * inverse_rms * norm.weight.double(),
@@ -216,8 +222,14 @@ class ObservedPredictorLayers(FusedPredictorLayers):
                 "activation_checkpoint_norm": asdict(
                     compare_tensors(actual_activation, checkpoint_activation)
                 ),
+                "activation_checkpoint_norm_and_silu_store": asdict(
+                    compare_tensors(actual_activation, checkpoint_activation_stores)
+                ),
                 "activation_folded_norm": asdict(
                     compare_tensors(actual_activation, folded_activation)
+                ),
+                "activation_folded_norm_and_silu_store": asdict(
+                    compare_tensors(actual_activation, folded_activation_stores)
                 ),
                 "activation_float64_norm_projection": asdict(
                     compare_tensors(actual_activation, mathematical_activation)
@@ -232,6 +244,7 @@ class ObservedPredictorLayers(FusedPredictorLayers):
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--capture-directory", type=Path, required=True)
+    parser.add_argument("--generation-directory", type=Path)
     parser.add_argument("--request-id", action="append", required=True)
     parser.add_argument("--model-path", required=True)
     parser.add_argument("--model-revision", required=True)
@@ -275,31 +288,70 @@ def main() -> None:
             ordinary.shape, reference.device, destination
         )
         for request_id in arguments.request_id:
-            directory = arguments.capture_directory / request_id
-            finished = torch.load(directory / "finished.pt", weights_only=True)
-            files = sorted(directory.glob("*-output.pt"))
-            assert [p.name for p in files] == [
-                f"{frame:04d}-output.pt" for frame in range(len(finished["output_ids"]))
-            ]
+            if arguments.generation_directory is None:
+                directory = arguments.capture_directory / request_id
+                finished = torch.load(directory / "finished.pt", weights_only=True)
+                files = sorted(directory.glob("*-output.pt"))
+                assert [p.name for p in files] == [
+                    f"{frame:04d}-output.pt"
+                    for frame in range(len(finished["output_ids"]))
+                ]
+            else:
+                directories = list(arguments.generation_directory.rglob(request_id))
+                assert len(directories) == 1
+                directory = directories[0]
+                files = sorted(directory.glob("*-post_*.pt"))
+                assert files
+                assert [path.name for path in files] == [
+                    f"{frame:04d}-post_{'prefill' if frame == 0 else 'decode'}.pt"
+                    for frame in range(len(files))
+                ]
             checked = 0
             for frame, filename in enumerate(files):
                 output = torch.load(filename, weights_only=True)
-                assert int(output["codec_ids"][0]) == int(finished["output_ids"][frame])
-                if frame == len(files) - 1:
-                    assert int(output["codec_ids"][0]) == config.codec_eos_token_id
+                codes = output["codec_ids"].reshape(-1).long()
+                if arguments.generation_directory is None:
+                    assert int(codes[0]) == int(finished["output_ids"][frame])
+                    handoff = None
+                elif frame < len(files) - 1:
+                    handoff = torch.load(
+                        directory / f"{frame:04d}-predictor-handoff.pt",
+                        weights_only=True,
+                    )
+                    assert torch.equal(handoff["native_codes"].reshape(-1), codes)
+                    assert torch.equal(
+                        handoff["query"].reshape(-1).view(torch.uint8),
+                        output["hidden_states"].reshape(-1).view(torch.uint8),
+                    )
                 else:
-                    main_code = output["codec_ids"][:1].to(reference.device).long()
+                    handoff = None
+                if frame == len(files) - 1:
+                    assert int(codes[0]) == config.codec_eos_token_id
+                else:
+                    assert int(codes[0]) != config.codec_eos_token_id
+                    main_code = codes[:1].to(reference.device)
                     query = output["hidden_states"].view(1, 1, -1).to(reference.device)
                     predictor.fused = ordinary
                     ordinary_codes, ordinary_feedback = predictor.generate(
                         main_code, query
                     )
-                    assert torch.equal(
-                        ordinary_codes[0].cpu(), output["codec_ids"].long()
-                    )
+                    assert torch.equal(ordinary_codes[0].cpu(), codes)
+                    if handoff is None:
+                        expected_feedback = output["codec_feedback"].reshape(-1)
+                    else:
+                        expected_feedback = handoff["feedback"].reshape(-1)
+                        for name, cache in (
+                            ("keys", predictor.keys),
+                            ("values", predictor.values),
+                        ):
+                            actual_cache = cache[:, :, : config.num_code_groups].cpu()
+                            assert torch.equal(
+                                actual_cache.view(torch.uint8),
+                                handoff[name].view(torch.uint8),
+                            )
                     assert torch.equal(
                         ordinary_feedback[0, 0].cpu().contiguous().view(torch.uint8),
-                        output["codec_feedback"].contiguous().view(torch.uint8),
+                        expected_feedback.contiguous().view(torch.uint8),
                     )
                     observed_layers.request_id = request_id
                     observed_layers.frame = frame
