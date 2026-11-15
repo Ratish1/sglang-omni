@@ -27,13 +27,33 @@ from scripts.qwen3_omni_checkpoint_weights import audit_checkpoint_weights
 from sglang_omni.client.audio import encode_wav
 
 
-def read_codec_sequence(trace_directory: Path, eos_token_id: int) -> torch.Tensor:
-    trace_files = sorted(trace_directory.glob("*-post_*.pt"))
+def read_codec_sequence(
+    trace_directory: Path, eos_token_id: int, *, native_capture: bool = False
+) -> torch.Tensor:
+    trace_files = sorted(
+        trace_directory.glob("*-output.pt" if native_capture else "*-post_*.pt")
+    )
     assert trace_files
+    if native_capture:
+        finished = torch.load(trace_directory / "finished.pt", weights_only=True)
+        assert len(trace_files) == len(finished["output_ids"])
+    else:
+        finished = None
     frames = []
-    for trace_file in trace_files:
+    for frame_index, trace_file in enumerate(trace_files):
         captured = torch.load(trace_file, map_location="cpu", weights_only=True)
         codes = captured["codec_ids"]
+        if native_capture:
+            assert trace_file.name == f"{frame_index:04d}-output.pt"
+            assert codes.ndim == 1 and finished is not None
+            assert int(codes[0]) == int(finished["output_ids"][frame_index])
+            codes = codes.unsqueeze(0)
+            if trace_file == trace_files[-1]:
+                assert int(codes[0, 0]) == eos_token_id
+            else:
+                pass
+        else:
+            pass
         if int(codes[0, 0]) == eos_token_id:
             assert trace_file == trace_files[-1]
         else:
@@ -50,6 +70,7 @@ def main() -> None:
     parser.add_argument("--dtype", choices=("bfloat16", "float32"), default="bfloat16")
     parser.add_argument("--asr-port", type=int)
     parser.add_argument("--decode-only", action="store_true")
+    parser.add_argument("--native-capture", action="store_true")
     parser.add_argument("--asr-model", default=QWEN3_ASR_MODEL_PATH)
     target_arguments = parser.add_mutually_exclusive_group(required=True)
     target_arguments.add_argument("--target-text")
@@ -105,7 +126,9 @@ def main() -> None:
     with torch.inference_mode():
         for trace_directory in arguments.trace_directory:
             codes = read_codec_sequence(
-                trace_directory, config.talker_config.codec_eos_token_id
+                trace_directory,
+                config.talker_config.codec_eos_token_id,
+                native_capture=arguments.native_capture,
             ).to(reference.device)
             waveform = reference(codes).float().reshape(-1).cpu().numpy()
             assert torch.isfinite(torch.from_numpy(waveform)).all()
@@ -147,6 +170,7 @@ def main() -> None:
                 )
             report = {
                 "trace_directory": str(trace_directory),
+                "native_capture": arguments.native_capture,
                 "reference_dtype": arguments.dtype,
                 "allow_tf32_convolutions": torch.backends.cudnn.allow_tf32,
                 "non_eos_frames": codes.shape[-1],
