@@ -46,6 +46,7 @@ class NativeTalkerExperts:
         "checkpoint-reduction",
         "fused-activation-checkpoint-reduction",
         "workspace-checkpoint-reduction",
+        "workspace-bfloat16-reduction",
     ] = "native"
     native_output_arithmetic: Literal[
         "native", "rounded-contributions", "checkpoint-reduction"
@@ -315,7 +316,11 @@ class NativeTalkerExperts:
             pass
         self.used_profiles.add(profiles)
         if self.is_expert_batch_replay_enabled:
-            assert self.output_arithmetic == "native"
+            assert self.output_arithmetic in (
+                "native",
+                "workspace-checkpoint-reduction",
+                "workspace-bfloat16-reduction",
+            )
             assert self.route_precision == "float32"
             snapshot = self.captured_snapshot(frame_index, layer_index)
             replay_inputs = snapshot["batch_mlp_normalized"].to(hidden_states.device)
@@ -338,12 +343,15 @@ class NativeTalkerExperts:
             replay_indices = indices.to(torch.int32).contiguous()
             replay_weights = weights.float().contiguous()
         expected_inputs = replay_inputs.clone()
-        if self.output_arithmetic == "workspace-checkpoint-reduction":
+        if self.output_arithmetic in (
+            "workspace-checkpoint-reduction",
+            "workspace-bfloat16-reduction",
+        ):
             assert not self.runtime.use_fused_finalize
             assert self.native_output_arithmetic == "native"
             workspace = torch.empty(
                 cutlass_fused_moe_workspace_size(
-                    len(hidden_states),
+                    len(replay_inputs),
                     hidden_states.shape[-1],
                     down.shape[-1],
                     len(down),
@@ -373,16 +381,28 @@ class NativeTalkerExperts:
             workspace_buffer=workspace,
         )[0]
         assert torch.equal(replay_inputs, expected_inputs)
+        if workspace is not None:
+            fused_output = checkpoint_reduce_workspace(
+                workspace,
+                replay_indices,
+                replay_weights,
+                down.shape[-1],
+                len(down),
+                fused_output,
+                (
+                    "expert-order-bfloat16-sum"
+                    if self.output_arithmetic == "workspace-bfloat16-reduction"
+                    else "checkpoint-reduction"
+                ),
+            )
+        else:
+            pass
         if self.is_expert_batch_replay_enabled:
             fused_output = fused_output[start:stop]
         else:
             pass
         assert fused_output.shape == output.shape
-        if self.output_arithmetic == "workspace-checkpoint-reduction":
-            fused_output = checkpoint_reduce_workspace(
-                workspace, indices, weights, down.shape[-1], len(down), fused_output
-            )
-        elif self.output_arithmetic in (
+        if self.output_arithmetic in (
             "native-reduction",
             "rounded-contributions",
             "bf16-reduction",

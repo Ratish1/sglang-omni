@@ -130,7 +130,11 @@ def combine_expert_contributions(
     indices: torch.Tensor,
     weights: torch.Tensor,
     semantics: Literal[
-        "native", "rounded-contributions", "bf16-reduction", "checkpoint-reduction"
+        "native",
+        "rounded-contributions",
+        "bf16-reduction",
+        "checkpoint-reduction",
+        "expert-order-bfloat16-sum",
     ],
 ) -> torch.Tensor:
     assert len(contributions) == indices.shape[1] == weights.shape[1]
@@ -150,6 +154,9 @@ def combine_expert_contributions(
         pass
     if semantics == "checkpoint-reduction":
         weights = weights.bfloat16().float()
+    else:
+        pass
+    if semantics in ("checkpoint-reduction", "expert-order-bfloat16-sum"):
         order = indices.argsort(dim=1)
         selected = selected.gather(1, order[:, :, None].expand_as(selected))
         weights = weights.gather(1, order)

@@ -139,6 +139,7 @@ def main() -> None:
             "checkpoint-reduction",
             "fused-activation-checkpoint-reduction",
             "workspace-checkpoint-reduction",
+            "workspace-bfloat16-reduction",
         ),
         default="native",
     )
@@ -273,7 +274,11 @@ def main() -> None:
     if arguments.native_expert_batches:
         assert arguments.native_expert_profile_map is not None
         assert arguments.native_expert_route_precision == "float32"
-        assert arguments.expert_output_arithmetic == "native"
+        assert arguments.expert_output_arithmetic in (
+            "native",
+            "workspace-checkpoint-reduction",
+            "workspace-bfloat16-reduction",
+        )
     else:
         pass
     if arguments.native_projection_batches:
@@ -1347,6 +1352,7 @@ def main() -> None:
                 if arguments.expert_output_arithmetic in (
                     "native",
                     "workspace-checkpoint-reduction",
+                    "workspace-bfloat16-reduction",
                 ):
                     expected_kernel_calls = expected_calls
                 elif arguments.expert_output_arithmetic in (

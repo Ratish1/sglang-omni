@@ -150,6 +150,9 @@ def checkpoint_reduce_workspace(
     intermediate_channels: int,
     expert_count: int,
     output: torch.Tensor,
+    reduction_semantics: Literal[
+        "checkpoint-reduction", "expert-order-bfloat16-sum"
+    ] = "checkpoint-reduction",
 ) -> torch.Tensor:
     """Change only the final reduction after validating the actual down buffer."""
     tokens, hidden_channels = output.shape
@@ -198,5 +201,5 @@ def checkpoint_reduce_workspace(
     )
     contributions[token_rows, expert_ranks] = stages.projected
     return combine_expert_contributions(
-        list(contributions.unbind(dim=1)), indices, scales, "checkpoint-reduction"
+        list(contributions.unbind(dim=1)), indices, scales, reduction_semantics
     )
