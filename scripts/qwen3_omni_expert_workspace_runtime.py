@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Literal
 
 import torch
 
@@ -91,6 +92,7 @@ def read_workspace_stages(
     expert_ranks: torch.Tensor,
     intermediate_channels: int,
     output: torch.Tensor,
+    output_arithmetic: Literal["native", "checkpoint-reduction"],
 ) -> WorkspaceStages:
     tokens, hidden_channels = output.shape
     ranks = indices.shape[1]
@@ -125,7 +127,7 @@ def read_workspace_stages(
         )
         routed[token_rows, expert_ranks] = projected
         reconstructed = combine_expert_contributions(
-            list(routed.unbind(dim=1)), indices, scales, "checkpoint-reduction"
+            list(routed.unbind(dim=1)), indices, scales, output_arithmetic
         )
         if torch.equal(reconstructed.view(torch.uint8), output.view(torch.uint8)):
             matches.append(

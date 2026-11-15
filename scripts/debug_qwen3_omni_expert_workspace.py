@@ -242,6 +242,7 @@ def main() -> None:
                         expert_ranks,
                         intermediate_channels,
                         output,
+                        "checkpoint-reduction",
                     )
                     inverse_rows = torch.empty_like(source_rows)
                     inverse_rows[source_rows] = torch.arange(
