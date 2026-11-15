@@ -1,5 +1,5 @@
 """Where a served video request's time goes, per boot, from one events cell: mean and p90 ms of each state between
-consecutive marks (admission, preprocessing start and end, image encoder in and out, thinker queue, prefill start and end,
+consecutive marks (admission, preprocessing start and end, its send to the image encoder, image encoder in and out, thinker queue, prefill start and end,
 thinker complete, terminal response).
 
 usage: python3 video_states.py <events cell dir> [...]
@@ -16,6 +16,7 @@ MARKS = (
     ("coordinator", "request_admission"),
     ("preprocessing", "preprocess_start"),
     ("preprocessing", "preprocess_end"),
+    ("preprocessing", "stage_hop_sent"),
     ("image_encoder", "stage_input_received"),
     ("image_encoder", "stage_complete"),
     ("thinker", "scheduler_queue_enter"),
