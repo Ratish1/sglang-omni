@@ -56,6 +56,8 @@ class NativeTalkerExperts:
     is_routing_capture_enabled: bool = False
     routing_snapshots: list[dict[str, torch.Tensor]] = field(default_factory=list)
     kernel_calls: int = 0
+    observed_profile_calls: int = 0
+    continuation_profile_calls: int = 0
     routing_semantics: Literal[
         "reconstructed", "indices", "native", "rounded", "indices-rounded"
     ] = "reconstructed"
@@ -127,7 +129,15 @@ class NativeTalkerExperts:
         assert layer_index == self.shared_gate_calls % layer_count
         frame = self.shared_gate_calls // layer_count
         hidden_states = inputs[0].reshape(-1, inputs[0].shape[-1])
-        if frame > 0 and self.shared_gate_decode_rows is not None:
+        has_recorded_geometry = (
+            self.profiles.frame_profiles is not None
+            and frame < len(self.profiles.frame_profiles)
+        )
+        if (
+            frame > 0
+            and self.shared_gate_decode_rows is not None
+            and not has_recorded_geometry
+        ):
             assert len(hidden_states) == 1
             batch_hidden_states = hidden_states.repeat(self.shared_gate_decode_rows, 1)
             start, stop = 0, 1
@@ -271,11 +281,21 @@ class NativeTalkerExperts:
         else:
             pass
         if self.profiles is not None:
-            profiles = (
-                self.profiles.prefill[layer_index]
-                if self.calls < len(self.weights)
-                else self.profiles.decode[layer_index]
-            )
+            frame_index = self.calls // len(self.weights)
+            if self.profiles.frame_profiles is not None and frame_index < len(
+                self.profiles.frame_profiles
+            ):
+                profiles = self.profiles.frame_profiles[frame_index][layer_index]
+            else:
+                profiles = (
+                    self.profiles.prefill[layer_index]
+                    if frame_index == 0
+                    else self.profiles.decode[layer_index]
+                )
+            if frame_index < self.profiles.verified_frames:
+                self.observed_profile_calls += 1
+            else:
+                self.continuation_profile_calls += 1
         else:
             profiles = (-1, -1)
         if self.gemm1_profile is not None:
