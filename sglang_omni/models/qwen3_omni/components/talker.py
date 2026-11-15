@@ -5,11 +5,13 @@ SGLang-native Talker model for Qwen3-Omni compatiable with hf formatting.
 from __future__ import annotations
 
 import logging
+from dataclasses import replace
 from typing import Iterable, Optional, Tuple
 
 import torch
 from sglang.kernels.fused_op import get_fused_op_backend
 from sglang.kernels.spec import KernelBackend
+from sglang.srt.layers.layer_boundary.residual.add_norm import UNFUSED_NORM_READOUT
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.model_executor.runner_utils.capture_mode import get_is_capture_mode
 from sglang.srt.model_loader.weight_utils import default_weight_loader
@@ -57,6 +59,7 @@ from sglang_omni.vendor.sglang.layers import (
     RMSNorm,
     RowParallelLinear,
     SiluAndMul,
+    StageDeclaration,
     residual_batch,
 )
 from sglang_omni.vendor.sglang.models import FusedSetKVBufferArg, apply_qk_norm
@@ -364,6 +367,18 @@ class Qwen3OmniMoeTalkerDecoderLayer(Qwen3OmniMoeThinkerTextDecoderLayer):
     # note (ratish): avoid constructing discarded experts that stay alive until cyclic gc
     sparse_moe_block_cls = Qwen3OmniMoeTalkerSparseMoeBlock
 
+    @staticmethod
+    def stage_facts(
+        config: Qwen3OmniMoeTalkerTextConfig, layer_id: int
+    ) -> tuple[StageDeclaration, StageDeclaration]:
+        attention, feed_forward = Qwen3OmniMoeThinkerTextDecoderLayer.stage_facts(
+            config, layer_id
+        )
+        return (
+            replace(attention, read=UNFUSED_NORM_READOUT),
+            replace(feed_forward, read=UNFUSED_NORM_READOUT),
+        )
+
 
 # ---------------------------------------------------------------------------
 # Talker Text Model
@@ -411,7 +426,12 @@ class Qwen3OmniMoeTalkerTextModel(nn.Module):
         self.start_layer = 0
         self.end_layer = config.num_hidden_layers
 
-        self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.norm = RMSNorm(
+            config.hidden_size, eps=config.rms_norm_eps, cast_x_before_out_mul=True
+        )
+        for layer in self.layers:
+            layer.input_layernorm.cast_x_before_out_mul = True
+            layer.post_attention_layernorm.cast_x_before_out_mul = True
         self.layers_to_capture = []
         max_batch_size = get_schedule().max_running_requests
         self.cp_enabled = True
@@ -482,6 +502,7 @@ class Qwen3OmniMoeTalkerTextModel(nn.Module):
                 ),
             )
 
+        hidden_states = residual_batch.fold(hidden_states, forward_batch)
         hidden_states = residual_batch.final_norm(
             hidden_states, forward_batch, self.norm, skip_empty=True
         )
