@@ -317,7 +317,19 @@ Against it:
      - `fix/qwen3-tts-unbounded-waiting-queue` `bf88f7d8c` (tree `f51eb68ba`) drops `max_queued_requests` from both Qwen3-TTS defaults (`config.py` `generation_admission_defaults` and `engine_builder.py` `generation_defaults`). The coordinator then sets no in-flight cap (`mp_runner.py:79-82`), and the scheduler treats `None` as unbounded (`omni_scheduler.py:1557`, `:444`).
      - An operator's `max_queued_requests` still bounds both. The NPU example configs keep theirs.
      - Tests cover both bounds. The tuning doc is updated.
-     - On the bar our peak in flight is 47, so no rate up to 40 req/s can change. The served check is Nari's client at 80 req/s, just above the CustomVoice throughput of about 75 req/s, main against the branch, queued after the unseeded A/B.
+     - On the bar our peak in flight is 47, so no rate up to 40 req/s can change. The served check is Nari's client at 80 req/s, main against the branch.
+     - **Measured at 80 req/s, seed 0** (`overload_20261115`):
+
+       | Arm | Succeeded | Failures |
+       |---|---|---|
+       | Main | 5.4 % (515), all with underruns | 7,014 HTTP 503 |
+       | Branch | 0 % | 1,971 timeouts at 120 s |
+
+       - The branch's first byte reached p50 19.5 s and p95 49.3 s, and its largest playback stall was 29.3 s.
+       - With no bound, every arrival is preprocessed in the pipeline process, under the same lock as the scheduler and vocoder, so the backlog starves the running streams.
+       - SGLang's queue holds tokens only. Ours holds preprocessed requests, and the backlog keeps preprocessing more.
+       - Both arms collapse at 80 while 40 is clean. A knee search at 50, 60 and 70 req/s for both arms runs next.
+     - Held, not for a PR, until the queue stops preprocessing ahead of engine capacity.
 4. c64 decode, by GIL share. Each is a host-only change, so seeded outputs must stay byte-identical. Gate on c16 and c64 RTF and throughput.
    1. The talker scheduler's per-row Python: `write_feedback_buffers` re-gathers rows of last step's batched `output_embeds`, and `post_process_outputs` and `finalize` also loop over rows.
    2. Stream messages from engine to vocoder: one per request a step on both sides. This is `OmniScheduler`'s shared path, so other models must keep main's behaviour.
