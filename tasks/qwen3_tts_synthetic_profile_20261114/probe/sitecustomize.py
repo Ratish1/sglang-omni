@@ -12,6 +12,8 @@ import os
 import sys
 
 ENABLED = os.environ.get("QWEN3_TTS_SYNTHETIC") == "1"
+# QWEN3_TTS_PROBE_LABELS=1 labels the steps and batches alone, for served cells that stop naturally.
+IS_LABELS_ONLY = os.environ.get("QWEN3_TTS_PROBE_LABELS") == "1"
 # MODE:BATCH:INDEX, e.g. DECODE:64:100, opens a cudaProfilerStart/Stop window around that one step.
 PROFILE_STEP = os.environ.get("QWEN3_TTS_PROFILE_STEP")
 
@@ -132,6 +134,16 @@ if ENABLED:
         PatchAfterImport(
             {
                 "sglang_omni.models.qwen3_tts.model_runner": mask_codec_eos,
+                "sglang_omni.scheduling.omni_scheduler": label_talker_steps,
+                "sglang_omni.models.qwen3_tts.streaming_vocoder": label_vocoder_batches,
+            }
+        ),
+    )
+elif IS_LABELS_ONLY:
+    sys.meta_path.insert(
+        0,
+        PatchAfterImport(
+            {
                 "sglang_omni.scheduling.omni_scheduler": label_talker_steps,
                 "sglang_omni.models.qwen3_tts.streaming_vocoder": label_vocoder_batches,
             }
