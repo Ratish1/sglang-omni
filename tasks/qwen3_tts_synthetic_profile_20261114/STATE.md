@@ -163,6 +163,20 @@ The same branch on Pipeshift's bar, seeds 0 to 2, median of seeds, main → bran
 | First byte p95 | 21.5 → 21.2 | 22.7 → 21.8 | 23.5 → 22.8 | 24.2 → 24.3 | 26.3 → 25.7 | 29.2 → 28.7 | 30.8 → 30.7 |
 | Audible p95 | 24.7 → 29.0 | 31.5 → 30.1 | 30.9 → 30.2 | 31.1 → 30.5 | 32.4 → 31.4 | 37.0 → 38.2 | 100.1 → 99.0 |
 
+`fix/qwen3-tts-opening-at-any-load` `7bbc943b2` on Pipeshift's bar at the rates where more than 24 streams are live, seeds 0 to 2, median of seeds (all three seeds in brackets for the p95 at 40), main → branch, ms. Every request succeeded, with no underrun and no stall.
+
+| req/s | 20 | 30 | 40 |
+|---|---|---|---|
+| Audible p95 | 32.4 → 31.9 | 37.0 → 34.1 | 100.1 → 37.2 (36.8 to 37.6) |
+| Audible p50 | 21.3 → 21.2 | 22.6 → 22.6 | 25.4 → 24.1 |
+| First byte p50 | 20.9 → 20.9 | 22.1 → 22.3 | 22.4 → 23.7 |
+| First byte p95 | 26.3 → 26.5 | 29.2 → 29.1 | 30.8 → 32.1 |
+| Leading silence p95 | 10 → 10 | 10 → 10 | 80 → 10 |
+
+- **At 40 req/s** the gap to Pipeshift's p95 (33.7) goes from 66.4 to 3.5 ms.
+- **The cost** is the extra first-chunk frame above 24 streams: about 1.3 ms of first byte at 40 req/s.
+- **No continuity cost:** #1901 gated the trim on stream count for continuity, and at these loads the branch shows no underrun and no stall.
+
 **Same-card drift band.** The opening branch runs CustomVoice SeedTTS cells where its mechanism cannot act: the SeedTTS client sends no language, so the Ryan and English trim never engages. These cells are therefore an A/A of main's behaviour about 2.5 h apart.
 
 | CustomVoice cell | First audio mean / median / p95, main → same behaviour | RTF | Throughput |
