@@ -278,6 +278,13 @@ The same branch on Pipeshift's bar, seeds 0 to 2, median of seeds, main → bran
 - First audio mean and median are lower in every cell in both pairs. Main against main moves at most 0.6 ms.
 - RTF stays within main's own repeat band (up to 0.7 %). It leans 0.3 to 1.1 % higher at c16 and c64, which this repeat does not resolve. The seeded −2.9 % at Base c64 was noise.
 
+**Tracing the first-chunk branch's RTF lean** (py-spy `--gil`, `firstchunk_profile/{main,firstchunk}`, served unseeded c64 and c16):
+- The first-chunk worker's lock samples rise 58 → 69 at c64 and 36 → 44 at c16. The follow-up workers are level (199 → 206, 124 → 113). Without the 2 ms wait, each first chunk is a batch of its own and pays the batch's fixed host cost alone.
+- The largest single piece of that cost is not batching. `Qwen3TTSCodecStateArena.acquire` → `zero_slot` (`codec_state_arena.py:224-227`) takes 280 of the worker's 690 ms inclusive. Every acquire built, in Python, a new list of views of the slot's rows of every state buffer and K/V ring before its one `_foreach_zero_` launch.
+- The storage tensors are created once in the constructor and only written in place; gather and eager states replace tensors in their own copies. So the views can be built once per slot.
+- **Fix:** `perf/qwen3-tts-codec-slot-views` `45f189833` (tree `2b0274b2d`) keeps `slot_buffers`, built in the constructor; `zero_slot` launches over the slot's cached list. The existing tests `test_arena_slot_reuse_starts_from_a_cold_state` and `test_arena_acquire_zeroes_only_the_acquired_slot` hold the contract.
+- **Measurement:** served unseeded streaming at c1, c16 and c64, run in alternating order, twice: main, slot views alone, and `test/qwen3-tts-first-chunk-slot-views` `3e360e05e` (tree `8fd9a022b`), the first-chunk branch with slot views (`ab_slotviews_20261115`).
+
 **Same-card drift band.** The opening branch runs CustomVoice SeedTTS cells where its mechanism cannot act: the SeedTTS client sends no language, so the Ryan and English trim never engages. These cells are therefore an A/A of main's behaviour about 2.5 h apart.
 
 | CustomVoice cell | First audio mean / median / p95, main → same behaviour | RTF | Throughput |
