@@ -330,6 +330,21 @@ Against it:
        - SGLang's queue holds tokens only. Ours holds preprocessed requests, and the backlog keeps preprocessing more.
        - Both arms collapse at 80 while 40 is clean. A knee search at 50, 60 and 70 req/s for both arms runs next.
      - Held, not for a PR, until the queue stops preprocessing ahead of engine capacity.
+     - **Knee, seed 0** (`overload_20261115/knee`):
+
+       | Arm | 50 req/s | 60 req/s | 70 req/s |
+       |---|---|---|---|
+       | Main | 100 % succeed, first byte p95 29 ms | 4.5 % succeed (325), 4,678 HTTP 503, every success underruns | 90.9 % succeed, first byte about 1 s, 1 underrun |
+       | Unbounded | 100 % | 0 %; the client dispatched only 33.8 of 60 req/s with thousands open, so this arm is partly client-bound | — |
+
+     - **Root cause of the collapse** (main's `serve.log`): `Qwen3-TTS incremental Codec state arena is full (64 slots); this request uses the left-context decoder`.
+       - Counts per minute of the log: 4 in the 50 req/s run, then 2,078, 3,020 and 1,745 per minute during the 60 req/s run, and 300 to 600 per minute at 70 req/s.
+       - The arena holds `DEFAULT_QWEN3_TTS_CODEC_STATE_SLOTS = 64` stream slots (`streaming_vocoder.py:86`, from #1997), the same as the engine's running bound.
+       - A slot is taken at a stream's first decode (`streaming_vocoder.py:1884`) and released at its final decode (`release_stream_resources`, `:1996`). A stream whose generation ended keeps its slot while the vocoder decodes its tail.
+       - Once the vocoder falls behind, more than 64 streams are live. Each one over the limit takes the left-context decoder (`:1886-1893`), which costs more per chunk. That slows the vocoder, so more streams stay live: a feedback loop.
+       - In-flight then sits at the 128 cap, the excess gets 503, and the admitted streams underrun.
+       - The served cells at c1, c16 and c64 and the bar up to 40 req/s logged 0 arena-full fallbacks. The loop only starts past about 50 req/s open-loop.
+     - **Fix at the root:** a stream that finds the arena full waits for a slot, keeping the incremental path, instead of taking the costlier decoder. A full vocoder then holds new streams' first audio back (backpressure) rather than slowing every stream. The unbounded queue is reassessed on top of that fix.
 4. c64 decode, by GIL share. Each is a host-only change, so seeded outputs must stay byte-identical. Gate on c16 and c64 RTF and throughput.
    1. The talker scheduler's per-row Python: `write_feedback_buffers` re-gathers rows of last step's batched `output_embeds`, and `post_process_outputs` and `finalize` also loop over rows.
    2. Stream messages from engine to vocoder: one per request a step on both sides. This is `OmniScheduler`'s shared path, so other models must keep main's behaviour.
