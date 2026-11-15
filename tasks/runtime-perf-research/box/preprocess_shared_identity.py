@@ -1,9 +1,11 @@
 """Whether one shared HF processor stays byte-identical under concurrent speech and video requests.
 
 Runs the Qwen3-Omni preprocessing stage alone, CPU only, first serially, then with video threads at two client concurrencies. Requests
-mix Video-MME CI videos with text and audio of varied length, and every output tensor and cache key is hashed by request.
+mix Video-MME CI videos with text and audio of varied length, plus one request per input form the stage reads (video key, video and
+image parts, images and audios keys, a message list), and every output tensor and cache key is hashed by request. With --threads 1 it
+runs the serial stage alone; --against compares this tree's serial hashes with another tree's report.
 
-usage: PYTHONPATH=<tree> OMP_WAIT_POLICY=PASSIVE taskset -c <cpus> python3 preprocess_shared_identity.py --threads 8 --out identity.json
+usage: PYTHONPATH=<tree> taskset -c <cpus> python3 preprocess_shared_identity.py --threads 8 --out identity.json [--against main.json]
 """
 
 import argparse
@@ -13,8 +15,10 @@ import threading
 import time
 
 import numpy as np
+from PIL import Image
 from preprocess_stage_bench import MODEL, VIDEO_SETTINGS, VIDEOMME_CI, tensor_hashes
 
+import sglang_omni
 import sglang_omni.models.qwen3_omni.stages as qwen_stages
 from benchmarks.dataset.videomme import load_videomme_samples
 from sglang_omni.proto.request import OmniRequest, StagePayload
@@ -22,12 +26,68 @@ from sglang_omni.scheduling.message import IncomingMessage
 
 SPEECH_PER_VIDEO = 4
 SAMPLE_RATE = 16000
+IMAGE_SIDE = 448
 
 
-def build_requests() -> dict[str, dict[str, object]]:
+def tone(seconds: float, frequency: float) -> np.ndarray:
+    phase = np.arange(int(seconds * SAMPLE_RATE), dtype=np.float32) / SAMPLE_RATE
+    return np.sin(2 * np.pi * frequency * phase) * 0.1
+
+
+def input_form_requests(video_path: str, image_path: str) -> dict[str, object]:
+    def ask(text: str) -> list[dict[str, object]]:
+        return [{"role": "user", "content": text}]
+
+    return {
+        "form-video-key": {
+            "messages": ask("Describe the clip."),
+            "video": [video_path],
+            **VIDEO_SETTINGS,
+        },
+        "form-video-part": {
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "video_url", "video_url": {"url": video_path}},
+                        {"type": "text", "text": "Describe the clip."},
+                    ],
+                }
+            ],
+            **VIDEO_SETTINGS,
+        },
+        "form-image-part": {
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "image_url", "image_url": {"url": image_path}},
+                        {"type": "text", "text": "Describe the image."},
+                    ],
+                }
+            ]
+        },
+        "form-images-key": {
+            "messages": ask("Describe the image."),
+            "images": [image_path],
+        },
+        "form-audios-key": {
+            "messages": ask("Say what you hear."),
+            "audios": [tone(3.0, 440.0)],
+        },
+        "form-message-list": ask("Name three colors."),
+    }
+
+
+def build_requests(image_path: str) -> dict[str, object]:
     generator = random.Random(3452)
-    requests: dict[str, dict[str, object]] = {}
-    for index, sample in enumerate(load_videomme_samples(50, repo_id=VIDEOMME_CI)):
+    pixels = np.random.default_rng(3452).integers(
+        0, 256, (IMAGE_SIDE, IMAGE_SIDE, 3), dtype=np.uint8
+    )
+    Image.fromarray(pixels).save(image_path)
+    requests: dict[str, object] = {}
+    samples = load_videomme_samples(50, repo_id=VIDEOMME_CI)
+    for index, sample in enumerate(samples):
         requests[f"video-{index}"] = {
             "messages": [{"role": "user", "content": sample.prompt or sample.question}],
             "videos": [sample.video_path],
@@ -35,8 +95,6 @@ def build_requests() -> dict[str, dict[str, object]]:
         }
         for speech in range(SPEECH_PER_VIDEO):
             seconds = generator.uniform(0.5, 25.0)
-            samples = int(seconds * SAMPLE_RATE)
-            phase = np.arange(samples, dtype=np.float32) / SAMPLE_RATE
             frequency = generator.uniform(120.0, 900.0)
             requests[f"speech-{index}-{speech}"] = {
                 "messages": [
@@ -46,13 +104,14 @@ def build_requests() -> dict[str, dict[str, object]]:
                         + "word " * generator.randint(1, 120),
                     }
                 ],
-                "audio": [np.sin(2 * np.pi * frequency * phase) * 0.1],
+                "audio": [tone(seconds, frequency)],
             }
+    requests.update(input_form_requests(samples[0].video_path, image_path))
     return requests
 
 
 def run_requests(
-    threads: int, concurrency: int, requests: dict[str, dict[str, object]]
+    threads: int, concurrency: int, requests: dict[str, object]
 ) -> tuple[dict[str, dict[str, str]], float]:
     scheduler = qwen_stages.create_preprocessing_executor(
         MODEL, max_concurrency=threads, max_seq_len=32768
@@ -66,13 +125,19 @@ def run_requests(
         nonlocal next_index
         name = names[next_index]
         next_index += 1
+        inputs = requests[name]
         scheduler.inbox.put(
             IncomingMessage(
                 request_id=name,
                 type="new_request",
                 data=StagePayload(
                     request_id=name,
-                    request=OmniRequest(inputs=dict(requests[name]), params={}),
+                    request=OmniRequest(
+                        inputs=(
+                            list(inputs) if isinstance(inputs, list) else dict(inputs)
+                        ),
+                        params={},
+                    ),
                     data={},
                 ),
             )
@@ -100,11 +165,31 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--threads", type=int, default=8)
     parser.add_argument("--out", required=True)
+    parser.add_argument("--image", required=True)
+    parser.add_argument("--against")
     args = parser.parse_args()
-    requests = build_requests()
+    print(f"sglang_omni from {sglang_omni.__file__}", flush=True)
+    requests = build_requests(args.image)
     reference, reference_seconds = run_requests(1, 1, requests)
-    report = {"requests": len(requests), "serial_seconds": reference_seconds}
-    for concurrency in (16, 64, 64):
+    report = {
+        "requests": len(requests),
+        "serial_seconds": reference_seconds,
+        "serial_hashes": reference,
+    }
+    print(f"serial: {reference_seconds:.1f} s, {len(reference)} requests", flush=True)
+    if args.against is not None:
+        with open(args.against) as source:
+            other = json.load(source)["serial_hashes"]
+        differing = [name for name in reference if other.get(name) != reference[name]]
+        print(
+            f"serial against {args.against}: {len(other)} requests there, "
+            f"{len(differing)} differ {differing[:5]}",
+            flush=True,
+        )
+        report["against"] = {"path": args.against, "differing": differing}
+    else:
+        pass
+    for concurrency in (16, 64, 64) if args.threads > 1 else ():
         hashes, seconds = run_requests(args.threads, concurrency, requests)
         differing = [name for name in reference if hashes.get(name) != reference[name]]
         tensors = sum(len(value) for value in reference.values())
