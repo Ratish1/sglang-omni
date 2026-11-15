@@ -16,10 +16,12 @@ from served_baseline import MODELS, SEED, wait_healthy
 from synthetic_driver import LAUNCH_OPTIONS, START_OPTIONS
 
 HERE = Path(__file__).resolve().parent
-WARMUP_S = 20.0
+WARMUP_S = 5.0
 WINDOW_S = 3.0
+# note (ratish): one pass of the 1,088 prompts lasts about 16 s at c64, so the client repeats it to outlast the window.
+CLIENT_PASSES = 3
 PYSPY_MODE = "pyspy"
-PYSPY_WINDOW_S = 10
+PYSPY_WINDOW_S = 30
 PYSPY_RATE_HZ = 100
 
 
@@ -66,6 +68,7 @@ def client(tree: Path, model: str, extra: list[str], port: int, concurrency: int
         "--use-existing-server", "--host", "127.0.0.1", "--port", str(port),
         "--generate-only", "--lang", "en", "--warmup", str(concurrency),
         "--max-concurrency", str(concurrency), "--seed", str(SEED), "--stream",
+        "--repeats", str(CLIENT_PASSES),
         "--output-dir", str(directory / "bench"), *extra,
     ]
     with (directory / "benchmark.log").open("w") as log:
