@@ -277,7 +277,11 @@ def main() -> None:
     else:
         pass
     if arguments.native_projection_batches:
-        assert arguments.native_expert_batches
+        assert (
+            arguments.native_expert_batches
+            or arguments.expert_output_arithmetic == "checkpoint"
+        )
+        assert arguments.native_expert_profile_map is not None
         assert arguments.paired_native_routing_controls
         assert arguments.restore_prefill_state is None
     else:
@@ -998,7 +1002,7 @@ def main() -> None:
             restored_prefill_cache_layers = 0
             restored_prefill_query = False
             frame_limit = min(arguments.max_frames, captured_sampling["max_new_tokens"])
-            if arguments.native_expert_batches:
+            if arguments.native_expert_batches or arguments.native_projection_batches:
                 assert (
                     expert_control is not None and expert_control.profiles is not None
                 )

@@ -1,4 +1,4 @@
-"""Split backbone and predictor paths after a byte-exact native replay."""
+"""Split speech components after an exact native replay."""
 
 from __future__ import annotations
 
@@ -12,6 +12,11 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--native-command-file", type=Path, required=True)
     parser.add_argument("--native-proof-file", type=Path, required=True)
+    parser.add_argument(
+        "--split-kind",
+        choices=("backbone-predictor", "boundary-experts"),
+        default="backbone-predictor",
+    )
     parser.add_argument("--output-directory", type=Path, required=True)
     arguments = parser.parse_args()
     proof = json.loads(arguments.native_proof_file.read_bytes())
@@ -35,14 +40,36 @@ def main() -> None:
     native_capture = native_command[
         native_command.index("--native-predictor-capture-directory") + 1
     ]
+    phases = (
+        (
+            "checkpoint-backbone-checkpoint-predictor",
+            "native-backbone-checkpoint-predictor",
+            "checkpoint-backbone-native-predictor",
+        )
+        if arguments.split_kind == "backbone-predictor"
+        else (
+            "checkpoint-boundary-native-experts",
+            "native-boundary-checkpoint-experts",
+            "checkpoint-boundary-checkpoint-experts",
+        )
+    )
     commands = []
-    for phase in (
-        "checkpoint-backbone-checkpoint-predictor",
-        "native-backbone-checkpoint-predictor",
-        "checkpoint-backbone-native-predictor",
-    ):
+    for phase in phases:
         output_directory = arguments.output_directory / phase
-        if phase == "native-backbone-checkpoint-predictor":
+        if arguments.split_kind == "boundary-experts":
+            command = native_command.copy()
+            command.remove("--verify-native-projection-inputs")
+            command[command.index("--output-directory") + 1] = str(output_directory)
+            if phase.startswith("checkpoint-boundary-"):
+                command[command.index("--normalization-semantics") + 1] = "checkpoint"
+            else:
+                pass
+            if phase.endswith("-checkpoint-experts"):
+                command.remove("--native-expert-batches")
+                command[command.index("--expert-output-arithmetic") + 1] = "checkpoint"
+            else:
+                pass
+        elif phase == "native-backbone-checkpoint-predictor":
             command = native_command.copy()
             command.remove("--verify-native-projection-inputs")
             command[command.index("--native-feedback-reduction") + 1] = "sequential"
@@ -73,9 +100,10 @@ def main() -> None:
     ).strip()
     manifest = {
         "source_commit": source_commit,
+        "split_kind": arguments.split_kind,
         "native_proof": proof,
         "commands": commands,
-        "scope": "Same captured conditioning and sampling coordinates as the exact native control. Native backbone retains original dense/expert peers only through their recorded horizon. Checkpoint paths run independently to natural EOS. This component split is not a performance comparison, full-population quality gate, or proof that either valid arithmetic path is universally better.",
+        "scope": "Same captured conditioning and sampling coordinates as the exact native control. Any recorded dense/expert peer mode stops at its recorded horizon. Backbone-predictor split changes whole components. Boundary-expert split retains the native predictor, Q/K normalization, attention, routing and shared expert, changing only boundary normalization and/or routed-expert arithmetic. Neither is a performance comparison, full-population quality gate, or universal repair claim.",
     }
     (arguments.output_directory / "commands.json").write_text(
         json.dumps(manifest, indent=2) + "\n"
