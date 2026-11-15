@@ -116,6 +116,7 @@ class QwenTalkerModelRunner(ModelRunner["SGLangARRequestData"]):
                 ),
                 request_ids=frozenset(json.loads(request_ids_file.read_text())),
                 operator_recorders=self.model.backbone_recorders,
+                head_recorder=self.model.head_recorder,
                 retain_moe_batches=retain_moe_batches,
                 moe_tactic_choices=self.model.moe_tactic_choices,
             )

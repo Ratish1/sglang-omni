@@ -32,6 +32,7 @@ class TalkerConditioningRecorder:
     previous_keys: dict[str, list[torch.Tensor]] = field(default_factory=dict)
     previous_values: dict[str, list[torch.Tensor]] = field(default_factory=dict)
     operator_recorders: list[LayerOperandRecorder] = field(default_factory=list)
+    head_recorder: LayerOperandRecorder | None = None
     retain_moe_batches: bool = False
     moe_tactic_choices: list[MoeTacticChoice] = field(default_factory=list)
 
@@ -311,27 +312,38 @@ class TalkerConditioningRecorder:
                     if is_extend
                     else row
                 )
-                torch.save(
-                    [
-                        recorder.read(
-                            step,
-                            operand_row,
-                            retain_moe_batches=self.retain_moe_batches,
-                            prefill_rows=(
-                                slice(
-                                    operand_row
-                                    + 1
-                                    - forward_batch.extend_seq_lens_cpu[row],
-                                    operand_row + 1,
-                                )
-                                if is_extend
-                                else None
-                            ),
-                        )
-                        for recorder in self.operator_recorders
-                    ],
-                    destination / f"{frame_index:04d}-operators.pt",
-                )
+                snapshots = [
+                    recorder.read(
+                        step,
+                        operand_row,
+                        retain_moe_batches=self.retain_moe_batches,
+                        prefill_rows=(
+                            slice(
+                                operand_row
+                                + 1
+                                - forward_batch.extend_seq_lens_cpu[row],
+                                operand_row + 1,
+                            )
+                            if is_extend
+                            else None
+                        ),
+                    )
+                    for recorder in self.operator_recorders
+                ]
+                if self.head_recorder is not None:
+                    head = self.head_recorder.read(
+                        step, row, retain_operator_batches=True
+                    )
+                    for source_name, destination_name in (
+                        ("batch_operator_head_input", "batch_codec_head_input"),
+                        ("batch_operator_head_output", "batch_codec_head_output"),
+                        ("layout_operator_head_input", "layout_codec_head_input"),
+                        ("layout_operator_head_output", "layout_codec_head_output"),
+                    ):
+                        snapshots[-1][destination_name] = head[source_name]
+                else:
+                    pass
+                torch.save(snapshots, destination / f"{frame_index:04d}-operators.pt")
             else:
                 pass
 

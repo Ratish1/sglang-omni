@@ -938,6 +938,7 @@ class Qwen3OmniTalker(nn.Module):
 
         device = self.model.codec_embedding.weight.device
         self.backbone_recorders: list[LayerOperandRecorder] = []
+        self.head_recorder: LayerOperandRecorder | None = None
         self.moe_tactic_choices: list[MoeTacticChoice] = []
         retain_moe_batches = os.environ.get("SGLANG_OMNI_DIAGNOSTIC_MOE_BATCHES") == "1"
         if retain_moe_batches:
@@ -962,6 +963,14 @@ class Qwen3OmniTalker(nn.Module):
                 layer.operator_recorder = recorder
                 layer.self_attn.operator_recorder = recorder
                 layer.mlp.operator_recorder = recorder
+        else:
+            pass
+        if self.backbone_recorders and retain_moe_batches:
+            self.head_recorder = LayerOperandRecorder(
+                step_counter=self.backbone_recorders[0].step_counter,
+                maximum_prefill_token_rows=0,
+                retain_moe_batches=True,
+            )
         else:
             pass
         hidden_size = config.text_config.hidden_size
@@ -1625,11 +1634,16 @@ class Qwen3OmniTalker(nn.Module):
 
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """Compute layer-0 codec logits."""
+        if self.head_recorder is not None:
+            self.head_recorder.begin(
+                torch.arange(len(hidden_states), device=hidden_states.device)
+            )
+            self.head_recorder.record("operator_head_input", hidden_states)
+        else:
+            pass
         logits, _ = self.codec_head(hidden_states)
-        if self.backbone_recorders and self.backbone_recorders[-1].retain_moe_batches:
-            recorder = self.backbone_recorders[-1]
-            recorder.record("codec_head_input", hidden_states)
-            recorder.record("codec_head_output", logits)
+        if self.head_recorder is not None:
+            self.head_recorder.record("operator_head_output", logits)
         else:
             pass
         return logits
