@@ -14,8 +14,10 @@ One server from this tree, placed on --card with the stage gpu flags, healthy be
           server launched under the nsys session --nsys-session (CUDA trace, graph level), exported to trace.sqlite
   warm    a full benchmark pass whose numbers are not read (absorbs first-use work after the server's warmup)
 
-Every pass also stores the CPU seconds of every server thread at its start and end (thread_cpu.json) and the
-benchmark window. Identity (head, tree hash, dirty check, imported file) goes to identity.txt before the boot.
+Every pass also stores the CPU seconds of every server thread at its start and end (thread_cpu.json), the
+benchmark window, and each serving process's resident peak over the pass, its peak restarted as the pass starts, with
+its thread names (memory.json). Identity (head, tree hash, dirty check, imported file) goes to identity.txt before
+the boot. A model with a launcher boots that example script with its own placement flags in place of the CLI.
 """
 
 import argparse
@@ -65,6 +67,15 @@ MODELS = {
         "path": "Qwen/Qwen3-Omni-30B-A3B-Instruct",
         "config": "",
         "placement": "",
+    },
+    # note (ratish): the CI's Video-MME server (tests/test_model/conftest.py start_qwen3_omni_disagg), both cards.
+    "omni_disagg_ci": {
+        "path": "Qwen/Qwen3-Omni-30B-A3B-Instruct",
+        "config": "",
+        "placement": "",
+        "launcher": "examples/run_qwen3_omni_speech_server.py --model-name qwen3-omni --thinker-max-seq-len 32768 "
+        "--gpu-thinker 0 --gpu-image-encoder 0 --gpu-audio-encoder 0 --gpu-talker 1 --gpu-code2wav 1 "
+        "--thinker-mem-fraction-static 0.82 --talker-mem-fraction-static 0.40",
     },
     "omni_fp8_colocated": {
         "path": "marksverdhei/Qwen3-Omni-30B-A3B-FP8",
@@ -378,6 +389,44 @@ def thread_cpu(pgid: int) -> dict[str, dict[str, object]]:
     return threads
 
 
+def restart_peak_memory(pgid: int) -> None:
+    """Restart each serving process's resident peak at its current size, so the next VmHWM read covers one pass."""
+    for pid in serving_pids(pgid):
+        try:
+            Path(f"/proc/{pid}/clear_refs").write_text("5")
+        except (FileNotFoundError, ProcessLookupError):
+            continue
+
+
+def process_memory(pgid: int) -> dict[str, dict[str, object]]:
+    """Resident peak and size in MiB of each serving process, keyed by pid, with its thread names."""
+    memory = {}
+    for pid in serving_pids(pgid):
+        try:
+            status = Path(f"/proc/{pid}/status").read_text()
+            tasks = list(Path(f"/proc/{pid}/task").iterdir())
+        except (FileNotFoundError, ProcessLookupError):
+            continue
+        names = set()
+        for task in tasks:
+            try:
+                names.add((task / "comm").read_text().strip())
+            except (FileNotFoundError, ProcessLookupError):
+                continue
+        fields = dict(line.split(":", 1) for line in status.splitlines() if ":" in line)
+        memory[str(pid)] = {
+            key: int(fields[name].split()[0]) / 1024
+            for key, name in (
+                ("peak_mib", "VmHWM"),
+                ("rss_mib", "VmRSS"),
+                ("anon_mib", "RssAnon"),
+                ("shmem_mib", "RssShmem"),
+            )
+        }
+        memory[str(pid)]["threads"] = sorted(names)
+    return memory
+
+
 def process_table(pgid: int) -> str:
     rows = []
     for pid in group_pids(pgid):
@@ -502,6 +551,7 @@ def run_pass(
         )
     (out / "bench_command.txt").write_text(shlex.join(command) + "\n", encoding="utf-8")
     cpu_start = thread_cpu(server.pid)
+    restart_peak_memory(server.pid)
     window_start = time.time()
     with open(out / "bench.log", "w", encoding="utf-8") as bench_log:
         bench = subprocess.Popen(
@@ -591,6 +641,9 @@ def run_pass(
                     hung.write(f"{shlex.join(spy.args)}\n")
     window_end = time.time()
     cpu_end = thread_cpu(server.pid)
+    (out / "memory.json").write_text(
+        json.dumps(process_memory(server.pid)), encoding="utf-8"
+    )
     # note (ratish): Python threads keep the OS name python3, so a nonblocking dump maps each tid to its thread name
     for pid in serving_pids(server.pid):
         with open(out / f"dump_{pid}.txt", "w", encoding="utf-8") as dump:
@@ -778,21 +831,34 @@ def main() -> None:
         capture_output=True,
         text=True,
     ).stdout
-    serve = [
-        sys.executable,
-        "-m",
-        "sglang_omni.cli",
-        "serve",
-        "--model-path",
-        spec["path"],
-        *(["--config", spec["config"]] if spec["config"] else []),
-        "--host",
-        "127.0.0.1",
-        "--port",
-        str(args.port),
-        *shlex.split(spec["placement"].format(card=args.card)),
-        *shlex.split(args.serve_extra),
-    ]
+    if "launcher" in spec:
+        serve = [
+            sys.executable,
+            *shlex.split(spec["launcher"]),
+            "--model-path",
+            spec["path"],
+            "--host",
+            "127.0.0.1",
+            "--port",
+            str(args.port),
+            *shlex.split(args.serve_extra),
+        ]
+    else:
+        serve = [
+            sys.executable,
+            "-m",
+            "sglang_omni.cli",
+            "serve",
+            "--model-path",
+            spec["path"],
+            *(["--config", spec["config"]] if spec["config"] else []),
+            "--host",
+            "127.0.0.1",
+            "--port",
+            str(args.port),
+            *shlex.split(spec["placement"].format(card=args.card)),
+            *shlex.split(args.serve_extra),
+        ]
     if args.nsys_session:
         serve = [
             "nsys",
