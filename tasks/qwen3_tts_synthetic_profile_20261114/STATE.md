@@ -355,7 +355,17 @@ Against it:
        - **Stats:** `slot_waits` is added.
        - **Tests:** a full arena holds the stream and a release reschedules it; a waiting stream whose generation ends stays on the async path.
        - **Normal load:** the served cells never fill the arena (0 fallbacks), so normal load takes main's path.
-     - Running on Pipeshift's bar at 60, 70 and 80 req/s, against main's knee above.
+     - **Measured on Pipeshift's bar, seed 0, main → branch** (`overload_20261115/knee/slotwait_s0`; main at 80 from `overload_20261115/main_s0`):
+
+       | req/s | Succeeded | First byte p50 / p95, ms | Underrun requests | Largest stall, ms | HTTP 503 (measured) |
+       |---|---|---|---|---|---|
+       | 60 | 4.5 % → 100 % | 47.0 / 95.3 → 19.1 / 26.5 | 2,529 → 0 | 548 → 0 | 4,678 → 0 |
+       | 70 | 90.9 % → 100 % | 908 / 1,034 → 22.8 / 185 | 1 → 3 | 0.3 → 4.8 | 765 → 0 |
+       | 80 | 5.4 % → 93.8 % (9,010) | 47.6 / 94.1 → 768 / 867 | 2,587 → 0 | 521 → 0 | 7,014 → 591 |
+
+       - Past capacity (about 75 req/s on this load) the branch serves at capacity with clean audio and turns away only the excess.
+       - The arena-full fallback no longer fires: 0 warnings, since the warning only remains on the synchronous path.
+     - `test/qwen3-tts-slot-wait-unbounded` `1e0d175e2` (tree `06d1c6f24`) puts the unbounded-queue commit on top, for measurement only. It runs at 70 and 80 req/s.
 4. c64 decode, by GIL share. Each is a host-only change, so seeded outputs must stay byte-identical. Gate on c16 and c64 RTF and throughput.
    1. The talker scheduler's per-row Python: `write_feedback_buffers` re-gathers rows of last step's batched `output_embeds`, and `post_process_outputs` and `finalize` also loop over rows.
    2. Stream messages from engine to vocoder: one per request a step on both sides. This is `OmniScheduler`'s shared path, so other models must keep main's behaviour.
