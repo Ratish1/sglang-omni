@@ -298,6 +298,23 @@ The same branch on Pipeshift's bar, seeds 0 to 2, median of seeds, main → bran
   - **Reading:** slot views lowers c64 first audio in both rounds, and its RTF is inside the noise. It does not remove the first-chunk branch's Base c64 RTF lean, which reads +2.4 to +3.7 % here (+0.3 to +1.1 % in the earlier ABAB).
   - **Next step for that lean:** a lean under 3 % gets a kernel census and loop ledger at c64, main against the branch: vocoder initial batch counts, graph replays and talker idle per step. Not more pairs.
 
+**Census at served c64, unseeded** (`firstchunk_census/{main,firstchunk}`, nsys timing mode, probe labels, `census_digest.py`):
+
+| | Main | First-chunk branch |
+|---|---|---|
+| Window | 1,846 ms, 134 talker steps, 13.8 ms a step | 1,278 ms, 90 steps, 14.2 ms a step |
+| Decode step | 101 at 7.96 ms | 75 at 7.75 ms |
+| Prefill step | 33 at 13.27 ms | 15 at 19.03 ms |
+| Initial vocoder batches | 33 batches, 175 streams | 16 batches, 132 streams |
+| Initial worker's share of the window (in batches) | 527 ms, 28 % | 441 ms, 35 % |
+| One-stream initial batch | 7.3 ms | 14.3 ms |
+| Initial batches of 9 to 16 streams | 43 to 65 ms | 22 to 57 ms |
+| Follow-up batches of 8 streams | 4.8 ms | 5.0 ms |
+
+- A Base first chunk decodes the reference's codes as left context, so it is a wide decode.
+- **Main's initial worker** (CUDA runtime table): 43 graph launches for 33 batches, 1,027 eager launches for staging, and 123 `cudaEventSynchronize` calls totalling 96.7 ms. The follow-up workers spent 2.4 and 5.6 ms in syncs.
+- **Next target, c64 first audio:** the initial worker's wide reference-context replays sharing the card with the talker, and its event waits. Which event each sync waits on is next. The timing mode's kernel-per-stream figures are near zero because graph trace mode records graphs whole, so read graph spans for device time.
+
 **Same-card drift band.** The opening branch runs CustomVoice SeedTTS cells where its mechanism cannot act: the SeedTTS client sends no language, so the Ryan and English trim never engages. These cells are therefore an A/A of main's behaviour about 2.5 h apart.
 
 | CustomVoice cell | First audio mean / median / p95, main → same behaviour | RTF | Throughput |
