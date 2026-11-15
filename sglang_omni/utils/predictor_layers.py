@@ -394,7 +394,8 @@ if HAS_TRITON:
         visible = rs[None, :] < end - T + token[:, None] + 1
         scores = tl.where(visible, scores, float("-inf"))
         weights = libdevice.exp(scores - tl.max(scores, 1)[:, None])
-        attended = tl.dot(weights.to(tl.bfloat16), v) / tl.sum(weights, 1)[:, None]
+        probabilities = weights / tl.sum(weights, 1)[:, None]
+        attended = tl.dot(probabilities.to(tl.bfloat16), v)
         tl.store(OUT + out_offsets, attended.to(tl.bfloat16), mask=is_query[:, None])
         # note (ratish): released after the store, so o_proj's waiting programs do not hold
         # the SM slots the attention's later waves need.
