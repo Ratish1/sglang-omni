@@ -6,10 +6,9 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import torch
+from check import DIRECTORY, MODEL, VAE, reference_module
 from safetensors import safe_open
 from torch import nn
-
-from check import DIRECTORY, MODEL, VAE, reference_module
 
 from sglang_omni.models.yue2 import model_runner
 from sglang_omni.models.yue2.model_runner import Yue2ModelRunner
@@ -28,7 +27,7 @@ from sglang_omni.utils.checkpoint import resolve_checkpoint
 
 @torch.inference_mode()
 def compare_support(logits: torch.Tensor) -> dict[str, int | float]:
-    sampling = SamplingConfig(repetition_penalty=1.0, min_tokens=0)
+    sampling = SamplingConfig()
     reference = reference_module("sampling.py")
     expected = reference.distribution(logits, sampling, [], 0, "semantic", True)
     captured: dict[str, torch.Tensor] = {}
@@ -44,8 +43,9 @@ def compare_support(logits: torch.Tensor) -> dict[str, int | float]:
         captured["values"] = values.clone()
         return native_multinomial(values, seeds, positions)
 
-    with patch.object(torch.Tensor, "topk", capture_topk), patch.object(
-        model_runner, "multinomial_with_seed", capture_multinomial
+    with (
+        patch.object(torch.Tensor, "topk", capture_topk),
+        patch.object(model_runner, "multinomial_with_seed", capture_multinomial),
     ):
         Yue2ModelRunner.sample_group(
             logits,
@@ -57,13 +57,21 @@ def compare_support(logits: torch.Tensor) -> dict[str, int | float]:
     actual.scatter_(-1, captured["candidates"], captured["values"])
     expected_probabilities = expected.float().softmax(-1)
     actual_probabilities = actual.float().softmax(-1)
-    threshold = logits[:, CODEC_OFFSET : CODEC_OFFSET + CODEC_SIZE].topk(100).values[:, -1:]
+    threshold = (
+        logits[:, CODEC_OFFSET : CODEC_OFFSET + CODEC_SIZE].topk(100).values[:, -1:]
+    )
     return {
         "reference_support": int(torch.isfinite(expected).sum()),
         "pr_support": int(torch.isfinite(actual).sum()),
-        "total_variation": float((expected_probabilities - actual_probabilities).abs().sum() / 2),
-        "reference_probability_outside_pr_support": float(expected_probabilities.masked_select(~torch.isfinite(actual)).sum()),
-        "top_k_boundary_ties": int((logits[:, CODEC_OFFSET : CODEC_OFFSET + CODEC_SIZE] == threshold).sum()),
+        "total_variation": float(
+            (expected_probabilities - actual_probabilities).abs().sum() / 2
+        ),
+        "reference_probability_outside_pr_support": float(
+            expected_probabilities.masked_select(~torch.isfinite(actual)).sum()
+        ),
+        "top_k_boundary_ties": int(
+            (logits[:, CODEC_OFFSET : CODEC_OFFSET + CODEC_SIZE] == threshold).sum()
+        ),
     }
 
 
@@ -79,22 +87,33 @@ def main() -> None:
     configuration = SimpleNamespace(**runtime.model.config.model_dump())
     with torch.device("meta"):
         backbone = official.Backbone(configuration)
-        token_head = nn.Linear(configuration.hidden_size, configuration.vocab_size, bias=False)
+        token_head = nn.Linear(
+            configuration.hidden_size, configuration.vocab_size, bias=False
+        )
     backbone.load_state_dict(runtime.model.model.state_dict(), assign=True, strict=True)
     backbone.eval()
     directory = Path(resolve_checkpoint(MODEL))
-    mapping = json.loads((directory / "model.safetensors.index.json").read_text())["weight_map"]
-    with safe_open(directory / mapping["lm_head.weight"], framework="pt", device="cpu") as archive:
-        token_head.load_state_dict({"weight": archive.get_tensor("lm_head.weight").cuda()}, assign=True)
+    mapping = json.loads((directory / "model.safetensors.index.json").read_text())[
+        "weight_map"
+    ]
+    with safe_open(
+        directory / mapping["lm_head.weight"], framework="pt", device="cpu"
+    ) as archive:
+        token_head.load_state_dict(
+            {"weight": archive.get_tensor("lm_head.weight").cuda()}, assign=True
+        )
     token_head.eval()
     tokenizer = Yue2Tokenizer(directory / "qwen.tiktoken")
-    for index, style in enumerate([
-        "Gentle acoustic pop, warm female vocals",
-        "Fast electronic dance music, powerful male vocals",
-        "Jazz piano, relaxed female vocals",
-    ]):
+    for index, style in enumerate(
+        [
+            "Gentle acoustic pop, warm female vocals",
+            "Fast electronic dance music, powerful male vocals",
+            "Jazz piano, relaxed female vocals",
+        ]
+    ):
         payload = StagePayload(
-            request_id=f"sampling-{index}", data={},
+            request_id=f"sampling-{index}",
+            data={},
             request=OmniRequest(
                 inputs="[Verse]\nMorning light is shining through",
                 metadata={"tts_params": {"instructions": style, "seed": 42}},
@@ -102,12 +121,17 @@ def main() -> None:
             ),
         )
         request = build_request(payload)
-        prefixes = [tokenizer.prefix(request, []), tokenizer.negative_prefix(request, [])]
+        prefixes = [
+            tokenizer.prefix(request, []),
+            tokenizer.negative_prefix(request, []),
+        ]
         branch_logits = []
         for prefix in prefixes:
             tokens = torch.tensor([prefix], device="cuda")
             positions = torch.arange(len(prefix), device="cuda")[None]
-            hidden, _ = backbone(input_ids=tokens, position_ids=positions, use_cache=False)
+            hidden, _ = backbone(
+                input_ids=tokens, position_ids=positions, use_cache=False
+            )
             branch_logits.append(token_head(hidden[:, -1]))
         conditional, unconditional = branch_logits
         logits = unconditional + request.guidance * (conditional - unconditional)
