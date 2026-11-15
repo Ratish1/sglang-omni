@@ -1626,12 +1626,8 @@ class Qwen3OmniTalker(nn.Module):
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """Compute layer-0 codec logits."""
         logits, _ = self.codec_head(hidden_states)
-        if (
-            self.conditioning_recorder is not None
-            and self.conditioning_recorder.retain_moe_batches
-            and self.conditioning_recorder.operator_recorders
-        ):
-            recorder = self.conditioning_recorder.operator_recorders[-1]
+        if self.backbone_recorders and self.backbone_recorders[-1].retain_moe_batches:
+            recorder = self.backbone_recorders[-1]
             recorder.record("codec_head_input", hidden_states)
             recorder.record("codec_head_output", logits)
         else:
