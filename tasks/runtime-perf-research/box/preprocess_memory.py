@@ -95,6 +95,7 @@ def run_one(threads: int, concurrency: int) -> dict[str, object]:
     end_mib = status_mib("VmRSS")
     ctypes.CDLL("libc.so.6").malloc_trim(0)
     trimmed_mib = status_mib("VmRSS")
+    os_threads = len(os.listdir("/proc/self/task"))
     scheduler.stop()
     return {
         "threads": threads,
@@ -104,6 +105,7 @@ def run_one(threads: int, concurrency: int) -> dict[str, object]:
         "peak_mib": peak_mib,
         "end_mib": end_mib,
         "trimmed_mib": trimmed_mib,
+        "os_threads": os_threads,
         "pixel_mib_mean": statistics.mean(pixel_mib),
         "pixel_mib_max": max(pixel_mib),
     }
@@ -145,6 +147,7 @@ def main() -> None:
         print(
             f"threads {threads}: {row['seconds']:.1f} s, rss start {row['start_mib']:.0f} MiB, "
             f"peak {row['peak_mib']:.0f}, end {row['end_mib']:.0f}, after trim {row['trimmed_mib']:.0f}, "
+            f"threads {row['os_threads']}, "
             f"pixels a video {row['pixel_mib_mean']:.0f} (max {row['pixel_mib_max']:.0f})",
             flush=True,
         )
