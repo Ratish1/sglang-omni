@@ -32,7 +32,12 @@ def main() -> None:
     parser.add_argument("--build-jobs", type=int, required=True)
     parser.add_argument(
         "--output-arithmetic",
-        choices=("native", "rounded-contributions", "checkpoint-reduction"),
+        choices=(
+            "native",
+            "rounded-contributions",
+            "checkpoint-reduction",
+            "expert-order-bfloat16-sum",
+        ),
         default="rounded-contributions",
     )
     parser.add_argument(
@@ -58,9 +63,14 @@ def main() -> None:
     else:
         patch_filenames.append(
             "qwen3_omni_checkpoint_reduction.patch"
-            if arguments.output_arithmetic == "checkpoint-reduction"
+            if arguments.output_arithmetic
+            in ("checkpoint-reduction", "expert-order-bfloat16-sum")
             else "qwen3_omni_bf16_contributions.patch"
         )
+        if arguments.output_arithmetic == "expert-order-bfloat16-sum":
+            patch_filenames.append("qwen3_omni_native_route_scales.patch")
+        else:
+            pass
         expected_changes.add(FINALIZER_PATH.as_posix())
     if arguments.activation_arithmetic == "checkpoint":
         assert original_sources[GATED_ROUTINE_PATH.as_posix()] == GATED_ROUTINE_SHA256
