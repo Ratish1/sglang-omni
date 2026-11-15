@@ -138,6 +138,22 @@ First audio (Base, 20 s references):
   - preprocessing and admission, about 3 ms.
 - A faster c1 decode step counts twice in audible first audio.
 
+## A/B on one H100 (11-15, after main's baseline, one run each)
+
+`perf/qwen3-tts-first-chunk-from-queue` `5d18dc578`, served streaming cells (`ab_20261115/firstchunk/served`):
+
+| Cell | First audio mean / median / p95, main → branch | RTF, main → branch |
+|---|---|---|
+| Base c1 | 18.4 / 19.7 / 22.5 → 17.0 / 18.8 / 20.5 | 0.0656 → 0.0652 |
+| Base c16 | 30.6 / 27.7 / 43.8 → 27.4 / 26.6 / 39.9 | 0.1034 → 0.1014 |
+| Base c64 | 51.6 / 39.8 / 133.1 → 49.3 / 38.4 / 128.7 | 0.2255 → 0.2190 |
+| CustomVoice c1 | 12.0 / 11.8 / 13.2 → 11.0 / 10.9 / 11.5 | 0.0636 → 0.0636 |
+| CustomVoice c16 | 18.2 / 17.9 / 21.9 → 17.4 / 17.4 / 20.3 | 0.0927 → 0.0926 |
+| CustomVoice c64 | 28.4 / 21.8 / 121.2 → 27.5 / 21.5 / 110.2 | 0.1790 → 0.1818 |
+
+- First audio is lower in every cell, on mean, median and p95. No cell had an underrun.
+- The RTF changes are within ±3 % and go both ways. Main's repeat at the end of the queue gives the drift band.
+
 ## Order of work
 
 1. Baseline of upstream main `bac76771a` on one H100:
