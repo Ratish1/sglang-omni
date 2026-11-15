@@ -151,12 +151,18 @@ def main() -> None:
                     hidden_states.dtype == packed.dtype == down.dtype == torch.bfloat16
                 )
                 assert indices.shape == scales.shape
-                reference_unrounded = torch.empty(
-                    (tokens, ranks, intermediate_channels),
-                    dtype=torch.bfloat16,
-                    device=device,
-                )
-                reference_stores = torch.empty_like(reference_unrounded)
+                reference_activations = {
+                    name: torch.empty(
+                        (tokens, ranks, intermediate_channels),
+                        dtype=torch.bfloat16,
+                        device=device,
+                    )
+                    for name in (
+                        "fp64_gemm_without_stores",
+                        "fp64_gemm_bf16_store",
+                        "fp64_gemm_with_bf16_stores",
+                    )
+                }
                 for expert_index in indices.unique().tolist():
                     token_rows, expert_ranks = (indices == expert_index).nonzero(
                         as_tuple=True
@@ -165,10 +171,20 @@ def main() -> None:
                         hidden_states[token_rows].double(),
                         packed[expert_index].double(),
                     ).chunk(2, dim=-1)
-                    reference_unrounded[token_rows, expert_ranks] = (
+                    reference_activations["fp64_gemm_without_stores"][
+                        token_rows, expert_ranks
+                    ] = (
                         torch.nn.functional.silu(gate_projection) * up_projection
                     ).bfloat16()
-                    reference_stores[token_rows, expert_ranks] = (
+                    reference_activations["fp64_gemm_bf16_store"][
+                        token_rows, expert_ranks
+                    ] = (
+                        torch.nn.functional.silu(gate_projection.bfloat16().float())
+                        * up_projection.bfloat16().float()
+                    ).bfloat16()
+                    reference_activations["fp64_gemm_with_bf16_stores"][
+                        token_rows, expert_ranks
+                    ] = (
                         torch.nn.functional.silu(gate_projection.bfloat16()).bfloat16()
                         * up_projection.bfloat16()
                     )
@@ -292,20 +308,16 @@ def main() -> None:
                         source_rows // tokens,
                     )
                     reference_differences = {
-                        "fp64_gemm_without_stores": asdict(
+                        name: asdict(
                             compare_tensors(
                                 repeated["activated"],
-                                reference_unrounded[token_rows, expert_ranks],
+                                reference[token_rows, expert_ranks],
                             )
-                        ),
-                        "fp64_gemm_with_bf16_stores": asdict(
-                            compare_tensors(
-                                repeated["activated"],
-                                reference_stores[token_rows, expert_ranks],
-                            )
-                        ),
+                        )
+                        for name, reference in reference_activations.items()
                     }
                     differences = {}
+                    baseline_reference_differences = {}
                     if arguments.baseline_directory is None:
                         torch.save(
                             {name: tensor.cpu() for name, tensor in repeated.items()},
@@ -320,6 +332,15 @@ def main() -> None:
                         assert torch.equal(
                             baseline["source_rows"], repeated["source_rows"]
                         )
+                        baseline_reference_differences = {
+                            name: asdict(
+                                compare_tensors(
+                                    baseline["activated"],
+                                    reference[token_rows, expert_ranks],
+                                )
+                            )
+                            for name, reference in reference_activations.items()
+                        }
                         differences = {
                             name: asdict(
                                 compare_tensors(repeated[name], baseline[name])
@@ -346,6 +367,7 @@ def main() -> None:
                                 "complete_output_reconstructed": True,
                                 "differences": differences,
                                 "activation_references": reference_differences,
+                                "baseline_activation_references": baseline_reference_differences,
                             }
                         )
                         + "\n"
