@@ -313,6 +313,19 @@ The same branch on Pipeshift's bar, seeds 0 to 2, median of seeds, main → bran
 
 - A Base first chunk decodes the reference's codes as left context, so it is a wide decode.
 - **Main's initial worker** (CUDA runtime table): 43 graph launches for 33 batches, 1,027 eager launches for staging, and 123 `cudaEventSynchronize` calls totalling 96.7 ms. The follow-up workers spent 2.4 and 5.6 ms in syncs.
+**Graph overlap at served c64** (`CUPTI_ACTIVITY_KIND_GRAPH_TRACE` joined to the launching thread):
+
+| Talker graph | Arm | Graphs | Mean span | Overlapped by first-chunk graphs | Overlapped by any vocoder graph | Mean when first-chunk overlap > 20 % | Otherwise |
+|---|---|---|---|---|---|---|---|
+| Decode (graph 685) | Main | 81 | 3,281 µs | 12.1 % | 37.8 % | 3,664 µs (n=14) | 3,201 µs |
+| Decode (graph 685) | Branch | 48 | 3,046 µs | 7.0 % | 28.7 % | 3,458 µs (n=4) | 3,009 µs |
+| Predictor (graph 439) | Main | 81 | 4,643 µs | 4.2 % | 27.4 % | 4,604 µs (n=10) | 4,649 µs |
+| Predictor (graph 439) | Branch | 48 | 4,770 µs | 4.7 % | 31.6 % | 6,896 µs (n=3) | 4,629 µs |
+
+- Vocoder graphs (first chunks and follow-ups) run beside the talker's critical-path graphs on the same SMs for 27 to 38 % of their time.
+- A talker graph that a first-chunk graph overlaps runs 14 % (talker decode, main) to 49 % (predictor, branch) longer.
+- **The defect the first-chunk branch exposes:** nothing orders vocoder work against the talker's critical path. The 2 ms wait only moved some of it aside. It is the same mechanism as the 10-24 ledger's "+99 % talker, +177 % predictor beside follow-ups at c64", and as Nari's one deadline order (10-27 notes).
+- **The fix belongs there:** vocoder decodes scheduled around the talker's step, not concurrently with its graphs. The first-chunk branch then goes on top.
 - **Next target, c64 first audio:** the initial worker's wide reference-context replays sharing the card with the talker, and its event waits. Which event each sync waits on is next. The timing mode's kernel-per-stream figures are near zero because graph trace mode records graphs whole, so read graph spans for device time.
 
 **Same-card drift band.** The opening branch runs CustomVoice SeedTTS cells where its mechanism cannot act: the SeedTTS client sends no language, so the Ryan and English trim never engages. These cells are therefore an A/A of main's behaviour about 2.5 h apart.
