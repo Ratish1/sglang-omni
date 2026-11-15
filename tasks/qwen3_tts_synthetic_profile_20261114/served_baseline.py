@@ -105,6 +105,7 @@ def main() -> None:
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--port", type=int, default=23500)
     parser.add_argument("--models", default="base,customvoice")
+    parser.add_argument("--stream-only", action="store_true")
     args = parser.parse_args()
     args.out.mkdir(parents=True, exist_ok=True)
     head = subprocess.check_output(
@@ -113,7 +114,7 @@ def main() -> None:
     print(f"{time.strftime('%T')} tree {head[0]} sglang_omni {head[1]}", flush=True)
     for name in args.models.split(","):
         cells = [(concurrency, True) for concurrency in CONCURRENCIES]
-        if name == "base":
+        if name == "base" and not args.stream_only:
             cells += [(concurrency, False) for concurrency in CONCURRENCIES]
         else:
             pass
