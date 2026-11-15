@@ -548,7 +548,8 @@ if HAS_TRITON:
         gate, up = tl.split(
             tl.permute(tl.reshape(products, [BLOCK_M, 2, BLOCK_N]), [0, 2, 1])
         )
-        activated = gate / (1.0 + libdevice.exp(-gate)) * up
+        silu = (gate / (1.0 + libdevice.exp(-gate))).to(tl.bfloat16).to(tl.float32)
+        activated = silu * up
         offsets = rm[:, None] * INTERMEDIATE + gate_cols[None, :]
         tl.store(OUT + offsets, activated.to(tl.bfloat16), mask=row_mask[:, None])
 
