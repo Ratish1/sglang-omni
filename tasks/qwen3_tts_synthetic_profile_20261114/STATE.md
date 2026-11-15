@@ -285,6 +285,19 @@ The same branch on Pipeshift's bar, seeds 0 to 2, median of seeds, main → bran
 - **Fix:** `perf/qwen3-tts-codec-slot-views` `45f189833` (tree `2b0274b2d`) keeps `slot_buffers`, built in the constructor; `zero_slot` launches over the slot's cached list. The existing tests `test_arena_slot_reuse_starts_from_a_cold_state` and `test_arena_acquire_zeroes_only_the_acquired_slot` hold the contract.
 - **Measurement:** served unseeded streaming at c1, c16 and c64, run in alternating order, twice: main, slot views alone, and `test/qwen3-tts-first-chunk-slot-views` `3e360e05e` (tree `8fd9a022b`), the first-chunk branch with slot views (`ab_slotviews_20261115`).
 
+  | Cell | Slot views vs main, round 1 / round 2 | First chunk plus slot views vs main, round 1 / round 2 |
+  |---|---|---|
+  | Base c64 first audio mean | −2.6 / −0.8 ms | −3.0 / −2.4 ms |
+  | CustomVoice c64 first audio mean | −1.4 / −1.5 ms | −1.8 / −0.6 ms |
+  | Base c64 RTF | −0.5 % / +5.0 % | +3.7 % / +2.4 % |
+  | CustomVoice c64 RTF | −2.6 % / −1.7 % | −0.3 % / +5.1 % |
+  | c1 first audio mean | within ±0.4 ms (CustomVoice round 2: +1.5) | within ±1 ms |
+
+  - **Main against main** in this run: RTF within 0.3 %; CustomVoice c64 throughput 73.97 against 69.03 req/s, so c64 throughput is too noisy to read.
+  - Round 2 of both branch arms is noisier (CustomVoice c1 13.2 ms, Base c64 RTF +5 %) while main's second run stayed level.
+  - **Reading:** slot views lowers c64 first audio in both rounds, and its RTF is inside the noise. It does not remove the first-chunk branch's Base c64 RTF lean, which reads +2.4 to +3.7 % here (+0.3 to +1.1 % in the earlier ABAB).
+  - **Next step for that lean:** a lean under 3 % gets a kernel census and loop ledger at c64, main against the branch: vocoder initial batch counts, graph replays and talker idle per step. Not more pairs.
+
 **Same-card drift band.** The opening branch runs CustomVoice SeedTTS cells where its mechanism cannot act: the SeedTTS client sends no language, so the Ryan and English trim never engages. These cells are therefore an A/A of main's behaviour about 2.5 h apart.
 
 | CustomVoice cell | First audio mean / median / p95, main → same behaviour | RTF | Throughput |
