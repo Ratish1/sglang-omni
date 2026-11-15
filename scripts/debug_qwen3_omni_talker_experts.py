@@ -63,11 +63,14 @@ class NativeTalkerExperts:
     ] = "reconstructed"
     shared_enabled: bool = False
     shared_calls: int = 0
+    is_expert_batch_replay_enabled: bool = False
+    expert_batch_calls: int = 0
     is_shared_gate_batch_replay_enabled: bool = False
     shared_gate_decode_rows: int | None = None
     shared_gate_calls: int = 0
     shared_gate_exact_input_calls: int = 0
-    shared_gate_snapshots: list[dict[str, torch.Tensor]] = field(default_factory=list)
+    frame_snapshots: list[dict[str, torch.Tensor]] = field(default_factory=list)
+    snapshot_frame_index: int | None = None
     profiles: ObservedExpertProfiles | None = None
     gemm1_profile: int | None = None
     used_profiles: set[tuple[int, int]] = field(default_factory=set)
@@ -116,6 +119,21 @@ class NativeTalkerExperts:
                 ]
             )
 
+    def captured_snapshot(
+        self, frame: int, layer_index: int
+    ) -> dict[str, torch.Tensor]:
+        assert self.profiles is not None
+        assert frame < self.profiles.verified_frames
+        if self.snapshot_frame_index != frame:
+            self.frame_snapshots = torch.load(
+                self.profiles.source_capture / f"{frame:04d}-operators.pt",
+                weights_only=True,
+            )
+            self.snapshot_frame_index = frame
+        else:
+            pass
+        return self.frame_snapshots[layer_index]
+
     def shared_gate(
         self,
         module: torch.nn.Linear,
@@ -142,14 +160,7 @@ class NativeTalkerExperts:
             batch_hidden_states = hidden_states.repeat(self.shared_gate_decode_rows, 1)
             start, stop = 0, 1
         else:
-            if layer_index == 0:
-                self.shared_gate_snapshots = torch.load(
-                    self.profiles.source_capture / f"{frame:04d}-operators.pt",
-                    weights_only=True,
-                )
-            else:
-                pass
-            snapshot = self.shared_gate_snapshots[layer_index]
+            snapshot = self.captured_snapshot(frame, layer_index)
             batch_hidden_states = snapshot["batch_mlp_normalized"].to(
                 hidden_states.device
             )
@@ -280,8 +291,8 @@ class NativeTalkerExperts:
             return stages["fused_activation_checkpoint_sum"]
         else:
             pass
+        frame_index = self.calls // len(self.weights)
         if self.profiles is not None:
-            frame_index = self.calls // len(self.weights)
             if self.profiles.frame_profiles is not None and frame_index < len(
                 self.profiles.frame_profiles
             ):
@@ -303,7 +314,30 @@ class NativeTalkerExperts:
         else:
             pass
         self.used_profiles.add(profiles)
-        replay_inputs = hidden_states.contiguous().clone()
+        if self.is_expert_batch_replay_enabled:
+            assert self.output_arithmetic == "native"
+            assert self.route_precision == "float32"
+            snapshot = self.captured_snapshot(frame_index, layer_index)
+            replay_inputs = snapshot["batch_mlp_normalized"].to(hidden_states.device)
+            replay_indices = snapshot["batch_expert_indices"].to(hidden_states.device)
+            replay_weights = snapshot["batch_expert_weights"].to(hidden_states.device)
+            if frame_index == 0:
+                start, stop = snapshot["prefix_token_rows"].tolist()
+            else:
+                start = int(snapshot["batch_selected_row"])
+                stop = start + 1
+            assert replay_inputs[start:stop].shape == hidden_states.shape
+            assert replay_indices[start:stop].shape == indices.shape
+            assert replay_weights[start:stop].shape == weights.shape
+            replay_inputs[start:stop] = hidden_states
+            replay_indices[start:stop] = indices
+            replay_weights[start:stop] = weights
+            self.expert_batch_calls += 1
+        else:
+            replay_inputs = hidden_states.contiguous().clone()
+            replay_indices = indices.to(torch.int32).contiguous()
+            replay_weights = weights.float().contiguous()
+        expected_inputs = replay_inputs.clone()
         if self.output_arithmetic == "workspace-checkpoint-reduction":
             assert not self.runtime.use_fused_finalize
             assert self.native_output_arithmetic == "native"
@@ -326,8 +360,8 @@ class NativeTalkerExperts:
             workspace = None
         fused_output = cutlass_fused_moe(
             input=replay_inputs,
-            token_selected_experts=indices.to(torch.int32).contiguous(),
-            token_final_scales=weights.float().contiguous(),
+            token_selected_experts=replay_indices,
+            token_final_scales=replay_weights,
             fc1_expert_weights=packed,
             fc2_expert_weights=down,
             output_dtype=torch.bfloat16,
@@ -338,7 +372,11 @@ class NativeTalkerExperts:
             profile_ids=list(profiles),
             workspace_buffer=workspace,
         )[0]
-        assert torch.equal(replay_inputs, hidden_states)
+        assert torch.equal(replay_inputs, expected_inputs)
+        if self.is_expert_batch_replay_enabled:
+            fused_output = fused_output[start:stop]
+        else:
+            pass
         assert fused_output.shape == output.shape
         if self.output_arithmetic == "workspace-checkpoint-reduction":
             fused_output = checkpoint_reduce_workspace(

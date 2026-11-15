@@ -143,6 +143,7 @@ def main() -> None:
         default="native",
     )
     parser.add_argument("--native-shared-gate-batches", action="store_true")
+    parser.add_argument("--native-expert-batches", action="store_true")
     parser.add_argument("--shared-gate-decode-rows", type=int)
     parser.add_argument("--paired-native-expert-controls", action="store_true")
     parser.add_argument("--paired-native-attention-controls", action="store_true")
@@ -264,6 +265,12 @@ def main() -> None:
         assert arguments.native_expert_profile_map is not None
         assert arguments.native_shared_expert
         assert not arguments.paired_native_expert_controls
+    else:
+        pass
+    if arguments.native_expert_batches:
+        assert arguments.native_expert_profile_map is not None
+        assert arguments.native_expert_route_precision == "float32"
+        assert arguments.expert_output_arithmetic == "native"
     else:
         pass
     if arguments.routing_controls is not None:
@@ -425,6 +432,7 @@ def main() -> None:
             output_arithmetic=arguments.expert_output_arithmetic,
             native_output_arithmetic=arguments.native_output_arithmetic,
             shared_enabled=arguments.native_shared_expert,
+            is_expert_batch_replay_enabled=arguments.native_expert_batches,
             is_shared_gate_batch_replay_enabled=arguments.native_shared_gate_batches,
             shared_gate_decode_rows=arguments.shared_gate_decode_rows,
             gemm1_profile=arguments.expert_gemm1_profile,
@@ -651,7 +659,9 @@ def main() -> None:
                 expert_control.shared_calls = 0
                 expert_control.shared_gate_calls = 0
                 expert_control.shared_gate_exact_input_calls = 0
-                expert_control.shared_gate_snapshots.clear()
+                expert_control.frame_snapshots.clear()
+                expert_control.snapshot_frame_index = None
+                expert_control.expert_batch_calls = 0
                 expert_control.used_profiles.clear()
                 expert_control.profiles = (
                     observed_profiles.profiles[str(trace_directory.resolve())]
@@ -1287,6 +1297,9 @@ def main() -> None:
                     else 0
                 )
                 assert expert_control.calls == expected_calls
+                assert expert_control.expert_batch_calls == (
+                    expected_calls if arguments.native_expert_batches else 0
+                )
                 if arguments.expert_output_arithmetic in (
                     "native",
                     "workspace-checkpoint-reduction",
@@ -1436,6 +1449,9 @@ def main() -> None:
                 ),
                 "native_expert_kernel_calls": (
                     expert_control.kernel_calls if expert_control else 0
+                ),
+                "native_expert_batch_calls": (
+                    expert_control.expert_batch_calls if expert_control else 0
                 ),
                 "native_expert_used_profiles": (
                     sorted(expert_control.used_profiles)
