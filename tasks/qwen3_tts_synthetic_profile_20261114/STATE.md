@@ -108,6 +108,12 @@ First audio (Base, 20 s references):
 | Base stream c16 | 30.6 / 27.7 / 43.8 | 0.1034 | 37.6 | 0 |
 | Base stream c64 | 51.6 / 39.8 / 133.1 | 0.2255 | 68.0 | 0 |
 
+| Whole-request cell | Latency mean / median / p95, ms | RTF mean | Throughput, req/s |
+|---|---|---|---|
+| Base c1 | 265 / 259 / 382 | 0.0645 | 3.78 |
+| Base c16 | 398 / 388 / 571 | 0.0970 | 40.0 |
+| Base c64 | 773 / 762 / 1,139 | 0.1887 | 80.8 |
+
 - SeedTTS references are a few seconds long, so Base's c1 first audio is about 18 ms. The 12 ms CPU speaker mel of the 20 s synthetic references does not appear at this length.
 
 ## Order of work
@@ -118,6 +124,12 @@ First audio (Base, 20 s references):
 2. Then the items by measured size in each regime. Each item gets its own branch from main, a design with file:line flow and its SGLang counterpart, a component bench, and the served A/B at c1, c16 and c64, plus the bar when it moves CustomVoice streaming.
 3. Bar items first where they are fixes of a named defect: the load-independent opening, admission sized as SGLang sizes it, and the first-chunk wait.
    - Built 11-15 from main, in the A/B queue: `fix/qwen3-tts-opening-at-any-load` `7bbc943b2` (tree `cda960bb0`) and `perf/qwen3-tts-first-chunk-from-queue` `5d18dc578` (tree `16cc6d127`).
+   - **Prompt mode:** `fix/qwen3-tts-honor-prompt-mode` `e72d22744` (tree `0fa6e1c70`), queued after the served profile, with Pipeshift's benchmark over three seeds and WER at 1 req/s against main.
+     - Official `generate_custom_voice` and `generate_voice_design` default `non_streaming_mode=True` and accept `False`. `generate_voice_clone` defaults to `False`.
+     - On main, `CreateSpeechRequest` drops the field, and the builder forces `True` for both named-voice tasks (since #527, kept by #1852).
+     - The branch declares the field on the four request types, forwards it, and drops the forcing. The default is unchanged.
+     - Drama3 still refuses the field through its `supported_speech_fields`.
+   - **Admission is a policy question for the user.** #1449 set the bound to fast-reject past running plus queued (load shedding). SGLang leaves the queue unbounded. On the bar our peak in flight was 47, under the 128 cap, so it causes no failure at today's throughput.
 4. c64 decode, by GIL share. Each is a host-only change, so seeded outputs must stay byte-identical. Gate on c16 and c64 RTF and throughput.
    1. The talker scheduler's per-row Python: `write_feedback_buffers` re-gathers rows of last step's batched `output_embeds`, and `post_process_outputs` and `finalize` also loop over rows.
    2. Stream messages from engine to vocoder: one per request a step on both sides. This is `OmniScheduler`'s shared path, so other models must keep main's behaviour.
