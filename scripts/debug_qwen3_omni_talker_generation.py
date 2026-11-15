@@ -969,6 +969,17 @@ def main() -> None:
             restored_prefill_cache_layers = 0
             restored_prefill_query = False
             frame_limit = min(arguments.max_frames, captured_sampling["max_new_tokens"])
+            if arguments.native_expert_batches:
+                assert (
+                    expert_control is not None and expert_control.profiles is not None
+                )
+                if expert_control.profiles.verified_frames < frame_limit:
+                    frame_limit = expert_control.profiles.verified_frames
+                    termination = "recorded_peer_geometry_exhausted"
+                else:
+                    pass
+            else:
+                pass
             for frame_index in range(frame_limit):
                 if arguments.capture_layer_states:
                     captured_inputs = prepared_inputs["inputs_embeds"].detach().cpu()
@@ -1408,6 +1419,7 @@ def main() -> None:
                 "native_frames_including_eos": len(native_frames),
                 "reference_frames_including_eos": len(frame_reports),
                 "termination": termination,
+                "sequence_complete": termination == "codec_eos",
                 "reference_dtype": arguments.dtype,
                 "reference_attention_implementation": arguments.attention_implementation,
                 "conditioning_variant": (
