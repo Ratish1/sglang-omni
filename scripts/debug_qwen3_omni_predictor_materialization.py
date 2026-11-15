@@ -132,6 +132,15 @@ class ObservedPredictorLayers(FusedPredictorLayers):
                 .reshape(tokens, -1)
                 .to(torch.bfloat16)
             )
+            normalized_attention = (
+                (
+                    (weights / weights.sum(-1, keepdim=True)).to(torch.bfloat16).float()
+                    @ values.float()
+                )
+                .transpose(1, 2)
+                .reshape(tokens, -1)
+                .to(torch.bfloat16)
+            )
             actual_attention = self.attention_output[:tokens]
 
             after_attention = torch.empty_like(inputs)
@@ -218,6 +227,9 @@ class ObservedPredictorLayers(FusedPredictorLayers):
                 ),
                 "attention_unnormalized_bf16_weights": asdict(
                     compare_tensors(actual_attention, folded_attention)
+                ),
+                "attention_normalized_bf16_weights": asdict(
+                    compare_tensors(actual_attention, normalized_attention)
                 ),
                 "activation_checkpoint_norm": asdict(
                     compare_tensors(actual_activation, checkpoint_activation)
