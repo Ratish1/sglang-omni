@@ -674,7 +674,7 @@ class Qwen3TTSStreamingVocoderScheduler(
         max_batch_wait_ms: int = 2,
         async_decode: bool | None = None,
         initial_max_batch_size: int = 32,
-        initial_batch_wait_ms: int = 2,
+        initial_batch_wait_ms: int = 0,
         followup_max_batch_size: int = 8,
         followup_batch_wait_ms: int = 1,
         followup_worker_count: int = 2,
@@ -2795,13 +2795,18 @@ class Qwen3TTSStreamingVocoderScheduler(
                 return batch
             else:
                 batch.append(queued)
-            remaining = deadline - time.monotonic()
-            if len(batch) == self.initial_max_batch_size or remaining <= 0:
+            if len(batch) == self.initial_max_batch_size:
                 return batch
             else:
                 pass
+            remaining = deadline - time.monotonic()
+            # note (ratish): past the wait the batch still takes what is already queued, so a zero
+            # wait batches the ready streams without delaying the first one.
             try:
-                queued = self.initial_queue.get(timeout=remaining)
+                if remaining > 0:
+                    queued = self.initial_queue.get(timeout=remaining)
+                else:
+                    queued = self.initial_queue.get_nowait()
             except queue.Empty:
                 return batch
             if queued is None:
