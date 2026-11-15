@@ -7,7 +7,8 @@ call, timed by wrapping the preprocessor module's loader and the processor in pl
 
 usage: PYTHONPATH=<tree> taskset -c <cpus> python3 preprocess_team_profile.py --configs 8:14:14:16,8:112:16:16,... --out t.json
        a configuration is video_threads:omp:decode_threads:concurrency[:video_team]; video_team sizes each video
-       thread's own OpenMP team as the thread starts, the process team (omp) staying with every other thread
+       thread's own OpenMP team as the thread starts, the process team (omp) staying with every other thread;
+       decode_threads 0 leaves the stage's automatic count
 """
 
 import argparse
@@ -60,7 +61,7 @@ def run_one(
         MODEL,
         max_concurrency=threads,
         max_seq_len=32768,
-        video_decode_threads=decode_threads,
+        video_decode_threads=decode_threads or None,
     )
     processor_class = type(scheduler.fn.processor)
     call_processor = processor_class.__call__
