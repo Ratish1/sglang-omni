@@ -1,5 +1,6 @@
 """Served SeedTTS EN at c1, c16 and c64 on one card: one fresh server per model, every
-cell over the full 1,088 prompts, seeded, generation only; one summary JSON per run."""
+cell over the full 1,088 prompts, unseeded as served traffic is, generation only; one
+summary JSON per run."""
 
 import argparse
 import json
@@ -12,7 +13,6 @@ import urllib.request
 from pathlib import Path
 
 CONCURRENCIES = (1, 16, 64)
-SEED = 1234
 HEALTH_TIMEOUT_S = 1800
 CELL_TIMEOUT_S = 3600
 MODELS = {
@@ -50,7 +50,7 @@ def run_cell(
         "--meta", "zhaochenyang20/seed-tts-eval-arrow", "--model", model,
         "--use-existing-server", "--host", "127.0.0.1", "--port", str(port),
         "--generate-only", "--lang", "en", "--warmup", str(concurrency),
-        "--max-concurrency", str(concurrency), "--seed", str(SEED),
+        "--max-concurrency", str(concurrency),
         "--output-dir", str(directory / "bench"), *extra,
     ]
     if stream:

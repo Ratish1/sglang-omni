@@ -12,7 +12,7 @@ import threading
 import time
 from pathlib import Path
 
-from served_baseline import MODELS, SEED, wait_healthy
+from served_baseline import MODELS, wait_healthy
 from synthetic_driver import LAUNCH_OPTIONS, START_OPTIONS
 
 HERE = Path(__file__).resolve().parent
@@ -67,7 +67,7 @@ def client(tree: Path, model: str, extra: list[str], port: int, concurrency: int
         "--meta", "zhaochenyang20/seed-tts-eval-arrow", "--model", model,
         "--use-existing-server", "--host", "127.0.0.1", "--port", str(port),
         "--generate-only", "--lang", "en", "--warmup", str(concurrency),
-        "--max-concurrency", str(concurrency), "--seed", str(SEED), "--stream",
+        "--max-concurrency", str(concurrency), "--stream",
         "--repeats", str(CLIENT_PASSES),
         "--output-dir", str(directory / "bench"), *extra,
     ]
