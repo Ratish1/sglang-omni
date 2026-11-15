@@ -427,10 +427,10 @@ class Qwen3OmniMoeTalkerTextModel(nn.Module):
             device=self.codec_embedding.weight.device,
         )
 
-        # Disable fused_qk_norm_rope so the separate QK-norm + RoPE path is
-        # used.  The fp32 weight promotion + cast_x_before_out_mul is applied
-        # in load_weights() (after weights are loaded from checkpoint).
+        # note (ratish): checkpoint Q/K normalization rounds before weight multiplication.
         for idx in range(self.start_layer, self.end_layer):
+            self.layers[idx].self_attn.q_norm.cast_x_before_out_mul = True
+            self.layers[idx].self_attn.k_norm.cast_x_before_out_mul = True
             self.layers[idx].self_attn.use_fused_qk_norm_rope = False
             self.layers[idx].self_attn.compatible_with_fused_qk_norm_rope = False
 
