@@ -11,6 +11,7 @@ import torch
 from huggingface_hub import hf_hub_download
 from sgl_kernel import fused_add_rmsnorm, rmsnorm
 from sglang.kernels.ops.layernorm.norm import fused_inplace_qknorm
+from sglang.kernels.ops.layernorm.rmsnorm_hf import rmsnorm_hf
 from transformers import Qwen3OmniMoeConfig
 from transformers.conversion_mapping import (
     get_checkpoint_conversion_mapping,
@@ -124,6 +125,7 @@ def main() -> None:
         destination = arguments.output_directory / directory.name
         destination.mkdir()
         exact_counts: dict[str, int] = {}
+        operand_dtype_counts: dict[str, dict[str, int]] = {}
         maximum_errors: dict[str, float] = {}
         layer_rows = 0
         layer_steps = 0
@@ -285,6 +287,9 @@ def main() -> None:
                 else:
                     pass
                 for name, tensor in snapshot.items():
+                    counts = operand_dtype_counts.setdefault(name, {})
+                    dtype = str(tensor.dtype)
+                    counts[dtype] = counts.get(dtype, 0) + 1
                     assert torch.isfinite(tensor).all()
                     if name == "positions":
                         assert tensor.dtype == torch.int64
@@ -345,6 +350,15 @@ def main() -> None:
                     )
                     differences[f"{phase}_checkpoint_norm"] = compare_tensors(
                         tensors[f"{phase}_normalized"], norm(residual)
+                    )
+                    checkpoint_kernel = rmsnorm_hf(
+                        residual.contiguous(), norm.weight, norm.variance_epsilon
+                    )
+                    differences[f"{phase}_checkpoint_kernel"] = compare_tensors(
+                        tensors[f"{phase}_normalized"], checkpoint_kernel
+                    )
+                    differences[f"{phase}_checkpoint_kernel_vs_python"] = (
+                        compare_tensors(checkpoint_kernel, norm(residual))
                     )
                 projected = torch.nn.functional.linear(
                     tensors["attention_normalized"],
@@ -574,6 +588,16 @@ def main() -> None:
                         observed["hidden_states"].to(reference.device).unsqueeze(0),
                         final_hidden[-1:],
                     )
+                    differences["final_checkpoint_kernel"] = compare_tensors(
+                        observed["hidden_states"].to(reference.device).unsqueeze(0),
+                        rmsnorm_hf(
+                            (
+                                tensors["mlp_output"] + tensors["mlp_residual"]
+                            ).contiguous(),
+                            reference.model.norm.weight,
+                            reference.model.norm.variance_epsilon,
+                        )[-1:],
+                    )
                     captured_logits = (
                         torch.load(
                             directory / "0000-prefill-logits.pt", weights_only=True
@@ -643,6 +667,7 @@ def main() -> None:
             "exact_counts_unit": "whole operator output tensors, not individual token rows",
             "full_prefill_prefix": arguments.full_prefill_prefix,
             "exact_counts": exact_counts,
+            "operand_dtype_counts": operand_dtype_counts,
             "maximum_errors": maximum_errors,
         }
         reports.append(report)

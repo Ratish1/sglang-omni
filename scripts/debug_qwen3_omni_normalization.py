@@ -7,6 +7,7 @@ from dataclasses import dataclass, field
 
 import torch
 from sgl_kernel import fused_add_rmsnorm, rmsnorm
+from sglang.kernels.ops.layernorm.rmsnorm_hf import rmsnorm_hf
 from torch.utils.hooks import RemovableHandle
 from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import (
     Qwen3OmniMoeRMSNorm,
@@ -78,6 +79,7 @@ class NativeNormalization:
     reference: Qwen3OmniMoeTalkerForConditionalGeneration
     round_residual_before_normalization: bool = False
     round_normalized_before_weight: bool = False
+    use_checkpoint_boundary_kernel: bool = False
     boundary_enabled: bool = True
     query_key_enabled: bool = True
     attention_residual: torch.Tensor | None = None
@@ -117,6 +119,13 @@ class NativeNormalization:
         assert (
             contribution.dtype == residual.dtype == rounded_sum.dtype == torch.bfloat16
         )
+        if self.use_checkpoint_boundary_kernel:
+            self.boundary_calls += 1
+            return rmsnorm_hf(
+                rounded_sum.reshape(-1, weight.numel()).contiguous(), weight, epsilon
+            ).view_as(rounded_sum)
+        else:
+            pass
         if self.round_residual_before_normalization:
             normalized = (contribution + residual).reshape(-1, weight.numel())
             assert torch.equal(
@@ -154,7 +163,13 @@ class NativeNormalization:
         self.attention_residual = inputs[0]
         if module is self.reference.model.layers[0].input_layernorm:
             self.boundary_calls += 1
-            if self.round_normalized_before_weight:
+            if self.use_checkpoint_boundary_kernel:
+                return rmsnorm_hf(
+                    inputs[0].reshape(-1, module.weight.numel()).contiguous(),
+                    module.weight,
+                    module.variance_epsilon,
+                ).view_as(output)
+            elif self.round_normalized_before_weight:
                 normalized = rmsnorm(
                     inputs[0].reshape(-1, module.weight.numel()),
                     torch.ones_like(module.weight),

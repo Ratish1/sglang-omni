@@ -72,7 +72,13 @@ def main() -> None:
     )
     parser.add_argument(
         "--normalization-semantics",
-        choices=("checkpoint", "native", "native-boundary", "native-query-key"),
+        choices=(
+            "checkpoint",
+            "native",
+            "native-boundary",
+            "native-query-key",
+            "checkpoint-boundary",
+        ),
         default="checkpoint",
     )
     parser.add_argument("--paired-normalization-controls", action="store_true")
@@ -336,9 +342,13 @@ def main() -> None:
         reference=reference,
         round_residual_before_normalization=arguments.round_residual_before_normalization,
         round_normalized_before_weight=arguments.round_normalized_before_weight,
+        use_checkpoint_boundary_kernel=(
+            arguments.normalization_semantics == "checkpoint-boundary"
+        ),
     )
     if (
         arguments.normalization_semantics.startswith("native")
+        or arguments.normalization_semantics == "checkpoint-boundary"
         or arguments.paired_normalization_controls
     ):
         normalization.install()
@@ -682,10 +692,12 @@ def main() -> None:
             normalization.boundary_enabled = normalization_mode in (
                 "native",
                 "native-boundary",
+                "checkpoint-boundary",
             )
             normalization.query_key_enabled = normalization_mode in (
                 "native",
                 "native-query-key",
+                "checkpoint-boundary",
             ) and not (
                 projection_control is not None
                 and projection_control.enabled
