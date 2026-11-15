@@ -264,6 +264,20 @@ The same branch on Pipeshift's bar, seeds 0 to 2, median of seeds, main → bran
 - **WER at 1 req/s, seed 0, Qwen3-ASR** (`bar_wer.py`): main 2.11 % (1.85 % without its one sample over 50 %), branch 1.43 % (none over 50 %), over 136 requests each.
 - A full SeedTTS EN WER with `non_streaming_mode: false` is the gate before a PR.
 
+**First-chunk branch, unseeded ABAB** (`ab_unseeded_20261115/{main_1,firstchunk_1,main_2,firstchunk_2}`, streaming SeedTTS EN, 1,088 prompts per cell, every request completed).
+
+| Cell | First audio mean, main → branch (pair 1 / pair 2), ms | RTF, main_1 / branch_1 / main_2 / branch_2 |
+|---|---|---|
+| Base c1 | 17.5 → 17.2 / 17.4 → 17.0 | 0.0642 / 0.0642 / 0.0640 / 0.0641 |
+| Base c16 | 27.5 → 27.0 / 27.8 → 26.7 | 0.0993 / 0.0998 / 0.0991 / 0.0996 |
+| Base c64 | 52.5 → 50.6 / 52.1 → 49.4 | 0.2162 / 0.2186 / 0.2157 / 0.2164 |
+| CustomVoice c1 | 11.6 → 10.8 / 11.5 → 10.9 | 0.0625 / 0.0625 / 0.0626 / 0.0626 |
+| CustomVoice c16 | 17.8 → 17.2 / 17.7 → 17.1 | 0.0907 / 0.0910 / 0.0910 / 0.0911 |
+| CustomVoice c64 | 28.3 → 26.9 / 27.7 → 26.6 | 0.1758 / 0.1770 / 0.1770 / 0.1770 |
+
+- First audio mean and median are lower in every cell in both pairs. Main against main moves at most 0.6 ms.
+- RTF stays within main's own repeat band (up to 0.7 %). It leans 0.3 to 1.1 % higher at c16 and c64, which this repeat does not resolve. The seeded −2.9 % at Base c64 was noise.
+
 **Same-card drift band.** The opening branch runs CustomVoice SeedTTS cells where its mechanism cannot act: the SeedTTS client sends no language, so the Ryan and English trim never engages. These cells are therefore an A/A of main's behaviour about 2.5 h apart.
 
 | CustomVoice cell | First audio mean / median / p95, main → same behaviour | RTF | Throughput |
