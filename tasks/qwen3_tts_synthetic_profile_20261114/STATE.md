@@ -108,6 +108,33 @@ Other readings:
 - **The fp32 reference encoder** adds 170 ms of kernels on its own stream in the c64 window.
 - **At c1** the scheduler's own Python is the whole host cost. The first vocoder chunk holds the GIL 0.65 ms (`vocoder.initial[streams=1]`), and a one-stream follow-up 0.3 to 0.37 ms.
 
+**GIL owners by function, served c64** (`served_profile.py --mode pyspy`, `py-spy --gil --threads --subprocesses`, a 30 s window inside a three-pass c64 load; `pyspy_digest.py`, `served_profile_main/pyspy/base_stream_c64.pyspy.txt`). py-spy samples about 46 Hz on the pipeline process's 251 threads, so read shares.
+
+Pipeline process, 1,138 samples holding the lock:
+
+| Holder | Share |
+|---|---|
+| Talker scheduler | 50 % |
+| Vocoder follow-up and initial workers and the vocoder scheduler | 27 % |
+| Preprocessing pool | 17 % |
+| Main thread stream routing (`drain_outbox`, `route_stream_run`, ZMQ sends) | 5 % |
+
+Within the scheduler (inclusive, of 564 samples):
+- **`execute` 40 %:**
+  - forward host side 16 %;
+  - `before_decode` 12 %;
+  - `sample_next_token_ids` 8 % (SGLang's `top_k_top_p_min_p_sampling_from_probs_torch`);
+  - finalize 6 %.
+- **`process_batch_result` 15 %:**
+  - `emit_stream_output` 7 %, of which `stream_output_builder:2195`, a per-row `.to(long)`, is 3 %;
+  - `result_adapter` 4 %.
+- **`get_next_batch_to_run` 12 %**, mostly the coalesced prefill pick.
+- **`process_input_requests` 3 %:** `build_sglang_qwen3_tts_request` and `adopt_prepared_tensors`.
+
+The hottest innermost frames are per-row: the stream output builder, `decode_row`'s device and dtype check, `apply_sglang_qwen3_tts_result`, `prepare_decode_buffers:1354-1355`, `append_decode_input_history`, `reset_padding`.
+
+The API process is separate (217 samples on its own GIL): HTTP streaming and PCM encoding.
+
 First audio (Base, 20 s references):
 
 | | c1 | c64 |
