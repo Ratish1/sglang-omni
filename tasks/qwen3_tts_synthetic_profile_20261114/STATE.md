@@ -177,6 +177,17 @@ The same branch on Pipeshift's bar, seeds 0 to 2, median of seeds, main → bran
 - **The cost** is the extra first-chunk frame above 24 streams: about 1.3 ms of first byte at 40 req/s.
 - **No continuity cost:** #1901 gated the trim on stream count for continuity, and at these loads the branch shows no underrun and no stall.
 
+`fix/qwen3-tts-honor-prompt-mode` `e72d22744` on Pipeshift's bar (Nari's client sends `non_streaming_mode: false`), seeds 0 to 2, median of seeds, main → branch, ms. Every request succeeded, with no underrun.
+
+| req/s | 1 | 4 | 8 | 12 | 20 | 30 | 40 |
+|---|---|---|---|---|---|---|---|
+| Audible p50 | 19.5 → 16.8 | 19.5 → 19.1 | 20.5 → 19.9 | 20.4 → 20.4 | 21.3 → 21.3 | 22.6 → 22.5 | 25.4 → 25.3 |
+| First byte p95 | 21.5 → 21.1 | 22.7 → 22.0 | 23.5 → 23.0 | 24.2 → 24.5 | 26.3 → 26.5 | 29.2 → 29.0 | 30.8 → 30.8 |
+
+- The shorter prefill shows at 1 req/s (−2.7 ms, outside the 1.2 ms band at that rate) and fades by 12 req/s, where prefills share steps.
+- **WER at 1 req/s, seed 0, Qwen3-ASR** (`bar_wer.py`): main 2.11 % (1.85 % without its one sample over 50 %), branch 1.43 % (none over 50 %), over 136 requests each.
+- A full SeedTTS EN WER with `non_streaming_mode: false` is the gate before a PR.
+
 **Same-card drift band.** The opening branch runs CustomVoice SeedTTS cells where its mechanism cannot act: the SeedTTS client sends no language, so the Ryan and English trim never engages. These cells are therefore an A/A of main's behaviour about 2.5 h apart.
 
 | CustomVoice cell | First audio mean / median / p95, main → same behaviour | RTF | Throughput |
