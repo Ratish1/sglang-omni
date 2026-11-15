@@ -144,6 +144,8 @@ def main() -> None:
     )
     parser.add_argument("--native-shared-gate-batches", action="store_true")
     parser.add_argument("--native-expert-batches", action="store_true")
+    parser.add_argument("--native-projection-batches", action="store_true")
+    parser.add_argument("--verify-native-projection-inputs", action="store_true")
     parser.add_argument("--shared-gate-decode-rows", type=int)
     parser.add_argument("--paired-native-expert-controls", action="store_true")
     parser.add_argument("--paired-native-attention-controls", action="store_true")
@@ -274,6 +276,12 @@ def main() -> None:
         assert arguments.expert_output_arithmetic == "native"
     else:
         pass
+    if arguments.native_projection_batches:
+        assert arguments.native_expert_batches
+        assert arguments.paired_native_routing_controls
+        assert arguments.restore_prefill_state is None
+    else:
+        assert not arguments.verify_native_projection_inputs
     if arguments.checkpoint_query_key_normalization:
         assert arguments.paired_native_routing_controls
         assert not arguments.paired_native_projection_controls
@@ -642,6 +650,18 @@ def main() -> None:
                 assert not projection_control.projections
                 projection_control.projection_calls = 0
                 projection_control.normalization_calls = 0
+                projection_control.head_calls = 0
+                projection_control.output_calls = 0
+                projection_control.cached_frame_index = -1
+                projection_control.frame_snapshots.clear()
+                projection_control.native_directory = (
+                    arguments.native_expert_capture_directory / trace_directory.name
+                    if arguments.native_projection_batches
+                    else None
+                )
+                projection_control.verify_native_inputs = (
+                    arguments.verify_native_projection_inputs
+                )
                 if projection_mode in ("merged", "paired", "merged-paired"):
                     projection_control.enabled = True
                     projection_control.mode = projection_mode
@@ -1371,6 +1391,11 @@ def main() -> None:
                     if projection_control.mode in ("paired", "merged-paired")
                     else 0
                 )
+                if arguments.native_projection_batches:
+                    assert projection_control.output_calls == expected_projection_calls
+                    assert projection_control.head_calls == len(frame_reports)
+                else:
+                    pass
             else:
                 pass
             if rotary_control is not None:
@@ -1457,6 +1482,14 @@ def main() -> None:
                 ),
                 "native_paired_normalization_calls": (
                     projection_control.normalization_calls if projection_control else 0
+                ),
+                "native_projection_batches": arguments.native_projection_batches,
+                "verified_native_projection_inputs": arguments.verify_native_projection_inputs,
+                "native_output_projection_calls": (
+                    projection_control.output_calls if projection_control else 0
+                ),
+                "native_head_projection_calls": (
+                    projection_control.head_calls if projection_control else 0
                 ),
                 "native_backbone_attention_calls": (
                     attention_control.calls if attention_control is not None else 0
