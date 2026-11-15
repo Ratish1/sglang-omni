@@ -345,6 +345,17 @@ Against it:
        - In-flight then sits at the 128 cap, the excess gets 503, and the admitted streams underrun.
        - The served cells at c1, c16 and c64 and the bar up to 40 req/s logged 0 arena-full fallbacks. The loop only starts past about 50 req/s open-loop.
      - **Fix at the root:** a stream that finds the arena full waits for a slot, keeping the incremental path, instead of taking the costlier decoder. A full vocoder then holds new streams' first audio back (backpressure) rather than slowing every stream. The unbounded queue is reassessed on top of that fix.
+     - **Proof of the mechanism:** py-spy `--gil` on main at 60 req/s (`overload_20261115/pyspy/main_rps60.pyspy.txt`). The two follow-up workers hold the lock for 312 and 306 samples, against 85 and 72 in the served c64 cell. Nearly all of it is in `decode_group` (`streaming_vocoder.py:3348`), the left-context path only fallback streams take.
+     - **Branch** `fix/qwen3-tts-wait-for-codec-slot` `73b3e655c` (tree `424e1fec5`), from main:
+       - **Waiting instead of fallback:** with async decode, a full arena sets `awaiting_codec_slot` and returns no plan, not the fallback.
+       - **The waiter list:** `plan_stream_decode` records the stream in `codec_slot_waiters` (oldest first, under `state_lock`).
+       - **Wake-up:** every slot that returns to the arena (`release_codec_slot`, `finish_codec_slots`) schedules the oldest live waiter's first decode.
+       - **End of generation:** `handle_stream_done` keeps a waiting stream on the async path, so it is not decoded whole on the message thread.
+       - **Synchronous decoder:** keeps the fallback.
+       - **Stats:** `slot_waits` is added.
+       - **Tests:** a full arena holds the stream and a release reschedules it; a waiting stream whose generation ends stays on the async path.
+       - **Normal load:** the served cells never fill the arena (0 fallbacks), so normal load takes main's path.
+     - Running on Pipeshift's bar at 60, 70 and 80 req/s, against main's knee above.
 4. c64 decode, by GIL share. Each is a host-only change, so seeded outputs must stay byte-identical. Gate on c16 and c64 RTF and throughput.
    1. The talker scheduler's per-row Python: `write_feedback_buffers` re-gathers rows of last step's batched `output_embeds`, and `post_process_outputs` and `finalize` also loop over rows.
    2. Stream messages from engine to vocoder: one per request a step on both sides. This is `OmniScheduler`'s shared path, so other models must keep main's behaviour.
