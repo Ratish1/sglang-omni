@@ -133,12 +133,48 @@ def report(boot: str, cell: str) -> None:
         else:
             pass
 
-    changed = [s for prior, s in zip(steps, steps[1:]) if s["rids"] != prior["rids"]]
-    kept = [s for prior, s in zip(steps, steps[1:]) if s["rids"] == prior["rids"]]
+    row_steps = sum(s["rows"] for s in steps)
     print(
-        f"  row list: {len(changed)} of {len(steps) - 1} steps changed it ({100 * len(changed) / max(len(steps) - 1, 1):.1f} %),"
+        f"  stream period (each step weighted by its rows): {sum(s['rows'] * s['period'] for s in steps) / row_steps / 1e6:.2f} ms,"
+        f" step {sum(s['rows'] * s['step'] for s in steps) / row_steps / 1e6:.2f},"
+        f" prefill {sum(s['rows'] * s['prefill'] for s in steps) / row_steps / 1e6:.2f}"
+    )
+    steps[0]["change"] = "first"
+    for prior, step in zip(steps, steps[1:]):
+        if step["rids"] == prior["rids"]:
+            step["change"] = "same"
+        elif sorted(step["rids"]) == sorted(prior["rids"]):
+            step["change"] = "order"
+        else:
+            step["change"] = "members"
+    changed = [s for s in steps[1:] if s["change"] != "same"]
+    kept = [s for s in steps[1:] if s["change"] == "same"]
+    print(
+        f"  row list: {len(changed)} of {len(steps) - 1} steps changed it ({100 * len(changed) / max(len(steps) - 1, 1):.1f} %;"
+        f" order only {sum(1 for s in changed if s['change'] == 'order')}),"
         f" step {mean_ms([s['step'] for s in changed]):.2f} against {mean_ms([s['step'] for s in kept]):.2f} ms unchanged"
     )
+    for low, high in ROW_BUCKETS:
+        cells = []
+        for change in ("same", "changed"):
+            for thinker in ("idle", "sending"):
+                values = [
+                    s["step"]
+                    for s in steps[1:]
+                    if low <= s["rows"] <= high
+                    and (s["change"] == "same") == (change == "same")
+                    and bool(s["thinker_tokens"]) == (thinker == "sending")
+                ]
+                cells.append(
+                    f"{change}/{thinker} {mean_ms(values):6.2f} ({len(values)})"
+                )
+        if sum(1 for s in steps[1:] if low <= s["rows"] <= high) >= 50:
+            print(
+                f"    rows {low:2d}-{high:2d} step by row list and thinker: "
+                + ", ".join(cells)
+            )
+        else:
+            pass
 
     appearances = collections.defaultdict(list)
     for index, step in enumerate(steps):
