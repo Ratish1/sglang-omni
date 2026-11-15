@@ -18,6 +18,8 @@ clock of the request event recorder, so records join its events per request.
   kind "frozen" every OMNI_HOP_PROBE_FREEZE_COUNT_S seconds when set: objects in the permanent generation
   kind "tb"   with OMNI_HOP_PROBE_TALKER_BATCHES=1, each Qwen3-Omni talker decode step: its rows and their request
               ids (Qwen3OmniTalker.prepare_decode_buffers)
+  kind "tr"   with OMNI_HOP_PROBE_TALKER_BATCHES=1, each talker step's result processing (decode and prefill): its
+              forward mode and rows as it starts (ns0) and its end (ns), after the step's outputs reached the host
   kind "req"  with OMNI_HOP_PROBE_TALKER_BATCHES=1, each Qwen3-Omni request at preprocessing: its id and the text of
               its last message, which joins a benchmark sample to its request id
 """
@@ -144,7 +146,9 @@ def load_reference_builder(tree):
         spec.loader.exec_module(module)
         return module
 
-    reference_input = load("reference_talker_input", os.path.join(components, "talker_input.py"))
+    reference_input = load(
+        "reference_talker_input", os.path.join(components, "talker_input.py")
+    )
     running_input = sys.modules[name]
     sys.modules[name] = reference_input
     try:
@@ -173,19 +177,30 @@ def patch_talker_prefill(module):
             reference["pending_text_queue"]
         )
         same = {
-            "input_embeds": torch.equal(built["input_embeds"], reference["input_embeds"]),
-            "input_ids": torch.equal(built["input_ids"].cpu(), reference["input_ids"].cpu()),
+            "input_embeds": torch.equal(
+                built["input_embeds"], reference["input_embeds"]
+            ),
+            "input_ids": torch.equal(
+                built["input_ids"].cpu(), reference["input_ids"].cpu()
+            ),
             "pending_text_rows": len(built_rows) == len(reference_rows)
             and all(torch.equal(a, b) for a, b in zip(built_rows, reference_rows)),
-            "tts_pad_embed": torch.equal(built["tts_pad_embed"], reference["tts_pad_embed"]),
-            "tts_eos_embed": torch.equal(built["tts_eos_embed"], reference["tts_eos_embed"]),
+            "tts_pad_embed": torch.equal(
+                built["tts_pad_embed"], reference["tts_pad_embed"]
+            ),
+            "tts_eos_embed": torch.equal(
+                built["tts_eos_embed"], reference["tts_eos_embed"]
+            ),
         }
         record(
             {
                 "k": "build",
                 "rid": payload.request_id,
                 "same": same,
-                "devices": [str(built["input_embeds"].device), str(built["input_ids"].device)],
+                "devices": [
+                    str(built["input_embeds"].device),
+                    str(built["input_ids"].device),
+                ],
             }
         )
         return built
@@ -198,7 +213,9 @@ def flush():
         total = sum(sync_sites.values())
         if total != sync_sites_flushed[0]:
             sync_sites_flushed[0] = total
-            records.append({"k": "sync", "ns": time.time_ns(), "counts": dict(sync_sites)})
+            records.append(
+                {"k": "sync", "ns": time.time_ns(), "counts": dict(sync_sites)}
+            )
         else:
             pass
         pending = records[:]
@@ -473,6 +490,23 @@ def patch_talker(module):
     talker.prepare_decode_buffers = prepare_recorded
 
 
+def patch_talker_scheduler(module):
+    scheduler = module.QwenTalkerScheduler
+    process = scheduler.process_batch_result
+
+    @functools.wraps(process)
+    def process_recorded(self, batch, result):
+        started_ns = time.time_ns()
+        mode = batch.forward_mode.name
+        rows = len(batch.reqs)
+        try:
+            return process(self, batch, result)
+        finally:
+            record({"k": "tr", "ns0": started_ns, "mode": mode, "rows": rows})
+
+    scheduler.process_batch_result = process_recorded
+
+
 def patch_preprocessor(module):
     preprocessor = module.Qwen3OmniPreprocessor
     call_impl = preprocessor.call_impl
@@ -540,6 +574,7 @@ else:
     pass
 if TALKER_BATCHES:
     PATCHES["sglang_omni.models.qwen3_omni.components.talker"] = patch_talker
+    PATCHES["sglang_omni.models.qwen3_omni.talker_scheduler"] = patch_talker_scheduler
     PATCHES["sglang_omni.models.qwen3_omni.components.preprocessor"] = (
         patch_preprocessor
     )
