@@ -188,6 +188,14 @@ The same branch on Pipeshift's bar, seeds 0 to 2, median of seeds, main → bran
 - **The band:** first audio within 0.5 ms on median, RTF and throughput within 0.6 %.
 - **Against it, the first-chunk branch:** its first-audio drops of 0.9 to 3.2 ms on mean clear the band. Its c64 RTF changes (Base −2.9 %, CustomVoice +1.6 %) go both ways and need a repeat before either is read.
 
+**Bar drift band.** Main's repeat, seed 0, run 3.5 h after the first (`ab_20261115/bar/main_aa_s0`):
+- From 4 to 40 req/s, p50 moved within ±0.4 ms and first byte p95 within ±0.8 ms.
+- At 1 req/s, the p50 moved −1.2 ms and the audible p95 swung from 21.9 to 29.8 ms, on 136 requests.
+
+Against it:
+- The first-chunk branch's bar p50 gains (0.3 to 0.8 ms from 4 to 40 req/s) sit at the band's edge, all in one direction.
+- The opening branch's 40 req/s gain (63 ms) is far outside it.
+
 - The audible p95 at 1 req/s comes from 136 requests. Main's own seeds gave 21.9, 29.3 and 24.7.
 - Its tail there is the model's 10 ms opening quiet (leading silence p95 0 → 10 ms), which unseeded sampling varies. The first-byte p95 at that rate fell.
 
