@@ -893,6 +893,20 @@ def resolved_qwen3_tts_server_args(
     return server_args
 
 
+@pytest.mark.parametrize(
+    ("overrides", "queued"), [({}, None), ({"max_queued_requests": 16}, 16)]
+)
+def test_qwen3_tts_waiting_queue_is_bounded_only_by_the_operator(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    overrides: dict[str, object],
+    queued: int | None,
+) -> None:
+    server_args = resolved_qwen3_tts_server_args(tmp_path, monkeypatch, overrides)
+
+    assert server_args.max_queued_requests == queued
+
+
 @pytest.mark.parametrize("backend", ["breakable", "full"])
 def test_qwen3_tts_prefill_ladder_starts_at_one_and_reaches_the_chunk(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, backend: str

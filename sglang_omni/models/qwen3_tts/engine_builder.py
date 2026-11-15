@@ -26,7 +26,6 @@ from sglang_omni.model_runner.model_worker import ModelWorker
 from sglang_omni.models.qwen3_tts import CAPABILITIES, request_builders
 from sglang_omni.models.qwen3_tts import stages as qwen3_stages
 from sglang_omni.models.qwen3_tts.config import (
-    QWEN3_TTS_MAX_QUEUED_REQUESTS,
     QWEN3_TTS_MAX_RUNNING_REQUESTS,
     load_qwen3_tts_checkpoint_config,
     normalize_qwen3_tts_model_type,
@@ -283,7 +282,6 @@ class Qwen3TtsEngineBuilder(TtsEngineBuilder[Qwen3TTSSGLangRequestData]):
         # is not set here.
         defaults: GenerationDefaults = {
             "max_running_requests": QWEN3_TTS_MAX_RUNNING_REQUESTS,
-            "max_queued_requests": QWEN3_TTS_MAX_QUEUED_REQUESTS,
             "dtype": dtype,
             "disable_cuda_graph": False,
             "disable_overlap_schedule": True,

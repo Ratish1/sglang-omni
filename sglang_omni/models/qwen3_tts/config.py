@@ -35,7 +35,6 @@ _QWEN3_TTS_CUSTOM_VARIANT_MARKERS = (
     "voicedesign",
 )
 QWEN3_TTS_MAX_RUNNING_REQUESTS = 64
-QWEN3_TTS_MAX_QUEUED_REQUESTS = 64
 
 
 class Qwen3TTSStageFactoryKwargs(TypedDict, total=False):
@@ -66,10 +65,9 @@ class Qwen3TTSPipelineConfig(PipelineConfig):
     @classmethod
     def generation_admission_defaults(cls) -> dict[str, int]:
         # note (ratish): constants here, so the launcher reads them without importing the engine.
-        return {
-            "max_running_requests": QWEN3_TTS_MAX_RUNNING_REQUESTS,
-            "max_queued_requests": QWEN3_TTS_MAX_QUEUED_REQUESTS,
-        }
+        # The waiting queue is unbounded unless an operator sets one, as in SGLang, so a full
+        # server queues arrivals instead of refusing them.
+        return {"max_running_requests": QWEN3_TTS_MAX_RUNNING_REQUESTS}
 
     model_path: str
     # note (0xtoward): Keep deterministic inference opt-in because it serializes

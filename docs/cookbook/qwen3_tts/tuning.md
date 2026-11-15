@@ -17,9 +17,11 @@ Two SGLang generation-stage knobs bound how the server behaves past saturation:
 | Knob | Meaning | Qwen3-TTS default |
 |---|---|---|
 | `--tts_engine.engine.max_running_requests` | Concurrent running slots | `64` |
-| `--tts_engine.engine.max_queued_requests` | Waiting-queue depth before fast-reject | `64` |
+| `--tts_engine.engine.max_queued_requests` | Waiting-queue depth before fast-reject | unset, no limit |
 
-Every request enters the waiting queue first, so `max_queued_requests` must be **≥ 1**. Capacity is about `running + queued`. Extra arrivals get HTTP **503** (`The request queue is full.`) before preprocessing, or later if the AR waiting queue or request-build backlog is full. Qwen3-TTS defaults to 4 request-build workers with pending depth 16.
+By default the waiting queue has no limit. Past the running slots, arrivals wait for a slot instead of failing.
+
+Setting `max_queued_requests` bounds it. Every request enters the waiting queue first, so the value must be **≥ 1**. Capacity is then about `running + queued`. Extra arrivals get HTTP **503** (`The request queue is full.`) before preprocessing, or later if the AR waiting queue or request-build backlog is full. Qwen3-TTS defaults to 4 request-build workers with pending depth 16.
 
 A finished request no longer counts toward that capacity, but its streamed audio waits in the API process until the client reads it. `--stream_delivery.max_total_backlog_bytes` caps the undelivered stream bytes all requests may hold together, per API process (default `1073741824`, 1 GiB; `none` turns it off).
 
@@ -27,7 +29,7 @@ A client that reads at least as fast as audio is generated holds almost nothing 
 
 Over the cap, the streams whose readers have been idle longest fail first, until the total fits. A failed stream's generation is aborted if it is still running. SSE (`stream_format=sse`) and WebSocket clients get an error event with `The request queue is full.`; a raw PCM stream is closed early. New requests are not refused because of the cap. `/health` reports the backlog under `stream_delivery`, including the held bytes, open streams and failed streams.
 
-To change the ceiling, set `max_running_requests` and `max_queued_requests` together:
+To bound admission, set `max_queued_requests`, with `max_running_requests` if the running slots change too:
 
 ```bash
 sgl-omni serve \
@@ -38,7 +40,7 @@ sgl-omni serve \
   --port 8000
 ```
 
-Stepped `--concurrencies` is a closed-loop client: it never holds more than N in-flight requests, so past-ceiling load is a burst that drains. Keep offered load above `max_running_requests + max_queued_requests` for a duration with open-loop sustained overshoot:
+With a bound set, stepped `--concurrencies` never holds more than N requests in flight, so load past the ceiling is a burst that drains. To keep offered load above `max_running_requests + max_queued_requests` for a duration, use sustained overshoot:
 
 ```bash
 python -m benchmarks.eval.benchmark_tts_seedtts \

@@ -8,8 +8,10 @@ from unittest.mock import Mock
 import pytest
 
 from sglang_omni.config.schema import EngineArgs, FactoryArgs, ProcessConfig
+from sglang_omni.config.topology import compile_logical_processes
 from sglang_omni.models.qwen3_tts import config as qwen3_tts_config
 from sglang_omni.models.qwen3_tts.config import Qwen3TTSPipelineConfig
+from sglang_omni.pipeline import mp_runner
 from sglang_omni.platforms.cuda import CUDAOmniPlatform
 from sglang_omni.platforms.npu import NPUOmniPlatform
 from sglang_omni.serve.speech_service import SpeechRequestValidator
@@ -28,6 +30,16 @@ def test_vocoder_platform_default_keeps_npu_opt_in(
     expected["running_stream_count"] = 64
     expected["shares_engine_speech_tokenizer"] = True
     assert config.stage_factory_kwargs("vocoder") == expected
+
+
+def test_default_pipeline_sets_no_in_flight_cap() -> None:
+    config = Qwen3TTSPipelineConfig(model_path="model")
+    plan, _ = compile_logical_processes(config)
+
+    assert (
+        mp_runner.resolve_coordinator_max_in_flight(config, logical_process_plan=plan)
+        is None
+    )
 
 
 def test_admission_defaults_load_without_the_engine() -> None:
