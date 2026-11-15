@@ -86,7 +86,14 @@ def original_euler(
 @torch.inference_mode()
 def compare_variant(variant: str) -> None:
     directory = Path(
-        snapshot_download(f"CKermit/FireRedTTS3-{variant}", local_files_only=True)
+        snapshot_download(
+            f"CKermit/FireRedTTS3-{variant}",
+            revision={
+                "Base": "53f8b59c3252f15d539a9205fbcab3e334a36b9f",
+                "Instruct": "edd602371bd356a974dfa8ed7eed949ec4c398b8",
+            }[variant],
+            local_files_only=True,
+        )
     )
     configuration = FireRedTTS3Config(
         **json.loads((directory / "config.json").read_text())
