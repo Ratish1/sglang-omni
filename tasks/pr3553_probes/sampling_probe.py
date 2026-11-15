@@ -93,11 +93,8 @@ def main() -> None:
     backbone.load_state_dict(runtime.model.model.state_dict(), assign=True, strict=True)
     backbone.eval()
     directory = Path(resolve_checkpoint(MODEL))
-    mapping = json.loads((directory / "model.safetensors.index.json").read_text())[
-        "weight_map"
-    ]
     with safe_open(
-        directory / mapping["lm_head.weight"], framework="pt", device="cpu"
+        directory / "model.safetensors", framework="pt", device="cpu"
     ) as archive:
         token_head.load_state_dict(
             {"weight": archive.get_tensor("lm_head.weight").cuda()}, assign=True
