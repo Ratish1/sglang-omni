@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 from dataclasses import replace
 from functools import partial
 from pathlib import Path
@@ -15,6 +16,20 @@ from flashinfer.jit.core import JitSpecNvcc
 from flashinfer.jit.fused_moe import gen_cutlass_fused_moe_sm90_module
 
 FINALIZER_PATH = Path("fused_moe/cutlass_backend/cutlass_fused_moe_kernels.cuh")
+GATED_ROUTINE_PATH = Path(
+    "nv_internal/tensorrt_llm/cutlass_extensions/include/"
+    "cutlass_extensions/gemm/kernel/fused_moe_kernel_routine.cuh"
+)
+
+
+def source_file_fingerprints(source_directory: Path) -> dict[str, str]:
+    return {
+        filename.relative_to(source_directory)
+        .as_posix(): hashlib.sha256(filename.read_bytes())
+        .hexdigest()
+        for filename in sorted(source_directory.rglob("*"))
+        if filename.is_file()
+    }
 
 
 def shared_activation_fake(x: torch.Tensor) -> torch.Tensor:
@@ -46,12 +61,12 @@ def contribution_build_spec(
         )
         for directory in original_specification.extra_include_dirs
     ]
-    finalizer_digest = hashlib.sha256(
-        (source_directory / FINALIZER_PATH).read_bytes()
+    source_digest = hashlib.sha256(
+        json.dumps(source_file_fingerprints(source_directory), sort_keys=True).encode()
     ).hexdigest()
     return replace(
         original_specification,
-        name=f"fused_moe_90_contributions_{finalizer_digest[:16]}",
+        name=f"fused_moe_90_diagnostic_{source_digest[:16]}",
         sources=source_files,
         extra_include_dirs=[source_directory, *include_directories],
     )
