@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 from dataclasses import asdict
 from pathlib import Path
@@ -69,6 +70,31 @@ def main() -> None:
         )
         for layer_index in range(layer_count)
     ]
+    native_parameters = json.loads(
+        (arguments.capture_directory / "native-talker-parameters.json").read_text()
+    )["parameters"]
+    checked_weights = {
+        "codec_head.weight": projection_weights["talker.codec_head.weight"]
+    }
+    for layer_index, weight in enumerate(merged_weights):
+        checked_weights[f"model.layers.{layer_index}.self_attn.qkv_proj.weight"] = (
+            weight
+        )
+        checked_weights[f"model.layers.{layer_index}.self_attn.o_proj.weight"] = (
+            projection_weights[
+                f"talker.model.layers.{layer_index}.self_attn.o_proj.weight"
+            ]
+        )
+    for name, weight in checked_weights.items():
+        actual = native_parameters[name]
+        assert actual["shape"] == list(weight.shape)
+        assert actual["dtype"] == str(weight.dtype)
+        assert (
+            actual["sha256"]
+            == hashlib.sha256(
+                weight.cpu().contiguous().view(torch.uint8).numpy().tobytes()
+            ).hexdigest()
+        ), name
     counts = {
         "comparisons": 0,
         "full_batch_mismatches": 0,
@@ -196,6 +222,7 @@ def main() -> None:
                 "scope": "Teacher-forced dense operator equality on every recorded frame and layer. Full and selected-row geometry are compared separately. No speech-quality or free-running causal claim.",
                 "model_revision": arguments.model_revision,
                 "request_ids": arguments.request_id,
+                "native_checkpoint_projection_weights_exact": len(checked_weights),
                 **counts,
             },
             indent=2,
