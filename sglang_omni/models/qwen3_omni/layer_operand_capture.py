@@ -8,8 +8,10 @@ import torch
 from flashinfer.autotuner import AutoTuner, TunableRunner, TuningConfig
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 
-MOE_BATCH_FIELDS = frozenset(
+BATCH_OPERAND_FIELDS = frozenset(
     (
+        "attention_normalized",
+        "attention_values",
         "mlp_normalized",
         "router_logits",
         "expert_indices",
@@ -17,6 +19,7 @@ MOE_BATCH_FIELDS = frozenset(
         "routed_output",
     )
 )
+CODEC_HEAD_FIELDS = frozenset(("codec_head_input", "codec_head_output"))
 
 
 @dataclass(kw_only=True)
@@ -104,7 +107,10 @@ class LayerOperandRecorder:
 
     def record(self, name: str, tensor: torch.Tensor) -> None:
         if self.retain_moe_batches and (
-            name in MOE_BATCH_FIELDS or name == "qkv" or name.startswith("operator_")
+            name in BATCH_OPERAND_FIELDS
+            or name in CODEC_HEAD_FIELDS
+            or name == "qkv"
+            or name.startswith("operator_")
         ):
             self.current_snapshot[f"layout_{name}"] = torch.tensor(
                 (*tensor.shape, *tensor.stride(), tensor.data_ptr() % 16), device="cpu"
@@ -163,7 +169,9 @@ class LayerOperandRecorder:
                 else tensor[row].detach().cpu().clone()
             )
             for name, tensor in snapshot.items()
-            if name != "step" and not name.startswith("fresh_")
+            if name != "step"
+            and name not in CODEC_HEAD_FIELDS
+            and not name.startswith("fresh_")
         }
         if prefill_rows is not None:
             assert bool(snapshot["layout_is_prefill"])
@@ -185,7 +193,9 @@ class LayerOperandRecorder:
                 {
                     f"prefix_{name}": tensor[prefill_rows].detach().cpu().clone()
                     for name, tensor in snapshot.items()
-                    if name != "step" and not name.startswith(("fresh_", "layout_"))
+                    if name != "step"
+                    and name not in CODEC_HEAD_FIELDS
+                    and not name.startswith(("fresh_", "layout_"))
                 }
             )
             tensors["prefix_token_rows"] = torch.tensor(
@@ -197,7 +207,14 @@ class LayerOperandRecorder:
             tensors.update(
                 {
                     f"batch_{name}": snapshot[name].detach().cpu().clone()
-                    for name in MOE_BATCH_FIELDS
+                    for name in BATCH_OPERAND_FIELDS
+                }
+            )
+            tensors.update(
+                {
+                    f"batch_{name}": snapshot[name].detach().cpu().clone()
+                    for name in CODEC_HEAD_FIELDS
+                    if name in snapshot
                 }
             )
             tensors["batch_selected_row"] = torch.tensor(row)

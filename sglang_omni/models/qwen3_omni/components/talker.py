@@ -1519,7 +1519,7 @@ class Qwen3OmniTalker(nn.Module):
         """
         last_index = self.extend_last_index(forward_batch, hidden_states.device)
         pruned_states = hidden_states[last_index]
-        next_token_logits, _ = self.codec_head(pruned_states)
+        next_token_logits = self.compute_logits(pruned_states)
         return LogitsProcessorOutput(
             next_token_logits=next_token_logits.float(),
             hidden_states=pruned_states,
@@ -1530,7 +1530,7 @@ class Qwen3OmniTalker(nn.Module):
         hidden_states: torch.Tensor,
     ) -> LogitsProcessorOutput:
         """Compute codec logits directly for decode/CUDA-graph capture."""
-        next_token_logits, _ = self.codec_head(hidden_states)
+        next_token_logits = self.compute_logits(hidden_states)
         # note (ratish): sglang's sampler divides and softmaxes in the logits' own dtype.
         # The reference samples from fp32 logits, as sglang's logits processor returns them.
         return LogitsProcessorOutput(
@@ -1626,6 +1626,16 @@ class Qwen3OmniTalker(nn.Module):
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """Compute layer-0 codec logits."""
         logits, _ = self.codec_head(hidden_states)
+        if (
+            self.conditioning_recorder is not None
+            and self.conditioning_recorder.retain_moe_batches
+            and self.conditioning_recorder.operator_recorders
+        ):
+            recorder = self.conditioning_recorder.operator_recorders[-1]
+            recorder.record("codec_head_input", hidden_states)
+            recorder.record("codec_head_output", logits)
+        else:
+            pass
         return logits
 
     def code_predictor_forward_incremental(
