@@ -299,7 +299,11 @@ Against it:
      - On main, `CreateSpeechRequest` drops the field, and the builder forces `True` for both named-voice tasks (since #527, kept by #1852).
      - The branch declares the field on the four request types, forwards it, and drops the forcing. The default is unchanged.
      - Drama3 still refuses the field through its `supported_speech_fields`.
-   - **Admission is a policy question for the user.** #1449 set the bound to fast-reject past running plus queued (load shedding). SGLang leaves the queue unbounded. On the bar our peak in flight was 47, under the 128 cap, so it causes no failure at today's throughput.
+   - **Admission: the user chose SGLang's unbounded queue (11-15).** #1449 had set a fast reject past 64 running plus 64 queued.
+     - `fix/qwen3-tts-unbounded-waiting-queue` `bf88f7d8c` (tree `f51eb68ba`) drops `max_queued_requests` from both Qwen3-TTS defaults (`config.py` `generation_admission_defaults` and `engine_builder.py` `generation_defaults`). The coordinator then sets no in-flight cap (`mp_runner.py:79-82`), and the scheduler treats `None` as unbounded (`omni_scheduler.py:1557`, `:444`).
+     - An operator's `max_queued_requests` still bounds both. The NPU example configs keep theirs.
+     - Tests cover both bounds. The tuning doc is updated.
+     - On the bar our peak in flight is 47, so no rate up to 40 req/s can change. The served check is Nari's client at 80 req/s, just above the CustomVoice throughput of about 75 req/s, main against the branch, queued after the unseeded A/B.
 4. c64 decode, by GIL share. Each is a host-only change, so seeded outputs must stay byte-identical. Gate on c16 and c64 RTF and throughput.
    1. The talker scheduler's per-row Python: `write_feedback_buffers` re-gathers rows of last step's batched `output_embeds`, and `post_process_outputs` and `finalize` also loop over rows.
    2. Stream messages from engine to vocoder: one per request a step on both sides. This is `OmniScheduler`'s shared path, so other models must keep main's behaviour.
