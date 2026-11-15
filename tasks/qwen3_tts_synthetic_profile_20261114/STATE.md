@@ -154,6 +154,18 @@ First audio (Base, 20 s references):
 - First audio is lower in every cell, on mean, median and p95. No cell had an underrun.
 - The RTF changes are within ±3 % and go both ways. Main's repeat at the end of the queue gives the drift band.
 
+The same branch on Pipeshift's bar, seeds 0 to 2, median of seeds, main → branch, ms. Every request succeeded, with no underrun.
+
+| req/s | 1 | 4 | 8 | 12 | 20 | 30 | 40 |
+|---|---|---|---|---|---|---|---|
+| Audible p50 | 19.5 → 17.1 | 19.5 → 18.9 | 20.5 → 19.7 | 20.4 → 20.1 | 21.3 → 20.7 | 22.6 → 22.0 | 25.4 → 25.0 |
+| First byte p50 | 19.5 → 17.1 | 19.4 → 18.6 | 20.3 → 19.4 | 20.1 → 19.8 | 20.9 → 20.5 | 22.1 → 21.5 | 22.4 → 22.0 |
+| First byte p95 | 21.5 → 21.2 | 22.7 → 21.8 | 23.5 → 22.8 | 24.2 → 24.3 | 26.3 → 25.7 | 29.2 → 28.7 | 30.8 → 30.7 |
+| Audible p95 | 24.7 → 29.0 | 31.5 → 30.1 | 30.9 → 30.2 | 31.1 → 30.5 | 32.4 → 31.4 | 37.0 → 38.2 | 100.1 → 99.0 |
+
+- The audible p95 at 1 req/s comes from 136 requests. Main's own seeds gave 21.9, 29.3 and 24.7.
+- Its tail there is the model's 10 ms opening quiet (leading silence p95 0 → 10 ms), which unseeded sampling varies. The first-byte p95 at that rate fell.
+
 ## Order of work
 
 1. Baseline of upstream main `bac76771a` on one H100:
