@@ -73,6 +73,7 @@ def main() -> None:
             [
                 "patch",
                 "--batch",
+                "--no-backup-if-mismatch",
                 "--fuzz=0",
                 "-p1",
                 "-d",
