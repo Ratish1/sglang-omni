@@ -76,6 +76,8 @@ class PredictorProjectionNorm:
 @dataclass(kw_only=True)
 class NativeNormalization:
     reference: Qwen3OmniMoeTalkerForConditionalGeneration
+    round_residual_before_normalization: bool = False
+    round_normalized_before_weight: bool = False
     boundary_enabled: bool = True
     query_key_enabled: bool = True
     attention_residual: torch.Tensor | None = None
@@ -112,10 +114,30 @@ class NativeNormalization:
         weight: torch.Tensor,
         epsilon: float,
     ) -> torch.Tensor:
-        normalized = contribution.reshape(-1, weight.numel()).clone()
-        updated_residual = residual.reshape_as(normalized).clone()
-        fused_add_rmsnorm(normalized, updated_residual, weight, epsilon)
-        assert torch.equal(updated_residual.view_as(rounded_sum), rounded_sum)
+        assert (
+            contribution.dtype == residual.dtype == rounded_sum.dtype == torch.bfloat16
+        )
+        if self.round_residual_before_normalization:
+            normalized = (contribution + residual).reshape(-1, weight.numel())
+            assert torch.equal(
+                normalized.view_as(rounded_sum).view(torch.uint8),
+                rounded_sum.view(torch.uint8),
+            )
+            updated_residual = torch.zeros_like(normalized)
+        else:
+            normalized = contribution.reshape(-1, weight.numel()).clone()
+            updated_residual = residual.reshape_as(normalized).clone()
+        if self.round_normalized_before_weight:
+            fused_add_rmsnorm(
+                normalized, updated_residual, torch.ones_like(weight), epsilon
+            )
+            normalized = normalized * weight
+        else:
+            fused_add_rmsnorm(normalized, updated_residual, weight, epsilon)
+        assert torch.equal(
+            updated_residual.view_as(rounded_sum).view(torch.uint8),
+            rounded_sum.view(torch.uint8),
+        )
         self.boundary_calls += 1
         return normalized.view_as(rounded_sum)
 
@@ -132,11 +154,19 @@ class NativeNormalization:
         self.attention_residual = inputs[0]
         if module is self.reference.model.layers[0].input_layernorm:
             self.boundary_calls += 1
-            return rmsnorm(
-                inputs[0].reshape(-1, module.weight.numel()),
-                module.weight,
-                module.variance_epsilon,
-            ).view_as(output)
+            if self.round_normalized_before_weight:
+                normalized = rmsnorm(
+                    inputs[0].reshape(-1, module.weight.numel()),
+                    torch.ones_like(module.weight),
+                    module.variance_epsilon,
+                )
+                return (normalized * module.weight).view_as(output)
+            else:
+                return rmsnorm(
+                    inputs[0].reshape(-1, module.weight.numel()),
+                    module.weight,
+                    module.variance_epsilon,
+                ).view_as(output)
         else:
             assert self.mlp_output is not None and self.mlp_residual is not None
             return self.normalize_sum(

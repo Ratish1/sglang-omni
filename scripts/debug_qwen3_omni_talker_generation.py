@@ -76,6 +76,8 @@ def main() -> None:
         default="checkpoint",
     )
     parser.add_argument("--paired-normalization-controls", action="store_true")
+    parser.add_argument("--round-residual-before-normalization", action="store_true")
+    parser.add_argument("--round-normalized-before-weight", action="store_true")
     parser.add_argument(
         "--residual-policy",
         choices=("greedy", "sampled"),
@@ -187,6 +189,13 @@ def main() -> None:
     )
     parser.add_argument("--output-directory", type=Path, required=True)
     arguments = parser.parse_args()
+    if (
+        arguments.round_residual_before_normalization
+        or arguments.round_normalized_before_weight
+    ):
+        assert arguments.normalization_semantics in ("native", "native-boundary")
+    else:
+        pass
     if arguments.predictor_attention_implementation == "native":
         assert (
             arguments.dtype == "bfloat16"
@@ -323,7 +332,11 @@ def main() -> None:
         == arguments.attention_implementation
         for layer in (*reference.model.layers, *reference.code_predictor.model.layers)
     )
-    normalization = NativeNormalization(reference=reference)
+    normalization = NativeNormalization(
+        reference=reference,
+        round_residual_before_normalization=arguments.round_residual_before_normalization,
+        round_normalized_before_weight=arguments.round_normalized_before_weight,
+    )
     if (
         arguments.normalization_semantics.startswith("native")
         or arguments.paired_normalization_controls
@@ -1383,6 +1396,8 @@ def main() -> None:
                     else None
                 ),
                 "normalization_semantics": normalization_mode,
+                "round_residual_before_normalization": arguments.round_residual_before_normalization,
+                "round_normalized_before_weight": arguments.round_normalized_before_weight,
                 "expert_mode": expert_mode,
                 "attention_mode": attention_mode,
                 "decode_page_table_tokens": arguments.decode_page_table_tokens,
