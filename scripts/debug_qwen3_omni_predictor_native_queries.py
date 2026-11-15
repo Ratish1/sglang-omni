@@ -31,6 +31,7 @@ def main() -> None:
     parser.add_argument("--gpu", type=int, required=True)
     parser.add_argument("--output-directory", type=Path, required=True)
     parser.add_argument("--regenerate-residuals", action="store_true")
+    parser.add_argument("--native-head-operands", action="store_true")
     parser.add_argument(
         "--residual-policy",
         choices=("greedy", "sampled"),
@@ -99,17 +100,38 @@ def main() -> None:
             native_hidden_states = hidden_states
             assert int(codes[0, 0]) == int(finished["output_ids"][frame])
             projected = reference.codec_head(hidden_states).float()
-            actual_logits = (
-                (
-                    torch.load(directory / "0000-prefill-logits.pt", weights_only=True)
-                    if frame == 0
-                    else observed["logits"]
+            if arguments.native_head_operands:
+                snapshots = torch.load(
+                    directory / f"{frame:04d}-operators.pt", weights_only=True
                 )
-                .unsqueeze(0)
-                .to(reference.device)
-            )
-            finite_columns = actual_logits.isfinite()
-            head_difference = (projected - actual_logits)[finite_columns]
+                active_row = json.loads(
+                    (directory / f"{frame:04d}-batch.json").read_bytes()
+                )["active_row"]
+                actual_logits = snapshots[-1]["batch_codec_head_output"][
+                    active_row : active_row + 1
+                ].to(device=reference.device, dtype=torch.float32)
+            else:
+                actual_logits = (
+                    (
+                        torch.load(
+                            directory / "0000-prefill-logits.pt", weights_only=True
+                        )
+                        if frame == 0
+                        else observed["logits"]
+                    )
+                    .unsqueeze(0)
+                    .to(reference.device)
+                )
+            has_raw_head_output = arguments.native_head_operands or frame == 0
+            if has_raw_head_output:
+                assert projected.shape == actual_logits.shape
+                finite_columns = actual_logits.isfinite()
+                head_difference = (projected - actual_logits)[finite_columns]
+                head_exact = bool((head_difference == 0).all())
+                head_maximum_error = float(head_difference.abs().max())
+            else:
+                head_exact = None
+                head_maximum_error = None
             assert projected.isfinite().all()
             if arguments.native_past_query_directory is not None:
                 replacement = torch.load(
@@ -301,8 +323,8 @@ def main() -> None:
             row = {
                 "frame": frame,
                 "is_eos": is_eos,
-                "head_reprojection_exact": bool((head_difference == 0).all()),
-                "head_reprojection_maximum_error": float(head_difference.abs().max()),
+                "head_reprojection_exact": head_exact,
+                "head_reprojection_maximum_error": head_maximum_error,
                 "groups": groups,
                 "sampled_residual_repeat_exact": sampled_repeat_exact,
             }
@@ -312,9 +334,15 @@ def main() -> None:
         report = {
             "request_id": directory.name,
             "frames": len(rows),
-            "head_reprojection_exact": all(
-                row["head_reprojection_exact"] for row in rows
+            "head_reprojection_checked_frames": sum(
+                row["head_reprojection_exact"] is not None for row in rows
             ),
+            "head_reprojection_exact": (
+                all(row["head_reprojection_exact"] for row in rows)
+                if all(row["head_reprojection_exact"] is not None for row in rows)
+                else None
+            ),
+            "native_head_operands": arguments.native_head_operands,
             "residual_choices": sum(len(row["groups"]) for row in rows),
             "regenerated_residuals": arguments.regenerate_residuals,
             "residual_policies": (
