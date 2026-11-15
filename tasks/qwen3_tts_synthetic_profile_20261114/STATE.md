@@ -149,6 +149,13 @@ First audio (Base, 20 s references):
 
 ## Baseline of main `bac76771a`, one H100 (11-15, `served_baseline.py`, SeedTTS EN 1,088 prompts, seed 1234)
 
+**These served cells, the first-chunk and opening served cells, and the first two py-spy captures ran seeded** (`--seed 1234`, carried over from the #3477 review driver). Our A/B protocol is unseeded.
+
+- A seeded batch samples the talker's layer 0 through SGLang's torch `top_k_top_p_min_p_sampling_from_probs_torch`, which sorts the full vocab per row. Unseeded batches do not take it.
+- Both arms of each served A/B were seeded, so the comparisons hold. The absolute numbers include that sampler.
+- Pipeshift's bar (Nari's client) was unseeded throughout.
+- The drivers are unseeded from kit `6fe6d831b`.
+
 | Cell | First audio mean / median / p95, ms | RTF mean | Throughput, req/s | Max underrun p95 |
 |---|---|---|---|---|
 | Base stream c1 | 18.4 / 19.7 / 22.5 | 0.0656 | 3.70 | 0 |
