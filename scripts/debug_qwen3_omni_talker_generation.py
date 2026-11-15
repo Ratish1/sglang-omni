@@ -84,6 +84,7 @@ def main() -> None:
         help="Free-running residual-code policies, in execution order, with repeatable request-derived Torch RNG.",
     )
     parser.add_argument("--audit-loaded-weights", action="store_true")
+    parser.add_argument("--audit-text-handoff", action="store_true")
     parser.add_argument("--native-predictor-capture-directory", type=Path)
     parser.add_argument("--checkpoint-residual-predictor", action="store_true")
     parser.add_argument(
@@ -779,6 +780,7 @@ def main() -> None:
             sampling_seed = torch.tensor([seed], device=reference.device)
             assert captured_sampling["sampling_seed"] == seed
             checked_feedback_rows = 0
+            checked_checkpoint_handoffs = 0
             for frame_index, filename in enumerate(
                 sorted(trace_directory.glob("*-before_decode.pt"))
             ):
@@ -1130,6 +1132,31 @@ def main() -> None:
                         use_cache=True,
                     )
                     codes = prepared_inputs["residual_codes"]
+                    if arguments.audit_text_handoff:
+                        embedding_rows = [
+                            reference.get_input_embeddings()(codes[:, :1])
+                        ]
+                        embedding_rows.extend(
+                            embedding(codes[:, group + 1 : group + 2])
+                            for group, embedding in enumerate(
+                                reference.code_predictor.get_input_embeddings()
+                            )
+                        )
+                        expected_feedback = torch.cat(embedding_rows, dim=1).sum(
+                            dim=1, keepdim=True
+                        )
+                        next_text = (
+                            text_rows[frame_index : frame_index + 1]
+                            if frame_index < len(text_rows)
+                            else pad_embedding
+                        )
+                        assert torch.equal(
+                            prepared_inputs["inputs_embeds"],
+                            expected_feedback + next_text[None],
+                        )
+                        checked_checkpoint_handoffs += 1
+                    else:
+                        pass
                     if native_predictor is not None:
                         reference_codes = codes.clone()
                         predictor_query = output.hidden_states[0][-1][:, -1:]
@@ -1209,6 +1236,13 @@ def main() -> None:
                     break
                 else:
                     pass
+            if arguments.audit_text_handoff:
+                assert checked_checkpoint_handoffs == sum(
+                    frame["main_code"] != config.codec_eos_token_id
+                    for frame in frame_reports
+                )
+            else:
+                pass
             if expert_control is not None:
                 expected_calls = (
                     len(frame_reports) * len(reference.model.layers)
@@ -1316,6 +1350,7 @@ def main() -> None:
                 ).hexdigest(),
                 "verified_sampling_seed": seed,
                 "captured_feedback_rows_verified": checked_feedback_rows,
+                "checkpoint_text_handoffs_verified": checked_checkpoint_handoffs,
                 "complete_text_queue_rows": len(text_rows),
                 "complete_text_projection_verified": complete_text_verified,
                 "first_codec_divergence": first_codec_divergence,
