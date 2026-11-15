@@ -129,6 +129,7 @@ def main() -> None:
             "bf16-reduction",
             "checkpoint-reduction",
             "fused-activation-checkpoint-reduction",
+            "workspace-checkpoint-reduction",
         ),
         default="native",
     )
@@ -1215,7 +1216,10 @@ def main() -> None:
                     else 0
                 )
                 assert expert_control.calls == expected_calls
-                if arguments.expert_output_arithmetic == "native":
+                if arguments.expert_output_arithmetic in (
+                    "native",
+                    "workspace-checkpoint-reduction",
+                ):
                     expected_kernel_calls = expected_calls
                 elif arguments.expert_output_arithmetic in (
                     "checkpoint",

@@ -141,3 +141,62 @@ def read_workspace_stages(
             pass
     assert len(matches) == 1, ("workspace alias uniqueness", len(matches))
     return matches[0]
+
+
+def checkpoint_reduce_workspace(
+    workspace: torch.Tensor,
+    indices: torch.Tensor,
+    scales: torch.Tensor,
+    intermediate_channels: int,
+    expert_count: int,
+    output: torch.Tensor,
+) -> torch.Tensor:
+    """Change only the final reduction after validating the actual down buffer."""
+    tokens, hidden_channels = output.shape
+    ranks = indices.shape[1]
+    expanded_tokens = tokens * ranks
+    buffers = workspace_prefix(
+        tokens, hidden_channels, intermediate_channels, expert_count, ranks
+    )
+    source_rows = workspace_view(
+        workspace,
+        buffers["permuted_row_to_unpermuted_row"],
+        torch.int32,
+        (expanded_tokens,),
+    ).long()
+    assert torch.equal(
+        source_rows.sort().values, torch.arange(expanded_tokens, device=output.device)
+    )
+    offsets = workspace_view(
+        workspace,
+        buffers["expert_first_token_offset"],
+        torch.int64,
+        (expert_count + 1,),
+    )
+    assert int(offsets[0]) == 0 and int(offsets[-1]) == expanded_tokens
+    assert (offsets.diff() >= 0).all()
+    token_rows, expert_ranks = source_rows % tokens, source_rows // tokens
+    assert torch.equal(
+        indices[token_rows, expert_ranks],
+        torch.repeat_interleave(
+            torch.arange(expert_count, device=output.device), offsets.diff()
+        ),
+    )
+    stages = read_workspace_stages(
+        workspace,
+        buffers,
+        indices,
+        scales,
+        token_rows,
+        expert_ranks,
+        intermediate_channels,
+        output,
+        "native",
+    )
+    contributions = torch.empty(
+        (tokens, ranks, hidden_channels), dtype=output.dtype, device=output.device
+    )
+    contributions[token_rows, expert_ranks] = stages.projected
+    return combine_expert_contributions(
+        list(contributions.unbind(dim=1)), indices, scales, "checkpoint-reduction"
+    )

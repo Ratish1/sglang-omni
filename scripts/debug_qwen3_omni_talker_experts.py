@@ -9,7 +9,7 @@ from typing import Literal
 
 import torch
 from flashinfer.fused_moe import cutlass_fused_moe
-from flashinfer.fused_moe.core import ActivationType
+from flashinfer.fused_moe.core import ActivationType, cutlass_fused_moe_workspace_size
 from sglang.kernels.ops.moe.moe_fused_gate import moe_fused_gate
 from sglang.srt.layers.activation import SiluAndMul
 from torch.utils.hooks import RemovableHandle
@@ -20,6 +20,7 @@ from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import (
     Qwen3OmniMoeTalkerTextTopKRouter,
 )
 
+from scripts.qwen3_omni_expert_workspace_runtime import checkpoint_reduce_workspace
 from scripts.qwen3_omni_talker_expert_rounding import expert_rounding_stages
 from scripts.qwen3_omni_talker_expert_runtime import (
     NativeRuntime,
@@ -44,6 +45,7 @@ class NativeTalkerExperts:
         "bf16-reduction",
         "checkpoint-reduction",
         "fused-activation-checkpoint-reduction",
+        "workspace-checkpoint-reduction",
     ] = "native"
     native_output_arithmetic: Literal[
         "native", "rounded-contributions", "checkpoint-reduction"
@@ -282,6 +284,26 @@ class NativeTalkerExperts:
             pass
         self.used_profiles.add(profiles)
         replay_inputs = hidden_states.contiguous().clone()
+        if self.output_arithmetic == "workspace-checkpoint-reduction":
+            assert not self.runtime.use_fused_finalize
+            assert self.native_output_arithmetic == "native"
+            workspace = torch.empty(
+                cutlass_fused_moe_workspace_size(
+                    len(hidden_states),
+                    hidden_states.shape[-1],
+                    down.shape[-1],
+                    len(down),
+                    indices.shape[1],
+                    x_dtype=hidden_states.dtype,
+                    weight_dtype=packed.dtype,
+                    use_fused_finalize=False,
+                    device=hidden_states.device,
+                ),
+                dtype=torch.uint8,
+                device=hidden_states.device,
+            )
+        else:
+            workspace = None
         fused_output = cutlass_fused_moe(
             input=replay_inputs,
             token_selected_experts=indices.to(torch.int32).contiguous(),
@@ -294,10 +316,15 @@ class NativeTalkerExperts:
             tune_max_num_tokens=self.runtime.tune_max_num_tokens,
             use_fused_finalize=self.runtime.use_fused_finalize,
             profile_ids=list(profiles),
+            workspace_buffer=workspace,
         )[0]
         assert torch.equal(replay_inputs, hidden_states)
         assert fused_output.shape == output.shape
-        if self.output_arithmetic in (
+        if self.output_arithmetic == "workspace-checkpoint-reduction":
+            fused_output = checkpoint_reduce_workspace(
+                workspace, indices, weights, down.shape[-1], len(down), fused_output
+            )
+        elif self.output_arithmetic in (
             "native-reduction",
             "rounded-contributions",
             "bf16-reduction",
