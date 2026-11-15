@@ -228,8 +228,26 @@ def report(boot: str, cell: str) -> None:
             outputs[item[4]].append(item[0])
         else:
             pass
+    last_thinker_token = {}
+    for item in queue:
+        if item[1] == "thinker.out" and item[2] == "put" and item[6] == "talker_ar":
+            last_thinker_token[item[4]] = item[0]
+        else:
+            pass
+    gaps_by_phase = {"thinker running": [], "thinker done": []}
+    gaps_by_index = collections.defaultdict(list)
     gaps, frame_gaps, delay_changes, delays = [], [], [], []
     for rid, output_times in outputs.items():
+        thinker_end = last_thinker_token.get(rid)
+        for index, (out_a, out_b) in enumerate(
+            zip(output_times, output_times[1:]), start=1
+        ):
+            if thinker_end is not None:
+                phase = "thinker running" if out_b <= thinker_end else "thinker done"
+                gaps_by_phase[phase].append(out_b - out_a)
+            else:
+                pass
+            gaps_by_index[min(index, 6)].append(out_b - out_a)
         frame_times = frames.get(rid, [])
         if len(output_times) < 2 or not frame_times:
             continue
@@ -259,6 +277,21 @@ def report(boot: str, cell: str) -> None:
         )
     else:
         print("  chunk gaps: none matched")
+    phase_counts = {phase: len(values) for phase, values in gaps_by_phase.items()}
+    print(
+        "  chunk gaps by the request's thinker: "
+        + ", ".join(
+            f"{phase} {mean_ms(values):.1f} ms ({phase_counts[phase]})"
+            for phase, values in gaps_by_phase.items()
+        )
+    )
+    print(
+        "  chunk gaps by index (6 = sixth and later): "
+        + ", ".join(
+            f"{index}: {mean_ms(gaps_by_index[index]):.1f} ({len(gaps_by_index[index])})"
+            for index in sorted(gaps_by_index)
+        )
+    )
 
 
 def main() -> None:
