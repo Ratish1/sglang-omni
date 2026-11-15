@@ -3053,7 +3053,7 @@ def test_qwen3_tts_vocoder_batches_decode_requests(
     assert scheduler.stream_followup_stride == 8
     assert scheduler.followup_stride_ramp == (2, 4)
     assert scheduler.initial_max_batch_size == 32
-    assert scheduler.initial_batch_wait_s == pytest.approx(0.002)
+    assert scheduler.initial_batch_wait_s == 0.0
     assert scheduler.followup_max_batch_size == 8
     assert scheduler.followup_batch_wait_s == pytest.approx(0.004)
     first = make_payload(inputs="first")
@@ -7642,6 +7642,27 @@ def test_qwen3_tts_async_decode_records_request_events(
     ]
     assert [metadata["emitted_generated_frames"] for metadata in committed] == [1, 3]
     assert [metadata["samples"] for metadata in committed] == [4, 8]
+
+
+@pytest.mark.parametrize(("max_batch_size", "taken"), [(8, 3), (2, 2)])
+def test_qwen3_tts_first_chunks_take_what_is_queued_without_waiting(
+    max_batch_size: int, taken: int
+) -> None:
+    scheduler = Qwen3TTSStreamingVocoderScheduler(
+        FakeQwen3TTSSpeechTokenizer(),
+        device="cpu",
+        async_decode=True,
+        initial_max_batch_size=max_batch_size,
+    )
+    for request_id in ("0", "1", "2"):
+        scheduler.initial_queue.put(
+            (request_id, scheduler.create_stream_state(request_id))
+        )
+
+    batch = scheduler.wait_for_first_chunks()
+
+    assert [request_id for request_id, _ in batch] == ["0", "1", "2"][:taken]
+    assert scheduler.initial_queue.qsize() == 3 - taken
 
 
 def test_qwen3_tts_async_initial_batches_ready_requests() -> None:
