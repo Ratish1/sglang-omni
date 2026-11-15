@@ -107,6 +107,9 @@ First audio (Base, 20 s references):
 | Base stream c1 | 18.4 / 19.7 / 22.5 | 0.0656 | 3.70 | 0 |
 | Base stream c16 | 30.6 / 27.7 / 43.8 | 0.1034 | 37.6 | 0 |
 | Base stream c64 | 51.6 / 39.8 / 133.1 | 0.2255 | 68.0 | 0 |
+| CustomVoice stream c1 | 12.0 / 11.8 / 13.2 | 0.0636 | 3.38 | 0 |
+| CustomVoice stream c16 | 18.2 / 17.9 / 21.9 | 0.0927 | 36.5 | 0 |
+| CustomVoice stream c64 | 28.4 / 21.8 / 121.2 | 0.1790 | 74.7 | 0 |
 
 | Whole-request cell | Latency mean / median / p95, ms | RTF mean | Throughput, req/s |
 |---|---|---|---|
