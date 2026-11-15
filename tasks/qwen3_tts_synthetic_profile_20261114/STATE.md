@@ -365,7 +365,16 @@ Against it:
 
        - Past capacity (about 75 req/s on this load) the branch serves at capacity with clean audio and turns away only the excess.
        - The arena-full fallback no longer fires: 0 warnings, since the warning only remains on the synchronous path.
-     - `test/qwen3-tts-slot-wait-unbounded` `1e0d175e2` (tree `06d1c6f24`) puts the unbounded-queue commit on top, for measurement only. It runs at 70 and 80 req/s.
+     - `test/qwen3-tts-slot-wait-unbounded` `1e0d175e2` (tree `06d1c6f24`) puts the unbounded-queue commit on top, for measurement only.
+
+       | Arm | 70 req/s | 80 req/s |
+       |---|---|---|
+       | Slot fix alone | 100 %, first byte p50 / p95 22.8 / 185 ms | 93.8 % (591 HTTP 503), first byte 768 / 867 ms, 0 underrun |
+       | Slot fix plus unbounded queue | 100 %, first byte 22.6 / 170 ms, 1 underrun | **100 % (9,601)**, first byte 7.8 / 13.1 s, 11 underruns, largest stall 51 ms |
+
+       - With the slot fix, the unbounded queue behaves as SGLang's does: every request is served, and under sustained overload the wait grows by the excess, about 5 req/s here.
+       - Without the slot fix the same queue served 0 %.
+     - **PR order:** two mechanisms, two PRs. The slot wait goes first; the unbounded queue is stacked on it and depends on it.
 4. c64 decode, by GIL share. Each is a host-only change, so seeded outputs must stay byte-identical. Gate on c16 and c64 RTF and throughput.
    1. The talker scheduler's per-row Python: `write_feedback_buffers` re-gathers rows of last step's batched `output_embeds`, and `post_process_outputs` and `finalize` also loop over rows.
    2. Stream messages from engine to vocoder: one per request a step on both sides. This is `OmniScheduler`'s shared path, so other models must keep main's behaviour.
