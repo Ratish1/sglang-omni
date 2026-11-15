@@ -18,10 +18,16 @@ from synthetic_driver import LAUNCH_OPTIONS, START_OPTIONS
 HERE = Path(__file__).resolve().parent
 WARMUP_S = 20.0
 WINDOW_S = 3.0
+PYSPY_MODE = "pyspy"
+PYSPY_WINDOW_S = 10
+PYSPY_RATE_HZ = 100
 
 
 def launch(tree: Path, mode: str, session: str, model: str, port: int, out: Path) -> subprocess.Popen:
-    profiler = ["nsys", "launch", f"--session-new={session}", *LAUNCH_OPTIONS[mode]]
+    if mode == PYSPY_MODE:
+        profiler = []
+    else:
+        profiler = ["nsys", "launch", f"--session-new={session}", *LAUNCH_OPTIONS[mode]]
     if mode == "attribution":
         merged = out / "marks_attribution.json"
         merged.write_text(
@@ -69,7 +75,21 @@ def client(tree: Path, model: str, extra: list[str], port: int, concurrency: int
         )
 
 
-def record_window(session: str, mode: str, output: Path) -> None:
+def record_window(session: str, mode: str, output: Path, server_pid: int) -> None:
+    if mode == PYSPY_MODE:
+        # note (ratish): --gil keeps only samples whose thread holds the interpreter lock, in every process of the server.
+        subprocess.run(
+            [
+                "py-spy", "record", "--pid", str(server_pid), "--subprocesses", "--gil",
+                "--nonblocking", "--threads", "--rate", str(PYSPY_RATE_HZ),
+                "--duration", str(PYSPY_WINDOW_S), "--format", "raw",
+                "--output", f"{output}.pyspy.txt",
+            ],
+            check=True,
+        )
+        return
+    else:
+        pass
     subprocess.run(
         ["nsys", "start", f"--session={session}", f"--output={output}", "--force-overwrite=true", *START_OPTIONS[mode]],
         check=True,
@@ -82,7 +102,7 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--tree", type=Path, required=True)
     parser.add_argument("--out", type=Path, required=True)
-    parser.add_argument("--mode", choices=sorted(LAUNCH_OPTIONS), required=True)
+    parser.add_argument("--mode", choices=[*sorted(LAUNCH_OPTIONS), PYSPY_MODE], required=True)
     parser.add_argument("--model", choices=sorted(MODELS), default="base")
     parser.add_argument("--concurrencies", type=int, nargs="+", default=[64, 16])
     parser.add_argument("--port", type=int, default=24300)
@@ -102,7 +122,7 @@ def main() -> None:
                 raise RuntimeError(f"{cell} client ended before the window")
             else:
                 pass
-            record_window(session, args.mode, args.out / cell)
+            record_window(session, args.mode, args.out / cell, server.pid)
             print(f"{time.strftime('%T')} {cell} window recorded", flush=True)
             load.wait(timeout=3600)
             print(f"{time.strftime('%T')} {cell} client rc {load.returncode}", flush=True)
