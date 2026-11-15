@@ -48,7 +48,8 @@ def main() -> None:
     parser.add_argument("--trace-directory", action="append", type=Path, required=True)
     parser.add_argument("--gpu", type=int, required=True)
     parser.add_argument("--dtype", choices=("bfloat16", "float32"), default="bfloat16")
-    parser.add_argument("--asr-port", type=int, required=True)
+    parser.add_argument("--asr-port", type=int)
+    parser.add_argument("--decode-only", action="store_true")
     parser.add_argument("--asr-model", default=QWEN3_ASR_MODEL_PATH)
     target_arguments = parser.add_mutually_exclusive_group(required=True)
     target_arguments.add_argument("--target-text")
@@ -56,6 +57,10 @@ def main() -> None:
     parser.add_argument("--sample-rate", type=int, required=True)
     parser.add_argument("--output-directory", type=Path, required=True)
     arguments = parser.parse_args()
+    if not arguments.decode_only and arguments.asr_port is None:
+        parser.error("--asr-port is required unless --decode-only is set")
+    else:
+        pass
     arguments.output_directory.mkdir(exist_ok=False)
     torch.cuda.set_device(arguments.gpu)
     if arguments.dtype == "float32":
@@ -122,21 +127,24 @@ def main() -> None:
                 destination = case_directory / waveform_filename
                 target_text = target_text_by_request[trace_directory.name]
             destination.write_bytes(wav_bytes)
-            hypothesis = transcribe(
-                load_router_asr(arguments.asr_port, arguments.asr_model),
-                str(destination),
-                "en",
-                f"cuda:{arguments.gpu}",
-            )
-            score = apply_wer(
-                SampleOutput(
-                    sample_id=trace_directory.parent.name,
-                    target_text=target_text,
-                    audio_duration_s=len(waveform) / arguments.sample_rate,
-                ),
-                hypothesis,
-                "en",
-            )
+            if arguments.decode_only:
+                score = None
+            else:
+                hypothesis = transcribe(
+                    load_router_asr(arguments.asr_port, arguments.asr_model),
+                    str(destination),
+                    "en",
+                    f"cuda:{arguments.gpu}",
+                )
+                score = apply_wer(
+                    SampleOutput(
+                        sample_id=trace_directory.parent.name,
+                        target_text=target_text,
+                        audio_duration_s=len(waveform) / arguments.sample_rate,
+                    ),
+                    hypothesis,
+                    "en",
+                )
             report = {
                 "trace_directory": str(trace_directory),
                 "reference_dtype": arguments.dtype,
@@ -146,7 +154,7 @@ def main() -> None:
                 "sample_rate": arguments.sample_rate,
                 "waveform_file": str(destination),
                 "waveform_sha256": hashlib.sha256(wav_bytes).hexdigest(),
-                "score": asdict(score),
+                "score": asdict(score) if score is not None else None,
             }
             reports.append(report)
             (arguments.output_directory / "summary.json").write_text(
