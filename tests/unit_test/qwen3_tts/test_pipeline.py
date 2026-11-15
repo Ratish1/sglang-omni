@@ -2577,6 +2577,31 @@ def test_qwen3_tts_text_only_defaults_to_custom_voice() -> None:
     assert state.stream_codec_output is True
 
 
+@pytest.mark.parametrize(
+    ("task_params", "task_type"),
+    [
+        ({"task_type": "CustomVoice"}, "CustomVoice"),
+        (
+            {"task_type": "VoiceDesign", "instructions": "A warm adult voice."},
+            "VoiceDesign",
+        ),
+    ],
+)
+def test_qwen3_tts_named_voice_tasks_honor_requested_prompt_mode(
+    task_params: dict[str, str], task_type: str
+) -> None:
+    payload = make_payload(
+        inputs="target",
+        tts_params={**task_params, "non_streaming_mode": False},
+    )
+
+    state = build_qwen3_tts_state(payload)
+
+    assert state.task_type == task_type
+    assert state.non_streaming_mode is False
+    assert state.stream_codec_output is True
+
+
 @pytest.mark.parametrize("source", ["params", "tts_params"])
 def test_qwen3_tts_stream_codec_output_request_override_disables_streaming(
     source: str,

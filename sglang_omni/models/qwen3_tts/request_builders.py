@@ -484,9 +484,6 @@ def build_qwen3_tts_state(
         else:
             pass
         voice = voice or QWEN3_TTS_DEFAULT_CUSTOM_VOICE
-        # Note (Jiaxin Deng): this is prompt-side text/codec interleaving, not output
-        # transport; codec streaming is resolved independently above.
-        non_streaming_mode = True
     elif task_type == QWEN3_TTS_TASK_VOICE_DESIGN:
         if has_param(tts_params, params, "ref_audio") or references_contain_audio(
             references
@@ -509,7 +506,6 @@ def build_qwen3_tts_state(
         else:
             pass
         voice = None
-        non_streaming_mode = True
     else:
         raise AssertionError(f"unhandled Qwen3-TTS task type: {task_type}")
 

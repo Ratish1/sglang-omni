@@ -527,6 +527,7 @@ These fields are accepted by the shared speech endpoint. Model support and defau
 | `token_count` | int | `null` | Model-specific duration token target |
 | `duration_tokens` | int | `null` | Alias-style duration token target for models that expose duration control |
 | `x_vector_only_mode` | bool | `null` | Qwen3-TTS Base speaker-embedding mode |
+| `non_streaming_mode` | bool | `null` | Qwen3-TTS prompt mode. `true` puts the whole target text in the prompt, `false` feeds it to the talker one token per codec frame. Defaults to `true` for CustomVoice and VoiceDesign and `false` for Base |
 | `temperature` | float | `null` | Sampling temperature |
 | `top_p` | float | `null` | Top-p sampling |
 | `top_k` | int | `null` | Top-k sampling |
