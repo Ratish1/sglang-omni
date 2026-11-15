@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Run the CI MMSU Talker workload with paired request identities."""
+"""Run saved MMSU Talker workloads with paired request identities."""
 
 from __future__ import annotations
 
@@ -122,7 +122,7 @@ async def run(base_url: str, output_directory: Path, sample_file: Path) -> None:
         )
     )
     request_results = await runner.run(samples, send_request)
-    assert len(request_results) == MAX_SAMPLES
+    assert len(request_results) == len(samples)
     assert all(result.is_success for result in request_results)
     results = build_mmsu_results(request_results, samples, ["text", "audio"])
     summary = {
@@ -134,7 +134,7 @@ async def run(base_url: str, output_directory: Path, sample_file: Path) -> None:
         "per_sample": [asdict(result) for result in results],
         "concurrency": CONCURRENCY,
         "max_tokens": MAX_TOKENS,
-        "max_samples": MAX_SAMPLES,
+        "max_samples": len(samples),
     }
     (output_directory / "results.json").write_text(json.dumps(summary, indent=2))
     print(
