@@ -14,7 +14,8 @@ STEP_PREFIX = "step["
 
 def load_ranges(connection: sqlite3.Connection) -> list[tuple[int, int, str, str]]:
     query = """
-        select e.start, e.end, coalesce(s.value, e.text, ''), coalesce(t.value, '')
+        select e.start, e.end, coalesce(s.value, e.text, ''),
+            ((e.globalTid >> 24) & 16777215) || ':' || coalesce(t.value, '')
         from NVTX_EVENTS e
         left join StringIds s on s.id = e.textId
         left join ThreadNames n on n.globalTid = e.globalTid
