@@ -150,6 +150,7 @@ def main() -> None:
     parser.add_argument("--native-backbone-attention", action="store_true")
     parser.add_argument("--decode-page-table-tokens", type=int)
     parser.add_argument("--paired-native-projection-controls", action="store_true")
+    parser.add_argument("--checkpoint-query-key-normalization", action="store_true")
     parser.add_argument("--paired-native-rotary-controls", action="store_true")
     parser.add_argument(
         "--paired-native-routing-controls",
@@ -271,6 +272,11 @@ def main() -> None:
         assert arguments.native_expert_profile_map is not None
         assert arguments.native_expert_route_precision == "float32"
         assert arguments.expert_output_arithmetic == "native"
+    else:
+        pass
+    if arguments.checkpoint_query_key_normalization:
+        assert arguments.paired_native_routing_controls
+        assert not arguments.paired_native_projection_controls
     else:
         pass
     if arguments.routing_controls is not None:
@@ -479,7 +485,10 @@ def main() -> None:
         or arguments.paired_native_routing_controls
     ):
         assert arguments.dtype == "bfloat16"
-        projection_control = NativeAttentionInputs(reference=reference)
+        projection_control = NativeAttentionInputs(
+            reference=reference,
+            is_checkpoint_query_key_enabled=arguments.checkpoint_query_key_normalization,
+        )
         projection_control.install()
     else:
         projection_control = None
@@ -1439,6 +1448,7 @@ def main() -> None:
                 "attention_mode": attention_mode,
                 "decode_page_table_tokens": arguments.decode_page_table_tokens,
                 "attention_projection_mode": projection_mode,
+                "checkpoint_query_key_normalization": arguments.checkpoint_query_key_normalization,
                 "rotary_mode": rotary_mode,
                 "routing_mode": routing_mode,
                 "native_rotary_calls": rotary_control.calls if rotary_control else 0,

@@ -8,6 +8,7 @@ from typing import Literal
 
 import torch
 from sglang.kernels.ops.layernorm.norm import fused_inplace_qknorm
+from sglang.kernels.ops.layernorm.rmsnorm_hf import rmsnorm_hf
 from torch.utils.hooks import RemovableHandle
 from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import (
     Qwen3OmniMoeTalkerForConditionalGeneration,
@@ -29,6 +30,7 @@ class NativeAttentionInputs:
     reference: Qwen3OmniMoeTalkerForConditionalGeneration
     enabled: bool = False
     mode: Literal["merged", "paired", "merged-paired"] = "merged"
+    is_checkpoint_query_key_enabled: bool = False
     projection_calls: int = 0
     normalization_calls: int = 0
     weights: list[torch.Tensor] = field(default_factory=list)
@@ -142,14 +144,30 @@ class NativeAttentionInputs:
                     (normalized.stride(0), head_dimensions, 1),
                     storage_offset=query_dimensions,
                 )
-                fused_inplace_qknorm(
-                    q=query,
-                    k=key,
-                    q_weight=attention.q_norm.weight,
-                    k_weight=attention.k_norm.weight,
-                    eps=attention.q_norm.variance_epsilon,
-                    head_dim=head_dimensions,
-                )
+                if self.is_checkpoint_query_key_enabled:
+                    query.copy_(
+                        rmsnorm_hf(
+                            query.reshape(-1, head_dimensions).contiguous(),
+                            attention.q_norm.weight,
+                            attention.q_norm.variance_epsilon,
+                        ).view_as(query)
+                    )
+                    key.copy_(
+                        rmsnorm_hf(
+                            key.reshape(-1, head_dimensions).contiguous(),
+                            attention.k_norm.weight,
+                            attention.k_norm.variance_epsilon,
+                        ).view_as(key)
+                    )
+                else:
+                    fused_inplace_qknorm(
+                        q=query,
+                        k=key,
+                        q_weight=attention.q_norm.weight,
+                        k_weight=attention.k_norm.weight,
+                        eps=attention.q_norm.variance_epsilon,
+                        head_dim=head_dimensions,
+                    )
                 state.normalized_query = query
                 state.normalized_key = key
             else:
