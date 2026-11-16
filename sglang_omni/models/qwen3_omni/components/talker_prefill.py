@@ -8,6 +8,7 @@ This module mirrors HF's talker prefill layout, then keeps HF's
 from __future__ import annotations
 
 import json
+import os
 from collections.abc import Mapping
 from pathlib import Path
 from typing import TYPE_CHECKING, TypedDict
@@ -100,6 +101,16 @@ class TalkerPromptPrefill(TypedDict):
     prompt_model_inputs: dict[str, object]
 
 
+class PromptHiddenControl(TypedDict):
+    request_id: str
+    prompt_input_ids: torch.Tensor
+    assistant_token_ids: torch.Tensor
+    native_hidden: torch.Tensor
+    replacement_hidden: torch.Tensor
+    expected_prefill_embeds: torch.Tensor
+    expected_future_text: torch.Tensor
+
+
 def resolve_speaker_id(
     params: Mapping[str, object], speaker_map: dict[str, int]
 ) -> int:
@@ -176,6 +187,14 @@ class TalkerPrefillBuilder:
         self.tts_special_cache: (
             tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None
         ) = None
+        control_filename = os.environ.get(
+            "SGLANG_OMNI_DIAGNOSTIC_PROMPT_HIDDEN_CONTROL"
+        )
+        self.prompt_hidden_control: PromptHiddenControl | None = (
+            torch.load(control_filename, map_location="cpu", weights_only=True)
+            if control_filename is not None
+            else None
+        )
 
     def build_prompt_prefill(
         self,
@@ -228,6 +247,43 @@ class TalkerPrefillBuilder:
             prompt_hidden[captured_positions] = prompt_chunk.data.to(prompt_hidden)
         else:
             pass
+        control = self.prompt_hidden_control
+        is_controlled_prompt = control is not None and control["request_id"] == str(
+            payload.request_id
+        )
+        if is_controlled_prompt:
+            assert control is not None
+            recorder = self.model.conditioning_recorder
+            assert recorder is not None
+            destination = recorder.directory / str(payload.request_id)
+            destination.mkdir(parents=True, exist_ok=True)
+            torch.save(
+                {
+                    "prompt_input_ids": prompt_ids,
+                    "assistant_token_ids": assistant_token_ids,
+                    "native_hidden": prompt_hidden.detach().cpu().clone(),
+                },
+                destination / "control-incoming.pt",
+            )
+            assert torch.equal(prompt_ids, control["prompt_input_ids"])
+            assert torch.equal(assistant_token_ids, control["assistant_token_ids"])
+            assert control["native_hidden"].dtype == prompt_hidden.dtype
+            native_hidden = control["native_hidden"].to(device=self.device)
+            replacement_hidden = control["replacement_hidden"].to(device=self.device)
+            assert (
+                native_hidden.shape == replacement_hidden.shape == prompt_hidden.shape
+            )
+            assert replacement_hidden.dtype == prompt_hidden.dtype
+            assert torch.equal(prompt_hidden, native_hidden)
+            assert torch.isfinite(replacement_hidden).all()
+            assert torch.equal(
+                native_hidden[~prompt_positions.to(self.device)],
+                replacement_hidden[~prompt_positions.to(self.device)],
+            )
+            prompt_hidden.copy_(replacement_hidden)
+            torch.save(control, destination / "prompt-hidden-control.pt")
+        else:
+            pass
         thinker_hidden = torch.cat([prompt_hidden, assistant_embed], dim=0)
 
         tts_bos_embed, tts_eos_embed, tts_pad_embed = self.get_tts_special_embeds()
@@ -258,6 +314,16 @@ class TalkerPrefillBuilder:
             include_assistant_eos=thinker_done,
             im_end_token_id=self.im_end_token_id,
         )
+        if is_controlled_prompt:
+            assert control is not None
+            assert torch.equal(
+                prefill["input_embeds"].cpu(), control["expected_prefill_embeds"]
+            )
+            assert torch.equal(
+                prefill["future_text_rows"].cpu(), control["expected_future_text"]
+            )
+        else:
+            pass
 
         if self.model.conditioning_recorder is not None:
             self.model.conditioning_recorder.record_prompt(
