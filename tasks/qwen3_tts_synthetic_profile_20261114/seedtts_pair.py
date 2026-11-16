@@ -114,7 +114,10 @@ def score(tree: Path, model: str, extra: list[str], card: int, port: int, out: P
         )
 
 
-def run_order(order: int, trees: dict[str, Path], cards: dict[str, int], model: str, extra: list[str], port: int, out: Path) -> None:
+def run_order(
+    order: int, trees: dict[str, Path], cards: dict[str, int], model: str, extra: list[str], port: int, out: Path,
+    cells: tuple[tuple[str, int, bool], ...], should_score: bool,
+) -> None:
     ports = {"a": port, "b": port + 200}
     servers = {}
     try:
@@ -127,7 +130,7 @@ def run_order(order: int, trees: dict[str, Path], cards: dict[str, int], model: 
         for arm in ("a", "b"):
             wait_healthy(ports[arm], servers[arm])
         print(f"{time.strftime('%T')} order {order} healthy, a card {cards['a']}, b card {cards['b']}", flush=True)
-        for cell, concurrency, stream in CELLS:
+        for cell, concurrency, stream in cells:
             with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
                 futures = {
                     arm: pool.submit(bench, trees[arm], model, extra, ports[arm], concurrency, stream,
@@ -141,9 +144,12 @@ def run_order(order: int, trees: dict[str, Path], cards: dict[str, int], model: 
     finally:
         for server in servers.values():
             stop(server)
-    for index, arm in enumerate(("a", "b")):
-        score(trees[arm], model, extra, cards[arm], port + 400 + 400 * index, out / f"order{order}" / arm / SCORED_CELL)
-    print(f"{time.strftime('%T')} order {order} scored", flush=True)
+    if should_score:
+        for index, arm in enumerate(("a", "b")):
+            score(trees[arm], model, extra, cards[arm], port + 400 + 400 * index, out / f"order{order}" / arm / SCORED_CELL)
+        print(f"{time.strftime('%T')} order {order} scored", flush=True)
+    else:
+        pass
 
 
 def main() -> None:
@@ -153,11 +159,19 @@ def main() -> None:
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--model", choices=sorted(MODELS), default="base")
     parser.add_argument("--port", type=int, default=21000)
+    parser.add_argument(
+        "--c16-rounds", type=int, default=0,
+        help="run only streaming c16, this many rounds on the same servers, unscored",
+    )
     args = parser.parse_args()
     model, extra = MODELS[args.model]
     trees = {"a": args.a_tree, "b": args.b_tree}
+    if args.c16_rounds > 0:
+        cells = tuple((f"stream_c16_r{index + 1}", 16, True) for index in range(args.c16_rounds))
+    else:
+        cells = CELLS
     for order, cards in enumerate(({"a": 0, "b": 1}, {"a": 1, "b": 0})):
-        run_order(order, trees, cards, model, extra, args.port, args.out)
+        run_order(order, trees, cards, model, extra, args.port, args.out, cells, args.c16_rounds == 0)
     print(f"{time.strftime('%T')} seedtts_pair done", flush=True)
 
 
