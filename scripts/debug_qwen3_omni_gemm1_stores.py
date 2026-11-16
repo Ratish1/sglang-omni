@@ -37,12 +37,14 @@ def main() -> None:
     parser.add_argument("--unchanged-profile", nargs=2, type=int, required=True)
     parser.add_argument("--source-directory", type=Path)
     parser.add_argument("--baseline-directory", type=Path)
+    parser.add_argument(
+        "--output-arithmetic",
+        choices=("native", "expert-order-bfloat16-sum"),
+        default="native",
+    )
     parser.add_argument("--gpu", type=int, required=True)
     parser.add_argument("--output-directory", type=Path, required=True)
     arguments = parser.parse_args()
-    assert (arguments.source_directory is None) == (
-        arguments.baseline_directory is None
-    )
     assert arguments.unchanged_profile in arguments.profile
     arguments.output_directory.mkdir(exist_ok=False)
     if arguments.source_directory is not None:
@@ -66,6 +68,7 @@ def main() -> None:
             for filename in routing_files
         },
         "profiles": arguments.profile,
+        "output_arithmetic": arguments.output_arithmetic,
     }
     if arguments.baseline_directory is not None:
         baseline_summary = json.loads(
@@ -286,7 +289,7 @@ def main() -> None:
                             expert_ranks,
                             intermediate_channels,
                             output,
-                            "native",
+                            arguments.output_arithmetic,
                         )
                         current = {
                             "activated": stages.activated.clone(),
