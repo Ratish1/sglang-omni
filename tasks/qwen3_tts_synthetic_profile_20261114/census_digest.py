@@ -61,13 +61,19 @@ def print_step_split(connection: sqlite3.Connection, window_start: int, window_e
         else:
             pass
     waits: dict[int, list[tuple[int, int]]] = defaultdict(list)
+    calls: dict[int, list[tuple[int, int, str]]] = defaultdict(list)
     if "OSRT_API" in tables:
-        for tid, start, end in connection.execute(
-            "select globalTid, start, end from OSRT_API where end > ? and start < ?",
+        for tid, start, end, name in connection.execute(
+            """
+            select o.globalTid, o.start, o.end, coalesce(s.value, '')
+            from OSRT_API o left join StringIds s on s.id = o.nameId
+            where o.end > ? and o.start < ?
+            """,
             (window_start, window_end),
         ):
             if tid in step_threads:
                 waits[tid].append((start, end))
+                calls[tid].append((start, end, name))
             else:
                 pass
     else:
@@ -83,6 +89,22 @@ def print_step_split(connection: sqlite3.Connection, window_start: int, window_e
         count = len(rows)
         step_ms, gpu_ms, wait_ms = (sum(row[index] for row in rows) / count for index in range(3))
         print(f"  {mode} bs={batch}: {count} steps, step {step_ms:.2f}, gpu {gpu_ms:.2f}, os wait {wait_ms:.2f}")
+    by_call: dict[tuple[str, str], float] = defaultdict(float)
+    counts: dict[str, int] = defaultdict(int)
+    for start, end, tid, text in steps:
+        mode, _ = STEP.search(text).groups()
+        counts[mode] += 1
+        for call_start, call_end, name in calls[tid]:
+            if call_end > start and call_start < end:
+                by_call[(mode, name)] += (min(call_end, end) - max(call_start, start)) / 1e6
+            else:
+                pass
+    print("OS call ms per step inside talker steps, by mode:")
+    for (mode, name), total in sorted(by_call.items(), key=lambda item: -item[1]):
+        if total / counts[mode] >= 0.02:
+            print(f"  {mode} {name}: {total / counts[mode]:.3f}")
+        else:
+            pass
 
 
 def main() -> None:
