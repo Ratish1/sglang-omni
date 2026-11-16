@@ -1,3 +1,13 @@
+# Branch results: codec slot wait, #4077 (11-16, host-221, two H100s)
+
+Each head against main `ea8216220` at the same time on the two cards, orders swapped. RTF is fix against main.
+
+| Head | sglang_omni tree | Overload (60 / 70 / 80 req/s succeeded, fix) | Normal load | Read |
+|---|---|---|---|---|
+| `d2507351c` FIFO waiting queue | `d1460e887` | not run | streaming c16 RTF +1.5 %, c64 +2.3 %, whole c16 +1.5 % | the queue took `state_lock` on every stream end and release while empty |
+| `e528b9d9a` no lock while the queue is empty | `7d3df299e` | 100 / 96.6-98.7 / 85-86.9 %, three seeds | killed before it finished (head moved) | |
+| `f9bc7891b` planner owns the queue, failure exit, free-list count | `4bc1fa14d` | 97.3-100 / 97.9-99.5 / 83.2-93.0 %, three seeds | inside the A/A band in every cell on warm rounds; first audio equal or better | opened, ready for review |
+
 # Branch results: persistent predictor layer (11-14)
 
 Branch `dev/qwen3-tts-predictor-persistent-20261114`, measured on host-62 (H100) with `persistent_layer_check.py` and `persistent_stamps.py`. One layer is layer 0 back to back (L2-warm). Five layers is a chain over layers 0 to 4 in one CUDA graph. Triton is `FusedPredictorLayers`, measured in the same run.
