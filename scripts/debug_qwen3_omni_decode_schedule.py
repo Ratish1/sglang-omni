@@ -13,6 +13,7 @@ from sgl_kernel.flash_attn import flash_attn_with_kvcache, get_scheduler_metadat
 
 METADATA_ALIGNMENT = 4
 METADATA_VECTORS = 4
+DECODE_PADDING_TOKENS = 1
 
 
 class DecodeBatch(BaseModel):
@@ -80,10 +81,20 @@ def main() -> None:
                     directory / f"{frame_index:04d}-operators.pt", weights_only=True
                 )
                 query_heads = snapshots[0]["rotated_query"].numel() // head_channels
-                batch_size = len(batch.callback_sequence_lengths)
-                assert snapshots[0]["batch_attention_values"].shape[0] == batch_size
+                batch_size = snapshots[0]["batch_attention_values"].shape[0]
+                padding_requests = batch_size - len(batch.callback_sequence_lengths)
+                assert padding_requests >= 0
+                if padding_requests:
+                    assert bool(snapshots[0]["batch_is_graph"])
+                else:
+                    pass
+                # note (ratish): FA3 graph buffers reset inactive sequence lengths to one token.
+                scheduled_lengths = (
+                    batch.callback_sequence_lengths
+                    + [DECODE_PADDING_TOKENS] * padding_requests
+                )
                 batch_lengths = torch.tensor(
-                    batch.callback_sequence_lengths,
+                    scheduled_lengths,
                     dtype=torch.int32,
                     device=arguments.gpu,
                 )
@@ -175,6 +186,7 @@ def main() -> None:
                         "batch_size": batch_size,
                         "selected_tokens": token_count,
                         "batch_sequence_lengths": batch.callback_sequence_lengths,
+                        "graph_padding_requests": padding_requests,
                         "isolated_splits": int(single_metadata[0]),
                         "recorded_splits": selected_splits,
                         "comparisons": comparisons,
