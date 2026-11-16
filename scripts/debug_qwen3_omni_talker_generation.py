@@ -145,6 +145,7 @@ def main() -> None:
             "fused-activation-checkpoint-reduction",
             "workspace-checkpoint-reduction",
             "workspace-bfloat16-reduction",
+            "checkpoint-down-projection",
         ),
         default="native",
     )
@@ -284,6 +285,7 @@ def main() -> None:
             "native",
             "workspace-checkpoint-reduction",
             "workspace-bfloat16-reduction",
+            "checkpoint-down-projection",
         )
     else:
         pass
@@ -1368,6 +1370,7 @@ def main() -> None:
                     "native",
                     "workspace-checkpoint-reduction",
                     "workspace-bfloat16-reduction",
+                    "checkpoint-down-projection",
                 ):
                     expected_kernel_calls = expected_calls
                 elif arguments.expert_output_arithmetic in (

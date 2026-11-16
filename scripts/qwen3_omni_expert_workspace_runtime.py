@@ -28,6 +28,14 @@ class WorkspaceStages:
     has_glu_intermediate: bool
 
 
+@dataclass(kw_only=True)
+class RoutedWorkspace:
+    stages: WorkspaceStages
+    token_rows: torch.Tensor
+    expert_ranks: torch.Tensor
+    expert_offsets: torch.Tensor
+
+
 def workspace_prefix(
     tokens: int,
     hidden_channels: int,
@@ -92,7 +100,9 @@ def read_workspace_stages(
     expert_ranks: torch.Tensor,
     intermediate_channels: int,
     output: torch.Tensor,
-    output_arithmetic: Literal["native", "checkpoint-reduction"],
+    output_arithmetic: Literal[
+        "native", "checkpoint-reduction", "expert-order-bfloat16-sum"
+    ],
 ) -> WorkspaceStages:
     tokens, hidden_channels = output.shape
     ranks = indices.shape[1]
@@ -143,18 +153,17 @@ def read_workspace_stages(
     return matches[0]
 
 
-def checkpoint_reduce_workspace(
+def validated_routed_workspace(
     workspace: torch.Tensor,
     indices: torch.Tensor,
     scales: torch.Tensor,
     intermediate_channels: int,
     expert_count: int,
     output: torch.Tensor,
-    reduction_semantics: Literal[
-        "checkpoint-reduction", "expert-order-bfloat16-sum"
-    ] = "checkpoint-reduction",
-) -> torch.Tensor:
-    """Change only the final reduction after validating the actual down buffer."""
+    output_arithmetic: Literal[
+        "native", "checkpoint-reduction", "expert-order-bfloat16-sum"
+    ],
+) -> RoutedWorkspace:
     tokens, hidden_channels = output.shape
     ranks = indices.shape[1]
     expanded_tokens = tokens * ranks
@@ -194,12 +203,87 @@ def checkpoint_reduce_workspace(
         expert_ranks,
         intermediate_channels,
         output,
+        output_arithmetic,
+    )
+    return RoutedWorkspace(
+        stages=stages,
+        token_rows=token_rows,
+        expert_ranks=expert_ranks,
+        expert_offsets=offsets,
+    )
+
+
+def checkpoint_reduce_workspace(
+    workspace: torch.Tensor,
+    indices: torch.Tensor,
+    scales: torch.Tensor,
+    intermediate_channels: int,
+    expert_count: int,
+    output: torch.Tensor,
+    reduction_semantics: Literal[
+        "checkpoint-reduction", "expert-order-bfloat16-sum"
+    ] = "checkpoint-reduction",
+) -> torch.Tensor:
+    """Change only the final reduction after validating the actual down buffer."""
+    routed = validated_routed_workspace(
+        workspace,
+        indices,
+        scales,
+        intermediate_channels,
+        expert_count,
+        output,
         "native",
     )
+    tokens, hidden_channels = output.shape
+    ranks = indices.shape[1]
     contributions = torch.empty(
         (tokens, ranks, hidden_channels), dtype=output.dtype, device=output.device
     )
-    contributions[token_rows, expert_ranks] = stages.projected
+    contributions[routed.token_rows, routed.expert_ranks] = routed.stages.projected
     return combine_expert_contributions(
         list(contributions.unbind(dim=1)), indices, scales, reduction_semantics
+    )
+
+
+def checkpoint_project_workspace(
+    workspace: torch.Tensor,
+    indices: torch.Tensor,
+    scales: torch.Tensor,
+    down_weights: torch.Tensor,
+    output: torch.Tensor,
+) -> torch.Tensor:
+    """Keep actual native activations and change only their down projections."""
+    routed = validated_routed_workspace(
+        workspace,
+        indices,
+        scales,
+        down_weights.shape[-1],
+        len(down_weights),
+        output,
+        "expert-order-bfloat16-sum",
+    )
+    projected = torch.empty_like(routed.stages.projected)
+    expert_token_offsets = routed.expert_offsets.tolist()
+    for expert_index, (start_token_row, stop_token_row) in enumerate(
+        zip(expert_token_offsets[:-1], expert_token_offsets[1:], strict=True)
+    ):
+        if stop_token_row > start_token_row:
+            projected[start_token_row:stop_token_row] = torch.nn.functional.linear(
+                routed.stages.activated[start_token_row:stop_token_row],
+                down_weights[expert_index],
+            )
+        else:
+            pass
+    tokens, hidden_channels = output.shape
+    contributions = torch.empty(
+        (tokens, indices.shape[1], hidden_channels),
+        dtype=output.dtype,
+        device=output.device,
+    )
+    contributions[routed.token_rows, routed.expert_ranks] = projected
+    return combine_expert_contributions(
+        list(contributions.unbind(dim=1)),
+        indices,
+        scales,
+        "expert-order-bfloat16-sum",
     )

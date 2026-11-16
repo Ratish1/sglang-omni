@@ -20,7 +20,10 @@ from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import (
     Qwen3OmniMoeTalkerTextTopKRouter,
 )
 
-from scripts.qwen3_omni_expert_workspace_runtime import checkpoint_reduce_workspace
+from scripts.qwen3_omni_expert_workspace_runtime import (
+    checkpoint_project_workspace,
+    checkpoint_reduce_workspace,
+)
 from scripts.qwen3_omni_talker_expert_rounding import expert_rounding_stages
 from scripts.qwen3_omni_talker_expert_runtime import (
     NativeRuntime,
@@ -47,6 +50,7 @@ class NativeTalkerExperts:
         "fused-activation-checkpoint-reduction",
         "workspace-checkpoint-reduction",
         "workspace-bfloat16-reduction",
+        "checkpoint-down-projection",
     ] = "native"
     native_output_arithmetic: Literal[
         "native",
@@ -323,6 +327,7 @@ class NativeTalkerExperts:
                 "native",
                 "workspace-checkpoint-reduction",
                 "workspace-bfloat16-reduction",
+                "checkpoint-down-projection",
             )
             assert self.route_precision == "float32"
             snapshot = self.captured_snapshot(frame_index, layer_index)
@@ -349,9 +354,14 @@ class NativeTalkerExperts:
         if self.output_arithmetic in (
             "workspace-checkpoint-reduction",
             "workspace-bfloat16-reduction",
+            "checkpoint-down-projection",
         ):
             assert not self.runtime.use_fused_finalize
-            assert self.native_output_arithmetic == "native"
+            assert self.native_output_arithmetic == (
+                "expert-order-bfloat16-sum"
+                if self.output_arithmetic == "checkpoint-down-projection"
+                else "native"
+            )
             workspace = torch.empty(
                 cutlass_fused_moe_workspace_size(
                     len(replay_inputs),
@@ -384,7 +394,12 @@ class NativeTalkerExperts:
             workspace_buffer=workspace,
         )[0]
         assert torch.equal(replay_inputs, expected_inputs)
-        if workspace is not None:
+        if self.output_arithmetic == "checkpoint-down-projection":
+            assert workspace is not None
+            fused_output = checkpoint_project_workspace(
+                workspace, replay_indices, replay_weights, down, fused_output
+            )
+        elif workspace is not None:
             fused_output = checkpoint_reduce_workspace(
                 workspace,
                 replay_indices,
