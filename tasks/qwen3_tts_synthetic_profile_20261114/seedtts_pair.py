@@ -31,10 +31,15 @@ CELLS = (
     ("whole_c1", 1, False),
 )
 SCORED_CELL = "stream_c16"
+# note (ratish): both H100s of host-221 sit on NUMA node 1, so each server takes half of that socket and
+# the clients take node 0.
+CARD_CPUS = {0: "32-47,96-111", 1: "48-63,112-127"}
+CLIENT_CPUS = "0-31,64-95"
 
 
 def serve(tree: Path, model: str, card: int, port: int, log: Path, env_extra: dict[str, str]) -> subprocess.Popen:
     command = [
+        "taskset", "-c", CARD_CPUS[card],
         sys.executable, "-m", "sglang_omni.cli", "serve", "--model-path", model, "--host", "127.0.0.1",
         "--port", str(port), "--tts_engine.gpu", str(card), "--vocoder.gpu", str(card),
     ]
@@ -60,6 +65,7 @@ def stop(server: subprocess.Popen) -> None:
 def bench(tree: Path, model: str, extra: list[str], port: int, concurrency: int, stream: bool, out: Path) -> dict:
     out.mkdir(parents=True, exist_ok=True)
     command = [
+        "taskset", "-c", CLIENT_CPUS,
         sys.executable, "-m", "benchmarks.eval.benchmark_tts_seedtts", "--meta", "zhaochenyang20/seed-tts-eval-arrow",
         "--model", model, "--use-existing-server", "--host", "127.0.0.1", "--port", str(port), "--generate-only",
         "--lang", "en", "--warmup", str(concurrency), "--max-concurrency", str(concurrency),
@@ -82,8 +88,8 @@ def score(tree: Path, model: str, extra: list[str], card: int, port: int, out: P
     ]
     with (out / "asr_serve.log").open("w") as log:
         asr = subprocess.Popen(
-            [sys.executable, "-m", "sglang_omni.cli", "serve", "--model-path", ASR_MODEL, "--host", "127.0.0.1",
-             "--port", str(port), "--asr.gpu", str(card)],
+            ["taskset", "-c", CARD_CPUS[card], sys.executable, "-m", "sglang_omni.cli", "serve", "--model-path",
+             ASR_MODEL, "--host", "127.0.0.1", "--port", str(port), "--asr.gpu", str(card)],
             cwd=tree, env={**env, "MASTER_PORT": str(port + 50)}, stdout=log, stderr=subprocess.STDOUT,
             start_new_session=True,
         )
