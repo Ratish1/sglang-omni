@@ -1,0 +1,40 @@
+--- a/fused_moe/cutlass_backend/cutlass_fused_moe_kernels.cuh
++++ b/fused_moe/cutlass_backend/cutlass_fused_moe_kernels.cuh
+@@ -2365,7 +2365,18 @@
+     // BF16 isn't supported, use FP32 for activation function
+     auto gate_value =
+         arrayConvert<GemmResultElem, ComputeElem>(gemm_result_vec[elem_index + inter_size_vec]);
+-    auto gate_act = fn(gate_value, linear_value);
++    auto gate_act = [&]() {
++      if constexpr (std::is_same_v<ActivationOutputType, __nv_bfloat16> &&
++                    std::is_same_v<GemmOutputType, __nv_bfloat16> &&
++                    std::is_same_v<ActFn, GLUAdaptor<cutlass::epilogue::thread::SiLu>>) {
++        cutlass::epilogue::thread::SiLu<ComputeElem> silu;
++        auto activated_gate = arrayConvert<OutputElem, ComputeElem>(
++            arrayConvert<ComputeElem, OutputElem>(silu(gate_value)));
++        return activated_gate * linear_value;
++      } else {
++        return fn(gate_value, linear_value);
++      }
++    }();
+     output_vec[elem_index] = arrayConvert<ComputeElem, OutputElem>(gate_act);
+   }
+ }
+@@ -2517,7 +2528,16 @@
+                                                                    bias_ptr_vec + elem_index, true);
+             linear_value = linear_value + arrayConvert<BiasElem, ComputeElem>(linear_bias_value);
+           }
+-          return fn(fc1_value, linear_value);
++          if constexpr (std::is_same_v<T, __nv_bfloat16> &&
++                        std::is_same_v<GemmOutputType, __nv_bfloat16> &&
++                        std::is_same_v<ActFn, GLUAdaptor<cutlass::epilogue::thread::SiLu>>) {
++            cutlass::epilogue::thread::SiLu<ComputeElem> silu;
++            auto activated_gate = arrayConvert<OutputElem, ComputeElem>(
++                arrayConvert<ComputeElem, OutputElem>(silu(fc1_value)));
++            return activated_gate * linear_value;
++          } else {
++            return fn(fc1_value, linear_value);
++          }
+         } else {
+           return fn(fc1_value);
+         }

@@ -41,7 +41,9 @@ def main() -> None:
         default="rounded-contributions",
     )
     parser.add_argument(
-        "--activation-arithmetic", choices=("native", "checkpoint"), default="native"
+        "--activation-arithmetic",
+        choices=("native", "checkpoint", "checkpoint-all-paths"),
+        default="native",
     )
     arguments = parser.parse_args()
     if arguments.build_jobs < 1:
@@ -72,10 +74,15 @@ def main() -> None:
         else:
             pass
         expected_changes.add(FINALIZER_PATH.as_posix())
-    if arguments.activation_arithmetic == "checkpoint":
+    if arguments.activation_arithmetic in ("checkpoint", "checkpoint-all-paths"):
         assert original_sources[GATED_ROUTINE_PATH.as_posix()] == GATED_ROUTINE_SHA256
         patch_filenames.append("qwen3_omni_bf16_activation.patch")
         expected_changes.add(GATED_ROUTINE_PATH.as_posix())
+    else:
+        pass
+    if arguments.activation_arithmetic == "checkpoint-all-paths":
+        patch_filenames.append("qwen3_omni_bf16_unfused_activation.patch")
+        expected_changes.add(FINALIZER_PATH.as_posix())
     else:
         pass
     for patch_filename in patch_filenames:
