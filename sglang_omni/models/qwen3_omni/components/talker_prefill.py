@@ -105,7 +105,6 @@ class PromptHiddenControl(TypedDict):
     request_id: str
     prompt_input_ids: torch.Tensor
     assistant_token_ids: torch.Tensor
-    native_hidden: torch.Tensor
     replacement_hidden: torch.Tensor
     expected_prefill_embeds: torch.Tensor
     expected_future_text: torch.Tensor
@@ -268,19 +267,12 @@ class TalkerPrefillBuilder:
             )
             assert torch.equal(prompt_ids, control["prompt_input_ids"])
             assert torch.equal(assistant_token_ids, control["assistant_token_ids"])
-            assert control["native_hidden"].dtype == prompt_hidden.dtype
-            native_hidden = control["native_hidden"].to(device=self.device)
             replacement_hidden = control["replacement_hidden"].to(device=self.device)
-            assert (
-                native_hidden.shape == replacement_hidden.shape == prompt_hidden.shape
-            )
+            assert replacement_hidden.shape == prompt_hidden.shape
             assert replacement_hidden.dtype == prompt_hidden.dtype
-            assert torch.equal(
-                prompt_hidden.view(torch.uint8), native_hidden.view(torch.uint8)
-            )
             assert torch.isfinite(replacement_hidden).all()
             assert torch.equal(
-                native_hidden[~prompt_positions.to(self.device)],
+                prompt_hidden[~prompt_positions.to(self.device)],
                 replacement_hidden[~prompt_positions.to(self.device)],
             )
             prompt_hidden.copy_(replacement_hidden)
