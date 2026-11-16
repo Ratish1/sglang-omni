@@ -289,7 +289,8 @@ def main() -> None:
     if arguments.native_projection_batches:
         assert (
             arguments.native_expert_batches
-            or arguments.expert_output_arithmetic == "checkpoint"
+            or arguments.expert_output_arithmetic
+            in ("checkpoint", "fused-activation-checkpoint-reduction")
         )
         assert arguments.native_expert_profile_map is not None
         assert arguments.paired_native_routing_controls
