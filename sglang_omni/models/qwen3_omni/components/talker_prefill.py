@@ -189,11 +189,15 @@ class TalkerPrefillBuilder:
         control_filename = os.environ.get(
             "SGLANG_OMNI_DIAGNOSTIC_PROMPT_HIDDEN_CONTROL"
         )
-        self.prompt_hidden_control: PromptHiddenControl | None = (
+        prompt_hidden_controls: list[PromptHiddenControl] = (
             torch.load(control_filename, map_location="cpu", weights_only=True)
             if control_filename is not None
-            else None
+            else []
         )
+        self.prompt_hidden_controls: dict[str, PromptHiddenControl] = {
+            control["request_id"]: control for control in prompt_hidden_controls
+        }
+        assert len(self.prompt_hidden_controls) == len(prompt_hidden_controls)
 
     def build_prompt_prefill(
         self,
@@ -246,10 +250,8 @@ class TalkerPrefillBuilder:
             prompt_hidden[captured_positions] = prompt_chunk.data.to(prompt_hidden)
         else:
             pass
-        control = self.prompt_hidden_control
-        is_controlled_prompt = control is not None and control["request_id"] == str(
-            payload.request_id
-        )
+        control = self.prompt_hidden_controls.get(str(payload.request_id))
+        is_controlled_prompt = control is not None
         if is_controlled_prompt:
             assert control is not None
             assert captured_positions is not None
