@@ -52,6 +52,25 @@ def main() -> None:
             delta = sum(b - a for a, b in pairs) / len(pairs)
             relative = sum((b - a) / a for a, b in pairs) / len(pairs)
             print(f"  {label:22s} {row}  | b-a {delta:+.4g} ({relative:+.1%})")
+    for bench_dir in sorted(args.out.glob("order*/*/*/bench")):
+        wer_path = bench_dir / "wer_results.json"
+        similarity_path = bench_dir / "similarity_results.json"
+        if wer_path.exists() and similarity_path.exists():
+            wer = json.loads(wer_path.read_text())["summary"]
+            similarity = json.loads(similarity_path.read_text())
+            similarity = similarity.get("summary", similarity)
+            similarity_mean = next(
+                value
+                for name, value in similarity.items()
+                if "mean" in name.lower() and isinstance(value, (int, float))
+            )
+            print(
+                f"{bench_dir.parent.relative_to(args.out)} wer_corpus {wer['wer_corpus']:.4f} "
+                f"wer_mean {wer['wer_per_sample_mean']:.4f} above_50 {wer['n_above_50_pct_wer']} "
+                f"sim {similarity_mean:.2f}"
+            )
+        else:
+            pass
 
 
 if __name__ == "__main__":
