@@ -118,18 +118,21 @@ class LayerOperandRecorder:
         else:
             pass
         if self.recording_prefill:
-            assert tensor.shape[0] <= self.maximum_prefill_token_rows
-            if name not in self.prefill_buffers:
+            if tensor.shape[0] > self.maximum_prefill_token_rows:
                 assert not torch.cuda.is_current_stream_capturing()
-                self.prefill_buffers[name] = tensor.new_empty(
-                    (self.maximum_prefill_token_rows, *tensor.shape[1:])
-                )
+                captured = tensor.clone()
             else:
-                pass
-            captured = self.prefill_buffers[name][: len(tensor)]
-            # note (ratish): non-overlapping prefills let every graph bucket share stable storage.
-            assert captured.dtype == tensor.dtype and captured.shape == tensor.shape
-            captured.copy_(tensor)
+                if name not in self.prefill_buffers:
+                    assert not torch.cuda.is_current_stream_capturing()
+                    self.prefill_buffers[name] = tensor.new_empty(
+                        (self.maximum_prefill_token_rows, *tensor.shape[1:])
+                    )
+                else:
+                    pass
+                captured = self.prefill_buffers[name][: len(tensor)]
+                # note (ratish): non-overlapping prefills let every graph bucket share stable storage.
+                assert captured.dtype == tensor.dtype and captured.shape == tensor.shape
+                captured.copy_(tensor)
             self.current_snapshot[name] = captured
             self.current_snapshot[f"fresh_{name}"] = self.step_counter.clone()
         else:
