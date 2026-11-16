@@ -160,18 +160,20 @@ def main() -> None:
     parser.add_argument("--model", choices=sorted(MODELS), default="base")
     parser.add_argument("--port", type=int, default=21000)
     parser.add_argument(
-        "--c16-rounds", type=int, default=0,
-        help="run only streaming c16, this many rounds on the same servers, unscored",
+        "--rounds", type=int, default=0,
+        help="run only --rounds-cell, this many rounds on the same servers, unscored",
     )
+    parser.add_argument("--rounds-cell", choices=[cell for cell, _, _ in CELLS], default="stream_c16")
     args = parser.parse_args()
     model, extra = MODELS[args.model]
     trees = {"a": args.a_tree, "b": args.b_tree}
-    if args.c16_rounds > 0:
-        cells = tuple((f"stream_c16_r{index + 1}", 16, True) for index in range(args.c16_rounds))
+    if args.rounds > 0:
+        _, concurrency, stream = next(entry for entry in CELLS if entry[0] == args.rounds_cell)
+        cells = tuple((f"{args.rounds_cell}_r{index + 1}", concurrency, stream) for index in range(args.rounds))
     else:
         cells = CELLS
     for order, cards in enumerate(({"a": 0, "b": 1}, {"a": 1, "b": 0})):
-        run_order(order, trees, cards, model, extra, args.port, args.out, cells, args.c16_rounds == 0)
+        run_order(order, trees, cards, model, extra, args.port, args.out, cells, args.rounds == 0)
     print(f"{time.strftime('%T')} seedtts_pair done", flush=True)
 
 
