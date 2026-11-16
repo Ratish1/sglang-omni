@@ -253,6 +253,7 @@ class TalkerPrefillBuilder:
         )
         if is_controlled_prompt:
             assert control is not None
+            assert captured_positions is not None
             recorder = self.model.conditioning_recorder
             assert recorder is not None
             destination = recorder.directory / str(payload.request_id)
@@ -274,7 +275,9 @@ class TalkerPrefillBuilder:
                 native_hidden.shape == replacement_hidden.shape == prompt_hidden.shape
             )
             assert replacement_hidden.dtype == prompt_hidden.dtype
-            assert torch.equal(prompt_hidden, native_hidden)
+            assert torch.equal(
+                prompt_hidden.view(torch.uint8), native_hidden.view(torch.uint8)
+            )
             assert torch.isfinite(replacement_hidden).all()
             assert torch.equal(
                 native_hidden[~prompt_positions.to(self.device)],
