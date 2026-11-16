@@ -156,6 +156,7 @@ def main() -> None:
     parser.add_argument("--paired-native-expert-controls", action="store_true")
     parser.add_argument("--paired-native-attention-controls", action="store_true")
     parser.add_argument("--native-backbone-attention", action="store_true")
+    parser.add_argument("--native-attention-schedule", action="store_true")
     parser.add_argument("--decode-page-table-tokens", type=int)
     parser.add_argument("--paired-native-projection-controls", action="store_true")
     parser.add_argument("--checkpoint-query-key-normalization", action="store_true")
@@ -309,6 +310,11 @@ def main() -> None:
     if arguments.decode_page_table_tokens is not None:
         assert arguments.native_backbone_attention
         assert arguments.decode_page_table_tokens > 0
+    else:
+        pass
+    if arguments.native_attention_schedule:
+        assert arguments.native_projection_batches
+        assert arguments.decode_page_table_tokens is not None
     else:
         pass
     if (
@@ -686,6 +692,9 @@ def main() -> None:
                 pass
             if attention_control is not None:
                 attention_control.set_enabled(attention_mode == "fa3")
+                attention_control.native_directory = (
+                    trace_directory if arguments.native_attention_schedule else None
+                )
             else:
                 pass
             if expert_control is not None:
@@ -1488,6 +1497,7 @@ def main() -> None:
                 "expert_mode": expert_mode,
                 "attention_mode": attention_mode,
                 "decode_page_table_tokens": arguments.decode_page_table_tokens,
+                "native_attention_schedule": arguments.native_attention_schedule,
                 "attention_projection_mode": projection_mode,
                 "checkpoint_query_key_normalization": arguments.checkpoint_query_key_normalization,
                 "rotary_mode": rotary_mode,

@@ -5,21 +5,12 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
-from typing import Literal, TypedDict
+from typing import TypedDict
 
 import torch
-from pydantic import BaseModel
-from sgl_kernel.flash_attn import flash_attn_with_kvcache, get_scheduler_metadata
+from sgl_kernel.flash_attn import flash_attn_with_kvcache
 
-METADATA_ALIGNMENT = 4
-METADATA_VECTORS = 4
-DECODE_PADDING_TOKENS = 1
-
-
-class DecodeBatch(BaseModel):
-    mode: Literal["DECODE"]
-    active_row: int
-    callback_sequence_lengths: list[int]
+from scripts.qwen3_omni_talker_attention import DecodeBatch, recorded_decode_schedule
 
 
 class CapturedCache(TypedDict):
@@ -76,7 +67,6 @@ def main() -> None:
                 batch = DecodeBatch.model_validate_json(
                     (directory / f"{frame_index:04d}-batch.json").read_bytes()
                 )
-                assert batch.callback_sequence_lengths[batch.active_row] == token_count
                 snapshots: list[dict[str, torch.Tensor]] = torch.load(
                     directory / f"{frame_index:04d}-operators.pt", weights_only=True
                 )
@@ -88,65 +78,22 @@ def main() -> None:
                     assert bool(snapshots[0]["batch_is_graph"])
                 else:
                     pass
-                # note (ratish): FA3 graph buffers reset inactive sequence lengths to one token.
-                scheduled_lengths = (
-                    batch.callback_sequence_lengths
-                    + [DECODE_PADDING_TOKENS] * padding_requests
-                )
-                batch_lengths = torch.tensor(
-                    scheduled_lengths,
-                    dtype=torch.int32,
-                    device=arguments.gpu,
-                )
-                batch_metadata = get_scheduler_metadata(
+                schedule = recorded_decode_schedule(
+                    batch=batch,
                     batch_size=batch_size,
-                    max_seqlen_q=1,
-                    max_seqlen_k=arguments.page_table_tokens,
-                    num_heads=query_heads,
-                    num_heads_k=key_heads,
-                    headdim=head_channels,
-                    cache_seqlens=batch_lengths,
-                    cu_seqlens_q=torch.arange(
-                        batch_size + 1, dtype=torch.int32, device=arguments.gpu
-                    ),
-                    page_size=1,
-                    causal=True,
-                ).cpu()
-                rounded_batch_size = (
-                    (batch_size + METADATA_ALIGNMENT - 1)
-                    // METADATA_ALIGNMENT
-                    * METADATA_ALIGNMENT
+                    token_count=token_count,
+                    query_heads=query_heads,
+                    key_heads=key_heads,
+                    head_channels=head_channels,
+                    page_table_tokens=arguments.page_table_tokens,
+                    device=keys.device,
                 )
-                assert batch_metadata.numel() == (
-                    rounded_batch_size * METADATA_VECTORS + 1
+                lengths = torch.tensor(
+                    [token_count], dtype=torch.int32, device=arguments.gpu
                 )
-                batch_order = batch_metadata[
-                    2 * rounded_batch_size : 2 * rounded_batch_size + batch_size
-                ]
-                virtual_row = (batch_order == batch.active_row).nonzero().item()
-                lengths = batch_lengths[batch.active_row : batch.active_row + 1]
                 cumulative_query_tokens = torch.arange(
                     2, dtype=torch.int32, device=arguments.gpu
                 )
-                single_metadata = get_scheduler_metadata(
-                    batch_size=1,
-                    max_seqlen_q=1,
-                    max_seqlen_k=arguments.page_table_tokens,
-                    num_heads=query_heads,
-                    num_heads_k=key_heads,
-                    headdim=head_channels,
-                    cache_seqlens=lengths,
-                    cu_seqlens_q=cumulative_query_tokens,
-                    page_size=1,
-                    causal=True,
-                )
-                selected_splits = int(batch_metadata[virtual_row])
-                assert 0 < selected_splits <= int(single_metadata[0])
-                matched_metadata = torch.zeros_like(single_metadata)
-                for vector in (0, 1, 3):
-                    matched_metadata[vector * METADATA_ALIGNMENT] = batch_metadata[
-                        vector * rounded_batch_size + virtual_row
-                    ]
                 for layer_index, snapshot in enumerate(snapshots):
                     query = (
                         snapshot["rotated_query"]
@@ -159,7 +106,7 @@ def main() -> None:
                     comparisons = {}
                     for name, metadata in (
                         ("isolated", None),
-                        ("recorded_schedule", matched_metadata),
+                        ("recorded_schedule", schedule.metadata),
                     ):
                         actual = flash_attn_with_kvcache(
                             query,
@@ -186,9 +133,9 @@ def main() -> None:
                         "batch_size": batch_size,
                         "selected_tokens": token_count,
                         "batch_sequence_lengths": batch.callback_sequence_lengths,
-                        "graph_padding_requests": padding_requests,
-                        "isolated_splits": int(single_metadata[0]),
-                        "recorded_splits": selected_splits,
+                        "graph_padding_requests": schedule.padding_requests,
+                        "isolated_splits": schedule.isolated_splits,
+                        "recorded_splits": schedule.recorded_splits,
                         "comparisons": comparisons,
                     }
                     reports.append(report)
