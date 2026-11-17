@@ -138,7 +138,8 @@ def wait_healthy(url: str, server: subprocess.Popen) -> None:
 
 
 def serve_rounds(
-    tree: Path, model: str, card: int, port: int, server_args: list[str], rounds: int, out: Path
+    tree: Path, model: str, card: int, port: int, server_args: list[str], rounds: int, out: Path,
+    should_accept_refusals: bool,
 ) -> bool:
     url = f"http://127.0.0.1:{port}"
     command = [
@@ -174,7 +175,12 @@ def serve_rounds(
             time.sleep(1)
             stats = codec_state(url)
             should_finish = [r for r in results if r["kind"] in ("stream", "whole")] + [followup]
-            failures = [r for r in should_finish if r["outcome"] != "complete" or r["samples"] == 0]
+            refusals = [r for r in should_finish if r["outcome"] == "http_503"]
+            failures = [
+                r for r in should_finish
+                if (r["outcome"] != "complete" or r["samples"] == 0)
+                and not (should_accept_refusals and r["outcome"] == "http_503")
+            ]
             is_round_ok = not failures and stats.get("active_slots") == 0
             is_ok = is_ok and is_round_ok
             record = {
@@ -188,7 +194,7 @@ def serve_rounds(
             print(
                 f"{time.strftime('%T')} {model} round {round_index} ok={is_round_ok} "
                 f"slot_waits={stats.get('slot_waits')} active={stats.get('active_slots')} "
-                f"fallbacks={stats.get('left_context_fallbacks')} failures={len(failures)}",
+                f"fallbacks={stats.get('left_context_fallbacks')} refusals={len(refusals)} failures={len(failures)}",
                 flush=True,
             )
     finally:
@@ -216,6 +222,11 @@ def main() -> None:
         "--engine-caps", type=int, nargs=2, default=None, metavar=("RUNNING", "QUEUED"),
         help="bound the engine instead of the codec slots, so requests wait in the coordinator",
     )
+    parser.add_argument("--server-arg", action="append", default=[], help="one more serve argument, repeatable")
+    parser.add_argument(
+        "--expect-refusals", action="store_true",
+        help="HTTP 503 is an expected outcome (a bounded waiting queue), not a failure",
+    )
     args = parser.parse_args()
     if args.engine_caps is None:
         server_args = [
@@ -228,7 +239,10 @@ def main() -> None:
             "--tts_engine.engine.max_queued_requests", str(args.engine_caps[1]),
         ]
     results = {
-        model: serve_rounds(args.tree, model, args.card, args.port + 200 * index, server_args, args.rounds, args.out)
+        model: serve_rounds(
+            args.tree, model, args.card, args.port + 200 * index, [*server_args, *args.server_arg], args.rounds,
+            args.out, args.expect_refusals,
+        )
         for index, model in enumerate(MODELS)
     }
     print(f"{time.strftime('%T')} slot_wait_serving {'PASS' if all(results.values()) else 'FAIL'} {results}", flush=True)
