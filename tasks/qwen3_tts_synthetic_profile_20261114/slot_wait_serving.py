@@ -72,7 +72,10 @@ def run_request(url: str, body: dict, kind: str, cancel_after_s: float | None = 
         with httpx.Client(timeout=timeout) as client:
             with client.stream("POST", f"{url}/v1/audio/speech", json=body) as response:
                 if response.status_code != 200:
-                    return {"kind": kind, "outcome": f"http_{response.status_code}", "samples": 0}
+                    return {
+                        "kind": kind, "outcome": f"http_{response.status_code}", "samples": 0,
+                        "first_byte_s": None, "total_s": time.monotonic() - start,
+                    }
                 else:
                     pass
                 for audio in response.iter_bytes():
