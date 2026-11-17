@@ -9,6 +9,7 @@ usage: python3 loop_pair.py --a-tree MAIN --b-tree BRANCH --out DIR
 
 import argparse
 import concurrent.futures
+import json
 import os
 import subprocess
 import sys
@@ -25,10 +26,19 @@ CELLS = (("c64", 64, 512), ("c16", 16, 320))
 LEDGER_SKIP_S = 1.0
 
 
-def launch(tree: Path, model: str, card: int, port: int, session: str, log: Path) -> subprocess.Popen:
+def launch(tree: Path, model: str, card: int, port: int, session: str, log: Path, should_trace_gil: bool) -> subprocess.Popen:
+    if should_trace_gil:
+        # note (ratish): lock waits per step for the ledger, and hold time per thread and marked function for gil_owners.py.
+        marks = log.parent / "marks_attribution.json"
+        marks.write_text(
+            json.dumps(json.loads((HERE / "marks.json").read_text()) + json.loads((HERE / "marks_capture.json").read_text()))
+        )
+        tracing = ["--trace=cuda,nvtx,osrt,python-gil", f"--python-functions-trace={marks}"]
+    else:
+        tracing = ["--trace=cuda,nvtx"]
     command = [
         "taskset", "-c", CARD_CPUS[card],
-        "nsys", "launch", f"--session-new={session}", "--trace=cuda,nvtx", "--cuda-graph-trace=node",
+        "nsys", "launch", f"--session-new={session}", *tracing, "--cuda-graph-trace=node",
         sys.executable, "-m", "sglang_omni.cli", "serve", "--model-path", model, "--host", "127.0.0.1",
         "--port", str(port), "--tts_engine.gpu", str(card), "--vocoder.gpu", str(card),
     ]
@@ -44,7 +54,10 @@ def launch(tree: Path, model: str, card: int, port: int, session: str, log: Path
         )
 
 
-def run_order(order: int, trees: dict[str, Path], cards: dict[str, int], model: str, extra: list[str], port: int, out: Path) -> None:
+def run_order(
+    order: int, trees: dict[str, Path], cards: dict[str, int], model: str, extra: list[str], port: int, out: Path,
+    should_trace_gil: bool,
+) -> None:
     ports = {"a": port, "b": port + 200}
     sessions = {arm: f"loop{order}{arm}" for arm in ("a", "b")}
     arm_outs = {arm: out / f"order{order}" / arm for arm in ("a", "b")}
@@ -54,7 +67,9 @@ def run_order(order: int, trees: dict[str, Path], cards: dict[str, int], model: 
             arm_outs[arm].mkdir(parents=True, exist_ok=True)
             identity = subprocess.check_output(["git", "rev-parse", "HEAD", "HEAD:sglang_omni"], cwd=trees[arm], text=True)
             (arm_outs[arm] / "tree.txt").write_text(f"{trees[arm]} card {cards[arm]}\n{identity}")
-            servers[arm] = launch(trees[arm], model, cards[arm], ports[arm], sessions[arm], arm_outs[arm] / "serve.log")
+            servers[arm] = launch(
+                trees[arm], model, cards[arm], ports[arm], sessions[arm], arm_outs[arm] / "serve.log", should_trace_gil
+            )
         for arm in ("a", "b"):
             wait_healthy(ports[arm], servers[arm])
         print(f"{time.strftime('%T')} order {order} healthy, a card {cards['a']}, b card {cards['b']}", flush=True)
@@ -101,6 +116,14 @@ def run_order(order: int, trees: dict[str, Path], cards: dict[str, int], model: 
                      "--skip-head-s", str(LEDGER_SKIP_S), "--skip-tail-s", str(LEDGER_SKIP_S)],
                     stdout=handle, stderr=subprocess.STDOUT, check=False,
                 )
+            if should_trace_gil:
+                with (arm_outs[arm] / f"gil_{cell}.txt").open("w") as handle:
+                    subprocess.run(
+                        [sys.executable, str(HERE / "gil_owners.py"), str(sqlite)],
+                        stdout=handle, stderr=subprocess.STDOUT, check=False,
+                    )
+            else:
+                pass
     print(f"{time.strftime('%T')} order {order} ledgers written", flush=True)
 
 
@@ -111,11 +134,12 @@ def main() -> None:
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--model", choices=sorted(MODELS), default="base")
     parser.add_argument("--port", type=int, default=25000)
+    parser.add_argument("--gil", action="store_true", help="add OS waits and interpreter lock tracing")
     args = parser.parse_args()
     model, extra = MODELS[args.model]
     trees = {"a": args.a_tree, "b": args.b_tree}
     for order, cards in enumerate(({"a": 0, "b": 1}, {"a": 1, "b": 0})):
-        run_order(order, trees, cards, model, extra, args.port, args.out)
+        run_order(order, trees, cards, model, extra, args.port, args.out, args.gil)
     print(f"{time.strftime('%T')} loop_pair done", flush=True)
 
 

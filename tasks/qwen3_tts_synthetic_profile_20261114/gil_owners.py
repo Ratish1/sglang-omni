@@ -9,7 +9,8 @@ from collections import defaultdict
 
 HOLDING = "Holding GIL"
 WAITING = "Waiting for GIL"
-STEP_PREFIX = "step["
+# note (ratish): the kit probe labels talker steps "step[...]", the loop probe "loop.step ...".
+STEP_PREFIX = ("step[", "loop.step")
 
 
 def load_ranges(connection: sqlite3.Connection) -> list[tuple[int, int, str, str]]:
