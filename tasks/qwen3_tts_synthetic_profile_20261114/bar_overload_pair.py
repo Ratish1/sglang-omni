@@ -23,6 +23,8 @@ DATASET = CLIENT_DIR / "tts_bench/datasets/seed-tts-eval.jsonl"
 RATE_TIMEOUT_S = 1800
 SETTLE_S = 30
 MEMORY_SAMPLE_S = 5
+ENGINE_THREAD = "scheduler-tts_e"
+PYSPY_WINDOW_S = 20
 
 
 def prepare_client() -> None:
@@ -47,6 +49,32 @@ def sample_gpu_memory(out: Path, stop_event: threading.Event) -> None:
             handle.write(f"{time.time():.0f},{','.join(used)}\n")
             handle.flush()
             stop_event.wait(MEMORY_SAMPLE_S)
+
+
+def engine_process(server: subprocess.Popen) -> int:
+    """The server process (same process group) that runs the talker's scheduler thread."""
+    for task in Path("/proc").glob("[0-9]*/task/[0-9]*/comm"):
+        try:
+            pid = int(task.parts[2])
+            if os.getpgid(pid) == server.pid and task.read_text().strip() == ENGINE_THREAD:
+                return pid
+            else:
+                pass
+        except (OSError, ValueError):
+            continue
+    raise RuntimeError(f"no {ENGINE_THREAD} thread under process group {server.pid}")
+
+
+def record_pyspy(server: subprocess.Popen, delay_s: int, out: Path) -> None:
+    """After delay_s, interpreter lock holders, then every thread's stacks, PYSPY_WINDOW_S each."""
+    time.sleep(delay_s)
+    pid = engine_process(server)
+    for mode, flag in (("gil", "--gil"), ("all", "--idle")):
+        subprocess.run(
+            ["py-spy", "record", "--pid", str(pid), flag, "--nonblocking", "--threads", "--rate", "100",
+             "--duration", str(PYSPY_WINDOW_S), "--format", "raw", "--output", f"{out}.{mode}.pyspy.txt"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT, check=False,
+        )
 
 
 def run_rate(port: int, model: str, rate: int, seed: int, out: Path, duration_s: int) -> int:
@@ -74,6 +102,7 @@ def main() -> None:
     parser.add_argument("--seeds", type=int, nargs="+", default=[0, 1, 2])
     parser.add_argument("--port", type=int, default=22000)
     parser.add_argument("--duration", type=int, default=120, help="measured seconds per rate")
+    parser.add_argument("--pyspy-at", type=int, default=None, help="seconds into each rate to start the py-spy windows")
     args = parser.parse_args()
     prepare_client()
     model, _ = MODELS["customvoice"]
@@ -99,6 +128,15 @@ def main() -> None:
                     target=sample_gpu_memory, args=(seed_out / f"gpu_memory_rps{rate}.csv", stop_event), daemon=True
                 )
                 sampler.start()
+                profilers = [
+                    threading.Thread(
+                        target=record_pyspy, args=(servers[arm], args.pyspy_at, seed_out / arm / f"rps{rate}"), daemon=True
+                    )
+                    for arm in ("a", "b")
+                    if args.pyspy_at is not None
+                ]
+                for profiler in profilers:
+                    profiler.start()
                 with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
                     futures = {
                         arm: pool.submit(run_rate, ports[arm], model, rate, seed, seed_out / arm / f"rps{rate}", args.duration)
@@ -107,6 +145,8 @@ def main() -> None:
                     codes = {arm: future.result() for arm, future in futures.items()}
                 stop_event.set()
                 sampler.join()
+                for profiler in profilers:
+                    profiler.join()
                 print(f"{time.strftime('%T')} seed {seed} rps {rate} rc {codes}", flush=True)
                 time.sleep(SETTLE_S)
         finally:
