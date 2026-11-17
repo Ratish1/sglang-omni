@@ -8,7 +8,7 @@ chunk. After the round, one streaming request on the idle server (no later relea
 waiter then). A request that should finish must return audio within REQUEST_TIMEOUT_S. After every round
 the vocoder's own codec stats must show no active slot and no waiting stream.
 
-usage: python3 slot_wait_serving.py --tree TREE --card N --out DIR [--slots 2] [--rounds 4]
+usage: python3 slot_wait_serving.py --tree TREE --card N --out DIR [--slots 1] [--rounds 6]
 """
 
 import argparse
@@ -18,7 +18,6 @@ import os
 import signal
 import subprocess
 import sys
-import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -32,17 +31,18 @@ MODELS = {
     "customvoice": "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice",
 }
 INPUTS = (
-    "The weather cleared just before we reached the station.",
-    "We took the long way home, stopping at the bakery to buy fresh bread and a small cake for later.",
-    "Please confirm the meeting time with the rest of the team before noon tomorrow.",
+    "We took the long way home that evening, stopping at the bakery to buy fresh bread and a small cake, and then walking along the river while the lights came on one by one.",
+    "Please confirm the meeting time with the rest of the team before noon tomorrow, and send the updated agenda to everyone who could not attend the last review.",
+    "The weather cleared just before we reached the station, so we waited on the platform and watched the trains arrive from the north while the sun went down.",
 )
 REFERENCE_TEXT = "It was the night before my birthday. Hooray! It's almost here! It may not be a holiday, but it's the best day of the year."
 REFERENCE_WAV = "docs/_static/audio/ref_voice.wav"
 REQUEST_TIMEOUT_S = 120
-CANCEL_BEFORE_AUDIO_S = 0.3
 HEALTH_TIMEOUT_S = 900
-# (kind, count) per round
-ROUND_MIX = (("stream", 14), ("whole", 2), ("cancel_before_audio", 3), ("drop_after_first_chunk", 3))
+# (kind, count) per round; a cancelling client's deadline is CANCEL_FIRST_S plus CANCEL_STEP_S per index
+ROUND_MIX = (("stream", 16), ("whole", 2), ("cancel_before_audio", 6), ("drop_after_first_chunk", 3))
+CANCEL_FIRST_S = 0.05
+CANCEL_STEP_S = 0.1
 
 
 def request_body(model: str, kind: str, index: int, tree: Path) -> dict:
@@ -61,23 +61,20 @@ def request_body(model: str, kind: str, index: int, tree: Path) -> dict:
     return body
 
 
-def run_request(url: str, body: dict, kind: str) -> dict:
+def run_request(url: str, body: dict, kind: str, cancel_after_s: float | None = None) -> dict:
+    """One request; a client with cancel_after_s gives up if no audio (headers come with the first audio) by then."""
     start = time.monotonic()
     first_byte_s = None
     received = 0
     outcome = "complete"
-    with httpx.Client(timeout=REQUEST_TIMEOUT_S) as client:
-        with client.stream("POST", f"{url}/v1/audio/speech", json=body) as response:
-            if response.status_code != 200:
-                return {"kind": kind, "outcome": f"http_{response.status_code}", "samples": 0}
-            else:
-                pass
-            if kind == "cancel_before_audio":
-                closer = threading.Timer(CANCEL_BEFORE_AUDIO_S, response.close)
-                closer.start()
-            else:
-                closer = None
-            try:
+    timeout = httpx.Timeout(REQUEST_TIMEOUT_S, read=cancel_after_s or REQUEST_TIMEOUT_S)
+    try:
+        with httpx.Client(timeout=timeout) as client:
+            with client.stream("POST", f"{url}/v1/audio/speech", json=body) as response:
+                if response.status_code != 200:
+                    return {"kind": kind, "outcome": f"http_{response.status_code}", "samples": 0}
+                else:
+                    pass
                 for audio in response.iter_bytes():
                     if first_byte_s is None:
                         first_byte_s = time.monotonic() - start
@@ -89,17 +86,8 @@ def run_request(url: str, body: dict, kind: str) -> dict:
                         break
                     else:
                         pass
-            except (httpx.StreamClosed, httpx.ReadError, httpx.RemoteProtocolError):
-                outcome = "cancelled"
-            finally:
-                if closer is not None:
-                    closer.cancel()
-                else:
-                    pass
-    if kind == "cancel_before_audio" and first_byte_s is None:
-        outcome = "cancelled"
-    else:
-        pass
+    except httpx.ReadTimeout:
+        outcome = "cancelled" if first_byte_s is None else "timed_out_mid_stream"
     return {
         "kind": kind,
         "outcome": outcome,
@@ -169,9 +157,17 @@ def serve_rounds(tree: Path, model: str, card: int, port: int, slots: int, round
         wait_healthy(url, server)
         kinds = [kind for kind, count in ROUND_MIX for _ in range(count)]
         for round_index in range(rounds):
+            deadlines = {}
+            for index, kind in enumerate(kinds):
+                if kind == "cancel_before_audio":
+                    deadlines[index] = CANCEL_FIRST_S + CANCEL_STEP_S * len(deadlines)
+                else:
+                    pass
             with ThreadPoolExecutor(max_workers=len(kinds)) as pool:
                 results = list(pool.map(
-                    lambda pair: run_request(url, request_body(model, pair[1], pair[0], tree), pair[1]),
+                    lambda pair: run_request(
+                        url, request_body(model, pair[1], pair[0], tree), pair[1], deadlines.get(pair[0])
+                    ),
                     enumerate(kinds),
                 ))
             followup = run_request(url, request_body(model, "stream", round_index, tree), "stream")
@@ -213,8 +209,8 @@ def main() -> None:
     parser.add_argument("--tree", type=Path, required=True)
     parser.add_argument("--card", type=int, default=0)
     parser.add_argument("--out", type=Path, required=True)
-    parser.add_argument("--slots", type=int, default=2)
-    parser.add_argument("--rounds", type=int, default=4)
+    parser.add_argument("--slots", type=int, default=1)
+    parser.add_argument("--rounds", type=int, default=6)
     parser.add_argument("--port", type=int, default=27000)
     args = parser.parse_args()
     results = {
