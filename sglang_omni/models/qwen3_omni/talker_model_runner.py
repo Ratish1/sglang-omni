@@ -100,6 +100,9 @@ class QwenTalkerModelRunner(ModelRunner["SGLangARRequestData"]):
                 os.environ.get("SGLANG_OMNI_DIAGNOSTIC_MOE_BATCHES") == "1"
             )
             request_ids_file = Path(os.environ["SGLANG_OMNI_CORPUS_REQUEST_ID_FILE"])
+            operator_request_ids_file = os.environ.get(
+                "SGLANG_OMNI_DIAGNOSTIC_OPERATOR_REQUEST_ID_FILE"
+            )
             pool = tp_worker.model_runner.token_to_kv_pool
             assert isinstance(pool, MHATokenToKVPool)
             self.model.conditioning_recorder = TalkerConditioningRecorder(
@@ -115,6 +118,11 @@ class QwenTalkerModelRunner(ModelRunner["SGLangARRequestData"]):
                     else None
                 ),
                 request_ids=frozenset(json.loads(request_ids_file.read_text())),
+                operator_request_ids=(
+                    frozenset(json.loads(Path(operator_request_ids_file).read_text()))
+                    if operator_request_ids_file is not None
+                    else None
+                ),
                 operator_recorders=self.model.backbone_recorders,
                 head_recorder=self.model.head_recorder,
                 retain_moe_batches=retain_moe_batches,

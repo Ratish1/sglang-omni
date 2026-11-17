@@ -27,6 +27,7 @@ class TalkerConditioningRecorder:
     predictor_values: torch.Tensor
     predictor_counters: torch.Tensor | None
     request_ids: frozenset[str] | None = None
+    operator_request_ids: frozenset[str] | None = None
     assistant_tokens: dict[str, list[int]] = field(default_factory=dict)
     future_rows: dict[str, list[torch.Tensor]] = field(default_factory=dict)
     previous_keys: dict[str, list[torch.Tensor]] = field(default_factory=dict)
@@ -38,6 +39,11 @@ class TalkerConditioningRecorder:
 
     def should_capture(self, request_id: str) -> bool:
         return self.request_ids is None or request_id in self.request_ids
+
+    def should_capture_operators(self, request_id: str) -> bool:
+        return (
+            self.operator_request_ids is None or request_id in self.operator_request_ids
+        )
 
     def record_prompt(
         self,
@@ -299,7 +305,11 @@ class TalkerConditioningRecorder:
                 },
                 destination / f"{frame_index:04d}-predictor.pt",
             )
-            if self.operator_recorders and (not is_extend or self.retain_moe_batches):
+            if (
+                self.operator_recorders
+                and self.should_capture_operators(request.request_id)
+                and (not is_extend or self.retain_moe_batches)
+            ):
                 step = int(self.operator_recorders[0].step_counter)
                 if is_extend:
                     assert forward_batch.forward_mode == ForwardMode.EXTEND
@@ -406,7 +416,7 @@ class TalkerConditioningRecorder:
         )
         self.previous_keys.pop(request_id)
         self.previous_values.pop(request_id)
-        if self.retain_moe_batches:
+        if self.retain_moe_batches and self.should_capture_operators(request_id):
             (self.directory / "moe-choices-final.json").write_text(
                 json.dumps(
                     [asdict(choice) for choice in self.moe_tactic_choices], indent=2
