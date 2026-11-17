@@ -10,13 +10,15 @@ Past the knee the server collapses: at 60 req/s of Poisson arrivals, 1.7B Custom
 
 ## Change
 
-With async decoding, a stream that finds the arena full now waits for a slot and keeps the incremental decoder.
+With async decoding, a stream that finds the arena full waits for a slot and keeps the incremental decoder.
 
-- `build_incremental_plan` queues the stream (`is_waiting_for_codec_slot`) instead of setting `incremental_codec_fallback`; a new stream queues behind streams already waiting, and a stream leaves the queue where it acquires its slot.
-- A slot returned to the arena schedules the first decode of the oldest waiting streams, one per slot the arena can hand out (`Qwen3TTSCodecStateArena.free_slots`).
-- A waiting stream is not rescheduled by its new chunks. One whose generation ends keeps the async finish instead of a synchronous whole decode on the message thread.
-- A stream whose incremental planning fails leaves the queue with its fallback, and a stream that ends leaves it with its other resources.
-- While no stream waits, none of this takes a lock. The synchronous decoder keeps the left-context fallback. The codec stats gain `slot_waits`.
+- `build_incremental_plan` parks the stream in `codec_slot_waiting_queue`, oldest first, instead of setting `incremental_codec_fallback`. A new stream parks behind streams already waiting.
+- The initial worker is the only place a parked stream gets a slot. `admit_waiting_streams` runs at the start and the end of every initial batch, claims a row for the oldest waiting streams while the arena has one, and queues their first decodes, so picking a stream and taking its row are one step on one thread.
+- A returned row only wakes that worker: `wake_codec_slot_admission` queues the oldest waiter's first decode unless one is pending. A stream that leaves before its turn holds no row and takes no turn.
+- Once CUDA decode is disabled, the waiting streams fail with the decoder error and a new stream takes the fallback, whose launch fails it.
+- A fault while the arena zeroes a row retires the row instead of dropping it from the count.
+- A waiting stream is not rescheduled by its new chunks, and one whose generation ends keeps the async finish.
+- The synchronous decoder keeps the left-context fallback. The codec stats gain `slot_waits`.
 
 ## Results
 
@@ -24,41 +26,34 @@ One H100 pair, main `ea8216220` against this branch, both servers at once with o
 
 The load is Nari Labs' open client unmodified (`tts_bench` `a2d65e1`): 1.7B CustomVoice, Ryan, English, the SeedTTS EN sentences, Poisson arrivals, 30 s warm-up and 120 s measured per rate.
 
-| req/s | seed | completed, main → branch | first byte p50, ms | audible first audio p50, ms | requests with underruns |
+| req/s | seed | completed, main → branch | first byte p50, ms | first byte p95, ms | requests with underruns |
 |---|---|---|---|---|---|
-| 60 | 0 | 1.1 % → 97.3 % | 57 → 24 | 351 → 103 | 2,030 → 31 |
-| 60 | 1 | 1.4 % → 100 % | 55 → 21 | 309 → 98 | 2,298 → 0 |
-| 60 | 2 | 1.7 % → 100 % | 52 → 20 | 305 → 97 | 2,317 → 0 |
-| 70 | 0 | 84.7 % → 99.5 % | 1,005 → 279 | 1,083 → 358 | 21 → 2 |
-| 70 | 1 | 84.3 % → 97.9 % | 975 → 371 | 1,053 → 450 | 39 → 2 |
-| 70 | 2 | 86.5 % → 99.2 % | 990 → 239 | 1,068 → 319 | 2 → 0 |
-| 80 | 0 | 22.7 % → 83.2 % | 1,022 → 833 | 1,101 → 911 | 1,534 → 1 |
-| 80 | 1 | 79.2 % → 93.0 % | 975 → 785 | 1,053 → 863 | 4 → 1 |
-| 80 | 2 | 77.1 % → 90.6 % | 992 → 816 | 1,071 → 893 | 6 → 0 |
+| 60 | 0 | 1.8 % → 100 % | 54 → 19 | 104 → 28 | 2,334 → 0 |
+| 60 | 1 | 98.0 % → 100 % | 20 → 20 | 31 → 29 | 157 → 0 |
+| 70 | 0 | 90.3 % → 100 % | 918 → 24 | 1,051 → 230 | 1 → 1 |
+| 70 | 1 | 89.7 % → 100 % | 943 → 24 | 1,065 → 325 | 6 → 6 |
+| 80 | 0 | 79.3 % → 92.8 % | 965 → 780 | 1,069 → 881 | 3 → 0 |
+| 80 | 1 | 78.9 % → 92.6 % | 981 → 798 | 1,095 → 894 | 10 → 0 |
 
-Main's first byte p50 at 60 req/s covers only the requests it completed. The branch's remaining failures are HTTP 503 at the 128 in-flight admission cap; no stream takes the left-context decoder (`left_context_fallbacks` 0, about 12,000 `slot_waits` per run).
+Main's latencies at 60 req/s seed 0 cover only the requests it completed. The branch's failures at 80 req/s are HTTP 503 at the 128 in-flight cap; no stream takes the left-context decoder (`left_context_fallbacks` 0, about 9,000 `slot_waits` per run).
 
-Below the knee the arena never fills, so no stream waits (`slot_waits` 0, no failed acquire) and every stream takes main's path. SeedTTS EN, 1.7B Base, the full 1,088 prompts, unseeded, on the same pair of cards with each server pinned to its card's half of the socket. c16 and c64 are eight warm readings each (four passes on the same servers in both card orders); c1 is one pass in both card orders.
+Few slots, every way a client uses a stream: one slot, 1.7B Base with a reference clip and 1.7B CustomVoice, six rounds each of 16 streams, 2 whole requests, 6 clients that give up before their first audio (0.05 to 0.55 s deadlines, while their streams wait) and 3 that drop after the first chunk, then one stream on the idle server. Every stream, whole request and idle follow-up returned full audio in every round, 114 and 112 streams waited, none fell back, and no slot stayed active.
 
-| cell | RTF, main → branch | first audio mean, ms | first audio p95, ms | req/s |
+Below the knee no stream waits (`slot_waits` 0) and every stream takes main's path. SeedTTS EN, 1.7B Base, the full 1,088 prompts, unseeded, six warm passes each (three on the same servers in both card orders):
+
+| cell | RTF, main → branch | first audio mean, ms | first audio median, ms | req/s |
 |---|---|---|---|---|
-| streaming c1 | 0.0605 → 0.0605 | 18.8 → 18.9 | 22.9 → 22.8 | 3.98 → 3.99 |
-| streaming c16 | 0.0972 → 0.0968 | 30.4 → 30.2 | 43.2 → 43.2 | 39.7 → 39.8 |
-| streaming c64 | 0.2267 → 0.2281 | 55.3 → 54.9 | 179.7 → 165.5 | 67.0 → 66.6 |
-| whole c1 | 0.0595 → 0.0595 | | | 4.06 → 4.07 |
-| whole c16 | 0.0900 → 0.0898 | | | 42.8 → 42.8 |
+| streaming c16 | 0.0955 → 0.0955 | 29.2 → 29.2 | 28.5 → 28.5 | 40.3 → 40.3 |
+| streaming c64 | 0.2216 → 0.2223 | 54.2 → 54.1 | 41.4 → 40.9 | 68.4 → 68.4 |
 
-Main against main in the same way on the same node reads streaming c16 RTF -0.1 % and streaming c64 RTF +0.3 % (single passes -1.4 % to +1.8 %).
-
-| streaming c16, full corpus | WER | speaker similarity | requests above 50 % WER |
-|---|---|---|---|
-| main | 1.06 % | 71.47 | 1 |
-| branch | 1.06 % | 71.54 | 0 |
+Main against main in the same way on the same node reads streaming c64 RTF +0.3 % (single passes -1.4 % to +1.8 %).
 
 ## Tests
 
-- `test_qwen3_tts_full_codec_arena_holds_a_stream_until_a_slot_frees`
+- `test_qwen3_tts_full_codec_arena_holds_a_stream_until_a_slot_frees`: a stream that finds the arena full and ends while parked streams every frame and one result once the slot frees, and the row is reused.
 - `test_qwen3_tts_new_stream_waits_behind_streams_already_waiting_for_a_slot`
-- `test_qwen3_tts_waiting_stream_leaves_the_queue_when_incremental_planning_fails`
-- `test_qwen3_tts_waiting_stream_keeps_async_finish_when_generation_ends`
-- `test_arena_free_slots_counts_only_slots_acquire_can_hand_out`
+- `test_qwen3_tts_slot_freed_while_a_stream_parks_goes_to_that_stream`: the slot returns between the failed acquire and the park.
+- `test_qwen3_tts_a_cancelled_waiter_hands_its_turn_to_the_next`
+- `test_qwen3_tts_waiting_streams_fail_once_the_decoder_is_disabled`
+- `test_qwen3_tts_waiting_stream_falls_back_when_its_slot_faults`
+- `test_arena_withdraws_a_slot_whose_zeroing_faults`
