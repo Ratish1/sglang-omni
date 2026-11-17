@@ -7,6 +7,7 @@ from __future__ import annotations
 import logging
 import os
 from dataclasses import replace
+from functools import partial
 from pathlib import Path
 from typing import Iterable, Optional, Tuple
 
@@ -46,6 +47,9 @@ from sglang_omni.models.qwen3_omni.layer_operand_capture import (
     LayerOperandRecorder,
     MoeTacticChoice,
     observe_moe_tactics,
+)
+from sglang_omni.models.qwen3_omni.rotary_rounding import (
+    forward_rotary_without_contraction,
 )
 from sglang_omni.platforms import current_platform
 from sglang_omni.quantization import get_weight_preprocessor
@@ -900,6 +904,22 @@ class Qwen3OmniTalker(nn.Module):
             quant_config=quant_config,
             prefix=add_prefix("model", prefix),
         )
+        self.is_rotary_fp_fusion_enabled = (
+            os.environ.get("SGLANG_OMNI_DIAGNOSTIC_DISABLE_ROTARY_FP_FUSION") != "1"
+        )
+        if self.is_rotary_fp_fusion_enabled:
+            pass
+        else:
+            assert get_fused_op_backend() is None
+            for layer in self.model.layers:
+                rotary = layer.self_attn.rotary_emb
+                assert type(rotary) is MRotaryEmbedding
+                assert (
+                    not rotary._force_native and rotary.mrope_section
+                )  # noqa: leading-underscore -- external rotary dispatch contract
+                rotary.forward_triton = partial(
+                    forward_rotary_without_contraction, rotary=rotary
+                )
         if os.environ.get("SGLANG_OMNI_DIAGNOSTIC_CHECKPOINT_SHARED_ACTIVATION") == "1":
             for layer in self.model.layers:
                 activation = layer.mlp.shared_expert.act_fn

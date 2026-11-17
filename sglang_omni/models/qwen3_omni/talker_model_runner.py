@@ -389,6 +389,7 @@ class QwenTalkerModelRunner(ModelRunner["SGLangARRequestData"]):
                 (destination / "native-talker-buffer-runtime.json").write_text(
                     json.dumps(
                         {
+                            "rotary_fp_fusion_enabled": self.model.is_rotary_fp_fusion_enabled,
                             "predictor_fused_layers": self.model.predictor_fused_layers
                             is not None,
                             "predictor_layer_shape": (
