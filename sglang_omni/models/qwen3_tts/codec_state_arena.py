@@ -45,6 +45,7 @@ class CodecStateStats(TypedDict, total=False):
     exhausted: int
     enabled: bool
     left_context_fallbacks: int
+    slot_waits: int
     cuda_graphs: CodecCudaGraphStats
 
 
@@ -150,6 +151,11 @@ class Qwen3TTSCodecStateArena:
                 - len(self.free)
                 - sum(slot < self._num_slots for slot in self.retired)
             )  # noqa: leading-underscore
+
+    def free_slots(self) -> int:
+        """Slots an acquire can hand out now."""
+        with self.lock:
+            return len(self.free)
 
     def acquire(self) -> int | None:
         """Take a zeroed slot, or ``None`` when the arena is full."""
