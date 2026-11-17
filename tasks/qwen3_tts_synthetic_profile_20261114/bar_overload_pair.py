@@ -10,6 +10,7 @@ import argparse
 import concurrent.futures
 import os
 import subprocess
+import threading
 import time
 from pathlib import Path
 
@@ -19,8 +20,9 @@ from served_baseline import MODELS, wait_healthy
 CLIENT_DIR = Path("/data/tts_bench_src")
 CLIENT_COMMIT = "a2d65e1"
 DATASET = CLIENT_DIR / "tts_bench/datasets/seed-tts-eval.jsonl"
-RATE_TIMEOUT_S = 900
+RATE_TIMEOUT_S = 1800
 SETTLE_S = 30
+MEMORY_SAMPLE_S = 5
 
 
 def prepare_client() -> None:
@@ -34,12 +36,25 @@ def prepare_client() -> None:
     subprocess.run(["uv", "run", "-q", "bench", "dataset", "prepare"], cwd=CLIENT_DIR / "tts_bench", check=True)
 
 
-def run_rate(port: int, model: str, rate: int, seed: int, out: Path) -> int:
+def sample_gpu_memory(out: Path, stop_event: threading.Event) -> None:
+    """Every card's used memory every MEMORY_SAMPLE_S while a rate runs, one CSV row per sample."""
+    with out.open("w") as handle:
+        while not stop_event.is_set():
+            used = subprocess.run(
+                ["nvidia-smi", "--query-gpu=memory.used", "--format=csv,noheader,nounits"],
+                capture_output=True, text=True, check=False,
+            ).stdout.split()
+            handle.write(f"{time.time():.0f},{','.join(used)}\n")
+            handle.flush()
+            stop_event.wait(MEMORY_SAMPLE_S)
+
+
+def run_rate(port: int, model: str, rate: int, seed: int, out: Path, duration_s: int) -> int:
     out.parent.mkdir(parents=True, exist_ok=True)
     command = [
         "taskset", "-c", CLIENT_CPUS, "uv", "run", "-q", "bench", "run", "--target", "sglang-omni",
         "--base-url", f"http://127.0.0.1:{port}", "--model", model, "--voice", "Ryan", "--language", "English",
-        "--dataset", "datasets/seed-tts-eval.jsonl", "--rps", str(rate), "--warmup", "30s", "--duration", "120s",
+        "--dataset", "datasets/seed-tts-eval.jsonl", "--rps", str(rate), "--warmup", "30s", "--duration", f"{duration_s}s",
         "--arrival", "poisson", "--seed", str(seed), "--timeout", "120s", "--max-in-flight", "4096",
         "--output", str(out),
     ]
@@ -58,6 +73,7 @@ def main() -> None:
     parser.add_argument("--rates", type=int, nargs="+", default=[60, 70, 80])
     parser.add_argument("--seeds", type=int, nargs="+", default=[0, 1, 2])
     parser.add_argument("--port", type=int, default=22000)
+    parser.add_argument("--duration", type=int, default=120, help="measured seconds per rate")
     args = parser.parse_args()
     prepare_client()
     model, _ = MODELS["customvoice"]
@@ -77,12 +93,20 @@ def main() -> None:
                 wait_healthy(ports[arm], servers[arm])
             print(f"{time.strftime('%T')} seed {seed} healthy, a card {cards['a']}, b card {cards['b']}", flush=True)
             for rate in args.rates:
+                stop_event = threading.Event()
+                (seed_out / f"cards_rps{rate}.txt").write_text(f"a card {cards['a']}, b card {cards['b']}\n")
+                sampler = threading.Thread(
+                    target=sample_gpu_memory, args=(seed_out / f"gpu_memory_rps{rate}.csv", stop_event), daemon=True
+                )
+                sampler.start()
                 with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
                     futures = {
-                        arm: pool.submit(run_rate, ports[arm], model, rate, seed, seed_out / arm / f"rps{rate}")
+                        arm: pool.submit(run_rate, ports[arm], model, rate, seed, seed_out / arm / f"rps{rate}", args.duration)
                         for arm in ("a", "b")
                     }
                     codes = {arm: future.result() for arm, future in futures.items()}
+                stop_event.set()
+                sampler.join()
                 print(f"{time.strftime('%T')} seed {seed} rps {rate} rc {codes}", flush=True)
                 time.sleep(SETTLE_S)
         finally:
