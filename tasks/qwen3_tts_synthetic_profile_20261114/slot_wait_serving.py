@@ -137,14 +137,14 @@ def wait_healthy(url: str, server: subprocess.Popen) -> None:
     raise TimeoutError("server never became healthy")
 
 
-def serve_rounds(tree: Path, model: str, card: int, port: int, slots: int, rounds: int, out: Path) -> bool:
+def serve_rounds(
+    tree: Path, model: str, card: int, port: int, server_args: list[str], rounds: int, out: Path
+) -> bool:
     url = f"http://127.0.0.1:{port}"
     command = [
         "taskset", "-c", CARD_CPUS[card], sys.executable, "-m", "sglang_omni.cli", "serve",
         "--model-path", MODELS[model], "--host", "127.0.0.1", "--port", str(port),
-        "--tts_engine.gpu", str(card), "--vocoder.gpu", str(card),
-        "--tts_engine.engine.max_running_requests", "16",
-        "--vocoder.factory.codec_state_slots", str(slots),
+        "--tts_engine.gpu", str(card), "--vocoder.gpu", str(card), *server_args,
     ]
     out.mkdir(parents=True, exist_ok=True)
     is_ok = True
@@ -212,9 +212,23 @@ def main() -> None:
     parser.add_argument("--slots", type=int, default=1)
     parser.add_argument("--rounds", type=int, default=6)
     parser.add_argument("--port", type=int, default=27000)
+    parser.add_argument(
+        "--engine-caps", type=int, nargs=2, default=None, metavar=("RUNNING", "QUEUED"),
+        help="bound the engine instead of the codec slots, so requests wait in the coordinator",
+    )
     args = parser.parse_args()
+    if args.engine_caps is None:
+        server_args = [
+            "--tts_engine.engine.max_running_requests", "16",
+            "--vocoder.factory.codec_state_slots", str(args.slots),
+        ]
+    else:
+        server_args = [
+            "--tts_engine.engine.max_running_requests", str(args.engine_caps[0]),
+            "--tts_engine.engine.max_queued_requests", str(args.engine_caps[1]),
+        ]
     results = {
-        model: serve_rounds(args.tree, model, args.card, args.port + 200 * index, args.slots, args.rounds, args.out)
+        model: serve_rounds(args.tree, model, args.card, args.port + 200 * index, server_args, args.rounds, args.out)
         for index, model in enumerate(MODELS)
     }
     print(f"{time.strftime('%T')} slot_wait_serving {'PASS' if all(results.values()) else 'FAIL'} {results}", flush=True)
