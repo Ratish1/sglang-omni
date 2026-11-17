@@ -1108,6 +1108,120 @@ def test_coordinator_rejects_submit_when_in_flight_cap_is_reached() -> None:
     asyncio.run(run())
 
 
+def waiting_coordinator(
+    max_waiting_requests: int | None,
+) -> tuple[Coordinator, RecordingCoordinatorControlPlane]:
+    coordinator = Coordinator(
+        "inproc://complete",
+        "inproc://abort",
+        entry_stage="preprocess",
+        max_in_flight=1,
+        max_waiting_requests=max_waiting_requests,
+    )
+    control_plane = RecordingCoordinatorControlPlane()
+    coordinator.control_plane = control_plane
+    coordinator.register_stage("preprocess", "inproc://preprocess")
+    return coordinator, control_plane
+
+
+async def let_submits_run() -> None:
+    for _ in range(5):
+        await asyncio.sleep(0)
+
+
+def submitted_ids(control_plane: RecordingCoordinatorControlPlane) -> list[str]:
+    return [msg.request_id for _, _, msg in control_plane.submitted]
+
+
+def test_coordinator_holds_submits_past_the_in_flight_cap_and_admits_them_oldest_first() -> (
+    None
+):
+    async def run() -> None:
+        coordinator, control_plane = waiting_coordinator(None)
+        await coordinator.submit_request("req-1", "hello")
+        second = asyncio.create_task(coordinator.submit_request("req-2", "hello"))
+        await let_submits_run()
+        third = asyncio.create_task(coordinator.submit_request("req-3", "hello"))
+        await let_submits_run()
+
+        assert submitted_ids(control_plane) == ["req-1"]
+        assert coordinator.request_id_is_reserved("req-3")
+
+        await coordinator.handle_completion(
+            CompleteMessage("req-1", "preprocess", True, result={"ok": True})
+        )
+        await second
+        await let_submits_run()
+        assert submitted_ids(control_plane) == ["req-1", "req-2"]
+        assert not third.done()
+
+        await coordinator.handle_completion(
+            CompleteMessage("req-2", "preprocess", True, result={"ok": True})
+        )
+        await third
+        assert submitted_ids(control_plane) == ["req-1", "req-2", "req-3"]
+
+    asyncio.run(run())
+
+
+def test_coordinator_rejects_submits_past_the_waiting_bound() -> None:
+    async def run() -> None:
+        coordinator, control_plane = waiting_coordinator(1)
+        await coordinator.submit_request("req-1", "hello")
+        waiting = asyncio.create_task(coordinator.submit_request("req-2", "hello"))
+        await let_submits_run()
+
+        with pytest.raises(QueueFullError, match="The request queue is full"):
+            await coordinator.submit_request("req-3", "hello")
+
+        assert not coordinator.request_id_is_reserved("req-3")
+        waiting.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await waiting
+
+    asyncio.run(run())
+
+
+def test_cancelled_waiting_submit_passes_its_turn_to_the_next() -> None:
+    async def run() -> None:
+        coordinator, control_plane = waiting_coordinator(None)
+        await coordinator.submit_request("req-1", "hello")
+        cancelled = asyncio.create_task(coordinator.submit_request("req-2", "hello"))
+        await let_submits_run()
+        later = asyncio.create_task(coordinator.submit_request("req-3", "hello"))
+        await let_submits_run()
+
+        cancelled.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await cancelled
+        await coordinator.handle_completion(
+            CompleteMessage("req-1", "preprocess", True, result={"ok": True})
+        )
+        await later
+
+        assert submitted_ids(control_plane) == ["req-1", "req-3"]
+        assert not coordinator.request_id_is_reserved("req-2")
+
+    asyncio.run(run())
+
+
+def test_waiting_submit_fails_when_the_coordinator_fails() -> None:
+    async def run() -> None:
+        coordinator, control_plane = waiting_coordinator(None)
+        await coordinator.submit_request("req-1", "hello")
+        waiting = asyncio.create_task(coordinator.submit_request("req-2", "hello"))
+        await let_submits_run()
+
+        await coordinator.fail_pending_requests("stage died")
+
+        with pytest.raises(RuntimeError, match="stage died"):
+            await waiting
+        assert submitted_ids(control_plane) == ["req-1"]
+        assert not coordinator.request_id_is_reserved("req-2")
+
+    asyncio.run(run())
+
+
 def test_coordinator_rejects_bounded_stream_queue() -> None:
     async def run() -> None:
         coordinator = Coordinator(

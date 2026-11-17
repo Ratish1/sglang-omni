@@ -6,6 +6,7 @@ import logging
 import os
 import time
 import uuid
+from collections import deque
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field, replace
 from typing import AsyncIterator, TypedDict
@@ -141,6 +142,7 @@ class Coordinator(SessionGraphRunner):
         logical_process_plan: LogicalProcessPlan | None = None,
         binding_policy: BindingPolicy | None = None,
         max_in_flight: int | None = None,
+        max_waiting_requests: int | None = 0,
         max_total_backlog_bytes: int | None = None,
         session_route: Callable[[], list[str]] | None = None,
         session_graph: SessionGraph | None = None,
@@ -157,9 +159,12 @@ class Coordinator(SessionGraphRunner):
             replica_topology: Logical stage to expanded instance mapping.
             logical_process_plan: Compiled Process topology; the coordinator
                 selects one replica per replicated Process from it.
-            max_in_flight: If set, reject new submits once this many requests
-                are already tracked. Intended as generation capacity
-                (max_running_requests + max_queued_requests).
+            max_in_flight: If set, at most this many requests are tracked at
+                once. Intended as generation capacity (max_running_requests +
+                max_queued_requests).
+            max_waiting_requests: Submits past max_in_flight that may wait,
+                oldest first, for a tracked request to leave; past it a submit
+                is rejected. None waits without a bound, 0 rejects at once.
             max_total_backlog_bytes: If set, once all streams together hold
                 more undelivered bytes than this, fail the streams whose
                 readers have been idle longest until the total fits.
@@ -200,6 +205,15 @@ class Coordinator(SessionGraphRunner):
             else:
                 pass
             self.max_in_flight = value
+        if max_waiting_requests is not None and max_waiting_requests < 0:
+            raise ValueError("max_waiting_requests must be >= 0")
+        else:
+            pass
+        self.max_waiting_requests = max_waiting_requests
+        # note (ratish): requests holding an in-flight slot, and submits waiting for one oldest first; a freed slot is granted to the oldest live waiter.
+        self.admitted_request_ids: set[str] = set()
+        self.admission_waiters: deque[tuple[str, asyncio.Future[None]]] = deque()
+        self.waiting_submit_ids: set[str] = set()
 
         # Control plane
         self.control_plane = CoordinatorControlPlane(
@@ -277,7 +291,9 @@ class Coordinator(SessionGraphRunner):
                 )
             else:
                 pass
-        self.requests.clear()
+        # note (ratish): each freed slot wakes one waiting submit, which sees fatal_error and frees it again.
+        for request_id in list(self.requests):
+            self.forget_request(request_id)
         self.partial_results.clear()
         # Note (Junnan Li): Session pumps await request futures; wake them before waiting for cleanup.
         await self.fail_sessions(message)
@@ -586,22 +602,6 @@ class Coordinator(SessionGraphRunner):
         else:
             pass
 
-        if (
-            not should_bypass_admission
-            and self.max_in_flight is not None
-            and sum(info.counts_toward_admission for info in self.requests.values())
-            >= self.max_in_flight
-        ):
-            logger.warning(
-                "Rejecting request %s before pipeline submit: in-flight cap "
-                "(max_in_flight=%s)",
-                request_id,
-                self.max_in_flight,
-            )
-            raise QueueFullError()
-        else:
-            pass
-
         if not isinstance(request, OmniRequest):
             request = OmniRequest(inputs=request)
         else:
@@ -624,9 +624,7 @@ class Coordinator(SessionGraphRunner):
         else:
             pass
         entry_info = self.stages[entry_instance]
-
-        # Track request
-        self.requests[request_id] = RequestInfo(
+        request_info = RequestInfo(
             request_id=request_id,
             state=RequestState.PENDING,
             current_stage=self.entry_stage,
@@ -635,8 +633,15 @@ class Coordinator(SessionGraphRunner):
                 if terminal_stages is None
                 else terminal_stages
             ),
-            counts_toward_admission=not should_bypass_admission,
         )
+        # Note (Junnan Li): A session's close and its persistent read bypass admission and hold no in-flight slot.
+        if not should_bypass_admission:
+            await self.acquire_admission(request_id)
+        else:
+            pass
+
+        # Track request
+        self.requests[request_id] = request_info
 
         # Create future for completion
         loop = asyncio.get_running_loop()
@@ -677,7 +682,7 @@ class Coordinator(SessionGraphRunner):
             # Serialization runs before the socket send, and a ZMQ send either
             # queues the whole message or raises. No stage holds this request,
             # so it is dropped without an abort that would retire its ID there.
-            self.requests.pop(request_id, None)
+            self.forget_request(request_id)
             await self.release_submission(request_id, future)
             raise
         except BaseException:
@@ -734,10 +739,73 @@ class Coordinator(SessionGraphRunner):
         """Return whether any coordinator owner still holds this request ID."""
         return (
             request_id in self.requests
+            or request_id in self.waiting_submit_ids
             or request_id in self.completion_futures
             or request_id in self.stream_queues
             or request_id in self.abort_tasks
         )
+
+    def has_free_in_flight_slot(self) -> bool:
+        return (
+            self.max_in_flight is None
+            or len(self.admitted_request_ids) < self.max_in_flight
+        )
+
+    async def acquire_admission(self, request_id: str) -> None:
+        """Take an in-flight slot, behind the submits already waiting for one while all are taken."""
+        if not self.admission_waiters and self.has_free_in_flight_slot():
+            self.admitted_request_ids.add(request_id)
+            return
+        elif (
+            self.max_waiting_requests is not None
+            and len(self.waiting_submit_ids) >= self.max_waiting_requests
+        ):
+            logger.warning(
+                f"Rejecting request {request_id} before pipeline submit: in-flight cap "
+                f"(max_in_flight={self.max_in_flight}, max_waiting_requests={self.max_waiting_requests})"
+            )
+            raise QueueFullError()
+        else:
+            pass
+        waiter: asyncio.Future[None] = asyncio.get_running_loop().create_future()
+        self.admission_waiters.append((request_id, waiter))
+        self.waiting_submit_ids.add(request_id)
+        try:
+            await waiter
+        except BaseException:
+            if waiter.done() and not waiter.cancelled():
+                # note (ratish): granted a slot, then cancelled before submitting, so the slot goes to the next waiter.
+                self.forget_request(request_id)
+            else:
+                pass
+            raise
+        finally:
+            self.waiting_submit_ids.discard(request_id)
+        if self.fatal_error is not None:
+            self.forget_request(request_id)
+            raise RuntimeError(self.fatal_error)
+        else:
+            pass
+
+    def grant_waiting_submits(self) -> None:
+        """Give free in-flight slots to the oldest waiting submits, skipping cancelled ones."""
+        while self.admission_waiters and self.has_free_in_flight_slot():
+            request_id, waiter = self.admission_waiters.popleft()
+            if waiter.done():
+                continue
+            else:
+                pass
+            self.admitted_request_ids.add(request_id)
+            waiter.set_result(None)
+
+    def forget_request(self, request_id: str) -> None:
+        """Stop tracking a request and give its in-flight slot to the oldest waiting submit."""
+        self.requests.pop(request_id, None)
+        if request_id in self.admitted_request_ids:
+            self.admitted_request_ids.discard(request_id)
+            self.grant_waiting_submits()
+        else:
+            pass
 
     def reject_completion_future(
         self,
@@ -828,7 +896,7 @@ class Coordinator(SessionGraphRunner):
         else:
             pass
 
-        self.requests.pop(request_id, None)
+        self.forget_request(request_id)
         self.partial_results.pop(request_id, None)
 
         logger.info("Coordinator aborted req=%s", request_id)
@@ -954,7 +1022,7 @@ class Coordinator(SessionGraphRunner):
                     exc_info=True,
                 )
             else:
-                self.requests.pop(request_id, None)
+                self.forget_request(request_id)
             self.partial_results.pop(request_id, None)
             self.reject_completion_future(
                 request_id, QueueFullError.from_message(msg.error)
@@ -993,7 +1061,7 @@ class Coordinator(SessionGraphRunner):
                     pass
             else:
                 pass
-            self.requests.pop(request_id, None)
+            self.forget_request(request_id)
             if request_id in self.stream_queues:
                 await self.queue_stream_message(request_id, msg)
             else:
@@ -1020,7 +1088,7 @@ class Coordinator(SessionGraphRunner):
                     pass
             else:
                 pass
-            self.requests.pop(request_id, None)
+            self.forget_request(request_id)
         else:
             pass
 

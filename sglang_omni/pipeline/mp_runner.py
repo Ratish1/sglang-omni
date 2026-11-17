@@ -782,6 +782,7 @@ class MultiProcessPipelineRunner:
                 replica_topology=prep.replica_topology,
                 logical_process_plan=prep.logical_process_plan,
                 max_in_flight=max_in_flight,
+                max_waiting_requests=self.config.admission.max_waiting_requests,
                 max_total_backlog_bytes=stream_delivery.max_total_backlog_bytes,
                 session_route=(
                     self.config.session_route if session_graph is None else None
@@ -795,8 +796,8 @@ class MultiProcessPipelineRunner:
             )
             if max_in_flight is not None:
                 logger.info(
-                    "Coordinator in-flight cap=%s (generation running+queued)",
-                    max_in_flight,
+                    f"Coordinator in-flight cap={max_in_flight} (generation running+queued), "
+                    f"max_waiting_requests={self.config.admission.max_waiting_requests}"
                 )
             else:
                 pass

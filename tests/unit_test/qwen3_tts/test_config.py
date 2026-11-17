@@ -30,6 +30,16 @@ def test_vocoder_platform_default_keeps_npu_opt_in(
     assert config.stage_factory_kwargs("vocoder") == expected
 
 
+def test_requests_past_the_in_flight_cap_wait_without_a_bound() -> None:
+    config = Qwen3TTSPipelineConfig(model_path="model")
+
+    assert config.admission.max_waiting_requests is None
+    assert config.generation_admission_defaults() == {
+        "max_running_requests": 64,
+        "max_queued_requests": 64,
+    }
+
+
 def test_admission_defaults_load_without_the_engine() -> None:
     script = (
         "import sys\n"

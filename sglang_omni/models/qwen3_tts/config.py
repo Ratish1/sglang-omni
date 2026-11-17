@@ -21,7 +21,7 @@ from sglang_omni.config.runtime import (
     resolve_stage_factory_kwargs,
     resolve_stage_typed_kwargs,
 )
-from sglang_omni.config.schema import stage_process_name
+from sglang_omni.config.schema import AdmissionConfig, stage_process_name
 from sglang_omni.platforms import current_platform
 from sglang_omni.serve.protocol import CreateSpeechRequest
 from sglang_omni.serve.server_warmup import warmup_tone_wav_bytes
@@ -72,6 +72,8 @@ class Qwen3TTSPipelineConfig(PipelineConfig):
         }
 
     model_path: str
+    # note (ratish): past the in-flight cap a request waits before preprocessing, holding no engine work or device memory, so none is refused.
+    admission: AdmissionConfig = AdmissionConfig(max_waiting_requests=None)
     # note (0xtoward): Keep deterministic inference opt-in because it serializes
     # preprocessing and vocoder decoding and disables the vocoder CUDA graphs,
     # reducing throughput.
