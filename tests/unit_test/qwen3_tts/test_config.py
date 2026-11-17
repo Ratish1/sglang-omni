@@ -43,6 +43,16 @@ def test_codec_arena_holds_every_request_the_coordinator_admits() -> None:
     ] == resolve_coordinator_max_in_flight(config, logical_process_plan=plan)
 
 
+def test_requests_past_the_in_flight_cap_wait_without_a_bound() -> None:
+    config = Qwen3TTSPipelineConfig(model_path="model")
+
+    assert config.admission.max_waiting_requests is None
+    assert config.generation_admission_defaults() == {
+        "max_running_requests": 64,
+        "max_queued_requests": 64,
+    }
+
+
 def test_admission_defaults_load_without_the_engine() -> None:
     script = (
         "import sys\n"

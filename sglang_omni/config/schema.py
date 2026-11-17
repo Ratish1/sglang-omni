@@ -646,6 +646,16 @@ class StreamDeliveryConfig(BaseModel):
     max_total_backlog_bytes: int | None = Field(default=1024 * 1024 * 1024, ge=1)
 
 
+class AdmissionConfig(BaseModel):
+    """Requests that may wait in the coordinator, before preprocessing, once the in-flight cap is reached.
+
+    None waits without a bound. 0 rejects every request past the cap at once.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+    max_waiting_requests: int | None = Field(default=0, ge=0)
+
+
 @dataclass(frozen=True)
 class ResolvedAudioChunking:
     """The merged long-audio contract the transcription handlers consume.
@@ -791,6 +801,7 @@ class PipelineConfig(BaseModel):
     model_path: str
     audio_chunking: AudioChunkingConfig = Field(default_factory=AudioChunkingConfig)
     stream_delivery: StreamDeliveryConfig = Field(default_factory=StreamDeliveryConfig)
+    admission: AdmissionConfig = Field(default_factory=AdmissionConfig)
     stages: list[StageConfig]
     name: str | None = None
     entry_stage: str | None = None
