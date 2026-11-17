@@ -66,15 +66,22 @@ def engine_process(server: subprocess.Popen) -> int:
 
 
 def record_pyspy(server: subprocess.Popen, delay_s: int, out: Path) -> None:
-    """After delay_s, interpreter lock holders, then every thread's stacks, PYSPY_WINDOW_S each."""
+    """After delay_s, interpreter lock holders in the engine process and in the API process (the server's own pid)
+    over the same window, then every engine thread's stacks, PYSPY_WINDOW_S each."""
     time.sleep(delay_s)
     pid = engine_process(server)
+    api = subprocess.Popen(
+        ["py-spy", "record", "--pid", str(server.pid), "--gil", "--nonblocking", "--threads", "--rate", "100",
+         "--duration", str(PYSPY_WINDOW_S), "--format", "raw", "--output", f"{out}.api.pyspy.txt"],
+        stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT,
+    )
     for mode, flag in (("gil", "--gil"), ("all", "--idle")):
         subprocess.run(
             ["py-spy", "record", "--pid", str(pid), flag, "--nonblocking", "--threads", "--rate", "100",
              "--duration", str(PYSPY_WINDOW_S), "--format", "raw", "--output", f"{out}.{mode}.pyspy.txt"],
             stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT, check=False,
         )
+    api.wait(timeout=PYSPY_WINDOW_S * 4)
 
 
 def run_rate(port: int, model: str, rate: int, seed: int, out: Path, duration_s: int) -> int:
