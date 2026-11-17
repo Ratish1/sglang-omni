@@ -27,6 +27,7 @@ def main() -> None:
     parser.add_argument("--concurrency", type=int, required=True)
     parser.add_argument("--request-id", action="append")
     parser.add_argument("--capture-request-id", action="append")
+    parser.add_argument("--operator-request-id", action="append")
     parser.add_argument("--capture-token-rows", type=int, default=112)
     parser.add_argument("--capture-talker-operators", action="store_true")
     parser.add_argument("--capture-all-conditioning", action="store_true")
@@ -69,6 +70,7 @@ def main() -> None:
         arguments.capture_all_conditioning
         or arguments.capture_request_id is not None
         or arguments.capture_talker_operators
+        or arguments.operator_request_id is not None
         or arguments.reference_predictor_mode is not None
     ):
         raise ValueError("No-capture mode cannot request tensor or predictor capture")
@@ -98,7 +100,6 @@ def main() -> None:
     elif arguments.capture_all_conditioning and (
         arguments.request_id is not None
         or arguments.capture_request_id is not None
-        or arguments.capture_talker_operators
         or arguments.reference_predictor_mode is not None
         or arguments.control != ["original"]
     ):
@@ -118,6 +119,20 @@ def main() -> None:
         or arguments.reference_predictor_mode is not None
     ):
         raise ValueError("Selected receiver capture requires native Talker controls")
+    else:
+        pass
+    if arguments.operator_request_id is not None and not (
+        arguments.capture_all_conditioning and arguments.capture_talker_operators
+    ):
+        raise ValueError(
+            "Operator request IDs require whole-population receiver capture"
+        )
+    elif arguments.capture_all_conditioning and (
+        arguments.capture_talker_operators and arguments.operator_request_id is None
+    ):
+        raise ValueError(
+            "Whole-population receiver capture requires selected operators"
+        )
     else:
         pass
     arguments.output_directory.mkdir(exist_ok=False)
@@ -190,6 +205,12 @@ def main() -> None:
     )
     assert set(capture_request_ids) <= traffic_request_ids
     selected_ids.write_text(json.dumps(capture_request_ids))
+    if arguments.operator_request_id is not None:
+        assert set(arguments.operator_request_id) <= set(capture_request_ids)
+        operator_ids = arguments.output_directory / "operator-request-ids.json"
+        operator_ids.write_text(json.dumps(sorted(set(arguments.operator_request_id))))
+    else:
+        operator_ids = None
     if arguments.request_id is not None:
         assert {
             request_id
@@ -262,6 +283,12 @@ def main() -> None:
                     "SGLANG_OMNI_DIAGNOSTIC_MOE_BATCHES": "1",
                 }
             )
+            if operator_ids is not None:
+                diagnostic_environment[
+                    "SGLANG_OMNI_DIAGNOSTIC_OPERATOR_REQUEST_ID_FILE"
+                ] = str(operator_ids)
+            else:
+                pass
         else:
             pass
         if arguments.reference_predictor_mode is not None:
