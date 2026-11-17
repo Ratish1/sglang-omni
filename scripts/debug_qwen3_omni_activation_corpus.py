@@ -37,6 +37,7 @@ def main() -> None:
     parser.add_argument("--no-capture", dest="is_capture_disabled", action="store_true")
     parser.add_argument("--contribution-source-directory", type=Path)
     parser.add_argument("--gemm1-profile", type=int)
+    parser.add_argument("--disable-rotary-fp-fusion", action="store_true")
     parser.add_argument(
         "--shared-activation-semantics",
         choices=("native", "checkpoint"),
@@ -266,6 +267,12 @@ def main() -> None:
         if arguments.shared_activation_semantics == "checkpoint":
             diagnostic_environment[
                 "SGLANG_OMNI_DIAGNOSTIC_CHECKPOINT_SHARED_ACTIVATION"
+            ] = "1"
+        else:
+            pass
+        if arguments.disable_rotary_fp_fusion:
+            diagnostic_environment[
+                "SGLANG_OMNI_DIAGNOSTIC_DISABLE_ROTARY_FP_FUSION"
             ] = "1"
         else:
             pass
