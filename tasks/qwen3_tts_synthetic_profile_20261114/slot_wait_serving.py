@@ -143,6 +143,7 @@ def wait_healthy(url: str, server: subprocess.Popen) -> None:
 def serve_rounds(
     tree: Path, model: str, card: int, port: int, server_args: list[str], rounds: int, out: Path,
     should_accept_refusals: bool,
+    round_mix: tuple[tuple[str, int], ...],
 ) -> bool:
     url = f"http://127.0.0.1:{port}"
     command = [
@@ -159,7 +160,7 @@ def serve_rounds(
         )
     try:
         wait_healthy(url, server)
-        kinds = [kind for kind, count in ROUND_MIX for _ in range(count)]
+        kinds = [kind for kind, count in round_mix for _ in range(count)]
         for round_index in range(rounds):
             deadlines = {}
             for index, kind in enumerate(kinds):
@@ -188,7 +189,7 @@ def serve_rounds(
             is_ok = is_ok and is_round_ok
             record = {
                 "model": model, "round": round_index, "ok": is_round_ok, "failures": failures,
-                "outcomes": {kind: [r["outcome"] for r in results if r["kind"] == kind] for kind, _ in ROUND_MIX},
+                "outcomes": {kind: [r["outcome"] for r in results if r["kind"] == kind] for kind, _ in round_mix},
                 "followup": followup, "codec_state": stats,
                 "max_first_byte_s": max((r["first_byte_s"] or 0) for r in should_finish),
             }
@@ -230,23 +231,33 @@ def main() -> None:
         "--expect-refusals", action="store_true",
         help="HTTP 503 is an expected outcome (a bounded waiting queue), not a failure",
     )
+    parser.add_argument(
+        "--burst", type=int, default=0,
+        help="instead of the mixed round, this many streams at once on the default server settings",
+    )
+    parser.add_argument("--models", nargs="+", choices=sorted(MODELS), default=list(MODELS))
     args = parser.parse_args()
-    if args.engine_caps is None:
+    if args.burst > 0:
+        server_args: list[str] = []
+        round_mix: tuple[tuple[str, int], ...] = (("stream", args.burst),)
+    elif args.engine_caps is None:
         server_args = [
             "--tts_engine.engine.max_running_requests", "16",
             "--vocoder.factory.codec_state_slots", str(args.slots),
         ]
+        round_mix = ROUND_MIX
     else:
         server_args = [
             "--tts_engine.engine.max_running_requests", str(args.engine_caps[0]),
             "--tts_engine.engine.max_queued_requests", str(args.engine_caps[1]),
         ]
+        round_mix = ROUND_MIX
     results = {
         model: serve_rounds(
             args.tree, model, args.card, args.port + 200 * index, [*server_args, *args.server_arg], args.rounds,
-            args.out, args.expect_refusals,
+            args.out, args.expect_refusals, round_mix,
         )
-        for index, model in enumerate(MODELS)
+        for index, model in enumerate(args.models)
     }
     print(f"{time.strftime('%T')} slot_wait_serving {'PASS' if all(results.values()) else 'FAIL'} {results}", flush=True)
 
