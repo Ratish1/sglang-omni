@@ -17,10 +17,12 @@ Two SGLang generation-stage knobs bound the engine, and one server option sets w
 | Knob | Meaning | Qwen3-TTS default |
 |---|---|---|
 | `--tts_engine.engine.max_running_requests` | Concurrent running slots | `64` |
-| `--tts_engine.engine.max_queued_requests` | Engine waiting-queue depth | `64` |
+| `--tts_engine.engine.max_queued_requests` | Requests queued in the engine behind the running ones | `64` |
 | `--admission.max_waiting_requests` | Requests that may wait past `running + queued` | `none`, no limit |
 
-Every request enters the engine waiting queue first, so `max_queued_requests` must be **≥ 1**. Once `running + queued` requests are in flight, a new request waits in the server before preprocessing, and the oldest waiting request starts when an in-flight request finishes. A waiting request holds no engine work or device memory. With `--admission.max_waiting_requests N`, a request that finds N requests already waiting gets HTTP **503** (`The request queue is full.`), and `0` refuses every request past the cap at once. A request can still get 503 later if the AR waiting queue or request-build backlog is full. Qwen3-TTS defaults to 4 request-build workers with pending depth 16.
+Once `running + queued` requests are in flight, a new request waits in the server before preprocessing, and the oldest waiting request starts when an in-flight request finishes. A waiting request holds no engine work or device memory. With `--admission.max_waiting_requests N`, a request that finds N requests already waiting gets HTTP **503** (`The request queue is full.`), and `0` refuses every request past the cap at once. Qwen3-TTS defaults to 4 request-build workers with pending depth 16.
+
+By default the engine queue has no bound of its own, since the in-flight cap already holds it. Setting `max_queued_requests` also bounds the engine queue, which must then be **≥ 1** and refuses a burst past it with HTTP 503 even while running slots are free.
 
 A finished request no longer counts toward that capacity, but its streamed audio waits in the API process until the client reads it. `--stream_delivery.max_total_backlog_bytes` caps the undelivered stream bytes all requests may hold together, per API process (default `1073741824`, 1 GiB; `none` turns it off).
 

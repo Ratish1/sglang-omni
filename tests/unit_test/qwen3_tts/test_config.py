@@ -11,6 +11,7 @@ from sglang_omni.config.schema import EngineArgs, FactoryArgs, ProcessConfig
 from sglang_omni.config.topology import compile_logical_processes
 from sglang_omni.models.qwen3_tts import config as qwen3_tts_config
 from sglang_omni.models.qwen3_tts.config import Qwen3TTSPipelineConfig
+from sglang_omni.models.qwen3_tts.engine_builder import Qwen3TtsEngineBuilder
 from sglang_omni.pipeline.mp_runner import resolve_coordinator_max_in_flight
 from sglang_omni.platforms.cuda import CUDAOmniPlatform
 from sglang_omni.platforms.npu import NPUOmniPlatform
@@ -43,14 +44,15 @@ def test_codec_arena_holds_every_request_the_coordinator_admits() -> None:
     ] == resolve_coordinator_max_in_flight(config, logical_process_plan=plan)
 
 
-def test_requests_past_the_in_flight_cap_wait_without_a_bound() -> None:
+def test_only_the_coordinator_bounds_admission_by_default() -> None:
     config = Qwen3TTSPipelineConfig(model_path="model")
+    plan, _ = compile_logical_processes(config)
 
     assert config.admission.max_waiting_requests is None
-    assert config.generation_admission_defaults() == {
-        "max_running_requests": 64,
-        "max_queued_requests": 64,
-    }
+    assert resolve_coordinator_max_in_flight(config, logical_process_plan=plan) == 128
+    assert "max_queued_requests" not in Qwen3TtsEngineBuilder().generation_defaults(
+        dtype="bfloat16"
+    )
 
 
 def test_admission_defaults_load_without_the_engine() -> None:
