@@ -162,6 +162,7 @@ def main() -> None:
     parser.add_argument("--paired-native-projection-controls", action="store_true")
     parser.add_argument("--checkpoint-query-key-normalization", action="store_true")
     parser.add_argument("--paired-native-rotary-controls", action="store_true")
+    parser.add_argument("--disable-rotary-fp-fusion", action="store_true")
     parser.add_argument(
         "--paired-native-routing-controls",
         action="store_true",
@@ -207,6 +208,13 @@ def main() -> None:
     )
     parser.add_argument("--output-directory", type=Path, required=True)
     arguments = parser.parse_args()
+    if arguments.disable_rotary_fp_fusion and not (
+        arguments.paired_native_rotary_controls
+        or arguments.paired_native_routing_controls
+    ):
+        raise ValueError("Rotary fusion control requires the native rotary operation")
+    else:
+        pass
     if (
         arguments.round_residual_before_normalization
         or arguments.round_normalized_before_weight
@@ -505,7 +513,9 @@ def main() -> None:
         else:
             pass
         rotary_control = NativeBackboneRotary(
-            reference, arguments.native_predictor_capture_directory
+            reference,
+            arguments.native_predictor_capture_directory,
+            is_fp_fusion_enabled=not arguments.disable_rotary_fp_fusion,
         )
         rotary_control.install()
     else:
@@ -1504,6 +1514,11 @@ def main() -> None:
                 "attention_projection_mode": projection_mode,
                 "checkpoint_query_key_normalization": arguments.checkpoint_query_key_normalization,
                 "rotary_mode": rotary_mode,
+                "native_rotary_fp_fusion_enabled": (
+                    not arguments.disable_rotary_fp_fusion
+                    if rotary_mode == "native"
+                    else None
+                ),
                 "routing_mode": routing_mode,
                 "native_rotary_calls": rotary_control.calls if rotary_control else 0,
                 "native_projection_calls": (

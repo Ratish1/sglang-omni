@@ -6,7 +6,8 @@ from functools import partial
 from pathlib import Path
 
 import torch
-from sglang.kernels.ops.attention.rotary_triton import triton_mrope_fused
+import triton
+from sglang.kernels.ops.attention.rotary_triton import _triton_mrope_forward_fused
 from torch.utils.hooks import RemovableHandle
 from transformers.models.qwen3_omni_moe import modeling_qwen3_omni_moe
 from transformers.models.qwen3_omni_moe.configuration_qwen3_omni_moe import (
@@ -32,6 +33,8 @@ class NativeRotaryOperation:
         configuration: Qwen3OmniMoeTalkerTextConfig,
         capture_directory: Path,
         device: torch.device,
+        *,
+        is_fp_fusion_enabled: bool = True,
     ) -> None:
         scaling = normalize_rope_scaling(configuration.rope_parameters)
         assert scaling is not None
@@ -60,6 +63,7 @@ class NativeRotaryOperation:
         self.sections: list[int] = sections
         self.interleaved: bool = interleaved
         self.runtime: NativeRotaryModule = runtime
+        self.is_fp_fusion_enabled: bool = is_fp_fusion_enabled
         assert runtime.class_name == "MRotaryEmbedding"
         assert runtime.is_neox_style and not runtime.use_fallback_kernel
         assert runtime.head_size == runtime.rotary_dim == self.head_dimensions
@@ -99,18 +103,29 @@ class NativeRotaryOperation:
         )
         native_query.copy_(query)
         native_key.copy_(key)
-        triton_mrope_fused(
+        query_heads = query_dimensions // self.head_dimensions
+        key_heads = key_dimensions // self.head_dimensions
+        _triton_mrope_forward_fused[(len(query),)](
             native_query,
             native_key,
             self.cache,
             positions,
-            self.sections,
+            native_query.stride(0),
+            native_key.stride(0),
+            positions.stride(0),
+            query_heads,
+            key_heads,
             self.head_dimensions,
             self.head_dimensions,
+            triton.next_power_of_2(query_heads),
+            triton.next_power_of_2(key_heads),
+            triton.next_power_of_2(self.head_dimensions),
+            *self.sections,
             self.interleaved,
             False,
             True,
             None,
+            enable_fp_fusion=self.is_fp_fusion_enabled,
         )
         return native_query, native_key
 
@@ -120,10 +135,15 @@ class NativeBackboneRotary:
         self,
         reference: Qwen3OmniMoeTalkerForConditionalGeneration,
         capture_directory: Path,
+        *,
+        is_fp_fusion_enabled: bool,
     ) -> None:
         self.reference: Qwen3OmniMoeTalkerForConditionalGeneration = reference
         self.operation: NativeRotaryOperation = NativeRotaryOperation(
-            reference.config.text_config, capture_directory, reference.device
+            reference.config.text_config,
+            capture_directory,
+            reference.device,
+            is_fp_fusion_enabled=is_fp_fusion_enabled,
         )
         self.enabled: bool = False
         self.calls: int = 0
