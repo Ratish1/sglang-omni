@@ -75,6 +75,15 @@ class PredictorProjectionNorm:
 
 
 @dataclass(kw_only=True)
+class NormalizationOverride:
+    call_number: int
+    token_row: int
+    expected_residual: torch.Tensor
+    applied: bool = False
+    changed_values: int = 0
+
+
+@dataclass(kw_only=True)
 class NativeNormalization:
     reference: Qwen3OmniMoeTalkerForConditionalGeneration
     round_residual_before_normalization: bool = False
@@ -88,6 +97,7 @@ class NativeNormalization:
     mlp_output: torch.Tensor | None = None
     boundary_calls: int = 0
     query_key_calls: int = 0
+    override: NormalizationOverride | None = None
     handles: list[RemovableHandle] = field(default_factory=list)
 
     def install(self) -> None:
@@ -115,15 +125,17 @@ class NativeNormalization:
         rounded_sum: torch.Tensor,
         weight: torch.Tensor,
         epsilon: float,
+        checkpoint_output: torch.Tensor,
     ) -> torch.Tensor:
         assert (
             contribution.dtype == residual.dtype == rounded_sum.dtype == torch.bfloat16
         )
         if self.use_checkpoint_boundary_kernel:
             self.boundary_calls += 1
-            return rmsnorm_hf(
+            normalized = rmsnorm_hf(
                 rounded_sum.reshape(-1, weight.numel()).contiguous(), weight, epsilon
             ).view_as(rounded_sum)
+            return self.apply_override(normalized, checkpoint_output, rounded_sum)
         else:
             pass
         if self.round_residual_before_normalization:
@@ -150,6 +162,37 @@ class NativeNormalization:
         self.boundary_calls += 1
         return normalized.view_as(rounded_sum)
 
+    def apply_override(
+        self,
+        native_output: torch.Tensor,
+        checkpoint_output: torch.Tensor,
+        residual: torch.Tensor,
+    ) -> torch.Tensor:
+        if self.override is None or self.boundary_calls != self.override.call_number:
+            return native_output
+        else:
+            pass
+        assert not self.override.applied
+        assert native_output.shape == checkpoint_output.shape == residual.shape
+        assert native_output.dtype == checkpoint_output.dtype == torch.bfloat16
+        width = residual.shape[-1]
+        token_row = self.override.token_row
+        expected = self.override.expected_residual.to(residual.device)
+        assert 0 <= token_row < residual.numel() // width
+        assert expected.dtype == residual.dtype and expected.shape == (width,)
+        assert torch.equal(
+            residual.reshape(-1, width)[token_row].view(torch.uint8),
+            expected.view(torch.uint8),
+        )
+        result = native_output.clone()
+        shadow = checkpoint_output.reshape(-1, width)[token_row]
+        selected = result.reshape(-1, width)[token_row]
+        self.override.changed_values = int(torch.count_nonzero(selected != shadow))
+        assert self.override.changed_values > 0
+        selected.copy_(shadow)
+        self.override.applied = True
+        return result
+
     def input_norm(
         self,
         module: Qwen3OmniMoeThinkerTextRMSNorm,
@@ -164,11 +207,12 @@ class NativeNormalization:
         if module is self.reference.model.layers[0].input_layernorm:
             self.boundary_calls += 1
             if self.use_checkpoint_boundary_kernel:
-                return rmsnorm_hf(
+                normalized = rmsnorm_hf(
                     inputs[0].reshape(-1, module.weight.numel()).contiguous(),
                     module.weight,
                     module.variance_epsilon,
                 ).view_as(output)
+                return self.apply_override(normalized, output, inputs[0])
             elif self.round_normalized_before_weight:
                 normalized = rmsnorm(
                     inputs[0].reshape(-1, module.weight.numel()),
@@ -190,6 +234,7 @@ class NativeNormalization:
                 inputs[0],
                 module.weight,
                 module.variance_epsilon,
+                output,
             )
 
     def capture_attention(
@@ -219,6 +264,7 @@ class NativeNormalization:
             inputs[0],
             module.weight,
             module.variance_epsilon,
+            output,
         ).view_as(output)
 
     def capture_mlp(
@@ -263,4 +309,5 @@ class NativeNormalization:
             inputs[0],
             module.weight,
             module.variance_epsilon,
+            output,
         ).view_as(output)

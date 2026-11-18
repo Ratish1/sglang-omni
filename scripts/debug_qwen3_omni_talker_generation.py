@@ -27,6 +27,7 @@ from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import (
 
 from scripts.debug_qwen3_omni_normalization import (
     NativeNormalization,
+    NormalizationOverride,
     PredictorProjectionNorm,
 )
 from scripts.debug_qwen3_omni_predictor_cache import NativePredictorReplay
@@ -83,6 +84,7 @@ def main() -> None:
         default="checkpoint",
     )
     parser.add_argument("--paired-normalization-controls", action="store_true")
+    parser.add_argument("--normalization-override-file", type=Path)
     parser.add_argument("--round-residual-before-normalization", action="store_true")
     parser.add_argument("--round-normalized-before-weight", action="store_true")
     parser.add_argument(
@@ -211,6 +213,17 @@ def main() -> None:
     )
     parser.add_argument("--output-directory", type=Path, required=True)
     arguments = parser.parse_args()
+    if arguments.normalization_override_file is not None:
+        assert arguments.normalization_semantics == "checkpoint-boundary"
+        assert not arguments.paired_normalization_controls
+        overrides = torch.load(
+            arguments.normalization_override_file, map_location="cpu", weights_only=True
+        )
+        assert set(overrides) == {
+            directory.name for directory in arguments.trace_directory
+        }
+    else:
+        overrides = None
     if arguments.disable_rotary_fp_fusion and not (
         arguments.paired_native_rotary_controls
         or arguments.paired_native_routing_controls
@@ -777,6 +790,19 @@ def main() -> None:
                 residual_policy == "sampled"
             )
             normalization.boundary_calls = 0
+            normalization.override = (
+                NormalizationOverride(**overrides[trace_directory.name])
+                if overrides is not None
+                else None
+            )
+            if normalization.override is not None:
+                assert (
+                    1
+                    <= normalization.override.call_number
+                    <= (2 * len(reference.model.layers) + 1)
+                )
+            else:
+                pass
             if predictor_attention is not None:
                 predictor_attention.enable()
             else:
@@ -1494,6 +1520,20 @@ def main() -> None:
                 )
             else:
                 pass
+            if normalization.override is not None:
+                assert normalization.override.applied
+                assert normalization.boundary_calls == len(frame_reports) * (
+                    2 * len(reference.model.layers) + 1
+                )
+                override_report = {
+                    "call_number": normalization.override.call_number,
+                    "token_row": normalization.override.token_row,
+                    "changed_values": normalization.override.changed_values,
+                    "input_bytes_exact": True,
+                    "applied_once": True,
+                }
+            else:
+                override_report = None
             report = {
                 "model_revision": arguments.model_revision,
                 "frame_limit": frame_limit,
@@ -1526,6 +1566,7 @@ def main() -> None:
                     else None
                 ),
                 "normalization_semantics": normalization_mode,
+                "normalization_override": override_report,
                 "round_residual_before_normalization": arguments.round_residual_before_normalization,
                 "round_normalized_before_weight": arguments.round_normalized_before_weight,
                 "expert_mode": expert_mode,
