@@ -15,8 +15,8 @@ With async decoding, a stream that finds the arena full waits for a slot and kee
 - `build_incremental_plan` parks the stream in `codec_slot_waiting_queue`, oldest first, instead of setting `incremental_codec_fallback`. A new stream parks behind streams already waiting.
 - The initial worker is the only place a parked stream gets a slot. `admit_waiting_streams` runs at the start and the end of every initial batch, claims a row for the oldest waiting streams while the arena has one, and queues their first decodes, so picking a stream and taking its row are one step on one thread.
 - A returned row only wakes that worker: `wake_codec_slot_admission` queues the oldest waiter's first decode unless one is pending. A stream that leaves before its turn holds no row and takes no turn.
-- Once CUDA decode is disabled, the waiting streams fail with the decoder error and a new stream takes the fallback, whose launch fails it.
-- A fault while the arena zeroes a row retires the row instead of dropping it from the count.
+- A stream waits only while a live owner can return a row. Once CUDA decode is disabled, each waiting stream's error and abort commit under the lock that takes it off the queue, so a stream whose generation ends meanwhile is never finished synchronously, and a new stream takes the fallback, whose launch fails it.
+- A fault while the arena zeroes a row retires the row instead of dropping it from the count. Once every stream row is retired (`usable_slots()` reaches 0, which never grows back), the waiting streams and every later stream take the left-context decoder, which still runs.
 - A waiting stream is not rescheduled by its new chunks, and one whose generation ends keeps the async finish.
 - The synchronous decoder keeps the left-context fallback. The codec stats gain `slot_waits`.
 
@@ -54,6 +54,6 @@ Main against main in the same way on the same node reads streaming c64 RTF +0.3 
 - `test_qwen3_tts_new_stream_waits_behind_streams_already_waiting_for_a_slot`
 - `test_qwen3_tts_slot_freed_while_a_stream_parks_goes_to_that_stream`: the slot returns between the failed acquire and the park.
 - `test_qwen3_tts_a_cancelled_waiter_hands_its_turn_to_the_next`
-- `test_qwen3_tts_waiting_streams_fail_once_the_decoder_is_disabled`
-- `test_qwen3_tts_waiting_stream_falls_back_when_its_slot_faults`
-- `test_arena_withdraws_a_slot_whose_zeroing_faults`
+- `test_qwen3_tts_waiting_streams_fail_once_the_decoder_is_disabled`: two waiters, the second one's generation ends as soon as the lock is released; each gets one error and no synchronous decode runs.
+- `test_qwen3_tts_streams_take_the_fallback_once_the_last_slot_faults`: the only row faults on reset with a stream behind the faulted one; the faulted stream, the one behind it and a later stream each stream every sample and one result.
+- `test_arena_withdraws_a_slot_whose_zeroing_faults`: a held row keeps `usable_slots()` at 1 while `acquire()` returns `None`; the last row faulting brings it to 0.
