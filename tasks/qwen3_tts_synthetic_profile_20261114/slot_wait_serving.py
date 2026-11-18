@@ -235,11 +235,18 @@ def main() -> None:
         "--burst", type=int, default=0,
         help="instead of the mixed round, this many streams at once on the default server settings",
     )
+    parser.add_argument(
+        "--scale", type=int, default=0,
+        help="instead of the few-slot round, the mixed round with every count times this on the default server settings",
+    )
     parser.add_argument("--models", nargs="+", choices=sorted(MODELS), default=list(MODELS))
     args = parser.parse_args()
     if args.burst > 0:
         server_args: list[str] = []
         round_mix: tuple[tuple[str, int], ...] = (("stream", args.burst),)
+    elif args.scale > 0:
+        server_args = []
+        round_mix = tuple((kind, count * args.scale) for kind, count in ROUND_MIX)
     elif args.engine_caps is None:
         server_args = [
             "--tts_engine.engine.max_running_requests", "16",

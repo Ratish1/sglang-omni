@@ -33,6 +33,9 @@ PROCESS_SAMPLE_S = 2
 HEALTH_TIMEOUT_S = 30
 ENGINE_THREAD = "scheduler-tts_e"
 GC_PROBE_DIR = Path(__file__).resolve().parent / "gc_probe"
+CLIENT_WARMUP_S = 30
+# the API process's object census is taken after the measured window, so its cost lands on no measured request
+CENSUS_AFTER_WINDOW_S = 5
 PYSPY_WINDOW_S = 20
 
 
@@ -167,7 +170,7 @@ def run_rate(
     command = [
         "taskset", "-c", CLIENT_CPUS, "uv", "run", "-q", "bench", "run", "--target", "sglang-omni",
         "--base-url", f"http://127.0.0.1:{port}", "--model", model, "--voice", "Ryan", "--language", "English",
-        "--dataset", "datasets/seed-tts-eval.jsonl", "--rps", str(rate), "--warmup", "30s", "--duration", f"{duration_s}s",
+        "--dataset", "datasets/seed-tts-eval.jsonl", "--rps", str(rate), "--warmup", f"{CLIENT_WARMUP_S}s", "--duration", f"{duration_s}s",
         "--arrival", "poisson", "--seed", str(seed), "--timeout", "120s", "--max-in-flight", "4096",
         "--output", str(out),
     ]
@@ -247,6 +250,16 @@ def main() -> None:
                 ]
                 for profiler in profilers:
                     profiler.start()
+                census_timers = [
+                    threading.Timer(
+                        CLIENT_WARMUP_S + args.duration + CENSUS_AFTER_WINDOW_S,
+                        (seed_out / arm / "server.census").touch,
+                    )
+                    for arm in ("a", "b")
+                    if args.gc_probe
+                ]
+                for census_timer in census_timers:
+                    census_timer.start()
                 with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
                     futures = {
                         arm: pool.submit(
@@ -264,6 +277,8 @@ def main() -> None:
                 sampler.join()
                 for process_sampler in process_samplers:
                     process_sampler.join()
+                for census_timer in census_timers:
+                    census_timer.cancel()
                 for profiler in profilers:
                     profiler.join()
                 print(f"{time.strftime('%T')} seed {seed} rps {rate} rc {codes}", flush=True)
