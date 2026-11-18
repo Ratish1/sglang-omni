@@ -138,7 +138,10 @@ from sglang_omni.serve.speech_streaming import (
     create_streaming_wav_header,
     speech_pcm_chunk_bytes,
 )
-from sglang_omni.serve.speech_to_text import complete_unless_disconnected
+from sglang_omni.serve.speech_to_text import (
+    complete_unless_disconnected,
+    wait_for_request_disconnect,
+)
 from sglang_omni.serve.speech_voices import SpeakerSampleStore
 from sglang_omni.serve.speech_ws import SpeechWebSocketSession
 from sglang_omni.serve.streaming import STREAM_DONE_SENTINEL
@@ -152,7 +155,6 @@ from sglang_omni.serve.transcriptions import LongAudioAdmission, register_transc
 from sglang_omni.serve.translations import register_translations
 
 logger = logging.getLogger(__name__)
-HTTP_DISCONNECT_POLL_INTERVAL_S = 0.05
 HTTP_DISCONNECT_CANCEL_TIMEOUT_S = 0.1
 
 
@@ -2408,11 +2410,6 @@ def discard_cancelled_task_result(
         pass
     except Exception:
         logger.debug("Cancelled request task finished with an error", exc_info=True)
-
-
-async def wait_for_request_disconnect(request: Request) -> None:
-    while not await request.is_disconnected():
-        await asyncio.sleep(HTTP_DISCONNECT_POLL_INTERVAL_S)
 
 
 async def abort_and_close_speech_stream(

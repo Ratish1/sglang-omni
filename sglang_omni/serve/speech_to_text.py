@@ -45,7 +45,6 @@ from sglang_omni.serve.transcription_adapters.base import TranscriptionAdapter
 from sglang_omni.utils.g711 import resolve_g711_encoding, wrap_g711_as_wav
 
 logger = logging.getLogger(__name__)
-HTTP_DISCONNECT_POLL_INTERVAL_S = 0.05
 HTTP_DISCONNECT_CANCEL_TIMEOUT_S = 0.1
 DEFAULT_RESPONSE_FORMATS = frozenset({"json", "text", "verbose_json"})
 DEFAULT_STREAMING_RESPONSE_FORMATS = frozenset({"json", "text"})
@@ -542,8 +541,11 @@ def discard_cancelled_task_result(
 
 
 async def wait_for_request_disconnect(request: Request) -> None:
-    while not await request.is_disconnected():
-        await asyncio.sleep(HTTP_DISCONNECT_POLL_INTERVAL_S)
+    """Return once the client disconnects; the caller has already read the request body."""
+    # note (ratish): one waiting receive per request costs nothing until the client leaves, where a poll each would load the event loop with every request held before its response.
+    message = await request.receive()
+    while message["type"] != "http.disconnect":
+        message = await request.receive()
 
 
 async def abort_and_close_speech_to_text_stream(
