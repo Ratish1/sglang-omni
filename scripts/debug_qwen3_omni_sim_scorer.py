@@ -17,6 +17,7 @@ from benchmarks.metrics.speaker_similarity import WavLMSpeakerSimilarity, load_a
 from benchmarks.metrics.speaker_similarity_assets import (
     ensure_speaker_similarity_assets,
 )
+from benchmarks.tasks.tts import SPEAKER_SIMILARITY_BATCH_SIZE
 from scripts.debug_qwen3_omni_sim_bisect import Case, read_history
 
 ARMS = (
@@ -49,6 +50,18 @@ class PaddingProbe(TypedDict):
 class EncoderArguments(TypedDict):
     padding_mask: torch.Tensor
     layer: int | None
+
+
+def exact_encoder_arguments(
+    inputs: tuple[torch.Tensor],
+    arguments: EncoderArguments,
+    feature_frame_counts: list[int],
+) -> tuple[tuple[torch.Tensor], EncoderArguments]:
+    device = inputs[0].device
+    positions = torch.arange(inputs[0].shape[1], device=device)
+    lengths = torch.tensor(feature_frame_counts, device=device)
+    arguments["padding_mask"] = positions >= lengths[:, None]
+    return inputs, arguments
 
 
 def probe_padding(
@@ -84,17 +97,6 @@ def probe_padding(
     ) -> None:
         unmasked_frames.append((~arguments["padding_mask"][0]).sum().item())
 
-    def replace_mask(
-        _module: nn.Module,
-        inputs: tuple[torch.Tensor],
-        arguments: EncoderArguments,
-    ) -> tuple[tuple[torch.Tensor], EncoderArguments]:
-        padding_mask = arguments["padding_mask"]
-        positions = torch.arange(inputs[0].shape[1], device=padding_mask.device)
-        lengths = torch.tensor(feature_frame_counts, device=padding_mask.device)
-        arguments["padding_mask"] = positions >= lengths[:, None]
-        return inputs, arguments
-
     hooks = [
         layer.register_forward_hook(
             lambda _module, _inputs, output, layer_name=name, frame_count=frames: (
@@ -112,7 +114,11 @@ def probe_padding(
         equal_length = scorer.embed([short_audio_path, short_audio_path])
         mixed_length = scorer.embed([short_audio_path, long_audio_path])
         mask_override = upstream.encoder.register_forward_pre_hook(
-            replace_mask, with_kwargs=True, prepend=True
+            lambda _module, inputs, arguments: exact_encoder_arguments(
+                inputs, arguments, feature_frame_counts
+            ),
+            with_kwargs=True,
+            prepend=True,
         )
         try:
             exact_mask = scorer.embed([short_audio_path, long_audio_path])
@@ -161,6 +167,8 @@ def main() -> None:
     )
     reports = []
     sample_counts: dict[str, int] = {}
+    reference_paths: list[str] = []
+    generation_paths: dict[str, list[str]] = {"early": [], "late": []}
     for row in manifest["cases"]:
         case = Case(
             sample_id=row["sample_id"],
@@ -173,6 +181,7 @@ def main() -> None:
             == row["reference_sha256"]
         )
         reference_path = str(case.reference)
+        reference_paths.append(reference_path)
         sample_counts[reference_path] = load_audio(reference_path).numel()
         reference_embedding = scorer.embed([reference_path])[0]
         scores: dict[str, float] = {}
@@ -180,6 +189,10 @@ def main() -> None:
         for arm in ARMS:
             history = read_history(run_directory / arm, case, forced=False)
             audio_path = str(history.waveform)
+            if arm in generation_paths:
+                generation_paths[arm].append(audio_path)
+            else:
+                pass
             sample_counts[audio_path] = load_audio(audio_path).numel()
             if history.waveform_sha256 not in scores_by_sha:
                 embedding = scorer.embed([audio_path])[0]
@@ -197,8 +210,48 @@ def main() -> None:
         min(sample_counts, key=sample_counts.__getitem__),
         max(sample_counts, key=sample_counts.__getitem__),
     )
+    batch_reports: dict[str, dict[str, list[float]]] = {}
+    indices = list(range(len(reference_paths)))
+    encoder = scorer.model.feature_extract.model.encoder
+    for arm, audio_paths in generation_paths.items():
+        for order, batch_indices in (
+            ("manifest", indices),
+            ("rotated", indices[1:] + indices[:1]),
+        ):
+            current_scores = [0.0] * len(indices)
+            corrected_scores = [0.0] * len(indices)
+            for start in range(0, len(indices), SPEAKER_SIMILARITY_BATCH_SIZE):
+                group = batch_indices[start : start + SPEAKER_SIMILARITY_BATCH_SIZE]
+                references = [reference_paths[index] for index in group]
+                waveforms = [audio_paths[index] for index in group]
+                current = scorer.score_batch(references, waveforms)
+                feature_frame_counts = scorer.model.get_feat_lengths(
+                    [sample_counts[path] for path in references + waveforms],
+                    torch.device(scorer.device),
+                )
+                override = encoder.register_forward_pre_hook(
+                    lambda _module, inputs, arguments: exact_encoder_arguments(
+                        inputs, arguments, feature_frame_counts
+                    ),
+                    with_kwargs=True,
+                )
+                try:
+                    corrected = scorer.score_batch(references, waveforms)
+                finally:
+                    override.remove()
+                for index, before, after in zip(group, current, corrected, strict=True):
+                    current_scores[index] = before
+                    corrected_scores[index] = after
+            batch_reports[f"{arm}_{order}"] = {
+                "current": current_scores,
+                "exact_mask": corrected_scores,
+            }
     (run_directory / "scorer-report.json").write_text(
-        json.dumps({"padding": padding, "cases": reports}, indent=2, allow_nan=False)
+        json.dumps(
+            {"padding": padding, "cases": reports, "ci_batches": batch_reports},
+            indent=2,
+            allow_nan=False,
+        )
     )
 
 
