@@ -14,6 +14,7 @@ from typing import Any, Literal
 
 import httpx
 import pytest
+import uvicorn
 from fastapi import HTTPException
 from fastapi.testclient import TestClient
 from starlette.types import Message
@@ -53,6 +54,7 @@ from sglang_omni.serve.transcriptions import (
 from tests.unit_test.fixtures.pipeline_fakes import RecordingCoordinatorControlPlane
 
 MODEL_FAMILIES = {"qwen3-omni": "code2wav"}
+LIVE_SERVER_TIMEOUT_S = 30.0
 
 
 def test_chat_api_client_preserves_ordered_media_and_turns() -> None:
@@ -451,13 +453,14 @@ class DisconnectingRequest:
     def __init__(self) -> None:
         self.disconnected = asyncio.Event()
 
-    async def is_disconnected(self) -> bool:
-        return self.disconnected.is_set()
+    async def receive(self) -> Message:
+        await self.disconnected.wait()
+        return {"type": "http.disconnect"}
 
 
 class ConnectedRequest:
-    async def is_disconnected(self) -> bool:
-        return False
+    async def receive(self) -> Message:
+        return await asyncio.get_running_loop().create_future()
 
 
 class SuccessfulTranscriptionClient:
@@ -2085,6 +2088,52 @@ def test_raw_pcm_response_disconnect_before_first_chunk_aborts_request() -> None
         assert client.aborted == ["req-1"]
 
     asyncio.run(drive())
+
+
+def test_live_server_aborts_a_speech_stream_whose_client_leaves_before_first_audio() -> (
+    None
+):
+    async def drive() -> None:
+        speech_client = BlockingFirstAudioStreamingSpeechClient()
+        server = uvicorn.Server(
+            uvicorn.Config(
+                create_app(speech_client, model_name="s2-pro"),
+                host="127.0.0.1",
+                port=0,
+                log_level="critical",
+            )
+        )
+        serve_task = asyncio.create_task(server.serve())
+        while not server.started:
+            await asyncio.sleep(0)
+        port = server.servers[0].sockets[0].getsockname()[1]
+        body = json.dumps(
+            {
+                "model": "s2-pro",
+                "input": "hello",
+                "voice": "default",
+                "stream": True,
+                "response_format": "pcm",
+            }
+        ).encode()
+        _, writer = await asyncio.open_connection("127.0.0.1", port)
+        writer.write(
+            b"POST /v1/audio/speech HTTP/1.1\r\nHost: 127.0.0.1\r\n"
+            + f"Content-Type: application/json\r\nContent-Length: {len(body)}\r\n\r\n".encode()
+            + body
+        )
+        await writer.drain()
+        await speech_client.started.wait()
+        writer.close()
+        await writer.wait_closed()
+        while not speech_client.aborted:
+            await asyncio.sleep(0)
+        server.should_exit = True
+        await serve_task
+        assert len(speech_client.aborted) == 1
+        assert speech_client.aborted[0].startswith("speech-")
+
+    asyncio.run(asyncio.wait_for(drive(), timeout=LIVE_SERVER_TIMEOUT_S))
 
 
 def test_sse_speech_response_close_aborts_inner_speech_stream() -> None:
@@ -3923,8 +3972,9 @@ def test_client_disconnect_aborts_all_running_chunks() -> None:
         def __init__(self, all_started: asyncio.Event) -> None:
             self.all_started = all_started
 
-        async def is_disconnected(self) -> bool:
-            return self.all_started.is_set()
+        async def receive(self) -> Message:
+            await self.all_started.wait()
+            return {"type": "http.disconnect"}
 
     async def scenario() -> None:
         hanging_client = HangingClient(expected=2)
@@ -3957,7 +4007,7 @@ def test_client_disconnect_aborts_all_running_chunks() -> None:
 
 def test_cancelling_the_wrapper_itself_aborts_running_chunks() -> None:
     # The wrapper's handler task can be cancelled from outside (server
-    # shutdown, ASGI teardown) rather than via is_disconnected(). The
+    # shutdown, ASGI teardown) rather than via a client disconnect. The
     # finally block must stop the work task too, or its engine requests
     # keep running with nobody left to abort them.
     from sglang_omni.serve.transcription_adapters.base import (
@@ -3985,8 +4035,8 @@ def test_cancelling_the_wrapper_itself_aborts_running_chunks() -> None:
             self.aborted.append(request_id)
 
     class NeverDisconnects:
-        async def is_disconnected(self) -> bool:
-            return False
+        async def receive(self) -> Message:
+            return await asyncio.get_running_loop().create_future()
 
     async def scenario() -> None:
         hanging_client = HangingClient(expected=2)
