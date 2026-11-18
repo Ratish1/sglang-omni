@@ -1205,6 +1205,28 @@ def test_cancelled_waiting_submit_passes_its_turn_to_the_next() -> None:
     asyncio.run(run())
 
 
+def test_waiting_submit_cancelled_after_its_grant_passes_the_slot_on() -> None:
+    async def run() -> None:
+        coordinator, control_plane = waiting_coordinator(None)
+        await coordinator.submit_request("req-1", "hello")
+        granted = asyncio.create_task(coordinator.submit_request("req-2", "hello"))
+        await let_submits_run()
+        later = asyncio.create_task(coordinator.submit_request("req-3", "hello"))
+        await let_submits_run()
+
+        coordinator.forget_request("req-1")
+        granted.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await granted
+        await asyncio.wait_for(later, timeout=10)
+
+        assert submitted_ids(control_plane) == ["req-1", "req-3"]
+        assert coordinator.admitted_request_ids == {"req-3"}
+        assert not coordinator.request_id_is_reserved("req-2")
+
+    asyncio.run(run())
+
+
 def test_waiting_submit_fails_when_the_coordinator_fails() -> None:
     async def run() -> None:
         coordinator, control_plane = waiting_coordinator(None)
