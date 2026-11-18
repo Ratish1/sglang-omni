@@ -232,6 +232,7 @@ class TtsSeedttsBenchmarkConfig:
     top_k: int | None = None
     repetition_penalty: float | None = None
     seed: int | None = None
+    non_streaming_mode: bool | None = None
     # Note (Shulei He): Fraction of requests sent with subtalker_dosample=True (rest use False),
     # deterministically alternated by sample index so runs are reproducible.
     # None leaves subtalker_dosample unset, i.e. the server-side default applies.
@@ -293,6 +294,10 @@ def _build_generation_kwargs(config: TtsSeedttsBenchmarkConfig) -> dict:
         generation_kwargs["repetition_penalty"] = config.repetition_penalty
     if config.seed is not None:
         generation_kwargs["seed"] = config.seed
+    if config.non_streaming_mode is not None:
+        generation_kwargs["non_streaming_mode"] = config.non_streaming_mode
+    else:
+        pass
     return generation_kwargs
 
 
@@ -339,6 +344,7 @@ def _build_results_config(
         "top_k": config.top_k,
         "repetition_penalty": config.repetition_penalty,
         "seed": config.seed,
+        "non_streaming_mode": config.non_streaming_mode,
         "subtalker_dosample_ratio": config.subtalker_dosample_ratio,
         "token_count": config.token_count,
         "warmup": _resolve_warmup(config),
@@ -537,6 +543,7 @@ def run_tts_seedtts_transcribe(
         "top_k": config.top_k,
         "repetition_penalty": config.repetition_penalty,
         "seed": config.seed,
+        "non_streaming_mode": config.non_streaming_mode,
         "max_samples": config.max_samples,
         "stream": config.stream,
         "collect_stream_outcomes": config.stream and config.collect_stream_outcomes,
@@ -580,6 +587,7 @@ def _config_from_args(args: argparse.Namespace) -> TtsSeedttsBenchmarkConfig:
         top_k=args.top_k,
         repetition_penalty=args.repetition_penalty,
         seed=args.seed,
+        non_streaming_mode=args.non_streaming_mode,
         subtalker_dosample_ratio=args.subtalker_dosample_ratio,
         warmup=args.warmup,
         concurrency=args.concurrency,
@@ -984,6 +992,12 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         type=int,
         default=None,
         help="Per-request sampler seed for reproducible generation.",
+    )
+    parser.add_argument(
+        "--non-streaming-mode",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Qwen3-TTS prompt mode for every request; omit for the task's default.",
     )
     parser.add_argument(
         "--subtalker-dosample-ratio",

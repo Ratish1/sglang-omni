@@ -503,6 +503,31 @@ def test_results_config_records_sampling_and_omits_fingerprint() -> None:
 
 
 @pytest.mark.parametrize(
+    ("flags", "non_streaming_mode"),
+    [
+        ((), None),
+        (("--non-streaming-mode",), True),
+        (("--no-non-streaming-mode",), False),
+    ],
+)
+def test_prompt_mode_flag_reaches_every_request_and_the_record(
+    flags: tuple[str, ...], non_streaming_mode: bool | None
+) -> None:
+    config = config_from_cli(*flags)
+    payload = _build_tts_payload(
+        SEEDTTS_SAMPLE,
+        config.model,
+        **tts._build_generation_kwargs(
+            config
+        ),  # noqa: leading-underscore  # production name
+    )
+    results_config = _build_results_config(config, base_url="http://localhost:8000")
+
+    assert payload.get("non_streaming_mode") is non_streaming_mode
+    assert results_config["non_streaming_mode"] is non_streaming_mode
+
+
+@pytest.mark.parametrize(
     "model, max_new_tokens",
     [
         ("FunAudioLLM/Fun-CosyVoice3-0.5B-2512", None),
