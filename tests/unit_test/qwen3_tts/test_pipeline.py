@@ -7219,24 +7219,30 @@ def test_qwen3_tts_bootstrap_suppression_credits_only_emitted_audio(
     ) / float(scheduler.sample_rate)
 
 
-def test_qwen3_tts_bootstrap_suppression_holds_at_any_stream_count() -> None:
-    scheduler = Qwen3TTSStreamingVocoderScheduler(
-        FakeQwen3TTSSpeechTokenizer(),
-        device="cpu",
-    )
+def test_qwen3_tts_bootstrap_suppression_trims_the_first_chunk_at_any_stream_count(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Past 24 live streams an eligible stream kept its silent opening frame, so its audible start depended on server load."""
+    scheduler, _ = stateful_qwen3_tts_scheduler(monkeypatch)
     plain = scheduler.create_stream_state("probe").initial_chunk_frames
-    for rid in range(64):
-        scheduler.stream_states[str(rid)] = scheduler.create_stream_state(str(rid))
-    state = scheduler.create_stream_state("last")
-    scheduler.stream_states["last"] = state
+    for index in range(64):
+        scheduler.stream_states[str(index)] = scheduler.create_stream_state(str(index))
+    state = scheduler.create_stream_state("request")
+    scheduler.stream_states["request"] = state
     scheduler.latch_stream_contract(
-        "last",
+        "request",
         state,
         {"num_quantizers": 2, "bootstrap_silence_suppression": True},
         origin="metadata",
     )
-    assert state.suppress_bootstrap is True
+    state.code_chunks.append(torch.tensor([[0, 0], [10, 1], [20, 2]], dtype=torch.long))
+    state.total_frames = 3
+
+    first = scheduler.decode_delta("request", state, is_final=False)
+
     assert state.initial_chunk_frames == plain + 1
+    assert first is not None
+    assert first.tolist() == [10.0] * 4 + [20.0] * 4
 
 
 def test_qwen3_tts_bootstrap_suppression_trims_one_silent_frame_once() -> None:
