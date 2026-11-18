@@ -22,6 +22,17 @@ One H100 pair, main against this branch at the same time, one server per card, e
 
 At 80 req/s main's first byte covers only the 4 % it completed; past capacity the branch serves at capacity and the excess gets HTTP 503 at the in-flight cap. No stream took the left-context decoder (main: 1,614 times at 60 req/s).
 
+Below the knee every stream fits either arena, so normal load takes main's path with more rows free. SeedTTS EN, 1.7B Base, the full 1,088 prompts, unseeded, both card orders:
+
+| cell | first audio mean / median / p95, ms, main → branch | RTF |
+|---|---|---|
+| streaming c1 | 18.8 / 20.6 / 22.8 → 18.85 / 20.55 / 23.15 | -0.2 % |
+| streaming c16 | 30.6 / 29.55 / 43.8 → 30.5 / 29.4 / 43.9 | -0.3 % |
+| streaming c64, three warm passes | 54.25 / 41.27 / 169.3 → 54.45 / 41.7 / 153.7 | -0.4 % |
+| whole c1, c16 | | -0.4 %, +0.2 % |
+
+WER 0.95 / 1.67 → 1.04 / 1.09 % (main's second order has one sample over 50 %), SIM 71.27 / 71.32 → 71.57 / 71.41.
+
 ## Tests
 
 - `test_codec_arena_holds_every_request_the_coordinator_admits`: the default arena equals the coordinator's in-flight cap.
