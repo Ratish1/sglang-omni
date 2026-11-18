@@ -6,9 +6,9 @@ usage: python3 overload_digest.py OUT
 """
 
 import json
-import statistics
 import sys
 from collections import defaultdict
+from datetime import datetime
 from pathlib import Path
 
 TOP_STAGE_THREADS = 4
@@ -65,6 +65,39 @@ def process_view(path: Path) -> dict:
     }
 
 
+def gc_view(seed_dir: Path, arm: str, rate: int) -> list[str]:
+    """Per process role, the garbage collections gc_probe recorded during this rate: count, full
+    collections, their p50 and longest milliseconds, and the client second of each pause of 50 ms or more."""
+    run_path = seed_dir / arm / f"rps{rate}" / "run.json"
+    procs_path = seed_dir / arm / f"rps{rate}.procs.jsonl"
+    if not run_path.exists() or not procs_path.exists():
+        return []
+    else:
+        pass
+    anchor = datetime.fromisoformat(json.loads(run_path.read_text())["started_at_utc"]).timestamp()
+    samples = [json.loads(line) for line in procs_path.read_text().splitlines() if line.strip()]
+    roles = {thread["pid"]: thread["role"] for sample in samples for thread in sample["threads"]}
+    window = (samples[0]["t"], samples[-1]["t"])
+    lines = []
+    for path in sorted((seed_dir / arm).glob("server.*.gc.tsv")) + sorted((seed_dir / arm).glob(f"rps{rate}.client.*.gc.tsv")):
+        pid = int(path.name.split(".")[-3])
+        rows = [line.split("\t") for line in path.read_text().splitlines()]
+        rows = [row for row in rows if window[0] <= float(row[0]) <= window[1]]
+        if not rows:
+            continue
+        else:
+            pass
+        full = [float(row[2]) for row in rows if row[1] == "2"]
+        long_pauses = [f"{float(row[0]) - anchor:.0f}s:{float(row[2]):.0f}ms" for row in rows if float(row[2]) >= 50]
+        role = roles.get(pid, "client" if ".client." in path.name else "stage")
+        lines.append(
+            f"  {arm} {role} pid {pid}: {len(rows)} long or full collections, {len(full)} full, full p50 "
+            f"{fmt(quantile(full, 0.5), 1, 1)} ms, longest {fmt(max((float(r[2]) for r in rows), default=None), 1, 1)} ms, "
+            f">= 50 ms at {long_pauses[:30]}"
+        )
+    return lines
+
+
 def main() -> None:
     out = Path(sys.argv[1])
     for seed_dir in sorted(out.glob("seed*")):
@@ -99,6 +132,9 @@ def main() -> None:
                     f"| {fmt(view.get('client_total_p50'))} / {fmt(view.get('client_top_p90'))} "
                     f"| {view.get('tracked_max', '-')} | {view.get('stage_top', '-')} |"
                 )
+            for arm in arms:
+                for line in gc_view(seed_dir, arm, rate):
+                    print(line)
 
 
 if __name__ == "__main__":

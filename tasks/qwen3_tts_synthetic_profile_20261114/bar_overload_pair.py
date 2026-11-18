@@ -32,6 +32,7 @@ MEMORY_SAMPLE_S = 5
 PROCESS_SAMPLE_S = 2
 HEALTH_TIMEOUT_S = 30
 ENGINE_THREAD = "scheduler-tts_e"
+GC_PROBE_DIR = Path(__file__).resolve().parent / "gc_probe"
 PYSPY_WINDOW_S = 20
 
 
@@ -159,7 +160,9 @@ def record_pyspy(server: subprocess.Popen, delay_s: int, out: Path) -> None:
     api.wait(timeout=PYSPY_WINDOW_S * 4)
 
 
-def run_rate(port: int, model: str, rate: int, seed: int, out: Path, duration_s: int) -> int:
+def run_rate(
+    port: int, model: str, rate: int, seed: int, out: Path, duration_s: int, env_extra: dict[str, str]
+) -> int:
     out.parent.mkdir(parents=True, exist_ok=True)
     command = [
         "taskset", "-c", CLIENT_CPUS, "uv", "run", "-q", "bench", "run", "--target", "sglang-omni",
@@ -170,8 +173,8 @@ def run_rate(port: int, model: str, rate: int, seed: int, out: Path, duration_s:
     ]
     with (out.parent / f"bench_rps{rate}.log").open("w") as log:
         return subprocess.run(
-            command, cwd=CLIENT_DIR / "tts_bench", stdout=log, stderr=subprocess.STDOUT, timeout=RATE_TIMEOUT_S,
-            check=False,
+            command, cwd=CLIENT_DIR / "tts_bench", env={**os.environ, **env_extra}, stdout=log,
+            stderr=subprocess.STDOUT, timeout=RATE_TIMEOUT_S, check=False,
         ).returncode
 
 
@@ -187,6 +190,9 @@ def main() -> None:
     parser.add_argument("--pyspy-at", type=int, default=None, help="seconds into each rate to start the py-spy windows")
     parser.add_argument("--a-arg", action="append", default=[], help="one more serve argument for arm a, repeatable")
     parser.add_argument("--b-arg", action="append", default=[], help="one more serve argument for arm b, repeatable")
+    parser.add_argument(
+        "--gc-probe", action="store_true", help="record every server and client process's long garbage collections"
+    )
     args = parser.parse_args()
     prepare_client()
     model, _ = MODELS["customvoice"]
@@ -204,8 +210,13 @@ def main() -> None:
                 (seed_out / arm / "tree.txt").write_text(
                     f"{trees[arm]} card {cards[arm]} cpus {CARD_CPUS[cards[arm]]} args {' '.join(server_args[arm])}\n{identity}"
                 )
+                server_env = (
+                    {"PYTHONPATH": f"{trees[arm]}:{GC_PROBE_DIR}", "GC_PROBE_OUT": str(seed_out / arm / "server")}
+                    if args.gc_probe
+                    else {}
+                )
                 servers[arm] = serve(
-                    trees[arm], model, cards[arm], ports[arm], seed_out / arm / "serve.log", {}, server_args[arm]
+                    trees[arm], model, cards[arm], ports[arm], seed_out / arm / "serve.log", server_env, server_args[arm]
                 )
             for arm in ("a", "b"):
                 wait_healthy(ports[arm], servers[arm])
@@ -238,7 +249,14 @@ def main() -> None:
                     profiler.start()
                 with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
                     futures = {
-                        arm: pool.submit(run_rate, ports[arm], model, rate, seed, seed_out / arm / f"rps{rate}", args.duration)
+                        arm: pool.submit(
+                            run_rate, ports[arm], model, rate, seed, seed_out / arm / f"rps{rate}", args.duration,
+                            (
+                                {"PYTHONPATH": str(GC_PROBE_DIR), "GC_PROBE_OUT": str(seed_out / arm / f"rps{rate}.client")}
+                                if args.gc_probe
+                                else {}
+                            ),
+                        )
                         for arm in ("a", "b")
                     }
                     codes = {arm: future.result() for arm, future in futures.items()}
