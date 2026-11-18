@@ -437,6 +437,8 @@ class Qwen3OmniMoeTalkerTextModel(nn.Module):
         sim_cast_mask = os.environ.get("SGLANG_OMNI_SIM_CAST_MASK")
         if sim_cast_mask is not None:
             assert len(sim_cast_mask) == 3 and set(sim_cast_mask) <= {"0", "1"}
+            sim_norm_backend = os.environ.get("SGLANG_OMNI_SIM_NORM_BACKEND", "native")
+            assert sim_norm_backend in ("native", "dispatch")
             norm_sites = (
                 [layer.input_layernorm for layer in self.layers],
                 [layer.post_attention_layernorm for layer in self.layers],
@@ -445,7 +447,13 @@ class Qwen3OmniMoeTalkerTextModel(nn.Module):
             for is_early, norms in zip(sim_cast_mask, norm_sites, strict=True):
                 for norm in norms:
                     norm.cast_x_before_out_mul = is_early == "1"
-                    norm.forward = norm.forward_native
+                    if sim_norm_backend == "native":
+                        norm.forward = norm.forward_native
+                    else:
+                        pass
+            logger.info(
+                f"Talker SIM cast mask {sim_cast_mask} with {sim_norm_backend} normalization"
+            )
         else:
             pass
         self.layers_to_capture = []

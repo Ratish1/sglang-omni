@@ -10,6 +10,7 @@ import subprocess
 import sys
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Literal
 
 from huggingface_hub import snapshot_download
 
@@ -32,6 +33,7 @@ class Arm:
     cast_mask: str
     donor_name: str = ""
     comparison_name: str = "late"
+    norm_backend: Literal["native", "dispatch"] = "native"
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -103,7 +105,9 @@ def read_history(arm_directory: Path, case: Case, *, forced: bool) -> History:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--phase", choices=("natural", "held", "sites"), required=True)
+    parser.add_argument(
+        "--phase", choices=("natural", "held", "sites", "dispatch"), required=True
+    )
     parser.add_argument("--replay-driver", type=Path, required=True)
     parser.add_argument("--run-directory", type=Path, required=True)
     parser.add_argument("--config", type=Path, required=True)
@@ -156,7 +160,7 @@ def main() -> None:
             for donor_name in ("late", "early")
             for cast_name, cast_mask in (("late", "000"), ("early", "111"))
         ]
-    else:
+    elif arguments.phase == "sites":
         arms = [
             Arm(
                 name=arm_name,
@@ -172,13 +176,23 @@ def main() -> None:
                 ("final-inverse", "110"),
             )
         ]
+    else:
+        arms = [
+            Arm(
+                name=f"dispatch-{cast_name}",
+                cast_mask=cast_mask,
+                comparison_name=cast_name,
+                norm_backend="dispatch",
+            )
+            for cast_name, cast_mask in (("late", "000"), ("early", "111"))
+        ]
     for arm in arms:
         if arm.donor_name:
             for case in cases:
                 read_history(run_directory / arm.donor_name, case, forced=False)
         else:
             pass
-    if arguments.phase in ("held", "sites"):
+    if arguments.phase != "natural":
         assert (run_directory / "natural-report.json").is_file()
     else:
         pass
@@ -210,6 +224,7 @@ def main() -> None:
             timeout=600,
             env={
                 "SGLANG_OMNI_SIM_CAST_MASK": arm.cast_mask,
+                "SGLANG_OMNI_SIM_NORM_BACKEND": arm.norm_backend,
                 "SGLANG_OMNI_SIM_MANIFEST": str(manifest_path),
                 "SGLANG_OMNI_SIM_TRACE_DIRECTORY": str(trace_directory),
                 "SGLANG_OMNI_SIM_DONOR_DIRECTORY": (
@@ -375,6 +390,17 @@ def main() -> None:
                                 == histories[arm.comparison_name].text
                             ),
                             "codec_frames": len(histories[arm.name].frames) - 1,
+                            "same_waveform": (
+                                histories[arm.name].waveform_sha256
+                                == histories[arm.comparison_name].waveform_sha256
+                            ),
+                            "same_codec_history": (
+                                [frame["codes"] for frame in histories[arm.name].frames]
+                                == [
+                                    frame["codes"]
+                                    for frame in histories[arm.comparison_name].frames
+                                ]
+                            ),
                             "reference_sim_delta": float(
                                 similarity_by_arm[arm.name]
                                 - similarity_by_arm[arm.comparison_name]
