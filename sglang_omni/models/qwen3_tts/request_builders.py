@@ -707,12 +707,11 @@ def resolve_stream_codec_output(
             return bool(source["stream_codec_output"])
         else:
             pass
-    for source in (params, tts_params):
-        if "non_streaming_mode" in source:
-            return not bool(source["non_streaming_mode"])
-        else:
-            pass
-    return default
+    # note (ratish): the speech API's non_streaming_mode arrives in tts_params and means the prompt mode alone, so a streamed request keeps streaming at either value.
+    if "non_streaming_mode" in params:
+        return not bool(params["non_streaming_mode"])
+    else:
+        return default
 
 
 # note (luojiaxuan): the model deterministically emits one silent bootstrap
