@@ -36,6 +36,9 @@ _QWEN3_TTS_CUSTOM_VARIANT_MARKERS = (
 )
 QWEN3_TTS_MAX_RUNNING_REQUESTS = 64
 QWEN3_TTS_MAX_QUEUED_REQUESTS = 64
+# A waiting request holds about 210 tracked objects in the API process, about 0.12 ms of each full
+# garbage collection on an H100 host's CPU; 256 keeps that pause under half a stream's 80 ms first chunk.
+QWEN3_TTS_MAX_WAITING_REQUESTS = 256
 
 
 class Qwen3TTSStageFactoryKwargs(TypedDict, total=False):
@@ -73,8 +76,10 @@ class Qwen3TTSPipelineConfig(PipelineConfig):
         }
 
     model_path: str
-    # note (ratish): past the in-flight cap a request waits before preprocessing, holding no engine work or device memory, so none is refused.
-    admission: AdmissionConfig = AdmissionConfig(max_waiting_requests=None)
+    # note (ratish): past the in-flight cap a request waits before preprocessing, holding no engine work or device memory, so a burst is not refused.
+    admission: AdmissionConfig = AdmissionConfig(
+        max_waiting_requests=QWEN3_TTS_MAX_WAITING_REQUESTS
+    )
     # note (0xtoward): Keep deterministic inference opt-in because it serializes
     # preprocessing and vocoder decoding and disables the vocoder CUDA graphs,
     # reducing throughput.

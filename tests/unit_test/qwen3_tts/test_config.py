@@ -48,7 +48,7 @@ def test_only_the_coordinator_bounds_admission_by_default() -> None:
     config = Qwen3TTSPipelineConfig(model_path="model")
     plan, _ = compile_logical_processes(config)
 
-    assert config.admission.max_waiting_requests is None
+    assert config.admission.max_waiting_requests == 256
     assert resolve_coordinator_max_in_flight(config, logical_process_plan=plan) == 128
     assert "max_queued_requests" not in Qwen3TtsEngineBuilder().generation_defaults(
         dtype="bfloat16"
