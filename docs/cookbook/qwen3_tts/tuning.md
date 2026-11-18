@@ -18,9 +18,9 @@ Two SGLang generation-stage knobs bound the engine, and one server option sets w
 |---|---|---|
 | `--tts_engine.engine.max_running_requests` | Concurrent running slots | `64` |
 | `--tts_engine.engine.max_queued_requests` | Requests queued in the engine behind the running ones | `64` |
-| `--admission.max_waiting_requests` | Requests that may wait past `running + queued` | `none`, no limit |
+| `--admission.max_waiting_requests` | Requests that may wait past `running + queued` | `256` |
 
-Once `running + queued` requests are in flight, a new request waits in the server before preprocessing, and the oldest waiting request starts when an in-flight request finishes. A waiting request holds no engine work or device memory. With `--admission.max_waiting_requests N`, a request that finds N requests already waiting gets HTTP **503** (`The request queue is full.`), and `0` refuses every request past the cap at once. Qwen3-TTS defaults to 4 request-build workers with pending depth 16.
+Once `running + queued` requests are in flight, a new request waits in the server before preprocessing, and the oldest waiting request starts when an in-flight request finishes. A waiting request holds no engine work or device memory. A request that finds `max_waiting_requests` requests already waiting gets HTTP **503** (`The request queue is full.`), and `0` refuses every request past the cap at once. Waiting absorbs bursts but adds no throughput, so under sustained overload each served request also waits for the queue ahead of it. Each waiting request keeps about 200 Python objects in the API process, and a full garbage collection walks all of them while every running stream waits for its next chunk. On an H100 host that is about 0.12 ms per waiting request, so `none` (no bound) can stall running streams for hundreds of milliseconds under sustained overload. Qwen3-TTS defaults to 4 request-build workers with pending depth 16.
 
 By default the engine queue has no bound of its own, since the in-flight cap already holds it. Setting `max_queued_requests` also bounds the engine queue, which must then be **≥ 1** and refuses a burst past it with HTTP 503 even while running slots are free.
 
