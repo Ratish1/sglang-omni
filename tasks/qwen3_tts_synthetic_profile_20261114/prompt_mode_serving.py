@@ -48,6 +48,7 @@ def request_body(model: str, tree: Path, text: str, value: bool | None, stream: 
     elif model == "customvoice":
         body["voice"] = "Ryan"
     else:
+        body["task_type"] = "VoiceDesign"
         body["instructions"] = "A calm adult male voice with a slow, clear delivery."
     if value is not None:
         body["non_streaming_mode"] = value
