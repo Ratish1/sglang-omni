@@ -560,16 +560,11 @@ if HAS_TRITON:
         CODES,
         codes_stride,
         CODEBOOK_INPUT,
-        SUMMED,
-        summed_stride,
         VOCAB: tl.constexpr,
         HIDDEN: tl.constexpr,
         USE_GDC: tl.constexpr,
     ):
-        """One program per row: the code torch.argmax picks (the first NaN, else the first
-        maximum) into the row's code slot, its embedding row as the next pass's input, and
-        that row added into the summed embedding with one bf16 rounding of the fp32 sum.
-        """
+        """Select the first NaN or maximum and gather its embedding row."""
         row = tl.program_id(0)
         vocab = tl.arange(0, VOCAB)
         logits = tl.load(LOGITS + row * logits_stride + vocab).to(tl.float32)
@@ -581,11 +576,6 @@ if HAS_TRITON:
         hidden = tl.arange(0, HIDDEN)
         embedding = tl.load(EMBEDDING + code * HIDDEN + hidden)
         tl.store(CODEBOOK_INPUT + row * HIDDEN + hidden, embedding)
-        summed = tl.load(SUMMED + row * summed_stride + hidden).to(tl.float32)
-        tl.store(
-            SUMMED + row * summed_stride + hidden,
-            (summed + embedding.to(tl.float32)).to(tl.bfloat16),
-        )
         if USE_GDC:
             gdc_launch_dependents()
         else:
@@ -1038,15 +1028,17 @@ def codebook_step(
     logits: torch.Tensor,
     embedding_weight: torch.Tensor,
     codes: torch.Tensor,
-    summed: torch.Tensor,
 ) -> torch.Tensor:
-    """codes = argmax(logits) as torch.argmax picks it, summed += embedding[codes] in
-    place, in one launch; returns the next pass's input rows (rows, 1, hidden). logits is
-    (rows, vocab), codes a (rows,) int64 view; bf16 tables, power-of-two widths."""
+    """Select codes and gather the next predictor input in one launch.
+
+    Returns (rows, 1, hidden) for BF16 tables with power-of-two widths.
+    """
     rows, vocab_size = logits.shape
     hidden_size = embedding_weight.shape[1]
     codebook_input = torch.empty(
-        (rows, 1, hidden_size), device=summed.device, dtype=summed.dtype
+        (rows, 1, hidden_size),
+        device=embedding_weight.device,
+        dtype=embedding_weight.dtype,
     )
     codebook_step_kernel[(rows,)](
         logits,
@@ -1055,8 +1047,6 @@ def codebook_step(
         codes,
         codes.stride(0),
         codebook_input,
-        summed,
-        summed.stride(0),
         VOCAB=vocab_size,
         HIDDEN=hidden_size,
         # note (ratish): it releases the next pass's first layer but launches as usual
