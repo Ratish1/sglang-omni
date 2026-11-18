@@ -58,7 +58,7 @@ def main() -> None:
             )
             waveform.score = apply_wer(
                 SampleOutput(
-                    sample_id=waveform.trace_directory.parent.name,
+                    sample_id=waveform.trace_directory.name,
                     target_text=target_text_by_request[waveform.trace_directory.name],
                     audio_duration_s=waveform.waveform_samples / waveform.sample_rate,
                 ),
