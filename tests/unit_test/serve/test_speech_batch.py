@@ -10,6 +10,7 @@ from unittest.mock import Mock
 
 import pytest
 from fastapi.testclient import TestClient
+from starlette.types import Message
 
 from sglang_omni.client import ClientError
 from sglang_omni.client.types import SpeechResult
@@ -82,8 +83,9 @@ class DisconnectingBatchRequest:
     def __init__(self, client_impl: BlockingBatchSpeechClient) -> None:
         self.client_impl = client_impl
 
-    async def is_disconnected(self) -> bool:
-        return self.client_impl.started.is_set()
+    async def receive(self) -> Message:
+        await self.client_impl.started.wait()
+        return {"type": "http.disconnect"}
 
 
 class MixedBatchSpeechClient:
