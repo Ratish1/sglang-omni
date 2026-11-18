@@ -153,6 +153,7 @@ def main() -> None:
     parser.add_argument("--native-shared-gate-batches", action="store_true")
     parser.add_argument("--native-expert-batches", action="store_true")
     parser.add_argument("--native-projection-batches", action="store_true")
+    parser.add_argument("--separate-query-key-value-projections", action="store_true")
     parser.add_argument("--verify-native-projection-inputs", action="store_true")
     parser.add_argument("--shared-gate-decode-rows", type=int)
     parser.add_argument("--paired-native-expert-controls", action="store_true")
@@ -309,6 +310,12 @@ def main() -> None:
         assert arguments.restore_prefill_state is None
     else:
         assert not arguments.verify_native_projection_inputs
+    if arguments.separate_query_key_value_projections:
+        assert arguments.native_projection_batches
+        assert arguments.paired_native_routing_controls
+        assert arguments.checkpoint_query_key_normalization
+    else:
+        pass
     if arguments.checkpoint_query_key_normalization:
         assert arguments.paired_native_routing_controls
         assert not arguments.paired_native_projection_controls
@@ -613,7 +620,11 @@ def main() -> None:
             arguments.paired_native_rotary_controls
             or arguments.paired_native_routing_controls
         ):
-            projection_modes = ("merged-paired",)
+            projection_modes = (
+                ("paired",)
+                if arguments.separate_query_key_value_projections
+                else ("merged-paired",)
+            )
         else:
             projection_modes = ("checkpoint",)
         if arguments.paired_native_rotary_controls:
@@ -1532,6 +1543,7 @@ def main() -> None:
                     projection_control.normalization_calls if projection_control else 0
                 ),
                 "native_projection_batches": arguments.native_projection_batches,
+                "separate_query_key_value_projections": arguments.separate_query_key_value_projections,
                 "verified_native_projection_inputs": arguments.verify_native_projection_inputs,
                 "native_output_projection_calls": (
                     projection_control.output_calls if projection_control else 0

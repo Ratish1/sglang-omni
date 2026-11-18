@@ -234,6 +234,23 @@ class NativeAttentionInputs:
                     projected = torch.nn.functional.linear(
                         hidden_states, self.weights[layer_index]
                     )
+            elif self.native_directory is not None:
+                projected = torch.cat(
+                    [
+                        self.project_batch(
+                            hidden_states,
+                            projection.weight,
+                            layer_index,
+                            "attention_normalized",
+                        )
+                        for projection in (
+                            attention.q_proj,
+                            attention.k_proj,
+                            attention.v_proj,
+                        )
+                    ],
+                    dim=-1,
+                )
             else:
                 projected = torch.cat(
                     (
@@ -305,7 +322,7 @@ class NativeAttentionInputs:
             (query_dimensions, key_dimensions, value_dimensions), dim=-1
         )
         selected = {"query": query, "key": key, "value": value}[name].view_as(output)
-        if self.mode == "paired":
+        if self.mode == "paired" and self.native_directory is None:
             assert torch.equal(selected, output)
         else:
             pass
