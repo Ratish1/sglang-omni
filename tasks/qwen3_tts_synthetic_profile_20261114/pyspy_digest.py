@@ -33,6 +33,7 @@ def main() -> None:
     parser.add_argument("raw")
     parser.add_argument("--top", type=int, default=15)
     parser.add_argument("--rate", type=float, default=100.0)
+    parser.add_argument("--package", default=PACKAGE, help="inclusive frames are those whose path holds this; empty keeps all")
     args = parser.parse_args()
     per_thread: Counter[tuple[str, str]] = Counter()
     inclusive: dict[tuple[str, str], Counter[str]] = defaultdict(Counter)
@@ -47,7 +48,7 @@ def main() -> None:
             process, thread, frames, count = parsed
             key = (process, thread)
             per_thread[key] += count
-            for frame in {frame for frame in frames if PACKAGE in frame}:
+            for frame in {frame for frame in frames if args.package in frame}:
                 inclusive[key][frame] += count
             if frames:
                 innermost[key][frames[-1]] += count
@@ -58,7 +59,7 @@ def main() -> None:
     print(f"samples holding the lock: {total} ({total * ms_per_sample:.0f} ms at {args.rate:g} Hz)")
     for key, samples in per_thread.most_common():
         print(f"\n## {key[0]} {key[1]}: {samples} samples, {samples * ms_per_sample:.0f} ms")
-        print("inclusive sglang_omni frames:")
+        print(f"inclusive frames under {args.package or 'any path'}:")
         for frame, count in inclusive[key].most_common(args.top):
             print(f"  {count * ms_per_sample:8.0f} ms  {frame}")
         print("innermost frames:")

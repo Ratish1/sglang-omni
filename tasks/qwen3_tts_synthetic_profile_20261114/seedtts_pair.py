@@ -37,11 +37,14 @@ CARD_CPUS = {0: "32-47,96-111", 1: "48-63,112-127"}
 CLIENT_CPUS = "0-31,64-95"
 
 
-def serve(tree: Path, model: str, card: int, port: int, log: Path, env_extra: dict[str, str]) -> subprocess.Popen:
+def serve(
+    tree: Path, model: str, card: int, port: int, log: Path, env_extra: dict[str, str],
+    server_args: tuple[str, ...] = (),
+) -> subprocess.Popen:
     command = [
         "taskset", "-c", CARD_CPUS[card],
         sys.executable, "-m", "sglang_omni.cli", "serve", "--model-path", model, "--host", "127.0.0.1",
-        "--port", str(port), "--tts_engine.gpu", str(card), "--vocoder.gpu", str(card),
+        "--port", str(port), "--tts_engine.gpu", str(card), "--vocoder.gpu", str(card), *server_args,
     ]
     with log.open("w") as handle:
         return subprocess.Popen(
