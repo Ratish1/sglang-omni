@@ -31,6 +31,8 @@ CELLS = (
     ("whole_c1", 1, False),
 )
 SCORED_CELL = "stream_c16"
+# cells only --rounds runs, where a host-side change acts but the standard pair does not look
+ROUNDS_ONLY_CELLS = (("whole_c64", 64, False),)
 # note (ratish): both H100s of host-221 sit on NUMA node 1, so each server takes half of that socket and
 # the clients take node 0.
 CARD_CPUS = {0: "32-47,96-111", 1: "48-63,112-127"}
@@ -166,12 +168,14 @@ def main() -> None:
         "--rounds", type=int, default=0,
         help="run only --rounds-cell, this many rounds on the same servers, unscored",
     )
-    parser.add_argument("--rounds-cell", choices=[cell for cell, _, _ in CELLS], default="stream_c16")
+    parser.add_argument(
+        "--rounds-cell", choices=[cell for cell, _, _ in CELLS + ROUNDS_ONLY_CELLS], default="stream_c16"
+    )
     args = parser.parse_args()
     model, extra = MODELS[args.model]
     trees = {"a": args.a_tree, "b": args.b_tree}
     if args.rounds > 0:
-        _, concurrency, stream = next(entry for entry in CELLS if entry[0] == args.rounds_cell)
+        _, concurrency, stream = next(entry for entry in CELLS + ROUNDS_ONLY_CELLS if entry[0] == args.rounds_cell)
         cells = tuple((f"{args.rounds_cell}_r{index + 1}", concurrency, stream) for index in range(args.rounds))
     else:
         cells = CELLS
