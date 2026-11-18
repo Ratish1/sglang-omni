@@ -7,6 +7,20 @@ Each head against main `ea8216220` at the same time on the two cards, orders swa
 | `d2507351c` FIFO waiting queue | `d1460e887` | not run | streaming c16 RTF +1.5 %, c64 +2.3 %, whole c16 +1.5 % | the queue took `state_lock` on every stream end and release while empty |
 | `e528b9d9a` no lock while the queue is empty | `7d3df299e` | 100 / 96.6-98.7 / 85-86.9 %, three seeds | killed before it finished (head moved) | |
 | `f9bc7891b` planner owns the queue, failure exit, free-list count | `4bc1fa14d` | 97.3-100 / 97.9-99.5 / 83.2-93.0 %, three seeds | inside the A/A band in every cell on warm rounds; first audio equal or better | opened, ready for review |
+| `038a071bd` initial worker owns admission (review 1) | `bc5372bbf` | 100 / 100 / 92.6-92.8 %, two seeds | c16 RTF +0.1 %, c64 +0.3 % on warm passes | second review: F1 last row retired strands waiters, F2 fatal drain gap |
+| `dade67035` fallback once every slot retires, fatal drain under the lock (review 2) | `780d0d283` | 80 req/s against `038a071bd`: 87.4 → 87.5 %, underrun requests 8 → 5 | failure paths only; normal path takes no new lock | pushed to #4077 (11-18); new tests fail on `038a071bd`; reviewer probe completes |
+
+# Branch results: coordinator waiting (11-18, host-221 GPUs [4 5])
+
+Against the slot fix at the same time on the two cards. Nari's client, 180 s measured.
+
+| Head | sglang_omni tree | 100 / 80 req/s: completed, underrun requests, first byte p50 | Normal load | Read |
+|---|---|---|---|---|
+| `42c1bd93b` unbounded, polled disconnect | `08fd7ff2c` | 100 / 100 %, 556 / 110 against 3 / 0 | not run | API loop saturated by the 50 ms disconnect poll |
+| `636861be0` event-driven disconnect watch | `6de866337` | 100 / 100 %, 128-145 / 40 against 7-21 / 1 | not run | full collections 270-470 ms with the queue: per-waiter objects |
+| same, `--admission.max_waiting_requests 0` | `6de866337` | 70.4 %, 2 against 4 (100 only) | | the residual is the waiting itself |
+| same, bound 512 / 256 (CLI) | `6de866337` | 512: 70.1 / 89.9 %, 3 / 4 against 4 / 12; 256: 69.7 / 88.2 %, 7 / 2 against 4 / 5 | | 256 chosen for stall margin |
+| `ddd52d694` default 256 on `dade67035` | `f6d2c8198` | seeds 0 / 1: 69.7 / 69.8 % and 85.8 / 87.3 %, underruns 4, 3 / 3, 7 against 2, 4 / 7, 6; first byte 4.6 s against 0.9 s | SeedTTS Base both orders inside the A/A band, WER 1.03 / 1.07 %, SIM 71.39 / 71.36; whole c64 RTF -0.4 % | ready to open on the user's word; bound trade-off for the user |
 
 # Branch results: persistent predictor layer (11-14)
 
