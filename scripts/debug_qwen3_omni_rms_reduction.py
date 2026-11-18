@@ -57,7 +57,8 @@ def main() -> None:
         assert len(normalization["origins"]) == len(residual)
         assert residual.isfinite().all() and observed.isfinite().all()
         width = residual.shape[-1]
-        assert width >= NORMALIZATION_THREADS and width % NORMALIZATION_THREADS == 0
+        threads = WARP_LANES if width < NORMALIZATION_THREADS else NORMALIZATION_THREADS
+        assert width >= WARP_LANES and width % threads == 0
         assert width & (width - 1) == 0
         epsilon = normalization["epsilon"]
         native = rmsnorm_hf(residual, weight, epsilon)
@@ -72,26 +73,28 @@ def main() -> None:
         eager = checkpoint(residual)
         values = residual.float()
         partial_squares = torch.zeros(
-            (len(values), NORMALIZATION_THREADS), device=device, dtype=torch.float32
+            (len(values), threads), device=device, dtype=torch.float32
         )
-        for offset in range(0, width, NORMALIZATION_THREADS):
+        for offset in range(0, width, threads):
             partial_squares = (
-                partial_squares
-                + values[:, offset : offset + NORMALIZATION_THREADS].square()
+                partial_squares + values[:, offset : offset + threads].square()
             )
         warp_squares = partial_squares.reshape(len(values), -1, WARP_LANES)
         lanes = torch.arange(WARP_LANES, device=device)
         for offset in (16, 8, 4, 2, 1):
             warp_squares = warp_squares + warp_squares.index_select(-1, lanes ^ offset)
-        block_squares = torch.zeros(
-            (len(values), WARP_LANES), device=device, dtype=torch.float32
-        )
-        block_squares[:, : NORMALIZATION_THREADS // WARP_LANES] = warp_squares[:, :, 0]
-        for offset in (16, 8, 4, 2, 1):
-            block_squares = block_squares + block_squares.index_select(
-                -1, lanes ^ offset
+        if threads == WARP_LANES:
+            native_variance = warp_squares[:, 0, :1] / width
+        else:
+            block_squares = torch.zeros(
+                (len(values), WARP_LANES), device=device, dtype=torch.float32
             )
-        native_variance = block_squares[:, :1] / width
+            block_squares[:, : threads // WARP_LANES] = warp_squares[:, :, 0]
+            for offset in (16, 8, 4, 2, 1):
+                block_squares = block_squares + block_squares.index_select(
+                    -1, lanes ^ offset
+                )
+            native_variance = block_squares[:, :1] / width
         eager_variance = values.pow(2).mean(-1, keepdim=True)
         native_inverse_rms = torch.rsqrt(native_variance + epsilon)
         eager_inverse_rms = torch.rsqrt(eager_variance + epsilon)
@@ -182,7 +185,7 @@ def main() -> None:
             json.dumps(
                 {
                     "normalizations": summaries,
-                    "scope": "All retained native residual-normalization operands. Exact native and source-derived reduction reproduction are mandatory. FP64 measures numerical distance, not universal speech quality or a production-fix criterion.",
+                    "scope": "All retained native normalization operands. Exact native and source-derived reduction reproduction are mandatory. FP64 measures numerical distance, not universal speech quality or a production-fix criterion.",
                 },
                 indent=2,
             )

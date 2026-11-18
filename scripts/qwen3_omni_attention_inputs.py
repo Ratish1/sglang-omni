@@ -33,6 +33,7 @@ class NativeAttentionInputs:
     enabled: bool = False
     mode: Literal["merged", "paired", "merged-paired"] = "merged"
     is_checkpoint_query_key_enabled: bool = False
+    is_checkpoint_query_key_reduction_enabled: bool = False
     native_directory: Path | None = None
     verify_native_inputs: bool = False
     head_calls: int = 0
@@ -266,7 +267,9 @@ class NativeAttentionInputs:
                 )
             assert projected.is_contiguous() and projected.dtype == torch.bfloat16
             state = PackedAttentionProjection(projected=projected)
-            if self.mode in ("paired", "merged-paired"):
+            if self.mode in ("paired", "merged-paired") and not (
+                self.is_checkpoint_query_key_reduction_enabled
+            ):
                 normalized = projected.clone()
                 head_dimensions = attention.head_dim
                 query = normalized.as_strided(
@@ -351,8 +354,12 @@ class NativeAttentionInputs:
         assert module is expected and inputs[0].dtype == torch.bfloat16
         assert layer_index == (self.normalization_calls // 2) % len(self.weights)
         assert name == PROJECTION_NAMES[self.normalization_calls % 2]
+        self.normalization_calls += 1
+        if self.is_checkpoint_query_key_reduction_enabled:
+            return output
+        else:
+            pass
         state = self.projections[layer_index]
         normalized = state.normalized_query if name == "query" else state.normalized_key
         assert normalized is not None
-        self.normalization_calls += 1
         return normalized.reshape_as(output)

@@ -163,6 +163,7 @@ def main() -> None:
     parser.add_argument("--decode-page-table-tokens", type=int)
     parser.add_argument("--paired-native-projection-controls", action="store_true")
     parser.add_argument("--checkpoint-query-key-normalization", action="store_true")
+    parser.add_argument("--checkpoint-query-key-reduction", action="store_true")
     parser.add_argument("--paired-native-rotary-controls", action="store_true")
     parser.add_argument("--disable-rotary-fp-fusion", action="store_true")
     parser.add_argument(
@@ -319,6 +320,10 @@ def main() -> None:
     if arguments.checkpoint_query_key_normalization:
         assert arguments.paired_native_routing_controls
         assert not arguments.paired_native_projection_controls
+    else:
+        pass
+    if arguments.checkpoint_query_key_reduction:
+        assert arguments.checkpoint_query_key_normalization
     else:
         pass
     if arguments.routing_controls is not None:
@@ -539,6 +544,7 @@ def main() -> None:
         projection_control = NativeAttentionInputs(
             reference=reference,
             is_checkpoint_query_key_enabled=arguments.checkpoint_query_key_normalization,
+            is_checkpoint_query_key_reduction_enabled=arguments.checkpoint_query_key_reduction,
         )
         projection_control.install()
     else:
@@ -1528,6 +1534,7 @@ def main() -> None:
                 "native_attention_schedule": arguments.native_attention_schedule,
                 "attention_projection_mode": projection_mode,
                 "checkpoint_query_key_normalization": arguments.checkpoint_query_key_normalization,
+                "checkpoint_query_key_reduction": arguments.checkpoint_query_key_reduction,
                 "rotary_mode": rotary_mode,
                 "native_rotary_fp_fusion_enabled": (
                     not arguments.disable_rotary_fp_fusion
