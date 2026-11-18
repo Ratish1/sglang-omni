@@ -5,6 +5,7 @@ SGLang-native Talker model for Qwen3-Omni compatiable with hf formatting.
 from __future__ import annotations
 
 import logging
+import os
 from dataclasses import replace
 from typing import Iterable, Optional, Tuple
 
@@ -433,6 +434,20 @@ class Qwen3OmniMoeTalkerTextModel(nn.Module):
         for layer in self.layers:
             layer.input_layernorm.cast_x_before_out_mul = True
             layer.post_attention_layernorm.cast_x_before_out_mul = True
+        sim_cast_mask = os.environ.get("SGLANG_OMNI_SIM_CAST_MASK")
+        if sim_cast_mask is not None:
+            assert len(sim_cast_mask) == 3 and set(sim_cast_mask) <= {"0", "1"}
+            norm_sites = (
+                [layer.input_layernorm for layer in self.layers],
+                [layer.post_attention_layernorm for layer in self.layers],
+                [self.norm],
+            )
+            for is_early, norms in zip(sim_cast_mask, norm_sites, strict=True):
+                for norm in norms:
+                    norm.cast_x_before_out_mul = is_early == "1"
+                    norm.forward = norm.forward_native
+        else:
+            pass
         self.layers_to_capture = []
         max_batch_size = get_schedule().max_running_requests
         self.cp_enabled = True

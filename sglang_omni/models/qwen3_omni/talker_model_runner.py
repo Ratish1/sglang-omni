@@ -3,9 +3,11 @@
 
 from __future__ import annotations
 
+import os
 from collections import deque
+from pathlib import Path
 from queue import Queue
-from typing import TYPE_CHECKING, TypeAlias
+from typing import TYPE_CHECKING, Literal, TypeAlias
 
 import torch
 
@@ -15,6 +17,7 @@ from sglang_omni.model_runner.prefill_inputs import (
     OmniPrefillInputs,
     attach_omni_prefill_inputs,
 )
+from sglang_omni.models.qwen3_omni.sim_bisect_trace import SimBisectTrace
 from sglang_omni.scheduling.message import OutgoingMessage, put_messages
 from sglang_omni.scheduling.pending_text_queue import PendingTextTensorQueue
 from sglang_omni.scheduling.sglang_backend.request_data import (
@@ -70,6 +73,16 @@ class QwenTalkerModelRunner(ModelRunner["SGLangARRequestData"]):
         self.codec_coalesce_frames = max(int(codec_coalesce_frames), 0)
         self.codec_coalesce_first_frames = max(int(codec_coalesce_first_frames), 0)
         self.codec_coalesce_early_frames = max(int(codec_coalesce_early_frames), 0)
+        sim_trace_directory = os.environ.get("SGLANG_OMNI_SIM_TRACE_DIRECTORY")
+        sim_donor_directory = os.environ.get("SGLANG_OMNI_SIM_DONOR_DIRECTORY")
+        self.sim_trace: SimBisectTrace | None = (
+            SimBisectTrace(
+                Path(sim_trace_directory),
+                Path(sim_donor_directory) if sim_donor_directory else None,
+            )
+            if sim_trace_directory
+            else None
+        )
 
     def execute(self, scheduler_output: SchedulerOutput) -> ModelRunnerOutput:
         return super().execute(scheduler_output)
@@ -87,6 +100,12 @@ class QwenTalkerModelRunner(ModelRunner["SGLangARRequestData"]):
         else:
             pass
         input_embeds, input_embeds_are_projected = composed
+        if self.sim_trace is not None:
+            self.record_sim_input(
+                "prefill", forward_batch, requests, input_embeds, is_lookahead=False
+            )
+        else:
+            pass
         attach_omni_prefill_inputs(
             forward_batch,
             OmniPrefillInputs(
@@ -103,8 +122,6 @@ class QwenTalkerModelRunner(ModelRunner["SGLangARRequestData"]):
         *,
         is_lookahead: bool = False,
     ) -> None:
-        del is_lookahead
-        del forward_batch
         del schedule_batch
         if not self.feedback_enabled:
             return
@@ -113,6 +130,16 @@ class QwenTalkerModelRunner(ModelRunner["SGLangARRequestData"]):
 
         self.model.prepare_decode_buffers(requests)
         self.write_feedback_buffers(requests)
+        if self.sim_trace is not None:
+            self.record_sim_input(
+                "decode",
+                forward_batch,
+                requests,
+                self.model.feedback_buffer[: len(requests)],
+                is_lookahead=is_lookahead,
+            )
+        else:
+            pass
 
     def post_prefill(
         self,
@@ -143,8 +170,16 @@ class QwenTalkerModelRunner(ModelRunner["SGLangARRequestData"]):
         else:
             pass
         # note (ratish): the layer 0 id is staged to the host ahead of the predictor, so the finalize wait covers the sample and not the predictor.
-        self.stage_token_ids(result, result.next_token_ids)
+        if self.sim_trace is None:
+            self.stage_token_ids(result, result.next_token_ids)
+        else:
+            pass
         self.model.code_predictor_forward(layer0_codes, talker_hidden)
+        if self.sim_trace is not None:
+            self.observe_sim_frame(result, requests, is_decode=False)
+            self.stage_token_ids(result, result.next_token_ids)
+        else:
+            pass
         self.emit_code_chunks_and_feedback(
             schedule_batch=schedule_batch,
             requests=requests,
@@ -164,10 +199,129 @@ class QwenTalkerModelRunner(ModelRunner["SGLangARRequestData"]):
 
         batch_size = len(requests)
         result.next_token_ids = self.model.sampled_token_ids[:batch_size].clone()
+        if self.sim_trace is not None:
+            self.observe_sim_frame(result, requests, is_decode=True)
+        else:
+            pass
         self.stage_token_ids(result, result.next_token_ids)
         self.emit_code_chunks_and_feedback(
             schedule_batch=schedule_batch,
             requests=requests,
+        )
+
+    def record_sim_input(
+        self,
+        phase: Literal["prefill", "decode"],
+        forward_batch: ForwardBatch | None,
+        requests: list[SchedulerRequest],
+        projected_input: torch.Tensor,
+        *,
+        is_lookahead: bool,
+    ) -> None:
+        trace = self.sim_trace
+        assert trace is not None
+        traced = [
+            request for request in requests if request.request_id in trace.request_ids
+        ]
+        if not traced:
+            return
+        else:
+            pass
+        assert not is_lookahead and len(requests) == 1
+        assert forward_batch is not None
+        positions = (
+            forward_batch.mrope_positions
+            if self.model.uses_mrope and forward_batch.mrope_positions is not None
+            else forward_batch.positions
+        )
+        trace.record_input(
+            traced[0].request_id,
+            phase,
+            projected_input,
+            positions,
+            forward_batch.input_ids,
+        )
+
+    @torch.no_grad()
+    def observe_sim_frame(
+        self,
+        result: GenerationBatchResult,
+        requests: list[SchedulerRequest],
+        *,
+        is_decode: bool,
+    ) -> None:
+        trace = self.sim_trace
+        assert trace is not None
+        traced = [
+            request for request in requests if request.request_id in trace.request_ids
+        ]
+        if not traced:
+            return
+        else:
+            pass
+        assert len(requests) == 1
+        request = traced[0]
+        frame_index = len(request.data.req.output_ids)
+        forced_codes = trace.forced_codes(request.request_id, frame_index)
+        codes = self.model.output_codes[0]
+        residual_code_margins: list[float] = []
+        if forced_codes is not None:
+            assert len(forced_codes) == self.model.config.num_code_groups
+            codes.copy_(
+                torch.tensor(forced_codes, device=codes.device, dtype=codes.dtype)
+            )
+            embeddings = [self.model.get_input_embeddings()(codes[:1])]
+            embeddings.extend(
+                embedding(codes[codebook_index : codebook_index + 1])
+                for codebook_index, embedding in enumerate(
+                    self.model.code_predictor.model.codec_embedding, start=1
+                )
+            )
+            feedback = torch.stack(embeddings, dim=1).sum(dim=1)
+            self.model.output_embeds[:1].copy_(feedback)
+            result.next_token_ids.copy_(codes[:1].reshape_as(result.next_token_ids))
+            if is_decode:
+                self.model.sampled_token_ids[:1].copy_(codes[:1])
+            else:
+                pass
+            # note (ratish): use the same recorded codec prefix inside the predictor, not only between Talker frames.
+            talker_hidden = result.logits_output.hidden_states
+            assert talker_hidden is not None and talker_hidden.shape == feedback.shape
+            predictor_hidden = self.model.predictor_forward_tokens(
+                token_embeds=torch.stack([talker_hidden, embeddings[0]], dim=1),
+                batch_size=1,
+                cache_len=0,
+            )
+            for group_index, head in enumerate(self.model.code_predictor.lm_head):
+                logits, _ = head(predictor_hidden[:, -1:, :].contiguous())
+                group_logits = logits[0, -1].float().clone()
+                chosen_code = forced_codes[group_index + 1]
+                chosen_logit = float(group_logits[chosen_code])
+                group_logits[chosen_code] = float("-inf")
+                residual_code_margins.append(chosen_logit - float(group_logits.max()))
+                if group_index + 1 < len(self.model.code_predictor.lm_head):
+                    predictor_hidden = self.model.predictor_forward_tokens(
+                        token_embeds=embeddings[group_index + 1].unsqueeze(1).clone(),
+                        batch_size=1,
+                        cache_len=group_index + 2,
+                    )
+                else:
+                    pass
+        else:
+            pass
+        if is_decode:
+            raw_logits = result.logits_output.next_token_logits
+        else:
+            # note (ratish): the prefill sampler can rewrite its logits before the runner sees the result.
+            raw_logits, _ = self.model.codec_head(result.logits_output.hidden_states)
+        trace.record_frame(
+            request.request_id,
+            frame_index,
+            codes,
+            self.model.config.codec_eos_token_id,
+            raw_logits[0].float(),
+            forced=forced_codes is not None,
+            residual_code_margins=residual_code_margins,
         )
 
     def emit_code_chunks_and_feedback(
