@@ -253,7 +253,7 @@ def main() -> None:
                 census_timers = [
                     threading.Timer(
                         CLIENT_WARMUP_S + args.duration + CENSUS_AFTER_WINDOW_S,
-                        (seed_out / arm / "server.census").touch,
+                        (seed_out / arm / "server.census.1").touch,
                     )
                     for arm in ("a", "b")
                     if args.gc_probe
