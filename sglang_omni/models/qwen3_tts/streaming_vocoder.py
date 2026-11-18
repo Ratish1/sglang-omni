@@ -2800,8 +2800,7 @@ class Qwen3TTSStreamingVocoderScheduler(
             else:
                 pass
             remaining = deadline - time.monotonic()
-            # note (ratish): past the wait the batch still takes what is already queued, so a zero
-            # wait batches the ready streams without delaying the first one.
+            # note (ratish): past the wait the batch still takes what is already queued, so a zero wait batches the ready streams without delaying the first one.
             try:
                 if remaining > 0:
                     queued = self.initial_queue.get(timeout=remaining)
