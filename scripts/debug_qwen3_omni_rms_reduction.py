@@ -128,6 +128,15 @@ def main() -> None:
         precise = (precise_values * precise_inverse_rms).bfloat16() * weight
         changed = native != eager
         changed_rows = changed.any(dim=-1)
+        changed_counts = changed.sum(dim=-1).cpu().tolist()
+        variance_differences = (
+            (native_variance - eager_variance).flatten().cpu().tolist()
+        )
+        inverse_rms_differences = (
+            (native_inverse_rms - eager_inverse_rms).flatten().cpu().tolist()
+        )
+        native_precise_counts = (native == precise).sum(dim=-1).cpu().tolist()
+        eager_precise_counts = (eager == precise).sum(dim=-1).cpu().tolist()
         row_records = []
         for row, origin in enumerate(normalization["origins"]):
             row_records.append(
@@ -135,19 +144,11 @@ def main() -> None:
                     "request_id": origin[0],
                     "frame": origin[1],
                     "token_row": origin[2],
-                    "changed_values": int(changed[row].sum()),
-                    "variance_difference": float(
-                        native_variance[row, 0] - eager_variance[row, 0]
-                    ),
-                    "inverse_rms_difference": float(
-                        native_inverse_rms[row, 0] - eager_inverse_rms[row, 0]
-                    ),
-                    "native_matches_fp64_values": int(
-                        (native[row] == precise[row]).sum()
-                    ),
-                    "eager_matches_fp64_values": int(
-                        (eager[row] == precise[row]).sum()
-                    ),
+                    "changed_values": changed_counts[row],
+                    "variance_difference": variance_differences[row],
+                    "inverse_rms_difference": inverse_rms_differences[row],
+                    "native_matches_fp64_values": native_precise_counts[row],
+                    "eager_matches_fp64_values": eager_precise_counts[row],
                 }
             )
         name = normalization["name"]
