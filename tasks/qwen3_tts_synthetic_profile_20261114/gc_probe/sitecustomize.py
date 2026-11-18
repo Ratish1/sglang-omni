@@ -4,8 +4,8 @@ With GC_PROBE_OUT set, the process takes the variable out of its environment (so
 spawns are not probed) and appends to GC_PROBE_OUT.<pid>.gc.tsv one row per collection that is a
 full one or lasts at least GC_PROBE_MIN_MS: wall time at its start, generation, milliseconds,
 objects collected, the collector's counts and the frozen object count. Once the file
-GC_PROBE_OUT.census exists, the next full collection also writes the tracked objects by type to
-GC_PROBE_OUT.<pid>.census.txt, once.
+GC_PROBE_OUT.census exists (looked for at most once a second), the next collection also writes the
+tracked objects by type to GC_PROBE_OUT.<pid>.census.txt, once.
 """
 
 import collections
@@ -15,11 +15,12 @@ import time
 
 GC_PROBE_MIN_MS = 2.0
 CENSUS_TYPES = 60
+CENSUS_CHECK_S = 1.0
 
 
 def write_census(prefix: str) -> None:
     objects = gc.get_objects()
-    by_type = collections.Counter(type(item).__qualname__ for item in objects)
+    by_type = collections.Counter(f"{type(item).__module__}.{type(item).__qualname__}" for item in objects)
     with open(f"{prefix}.{os.getpid()}.census.txt", "w") as handle:
         handle.write(f"{time.time():.3f} tracked {len(objects)} frozen {gc.get_freeze_count()}\n")
         for name, count in by_type.most_common(CENSUS_TYPES):
@@ -45,9 +46,14 @@ def install(prefix: str) -> None:
                 )
             else:
                 pass
-            if info["generation"] == 2 and not census["is_written"] and os.path.exists(f"{prefix}.census"):
-                census["is_written"] = True
-                write_census(prefix)
+            now_s = time.monotonic()
+            if not census["is_written"] and now_s - census.get("checked_s", 0.0) >= CENSUS_CHECK_S:
+                census["checked_s"] = now_s
+                if os.path.exists(f"{prefix}.census"):
+                    census["is_written"] = True
+                    write_census(prefix)
+                else:
+                    pass
             else:
                 pass
 
