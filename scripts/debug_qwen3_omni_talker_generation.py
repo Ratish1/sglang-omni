@@ -78,6 +78,7 @@ def main() -> None:
             "native-boundary",
             "native-query-key",
             "checkpoint-boundary",
+            "checkpoint-residual",
         ),
         default="checkpoint",
     )
@@ -395,12 +396,14 @@ def main() -> None:
         round_residual_before_normalization=arguments.round_residual_before_normalization,
         round_normalized_before_weight=arguments.round_normalized_before_weight,
         use_checkpoint_boundary_kernel=(
-            arguments.normalization_semantics == "checkpoint-boundary"
+            arguments.normalization_semantics
+            in ("checkpoint-boundary", "checkpoint-residual")
         ),
     )
     if (
         arguments.normalization_semantics.startswith("native")
-        or arguments.normalization_semantics == "checkpoint-boundary"
+        or arguments.normalization_semantics
+        in ("checkpoint-boundary", "checkpoint-residual")
         or arguments.paired_normalization_controls
     ):
         normalization.install()
@@ -768,6 +771,7 @@ def main() -> None:
                 "native",
                 "native-boundary",
                 "checkpoint-boundary",
+                "checkpoint-residual",
             )
             normalization.query_key_enabled = normalization_mode in (
                 "native",
