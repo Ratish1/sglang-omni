@@ -40,10 +40,15 @@ class PaddingProbe(TypedDict):
     long_file: str
     short_sha256: str
     samples_at_16khz: list[int]
-    valid_first_conv_frames: int
-    max_abs_prefix_change: dict[str, float]
-    equal_length_vs_singleton_cosine: float
-    mixed_length_vs_singleton_cosine: float
+    valid_feature_frames: int
+    encoder_unmasked_frames: dict[str, int]
+    max_abs_prefix_change: dict[str, dict[str, float]]
+    embedding_vs_singleton_cosine: dict[str, float]
+
+
+class EncoderArguments(TypedDict):
+    padding_mask: torch.Tensor
+    layer: int | None
 
 
 def probe_padding(
@@ -54,26 +59,67 @@ def probe_padding(
     (conv,) = (
         module for module in first_conv.modules() if isinstance(module, nn.Conv1d)
     )
-    (group_norm,) = (
-        module for module in first_conv.modules() if isinstance(module, nn.GroupNorm)
-    )
     short_samples = load_audio(short_audio_path).numel()
     long_samples = load_audio(long_audio_path).numel()
     assert short_samples < long_samples
-    valid_frames = (short_samples - conv.kernel_size[0]) // conv.stride[0] + 1
-    activation_prefixes: dict[str, list[torch.Tensor]] = {"conv": [], "group_norm": []}
+    first_conv_frames = (short_samples - conv.kernel_size[0]) // conv.stride[0] + 1
+    feature_frame_counts = scorer.model.get_feat_lengths(
+        [short_samples, long_samples], torch.device(scorer.device)
+    )
+    layers = (
+        ("first_conv", conv, first_conv_frames),
+        ("first_conv_block", first_conv, first_conv_frames),
+        ("position_conv", upstream.encoder.pos_conv, feature_frame_counts[0]),
+    )
+    activation_prefixes: dict[str, list[torch.Tensor]] = {
+        name: [] for name, _, _ in layers
+    }
+    labels = ("equal_length", "mixed_length", "exact_mask")
+    unmasked_frames: list[int] = []
+
+    def observe_mask(
+        _module: nn.Module,
+        _inputs: tuple[torch.Tensor],
+        arguments: EncoderArguments,
+    ) -> None:
+        unmasked_frames.append((~arguments["padding_mask"][0]).sum().item())
+
+    def replace_mask(
+        _module: nn.Module,
+        inputs: tuple[torch.Tensor],
+        arguments: EncoderArguments,
+    ) -> tuple[tuple[torch.Tensor], EncoderArguments]:
+        padding_mask = arguments["padding_mask"]
+        positions = torch.arange(inputs[0].shape[1], device=padding_mask.device)
+        lengths = torch.tensor(feature_frame_counts, device=padding_mask.device)
+        arguments["padding_mask"] = positions >= lengths[:, None]
+        return inputs, arguments
+
     hooks = [
         layer.register_forward_hook(
-            lambda _module, _inputs, output, layer_name=name: activation_prefixes[
-                layer_name
-            ].append(output[0, :, :valid_frames].detach().cpu())
+            lambda _module, _inputs, output, layer_name=name, frame_count=frames: (
+                activation_prefixes[layer_name].append(
+                    output[0, :, :frame_count].detach().cpu()
+                )
+            ),
         )
-        for name, layer in (("conv", conv), ("group_norm", group_norm))
+        for name, layer, frames in layers
     ]
+    observer = upstream.encoder.register_forward_pre_hook(
+        observe_mask, with_kwargs=True
+    )
     try:
         equal_length = scorer.embed([short_audio_path, short_audio_path])
         mixed_length = scorer.embed([short_audio_path, long_audio_path])
+        mask_override = upstream.encoder.register_forward_pre_hook(
+            replace_mask, with_kwargs=True, prepend=True
+        )
+        try:
+            exact_mask = scorer.embed([short_audio_path, long_audio_path])
+        finally:
+            mask_override.remove()
     finally:
+        observer.remove()
         for hook in hooks:
             hook.remove()
     independent = scorer.embed([short_audio_path])[0]
@@ -83,17 +129,21 @@ def probe_padding(
         "long_file": Path(long_audio_path).name,
         "short_sha256": hashlib.sha256(Path(short_audio_path).read_bytes()).hexdigest(),
         "samples_at_16khz": [short_samples, long_samples],
-        "valid_first_conv_frames": valid_frames,
+        "valid_feature_frames": feature_frame_counts[0],
+        "encoder_unmasked_frames": dict(zip(labels, unmasked_frames, strict=True)),
         "max_abs_prefix_change": {
-            name: (first - second).abs().max().item()
-            for name, (first, second) in activation_prefixes.items()
+            name: {
+                "mixed_length": (first - second).abs().max().item(),
+                "exact_mask": (first - third).abs().max().item(),
+            }
+            for name, (first, second, third) in activation_prefixes.items()
         },
-        "equal_length_vs_singleton_cosine": F.cosine_similarity(
-            equal_length[0], independent, dim=0
-        ).item(),
-        "mixed_length_vs_singleton_cosine": F.cosine_similarity(
-            mixed_length[0], independent, dim=0
-        ).item(),
+        "embedding_vs_singleton_cosine": {
+            label: F.cosine_similarity(embeddings[0], independent, dim=0).item()
+            for label, embeddings in zip(
+                labels, (equal_length, mixed_length, exact_mask), strict=True
+            )
+        },
     }
 
 
