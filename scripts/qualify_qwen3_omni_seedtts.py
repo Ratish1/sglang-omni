@@ -127,9 +127,24 @@ def exercise_server(
     run_phase: argparse.Namespace,
 ) -> None:
     port = find_available_port()
+    server_env = {"PYTHONPATH": str(tree)}
+    package_path = Path(
+        subprocess.check_output(
+            [
+                sys.executable,
+                "-P",
+                "-c",
+                "import sglang_omni; print(sglang_omni.__file__)",
+            ],
+            env={**no_proxy_env(), **server_env},
+            text=True,
+        ).strip()
+    ).resolve()
+    assert package_path.is_relative_to(tree), package_path
     server = start_server_from_cmd(
         [
             sys.executable,
+            "-P",
             "-m",
             "sglang_omni.cli",
             "serve",
@@ -146,7 +161,7 @@ def exercise_server(
         output_directory / "server.log",
         port,
         timeout=SERVER_TIMEOUT_SECONDS,
-        env={"PYTHONPATH": str(tree)},
+        env=server_env,
         strip_proxy=True,
     )
     try:
