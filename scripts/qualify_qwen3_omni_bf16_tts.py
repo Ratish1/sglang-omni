@@ -34,6 +34,7 @@ def main() -> None:
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument("--voice-probe", action="store_true")
     parser.add_argument("--seed", type=int)
+    parser.add_argument("--sample-ids", nargs="+")
     arguments = parser.parse_args()
     logging.basicConfig(level=logging.INFO)
     tree = arguments.tree.resolve(strict=True)
@@ -41,8 +42,25 @@ def main() -> None:
     output = arguments.output.resolve()
     output.mkdir()
 
-    samples = load_seedtts_samples(DATASETS["seedtts"])
+    dataset = DATASETS["seedtts"]
+    samples = load_seedtts_samples(dataset)
     assert len(samples) == FULL_SEEDTTS_SAMPLE_COUNT
+    if arguments.sample_ids is not None:
+        sample_ids = set(arguments.sample_ids)
+        samples = [sample for sample in samples if sample.sample_id in sample_ids]
+        assert {sample.sample_id for sample in samples} == sample_ids
+        rows = [
+            (sample.sample_id, sample.ref_text, sample.ref_audio, sample.target_text)
+            for sample in samples
+        ]
+        assert all(
+            "|" not in field and "\n" not in field for row in rows for field in row
+        )
+        metadata = output / "witnesses.lst"
+        metadata.write_text("".join("|".join(row) + "\n" for row in rows))
+        dataset = str(metadata)
+    else:
+        pass
     (output / "inputs.json").write_text(
         json.dumps(
             {
@@ -95,7 +113,7 @@ def main() -> None:
             model="qwen3-omni",
             host="127.0.0.1",
             port=port,
-            meta=DATASETS["seedtts"],
+            meta=dataset,
             voice_clone=True,
             max_concurrency=CONCURRENCY,
             output_dir=str(output / "generation"),
@@ -103,7 +121,7 @@ def main() -> None:
             disable_tqdm=True,
         )
         report = asyncio.run(run_omni_seedtts_benchmark(config))
-        assert report["summary"]["completed_requests"] == FULL_SEEDTTS_SAMPLE_COUNT
+        assert report["summary"]["completed_requests"] == len(samples)
         assert report["summary"]["failed_requests"] == 0
         logger.info(f"{output.name}: {report['summary']}")
         if arguments.voice_probe:
