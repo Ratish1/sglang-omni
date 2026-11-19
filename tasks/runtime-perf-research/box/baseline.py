@@ -77,6 +77,14 @@ MODELS = {
         "--gpu-thinker 0 --gpu-image-encoder 0 --gpu-audio-encoder 0 --gpu-talker 1 --gpu-code2wav 1 "
         "--thinker-mem-fraction-static 0.82 --talker-mem-fraction-static 0.40",
     },
+    # note (ratish): the CI's Video-MME speech pipeline on one card, for a host with one H200.
+    "omni_ci_onecard": {
+        "path": "Qwen/Qwen3-Omni-30B-A3B-Instruct",
+        "config": str(Path(__file__).resolve().parent / "qwen3_omni_speech_onecard_h200.yaml"),
+        "placement": "--image_encoder.gpu {card} --audio_encoder.gpu {card} --thinker.gpu {card} "
+        "--talker_ar.gpu {card} --code2wav.gpu {card} "
+        "--preprocessing.factory.max_seq_len 32768 --thinker.factory.max_seq_len 32768",
+    },
     "omni_fp8_colocated": {
         "path": "marksverdhei/Qwen3-Omni-30B-A3B-FP8",
         "config": "examples/configs/qwen3_omni_colocated_h100_fp8.yaml",

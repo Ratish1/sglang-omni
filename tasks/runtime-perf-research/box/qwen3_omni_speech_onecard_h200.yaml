@@ -1,0 +1,17 @@
+# The CI's Video-MME speech server pipeline (Qwen3OmniSpeechPipelineConfig, its processes and environment defaults)
+# with every GPU stage on one H200, at the colocated H200 config's stage memory budgets.
+config_cls: Qwen3OmniSpeechPipelineConfig
+name: qwen3-omni-speech-onecard-h200
+model_path: Qwen/Qwen3-Omni-30B-A3B-Instruct
+
+stages:
+  image_encoder:
+    gpu_memory_fraction: 0.017
+  audio_encoder:
+    gpu_memory_fraction: 0.017
+  thinker:
+    gpu_memory_fraction: 0.769
+  talker_ar:
+    gpu_memory_fraction: 0.123
+  code2wav:
+    gpu_memory_fraction: 0.014
