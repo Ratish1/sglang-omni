@@ -309,7 +309,29 @@ def watch() -> None:
     install(sys.modules[BASE], sys.modules[THINKER])
 
 
+def pin_attention_splits(splits: int) -> None:
+    """Causal control only: fixes FlashAttention's split-KV count for prefill and decode at `splits`, whatever the batch."""
+    module_name = "sglang.srt.layers.attention.flashattention_backend"
+    while module_name not in sys.modules or not hasattr(sys.modules[module_name], "FlashAttentionBackend"):
+        time.sleep(0.05)
+    backend = sys.modules[module_name].FlashAttentionBackend
+    original_init = backend.__init__
+
+    def init(self, *args, **kwargs):
+        original_init(self, *args, **kwargs)
+        self.num_splits = splits
+        self.decode_num_splits = splits
+
+    backend.__init__ = init
+
+
 if PREFIX:
     threading.Thread(target=watch, name="thinker-numerics-probe", daemon=True).start()
+    if os.environ.get("OMNI_FA_SPLITS"):
+        threading.Thread(
+            target=pin_attention_splits, args=(int(os.environ["OMNI_FA_SPLITS"]),), name="fa-splits-control", daemon=True
+        ).start()
+    else:
+        pass
 else:
     pass
