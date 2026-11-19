@@ -124,6 +124,7 @@ def score_visual(run: Path, port: int) -> dict:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--asr-checkpoint", required=True, type=Path)
+    parser.add_argument("--asr-gpu", type=int, default=0)
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument("--visual-runs", nargs="*", type=Path, default=())
     parser.add_argument("runs", nargs="*", type=Path)
@@ -164,6 +165,8 @@ def main() -> None:
             str(arguments.asr_checkpoint.resolve(strict=True)),
             "--model-name",
             QWEN3_ASR_MODEL_PATH,
+            "--asr.gpu",
+            str(arguments.asr_gpu),
             "--asr.engine.disable_speculative_decoding",
             "true",
         ],
