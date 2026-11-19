@@ -10,6 +10,7 @@ import json
 import logging
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import requests
@@ -18,6 +19,7 @@ from benchmarks.benchmarker.utils import start_server_from_cmd, stop_server
 from benchmarks.dataset.mmsu import MmsuSample, load_mmsu_samples
 from benchmarks.dataset.prepare import DATASETS
 from benchmarks.eval.benchmark_omni_mmsu import run
+from sglang_omni.profiler.views import assess_completeness
 from sglang_omni.utils import find_available_port
 from tests.test_model.conftest import (
     QWEN3_OMNI_FP8_TP2_THINKER_MEM_FRACTION,
@@ -34,6 +36,7 @@ from tests.test_model.test_qwen3_omni_mmsu_talker_ci import (
 logger = logging.getLogger(__name__)
 WARMUP_REQUEST_COUNT = 4
 CONTROL_TIMEOUT_SECONDS = 30
+STATUS_POLL_SECONDS = 0.25
 STARTUP_TIMEOUT_SECONDS = 600
 SEED = 20261119
 
@@ -179,11 +182,12 @@ def main() -> None:
             with requests.Session() as http:
                 http.trust_env = False
                 server_url = f"http://127.0.0.1:{port}"
+                event_directory = output / "events"
                 response = http.post(
                     f"{server_url}/{start_route}",
                     json={
                         "run_id": session_name,
-                        "event_dir": str(output / "events"),
+                        "event_dir": str(event_directory),
                         **(
                             {"trace_path_template": str(output / "{stage}")}
                             if capture_torch
@@ -230,6 +234,16 @@ def main() -> None:
                         json={"run_id": session_name},
                         timeout=CONTROL_TIMEOUT_SECONDS,
                     ).raise_for_status()
+                    # note (codex): stop broadcasts before the per-process writers finish.
+                    deadline = time.monotonic() + CONTROL_TIMEOUT_SECONDS
+                    while True:
+                        status = assess_completeness(event_directory)
+                        if status["complete"]:
+                            break
+                        elif time.monotonic() >= deadline:
+                            raise RuntimeError(f"Incomplete request events: {status}")
+                        else:
+                            time.sleep(STATUS_POLL_SECONDS)
     finally:
         stop_server(server)
 
