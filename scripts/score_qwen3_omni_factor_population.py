@@ -17,7 +17,11 @@ from benchmarks.eval.benchmark_omni_seedtts import (
     evaluate_generated_audio,
 )
 from benchmarks.metrics.wer import SampleOutput, calculate_wer_metrics
-from benchmarks.tasks.asr import QWEN3_ASR_MODEL_PATH, apply_wer
+from benchmarks.tasks.asr import (
+    QWEN3_ASR_MODEL_PATH,
+    apply_wer,
+    compute_text_audio_consistency_from_records,
+)
 from benchmarks.tasks.tts import run_seedtts_similarity, run_seedtts_utmos
 from sglang_omni.utils import find_available_port
 
@@ -94,10 +98,34 @@ def score_acoustics(run: Path) -> dict:
     }
 
 
+def score_visual(run: Path, port: int) -> dict:
+    evidence = json.loads((run / "visual-results.json").read_text())
+    for name, report in evidence["reports"].items():
+        del report["config"]
+        if name == "image-text":
+            continue
+        else:
+            pass
+        records = report["per_sample"]
+        audio_dir = run / name / "audio"
+        assert all((audio_dir / f"{row['sample_id']}.wav").is_file() for row in records)
+        report["wer"] = compute_text_audio_consistency_from_records(
+            records,
+            "en",
+            "cuda:0",
+            audio_dir=str(audio_dir),
+            asr_router_port=port,
+            asr_concurrency=1,
+        )
+        assert report["wer"]["summary"]["evaluated"] == len(records), name
+    return evidence
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--asr-checkpoint", required=True, type=Path)
     parser.add_argument("--output", required=True, type=Path)
+    parser.add_argument("--visual-runs", nargs="*", type=Path, default=())
     parser.add_argument("runs", nargs="+", type=Path)
     arguments = parser.parse_args()
     logging.basicConfig(level=logging.INFO)
@@ -138,6 +166,10 @@ def main() -> None:
         strip_proxy=True,
     )
     try:
+        visual_reports = {}
+        for run in arguments.visual_runs:
+            visual_reports[run.name] = score_visual(run, port)
+            logging.info(f"Finished visual speech scoring: {run.name}")
         reports = {}
         for run in arguments.runs:
             reports[run.name] = score_speech(run, port)
@@ -154,6 +186,7 @@ def main() -> None:
                 "manifest": voice_manifests,
                 "asr_checkpoint": arguments.asr_checkpoint.name,
                 "reports": reports,
+                "visual_reports": visual_reports,
             },
             indent=2,
             allow_nan=False,
