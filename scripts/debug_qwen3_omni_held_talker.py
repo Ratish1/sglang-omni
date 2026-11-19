@@ -10,6 +10,7 @@ from pathlib import Path
 import torch
 from sglang.srt.layers.sampler import top_k_top_p_min_p_sampling_from_probs_torch
 from transformers import Qwen3OmniMoeConfig
+from transformers.cache_utils import DynamicCache
 from transformers.conversion_mapping import (
     get_checkpoint_conversion_mapping,
     register_checkpoint_conversion_mapping,
@@ -227,11 +228,115 @@ def replay_history(
     return frames
 
 
+def compare_prefix_cache(
+    reference: Qwen3OmniMoeTalkerForConditionalGeneration,
+    trace_directory: Path,
+) -> dict[str, int | list[dict[str, int | float | str]]]:
+    target_device = reference.device
+    recorded = {
+        name: torch.load(
+            trace_directory / f"{name}.pt",
+            map_location=target_device,
+            weights_only=True,
+        )
+        for name in (
+            "backbone-prefill-000",
+            "backbone-decode-001",
+            "decode-sampling-001",
+            "first-decode-prefix-cache-000",
+            "codec-001",
+        )
+    }
+    prefill = recorded["backbone-prefill-000"]
+    decode = recorded["backbone-decode-001"]
+    sampling = recorded["decode-sampling-001"]
+    native_prefix = recorded["first-decode-prefix-cache-000"]
+    native_code = int(sampling["sampled_code"])
+    position = sampling["position"].reshape(1, 1, 1)
+    assert (
+        decode["rotary_positions"] is None
+        or (decode["rotary_positions"] == position).all()
+    )
+    assert int(position) == native_prefix["position"] == len(prefill["positions"])
+    prefill_positions = prefill["positions"].reshape(1, 1, -1)
+    assert prefill["rotary_positions"] is None or torch.equal(
+        prefill["rotary_positions"], prefill_positions.reshape(1, -1).expand(3, -1)
+    )
+    reference_cache = reference.model(
+        inputs_embeds=prefill["embeddings"].unsqueeze(0),
+        position_ids=prefill_positions.expand(4, 1, -1),
+        use_cache=True,
+    ).past_key_values
+    assert reference_cache.get_seq_length() == len(prefill["positions"])
+    decode_embeddings = decode["feedback_row"].reshape(-1) + decode["text_row"].reshape(
+        -1
+    )
+    assert torch.equal(
+        decode_embeddings,
+        recorded["codec-001"]["consumed_decode_embedding"].reshape(-1),
+    )
+    native_logits = sampling["raw_logits"]
+    native_distribution, repeated_code = filtered_distribution(native_logits, sampling)
+    assert native_code == repeated_code
+    results = []
+    for source in ("reference", "native_keys", "native_values", "native_both"):
+        cache = DynamicCache(config=reference.config.text_config)
+        for layer_index, reference_layer in enumerate(reference_cache.layers):
+            native_keys = (
+                native_prefix["key_rows"][layer_index].transpose(0, 1).unsqueeze(0)
+            )
+            native_values = (
+                native_prefix["value_rows"][layer_index].transpose(0, 1).unsqueeze(0)
+            )
+            assert native_keys.shape == reference_layer.keys.shape
+            assert native_values.shape == reference_layer.values.shape
+            assert native_keys.dtype == native_values.dtype == reference.dtype
+            cache.update(
+                (
+                    native_keys
+                    if source in ("native_keys", "native_both")
+                    else reference_layer.keys
+                ),
+                (
+                    native_values
+                    if source in ("native_values", "native_both")
+                    else reference_layer.values
+                ),
+                layer_index,
+            )
+        result = reference.model(
+            inputs_embeds=decode_embeddings.view(1, 1, -1),
+            position_ids=position.expand(4, 1, 1),
+            past_key_values=cache,
+            use_cache=True,
+        )
+        logits = (
+            reference.codec_head(result.last_hidden_state[:, -1:]).float().reshape(-1)
+        )
+        distribution, code = filtered_distribution(logits, sampling)
+        results.append(
+            {
+                "prefill_cache_source": source,
+                "selected_code": code,
+                "probability_of_native_code": float(distribution[0, native_code]),
+                "total_variation_from_native_distribution": float(
+                    0.5 * (native_distribution - distribution).abs().sum()
+                ),
+                "maximum_absolute_logit_difference_from_native": float(
+                    (logits - native_logits).abs().max()
+                ),
+            }
+        )
+    return {"native_code": native_code, "position": int(position), "arms": results}
+
+
 @torch.inference_mode()
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model-path", required=True)
-    parser.add_argument("--trace-directory", type=Path, required=True)
+    mode = parser.add_mutually_exclusive_group(required=True)
+    mode.add_argument("--trace-directory", type=Path)
+    mode.add_argument("--prefix-trace", type=Path)
     parser.add_argument("--output", type=Path, required=True)
     arguments = parser.parse_args()
     torch.set_float32_matmul_precision("highest")
@@ -251,12 +356,16 @@ def main() -> None:
     )
     assert not loading["missing_keys"] and not loading["mismatched_keys"], loading
     reference.eval()
-    reports = {}
-    for trace_directory in sorted(arguments.trace_directory.iterdir()):
-        frames = replay_history(reference, trace_directory)
-        repeated_frames = replay_history(reference, trace_directory)
-        assert frames == repeated_frames
-        reports[trace_directory.name] = frames
+    if arguments.prefix_trace is not None:
+        reports = compare_prefix_cache(reference, arguments.prefix_trace)
+        assert reports == compare_prefix_cache(reference, arguments.prefix_trace)
+    else:
+        reports = {}
+        for trace_directory in sorted(arguments.trace_directory.iterdir()):
+            frames = replay_history(reference, trace_directory)
+            repeated_frames = replay_history(reference, trace_directory)
+            assert frames == repeated_frames
+            reports[trace_directory.name] = frames
     with arguments.output.open("x") as output:
         json.dump(reports, output, indent=2)
         output.write("\n")
