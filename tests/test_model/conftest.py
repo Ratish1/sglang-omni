@@ -482,6 +482,8 @@ def start_qwen3_omni_speech_server(
     cmd = [
         sys.executable,
         "examples/run_qwen3_omni_speech_server.py",
+        "--host",
+        "127.0.0.1",
         "--model-path",
         model_path,
         "--port",
