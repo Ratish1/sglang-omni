@@ -4,6 +4,7 @@ Codec slots, and whether a stream completes.
 Modes on 1.7B CustomVoice, one card, one after another, each serving mode sent one stream and one whole request:
 - async_uncapped: the default asynchronous decode with max_queued_requests none and no slot count; must refuse to start
   naming the missing cap.
+- explicit_none_slots: codec_state_slots none on a capped server; must refuse to start naming the missing count.
 - fractional_slots and zero_slots: codec_state_slots 0.5 or 0; must refuse to start.
 - synchronous_uncapped: async_decode false, uncapped; must serve with no arena.
 - rollback_uncapped: enable_stateful_codec_decoder false, uncapped, on the default asynchronous workers; must serve
@@ -29,7 +30,8 @@ EXIT_TIMEOUT_S = 900
 UNCAPPED = ["--tts_engine.engine.max_queued_requests", "none"]
 # (mode, extra serve arguments, whether it must serve, the startup refusal it must log when it must not)
 MODES = (
-    ("async_uncapped", UNCAPPED, False, "admits without one"),
+    ("async_uncapped", UNCAPPED, False, "no Codec state slot count"),
+    ("explicit_none_slots", ["--vocoder.factory.codec_state_slots", "none"], False, "no Codec state slot count"),
     ("fractional_slots", ["--vocoder.factory.codec_state_slots", "0.5"], False, "must be a positive integer"),
     ("zero_slots", ["--vocoder.factory.codec_state_slots", "0"], False, "must be a positive integer"),
     ("synchronous_uncapped", [*UNCAPPED, "--vocoder.factory.async_decode", "false"], True, None),
