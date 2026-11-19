@@ -135,24 +135,29 @@ def install_layers(base, torch, lock, path) -> None:
                 return
             else:
                 pass
-            tensor = output[0] if isinstance(output, tuple) else output
-            if not isinstance(tensor, torch.Tensor) or tensor.shape[0] != plan["rows"]:
-                return
+            parts = [(name, output[0])] if isinstance(output, tuple) else [(name, output)]
+            if isinstance(output, tuple) and len(output) > 1 and name.endswith(".out"):
+                parts.append((name[:-4] + ".res", output[1]))
             else:
                 pass
-            for item in items:
-                rows = tensor[item["start"] : item["start"] + item["length"]]
-                item["fingerprints"][name] = row_fingerprint(rows)
-                if item["save"]:
-                    item["last_rows"][name] = rows[-1].detach().float().cpu()
+            for part_name, tensor in parts:
+                if not isinstance(tensor, torch.Tensor) or tensor.shape[0] != plan["rows"]:
+                    continue
                 else:
                     pass
+                for item in items:
+                    rows = tensor[item["start"] : item["start"] + item["length"]]
+                    item["fingerprints"][part_name] = row_fingerprint(rows)
+                    if item["save"]:
+                        item["last_rows"][part_name] = rows[-1].detach().float().cpu()
+                    else:
+                        pass
 
         return capture
 
     def attach(model) -> None:
         for module_name, module in model.named_modules():
-            if type(module).__name__ != "Qwen3OmniMoeThinkerTextDecoderLayer" or id(module) in hooked:
+            if type(module).__name__ not in ("Qwen3MoeDecoderLayer", "Qwen3OmniMoeThinkerTextDecoderLayer") or id(module) in hooked:
                 continue
             else:
                 pass
