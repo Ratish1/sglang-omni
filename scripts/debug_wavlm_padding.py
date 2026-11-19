@@ -215,6 +215,7 @@ def main() -> None:
     parser.add_argument("--output-file", type=Path, required=True)
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--trace", action="store_true")
+    parser.add_argument("--trace-only", action="store_true")
     arguments = parser.parse_args()
     samples = load_seedtts_samples(
         arguments.dataset, split=arguments.split, revision=arguments.revision
@@ -245,8 +246,7 @@ def main() -> None:
     ) -> torch.Tensor:
         return exact_feature_mask(features, padding_mask, convolutions)
 
-    if arguments.trace:
-        short_index = duration_order[0]
+    if arguments.trace or arguments.trace_only:
         long_index = duration_order[-1]
         long_path = paths[long_index]
         long_length = prepared_lengths[long_index]
@@ -268,6 +268,43 @@ def main() -> None:
         assert torch.equal(unchanged, repeat)
         equal, equal_trace = trace_embedding(scorer, [short_path, short_path])
         current, current_trace = trace_embedding(scorer, [short_path, long_path])
+        device = torch.device(arguments.device)
+        lengths = torch.tensor([valid_short, valid_long], device=device)
+        padding = torch.arange(valid_long, device=device) >= lengths[:, None]
+
+        def mask_position_input(
+            _module: nn.Module, inputs: tuple[torch.Tensor]
+        ) -> tuple[torch.Tensor]:
+            return (inputs[0].masked_fill(padding[:, None, :], 0),)
+
+        def replace_attention_mask(
+            _module: nn.Module,
+            inputs: tuple[torch.Tensor],
+            arguments: dict[str, torch.Tensor | bool | None],
+        ) -> tuple[tuple[torch.Tensor], dict[str, torch.Tensor | bool | None]]:
+            arguments["self_attn_padding_mask"] = padding
+            return inputs, arguments
+
+        position_hook = upstream.encoder.pos_conv.register_forward_pre_hook(
+            mask_position_input
+        )
+        try:
+            position_only, position_only_trace = trace_embedding(
+                scorer, [short_path, long_path]
+            )
+        finally:
+            position_hook.remove()
+        attention_hooks = [
+            layer.register_forward_pre_hook(replace_attention_mask, with_kwargs=True)
+            for layer in upstream.encoder.layers
+        ]
+        try:
+            attention_only, attention_only_trace = trace_embedding(
+                scorer, [short_path, long_path]
+            )
+        finally:
+            for hook in attention_hooks:
+                hook.remove()
         with patch.object(upstream, "forward_padding_mask", corrected_mask):
             corrected, corrected_trace = trace_embedding(
                 scorer, [short_path, long_path]
@@ -312,6 +349,20 @@ def main() -> None:
                     ("repeat", baseline, repeat_trace, unchanged, repeat),
                     ("equal", baseline, equal_trace, unchanged, equal),
                     ("current", baseline, current_trace, unchanged, current),
+                    (
+                        "exact_position_only",
+                        baseline,
+                        position_only_trace,
+                        unchanged,
+                        position_only,
+                    ),
+                    (
+                        "exact_attention_only",
+                        baseline,
+                        attention_only_trace,
+                        unchanged,
+                        attention_only,
+                    ),
                     ("exact", baseline, corrected_trace, unchanged, corrected),
                     (
                         "exact_no_cudnn_tf32",
@@ -325,6 +376,14 @@ def main() -> None:
         }
     else:
         trace_report = None
+
+    if arguments.trace_only:
+        arguments.output_file.write_text(
+            json.dumps(trace_report, indent=2, allow_nan=False)
+        )
+        return
+    else:
+        pass
 
     order = list(range(len(paths)))
     independent, independent_seconds = score_layout(
