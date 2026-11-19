@@ -15,6 +15,7 @@ from benchmarks.tasks.asr import (
     compute_text_audio_consistency_from_records,
 )
 from sglang_omni.utils import find_available_port
+from tests.test_model.test_qwen3_omni_mmsu_talker_ci import MAX_SAMPLES
 from tests.utils import QWEN3_ASR_WER_CONCURRENCY
 
 
@@ -23,6 +24,8 @@ def main() -> None:
     parser.add_argument("--results", required=True, nargs="+", type=Path)
     parser.add_argument("--model-snapshot", required=True, type=Path)
     parser.add_argument("--output", required=True, type=Path)
+    parser.add_argument("--sample-count", type=int, default=MAX_SAMPLES)
+    parser.add_argument("--plain-only", action="store_true")
     arguments = parser.parse_args()
     arguments.output.mkdir()
 
@@ -32,7 +35,7 @@ def main() -> None:
     }
     waveform_hashes = {}
     for path, records in records_by_report.items():
-        assert len(records) == 40
+        assert len(records) == arguments.sample_count
         assert len({record["sample_id"] for record in records}) == len(records)
         assert all(record["is_success"] and record["has_audio"] for record in records)
         audio_dir = Path(path).parent / "audio"
@@ -45,7 +48,9 @@ def main() -> None:
         json.dumps({str(path): digest for path, digest in waveform_hashes.items()})
     )
 
-    for mode in ("draft-a", "plain", "draft-b"):
+    modes = ("plain",) if arguments.plain_only else ("draft-a", "plain", "draft-b")
+    concurrencies = (1,) if arguments.plain_only else (1, QWEN3_ASR_WER_CONCURRENCY)
+    for mode in modes:
         port = find_available_port()
         options = (
             ["--asr.engine.disable_speculative_decoding", "true"]
@@ -75,7 +80,7 @@ def main() -> None:
             strip_proxy=True,
         )
         try:
-            for concurrency in (1, QWEN3_ASR_WER_CONCURRENCY):
+            for concurrency in concurrencies:
                 reports = {}
                 for path, records in records_by_report.items():
                     audio_dir = Path(path).parent / "audio"
