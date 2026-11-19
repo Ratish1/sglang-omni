@@ -16,7 +16,7 @@ import sys
 import time
 from pathlib import Path
 
-from seedtts_pair import CARD_CPUS, bench, stop
+from seedtts_pair import bench, card_cpus, stop
 from served_baseline import MODELS, wait_healthy
 
 HERE = Path(__file__).resolve().parent
@@ -37,7 +37,7 @@ def launch(tree: Path, model: str, card: int, port: int, session: str, log: Path
     else:
         tracing = ["--trace=cuda,nvtx"]
     command = [
-        "taskset", "-c", CARD_CPUS[card],
+        "taskset", "-c", card_cpus(card),
         "nsys", "launch", f"--session-new={session}", *tracing, "--cuda-graph-trace=node",
         sys.executable, "-m", "sglang_omni.cli", "serve", "--model-path", model, "--host", "127.0.0.1",
         "--port", str(port), "--tts_engine.gpu", str(card), "--vocoder.gpu", str(card),

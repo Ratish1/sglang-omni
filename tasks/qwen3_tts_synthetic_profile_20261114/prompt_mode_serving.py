@@ -22,7 +22,7 @@ from pathlib import Path
 
 import httpx
 
-from seedtts_pair import CARD_CPUS
+from seedtts_pair import card_cpus
 from slot_wait_serving import INPUTS, REFERENCE_TEXT, REFERENCE_WAV, wait_healthy
 
 MODELS = {
@@ -84,7 +84,7 @@ def run_request(url: str, body: dict) -> dict:
 def serve_model(tree: Path, model: str, card: int, port: int, out: Path) -> bool:
     url = f"http://127.0.0.1:{port}"
     command = [
-        "taskset", "-c", CARD_CPUS[card], sys.executable, "-m", "sglang_omni.cli", "serve",
+        "taskset", "-c", card_cpus(card), sys.executable, "-m", "sglang_omni.cli", "serve",
         "--model-path", MODELS[model], "--host", "127.0.0.1", "--port", str(port),
         "--tts_engine.gpu", str(card), "--vocoder.gpu", str(card),
     ]

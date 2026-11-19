@@ -8,6 +8,7 @@ usage: python3 seedtts_pair.py --a-tree MAIN --b-tree BRANCH --out DIR [--model 
 
 import argparse
 import concurrent.futures
+import functools
 import json
 import os
 import signal
@@ -33,10 +34,53 @@ CELLS = (
 SCORED_CELL = "stream_c16"
 # cells only --rounds runs, where a host-side change acts but the standard pair does not look
 ROUNDS_ONLY_CELLS = (("whole_c64", 64, False),)
-# note (ratish): both H100s of host-221 sit on NUMA node 1, so each server takes half of that socket and
-# the clients take node 0.
-CARD_CPUS = {0: "32-47,96-111", 1: "48-63,112-127"}
-CLIENT_CPUS = "0-31,64-95"
+def node_ranges(node: int) -> list[tuple[int, int]]:
+    """The NUMA node's CPU ranges, physical cores then their hyperthread siblings."""
+    text = Path(f"/sys/devices/system/node/node{node}/cpulist").read_text().strip()
+    return [(int(part.split("-")[0]), int(part.split("-")[-1])) for part in text.split(",")]
+
+
+def format_ranges(ranges: list[tuple[int, int]]) -> str:
+    return ",".join(f"{low}-{high}" for low, high in ranges)
+
+
+@functools.cache
+def cpu_layout() -> tuple[dict[int, str], str]:
+    """Each visible card's server takes a half of its own NUMA node; the client takes the nodes with no card, or the halves left."""
+    bus_ids = subprocess.run(
+        ["nvidia-smi", "--query-gpu=pci.bus_id", "--format=csv,noheader"], capture_output=True, text=True, check=True
+    ).stdout.split()
+    card_nodes = {}
+    for card, bus_id in enumerate(bus_ids):
+        domain, rest = bus_id.split(":", 1)
+        card_nodes[card] = int(Path(f"/sys/bus/pci/devices/{domain[-4:].lower()}:{rest.lower()}/numa_node").read_text())
+    nodes = sorted(int(path.name[4:]) for path in Path("/sys/devices/system/node").glob("node[0-9]*"))
+    card_cpus = {}
+    leftover = []
+    for node in nodes:
+        ranges = node_ranges(node)
+        halves = [
+            [(low, low + (high - low + 1) // 2 - 1) for low, high in ranges],
+            [(low + (high - low + 1) // 2, high) for low, high in ranges],
+        ]
+        node_cards = [card for card, card_node in card_nodes.items() if card_node == node]
+        for card, half in zip(node_cards, halves):
+            card_cpus[card] = format_ranges(half)
+        leftover.append((node, node_cards, halves[len(node_cards):] if len(node_cards) < 2 else []))
+    free_nodes = [format_ranges(node_ranges(node)) for node, node_cards, _ in leftover if not node_cards]
+    if free_nodes:
+        client = ",".join(free_nodes)
+    else:
+        client = ",".join(format_ranges(half) for _, _, halves in leftover for half in halves)
+    return card_cpus, client
+
+
+def card_cpus(card: int) -> str:
+    return cpu_layout()[0][card]
+
+
+def client_cpus() -> str:
+    return cpu_layout()[1]
 
 
 def serve(
@@ -44,7 +88,7 @@ def serve(
     server_args: tuple[str, ...] = (),
 ) -> subprocess.Popen:
     command = [
-        "taskset", "-c", CARD_CPUS[card],
+        "taskset", "-c", card_cpus(card),
         sys.executable, "-m", "sglang_omni.cli", "serve", "--model-path", model, "--host", "127.0.0.1",
         "--port", str(port), "--tts_engine.gpu", str(card), "--vocoder.gpu", str(card), *server_args,
     ]
@@ -70,7 +114,7 @@ def stop(server: subprocess.Popen) -> None:
 def bench(tree: Path, model: str, extra: list[str], port: int, concurrency: int, stream: bool, out: Path) -> dict:
     out.mkdir(parents=True, exist_ok=True)
     command = [
-        "taskset", "-c", CLIENT_CPUS,
+        "taskset", "-c", client_cpus(),
         sys.executable, "-m", "benchmarks.eval.benchmark_tts_seedtts", "--meta", "zhaochenyang20/seed-tts-eval-arrow",
         "--model", model, "--use-existing-server", "--host", "127.0.0.1", "--port", str(port), "--generate-only",
         "--lang", "en", "--warmup", str(concurrency), "--max-concurrency", str(concurrency),
@@ -93,7 +137,7 @@ def score(tree: Path, model: str, extra: list[str], card: int, port: int, out: P
     ]
     with (out / "asr_serve.log").open("w") as log:
         asr = subprocess.Popen(
-            ["taskset", "-c", CARD_CPUS[card], sys.executable, "-m", "sglang_omni.cli", "serve", "--model-path",
+            ["taskset", "-c", card_cpus(card), sys.executable, "-m", "sglang_omni.cli", "serve", "--model-path",
              ASR_MODEL, "--host", "127.0.0.1", "--port", str(port), "--asr.gpu", str(card)],
             cwd=tree, env={**env, "MASTER_PORT": str(port + 50)}, stdout=log, stderr=subprocess.STDOUT,
             start_new_session=True,

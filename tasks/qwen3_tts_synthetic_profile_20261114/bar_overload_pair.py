@@ -20,7 +20,7 @@ from pathlib import Path
 
 import httpx
 
-from seedtts_pair import CARD_CPUS, CLIENT_CPUS, serve, stop
+from seedtts_pair import card_cpus, client_cpus, serve, stop
 from served_baseline import MODELS, wait_healthy
 
 CLIENT_DIR = Path("/data/tts_bench_src")
@@ -168,7 +168,7 @@ def run_rate(
 ) -> int:
     out.parent.mkdir(parents=True, exist_ok=True)
     command = [
-        "taskset", "-c", CLIENT_CPUS, "uv", "run", "-q", "bench", "run", "--target", "sglang-omni",
+        "taskset", "-c", client_cpus(), "uv", "run", "-q", "bench", "run", "--target", "sglang-omni",
         "--base-url", f"http://127.0.0.1:{port}", "--model", model, "--voice", "Ryan", "--language", "English",
         "--dataset", "datasets/seed-tts-eval.jsonl", "--rps", str(rate), "--warmup", f"{CLIENT_WARMUP_S}s", "--duration", f"{duration_s}s",
         "--arrival", "poisson", "--seed", str(seed), "--timeout", "120s", "--max-in-flight", "4096",
@@ -211,7 +211,7 @@ def main() -> None:
                 (seed_out / arm).mkdir(parents=True, exist_ok=True)
                 identity = subprocess.check_output(["git", "rev-parse", "HEAD", "HEAD:sglang_omni"], cwd=trees[arm], text=True)
                 (seed_out / arm / "tree.txt").write_text(
-                    f"{trees[arm]} card {cards[arm]} cpus {CARD_CPUS[cards[arm]]} args {' '.join(server_args[arm])}\n{identity}"
+                    f"{trees[arm]} card {cards[arm]} cpus {card_cpus(cards[arm])} args {' '.join(server_args[arm])}\n{identity}"
                 )
                 server_env = (
                     {"PYTHONPATH": f"{trees[arm]}:{GC_PROBE_DIR}", "GC_PROBE_OUT": str(seed_out / arm / "server")}
