@@ -9,8 +9,10 @@ A stream that found the 64 rows taken decoded on the left-context path, which co
 ## Change
 
 - `Qwen3TTSPipelineConfig.stage_factory_kwargs("vocoder")` passes the coordinator's own in-flight cap, `resolve_coordinator_max_in_flight`, as `codec_state_slots`, and as `max_in_flight` for the startup check. The arena and the coordinator read one formula. An operator's `--vocoder.factory.codec_state_slots` still wins.
+- `resolve_coordinator_max_in_flight` and `engine_stage_capacity` move unchanged from the pipeline runner to `sglang_omni/config/topology.py`, so the model config reads the cap from the config layer.
 - `create_vocoder_executor` takes both as required arguments, so its default of 64 slots is gone. A server whose engine queue is unbounded has no cap, so it starts only with `codec_state_slots` set, and the startup check then warns that streams past those slots take the left-context path. It still warns when the slots are below the cap.
 - Whole requests keep their own, equal set of rows, so stream load never changes a whole request's audio. With the defaults the arena holds 128 stream rows and 128 whole-request rows, 701 MiB instead of 350 MiB. On an H100 the KV pool goes from 553,996 to 551,255 tokens (58.88 GiB), still above the 524,288 the running bound can demand.
+- Every vocoder replica takes the whole cap, so with replicated engines each replica's arena grows with the replica count: 1.40 GiB with two replicas and 2.80 GiB with four. A cap per replica at the coordinator would bound one replica's share, and is a separate change.
 
 This replaces the waiting queue this PR first proposed. With the arena sized to the cap, no stream waits for a row.
 
@@ -27,7 +29,7 @@ Overload: Nari Labs' open client, unmodified (`tts_bench` `a2d65e1`): 1.7B Custo
 - The branch took the left-context path 0 times. Sampled every 2 s, its arena held at most 57 to 61 rows at 60 req/s and 65 to 66 at 70 and 80 req/s, while main's 64 rows were full at every rate.
 - Main's 80 req/s swings between seeds (4.0 % against 77 %): once its rows run out, whether it recovers depends on the arrival sequence. At 80 req/s main's first byte covers only the requests it completed.
 - Past capacity the branch serves at capacity, and the excess gets HTTP 503 at the in-flight cap.
-- 128 clients that each drop their stream after the first chunk and send a new one at once, two rounds: no acquire found the arena full.
+- 128 clients that each drop their stream after the first chunk and send a new one at once, two rounds: no acquire found the arena full, and every stream ended. The coordinator refused 37 and 40 of the new streams with HTTP 503 at the cap, because it still counted the dropped ones.
 
 Normal load, the same 128-row arena: SeedTTS EN, 1.7B Base, the full 1,088 prompts, unseeded, both card orders.
 
