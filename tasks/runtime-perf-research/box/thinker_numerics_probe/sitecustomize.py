@@ -155,6 +155,38 @@ def install_layers(base, torch, lock, path) -> None:
 
         return capture
 
+    def input_hook(name):
+        def capture(module, args, output):
+            items = plan["items"]
+            if items is None:
+                return
+            else:
+                pass
+            inputs = [(f"{name}{index}", value) for index, value in enumerate(args) if isinstance(value, torch.Tensor)]
+            outputs = [output[0] if isinstance(output, tuple) else output]
+            inputs += [(name[:-3] + ".out", value) for value in outputs if isinstance(value, torch.Tensor)]
+            for part_name, tensor in inputs:
+                if tensor.shape[0] != plan["rows"]:
+                    continue
+                else:
+                    pass
+                for item in items:
+                    rows = tensor[item["start"] : item["start"] + item["length"]]
+                    item["fingerprints"][part_name] = row_fingerprint(rows)
+                    if item["save"]:
+                        item["last_rows"][part_name] = rows[-1].detach().float().cpu()
+                    else:
+                        pass
+
+        return capture
+
+    def has_path(module, path) -> bool:
+        try:
+            module.get_submodule(path)
+            return True
+        except AttributeError:
+            return False
+
     def attach(model) -> None:
         for module_name, module in model.named_modules():
             if type(module).__name__ not in ("Qwen3MoeDecoderLayer", "Qwen3OmniMoeThinkerTextDecoderLayer") or id(module) in hooked:
@@ -172,6 +204,15 @@ def install_layers(base, torch, lock, path) -> None:
                 pass
             if hasattr(module.mlp, "experts"):
                 module.mlp.experts.register_forward_hook(hook(f"L{index:02d}.experts"))
+            else:
+                pass
+            if index < 2:
+                for path in ("input_layernorm", "self_attn.qkv_proj", "self_attn.attn", "self_attn.o_proj", "post_attention_layernorm", "mlp.gate", "mlp.experts"):
+                    sub = module.get_submodule(path) if has_path(module, path) else None
+                    if sub is not None:
+                        sub.register_forward_hook(input_hook(f"L{index:02d}.{path}.in"))
+                    else:
+                        pass
             else:
                 pass
 
