@@ -22,6 +22,9 @@ from seedtts_pair import serve, stop
 from served_baseline import MODELS, wait_healthy
 
 EVENT_CAPACITY = 400000
+# the frame gaps reported per request, from frame 1 to 2 up to FRAME_GAPS to FRAME_GAPS + 1
+FRAME_GAPS = 5
+HERE = Path(__file__).resolve().parent
 FIRST_EVENTS = ("qwen3_tts_vocoder_decode_enqueued", "qwen3_tts_vocoder_decode_dispatched", "qwen3_tts_vocoder_decode_resolved")
 SECOND_EVENTS = ("qwen3_tts_vocoder_decode_enqueued", "qwen3_tts_vocoder_decode_launched", "qwen3_tts_vocoder_decode_resolved")
 
@@ -62,18 +65,40 @@ def quantiles(values: list[float]) -> str:
     return "/".join(f"{values[min(len(values) - 1, int(fraction * len(values)))]:.1f}" for fraction in (0.1, 0.5, 0.9))
 
 
+def frame_intervals(by_request: dict[str, list[dict]]) -> str:
+    """Per request, the gap from the ingest that first reached k generated frames to the one that reached k + 1."""
+    gaps: dict[int, list[float]] = collections.defaultdict(list)
+    for events in by_request.values():
+        reached: dict[int, int] = {}
+        for event in events:
+            if event["event_name"] == "qwen3_tts_frames_ingested":
+                frames = (event.get("metadata") or {}).get("generated_frames", 0)
+                for count in range(1, frames + 1):
+                    reached.setdefault(count, event["timestamp_ns"])
+            else:
+                pass
+        for count in range(1, FRAME_GAPS + 1):
+            if count in reached and count + 1 in reached:
+                gaps[count].append((reached[count + 1] - reached[count]) / 1e6)
+            else:
+                pass
+    return ", ".join(f"frame {count}->{count + 1} {quantiles(values)}" for count, values in sorted(gaps.items()) if values)
+
+
 def digest(event_dir: Path) -> str:
     by_request: dict[str, list[dict]] = collections.defaultdict(list)
     for path in event_dir.glob("events_*.jsonl"):
         for line in path.read_text().splitlines():
             event = json.loads(line)
-            if event["event_name"].startswith("qwen3_tts_vocoder_decode_"):
+            if event["event_name"].startswith("qwen3_tts_"):
                 by_request[event["request_id"]].append(event)
             else:
                 pass
-    rows = []
     for events in by_request.values():
         events.sort(key=lambda event: event["timestamp_ns"])
+    intervals = frame_intervals(by_request)
+    rows = []
+    for events in by_request.values():
         first = chunk_times(events, 0, FIRST_EVENTS)
         second = chunk_times(events, 1, SECOND_EVENTS)
         if first is not None and second is not None:
@@ -95,6 +120,7 @@ def digest(event_dir: Path) -> str:
         f"enqueue to launch {quantiles([(second[1] - second[0]) / milliseconds for _, second in rows])}, "
         f"launch to resolve {quantiles([(second[2] - second[1]) / milliseconds for _, second in rows])}",
         f"second resolve after first resolve {quantiles([(second[2] - first[2]) / milliseconds for first, second in rows])}",
+        f"frames ingested: {intervals}",
     ]
     return "\n".join(lines)
 
@@ -113,7 +139,10 @@ def main() -> None:
     prepare_client()
     model, _ = MODELS["customvoice"]
     args.out.mkdir(parents=True, exist_ok=True)
-    server = serve(args.tree, model, args.card, args.port, args.out / "serve.log", {})
+    server = serve(
+        args.tree, model, args.card, args.port, args.out / "serve.log",
+        {"PYTHONPATH": f"{HERE / 'frame_probe'}:{args.tree}", "QWEN3_TTS_FRAME_PROBE": "1"},
+    )
     try:
         wait_healthy(args.port, server)
         event_dir = args.out / "events"
