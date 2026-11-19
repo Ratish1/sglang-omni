@@ -274,6 +274,9 @@ def main() -> None:
     parser.add_argument("--arm", choices=(*ARMS, RESIDUAL_ARM))
     parser.add_argument("--replay", type=Path)
     parser.add_argument("--text-concurrency", type=int, default=CONCURRENCY)
+    parser.add_argument(
+        "--server-config", default="examples/configs/qwen3_omni_colocated_h200.yaml"
+    )
     arguments = parser.parse_args()
     run = arguments.run.resolve(strict=True)
     if arguments.phase == "prepare":
@@ -304,7 +307,7 @@ def main() -> None:
     server_options = (
         [
             "--config",
-            str(tree / "examples/configs/qwen3_omni_colocated_h200.yaml"),
+            str(tree / arguments.server_config),
         ]
         if generation
         else []
