@@ -1,12 +1,14 @@
 """Each vocoder mode on a real server, uncapped where the mode allows it: whether it starts, what its startup says about
 Codec slots, and whether a stream completes.
 
-Modes on 1.7B CustomVoice, one card, one after another:
+Modes on 1.7B CustomVoice, one card, one after another, each serving mode sent one stream and one whole request:
 - async_uncapped: the default asynchronous decode with max_queued_requests none and no slot count; must refuse to start
   naming the missing cap.
+- fractional_slots and zero_slots: codec_state_slots 0.5 or 0; must refuse to start.
 - synchronous_uncapped: async_decode false, uncapped; must serve with no arena.
-- rollback_uncapped: enable_stateful_codec_decoder false, uncapped; must serve with no arena.
-- capped: the defaults; must serve with an arena of the in-flight cap.
+- rollback_uncapped: enable_stateful_codec_decoder false, uncapped, on the default asynchronous workers; must serve
+  with no arena.
+- capped: the defaults; must serve with an arena of the in-flight cap for streams and as many for whole requests.
 
 usage: python3 arena_modes_check.py --tree TREE --card N --out DIR
 """
@@ -25,17 +27,18 @@ from slot_wait_serving import MODELS, request_body, run_request, wait_healthy
 
 EXIT_TIMEOUT_S = 900
 UNCAPPED = ["--tts_engine.engine.max_queued_requests", "none"]
-# (mode, extra serve arguments, whether it must serve)
+# (mode, extra serve arguments, whether it must serve, the startup refusal it must log when it must not)
 MODES = (
-    ("async_uncapped", UNCAPPED, False),
-    ("synchronous_uncapped", [*UNCAPPED, "--vocoder.factory.async_decode", "false"], True),
-    ("rollback_uncapped", [*UNCAPPED, "--vocoder.factory.enable_stateful_codec_decoder", "false"], True),
-    ("capped", [], True),
+    ("async_uncapped", UNCAPPED, False, "admits without one"),
+    ("fractional_slots", ["--vocoder.factory.codec_state_slots", "0.5"], False, "must be a positive integer"),
+    ("zero_slots", ["--vocoder.factory.codec_state_slots", "0"], False, "must be a positive integer"),
+    ("synchronous_uncapped", [*UNCAPPED, "--vocoder.factory.async_decode", "false"], True, None),
+    ("rollback_uncapped", [*UNCAPPED, "--vocoder.factory.enable_stateful_codec_decoder", "false"], True, None),
+    ("capped", [], True, None),
 )
 ARENA_LINE = "incremental Codec state: "
 SYNCHRONOUS_LINE = "decodes synchronously, each stream on its own Codec state"
 ROLLBACK_LINE = "stateful Codec decoder off"
-REFUSAL_LINE = "admits without one"
 
 
 def boot(tree: Path, card: int, port: int, log: Path, extra: list[str]) -> subprocess.Popen:
@@ -76,41 +79,59 @@ def main() -> None:
     args = parser.parse_args()
     args.out.mkdir(parents=True, exist_ok=True)
     report = {}
-    for index, (mode, extra, should_serve) in enumerate(MODES):
+    for index, (mode, extra, should_serve, refusal) in enumerate(MODES):
         log = args.out / f"{mode}_serve.log"
         port = args.port + 200 * index
+        url = f"http://127.0.0.1:{port}"
         server = boot(args.tree, args.card, port, log, extra)
-        result = None
+        results = {}
         try:
             if should_serve:
-                wait_healthy(f"http://127.0.0.1:{port}", server)
-                result = run_request(f"http://127.0.0.1:{port}", request_body("customvoice", "stream", 0, args.tree), "stream")
+                wait_healthy(url, server)
+                for kind in ("stream", "whole"):
+                    results[kind] = run_request(url, request_body("customvoice", kind, 0, args.tree), kind)
             else:
                 server.wait(timeout=EXIT_TIMEOUT_S)
         except (RuntimeError, TimeoutError, subprocess.TimeoutExpired) as error:
-            result = {"error": str(error)}
+            results["error"] = {"outcome": "error", "error": str(error)}
         finally:
             stop(server)
         text = log.read_text(errors="replace")
         report[mode] = {
             "exit_code": server.returncode if not should_serve else None,
-            "refused_naming_the_cap": REFUSAL_LINE in text,
+            "logged_refusal": refusal is not None and refusal in text,
             "arena": arena_lines(text),
             "says_synchronous": SYNCHRONOUS_LINE in text,
             "says_rollback": ROLLBACK_LINE in text,
-            "stream": {key: result.get(key) for key in ("outcome", "samples", "error")} if result else None,
+            "requests": {
+                kind: {key: result.get(key) for key in ("outcome", "samples", "error")} for kind, result in results.items()
+            },
         }
+
+    def served_both(mode: str) -> bool:
+        requests = report[mode]["requests"]
+        return all(
+            requests.get(kind, {}).get("outcome") == "complete" and (requests.get(kind, {}).get("samples") or 0) > 0
+            for kind in ("stream", "whole")
+        )
+
     checks = {
-        "async_uncapped": report["async_uncapped"]["refused_naming_the_cap"] and not report["async_uncapped"]["arena"],
-        "synchronous_uncapped": report["synchronous_uncapped"]["says_synchronous"]
-        and not report["synchronous_uncapped"]["arena"]
-        and (report["synchronous_uncapped"]["stream"] or {}).get("outcome") == "complete",
-        "rollback_uncapped": report["rollback_uncapped"]["says_rollback"]
-        and not report["rollback_uncapped"]["arena"]
-        and (report["rollback_uncapped"]["stream"] or {}).get("outcome") == "complete",
-        "capped": any(line.startswith("128 stream slots") for line in report["capped"]["arena"])
-        and (report["capped"]["stream"] or {}).get("outcome") == "complete",
+        mode: report[mode]["exit_code"] not in (None, 0) and report[mode]["logged_refusal"] and not report[mode]["arena"]
+        for mode, _, should_serve, _ in MODES
+        if not should_serve
     }
+    checks["synchronous_uncapped"] = (
+        report["synchronous_uncapped"]["says_synchronous"] and not report["synchronous_uncapped"]["arena"]
+        and served_both("synchronous_uncapped")
+    )
+    checks["rollback_uncapped"] = (
+        report["rollback_uncapped"]["says_rollback"] and not report["rollback_uncapped"]["arena"]
+        and served_both("rollback_uncapped")
+    )
+    checks["capped"] = (
+        any(line.startswith("128 stream slots and 128 for whole requests") for line in report["capped"]["arena"])
+        and served_both("capped")
+    )
     report["checks"] = checks
     (args.out / "report.json").write_text(json.dumps(report, indent=1))
     print(f"{time.strftime('%T')} arena_modes_check {'PASS' if all(checks.values()) else 'FAIL'} {json.dumps(checks)}", flush=True)

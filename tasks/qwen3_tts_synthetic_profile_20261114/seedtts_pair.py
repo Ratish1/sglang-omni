@@ -164,27 +164,27 @@ def score(tree: Path, model: str, extra: list[str], card: int, port: int, out: P
 
 
 def run_order(
-    order: int, trees: dict[str, Path], cards: dict[str, int], model: str, extras: dict[str, list[str]], port: int,
-    out: Path, cells: tuple[tuple[str, int, bool], ...], should_score: bool,
+    order: int, arms: tuple[str, ...], trees: dict[str, Path], cards: dict[str, int], model: str,
+    extras: dict[str, list[str]], port: int, out: Path, cells: tuple[tuple[str, int, bool], ...], should_score: bool,
 ) -> None:
     ports = {"a": port, "b": port + 200}
     servers = {}
     try:
-        for arm in ("a", "b"):
+        for arm in arms:
             arm_out = out / f"order{order}" / arm
             arm_out.mkdir(parents=True, exist_ok=True)
             identity = subprocess.check_output(["git", "rev-parse", "HEAD", "HEAD:sglang_omni"], cwd=trees[arm], text=True)
             (arm_out / "tree.txt").write_text(f"{trees[arm]} card {cards[arm]} client {' '.join(extras[arm])}\n{identity}")
             servers[arm] = serve(trees[arm], model, cards[arm], ports[arm], arm_out / "serve.log", {})
-        for arm in ("a", "b"):
+        for arm in arms:
             wait_healthy(ports[arm], servers[arm])
-        print(f"{time.strftime('%T')} order {order} healthy, a card {cards['a']}, b card {cards['b']}", flush=True)
+        print(f"{time.strftime('%T')} order {order} healthy, cards {cards}", flush=True)
         for cell, concurrency, stream in cells:
-            with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=len(arms)) as pool:
                 futures = {
                     arm: pool.submit(bench, trees[arm], model, extras[arm], ports[arm], concurrency, stream,
                                      out / f"order{order}" / arm / cell)
-                    for arm in ("a", "b")
+                    for arm in arms
                 }
                 summaries = {arm: future.result() for arm, future in futures.items()}
             for arm, summary in summaries.items():
@@ -194,7 +194,7 @@ def run_order(
         for server in servers.values():
             stop(server)
     if should_score:
-        for index, arm in enumerate(("a", "b")):
+        for index, arm in enumerate(arms):
             score(
                 trees[arm], model, extras[arm], cards[arm], port + 400 + 400 * index, out / f"order{order}" / arm / SCORED_CELL
             )
@@ -219,6 +219,14 @@ def main() -> None:
     )
     parser.add_argument("--a-client-arg", action="append", default=[], help="one more client argument for arm a")
     parser.add_argument("--b-client-arg", action="append", default=[], help="one more client argument for arm b")
+    parser.add_argument(
+        "--one-card", action="store_true",
+        help="run each arm alone on card 0, a then b in order 0 and b then a in order 1, when one card is held",
+    )
+    parser.add_argument(
+        "--cells", nargs="+", choices=[cell for cell, _, _ in CELLS], default=None,
+        help="only these cells, in the protocol's order",
+    )
     args = parser.parse_args()
     model, extra = MODELS[args.model]
     trees = {"a": args.a_tree, "b": args.b_tree}
@@ -227,9 +235,13 @@ def main() -> None:
         _, concurrency, stream = next(entry for entry in CELLS + ROUNDS_ONLY_CELLS if entry[0] == args.rounds_cell)
         cells = tuple((f"{args.rounds_cell}_r{index + 1}", concurrency, stream) for index in range(args.rounds))
     else:
-        cells = CELLS
+        cells = tuple(entry for entry in CELLS if args.cells is None or entry[0] in args.cells)
     for order, cards in enumerate(({"a": 0, "b": 1}, {"a": 1, "b": 0})):
-        run_order(order, trees, cards, model, extras, args.port, args.out, cells, args.rounds == 0)
+        if args.one_card:
+            for arm in ("a", "b") if order == 0 else ("b", "a"):
+                run_order(order, (arm,), trees, {arm: 0}, model, extras, args.port, args.out, cells, args.rounds == 0)
+        else:
+            run_order(order, ("a", "b"), trees, cards, model, extras, args.port, args.out, cells, args.rounds == 0)
     print(f"{time.strftime('%T')} seedtts_pair done", flush=True)
 
 
