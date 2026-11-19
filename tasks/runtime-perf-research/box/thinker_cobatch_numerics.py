@@ -84,38 +84,49 @@ def main() -> None:
             lines += [json.loads(line) for line in source if line.strip()]
     target_len = runs[0]["prompt_tokens"] if args.target_len == 0 else args.target_len
     lines = [line for line in lines if line["prompt_len"] == target_len]
+    import torch
+
+    prefix_dir = args.probe_prefix
     for entry in runs:
         steps = {}
-        for line in sorted((line for line in lines if entry["start"] <= line["time"] <= entry["end"] + 1.0), key=lambda line: line["time"]):
-            steps.setdefault(line["generated"], line)
+        for line in sorted((line for line in lines if entry["start"] <= line["time"] <= entry["end"] + 1.0 and line.get("sampled")), key=lambda line: line["time"]):
+            steps.setdefault(line["position"], line)
         entry["steps"] = [steps[key] for key in sorted(steps)]
+
+    def logits_of(line):
+        paths = glob.glob(f"{prefix_dir}.*.logits.{line['rid']}.{line['position']}.pt")
+        return torch.load(paths[0]) if paths else None
+
     reference = runs[0]["steps"]
     for entry in runs:
-        first_logits = next(
-            (index for index, (a, b) in enumerate(zip(reference, entry["steps"])) if a["fingerprint"] != b["fingerprint"]),
-            None,
-        )
-        first_token = next(
-            (index for index, (a, b) in enumerate(zip(reference, entry["steps"])) if a["top_ids"][0] != b["top_ids"][0]),
-            None,
-        )
-        entry["first_logits_step"] = first_logits
-        entry["first_token_step"] = first_token
+        pairs = list(zip(reference, entry["steps"]))
+        first_logits = next((index for index, (a, b) in enumerate(pairs) if a["fingerprint"] != b["fingerprint"]), None)
+        first_token = next((index for index, (a, b) in enumerate(pairs) if a["top_ids"][0] != b["top_ids"][0]), None)
+        entry["first_logits_index"] = first_logits
+        entry["first_token_index"] = first_token
         detail = ""
         if first_logits is not None:
-            step = entry["steps"][first_logits]
-            detail += f" logits first differ at step {first_logits} ({step['mode']}, rows {step['forward_rows']}, reqs {step['batch_reqs']}; alone ran {reference[first_logits]['mode']}, rows {reference[first_logits]['forward_rows']})"
+            ref, mine = pairs[first_logits]
+            a, b = logits_of(ref), logits_of(mine)
+            gap = float((a - b).abs().max()) if a is not None and b is not None else None
+            detail += (
+                f" logits first differ at position {mine['position']} (output token {first_logits}): this run mode {mine['mode']}, rows {mine['forward_rows']}, reqs {mine['batch_reqs']};"
+                f" alone mode {ref['mode']}, rows {ref['forward_rows']}; max abs logit difference {gap}"
+            )
+            entry["first_logits_max_abs"] = gap
         else:
             pass
         if first_token is not None:
-            mine, ref = entry["steps"][first_token], reference[first_token]
+            ref, mine = pairs[first_token]
+            a, b = logits_of(ref), logits_of(mine)
+            gap = float((a - b).abs().max()) if a is not None and b is not None else None
             detail += (
-                f"; token splits at step {first_token}: here {mine['top_ids']} {[round(v, 4) for v in mine['top_logits']]},"
-                f" alone {ref['top_ids']} {[round(v, 4) for v in ref['top_logits']]}"
+                f"; token splits at position {mine['position']} (output token {first_token}): here {mine['top_ids']} {[round(v, 4) for v in mine['top_logits']]},"
+                f" alone {ref['top_ids']} {[round(v, 4) for v in ref['top_logits']]} (alone margin {round(ref['top_logits'][0] - ref['top_logits'][1], 4)}), max abs logit difference there {gap}"
             )
         else:
             pass
-        print(f"{entry['label']} {entry['partners']}: {len(entry['steps'])} steps;{detail}", flush=True)
+        print(f"{entry['label']} {entry['partners']}: {len(entry['steps'])} sampled positions;{detail}", flush=True)
     with open(args.out, "w") as sink:
         json.dump(runs, sink, indent=1)
 

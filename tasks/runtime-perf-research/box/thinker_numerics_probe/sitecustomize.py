@@ -44,6 +44,11 @@ def install(base, thinker) -> None:
         else:
             pass
         lengths = [len(sched.data.req.origin_input_ids) for sched in requests]
+        seq_lens = getattr(forward_batch, "seq_lens_cpu", None) if forward_batch is not None else None
+        if seq_lens is None and forward_batch is not None:
+            seq_lens = forward_batch.seq_lens.cpu()
+        else:
+            pass
         lines = []
         for index, sched in enumerate(requests):
             req = sched.data.req
@@ -53,6 +58,11 @@ def install(base, thinker) -> None:
                 pass
             row = logits[index]
             top = torch.topk(row.float(), 2)
+            position = int(seq_lens[index]) if seq_lens is not None else None
+            if TARGET_LENS and position is not None and position >= lengths[index]:
+                torch.save(row.float().cpu(), f"{path[:-6]}.logits.{req.rid}.{position}.pt")
+            else:
+                pass
             lines.append(
                 json.dumps(
                     {
@@ -60,6 +70,8 @@ def install(base, thinker) -> None:
                         "source": source,
                         "rid": req.rid,
                         "prompt_len": lengths[index],
+                        "position": position,
+                        "sampled": position is not None and position >= lengths[index],
                         "generated": len(req.output_ids),
                         "mode": str(getattr(forward_batch, "forward_mode", None)),
                         "forward_rows": int(forward_batch.input_ids.shape[0]) if forward_batch is not None and forward_batch.input_ids is not None else None,
