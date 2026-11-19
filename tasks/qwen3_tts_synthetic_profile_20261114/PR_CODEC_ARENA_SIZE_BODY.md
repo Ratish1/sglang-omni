@@ -41,7 +41,7 @@ Normal load, the same 128-row arena: SeedTTS EN, 1.7B Base, the full 1,088 promp
 | whole c1, c16 | | -0.4 %, +0.2 % |
 
 - The first c64 pass after boot read RTF +1.0 % in both orders. The three warm passes per order read -0.4 %.
-- 27 seeded whole requests over Base, CustomVoice and VoiceDesign are byte-identical to main, so the arena size changes no audio.
+- 54 seeded requests over Base, CustomVoice and VoiceDesign, 27 streamed and 27 whole, are byte-identical to main, so the arena size changes no audio.
 - WER (streaming c16, Qwen3-ASR): 0.95 / 1.67 → 1.04 / 1.09 %. Main's second order has one sample over 50 %.
 
 ## Tests
