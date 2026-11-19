@@ -34,6 +34,9 @@ def main() -> None:
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument("--voice-probe", action="store_true")
     parser.add_argument("--seed", type=int)
+    parser.add_argument(
+        "--concurrency", type=int, default=CONCURRENCY, choices=(1, CONCURRENCY)
+    )
     parser.add_argument("--sample-ids", nargs="+")
     arguments = parser.parse_args()
     logging.basicConfig(level=logging.INFO)
@@ -69,6 +72,7 @@ def main() -> None:
                 ).strip(),
                 "checkpoint": checkpoint.name,
                 "seed": arguments.seed,
+                "concurrency": arguments.concurrency,
                 "samples": [
                     {
                         "sample_id": sample.sample_id,
@@ -115,7 +119,7 @@ def main() -> None:
             port=port,
             meta=dataset,
             voice_clone=True,
-            max_concurrency=CONCURRENCY,
+            max_concurrency=arguments.concurrency,
             output_dir=str(output / "generation"),
             seed=arguments.seed,
             disable_tqdm=True,
