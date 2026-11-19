@@ -116,10 +116,9 @@ def run_logged(command: list[str], log_file: Path, tree: Path) -> None:
         )
 
 
-def measure_generation(
-    run: Path, tree: Path, destination: Path, port: int, replay: Path
+def measure_text_mmsu(
+    tree: Path, destination: Path, base_url: str, concurrency: int
 ) -> None:
-    base_url = f"http://127.0.0.1:{port}"
     run_logged(
         [
             "-m",
@@ -139,7 +138,7 @@ def measure_generation(
             "--warmup",
             "0",
             "--max-concurrency",
-            str(CONCURRENCY),
+            str(concurrency),
             "--output-dir",
             str(destination / "mmsu-text"),
             "--disable-tqdm",
@@ -154,6 +153,11 @@ def measure_generation(
         f"{destination.name} MMSU text complete: {text_report['summary']['overall_accuracy']}",
         flush=True,
     )
+
+
+def measure_generation(
+    run: Path, tree: Path, destination: Path, base_url: str, replay: Path
+) -> None:
     for workload, packet, name, count in (
         ("mmsu", run / "mmsu-inputs", "mmsu-talker", MMSU_TALKER_COUNT),
         ("tts", run / "inputs", "generation", SAMPLE_COUNT),
@@ -263,12 +267,13 @@ def score_speech(
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
-        "--phase", required=True, choices=("prepare", "generate", "asr")
+        "--phase", required=True, choices=("prepare", "generate", "mmsu-text", "asr")
     )
     parser.add_argument("--run", required=True, type=Path)
     parser.add_argument("--tree", type=Path)
     parser.add_argument("--arm", choices=(*ARMS, RESIDUAL_ARM))
     parser.add_argument("--replay", type=Path)
+    parser.add_argument("--text-concurrency", type=int, default=CONCURRENCY)
     arguments = parser.parse_args()
     run = arguments.run.resolve(strict=True)
     if arguments.phase == "prepare":
@@ -279,16 +284,17 @@ def main() -> None:
     else:
         pass
     tree = arguments.tree.resolve(strict=True)
-    replay = arguments.replay.resolve(strict=True)
     port = find_available_port()
-    generation = arguments.phase == "generate"
+    generation = arguments.phase in ("generate", "mmsu-text")
     model, revision = (
         (OMNI_MODEL, OMNI_REVISION)
         if generation
         else (QWEN3_ASR_MODEL_PATH, ASR_REVISION)
     )
     assert Path(snapshot_download(model)).name == revision
-    if generation:
+    if arguments.phase == "mmsu-text":
+        destination = run / f"{arguments.arm}-mmsu-c{arguments.text_concurrency}"
+    elif generation:
         destination = run / arguments.arm
     elif arguments.arm is None:
         destination = run / "asr"
@@ -341,8 +347,15 @@ def main() -> None:
     )
     try:
         if generation:
-            measure_generation(run, tree, destination, port, replay)
+            base_url = f"http://127.0.0.1:{port}"
+            measure_text_mmsu(tree, destination, base_url, arguments.text_concurrency)
+            if arguments.phase == "generate":
+                replay = arguments.replay.resolve(strict=True)
+                measure_generation(run, tree, destination, base_url, replay)
+            else:
+                pass
         else:
+            replay = arguments.replay.resolve(strict=True)
             arms = ARMS if arguments.arm is None else (arguments.arm,)
             score_speech(run, tree, port, replay, arms)
     finally:
