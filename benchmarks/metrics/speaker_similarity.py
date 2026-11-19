@@ -308,9 +308,14 @@ class WavLMSpeakerSimilarity:
         self.device = device
 
     def embed(self, audio_paths: list[str]) -> torch.Tensor:
-        audio = [load_audio(audio_path).to(self.device) for audio_path in audio_paths]
         with torch.no_grad():
-            return self.model(audio)
+            # note (codex): Mixed-length WavLM padding can change valid features before the crop.
+            return torch.cat(
+                [
+                    self.model([load_audio(audio_path).to(self.device)])
+                    for audio_path in audio_paths
+                ]
+            )
 
     def score_batch(
         self,
