@@ -560,6 +560,7 @@ if HAS_TRITON:
         CODES,
         codes_stride,
         CODEBOOK_INPUT,
+        codebook_row_stride,
         VOCAB: tl.constexpr,
         HIDDEN: tl.constexpr,
         USE_GDC: tl.constexpr,
@@ -575,7 +576,7 @@ if HAS_TRITON:
         tl.store(CODES + row * codes_stride, code.to(tl.int64))
         hidden = tl.arange(0, HIDDEN)
         embedding = tl.load(EMBEDDING + code * HIDDEN + hidden)
-        tl.store(CODEBOOK_INPUT + row * HIDDEN + hidden, embedding)
+        tl.store(CODEBOOK_INPUT + row * codebook_row_stride + hidden, embedding)
         if USE_GDC:
             gdc_launch_dependents()
         else:
@@ -1028,25 +1029,27 @@ def codebook_step(
     logits: torch.Tensor,
     embedding_weight: torch.Tensor,
     codes: torch.Tensor,
+    *,
+    destination: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Select codes and gather the next predictor input in one launch.
 
-    Returns (rows, 1, hidden) for BF16 tables with power-of-two widths.
+    Returns (rows, 1, hidden), using destination when supplied.
     """
     rows, vocab_size = logits.shape
     hidden_size = embedding_weight.shape[1]
-    codebook_input = torch.empty(
-        (rows, 1, hidden_size),
-        device=embedding_weight.device,
-        dtype=embedding_weight.dtype,
-    )
+    if destination is None:
+        destination = embedding_weight.new_empty((rows, 1, hidden_size))
+    else:
+        pass
     codebook_step_kernel[(rows,)](
         logits,
         logits.stride(0),
         embedding_weight,
         codes,
         codes.stride(0),
-        codebook_input,
+        destination,
+        destination.stride(0),
         VOCAB=vocab_size,
         HIDDEN=hidden_size,
         # note (ratish): it releases the next pass's first layer but launches as usual
@@ -1054,7 +1057,7 @@ def codebook_step(
         USE_GDC=is_arch_support_pdl(),
         num_warps=NUM_WARPS,
     )
-    return codebook_input
+    return destination
 
 
 class FusedPredictorLayers:

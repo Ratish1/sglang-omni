@@ -908,6 +908,17 @@ class Qwen3OmniTalker(nn.Module):
             device,
             self.model.codec_embedding.weight.dtype,
         )
+        self.predictor_feedback_workspace: torch.Tensor | None = (
+            self.predictor_input_buffer.new_empty(
+                (
+                    self.predictor_fused_layers.max_rows,
+                    config.num_code_groups,
+                    hidden_size,
+                )
+            )
+            if self.predictor_fused_layers is not None
+            else None
+        )
         # note (ratish): where the exact kernel does not apply, the add and the norm
         # stay two launches.
         self.predictor_exact_add_norm = supports_exact_add_rmsnorm(
@@ -1701,6 +1712,16 @@ class Qwen3OmniTalker(nn.Module):
         predictor_input = self.predictor_input_buffer[:batch_size]
         num_groups = self.config.num_code_groups
         runtime_single_token = seq_len == 1
+        fused_layers = self.predictor_fused_layers
+        fused_single_token = fused_layers is not None and fused_layers.covers(
+            batch_size
+        )
+        workspace = self.predictor_feedback_workspace if fused_single_token else None
+        feedback_rows = (
+            workspace[:batch_size]
+            if runtime_single_token and workspace is not None
+            else None
+        )
         if runtime_single_token:
             self.output_codes[:batch_size].zero_()
             self.output_embeds[:batch_size].zero_()
@@ -1730,7 +1751,10 @@ class Qwen3OmniTalker(nn.Module):
             )
             predictor_input[:, 1, :] = layer0_embed[:, 0, :]
             pos_codes[:, 0].copy_(layer0_code[:, 0])
-            feedback_embeddings = [layer0_embed]
+            if feedback_rows is None:
+                feedback_embeddings = [layer0_embed]
+            else:
+                feedback_rows[:, :1].copy_(layer0_embed)
 
             cache_len = 0
             pair_hidden = self.predictor_forward_tokens(
@@ -1749,11 +1773,17 @@ class Qwen3OmniTalker(nn.Module):
                 # note (ratish): the codebook step runs where the fused layers do, on CUDA
                 # with Triton; the checkpoint's bf16 tables are 2048 by 1024, the
                 # power-of-two widths it needs.
-                if self.predictor_fused_layers is not None:
+                if fused_layers is not None:
+                    destination = (
+                        feedback_rows[:, layer_idx + 1 : layer_idx + 2]
+                        if feedback_rows is not None
+                        else None
+                    )
                     new_embed = codebook_step(
                         logits[:, -1, :],
                         codebook_embedding.weight,
                         pos_codes[:, layer_idx + 1],
+                        destination=destination,
                     )
                 else:
                     next_code = self.sample_code_predictor_token(logits)
@@ -1761,12 +1791,12 @@ class Qwen3OmniTalker(nn.Module):
                     new_embed = codebook_embedding(next_code).to(
                         dtype=predictor_input.dtype
                     )
-                feedback_embeddings.append(new_embed)
+                if feedback_rows is None:
+                    feedback_embeddings.append(new_embed)
+                else:
+                    pass
                 if layer_idx < num_groups - 2:
-                    if (
-                        self.predictor_fused_layers is not None
-                        and self.predictor_fused_layers.covers(batch_size)
-                    ):
+                    if fused_single_token:
                         predictor_token_embeddings = new_embed
                     else:
                         # note (ratish): the plain predictor mutates its input residual.
@@ -1780,7 +1810,11 @@ class Qwen3OmniTalker(nn.Module):
                 else:
                     pass
 
-            pos_summed.copy_(torch.cat(feedback_embeddings, dim=1).sum(dim=1))
+            if feedback_rows is None:
+                feedback_rows_to_sum = torch.cat(feedback_embeddings, dim=1)
+            else:
+                feedback_rows_to_sum = feedback_rows
+            pos_summed.copy_(feedback_rows_to_sum.sum(dim=1))
 
         return result_codes, summed_embeddings
 
