@@ -147,10 +147,10 @@ def measure_generation(
         tree,
     )
     text_report = json.loads((destination / "mmsu-text/mmsu_results.json").read_text())
-    assert text_report["accuracy"]["total_samples"] == MMSU_TEXT_COUNT
-    assert text_report["accuracy"]["failed_samples"] == 0
+    assert text_report["summary"]["total_samples"] == MMSU_TEXT_COUNT
+    assert text_report["summary"]["failed_samples"] == 0
     print(
-        f"{destination.name} MMSU text complete: {text_report['accuracy']['overall_accuracy']}",
+        f"{destination.name} MMSU text complete: {text_report['summary']['overall_accuracy']}",
         flush=True,
     )
     for workload, packet, name, count in (
