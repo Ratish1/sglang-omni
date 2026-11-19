@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
+import inspect
 import json
 import subprocess
 import sys
@@ -43,9 +44,24 @@ def test_vocoder_platform_default_keeps_npu_opt_in(
         (EngineArgs(max_queued_requests=32), {}, "pipeline", {}),
         (EngineArgs(max_queued_requests=None), {}, "pipeline", {}),
         (EngineArgs(), {"max_running_requests": 96}, "pipeline", {}),
-        (EngineArgs(), {}, "pipeline", {"pipeline": ProcessConfig(num_replicas=2)}),
-        (EngineArgs(), {}, "vocoder", {"pipeline": ProcessConfig(num_replicas=2)}),
-        (EngineArgs(), {}, "vocoder", {"vocoder": ProcessConfig(num_replicas=3)}),
+        (
+            EngineArgs(),
+            {},
+            "pipeline",
+            {"pipeline": ProcessConfig(num_replicas=2, replica_devices=[0, 1])},
+        ),
+        (
+            EngineArgs(),
+            {},
+            "vocoder",
+            {"pipeline": ProcessConfig(num_replicas=2, replica_devices=[0, 1])},
+        ),
+        (
+            EngineArgs(),
+            {},
+            "vocoder",
+            {"vocoder": ProcessConfig(num_replicas=3, replica_devices=[0, 1, 2])},
+        ),
     ],
     ids=[
         "default",
@@ -77,11 +93,18 @@ def test_codec_arena_holds_every_request_the_coordinator_admits(
         config, logical_process_plan=logical_process_plan
     )
 
-    factory_args = resolve_stage_factory_args(
-        config.stage_named("vocoder"), config, gpu_id=0
-    )
+    vocoder_stage = config.stage_named("vocoder")
+    factory_args = resolve_stage_factory_args(vocoder_stage, config, gpu_id=0)
+    factory_parameters = inspect.signature(
+        import_string(vocoder_stage.factory_path)
+    ).parameters
 
-    assert factory_args["codec_state_slots"] == max_in_flight
+    assert (
+        factory_args.get(
+            "codec_state_slots", factory_parameters["codec_state_slots"].default
+        )
+        == max_in_flight
+    )
     assert factory_args["max_in_flight"] == max_in_flight
 
 
