@@ -118,6 +118,7 @@ def _build_result_from_response(
 ) -> RequestResult:
     message = response_json.get("choices", [{}])[0].get("message", {})
     result.text = _extract_message_text(message)
+    result.server_request_id = response_json["id"].removeprefix("chatcmpl-")
 
     usage = response_json.get("usage") or {}
     result.prompt_tokens = usage.get("prompt_tokens", 0)
@@ -146,6 +147,8 @@ def _build_result_from_response(
 @dataclass
 class MmsuResult:
     sample_id: str = ""
+    server_request_id: str = ""
+    completion_tokens: int = 0
     task_name: str = ""
     category: str = ""
     sub_category: str = ""
@@ -261,6 +264,8 @@ def build_mmsu_results(
 
         result = MmsuResult(
             sample_id=sample.sample_id,
+            server_request_id=request_result.server_request_id,
+            completion_tokens=request_result.completion_tokens,
             task_name=sample.task_name,
             category=sample.category,
             sub_category=sample.sub_category,
