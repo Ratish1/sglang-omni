@@ -100,6 +100,16 @@ def run_request(url: str, body: dict, kind: str, cancel_after_s: float | None = 
     }
 
 
+def run_client(url: str, model: str, kind: str, index: int, tree: Path, cancel_after_s: float | None) -> dict:
+    """One client; a drop_then_stream client drops its stream after the first chunk and at once sends a full stream,
+    so the new request is admitted while the vocoder may still hold the dropped one's codec slot."""
+    if kind == "drop_then_stream":
+        run_request(url, request_body(model, "stream", index, tree), "drop_after_first_chunk")
+        return {**run_request(url, request_body(model, "stream", index + 1, tree), "stream"), "kind": kind}
+    else:
+        return run_request(url, request_body(model, kind, index, tree), kind, cancel_after_s)
+
+
 def codec_state(url: str) -> dict:
     """The vocoder's codec stats from /model_info, wherever the stage reports them."""
     found: list[dict] = []
@@ -170,15 +180,13 @@ def serve_rounds(
                     pass
             with ThreadPoolExecutor(max_workers=len(kinds)) as pool:
                 results = list(pool.map(
-                    lambda pair: run_request(
-                        url, request_body(model, pair[1], pair[0], tree), pair[1], deadlines.get(pair[0])
-                    ),
+                    lambda pair: run_client(url, model, pair[1], pair[0], tree, deadlines.get(pair[0])),
                     enumerate(kinds),
                 ))
             followup = run_request(url, request_body(model, "stream", round_index, tree), "stream")
             time.sleep(1)
             stats = codec_state(url)
-            should_finish = [r for r in results if r["kind"] in ("stream", "whole")] + [followup]
+            should_finish = [r for r in results if r["kind"] in ("stream", "whole", "drop_then_stream")] + [followup]
             refusals = [r for r in should_finish if r["outcome"] == "http_503"]
             failures = [
                 r for r in should_finish
@@ -197,7 +205,7 @@ def serve_rounds(
                 handle.write(json.dumps(record) + "\n")
             print(
                 f"{time.strftime('%T')} {model} round {round_index} ok={is_round_ok} "
-                f"slot_waits={stats.get('slot_waits')} active={stats.get('active_slots')} "
+                f"slot_waits={stats.get('slot_waits')} active={stats.get('active_slots')} exhausted={stats.get('exhausted')} "
                 f"fallbacks={stats.get('left_context_fallbacks')} refusals={len(refusals)} failures={len(failures)}",
                 flush=True,
             )
@@ -239,11 +247,18 @@ def main() -> None:
         "--scale", type=int, default=0,
         help="instead of the few-slot round, the mixed round with every count times this on the default server settings",
     )
+    parser.add_argument(
+        "--abort-wave", type=int, default=0,
+        help="instead of the mixed round, this many clients at once that each drop after the first chunk and send a new stream",
+    )
     parser.add_argument("--models", nargs="+", choices=sorted(MODELS), default=list(MODELS))
     args = parser.parse_args()
-    if args.burst > 0:
+    if args.abort_wave > 0:
         server_args: list[str] = []
-        round_mix: tuple[tuple[str, int], ...] = (("stream", args.burst),)
+        round_mix: tuple[tuple[str, int], ...] = (("drop_then_stream", args.abort_wave),)
+    elif args.burst > 0:
+        server_args = []
+        round_mix = (("stream", args.burst),)
     elif args.scale > 0:
         server_args = []
         round_mix = tuple((kind, count * args.scale) for kind, count in ROUND_MIX)
