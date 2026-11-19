@@ -94,6 +94,151 @@ def install(base, thinker) -> None:
 
     thinker.ThinkerModelRunner.sample_lookahead = sample_lookahead
 
+    if os.environ.get("OMNI_NUMERICS_LAYERS") == "1":
+        install_layers(base, torch, lock, path)
+    else:
+        pass
+
+
+def install_layers(base, torch, lock, path) -> None:
+    """Per forward with a target request (eager forwards only): a fingerprint of the target's rows after every thinker
+    layer's attention, router GEMM, experts and layer output, one JSON line per forward per target, and its last row
+    at each of those points saved to <prefix>.<pid>.<rid>.<first position>.pt for its first forwards."""
+    plan: dict[str, object] = {"items": None, "rows": None, "records": None, "saved": None}
+    hooked: set[int] = set()
+    saved_forwards: dict[str, int] = {}
+
+    def row_fingerprint(rows):
+        flat = rows.reshape(rows.shape[0], -1)
+        bits = flat.contiguous().view(torch.int16 if flat.element_size() == 2 else torch.int32).to(torch.int64)
+        columns = torch.arange(1, bits.shape[1] + 1, device=bits.device, dtype=torch.int64) * 2654435761 % 1000003
+        per_row = bits @ columns
+        row_weights = torch.arange(1, bits.shape[0] + 1, device=bits.device, dtype=torch.int64) * 40503 % 65521 + 1
+        return int((per_row * row_weights).sum())
+
+    def hook(name):
+        def capture(module, args, output):
+            items = plan["items"]
+            if items is None:
+                return
+            else:
+                pass
+            tensor = output[0] if isinstance(output, tuple) else output
+            if not isinstance(tensor, torch.Tensor) or tensor.shape[0] != plan["rows"]:
+                return
+            else:
+                pass
+            for item in items:
+                rows = tensor[item["start"] : item["start"] + item["length"]]
+                item["fingerprints"][name] = row_fingerprint(rows)
+                if item["save"]:
+                    item["last_rows"][name] = rows[-1].detach().float().cpu()
+                else:
+                    pass
+
+        return capture
+
+    def attach(model) -> None:
+        for module_name, module in model.named_modules():
+            if type(module).__name__ != "Qwen3OmniMoeThinkerTextDecoderLayer" or id(module) in hooked:
+                continue
+            else:
+                pass
+            hooked.add(id(module))
+            index = int(module_name.rsplit(".", 1)[-1])
+            module.register_forward_hook(hook(f"L{index:02d}.out"))
+            module.self_attn.register_forward_hook(hook(f"L{index:02d}.attn"))
+            module.mlp.register_forward_hook(hook(f"L{index:02d}.moe"))
+            if hasattr(module.mlp, "gate"):
+                module.mlp.gate.register_forward_hook(hook(f"L{index:02d}.gate"))
+            else:
+                pass
+            if hasattr(module.mlp, "experts"):
+                module.mlp.experts.register_forward_hook(hook(f"L{index:02d}.experts"))
+            else:
+                pass
+
+    original = base.ModelRunner.prepare_and_forward
+
+    def prepare_and_forward(self, forward_batch, schedule_batch, requests, is_prefill, **kwargs):
+        if forward_batch is None or not hooked:
+            attach(self.tp_worker.model_runner.model)
+        else:
+            pass
+        items = []
+        if forward_batch is not None:
+            reqs = list(schedule_batch.reqs)
+            if is_prefill:
+                lengths = forward_batch.extend_seq_lens_cpu
+                lengths = lengths.tolist() if isinstance(lengths, torch.Tensor) else list(lengths)
+                prefixes = forward_batch.extend_prefix_lens_cpu
+                prefixes = prefixes.tolist() if isinstance(prefixes, torch.Tensor) else list(prefixes)
+            else:
+                lengths = [1] * len(reqs)
+                prefixes = [len(req.origin_input_ids) + len(req.output_ids) - 1 for req in reqs]
+            start = 0
+            for req, length, prefix in zip(reqs, lengths, prefixes):
+                if not TARGET_LENS or len(req.origin_input_ids) in TARGET_LENS:
+                    count = saved_forwards.get(req.rid, 0)
+                    items.append(
+                        {
+                            "rid": req.rid,
+                            "prompt_len": len(req.origin_input_ids),
+                            "start": start,
+                            "length": int(length),
+                            "prefix": int(prefix),
+                            "save": count < 8,
+                            "fingerprints": {},
+                            "last_rows": {},
+                        }
+                    )
+                    saved_forwards[req.rid] = count + 1
+                else:
+                    pass
+                start += int(length)
+            plan["rows"] = start
+        else:
+            pass
+        plan["items"] = items or None
+        try:
+            return original(self, forward_batch, schedule_batch, requests, is_prefill, **kwargs)
+        finally:
+            plan["items"] = None
+            lines = []
+            for item in items:
+                if not item["fingerprints"]:
+                    continue
+                else:
+                    pass
+                lines.append(
+                    json.dumps(
+                        {
+                            "time": time.time(),
+                            "layers": True,
+                            "rid": item["rid"],
+                            "prompt_len": item["prompt_len"],
+                            "prefill": bool(is_prefill),
+                            "prefix": item["prefix"],
+                            "length": item["length"],
+                            "forward_rows": plan["rows"],
+                            "batch_reqs": len(schedule_batch.reqs),
+                            "fingerprints": item["fingerprints"],
+                        }
+                    )
+                )
+                if item["save"] and item["last_rows"]:
+                    torch.save(item["last_rows"], f"{path[:-6]}.{item['rid']}.{item['prefix']}.pt")
+                else:
+                    pass
+            if lines:
+                with lock:
+                    with open(path, "a", encoding="utf-8") as handle:
+                        handle.write("\n".join(lines) + "\n")
+            else:
+                pass
+
+    base.ModelRunner.prepare_and_forward = prepare_and_forward
+
 
 def watch() -> None:
     while not (
