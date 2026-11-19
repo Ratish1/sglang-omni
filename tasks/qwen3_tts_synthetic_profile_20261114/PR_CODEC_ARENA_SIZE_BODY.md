@@ -13,7 +13,7 @@ A stream that found the 64 rows taken decoded on the left-context path, which co
 - The scheduler builds the arena, and the graph runners that read it, only when it decodes asynchronously on the stateful decoder: those asynchronous workers are the only code that takes rows. A synchronous stateful decode (the default on Intel XPU, CPU and Apple MPS, `async_decode: false`, and deterministic inference) keeps each stream's state on the stream. Those servers now allocate no arena, where main allocated 64 idle rows (175 MiB on 1.7B), and their model info reports `codec_state` as not enabled. The left-context rollback keeps no Codec state and allocated no arena on main either, also when its decodes run on the asynchronous workers. The Ascend NPU examples turn asynchronous decode on, so their arenas move from 64 rows to their caps: 9, 32, 9 and 9 (not run on NPU).
 - The 64-slot default is gone from the factory and the scheduler. A server whose engine queue is unbounded has no cap, so with asynchronous stateful decode the scheduler refuses to start, after the checkpoint loads, unless `codec_state_slots` is set, and the startup check then warns that streams past those slots take the left-context path. The synchronous and rollback modes start uncapped as before. The startup line names the mode, and the warning when the slots are below the cap stays.
 - The slot count comes from free-form factory config, so the scheduler refuses a set count that is not a positive integer, in every mode as main did. Main truncated it with `int()` first, so 96.0 or 1.5 now refuse where main took 96 or 1, and a fraction such as 0.5 never reaches the arena as zero rows.
-- Whole requests keep their own, equal set of rows, so stream load never changes a whole request's audio. With the defaults the arena holds 128 stream rows and 128 whole-request rows, 701 MiB instead of 350 MiB. On an H100 the KV pool goes from 553,996 to 551,255 tokens (58.88 GiB), still above the 524,288 the running bound can demand.
+- Whole requests keep their own, equal set of rows, so stream load never changes a whole request's audio. With the defaults the arena holds 128 stream rows and 128 whole-request rows, 701 MiB instead of 350 MiB. On an H100 the KV pool goes from 554,006 to 551,255 tokens (59.17 to 58.88 GiB), still above the 524,288 the running bound can demand.
 - The arena grows with the cap: 5.48 MiB on 1.7B for every request `max_queued_requests` adds, taken from the KV pool since the vocoder loads first. A deep engine queue should set `codec_state_slots` below the cap, which the startup warning names.
 - Every vocoder replica takes the whole cap, so with replicated engines each replica's arena grows with the replica count: 1.37 GiB with two replicas and 2.74 GiB with four. A cap per replica at the coordinator would bound one replica's share, and is a separate change.
 
@@ -23,31 +23,33 @@ What the sizing covers: the cap counts a request until its result, or until the 
 
 ## Results
 
-Overload: Nari Labs' open client, unmodified (`tts_bench` `a2d65e1`): 1.7B CustomVoice, Ryan, English, the SeedTTS EN sentences, Poisson arrivals, 30 s warm-up and 120 s measured. Seed 0 is a same-time pair, one H100 per server, each pinned to its card's half of the socket. Seeds 1 and 2 ran each arm alone on one H100, in alternating order.
+Everything below ran on this head and on main `2a66cb083`, one H100, each server alone on the card in alternating order, pinned to the card's half of the socket with the client on the other socket.
 
-| req/s | completed, main → branch (seeds 0 / 1 / 2) | requests with underruns | first byte p50, ms | left-context decodes on main (seeds 1 / 2) |
+Overload: Nari Labs' open client, unmodified (`tts_bench` `a2d65e1`): 1.7B CustomVoice, Ryan, English, the SeedTTS EN sentences, Poisson arrivals, 30 s warm-up and 120 s measured, seeds 0, 1 and 2.
+
+| req/s | completed, main → branch | requests with underruns | first byte p50, ms | left-context decodes, main (branch 0) |
 |---|---|---|---|---|
-| 60 | 1.1 / 1.0 / 2.1 % → 100 / 100 / 100 % | 2,284 / 2,269 / 2,381 → 4 / 1 / 0 | 52 / 51 / 47 → 21 / 20 / 20 | 1,183 / 1,397 |
-| 70 | 85.6 / 88.0 / 89.9 % → 100 / 100 / 100 % | 13 / 23 / 15 → 5 / 4 / 4 | 999 / 969 / 926 → 67 / 28 / 23 | 343 / 358 |
-| 80 | 4.0 / 76.5 / 77.5 % → 91.5 / 95.4 / 95.1 % | 2,229 / 31 / 8 → 0 / 0 / 2 | 62 / 1,013 / 989 → 799 / 722 / 729 | 351 / 345 |
+| 60 | 29.7 / 100 / 1.3 % → 100 / 100 / 100 % | 1,746 / 23 / 2,255 → 1 / 7 / 6 | 24 / 24 / 51 → 20 / 21 / 21 | 832 / 88 / 1,359 |
+| 70 | 86.8 / 87.0 / 86.4 % → 100 / 100 / 99.8 % | 13 / 23 / 10 → 15 / 4 / 4 | 978 / 989 / 981 → 23 / 26 / 104 | 330 / 331 / 337 |
+| 80 | 77.5 / 74.7 / 75.5 % → 91.9 / 93.7 / 92.1 % | 18 / 20 / 10 → 4 / 6 / 1 | 990 / 1,047 / 1,017 → 796 / 767 / 788 | 343 / 327 / 330 |
 
-- The branch took the left-context path 0 times. Sampled every 2 s, its arena held at most 57 to 61 rows at 60 req/s and 65 to 66 at 70 and 80 req/s, while main's 64 rows were full at every rate.
-- Main's 80 req/s swings between seeds (4.0 % against 77 %): once its rows run out, whether it recovers depends on the arrival sequence. At 80 req/s main's first byte covers only the requests it completed.
+- Sampled every 2 s, the branch's arena held at most 58 to 67 of its 128 rows, while main's 64 rows were full at every rate.
+- Main is unstable at 60 req/s (29.7, 100 and 1.3 % across seeds): once its rows run out, whether it recovers depends on the arrival sequence. At 80 req/s main's first byte covers only the requests it completed.
 - Past capacity the branch serves at capacity, and the excess gets HTTP 503 at the in-flight cap.
-- 128 clients that each drop their stream after the first chunk and send a new one at once, two rounds: no acquire found the arena full, and every stream ended. The coordinator refused 37 and 40 of the new streams with HTTP 503 at the cap, because it still counted the dropped ones.
 
-Normal load, the same 128-row arena: SeedTTS EN, 1.7B Base, the full 1,088 prompts, unseeded, both card orders.
+Normal load: SeedTTS EN, 1.7B Base, the full 1,088 prompts, unseeded, two orders.
 
 | cell | first audio mean / median / p95, ms, main → branch | RTF |
 |---|---|---|
-| streaming c1 | 18.8 / 20.6 / 22.8 → 18.85 / 20.55 / 23.15 | -0.2 % |
-| streaming c16 | 30.6 / 29.55 / 43.8 → 30.5 / 29.4 / 43.9 | -0.3 % |
-| streaming c64, three warm passes per order | 54.25 / 41.27 / 169.3 → 54.45 / 41.7 / 153.7 | -0.4 % |
-| whole c1, c16 | | -0.4 %, +0.2 % |
+| streaming c16 | 30.2 / 29.3 / 43.7 → 29.6 / 28.8 / 42.4 | -1.0 % |
+| streaming c64, three warm rounds per order | 53.3 / 40.9 / 169.2 → 53.7 / 41.1 / 156.0 | +0.9 % |
+| whole c16 (latency mean) | 375 → 374 ms | 0.0 % |
 
-- The first c64 pass after boot read RTF +1.0 % in both orders. The three warm passes per order read -0.4 %.
+- Main against main on the same card, three warm c64 rounds per order: first audio mean +0.2 ms, median +0.6 ms, RTF +2.6 %. The branch's c64 differences sit inside that. The first c64 pass after each boot read mean +1.3 ms and median +0.15 ms, which the warm rounds do not repeat.
 - 54 seeded requests over Base, CustomVoice and VoiceDesign, 27 streamed and 27 whole, are byte-identical to main, so the arena size changes no audio.
-- WER (streaming c16, Qwen3-ASR): 0.95 / 1.67 → 1.04 / 1.09 %. Main's second order has one sample over 50 %.
+- WER (streaming c16, Qwen3-ASR): 1.04 / 1.09 → 1.01 / 1.06 %. SIM 71.51 / 71.53 → 71.40 / 71.34. With byte-identical seeded audio, both differences are unseeded sampling.
+
+Every mode on a real 1.7B CustomVoice server, one stream and one whole request each: an uncapped asynchronous server, `codec_state_slots` none, 0.5 or 0 refuse to start with the error naming the slot count. The uncapped synchronous and rollback servers serve both with no arena, and the default serves both with 128 and 128 rows.
 
 ## Tests
 
