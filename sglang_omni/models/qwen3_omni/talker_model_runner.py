@@ -165,6 +165,28 @@ class QwenTalkerModelRunner(ModelRunner["SGLangARRequestData"]):
 
         batch_size = len(requests)
         result.next_token_ids = self.model.sampled_token_ids[:batch_size].clone()
+        for row_index, request in enumerate(requests):
+            if request.data.codec_frames_seen == 1 and forward_batch is not None:
+                record_boundary(
+                    request.request_id,
+                    "first-decode-sampling",
+                    {
+                        "raw_logits": result.logits_output.next_token_logits[row_index],
+                        "position": forward_batch.positions[row_index],
+                        "sampled_code": result.next_token_ids[row_index],
+                        "seed": self.model.sampling_seeds[row_index],
+                        "temperature": self.model.sampling_temperatures[row_index],
+                        "repetition_penalty": self.model.repetition_penalties[
+                            row_index
+                        ],
+                        "repetition_mask": self.model.repetition_mask[row_index],
+                        "suppress_mask": self.model.suppress_mask[row_index],
+                        "top_k": self.model.sampling_top_ks[row_index],
+                        "top_p": self.model.sampling_top_ps[row_index],
+                    },
+                )
+            else:
+                pass
         self.stage_token_ids(result, result.next_token_ids)
         self.emit_code_chunks_and_feedback(
             schedule_batch=schedule_batch,
