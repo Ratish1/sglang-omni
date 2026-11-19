@@ -24,6 +24,15 @@ class TestIsFp8BlockQuant:
 class TestConvertFp8WeightScaleInv:
     """Tests for ``convert_fp8_weight_scale_inv``."""
 
+    def test_bf16_checkpoint_inverse_preserves_float32_scale(self) -> None:
+        """Converting stored inverse scales must not round the runtime scales to BF16."""
+        checkpoint_inverse_scales = torch.tensor([1328.0, 7008.0], dtype=torch.bfloat16)
+        runtime_scales = convert_fp8_weight_scale_inv(
+            "layer.weight_scale_inv", checkpoint_inverse_scales
+        )
+        assert runtime_scales.dtype == torch.float32
+        assert torch.equal(runtime_scales, torch.tensor([1.0 / 1328.0, 1.0 / 7008.0]))
+
     def test_original_tensor_not_mutated(self) -> None:
         scale_inv = torch.tensor([2.0, 4.0], dtype=torch.float32)
         _ = convert_fp8_weight_scale_inv(

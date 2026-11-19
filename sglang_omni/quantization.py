@@ -163,7 +163,9 @@ def convert_fp8_weight_scale_inv(
     else:
         pass
 
-    return torch.reciprocal(loaded_weight)
+    # note (codex): block-FP8 kernels consume FP32 scales even when the checkpoint stores BF16 inverses.
+    reciprocal_dtype = torch.promote_types(loaded_weight.dtype, torch.float32)
+    return loaded_weight.to(dtype=reciprocal_dtype).reciprocal()
 
 
 def identity_preprocessor(
