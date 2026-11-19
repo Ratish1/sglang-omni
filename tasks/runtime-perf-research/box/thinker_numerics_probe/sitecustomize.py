@@ -124,7 +124,7 @@ def install_layers(base, torch, lock, path) -> None:
         flat = rows.reshape(rows.shape[0], -1)
         bits = flat.contiguous().view(torch.int16 if flat.element_size() == 2 else torch.int32).to(torch.int64)
         columns = torch.arange(1, bits.shape[1] + 1, device=bits.device, dtype=torch.int64) * 2654435761 % 1000003
-        per_row = bits @ columns
+        per_row = (bits * columns).sum(dim=1)
         row_weights = torch.arange(1, bits.shape[0] + 1, device=bits.device, dtype=torch.int64) * 40503 % 65521 + 1
         return int((per_row * row_weights).sum())
 
