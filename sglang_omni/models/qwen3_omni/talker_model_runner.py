@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING, TypeAlias
 
 import torch
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
 
 from sglang_omni.model_runner.base import ModelRunner
 from sglang_omni.model_runner.model_worker import ModelWorker
@@ -157,6 +158,35 @@ class QwenTalkerModelRunner(ModelRunner["SGLangARRequestData"]):
                     },
                     frame_index=request.data.codec_frames_seen,
                 )
+                if request.data.codec_frames_seen == 1:
+                    position = int(forward_batch.positions[row_index])
+                    model_runner = self.tp_worker.model_runner
+                    live_slots = model_runner.req_to_token_pool.req_to_token[
+                        forward_batch.req_pool_indices[row_index], :position
+                    ].long()
+                    pool = model_runner.token_to_kv_pool
+                    assert isinstance(pool, MHATokenToKVPool)
+                    record_boundary(
+                        request.request_id,
+                        "first-decode-prefix-cache",
+                        {
+                            "key_rows": torch.stack(
+                                [
+                                    buffer.index_select(0, live_slots)
+                                    for buffer in pool.k_buffer
+                                ]
+                            ),
+                            "value_rows": torch.stack(
+                                [
+                                    buffer.index_select(0, live_slots)
+                                    for buffer in pool.v_buffer
+                                ]
+                            ),
+                            "position": position,
+                        },
+                    )
+                else:
+                    pass
             else:
                 pass
         self.write_feedback_buffers(requests)
