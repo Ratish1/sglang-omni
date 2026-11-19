@@ -323,6 +323,25 @@ def pin_attention_splits(splits: int) -> None:
         self.decode_num_splits = splits
 
     backend.__init__ = init
+    module = sys.modules[module_name]
+    original_kvcache = module.flash_attn_with_kvcache
+    calls = {"count": 0}
+
+    def flash_attn_with_kvcache(*args, **kwargs):
+        kwargs["num_splits"] = splits
+        if "scheduler_metadata" in kwargs:
+            kwargs["scheduler_metadata"] = None
+        else:
+            pass
+        calls["count"] += 1
+        if calls["count"] == 1 and PREFIX:
+            with open(f"{PREFIX}.{os.getpid()}.splits", "w", encoding="utf-8") as handle:
+                handle.write(f"flash_attn_with_kvcache forced num_splits={splits}, scheduler_metadata dropped\n")
+        else:
+            pass
+        return original_kvcache(*args, **kwargs)
+
+    module.flash_attn_with_kvcache = flash_attn_with_kvcache
 
 
 if PREFIX:
