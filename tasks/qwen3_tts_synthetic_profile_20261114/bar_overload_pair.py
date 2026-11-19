@@ -21,7 +21,6 @@ from pathlib import Path
 
 import httpx
 
-from loop_pair import launch
 from seedtts_pair import card_cpus, client_cpus, serve, stop
 from served_baseline import MODELS, wait_healthy
 from slot_wait_serving import codec_state
@@ -259,8 +258,8 @@ def run_block(
                     trees[arm], model, cards[arm], ports[arm], seed_out / arm / "serve.log", server_env, server_args[arm]
                 )
             else:
-                servers[arm] = launch(
-                    trees[arm], model, cards[arm], ports[arm], f"overload{seed}{arm}", seed_out / arm / "serve.log", False
+                servers[arm] = launch_traced(
+                    trees[arm], model, cards[arm], ports[arm], f"overload{seed}{arm}", seed_out / arm / "serve.log"
                 )
         for arm in arms:
             wait_healthy(ports[arm], servers[arm])
@@ -355,6 +354,24 @@ def run_block(
                     [sys.executable, str(HERE / "census_digest.py"), str(sqlite)],
                     stdout=handle, stderr=subprocess.STDOUT, check=False,
                 )
+
+
+def launch_traced(tree: Path, model: str, card: int, port: int, session: str, log: Path) -> subprocess.Popen:
+    """The server under an idle nsys session, with the probe's talker step and vocoder batch labels for census_digest.py."""
+    command = [
+        "taskset", "-c", card_cpus(card),
+        "nsys", "launch", f"--session-new={session}", "--trace=cuda,nvtx", "--cuda-graph-trace=node",
+        sys.executable, "-m", "sglang_omni.cli", "serve", "--model-path", model, "--host", "127.0.0.1",
+        "--port", str(port), "--tts_engine.gpu", str(card), "--vocoder.gpu", str(card),
+    ]
+    env = {
+        **os.environ,
+        "PYTHONPATH": f"{HERE / 'probe'}:{tree}",
+        "QWEN3_TTS_PROBE_LABELS": "1",
+        "SGLANG_OMNI_STRICT_PORT": "1",
+    }
+    with log.open("w") as handle:
+        return subprocess.Popen(command, cwd=tree, env=env, stdout=handle, stderr=subprocess.STDOUT, start_new_session=True)
 
 
 def record_nsys(session: str, delay_s: int, window_s: int, out: Path) -> None:
