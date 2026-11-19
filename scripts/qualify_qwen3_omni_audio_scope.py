@@ -41,6 +41,7 @@ MMSU_TALKER_COUNT = 40
 MMSU_TEXT_COUNT = 2000
 MMSU_DATASET = "zhaochenyang20/mmsu-ci-2000"
 ARMS = ("main-a", "narrow-a", "full-a", "narrow-b", "main-b")
+RESIDUAL_ARM = "residual-a"
 
 
 def build_mmsu_packet(run: Path) -> None:
@@ -195,8 +196,10 @@ def measure_generation(
         )
 
 
-def score_speech(run: Path, tree: Path, port: int, replay: Path) -> None:
-    for arm in ARMS:
+def score_speech(
+    run: Path, tree: Path, port: int, replay: Path, arms: tuple[str, ...]
+) -> None:
+    for arm in arms:
         destination = run / arm
         run_logged(
             [
@@ -264,7 +267,7 @@ def main() -> None:
     )
     parser.add_argument("--run", required=True, type=Path)
     parser.add_argument("--tree", type=Path)
-    parser.add_argument("--arm", choices=ARMS)
+    parser.add_argument("--arm", choices=(*ARMS, RESIDUAL_ARM))
     parser.add_argument("--replay", type=Path)
     arguments = parser.parse_args()
     run = arguments.run.resolve(strict=True)
@@ -285,7 +288,12 @@ def main() -> None:
         else (QWEN3_ASR_MODEL_PATH, ASR_REVISION)
     )
     assert Path(snapshot_download(model)).name == revision
-    destination = run / (arguments.arm if generation else "asr")
+    if generation:
+        destination = run / arguments.arm
+    elif arguments.arm is None:
+        destination = run / "asr"
+    else:
+        destination = run / f"{arguments.arm}-asr"
     destination.mkdir()
     server_options = (
         [
@@ -335,7 +343,8 @@ def main() -> None:
         if generation:
             measure_generation(run, tree, destination, port, replay)
         else:
-            score_speech(run, tree, port, replay)
+            arms = ARMS if arguments.arm is None else (arguments.arm,)
+            score_speech(run, tree, port, replay, arms)
     finally:
         stop_server(server)
     processes = subprocess.check_output(["ps", "-eo", "pgid=,stat="], text=True)
