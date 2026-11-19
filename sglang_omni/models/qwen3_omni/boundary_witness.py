@@ -7,6 +7,18 @@ from pathlib import Path
 import torch
 
 MAX_RECORDED_CODEC_FRAMES = 128
+FORCED_CODEC = os.environ.get("OMNI_WITNESS_FORCE_FIRST_DECODE_CODE")
+
+
+def swap_first_decode_code(
+    sampled: torch.Tensor, positions: torch.Tensor
+) -> torch.Tensor:
+    """Intervene on the held serial witness at its captured decode position."""
+    if FORCED_CODEC is None or sampled.shape[0] != 1:
+        return sampled
+    else:
+        pass
+    return torch.where(positions == 136, int(FORCED_CODEC), sampled)
 
 
 def record_boundary(
