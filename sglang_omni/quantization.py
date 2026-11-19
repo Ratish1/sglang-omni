@@ -10,7 +10,10 @@ custom weight loaders.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Callable
+import logging
+import os
+from functools import partial
+from typing import TYPE_CHECKING, Callable, Literal
 
 if TYPE_CHECKING:
     import torch
@@ -18,6 +21,8 @@ if TYPE_CHECKING:
     from transformers import PretrainedConfig
 else:
     pass
+
+logger = logging.getLogger(__name__)
 
 # A weight preprocessor maps `(target_name, loaded_weight) -> loaded_weight`.
 WeightPreprocessor = Callable[[str, "torch.Tensor"], "torch.Tensor"]
@@ -137,6 +142,8 @@ def is_fp8_block_quant(quant_dict: dict[str, object] | None) -> bool:
 def convert_fp8_weight_scale_inv(
     target_name: str,
     loaded_weight: "torch.Tensor",
+    *,
+    preserve_precision: bool = True,
 ) -> "torch.Tensor":
     """Reciprocate a `weight_scale_inv` tensor into the SGLang runtime scale."""
     if not target_name.endswith("weight_scale_inv"):
@@ -163,6 +170,10 @@ def convert_fp8_weight_scale_inv(
     else:
         pass
 
+    if not preserve_precision:
+        return loaded_weight.reciprocal()
+    else:
+        pass
     # note (codex): block-FP8 kernels consume FP32 scales even when the checkpoint stores BF16 inverses.
     reciprocal_dtype = torch.promote_types(loaded_weight.dtype, torch.float32)
     return loaded_weight.to(dtype=reciprocal_dtype).reciprocal()
@@ -178,12 +189,27 @@ def get_weight_preprocessor(
     config: PretrainedConfig | None = None,
     *,
     fp8_scale_inverted: bool = False,
+    scale_stage: Literal["thinker", "talker"] | None = None,
 ) -> WeightPreprocessor:
     """Return the per-tensor weight transform for a checkpoint's quantization."""
     quant_dict = resolve_quant_config(config)
 
     if fp8_scale_inverted and is_fp8_block_quant(quant_dict):
-        return convert_fp8_weight_scale_inv
+        selected_stage = os.environ.get("OMNI_AUDIT_FP8_SCALE_STAGE")
+        if selected_stage is None:
+            return convert_fp8_weight_scale_inv
+        elif selected_stage not in ("thinker", "talker") or scale_stage is None:
+            raise ValueError(
+                f"Unsupported FP8 scale audit {selected_stage!r} for {scale_stage!r}"
+            )
+        else:
+            preserve_precision = selected_stage == scale_stage
+            logger.info(
+                f"FP8 scale audit stage={scale_stage} preserve_precision={preserve_precision}"
+            )
+            return partial(
+                convert_fp8_weight_scale_inv, preserve_precision=preserve_precision
+            )
     else:
         pass
     return identity_preprocessor

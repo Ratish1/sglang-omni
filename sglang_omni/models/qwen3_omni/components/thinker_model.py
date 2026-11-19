@@ -714,7 +714,7 @@ class Qwen3OmniMoeThinkerTextModel(nn.Module):
         params_dict = self.cached_params_dict
 
         preprocess_weight = get_weight_preprocessor(
-            self.config, fp8_scale_inverted=True
+            self.config, fp8_scale_inverted=True, scale_stage="thinker"
         )
 
         for name, loaded_weight in weights:

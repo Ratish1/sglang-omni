@@ -2013,7 +2013,7 @@ class Qwen3OmniTalker(nn.Module):
         )
 
         preprocess_weight = get_weight_preprocessor(
-            self.root_config, fp8_scale_inverted=True
+            self.root_config, fp8_scale_inverted=True, scale_stage="talker"
         )
 
         for name, loaded_weight in weights:

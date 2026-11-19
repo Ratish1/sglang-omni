@@ -371,7 +371,7 @@ class Qwen3OmniThinkerForCausalLM(nn.Module):
         num_experts = self.config.num_experts
 
         preprocess_weight = get_weight_preprocessor(
-            self.root_config, fp8_scale_inverted=True
+            self.root_config, fp8_scale_inverted=True, scale_stage="thinker"
         )
 
         for name, loaded_weight in weights:
