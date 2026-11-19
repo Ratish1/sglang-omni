@@ -20,13 +20,17 @@ quiet_host() {
 tree_of() { case $1 in m) echo $MAIN ;; h) echo $PRHEAD ;; b) echo $B ;; *) exit 2 ;; esac; }
 log "q1119_stageshare start"
 
-(cd $B && python3 -m pytest -q -p no:cacheprovider tests/unit_test/qwen3_omni tests/unit_test/preprocessing \
-  tests/unit_test/utils tests/unit_test/minicpm_o tests/unit_test/ming_omni 2>&1 | tail -15) > $O/b_units.log
-log "units $(grep -E 'passed|failed' $O/b_units.log | tail -1)"
-for arm in h b; do
-  (cd $(tree_of $arm) && PYTHONPATH=$(tree_of $arm) python3 $K/video_share_probe.py 2>&1 | tail -3) >> $O/share_probe.log
-done
-log "share probe done"
+if [ ! -s $O/share_probe.log ]; then
+  (cd $B && python3 -m pytest -q -p no:cacheprovider tests/unit_test/qwen3_omni tests/unit_test/preprocessing \
+    tests/unit_test/utils tests/unit_test/minicpm_o tests/unit_test/ming_omni 2>&1 | tail -15) > $O/b_units.log
+  log "units $(grep -E 'passed|failed' $O/b_units.log | tail -1)"
+  for arm in h b; do
+    (cd $(tree_of $arm) && PYTHONPATH=$(tree_of $arm) python3 $K/video_share_probe.py 2>&1 | tail -3) >> $O/share_probe.log
+  done
+  log "share probe done"
+else
+  :
+fi
 
 ci_text_and_talker() {
   local name=$1 tree=$2 port=28400

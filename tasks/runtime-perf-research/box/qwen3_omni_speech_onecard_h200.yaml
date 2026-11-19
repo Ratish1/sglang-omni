@@ -1,8 +1,11 @@
 # The CI's Video-MME speech server pipeline (Qwen3OmniSpeechPipelineConfig, its processes and environment defaults)
-# with every GPU stage on one H200, at the colocated H200 config's stage memory budgets.
+# with every GPU stage on one H200, at the colocated H200 config's stage memory budgets. The Qwen placement policy
+# only validates, and allows the thinker and talker on one card only for the colocated class, whose checks ask for the
+# stage budgets this file sets, so it is off here.
 config_cls: Qwen3OmniSpeechPipelineConfig
 name: qwen3-omni-speech-onecard-h200
 model_path: Qwen/Qwen3-Omni-30B-A3B-Instruct
+placement_policy: null
 
 stages:
   image_encoder:
