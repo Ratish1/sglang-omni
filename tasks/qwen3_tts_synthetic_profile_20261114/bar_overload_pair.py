@@ -14,12 +14,14 @@ import concurrent.futures
 import json
 import os
 import subprocess
+import sys
 import threading
 import time
 from pathlib import Path
 
 import httpx
 
+from loop_pair import launch
 from seedtts_pair import card_cpus, client_cpus, serve, stop
 from served_baseline import MODELS, wait_healthy
 from slot_wait_serving import codec_state
@@ -33,7 +35,8 @@ MEMORY_SAMPLE_S = 5
 PROCESS_SAMPLE_S = 2
 HEALTH_TIMEOUT_S = 30
 ENGINE_THREAD = "scheduler-tts_e"
-GC_PROBE_DIR = Path(__file__).resolve().parent / "gc_probe"
+HERE = Path(__file__).resolve().parent
+GC_PROBE_DIR = HERE / "gc_probe"
 CLIENT_WARMUP_S = 30
 # the API process's object census is taken after the measured window, so its cost lands on no measured request
 CENSUS_AFTER_WINDOW_S = 5
@@ -209,6 +212,11 @@ def main() -> None:
     parser.add_argument(
         "--one-card", action="store_true", help="run each arm alone on card 0, one after the other, when one card is held"
     )
+    parser.add_argument(
+        "--nsys-at", type=int, default=None,
+        help="launch the servers under nsys with the loop probe and capture this many seconds into each rate",
+    )
+    parser.add_argument("--nsys-window", type=int, default=5, help="seconds each nsys capture records")
     args = parser.parse_args()
     prepare_client()
     model, _ = MODELS["customvoice"]
@@ -246,9 +254,14 @@ def run_block(
                 if args.gc_probe
                 else {}
             )
-            servers[arm] = serve(
-                trees[arm], model, cards[arm], ports[arm], seed_out / arm / "serve.log", server_env, server_args[arm]
-            )
+            if args.nsys_at is None:
+                servers[arm] = serve(
+                    trees[arm], model, cards[arm], ports[arm], seed_out / arm / "serve.log", server_env, server_args[arm]
+                )
+            else:
+                servers[arm] = launch(
+                    trees[arm], model, cards[arm], ports[arm], f"overload{seed}{arm}", seed_out / arm / "serve.log", False
+                )
         for arm in arms:
             wait_healthy(ports[arm], servers[arm])
         print(f"{time.strftime('%T')} seed {seed} healthy, cards {cards}", flush=True)
@@ -280,6 +293,17 @@ def run_block(
             ]
             for profiler in profilers:
                 profiler.start()
+            nsys_recorders = [
+                threading.Thread(
+                    target=record_nsys,
+                    args=(f"overload{seed}{arm}", args.nsys_at, args.nsys_window, seed_out / arm / f"rps{rate}"),
+                    daemon=True,
+                )
+                for arm in arms
+                if args.nsys_at is not None
+            ]
+            for recorder in nsys_recorders:
+                recorder.start()
             census_timers = [
                 threading.Timer(
                     CLIENT_WARMUP_S + args.duration + CENSUS_AFTER_WINDOW_S,
@@ -311,11 +335,38 @@ def run_block(
                 census_timer.cancel()
             for profiler in profilers:
                 profiler.join()
+            for recorder in nsys_recorders:
+                recorder.join()
             print(f"{time.strftime('%T')} seed {seed} rps {rate} rc {codes}", flush=True)
             time.sleep(SETTLE_S)
     finally:
         for server in servers.values():
             stop(server)
+    for arm in arms:
+        for rate in args.rates if args.nsys_at is not None else ():
+            report = seed_out / arm / f"rps{rate}.nsys-rep"
+            sqlite = seed_out / arm / f"rps{rate}.sqlite"
+            subprocess.run(
+                ["nsys", "export", "--type", "sqlite", "--force-overwrite", "true", "--output", str(sqlite), str(report)],
+                check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
+            with (seed_out / arm / f"census_rps{rate}.txt").open("w") as handle:
+                subprocess.run(
+                    [sys.executable, str(HERE / "census_digest.py"), str(sqlite)],
+                    stdout=handle, stderr=subprocess.STDOUT, check=False,
+                )
+
+
+def record_nsys(session: str, delay_s: int, window_s: int, out: Path) -> None:
+    """After delay_s into the rate, one nsys capture of window_s on the arm's launched session."""
+    time.sleep(delay_s)
+    subprocess.run(
+        ["nsys", "start", f"--session={session}", "--sample=none", "--cpuctxsw=none", f"--output={out}",
+         "--force-overwrite=true"],
+        check=True,
+    )
+    time.sleep(window_s)
+    subprocess.run(["nsys", "stop", f"--session={session}"], check=True)
 
 
 if __name__ == "__main__":
