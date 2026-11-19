@@ -25,7 +25,15 @@ Against the slot fix at the same time on the two cards. Nari's client, 180 s mea
 | same, `--admission.max_waiting_requests 0` | `6de866337` | 70.4 %, 2 against 4 (100 only) | | the residual is the waiting itself |
 | same, bound 512 / 256 (CLI) | `6de866337` | 512: 70.1 / 89.9 %, 3 / 4 against 4 / 12; 256: 69.7 / 88.2 %, 7 / 2 against 4 / 5 | | 256 chosen for stall margin |
 | `ddd52d694` default 256 on `dade67035` | `f6d2c8198` | seeds 0 / 1: 69.7 / 69.8 % and 85.8 / 87.3 %, underruns 4, 3 / 3, 7 against 2, 4 / 7, 6; first byte 4.6 s against 0.9 s | SeedTTS Base both orders inside the A/A band, WER 1.03 / 1.07 %, SIM 71.39 / 71.36; whole c64 RTF -0.4 % | ready to open on the user's word; bound trade-off for the user |
-| `3e07f76e4` rebuilt on the sizing branch `33bde3fa9` (`fix/qwen3-tts-admission-waits-on-arena`), then `a941cd93a` on `95a524770`, then `23fa9ea59` on `758506aef` | `7dab90093`, `75e445466`, `88ac8e2c6` | one card, against the sizing head: running | | 11-19 one card: CPU 2,745 passed (4 failures main shares), accelerator 286 passed; 384 streams at once two rounds and the mixed round times 8 three rounds both models complete, 0 refused; `a941cd93a`: 128 clients dropping after the first chunk and streaming again, two rounds, all complete, 0 refused, 0 exhausted |
+| `3e07f76e4` rebuilt on the sizing branch `33bde3fa9` (`fix/qwen3-tts-admission-waits-on-arena`), then `a941cd93a` on `95a524770`, then `23fa9ea59` on `758506aef` | `7dab90093`, `75e445466`, `88ac8e2c6` | `a941cd93a` against the sizing head `95a524770`, one card, each arm alone, 180 s, seeds 0 / 1: 80 req/s 92.7 / 95.0 → 96.0 / 94.7 %, underrun requests 1 / 7 → 4 / 5, first byte p50 0.77 / 0.73 → 4.0 / 4.2 s; 100 req/s 75.0 / 76.1 → 74.4 / 76.4 %, 4 / 4 → 2 / 5, 0.82 / 0.82 → 4.2 / 4.2 s; arena peak 65 to 66 rows on both arms, 0 exhausted | | 11-19 one card: CPU 2,745 passed (4 failures main shares), accelerator 286 passed; 384 streams at once two rounds and the mixed round times 8 three rounds both models complete, 0 refused; `a941cd93a`: 128 clients dropping after the first chunk and streaming again, two rounds, all complete, 0 refused, 0 exhausted |
+
+# Branch results: load-independent opening (11-19, host-221 card 3, one card)
+
+`test/qwen3-tts-opening-on-arena` (`fix/qwen3-tts-opening-load-independent` `b45d01067` merged on the sizing head), each arm alone, seeds 0 / 1, against the sizing head `95a524770`.
+
+| Head | sglang_omni tree | 60 / 70 / 80 req/s | Read |
+|---|---|---|---|
+| `6ee3b9e50` | `4cecd5b6f` | audible p50 97 / 97 → 29.5 / 28.9 ms, 101 / 100 → 70 / 36 ms, 829 / 796 → 825 / 789 ms; leading silence p95 90 → 10 ms; first byte p50 +9 ms at 60 (that byte was silence); completed 100 / 100 / 94.0, 95.3 → 100 / 100 / 90.8, 92.9 %; second-chunk margin p50 at 80 req/s 56.4 / 56.3 → 50.2 / 50.8 ms, p1 40.7 / 41.4 → 32.3 / 32.6 ms | regression at 80 req/s: end to end p50 +80 to 87 ms, engine decode 4,474 / 4,485 → 4,227 / 4,362 tok/s at about 63 running, thread CPU equal, graphs replay with no failure; census at 80 req/s next |
 
 # Branch results: persistent predictor layer (11-14)
 
