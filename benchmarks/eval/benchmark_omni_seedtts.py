@@ -378,6 +378,8 @@ def make_send_fn(
             if usage:
                 result.prompt_tokens = usage.get("prompt_tokens", 0)
                 result.completion_tokens = usage.get("completion_tokens", 0)
+                result.server_request_id = usage.get("server_request_id", "")
+                result.returned_text = usage.get("returned_text")
 
             # note (Chenyang): engine_time_s should be the time taken by
             # the engine. Current omni chat completions has no X-Engine-Time

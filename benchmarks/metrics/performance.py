@@ -465,6 +465,8 @@ def _request_result_to_dict(output: RequestResult) -> dict:
     return {
         "id": output.request_id,
         "text": output.text,
+        "server_request_id": output.server_request_id,
+        "returned_text": output.returned_text,
         "is_success": output.is_success,
         "latency_s": round(output.latency_s, 4),
         "audio_duration_s": round(output.audio_duration_s, 4),

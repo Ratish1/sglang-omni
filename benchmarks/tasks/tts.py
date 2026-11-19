@@ -954,7 +954,9 @@ class VoiceCloneOmni:
             raise ValueError("Empty audio data in response")
 
         wav_bytes = base64.b64decode(audio_b64)
-        usage = resp_json.get("usage", {})
+        usage = resp_json.get("usage") or {}
+        usage["server_request_id"] = resp_json["id"].removeprefix("chatcmpl-")
+        usage["returned_text"] = message.get("content") or ""
         return wav_bytes, latency, usage
 
     async def _read_streaming_chat_audio(

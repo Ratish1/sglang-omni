@@ -31,6 +31,7 @@ def finish_reason_from_server(value: str | None) -> FinishReason:
 class RequestResult:
     request_id: str = ""
     server_request_id: str = ""
+    returned_text: str | None = None
     text: str = ""
     is_success: bool = False
     latency_s: float = 0.0

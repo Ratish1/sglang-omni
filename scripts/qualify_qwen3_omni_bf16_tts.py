@@ -33,6 +33,7 @@ def main() -> None:
     parser.add_argument("--checkpoint", required=True, type=Path)
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument("--voice-probe", action="store_true")
+    parser.add_argument("--seed", type=int)
     arguments = parser.parse_args()
     logging.basicConfig(level=logging.INFO)
     tree = arguments.tree.resolve(strict=True)
@@ -49,6 +50,7 @@ def main() -> None:
                     ["git", "-C", str(tree), "rev-parse", "HEAD"], text=True
                 ).strip(),
                 "checkpoint": checkpoint.name,
+                "seed": arguments.seed,
                 "samples": [
                     {
                         "sample_id": sample.sample_id,
@@ -97,6 +99,7 @@ def main() -> None:
             voice_clone=True,
             max_concurrency=CONCURRENCY,
             output_dir=str(output / "generation"),
+            seed=arguments.seed,
             disable_tqdm=True,
         )
         report = asyncio.run(run_omni_seedtts_benchmark(config))
