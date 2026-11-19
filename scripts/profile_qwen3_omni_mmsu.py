@@ -37,6 +37,7 @@ logger = logging.getLogger(__name__)
 WARMUP_REQUEST_COUNT = 4
 CONTROL_TIMEOUT_SECONDS = 30
 STATUS_POLL_SECONDS = 0.25
+EVENT_BUFFER_CAPACITY = 16_384
 STARTUP_TIMEOUT_SECONDS = 600
 SEED = 20261119
 
@@ -188,6 +189,7 @@ def main() -> None:
                     json={
                         "run_id": session_name,
                         "event_dir": str(event_directory),
+                        "event_buffer_capacity": EVENT_BUFFER_CAPACITY,
                         **(
                             {"trace_path_template": str(output / "{stage}")}
                             if capture_torch
