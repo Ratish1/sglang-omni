@@ -126,8 +126,12 @@ def main() -> None:
     parser.add_argument("--asr-checkpoint", required=True, type=Path)
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument("--visual-runs", nargs="*", type=Path, default=())
-    parser.add_argument("runs", nargs="+", type=Path)
+    parser.add_argument("runs", nargs="*", type=Path)
     arguments = parser.parse_args()
+    if not arguments.runs and not arguments.visual_runs:
+        parser.error("provide SeedTTS runs, visual runs, or both")
+    else:
+        pass
     logging.basicConfig(level=logging.INFO)
 
     voice_manifests = {}
@@ -136,10 +140,13 @@ def main() -> None:
         assert manifest["seed"] is None and manifest["concurrency"] == 16, run
         assert len(manifest["samples"]) == SAMPLE_COUNT, run
         voice_manifests[run.name] = manifest
-    first = next(iter(voice_manifests.values()))
-    for manifest in voice_manifests.values():
-        assert manifest["samples"] == first["samples"]
-        assert manifest["checkpoint"] == first["checkpoint"]
+    if voice_manifests:
+        first = next(iter(voice_manifests.values()))
+        for manifest in voice_manifests.values():
+            assert manifest["samples"] == first["samples"]
+            assert manifest["checkpoint"] == first["checkpoint"]
+    else:
+        pass
 
     port = find_available_port()
     server = start_server_from_cmd(
