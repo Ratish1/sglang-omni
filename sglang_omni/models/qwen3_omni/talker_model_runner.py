@@ -8,6 +8,7 @@ from queue import Queue
 from typing import TYPE_CHECKING, TypeAlias
 
 import torch
+from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 
 from sglang_omni.model_runner.base import ModelRunner
 from sglang_omni.model_runner.model_worker import ModelWorker
@@ -15,7 +16,7 @@ from sglang_omni.model_runner.prefill_inputs import (
     OmniPrefillInputs,
     attach_omni_prefill_inputs,
 )
-from sglang_omni.models.qwen3_omni.boundary_witness import record_boundary
+from sglang_omni.models.qwen3_omni.boundary_witness import is_witness, record_boundary
 from sglang_omni.scheduling.message import OutgoingMessage, put_messages
 from sglang_omni.scheduling.pending_text_queue import PendingTextTensorQueue
 from sglang_omni.scheduling.sglang_backend.request_data import (
@@ -95,6 +96,29 @@ class QwenTalkerModelRunner(ModelRunner["SGLangARRequestData"]):
                 input_embeds_are_projected=input_embeds_are_projected,
             ),
         )
+        for request in requests:
+            if is_witness(request.request_id):
+                assert len(requests) == 1 and input_embeds_are_projected
+                assert forward_batch.extend_prefix_lens_cpu == [0]
+                parameters = request.data.req.sampling_params
+                record_boundary(
+                    request.request_id,
+                    "backbone-prefill",
+                    {
+                        "input_ids": forward_batch.input_ids,
+                        "embeddings": input_embeds,
+                        "positions": forward_batch.positions,
+                        "rotary_positions": (
+                            forward_batch.mrope_positions
+                            if self.model.uses_mrope
+                            else None
+                        ),
+                        "max_new_tokens": parameters.max_new_tokens,
+                        "suppressed_tokens": request.data.suppress_tokens,
+                    },
+                )
+            else:
+                pass
 
     def before_decode(
         self,
@@ -105,7 +129,6 @@ class QwenTalkerModelRunner(ModelRunner["SGLangARRequestData"]):
         is_lookahead: bool = False,
     ) -> None:
         del is_lookahead
-        del forward_batch
         del schedule_batch
         if not self.feedback_enabled:
             return
@@ -113,7 +136,44 @@ class QwenTalkerModelRunner(ModelRunner["SGLangARRequestData"]):
             pass
 
         self.model.prepare_decode_buffers(requests)
+        for row_index, request in enumerate(requests):
+            if is_witness(request.request_id):
+                assert forward_batch is not None
+                feedback_row, text_row = self.peek_next_decode_inputs(request.data)
+                record_boundary(
+                    request.request_id,
+                    "backbone-decode",
+                    {
+                        "position": forward_batch.positions[row_index],
+                        "rotary_positions": (
+                            forward_batch.mrope_positions[:, row_index : row_index + 1]
+                            if self.model.uses_mrope
+                            and forward_batch.mrope_positions is not None
+                            else None
+                        ),
+                        "feedback_row": feedback_row,
+                        "text_row": text_row,
+                        "uses_pad": int(not request.data.pending_text_queue),
+                    },
+                    frame_index=request.data.codec_frames_seen,
+                )
+            else:
+                pass
         self.write_feedback_buffers(requests)
+
+    def process_sampling_logits(
+        self, logits_output: LogitsProcessorOutput, requests: list[SchedulerRequest]
+    ) -> None:
+        for row_index, request in enumerate(requests):
+            record_boundary(
+                request.request_id,
+                "prefill-sampling",
+                {
+                    "masked_logits": logits_output.next_token_logits[row_index],
+                    "predictor_query": logits_output.hidden_states[row_index],
+                },
+                frame_index=request.data.codec_frames_seen,
+            )
 
     def post_prefill(
         self,
@@ -166,10 +226,11 @@ class QwenTalkerModelRunner(ModelRunner["SGLangARRequestData"]):
         batch_size = len(requests)
         result.next_token_ids = self.model.sampled_token_ids[:batch_size].clone()
         for row_index, request in enumerate(requests):
-            if request.data.codec_frames_seen == 1 and forward_batch is not None:
+            if is_witness(request.request_id):
+                assert forward_batch is not None
                 record_boundary(
                     request.request_id,
-                    "first-decode-sampling",
+                    "decode-sampling",
                     {
                         "raw_logits": result.logits_output.next_token_logits[row_index],
                         "position": forward_batch.positions[row_index],
@@ -183,7 +244,11 @@ class QwenTalkerModelRunner(ModelRunner["SGLangARRequestData"]):
                         "suppress_mask": self.model.suppress_mask[row_index],
                         "top_k": self.model.sampling_top_ks[row_index],
                         "top_p": self.model.sampling_top_ps[row_index],
+                        "predictor_query": result.logits_output.hidden_states[
+                            row_index
+                        ],
                     },
+                    frame_index=request.data.codec_frames_seen,
                 )
             else:
                 pass
@@ -331,6 +396,25 @@ class QwenTalkerModelRunner(ModelRunner["SGLangARRequestData"]):
     def on_request_finished(
         self, request_id: str, req_data: "SGLangARRequestData"
     ) -> None:
+        if is_witness(request_id):
+            assert req_data.tts_pad_embed is not None
+            pad_embedding = req_data.tts_pad_embed.reshape(-1)
+            pending_rows = list(req_data.pending_text_queue or ())
+            record_boundary(
+                request_id,
+                "backbone-finish",
+                {
+                    "pad_embedding": pad_embedding,
+                    "pending_rows": (
+                        torch.stack(pending_rows)
+                        if pending_rows
+                        else pad_embedding.new_empty((0, pad_embedding.numel()))
+                    ),
+                    "thinker_done": int(req_data.thinker_chunks_done),
+                },
+            )
+        else:
+            pass
         pending = req_data.pending_codec_rows
         if not pending:
             return

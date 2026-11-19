@@ -20,7 +20,6 @@ from sglang.srt.utils import add_prefix
 from sglang.srt.utils.common import async_h2d
 from torch import nn
 
-from sglang_omni.models.qwen3_omni.boundary_witness import swap_first_decode_code
 from sglang_omni.models.qwen3_omni.components.thinker_model import (
     Qwen3OmniMoeThinkerTextAttention,
     Qwen3OmniMoeThinkerTextDecoderLayer,
@@ -1375,9 +1374,6 @@ class Qwen3OmniTalker(nn.Module):
             sampled_token_ids = self.sample_decode_tokens(
                 logits_output.next_token_logits,
                 forward_batch,
-            )
-            sampled_token_ids = swap_first_decode_code(
-                sampled_token_ids, forward_batch.positions
             )
             batch_size = sampled_token_ids.shape[0]
             self.sampled_token_ids[:batch_size].copy_(sampled_token_ids)
