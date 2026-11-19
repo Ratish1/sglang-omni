@@ -206,6 +206,9 @@ def main() -> None:
     parser.add_argument(
         "--gc-probe", action="store_true", help="record every server and client process's long garbage collections"
     )
+    parser.add_argument(
+        "--one-card", action="store_true", help="run each arm alone on card 0, one after the other, when one card is held"
+    )
     args = parser.parse_args()
     prepare_client()
     model, _ = MODELS["customvoice"]
@@ -213,90 +216,106 @@ def main() -> None:
     server_args = {"a": tuple(args.a_arg), "b": tuple(args.b_arg)}
     ports = {"a": args.port, "b": args.port + 200}
     for index, seed in enumerate(args.seeds):
-        cards = {"a": 0, "b": 1} if index % 2 == 0 else {"a": 1, "b": 0}
         seed_out = args.out / f"seed{seed}"
-        servers = {}
-        try:
-            for arm in ("a", "b"):
-                (seed_out / arm).mkdir(parents=True, exist_ok=True)
-                identity = subprocess.check_output(["git", "rev-parse", "HEAD", "HEAD:sglang_omni"], cwd=trees[arm], text=True)
-                (seed_out / arm / "tree.txt").write_text(
-                    f"{trees[arm]} card {cards[arm]} cpus {card_cpus(cards[arm])} args {' '.join(server_args[arm])}\n{identity}"
-                )
-                server_env = (
-                    {"PYTHONPATH": f"{trees[arm]}:{GC_PROBE_DIR}", "GC_PROBE_OUT": str(seed_out / arm / "server")}
-                    if args.gc_probe
-                    else {}
-                )
-                servers[arm] = serve(
-                    trees[arm], model, cards[arm], ports[arm], seed_out / arm / "serve.log", server_env, server_args[arm]
-                )
-            for arm in ("a", "b"):
-                wait_healthy(ports[arm], servers[arm])
-            print(f"{time.strftime('%T')} seed {seed} healthy, a card {cards['a']}, b card {cards['b']}", flush=True)
-            for rate in args.rates:
-                stop_event = threading.Event()
-                (seed_out / f"cards_rps{rate}.txt").write_text(f"a card {cards['a']}, b card {cards['b']}\n")
-                sampler = threading.Thread(
-                    target=sample_gpu_memory, args=(seed_out / f"gpu_memory_rps{rate}.csv", stop_event), daemon=True
-                )
-                sampler.start()
-                process_samplers = [
-                    threading.Thread(
-                        target=sample_processes,
-                        args=(servers[arm], ports[arm], seed_out / arm / f"rps{rate}.procs.jsonl", stop_event),
-                        daemon=True,
-                    )
-                    for arm in ("a", "b")
-                ]
-                for process_sampler in process_samplers:
-                    process_sampler.start()
-                profilers = [
-                    threading.Thread(
-                        target=record_pyspy, args=(servers[arm], args.pyspy_at, seed_out / arm / f"rps{rate}"), daemon=True
-                    )
-                    for arm in ("a", "b")
-                    if args.pyspy_at is not None
-                ]
-                for profiler in profilers:
-                    profiler.start()
-                census_timers = [
-                    threading.Timer(
-                        CLIENT_WARMUP_S + args.duration + CENSUS_AFTER_WINDOW_S,
-                        (seed_out / arm / "server.census.1").touch,
-                    )
-                    for arm in ("a", "b")
-                    if args.gc_probe
-                ]
-                for census_timer in census_timers:
-                    census_timer.start()
-                with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
-                    futures = {
-                        arm: pool.submit(
-                            run_rate, ports[arm], model, rate, seed, seed_out / arm / f"rps{rate}", args.duration,
-                            (
-                                {"PYTHONPATH": str(GC_PROBE_DIR), "GC_PROBE_OUT": str(seed_out / arm / f"rps{rate}.client")}
-                                if args.gc_probe
-                                else {}
-                            ),
-                        )
-                        for arm in ("a", "b")
-                    }
-                    codes = {arm: future.result() for arm, future in futures.items()}
-                stop_event.set()
-                sampler.join()
-                for process_sampler in process_samplers:
-                    process_sampler.join()
-                for census_timer in census_timers:
-                    census_timer.cancel()
-                for profiler in profilers:
-                    profiler.join()
-                print(f"{time.strftime('%T')} seed {seed} rps {rate} rc {codes}", flush=True)
-                time.sleep(SETTLE_S)
-        finally:
-            for server in servers.values():
-                stop(server)
+        if args.one_card:
+            # note (ratish): one arm at a time on card 0, the first arm alternating by seed, so not a same-time pair.
+            blocks = [(("a",), {"a": 0}), (("b",), {"b": 0})]
+            blocks = blocks if index % 2 == 0 else blocks[::-1]
+        else:
+            blocks = [(("a", "b"), {"a": 0, "b": 1} if index % 2 == 0 else {"a": 1, "b": 0})]
+        for arms, cards in blocks:
+            run_block(args, model, trees, server_args, ports, seed, seed_out, arms, cards)
     print(f"{time.strftime('%T')} bar_overload_pair done", flush=True)
+
+
+def run_block(
+    args: argparse.Namespace, model: str, trees: dict[str, Path], server_args: dict[str, tuple[str, ...]],
+    ports: dict[str, int], seed: int, seed_out: Path, arms: tuple[str, ...], cards: dict[str, int],
+) -> None:
+    """Boot the arms' servers at once, one per card, and run every rate against all of them at once."""
+    servers = {}
+    try:
+        for arm in arms:
+            (seed_out / arm).mkdir(parents=True, exist_ok=True)
+            identity = subprocess.check_output(["git", "rev-parse", "HEAD", "HEAD:sglang_omni"], cwd=trees[arm], text=True)
+            (seed_out / arm / "tree.txt").write_text(
+                f"{trees[arm]} card {cards[arm]} cpus {card_cpus(cards[arm])} args {' '.join(server_args[arm])}\n{identity}"
+            )
+            server_env = (
+                {"PYTHONPATH": f"{trees[arm]}:{GC_PROBE_DIR}", "GC_PROBE_OUT": str(seed_out / arm / "server")}
+                if args.gc_probe
+                else {}
+            )
+            servers[arm] = serve(
+                trees[arm], model, cards[arm], ports[arm], seed_out / arm / "serve.log", server_env, server_args[arm]
+            )
+        for arm in arms:
+            wait_healthy(ports[arm], servers[arm])
+        print(f"{time.strftime('%T')} seed {seed} healthy, cards {cards}", flush=True)
+        for rate in args.rates:
+            stop_event = threading.Event()
+            (seed_out / f"cards_rps{rate}{'_' + arms[0] if len(arms) == 1 else ''}.txt").write_text(f"cards {cards}\n")
+            sampler = threading.Thread(
+                target=sample_gpu_memory,
+                args=(seed_out / f"gpu_memory_rps{rate}{'_' + arms[0] if len(arms) == 1 else ''}.csv", stop_event),
+                daemon=True,
+            )
+            sampler.start()
+            process_samplers = [
+                threading.Thread(
+                    target=sample_processes,
+                    args=(servers[arm], ports[arm], seed_out / arm / f"rps{rate}.procs.jsonl", stop_event),
+                    daemon=True,
+                )
+                for arm in arms
+            ]
+            for process_sampler in process_samplers:
+                process_sampler.start()
+            profilers = [
+                threading.Thread(
+                    target=record_pyspy, args=(servers[arm], args.pyspy_at, seed_out / arm / f"rps{rate}"), daemon=True
+                )
+                for arm in arms
+                if args.pyspy_at is not None
+            ]
+            for profiler in profilers:
+                profiler.start()
+            census_timers = [
+                threading.Timer(
+                    CLIENT_WARMUP_S + args.duration + CENSUS_AFTER_WINDOW_S,
+                    (seed_out / arm / "server.census.1").touch,
+                )
+                for arm in arms
+                if args.gc_probe
+            ]
+            for census_timer in census_timers:
+                census_timer.start()
+            with concurrent.futures.ThreadPoolExecutor(max_workers=len(arms)) as pool:
+                futures = {
+                    arm: pool.submit(
+                        run_rate, ports[arm], model, rate, seed, seed_out / arm / f"rps{rate}", args.duration,
+                        (
+                            {"PYTHONPATH": str(GC_PROBE_DIR), "GC_PROBE_OUT": str(seed_out / arm / f"rps{rate}.client")}
+                            if args.gc_probe
+                            else {}
+                        ),
+                    )
+                    for arm in arms
+                }
+                codes = {arm: future.result() for arm, future in futures.items()}
+            stop_event.set()
+            sampler.join()
+            for process_sampler in process_samplers:
+                process_sampler.join()
+            for census_timer in census_timers:
+                census_timer.cancel()
+            for profiler in profilers:
+                profiler.join()
+            print(f"{time.strftime('%T')} seed {seed} rps {rate} rc {codes}", flush=True)
+            time.sleep(SETTLE_S)
+    finally:
+        for server in servers.values():
+            stop(server)
 
 
 if __name__ == "__main__":
