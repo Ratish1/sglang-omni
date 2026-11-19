@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import base64
 import hashlib
 import json
 import logging
@@ -12,7 +13,13 @@ import subprocess
 import sys
 from pathlib import Path
 
-from benchmarks.benchmarker.utils import start_server_from_cmd, stop_server
+import httpx
+
+from benchmarks.benchmarker.utils import (
+    get_wav_duration,
+    start_server_from_cmd,
+    stop_server,
+)
 from benchmarks.dataset.prepare import DATASETS
 from benchmarks.dataset.seedtts import load_seedtts_samples
 from benchmarks.eval.benchmark_omni_seedtts import (
@@ -33,6 +40,8 @@ def main() -> None:
     parser.add_argument("--checkpoint", required=True, type=Path)
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument("--voice-probe", action="store_true")
+    parser.add_argument("--profile", choices=("h100_bf16", "h200"), default="h200")
+    parser.add_argument("--held-request", type=Path)
     parser.add_argument("--seed", type=int)
     parser.add_argument(
         "--concurrency", type=int, default=CONCURRENCY, choices=(1, CONCURRENCY)
@@ -48,6 +57,15 @@ def main() -> None:
     dataset = DATASETS["seedtts"]
     samples = load_seedtts_samples(dataset)
     assert len(samples) == FULL_SEEDTTS_SAMPLE_COUNT
+    if arguments.held_request is None:
+        held_request = None
+    else:
+        held_request = json.loads(arguments.held_request.read_bytes())
+        (previous_audio_path,) = held_request["audios"]
+        sample_id = Path(previous_audio_path).stem
+        (held_sample,) = [sample for sample in samples if sample.sample_id == sample_id]
+        held_request["audios"] = [held_sample.ref_audio]
+        (output / "held-request.json").write_text(json.dumps(held_request, indent=2))
     if arguments.sample_ids is not None:
         sample_ids = set(arguments.sample_ids)
         samples = [sample for sample in samples if sample.sample_id in sample_ids]
@@ -71,6 +89,7 @@ def main() -> None:
                     ["git", "-C", str(tree), "rev-parse", "HEAD"], text=True
                 ).strip(),
                 "checkpoint": checkpoint.name,
+                "profile": arguments.profile,
                 "seed": arguments.seed,
                 "concurrency": arguments.concurrency,
                 "samples": [
@@ -96,7 +115,9 @@ def main() -> None:
             "sglang_omni.cli",
             "serve",
             "--config",
-            str(tree / "examples/configs/qwen3_omni_colocated_h200.yaml"),
+            str(
+                tree / f"examples/configs/qwen3_omni_colocated_{arguments.profile}.yaml"
+            ),
             "--host",
             "127.0.0.1",
             "--port",
@@ -113,6 +134,39 @@ def main() -> None:
         strip_proxy=True,
     )
     try:
+        if held_request is None:
+            pass
+        else:
+            response = httpx.post(
+                f"http://127.0.0.1:{port}/v1/chat/completions",
+                json=held_request,
+                timeout=SERVER_TIMEOUT_SECONDS,
+                trust_env=False,
+            )
+            response.raise_for_status()
+            completion = response.json()
+            assert completion["id"] == f"chatcmpl-{held_request['request_id']}"
+            (choice,) = completion["choices"]
+            waveform = base64.b64decode(
+                choice["message"]["audio"]["data"], validate=True
+            )
+            (output / "held.wav").write_bytes(waveform)
+            (output / "held-response.json").write_text(
+                json.dumps(
+                    {
+                        "sample_id": held_sample.sample_id,
+                        "request_id": held_request["request_id"],
+                        "reference_audio_sha256": hashlib.sha256(
+                            Path(held_sample.ref_audio).read_bytes()
+                        ).hexdigest(),
+                        "text": choice["message"]["content"],
+                        "finish_reason": choice["finish_reason"],
+                        "waveform_sha256": hashlib.sha256(waveform).hexdigest(),
+                        "audio_duration_s": get_wav_duration(waveform),
+                    },
+                    indent=2,
+                )
+            )
         config = OmniSeedttsBenchmarkConfig(
             model="qwen3-omni",
             host="127.0.0.1",
