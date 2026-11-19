@@ -15,6 +15,7 @@ from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.tokenizer.tiktoken_tokenizer import TiktokenTokenizer
 from transformers import PreTrainedTokenizerBase
 
+from sglang_omni.models.qwen3_omni.boundary_witness import record_boundary
 from sglang_omni.models.qwen3_omni.components.talker_prefill import TalkerPrefillBuilder
 from sglang_omni.models.qwen3_omni.mrope_positions import talker_can_use_linear_mrope
 from sglang_omni.models.qwen3_omni.payload_types import (
@@ -1214,6 +1215,16 @@ def make_thinker_stream_output_builder(
                 )
                 message.metadata["prompt_hidden_positions"] = (
                     req_data.req.prompt_hidden_positions.tolist()
+                )
+                record_boundary(
+                    request_id,
+                    "thinker-publish",
+                    {
+                        "media_positions": req_data.req.prompt_hidden_positions,
+                        "media_hidden_states": message.data,
+                        "first_token_id": token_id,
+                        "request_pool_index": req_data.req.kv.req_pool_idx,
+                    },
                 )
                 req_data.req.is_prompt_hidden_handed_off = True
             else:

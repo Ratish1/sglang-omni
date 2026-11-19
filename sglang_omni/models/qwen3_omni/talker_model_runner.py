@@ -15,6 +15,7 @@ from sglang_omni.model_runner.prefill_inputs import (
     OmniPrefillInputs,
     attach_omni_prefill_inputs,
 )
+from sglang_omni.models.qwen3_omni.boundary_witness import record_boundary
 from sglang_omni.scheduling.message import OutgoingMessage, put_messages
 from sglang_omni.scheduling.pending_text_queue import PendingTextTensorQueue
 from sglang_omni.scheduling.sglang_backend.request_data import (
@@ -188,6 +189,20 @@ class QwenTalkerModelRunner(ModelRunner["SGLangARRequestData"]):
             req = schedule_batch.reqs[idx]
             code_chunk = codes_snap[idx]
             feedback_row = embeds_snap[idx]
+            input_history = sched_req.data.decode_input_embeds
+            record_boundary(
+                req.rid,
+                "codec",
+                {
+                    "codec_ids": code_chunk,
+                    "feedback_embedding": feedback_row,
+                    "consumed_decode_embedding": (
+                        input_history[-1] if input_history else None
+                    ),
+                    "active_rows": bs,
+                },
+                frame_index=sched_req.data.codec_frames_seen,
+            )
             if coalesce > 1:
                 data = sched_req.data
                 pending = data.pending_codec_rows

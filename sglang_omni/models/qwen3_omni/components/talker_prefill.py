@@ -16,6 +16,7 @@ import torch
 from safetensors import safe_open
 from sglang.srt.utils.common import async_h2d
 
+from sglang_omni.models.qwen3_omni.boundary_witness import record_boundary
 from sglang_omni.models.qwen3_omni.components.talker_input import (
     build_prefill_input,
     host_tensor_to_device,
@@ -263,6 +264,19 @@ class TalkerPrefillBuilder:
             tts_pad_token_id=self.tts_pad_token_id,
             include_assistant_eos=thinker_done,
             im_end_token_id=self.im_end_token_id,
+        )
+        record_boundary(
+            payload.request_id,
+            "talker-prompt",
+            {
+                "media_positions": captured_positions,
+                "media_hidden_states": prompt_chunk.data,
+                "prompt_token_ids": prompt_ids,
+                "assistant_token_ids": assistant_token_ids,
+                "prefill_embeddings": prefill["input_embeds"],
+                "pending_text_rows": prefill["future_text_rows"],
+                "speaker_id": speaker_id,
+            },
         )
 
         return {
