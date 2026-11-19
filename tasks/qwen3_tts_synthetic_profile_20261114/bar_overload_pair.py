@@ -2,8 +2,8 @@
 pinned to its card's half of the socket), Nari's client (unmodified, pinned to the other socket) runs
 every rate against both at once, and the cards swap for the next seed. Each rate writes the client's
 own summary.json under OUT/seed<seed>/<arm>/rps<rate>, and rps<rate>.procs.jsonl: every
-PROCESS_SAMPLE_S, each server and client thread's CPU share and the /health round trip, which waits
-behind everything else on the API event loop.
+PROCESS_SAMPLE_S, each server and client thread's CPU share, the /health round trip, which waits
+behind everything else on the API event loop, and the vocoder's arena counters.
 
 usage: python3 bar_overload_pair.py --a-tree MAIN --b-tree BRANCH --out DIR [--rates 60 70 80] [--seeds 0 1 2]
        [--a-arg ARG ...] [--b-arg ARG ...]
@@ -22,6 +22,7 @@ import httpx
 
 from seedtts_pair import card_cpus, client_cpus, serve, stop
 from served_baseline import MODELS, wait_healthy
+from slot_wait_serving import codec_state
 
 CLIENT_DIR = Path("/data/tts_bench_src")
 CLIENT_COMMIT = "a2d65e1"
@@ -37,6 +38,8 @@ CLIENT_WARMUP_S = 30
 # the API process's object census is taken after the measured window, so its cost lands on no measured request
 CENSUS_AFTER_WINDOW_S = 5
 PYSPY_WINDOW_S = 20
+# the vocoder's arena counters each process sample reads from /model_info: rows held now, refused acquires, fallbacks
+CODEC_FIELDS = ("slots", "active_slots", "exhausted", "left_context_fallbacks")
 
 
 def prepare_client() -> None:
@@ -124,7 +127,14 @@ def sample_processes(server: subprocess.Popen, port: int, out: Path, stop_event:
                     else:
                         pass
             health.pop("stages", None)
-            handle.write(json.dumps({"t": time.time(), "health_s": health_s, "health": health, "threads": threads}) + "\n")
+            try:
+                codec = {name: codec_state(f"http://127.0.0.1:{port}").get(name) for name in CODEC_FIELDS}
+            except (httpx.HTTPError, ValueError):
+                codec = {}
+            handle.write(
+                json.dumps({"t": time.time(), "health_s": health_s, "health": health, "codec": codec, "threads": threads})
+                + "\n"
+            )
             handle.flush()
             previous, previous_s = current, now_s
             stop_event.wait(PROCESS_SAMPLE_S)
