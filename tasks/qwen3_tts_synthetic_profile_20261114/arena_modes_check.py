@@ -9,7 +9,7 @@ Modes on 1.7B CustomVoice, one card, one after another, each serving mode sent o
 - synchronous_uncapped: async_decode false, uncapped; must serve with no arena.
 - rollback_uncapped: enable_stateful_codec_decoder false, uncapped, on the default asynchronous workers; must serve
   with no arena.
-- capped: the defaults; must serve with an arena of the in-flight cap for streams and as many for whole requests.
+- capped: the defaults; must serve with one arena of the in-flight cap that streams and whole requests share.
 
 usage: python3 arena_modes_check.py --tree TREE --card N --out DIR
 """
@@ -69,7 +69,7 @@ def stop(server: subprocess.Popen) -> None:
 
 
 def arena_lines(text: str) -> list[str]:
-    return [line.split(ARENA_LINE, 1)[1][:160] for line in text.splitlines() if ARENA_LINE in line and "stream slots" in line]
+    return [line.split(ARENA_LINE, 1)[1][:160] for line in text.splitlines() if ARENA_LINE in line and " MiB a slot" in line]
 
 
 def main() -> None:
@@ -131,7 +131,7 @@ def main() -> None:
         and served_both("rollback_uncapped")
     )
     checks["capped"] = (
-        any(line.startswith("128 stream slots and 128 for whole requests") for line in report["capped"]["arena"])
+        any(line.startswith("128 slots, 2.74 MiB a slot, 350.5 MiB total") for line in report["capped"]["arena"])
         and served_both("capped")
     )
     report["checks"] = checks
