@@ -293,7 +293,7 @@ Standard sampling parameters apply to the thinker. When `modalities` includes `"
 | `stop` | str or list | `null` | Thinker |
 | `seed` | int | `null` | Thinker |
 | `stream` | bool | `false` | Both |
-| `audio` | dict | `null` | Speech response format config, e.g. `{"format": "wav"}` |
+| `audio` | dict | `null` | Speech response format and optional preset voice, e.g. `{"format": "wav", "voice": "Chelsie"}`. Voice names come from the checkpoint and are case-insensitive. |
 | `talker_temperature` | float | `0.9` | Talker (audio output only) |
 | `talker_top_p` | float | `1.0` | Talker (audio output only) |
 | `talker_top_k` | int | `50` | Talker (audio output only) |

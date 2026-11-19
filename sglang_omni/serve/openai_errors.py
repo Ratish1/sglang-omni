@@ -9,6 +9,7 @@ from sglang_omni.admission import QueueFullError
 
 _BAD_REQUEST_MARKERS = (
     "Unsupported language:",
+    "Unsupported Qwen3-Omni audio.voice",
     "longer than the model's context length",
     "Requested token count exceeds the model's maximum context length",
     "Request has no prompt tokens",

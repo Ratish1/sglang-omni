@@ -13,13 +13,17 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from sglang_omni.client.client import Client
 from sglang_omni.models.qwen3_omni.components.code2wav_scheduler import (
     Code2WavScheduler,
 )
 from sglang_omni.models.qwen3_omni.components.streaming_detokenizer import (
     StreamingDetokenizeScheduler,
 )
-from sglang_omni.models.qwen3_omni.components.talker_prefill import TalkerPrefillBuilder
+from sglang_omni.models.qwen3_omni.components.talker_prefill import (
+    TalkerPrefillBuilder,
+    resolve_speaker_id,
+)
 from sglang_omni.models.qwen3_omni.payload_types import NO_SPEECH
 from sglang_omni.models.qwen3_omni.request_builders import (
     make_thinker_stream_output_builder,
@@ -41,6 +45,9 @@ from sglang_omni.scheduling.types import (
     SchedulerRequest,
     SpecTokensDetailsDict,
 )
+from sglang_omni.serve.openai_api import build_chat_generate_request
+from sglang_omni.serve.openai_errors import generation_error_status_code
+from sglang_omni.serve.protocol import ChatCompletionRequest
 from tests.unit_test.fixtures.prompt_hidden import cuda_prompt_hidden_store
 from tests.unit_test.fixtures.qwen_fakes import deliver_code2wav_chunk
 
@@ -239,7 +246,9 @@ def text_projected(*token_ids: int) -> torch.Tensor:
     return token_embedding_rows(torch.tensor(token_ids)) * 2.0
 
 
-def test_qwen_talker_conditions_on_streamed_token_ids():
+@pytest.mark.parametrize(("voice", "speaker_id"), [(None, 7), ("cHeLsIe", 8)])
+def test_qwen_talker_conditions_on_streamed_token_ids(voice, speaker_id):
+    """The chat preset must select the speaker embedding in the Talker prompt."""
     builder = make_thinker_stream_output_builder(
         speech_enabled=True, prompt_hidden_store=None
     )
@@ -258,7 +267,9 @@ def test_qwen_talker_conditions_on_streamed_token_ids():
         text_projection=lambda tensor: tensor * 2.0,
         hidden_projection=lambda tensor: tensor + 100.0,
         get_input_embeddings=lambda: (
-            lambda token_ids: torch.zeros((token_ids.numel(), 2))
+            lambda token_ids: token_embedding_rows(
+                torch.where(token_ids >= 7, token_ids, 0)
+            )
         ),
     )
     prefill_builder.device = torch.device("cpu")
@@ -278,7 +289,7 @@ def test_qwen_talker_conditions_on_streamed_token_ids():
     prefill_builder.codec_pad_id = 4
     prefill_builder.codec_bos_id = 5
     prefill_builder.tts_pad_token_id = 6
-    prefill_builder.speaker_map = {}
+    prefill_builder.speaker_map = {"ethan": 7, "chelsie": 8}
 
     prompt_ids = torch.tensor([10, 20, 30, 31, 10, 40, 41], dtype=torch.long)
     prefill_builder.reconstruct_prompt_states = lambda state: (
@@ -294,7 +305,17 @@ def test_qwen_talker_conditions_on_streamed_token_ids():
 
     payload = StagePayload(
         request_id="req-1",
-        request=OmniRequest(inputs=[], params={}),
+        request=Client.build_omni_request(
+            build_chat_generate_request(
+                ChatCompletionRequest.model_validate(
+                    {
+                        "messages": [{"role": "user", "content": "Say hello."}],
+                        "modalities": ["audio"],
+                        "audio": {"format": "wav", "voice": voice},
+                    }
+                )
+            )
+        ),
         data={},
     )
     prefill = prefill_builder.build_prompt_prefill(
@@ -314,6 +335,7 @@ def test_qwen_talker_conditions_on_streamed_token_ids():
             text_projected(11),
         ]
     )
+    expected_assistant_rows[6] += token_embedding_rows(torch.tensor([speaker_id]))[0]
     assert torch.equal(
         prefill["input_embeds"],
         torch.cat([expected_user_rows, expected_assistant_rows]),
@@ -335,6 +357,15 @@ def test_qwen_talker_conditions_on_streamed_token_ids():
         torch.stack(list(talker_req_data.pending_text_queue)),
         torch.cat([text_projected(12, 13, 14), tts_eos]),
     )
+
+
+@pytest.mark.parametrize("voice", ["unknown", "", 2302])
+def test_qwen_talker_rejects_an_unsupported_chat_voice(voice):
+    """An invalid explicit preset must not silently speak in the default voice."""
+    request = OmniRequest(inputs=[], metadata={"audio_config": {"voice": voice}})
+    with pytest.raises(ValueError, match="Unsupported Qwen3-Omni audio.voice") as error:
+        resolve_speaker_id(request, {"ethan": 2302})
+    assert generation_error_status_code(error.value) == 400
 
 
 def test_qwen_hidden_states_skip_only_explicit_text_output_requests():

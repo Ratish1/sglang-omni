@@ -144,8 +144,13 @@ def test_cli_accepts_separate_warmup_dataset():
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "reference_audio_field, voice_clone",
-    [(None, True), ("audio.ref_audio", True), ("audio.ref_audio", False)],
+    ("reference_audio_field", "voice_clone", "speaker"),
+    [
+        (None, True, None),
+        (None, True, "Chelsie"),
+        ("audio.ref_audio", True, "Chelsie"),
+        ("audio.ref_audio", False, None),
+    ],
 )
 async def test_speaker_reference_transport_reaches_warmup_and_measured_requests(
     monkeypatch: pytest.MonkeyPatch,
@@ -153,9 +158,11 @@ async def test_speaker_reference_transport_reaches_warmup_and_measured_requests(
     warmup_config: benchmark.OmniSeedttsBenchmarkConfig,
     reference_audio_field: str | None,
     voice_clone: bool,
+    speaker: str | None,
 ) -> None:
     warmup_config.stream = False
     warmup_config.voice_clone = voice_clone
+    warmup_config.speaker = speaker
     if reference_audio_field is not None:
         warmup_config.reference_audio_field = reference_audio_field
     reference = wav()
@@ -180,10 +187,14 @@ async def test_speaker_reference_transport_reaches_warmup_and_measured_requests(
         payload = call.kwargs["json"]
         if voice_clone and reference_audio_field is None:
             assert payload["audios"][0].endswith(".wav")
-            assert payload["audio"] == {"format": "wav"}
+            audio = {"format": "wav"}
+            if speaker is not None:
+                audio["voice"] = speaker
+            assert payload["audio"] == audio
             assert "Listen to the audio above" in payload["messages"][-1]["content"]
         elif voice_clone:
             assert "audios" not in payload
+            assert payload["audio"].keys() == {"format", "ref_audio"}
             prefix, encoded = payload["audio"]["ref_audio"].split(",", 1)
             assert prefix == "data:audio/wav;base64"
             assert base64.b64decode(encoded, validate=True) == reference

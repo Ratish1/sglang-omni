@@ -23,7 +23,7 @@ from sglang_omni.models.qwen3_omni.components.talker_input import (
 from sglang_omni.models.qwen3_omni.payload_types import Qwen3OmniPipelineState
 from sglang_omni.models.weight_loader import resolve_model_path
 from sglang_omni.pipeline.stage.stream_queue import StreamItem
-from sglang_omni.proto import StagePayload
+from sglang_omni.proto.request import OmniRequest, StagePayload
 from sglang_omni.scheduling.pending_text_queue import (
     PendingTextTensorQueue,
     coerce_pending_text_queue,
@@ -104,9 +104,23 @@ class TalkerPromptPrefill(TypedDict):
     prompt_model_inputs: dict[str, object]
 
 
-def resolve_speaker_id(
-    params: Mapping[str, object], speaker_map: dict[str, int]
-) -> int:
+def resolve_speaker_id(request: OmniRequest, speaker_map: dict[str, int]) -> int:
+    audio_config = request.metadata.get("audio_config")
+    voice = audio_config.get("voice") if isinstance(audio_config, Mapping) else None
+    if voice is not None:
+        speaker_id = speaker_map.get(voice.lower()) if isinstance(voice, str) else None
+        if speaker_id is not None:
+            return speaker_id
+        else:
+            supported = ", ".join(speaker_map)
+            raise ValueError(
+                f"Unsupported Qwen3-Omni audio.voice {voice!r}; "
+                f"expected one of: {supported}"
+            )
+    else:
+        pass
+
+    params = request.params
     speaker_name = str(params.get("speaker", "Ethan")).lower()
     if speaker_name in speaker_map:
         return speaker_map[speaker_name]
@@ -237,7 +251,7 @@ class TalkerPrefillBuilder:
         thinker_hidden = torch.cat([prompt_hidden, assistant_embed], dim=0)
 
         tts_bos_embed, tts_eos_embed, tts_pad_embed = self.get_tts_special_embeds()
-        speaker_id = resolve_speaker_id(payload.request.params, self.speaker_map)
+        speaker_id = resolve_speaker_id(payload.request, self.speaker_map)
 
         prefill = build_prefill_input(
             thinker_embed=thinker_embed,

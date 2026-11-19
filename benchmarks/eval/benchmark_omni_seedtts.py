@@ -208,7 +208,7 @@ class OmniSeedttsBenchmarkConfig:
     host: str = "localhost"
     port: int = 8000
     lang: str = "en"
-    speaker: str = "Ethan"
+    speaker: str | None = None
     voice_clone: bool = False
     reference_audio_field: ReferenceAudioField = "audios"
     stream: bool = False
@@ -248,7 +248,7 @@ class OmniSeedttsResultsConfig(TypedDict):
     reference_audio_field: ReferenceAudioField
     stream: bool
     lang: str
-    speaker: str
+    speaker: str | None
     max_samples: int | None
     max_new_tokens: int
     temperature: float
@@ -323,7 +323,7 @@ def make_send_fn(
     *,
     lang: str,
     voice_clone: bool,
-    speaker: str,
+    speaker: str | None,
     max_tokens: int,
     temperature: float,
     seed: int | None,
@@ -731,9 +731,8 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--speaker",
         type=str,
-        default="Ethan",
         choices=["Ethan", "Chelsie", "Aiden"],
-        help="Qwen3-Omni speaker voice; MiniCPM-o ignores it and clones the reference.",
+        help="Qwen3-Omni speaker preset (default: use the server's preset).",
     )
     # Voice-clone toggle: ``--voice-clone`` and ``--no-ref-audio`` are
     # complementary flags.  They map to a single ``voice_clone`` bool with the

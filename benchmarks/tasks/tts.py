@@ -851,7 +851,7 @@ class VoiceCloneOmni:
         model_name: str,
         sample: SampleInput,
         lang: str,
-        speaker: str = "Ethan",
+        speaker: str | None = None,
         max_tokens: int | None = None,
         temperature: float = 0.7,
         seed: int | None = None,
@@ -902,6 +902,10 @@ class VoiceCloneOmni:
             "temperature": temperature,
             "stream": stream,
         }
+        if speaker is not None and reference_audio_field == "audios":
+            payload["audio"]["voice"] = speaker
+        else:
+            pass
         if seed is not None:
             payload["seed"] = seed
         if talker_params:
@@ -1008,7 +1012,7 @@ class VoiceCloneOmni:
         lang: str,
         asr_device: str,
         audio_dir: str,
-        speaker: str = "Ethan",
+        speaker: str | None = None,
         max_tokens: int | None = None,
         voice_clone: bool = False,
         stream: bool = False,
