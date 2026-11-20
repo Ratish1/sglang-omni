@@ -863,6 +863,7 @@ class VoiceCloneOmni:
         reference_audio_field: ReferenceAudioField = "audios",
         reference_audio_data: str | None = None,
         talker_params: TalkerSamplingParams | None = None,
+        response_id_out: list[str] | None = None,
     ) -> tuple[bytes, float, dict]:
         if max_tokens is None:
             max_tokens = self.THINKER_MAX_NEW_TOKENS
@@ -936,6 +937,10 @@ class VoiceCloneOmni:
                 return wav_bytes, latency, usage
             resp_json = await response.json()
         latency = time.perf_counter() - t0
+        if response_id_out is not None:
+            response_id_out.append(resp_json["id"])
+        else:
+            pass
 
         choices = resp_json.get("choices", [])
         if not choices:

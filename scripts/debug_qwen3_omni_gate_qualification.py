@@ -15,6 +15,7 @@ import psutil
 from benchmarks.benchmarker.utils import start_server_from_cmd, stop_server
 from benchmarks.dataset.mmsu import load_mmsu_samples
 from benchmarks.dataset.prepare import DATASETS
+from benchmarks.eval.asr_profiling import start_request_profile, stop_request_profile
 from benchmarks.eval.benchmark_omni_mmsu import run as run_mmsu
 from benchmarks.tasks.asr import (
     QWEN3_ASR_MODEL_PATH,
@@ -70,6 +71,7 @@ def main() -> None:
     parser.add_argument("--prefill-gate-controls", action="store_true")
     parser.add_argument("--profile-prefill-samples", type=int)
     parser.add_argument("--seedtts-speed-only", action="store_true")
+    parser.add_argument("--seedtts-request-profile", action="store_true")
     parser.add_argument("--paired-stock-prefix-directory", type=Path)
     parser.add_argument("--paired-gate-kv", action="store_true")
     arguments = parser.parse_args()
@@ -81,8 +83,12 @@ def main() -> None:
         or set(arguments.arms) != {"baseline", "prefill-gate"}
     ):
         parser.error(
-            "Speed-only repeats require stock and prefill gate without profiling"
+            "SeedTTS-only repeats require stock and prefill gate without CUDA events"
         )
+    else:
+        pass
+    if arguments.seedtts_request_profile and not arguments.seedtts_speed_only:
+        parser.error("Request profiling requires --seedtts-speed-only")
     else:
         pass
     if arguments.profile_prefill_samples is not None and (
@@ -363,22 +369,31 @@ def generate(arguments: argparse.Namespace, run_directories: list[Path]) -> None
                 continue
             else:
                 pass
-            subprocess.run(
-                [
-                    *seedtts_command(),
-                    "--port",
-                    str(server_port),
-                    "--output-dir",
-                    str(run_directory / "seedtts"),
-                    "--generate-only",
-                    *(
-                        ["--max-samples", str(arguments.profile_prefill_samples)]
-                        if arguments.profile_prefill_samples is not None
-                        else []
-                    ),
-                ],
-                check=True,
-            )
+            command = [
+                *seedtts_command(),
+                "--port",
+                str(server_port),
+                "--output-dir",
+                str(run_directory / "seedtts"),
+                "--generate-only",
+            ]
+            if arguments.profile_prefill_samples is not None:
+                command.extend(
+                    ["--max-samples", str(arguments.profile_prefill_samples)]
+                )
+            else:
+                pass
+            if arguments.seedtts_request_profile:
+                base_url = f"http://127.0.0.1:{server_port}"
+                start_request_profile(
+                    base_url, run_directory.name, str(run_directory / "events")
+                )
+                try:
+                    subprocess.run([*command, "--record-response-ids"], check=True)
+                finally:
+                    stop_request_profile(base_url, run_directory.name)
+            else:
+                subprocess.run(command, check=True)
             seedtts_records = json.loads(
                 (run_directory / "seedtts" / "generated.json").read_bytes()
             )
@@ -396,6 +411,11 @@ def generate(arguments: argparse.Namespace, run_directories: list[Path]) -> None
                     assert (run_directory / "prefill-timing.jsonl").stat().st_size > 0
                     print(
                         f"{run_directory.name}: native prefill profile complete",
+                        flush=True,
+                    )
+                elif arguments.seedtts_request_profile:
+                    print(
+                        f"{run_directory.name}: SeedTTS request profile complete",
                         flush=True,
                     )
                 else:

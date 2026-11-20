@@ -238,6 +238,7 @@ class OmniSeedttsBenchmarkConfig:
     # were not fine-tuned to robustly interpret "please read aloud" as a
     # verbatim-TTS command (e.g. Ming-Omni).
     system_prompt: str | None = None
+    record_response_ids: bool = False
 
 
 class OmniSeedttsResultsConfig(TypedDict):
@@ -333,6 +334,7 @@ def make_send_fn(
     save_audio_dir: str,
     system_prompt: str | None = None,
     reference_audio_field: ReferenceAudioField = "audios",
+    response_ids: dict[str, str] | None = None,
 ) -> SendFn:
     """Return a SendFn that calls the Omni chat API and saves WAV."""
     task = VoiceCloneOmni()
@@ -346,6 +348,7 @@ def make_send_fn(
         )
         chunk_times: list[float] = []
         text_first_time_holder: list[float] = []
+        response_id_out: list[str] | None = [] if response_ids is not None else None
         start_time = time.perf_counter()
         try:
             wav_bytes, _, usage = await task.generate_speech(
@@ -366,7 +369,13 @@ def make_send_fn(
                 reference_audio_data=reference_audio_data.get(sample.ref_audio),
                 chunk_times_out=chunk_times if stream else None,
                 text_first_time_holder=text_first_time_holder if stream else None,
+                response_id_out=response_id_out,
             )
+            if response_ids is not None and response_id_out:
+                # Measured sends follow warmup and replace any entry for that sample.
+                response_ids[sample.sample_id] = response_id_out[0]
+            else:
+                pass
             result.audio_duration_s = get_wav_duration(wav_bytes)
             elapsed = time.perf_counter() - start_time
             if result.audio_duration_s > 0:
@@ -557,7 +566,14 @@ async def run_omni_seedtts_benchmark(
             disable_tqdm=config.disable_tqdm,
         )
     )
-    outputs = await runner.run(samples, build_send_fn(save_audio_dir=save_audio_dir))
+    response_ids: dict[str, str] | None = {} if config.record_response_ids else None
+    outputs = await runner.run(
+        samples, build_send_fn(save_audio_dir=save_audio_dir, response_ids=response_ids)
+    )
+    if response_ids is not None:
+        save_json_results(response_ids, config.output_dir, "response_ids.json")
+    else:
+        pass
     warn_if_tail_percentile_is_thin(len(outputs))
 
     metrics = compute_speed_metrics(outputs, wall_clock_s=runner.wall_clock_s)
@@ -633,6 +649,7 @@ def _config_from_args(args: argparse.Namespace) -> OmniSeedttsBenchmarkConfig:
         asr_concurrency=args.asr_concurrency,
         similarity_checkpoint=args.similarity_checkpoint,
         system_prompt=args.system_prompt,
+        record_response_ids=args.record_response_ids,
     )
 
 
@@ -760,6 +777,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         help="Reference transport: audios for Qwen3-Omni, audio.ref_audio for MiniCPM-o.",
     )
     parser.add_argument("--output-dir", type=str, default="results/omni_seedtts")
+    parser.add_argument("--record-response-ids", action="store_true")
     parser.add_argument("--max-samples", type=int, default=None)
     parser.add_argument("--max-new-tokens", type=int, default=256)
     parser.add_argument("--temperature", type=float, default=0.7)
@@ -961,6 +979,12 @@ def main() -> None:
         return
 
     is_sweep = args.concurrencies is not None or args.repeats > 1
+    if args.record_response_ids and (
+        config.stream or not args.generate_only or is_sweep
+    ):
+        parser.error("--record-response-ids requires a non-streaming generation pass")
+    else:
+        pass
     if is_sweep and not args.generate_only:
         parser.error("--concurrencies and --repeats require --generate-only")
 
