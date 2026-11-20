@@ -205,6 +205,7 @@ def run_rounding_witnesses(
                                 "client_concurrency": request_count,
                                 "comparison": name,
                                 "active_rows": paired["active_rows"],
+                                "captured_rows": paired["captured_rows"],
                                 "row_index": paired["row_index"],
                                 "batch_request_ids": paired["batch_request_ids"],
                                 "reference_codes": reference_codes.tolist(),

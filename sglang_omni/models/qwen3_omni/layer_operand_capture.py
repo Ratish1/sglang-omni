@@ -38,11 +38,21 @@ class LayerOperandRecorder:
         else:
             self.current_snapshot[name] = tensor.clone()
 
-    def read(self, expected_step: int, row_index: int) -> dict[str, torch.Tensor]:
+    def read(
+        self,
+        expected_step: int,
+        row_index: int,
+        *,
+        captured_rows: int | None = None,
+    ) -> dict[str, torch.Tensor]:
         snapshots = [
             snapshot
             for snapshot in (self.eager_snapshot, *self.graph_snapshots)
-            if snapshot and int(snapshot["step"]) == expected_step
+            if snapshot
+            and (
+                captured_rows is None or snapshot["positions"].size(0) == captured_rows
+            )
+            and int(snapshot["step"]) == expected_step
         ]
         assert len(snapshots) == 1, (expected_step, len(snapshots))
         return {

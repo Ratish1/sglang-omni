@@ -477,9 +477,10 @@ class QwenTalkerModelRunner(ModelRunner["SGLangARRequestData"]):
                     }
                 )
                 step = int(self.model.backbone_recorders[0].step_counter)
+                captured_rows = model_runner.decode_cuda_graph_runner.bs
                 layer_trials.append(
                     [
-                        recorder.read(step, row_index)
+                        recorder.read(step, row_index, captured_rows=captured_rows)
                         for recorder in self.model.backbone_recorders
                     ]
                 )
@@ -496,6 +497,7 @@ class QwenTalkerModelRunner(ModelRunner["SGLangARRequestData"]):
                     ],
                     "row_index": row_index,
                     "active_rows": len(requests),
+                    "captured_rows": captured_rows,
                     "reference_logits": first["logits"][row_index],
                     "alternative_logits": alternative["logits"][row_index],
                     "reference_codes": first["codes"][row_index],
