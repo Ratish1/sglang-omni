@@ -8,7 +8,9 @@ import base64
 import hashlib
 import json
 import sys
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from threading import Barrier
 
 import httpx
 import torch
@@ -19,7 +21,7 @@ from benchmarks.benchmarker.utils import (
     stop_server,
 )
 from benchmarks.dataset.prepare import DATASETS
-from benchmarks.dataset.seedtts import load_seedtts_samples
+from benchmarks.dataset.seedtts import SampleInput, load_seedtts_samples
 from benchmarks.metrics.wer import SampleOutput
 from benchmarks.tasks.asr import (
     QWEN3_ASR_MODEL_PATH,
@@ -38,6 +40,39 @@ MODERATE_CASE_COUNT = 8
 CLEAN_CASE_COUNT = 9
 HELD_SAMPLE_ID = "common_voice_en_19690002-common_voice_en_19690001"
 HELD_AUDIO_SHA256 = "b3180f36dadd42f6381c106b0538b842a1fb38f684e44c8a5674f9f1b87e247c"
+NATIVE_AUDIT_CLIENT_CONCURRENCY = 16
+
+
+def post_seedtts_sample(
+    client: httpx.Client,
+    endpoint: str,
+    sample: SampleInput,
+    request_id: str,
+    start_barrier: Barrier | None = None,
+) -> httpx.Response:
+    prompt = (
+        f'Listen to the audio above. The speaker is reading: "{sample.ref_text}". '
+        f"Now please read the following text out loud in the same voice and style: "
+        f"{sample.target_text}"
+    )
+    if start_barrier is not None:
+        start_barrier.wait(timeout=REQUEST_TIMEOUT_SECONDS)
+    else:
+        pass
+    return client.post(
+        endpoint,
+        json={
+            "model": "qwen3-omni",
+            "request_id": request_id,
+            "messages": [{"role": "user", "content": prompt}],
+            "modalities": ["text", "audio"],
+            "audio": {"format": "wav"},
+            "max_tokens": 256,
+            "temperature": 0.7,
+            "stream": False,
+            "audios": [sample.ref_audio],
+        },
+    )
 
 
 def select_cases(
@@ -249,6 +284,12 @@ def compare_pair(
 def audit_first_decode_attention(
     trace_directory: Path,
 ) -> dict[str, bool | int | float]:
+    thinker_publish = torch.load(
+        trace_directory / "thinker-publish-000.pt", weights_only=True
+    )
+    talker_prompt = torch.load(
+        trace_directory / "talker-prompt-000.pt", weights_only=True
+    )
     addresses = torch.load(
         trace_directory / "first-decode-addresses-000.pt", weights_only=True
     )
@@ -301,6 +342,8 @@ def audit_first_decode_attention(
     return {
         "cache_length": cache_length,
         "page_size": page_size,
+        "native_decode_batch_size": addresses.get("native_decode_batch_size", 1),
+        "native_decode_row_index": addresses.get("native_decode_row_index", 0),
         "captured_request_matches_scheduler": torch.equal(
             first_layer["attention_request_indices"], addresses["request_pool_index"]
         ),
@@ -318,6 +361,10 @@ def audit_first_decode_attention(
         == int(operands["position"]) + 1,
         "layer_input_matches_projected_text_and_feedback": torch.equal(
             combined_input, first_layer["input_contribution"]
+        ),
+        "thinker_handoff_matches_talker": all(
+            torch.equal(thinker_publish[field], talker_prompt[field])
+            for field in ("media_positions", "media_hidden_states")
         ),
         "attention_context_exact_after_rounding": torch.equal(
             actual_context, expected_context.to(actual_context)
@@ -339,6 +386,8 @@ def compare_native_prefill(
 ) -> dict[str, bool | int | float | list[int] | None]:
     comparison: dict[str, bool | int | float | list[int] | None] = {}
     for boundary in (
+        "thinker-publish-000.pt",
+        "talker-prompt-000.pt",
         "backbone-prefill-000.pt",
         "prefill-sampling-000.pt",
         "codec-000.pt",
@@ -349,6 +398,10 @@ def compare_native_prefill(
         eager = torch.load(eager_trace / boundary, weights_only=True)
         assert breakable.keys() == eager.keys()
         for name, value in breakable.items():
+            if name == "request_pool_index":
+                continue
+            else:
+                pass
             equivalent = (
                 value.dtype == eager[name].dtype and torch.equal(value, eager[name])
                 if isinstance(value, torch.Tensor)
@@ -384,6 +437,7 @@ def main() -> None:
     parser.add_argument("--exclude-frozen-transfer-control", action="store_true")
     parser.add_argument("--native-kv-audit", action="store_true")
     parser.add_argument("--eager-talker-prefill-reference", type=Path)
+    parser.add_argument("--batched-native-reference", type=Path)
     parser.add_argument("--score-existing", action="store_true")
     arguments = parser.parse_args()
     output = arguments.output.resolve()
@@ -396,12 +450,25 @@ def main() -> None:
     cases = select_cases(arguments.h200_history, arguments.h100_history)
     donor_population = arguments.transfer_from
     prefill_reference = arguments.eager_talker_prefill_reference
-    assert prefill_reference is None or arguments.native_kv_audit
+    batched_reference = arguments.batched_native_reference
+    assert prefill_reference is None or batched_reference is None
+    native_reference = prefill_reference or batched_reference
+    assert native_reference is None or arguments.native_kv_audit
     donor_rows = {}
     if arguments.native_kv_audit:
         assert donor_population is None and not arguments.score_existing
-        scopes = ("plain", "observe") if prefill_reference is None else ("observe",)
+        scopes = ("plain", "observe") if native_reference is None else ("observe",)
         cases = [case for case in cases if case["sample_id"] != HELD_SAMPLE_ID]
+        if batched_reference is not None:
+            cases = [
+                case
+                for case in cases
+                if case["cohort"] == "historic_severe"
+                or case["sample_id"]
+                == "common_voice_en_19401124-common_voice_en_19401123"
+            ]
+        else:
+            pass
     elif donor_population is None:
         scopes = ("none", "first", "decode")
     else:
@@ -448,6 +515,10 @@ def main() -> None:
         samples = load_seedtts_samples(DATASETS["seedtts"])
         assert len(samples) == EXPECTED_SEEDTTS_SAMPLES
         samples_by_id = {sample.sample_id: sample for sample in samples}
+        witness_ids = {case["sample_id"] for case in cases}
+        peer_samples = [
+            sample for sample in samples if sample.sample_id not in witness_ids
+        ][: NATIVE_AUDIT_CLIENT_CONCURRENCY - 1]
     control_path = output / "control.json"
     for scope in () if arguments.score_existing else scopes:
         control_path.write_text('{"request_id": ""}\n')
@@ -493,6 +564,7 @@ def main() -> None:
             strip_proxy=True,
         )
         try:
+            endpoint = f"http://127.0.0.1:{talker_port}/v1/chat/completions"
             with httpx.Client(
                 trust_env=False, timeout=REQUEST_TIMEOUT_SECONDS
             ) as client:
@@ -509,22 +581,6 @@ def main() -> None:
                     case_directory = output / f'{case["cohort"]}-{case["sample_id"]}'
                     arm_directory = case_directory / scope
                     arm_directory.mkdir(parents=True)
-                    prompt = (
-                        f'Listen to the audio above. The speaker is reading: "{sample.ref_text}". '
-                        f"Now please read the following text out loud in the same voice and style: "
-                        f"{sample.target_text}"
-                    )
-                    payload = {
-                        "model": "qwen3-omni",
-                        "request_id": case["request_id"],
-                        "messages": [{"role": "user", "content": prompt}],
-                        "modalities": ["text", "audio"],
-                        "audio": {"format": "wav"},
-                        "max_tokens": 256,
-                        "temperature": 0.7,
-                        "stream": False,
-                        "audios": [sample.ref_audio],
-                    }
                     control: WitnessControl = {
                         "request_id": case["request_id"],
                         "output_directory": str(arm_directory),
@@ -566,10 +622,36 @@ def main() -> None:
                     next_control = control_path.with_suffix(".next")
                     next_control.write_text(json.dumps(control))
                     next_control.replace(control_path)
-                    response = client.post(
-                        f"http://127.0.0.1:{talker_port}/v1/chat/completions",
-                        json=payload,
-                    )
+                    if batched_reference is None:
+                        response = post_seedtts_sample(
+                            client, endpoint, sample, case["request_id"]
+                        )
+                    else:
+                        start_barrier = Barrier(NATIVE_AUDIT_CLIENT_CONCURRENCY)
+                        assert len(peer_samples) == NATIVE_AUDIT_CLIENT_CONCURRENCY - 1
+                        with ThreadPoolExecutor(
+                            NATIVE_AUDIT_CLIENT_CONCURRENCY
+                        ) as workers:
+                            peer_responses = [
+                                workers.submit(
+                                    post_seedtts_sample,
+                                    client,
+                                    endpoint,
+                                    peer_sample,
+                                    f"audit-peer-{index}-{peer_index}",
+                                    start_barrier,
+                                )
+                                for peer_index, peer_sample in enumerate(peer_samples)
+                            ]
+                            response = post_seedtts_sample(
+                                client,
+                                endpoint,
+                                sample,
+                                case["request_id"],
+                                start_barrier,
+                            )
+                            for peer_response in peer_responses:
+                                peer_response.result().raise_for_status()
                     arm = {
                         "http_status": response.status_code,
                         "input_sha256": input_sha256,
@@ -612,11 +694,11 @@ def main() -> None:
         assert len({arm["input_sha256"] for arm in arms.values()}) == 1
         if arguments.native_kv_audit:
             assert all(arm["http_status"] == 200 for arm in arms.values())
-            if prefill_reference is None:
+            if native_reference is None:
                 reference_arm = arms["plain"]
                 prefill_comparison = {}
             else:
-                reference_trace = prefill_reference / case_directory.name / "observe"
+                reference_trace = native_reference / case_directory.name / "observe"
                 reference_arm = json.loads(
                     (reference_trace / "response.json").read_bytes()
                 )

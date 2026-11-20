@@ -102,20 +102,23 @@ class QwenTalkerModelRunner(ModelRunner["SGLangARRequestData"]):
                 input_embeds_are_projected=input_embeds_are_projected,
             ),
         )
-        for request in requests:
+        for row_index, request in enumerate(requests):
             if is_witness(request.request_id):
-                assert len(requests) == 1 and input_embeds_are_projected
-                assert forward_batch.extend_prefix_lens_cpu == [0]
+                assert input_embeds_are_projected
+                assert forward_batch.extend_prefix_lens_cpu[row_index] == 0
+                sequence_lengths = forward_batch.extend_seq_lens_cpu
+                start_token = sum(sequence_lengths[:row_index])
+                end_token = start_token + sequence_lengths[row_index]
                 parameters = request.data.req.sampling_params
                 record_boundary(
                     request.request_id,
                     "backbone-prefill",
                     {
-                        "input_ids": forward_batch.input_ids,
-                        "embeddings": input_embeds,
-                        "positions": forward_batch.positions,
+                        "input_ids": forward_batch.input_ids[start_token:end_token],
+                        "embeddings": input_embeds[start_token:end_token],
+                        "positions": forward_batch.positions[start_token:end_token],
                         "rotary_positions": (
-                            forward_batch.mrope_positions
+                            forward_batch.mrope_positions[:, start_token:end_token]
                             if self.model.uses_mrope
                             else None
                         ),
@@ -204,6 +207,8 @@ class QwenTalkerModelRunner(ModelRunner["SGLangARRequestData"]):
                                 "scheduler_cache_length": forward_batch.seq_lens[
                                     row_index
                                 ],
+                                "native_decode_batch_size": len(requests),
+                                "native_decode_row_index": row_index,
                                 "prefill_graph_replays": (
                                     self.tp_worker.prefill_cuda_graph_usage.replay_count
                                 ),
@@ -246,7 +251,11 @@ class QwenTalkerModelRunner(ModelRunner["SGLangARRequestData"]):
                 pass
             frame_index = request.data.codec_frames_seen
             held_directory = control["held_input_directory"]
-            assert len(requests) == 1 and forward_batch is not None
+            assert forward_batch is not None
+            assert (
+                self.model.backbone_recorders[0].capture_attention_geometry
+                or len(requests) == 1
+            )
             if held_directory is not None and frame_index == 1:
                 self.install_held_first_decode_inputs(
                     forward_batch, row_index, request, Path(held_directory)
