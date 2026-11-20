@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# 11-20, node-0000, both H200s: the #3452 rework (vlane 6a5aa0f6b) against main (4be177591) as same-time pairs. One
+# 11-20, node-0000, both H200s: the #3452 rework (vlane 6e3061f30) against main (4be177591) as same-time pairs. One
 # instance per card, each pinned to its own socket (card 0 CPUs 0-55,112-167, card 1 CPUs 56-111,168-223; sysfs puts
 # both cards on NUMA 0, so card 1's server keeps its socket), arm orders opposite, so every round runs main on one card
 # and the rework on the other, and the next round swaps them. Each round starts when both cards finished the last.
@@ -61,7 +61,7 @@ mixed() {
   wait $looper
 }
 
-until grep -q "q1120_cpu2 done" /data/v1120/queue.log; do sleep 30; done
+until grep -q "q1120_cpu3 done" /data/v1120/queue.log; do sleep 30; done
 log "q1120_gpu start order $ORDER cpus $CPUS"
 round=0
 for cell in oc sv cv; do
