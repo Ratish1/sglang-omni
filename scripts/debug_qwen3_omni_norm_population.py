@@ -445,6 +445,7 @@ def main() -> None:
     parser.add_argument("--native-kv-audit", action="store_true")
     parser.add_argument("--eager-talker-prefill-reference", type=Path)
     parser.add_argument("--batched-native-reference", type=Path)
+    parser.add_argument("--exact-talker-prefill-reference", type=Path)
     parser.add_argument("--prefill-token-probe", action="store_true")
     parser.add_argument("--audit-existing", action="store_true")
     parser.add_argument("--score-existing", action="store_true")
@@ -462,8 +463,19 @@ def main() -> None:
     donor_population = arguments.transfer_from
     prefill_reference = arguments.eager_talker_prefill_reference
     batched_reference = arguments.batched_native_reference
-    assert prefill_reference is None or batched_reference is None
-    native_reference = prefill_reference or batched_reference
+    exact_prefill_reference = arguments.exact_talker_prefill_reference
+    assert (
+        sum(
+            reference is not None
+            for reference in (
+                prefill_reference,
+                batched_reference,
+                exact_prefill_reference,
+            )
+        )
+        <= 1
+    )
+    native_reference = prefill_reference or batched_reference or exact_prefill_reference
     assert native_reference is None or arguments.native_kv_audit
     donor_rows = {}
     if arguments.native_kv_audit:
@@ -477,6 +489,14 @@ def main() -> None:
                 if case["cohort"] == "historic_severe"
                 or case["sample_id"]
                 == "common_voice_en_19401124-common_voice_en_19401123"
+            ]
+        else:
+            pass
+        if exact_prefill_reference is not None:
+            cases = [
+                case
+                for case in cases
+                if case["sample_id"] in PREFILL_PROBE_TOKEN_BY_SAMPLE
             ]
         else:
             pass
@@ -564,6 +584,11 @@ def main() -> None:
                 *(
                     ["--talker_ar.engine.cuda_graph_backend_prefill", "disabled"]
                     if prefill_reference is not None or scope == "eager"
+                    else []
+                ),
+                *(
+                    ["--talker_ar.engine.cuda_graph_bs_prefill", "[134,151]"]
+                    if exact_prefill_reference is not None
                     else []
                 ),
             ],
