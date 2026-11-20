@@ -18,6 +18,7 @@ class WitnessControl(TypedDict):
     held_input_directory: str | None
     codec_override_file: NotRequired[str]
     codec_override_frame: NotRequired[int]
+    kv_override_file: NotRequired[str]
 
 
 def witness_control(request_id: str) -> WitnessControl | None:

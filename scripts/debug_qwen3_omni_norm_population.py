@@ -256,6 +256,9 @@ def main() -> None:
     parser.add_argument("--held-input", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--transfer-from", type=Path)
+    parser.add_argument(
+        "--transfer-state", choices=("codec", "kv", "both"), default="codec"
+    )
     parser.add_argument("--score-existing", action="store_true")
     arguments = parser.parse_args()
     output = arguments.output.resolve()
@@ -389,12 +392,22 @@ def main() -> None:
                             "first_changed_codec_frame"
                         ]
                         control["codec_override_frame"] = frame_index
-                        control["codec_override_file"] = str(
-                            donor_population
-                            / donor_row["directory"]
-                            / donor_scope
-                            / f"codec-{frame_index:03d}.pt"
+                        donor_directory = (
+                            donor_population / donor_row["directory"] / donor_scope
                         )
+                        if arguments.transfer_state != "kv":
+                            control["codec_override_file"] = str(
+                                donor_directory / f"codec-{frame_index:03d}.pt"
+                            )
+                        else:
+                            pass
+                        if arguments.transfer_state != "codec":
+                            assert frame_index == 1
+                            control["kv_override_file"] = str(
+                                donor_directory / "first-decode-layers.pt"
+                            )
+                        else:
+                            pass
                     else:
                         pass
                     next_control = control_path.with_suffix(".next")
@@ -466,12 +479,20 @@ def main() -> None:
                 replay_frames, replay_text, replay_complete = controlled_history(
                     case_directory / scope
                 )
-                assert (
-                    case_directory / scope / f"codec-override-{frame_index:03d}.pt"
-                ).is_file()
-                assert torch.equal(
-                    replay_frames[frame_index], donor_frames[frame_index]
-                )
+                if arguments.transfer_state != "kv":
+                    assert (
+                        case_directory / scope / f"codec-override-{frame_index:03d}.pt"
+                    ).is_file()
+                    expected_frame = donor_frames[frame_index]
+                else:
+                    expected_frame = recipient_frames[frame_index]
+                if arguments.transfer_state != "codec":
+                    assert (
+                        case_directory / scope / f"kv-override-{frame_index:03d}.pt"
+                    ).is_file()
+                else:
+                    pass
+                assert torch.equal(replay_frames[frame_index], expected_frame)
                 sampling_name = f"decode-sampling-{frame_index:03d}.pt"
                 recipient_sampling = torch.load(
                     reference_directory / recipient_scope / sampling_name,
@@ -483,6 +504,15 @@ def main() -> None:
                 assert recipient_sampling.keys() == replay_sampling.keys()
                 pairs[scope] = {
                     "overridden_frame": frame_index,
+                    "transferred_state": arguments.transfer_state,
+                    "complete_donor_codec_history_equal": len(replay_frames)
+                    == len(donor_frames)
+                    and all(
+                        torch.equal(left, right)
+                        for left, right in zip(replay_frames, donor_frames)
+                    ),
+                    "waveform_matches_donor": arms[scope].get("waveform_sha256")
+                    == donor_row["arms"][donor_scope]["waveform_sha256"],
                     "preintervention_sampling_exact": all(
                         torch.equal(value, replay_sampling[name])
                         for name, value in recipient_sampling.items()

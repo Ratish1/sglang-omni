@@ -365,6 +365,7 @@ class QwenTalkerModelRunner(ModelRunner["SGLangARRequestData"]):
         result.next_token_ids = self.model.sampled_token_ids[:batch_size].clone()
         for row_index, request in enumerate(requests):
             control = witness_control(request.request_id)
+            snapshots = None
             if control is not None:
                 assert forward_batch is not None
                 record_boundary(
@@ -407,9 +408,50 @@ class QwenTalkerModelRunner(ModelRunner["SGLangARRequestData"]):
                     pass
             else:
                 pass
-            if control is not None and request.data.codec_frames_seen == control.get(
-                "codec_override_frame"
-            ):
+            is_override_step = (
+                control is not None
+                and request.data.codec_frames_seen
+                == control.get("codec_override_frame")
+            )
+            if is_override_step and "kv_override_file" in control:
+                assert snapshots is not None and forward_batch is not None
+                model_runner = self.tp_worker.model_runner
+                position = int(forward_batch.positions[row_index])
+                slot = forward_batch.out_cache_loc[row_index : row_index + 1].long()
+                mapped_slot = model_runner.req_to_token_pool.req_to_token[
+                    forward_batch.req_pool_indices[row_index], position
+                ]
+                assert torch.equal(slot.reshape(()), mapped_slot.long())
+                pool = model_runner.token_to_kv_pool
+                assert isinstance(pool, MHATokenToKVPool)
+                donor_layers = torch.load(
+                    control["kv_override_file"], map_location="cpu", weights_only=True
+                )
+                for buffers, name in (
+                    (pool.k_buffer, "key_rope"),
+                    (pool.v_buffer, "value"),
+                ):
+                    for buffer, emitted, donor in zip(
+                        buffers, snapshots, donor_layers, strict=True
+                    ):
+                        native_rows = buffer.index_select(0, slot)
+                        assert torch.equal(
+                            native_rows.cpu().reshape(-1), emitted[name].reshape(-1)
+                        )
+                        donor_rows = (
+                            donor[name].to(buffer.device).reshape_as(native_rows)
+                        )
+                        assert donor_rows.dtype == buffer.dtype
+                        buffer.index_copy_(0, slot, donor_rows)
+                record_boundary(
+                    request.request_id,
+                    "kv-override",
+                    {"position": position},
+                    frame_index=request.data.codec_frames_seen,
+                )
+            else:
+                pass
+            if is_override_step and "codec_override_file" in control:
                 donor = torch.load(
                     control["codec_override_file"],
                     map_location=result.next_token_ids.device,
