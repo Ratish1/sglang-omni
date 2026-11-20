@@ -16,7 +16,7 @@ from sglang.srt.environ import envs
 from sglang.srt.layers.activation import silu_and_mul
 from sglang.srt.layers.moe.topk import fused_topk
 from sglang.srt.layers.rotary_embedding import get_rope
-from torch.nn.functional import linear
+from torch.nn.functional import linear, silu
 
 from scripts.debug_qwen3_omni_peer_shape import read_weights
 
@@ -119,6 +119,59 @@ def routed_experts(
         use_fused_finalize=envs.SGLANG_FLASHINFER_MOE_FUSED_FINALIZE.get(),
         profile_ids=tactics,
     )[0]
+
+
+def compare_activation_store(
+    inputs: torch.Tensor,
+    ids: torch.Tensor,
+    weights: torch.Tensor,
+    fc1: torch.Tensor,
+    fc2: torch.Tensor,
+    target: slice,
+    tactics: list[list[int]],
+) -> None:
+    # Identity in FC2 exposes the stored SwiGLU activation. A one-hot route
+    # scale chooses the row's real first expert without changing top-k shape.
+    expert_width = fc2.shape[-1]
+    identity_fc2 = torch.zeros_like(fc2)
+    identity_fc2[:, :expert_width, :] = torch.eye(
+        expert_width, dtype=fc2.dtype, device=fc2.device
+    )
+    scales = torch.zeros_like(weights)
+    scales[:, 0] = 1
+    source = inputs[target].double()
+    selected = ids[target, 0]
+    fp64 = source.new_empty((source.shape[0], 2 * expert_width))
+    for expert in selected.unique().tolist():
+        mask = selected == expert
+        fp64[mask] = linear(source[mask], fc1[expert].double())
+    up, gate = fp64.chunk(2, dim=-1)
+    stored_up, stored_gate = fp64.to(inputs.dtype).double().chunk(2, dim=-1)
+    references = {
+        "full_fc1": (silu(gate) * up).to(inputs.dtype),
+        "bfloat16_fc1": (silu(stored_gate) * stored_up).to(inputs.dtype),
+    }
+    for pair in tactics:
+        observed = routed_experts(inputs, ids, scales, fc1, identity_fc2, pair)[
+            target, :expert_width
+        ]
+        print(
+            json.dumps(
+                {
+                    "activation_store_tactics": pair,
+                    "elements": observed.numel(),
+                    "different_elements": {
+                        name: int((observed != reference).count_nonzero())
+                        for name, reference in references.items()
+                    },
+                    "maximum_absolute_difference": {
+                        name: float((observed.float() - reference.float()).abs().max())
+                        for name, reference in references.items()
+                    },
+                }
+            ),
+            flush=True,
+        )
 
 
 @torch.inference_mode()
@@ -252,6 +305,18 @@ def main() -> None:
             pass
         if args.gemm1_tactics and physical_count in (1536, 1792):
             assert args.gemm2_tactic is not None
+            if physical_count == 1792:
+                compare_activation_store(
+                    ffn_input,
+                    ids,
+                    weights,
+                    packed_fc1,
+                    packed_fc2,
+                    target,
+                    [[gemm1, args.gemm2_tactic] for gemm1 in args.gemm1_tactics],
+                )
+            else:
+                pass
             for gemm1 in args.gemm1_tactics:
                 tactics = [gemm1, args.gemm2_tactic]
                 kernel_args = (ffn_input, ids, weights, packed_fc1, packed_fc2, tactics)
