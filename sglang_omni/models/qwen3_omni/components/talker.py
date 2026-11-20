@@ -946,6 +946,14 @@ class Qwen3OmniTalker(nn.Module):
             quant_config=quant_config,
             prefix=add_prefix("code_predictor", prefix),
         )
+        self.witness_residual_head_output: str = os.environ.get(
+            "OMNI_WITNESS_RESIDUAL_HEAD_OUTPUT", "native"
+        )
+        if self.witness_residual_head_output != "native":
+            assert self.witness_residual_head_output in ("rounded", "wide")
+            assert quant_config is None and current_platform.is_cuda()
+        else:
+            pass
 
         device = self.model.codec_embedding.weight.device
         self.witness_fixed_gate_switch: torch.Tensor | None = None
@@ -1903,7 +1911,26 @@ class Qwen3OmniTalker(nn.Module):
             cache_len += 2
 
             for layer_idx in range(num_groups - 1):
-                logits, _ = self.code_predictor.lm_head[layer_idx](last_hidden)
+                residual_head = self.code_predictor.lm_head[layer_idx]
+                if self.witness_residual_head_output == "native":
+                    logits, _ = residual_head(last_hidden)
+                else:
+                    assert (
+                        last_hidden.dtype
+                        == residual_head.weight.dtype
+                        == torch.bfloat16
+                    )
+                    assert residual_head.bias is None
+                    logits = torch.mm(
+                        last_hidden.flatten(0, 1),
+                        residual_head.weight.T,
+                        out_dtype=torch.float32,
+                    ).unsqueeze(1)
+                    # note (ratish): the rounded arm holds GEMM dispatch fixed for the argmax crossover.
+                    if self.witness_residual_head_output == "rounded":
+                        logits = logits.to(torch.bfloat16)
+                    else:
+                        pass
                 codebook_embedding = self.code_predictor.model.codec_embedding[
                     layer_idx
                 ]
