@@ -259,79 +259,73 @@ def main() -> None:
     output = arguments.output.resolve()
     output.mkdir()
     cases = select_cases(arguments.h200_history, arguments.h100_history)
-    (held_case,) = (row for row in cases if row["sample_id"] == HELD_SAMPLE_ID)
-    cases.append({**held_case, "cohort": "frozen_h200_control"})
     (output / "manifest.json").write_text(json.dumps(cases, indent=2) + "\n")
     samples = load_seedtts_samples(DATASETS["seedtts"])
     assert len(samples) == EXPECTED_SEEDTTS_SAMPLES
     samples_by_id = {sample.sample_id: sample for sample in samples}
     control_path = output / "control.json"
     control_path.write_text('{"request_id": ""}\n')
-    talker_port = find_available_port()
-    talker_server = start_server_from_cmd(
-        [
-            sys.executable,
-            "-P",
-            "-m",
-            "sglang_omni.cli",
-            "serve",
-            "--host",
-            "127.0.0.1",
-            "--port",
-            str(talker_port),
-            "--config",
-            str(arguments.server_config),
-            "--model-path",
-            arguments.model_path,
-            "--model-name",
-            "qwen3-omni",
-        ],
-        output / "talker.log",
-        talker_port,
-        timeout=SERVER_START_TIMEOUT_SECONDS,
-        env={"OMNI_WITNESS_BATCH_CONTROL": str(control_path)},
-        strip_proxy=True,
-    )
-    results = []
-    try:
-        with httpx.Client(trust_env=False, timeout=REQUEST_TIMEOUT_SECONDS) as client:
-            for case in cases:
-                sample = samples_by_id[case["sample_id"]]
-                input_sha256 = hashlib.sha256(
-                    Path(sample.ref_audio).read_bytes()
-                ).hexdigest()
-                if case["sample_id"] == HELD_SAMPLE_ID:
-                    assert input_sha256 == HELD_AUDIO_SHA256
-                else:
-                    pass
-                is_held = case["cohort"] == "frozen_h200_control"
-                case_directory = output / f'{case["cohort"]}-{case["sample_id"]}'
-                case_directory.mkdir()
-                prompt = (
-                    f'Listen to the audio above. The speaker is reading: "{sample.ref_text}". '
-                    f"Now please read the following text out loud in the same voice and style: "
-                    f"{sample.target_text}"
-                )
-                payload = {
-                    "model": "qwen3-omni",
-                    "request_id": case["request_id"],
-                    "messages": [{"role": "user", "content": prompt}],
-                    "modalities": ["text", "audio"],
-                    "audio": {"format": "wav"},
-                    "max_tokens": 256,
-                    "temperature": 0.7,
-                    "stream": False,
-                    "audios": [sample.ref_audio],
-                }
-                arms = {}
-                scopes = (
-                    ("first", "decode", "none")
-                    if len(results) % 2
-                    else ("none", "first", "decode")
-                )
-                for scope in scopes:
+    scopes = ("none", "first", "decode")
+    for scope in scopes:
+        control_path.write_text('{"request_id": ""}\n')
+        talker_port = find_available_port()
+        talker_server = start_server_from_cmd(
+            [
+                sys.executable,
+                "-P",
+                "-m",
+                "sglang_omni.cli",
+                "serve",
+                "--host",
+                "127.0.0.1",
+                "--port",
+                str(talker_port),
+                "--config",
+                str(arguments.server_config),
+                "--model-path",
+                arguments.model_path,
+                "--model-name",
+                "qwen3-omni",
+            ],
+            output / f"talker-{scope}.log",
+            talker_port,
+            timeout=SERVER_START_TIMEOUT_SECONDS,
+            env={"OMNI_WITNESS_BATCH_CONTROL": str(control_path)},
+            strip_proxy=True,
+        )
+        try:
+            with httpx.Client(
+                trust_env=False, timeout=REQUEST_TIMEOUT_SECONDS
+            ) as client:
+                for index, case in enumerate(cases, 1):
+                    sample = samples_by_id[case["sample_id"]]
+                    input_sha256 = hashlib.sha256(
+                        Path(sample.ref_audio).read_bytes()
+                    ).hexdigest()
+                    is_held = case["sample_id"] == HELD_SAMPLE_ID
+                    if is_held:
+                        assert input_sha256 == HELD_AUDIO_SHA256
+                    else:
+                        pass
+                    case_directory = output / f'{case["cohort"]}-{case["sample_id"]}'
                     arm_directory = case_directory / scope
-                    arm_directory.mkdir()
+                    arm_directory.mkdir(parents=True)
+                    prompt = (
+                        f'Listen to the audio above. The speaker is reading: "{sample.ref_text}". '
+                        f"Now please read the following text out loud in the same voice and style: "
+                        f"{sample.target_text}"
+                    )
+                    payload = {
+                        "model": "qwen3-omni",
+                        "request_id": case["request_id"],
+                        "messages": [{"role": "user", "content": prompt}],
+                        "modalities": ["text", "audio"],
+                        "audio": {"format": "wav"},
+                        "max_tokens": 256,
+                        "temperature": 0.7,
+                        "stream": False,
+                        "audios": [sample.ref_audio],
+                    }
                     control: WitnessControl = {
                         "request_id": case["request_id"],
                         "output_directory": str(arm_directory),
@@ -347,43 +341,59 @@ def main() -> None:
                         f"http://127.0.0.1:{talker_port}/v1/chat/completions",
                         json=payload,
                     )
-                    response.raise_for_status()
-                    completion = response.json()
-                    assert completion["id"] == f'chatcmpl-{case["request_id"]}'
-                    (choice,) = completion["choices"]
-                    waveform = base64.b64decode(
-                        choice["message"]["audio"]["data"], validate=True
-                    )
-                    (arm_directory / "audio.wav").write_bytes(waveform)
-                    arms[scope] = {
-                        "returned_text": choice["message"]["content"],
-                        "finish_reason": choice["finish_reason"],
-                        "waveform_sha256": hashlib.sha256(waveform).hexdigest(),
-                        "duration_seconds": get_wav_duration(waveform),
+                    arm = {
+                        "http_status": response.status_code,
+                        "input_sha256": input_sha256,
                     }
-                pairs = {
-                    scope: compare_pair(
-                        case_directory / "none", case_directory / scope, is_held
+                    if response.is_success:
+                        completion = response.json()
+                        assert completion["id"] == f'chatcmpl-{case["request_id"]}'
+                        (choice,) = completion["choices"]
+                        waveform = base64.b64decode(
+                            choice["message"]["audio"]["data"], validate=True
+                        )
+                        (arm_directory / "audio.wav").write_bytes(waveform)
+                        arm.update(
+                            returned_text=choice["message"]["content"],
+                            finish_reason=choice["finish_reason"],
+                            waveform_sha256=hashlib.sha256(waveform).hexdigest(),
+                            duration_seconds=get_wav_duration(waveform),
+                        )
+                    else:
+                        arm["error"] = response.text
+                    (arm_directory / "response.json").write_text(json.dumps(arm))
+                    print(
+                        f'{scope} {index}/{len(cases)}: {case["sample_id"]} HTTP {response.status_code}',
+                        flush=True,
                     )
-                    for scope in ("first", "decode")
-                }
-                result = {
-                    **case,
-                    "audio_sha256": input_sha256,
-                    "arm_order": scopes,
-                    "directory": case_directory.name,
-                    "arms": arms,
-                    "pairs": pairs,
-                }
-                results.append(result)
-                with (output / "generation.jsonl").open("a") as generated:
-                    generated.write(json.dumps(result) + "\n")
-                print(
-                    f'{len(results)}/{len(cases)} generated: {case["sample_id"]}',
-                    flush=True,
-                )
-    finally:
-        stop_server(talker_server)
+        finally:
+            stop_server(talker_server)
+
+    results = []
+    for case in cases:
+        case_directory = output / f'{case["cohort"]}-{case["sample_id"]}'
+        is_held = case["sample_id"] == HELD_SAMPLE_ID
+        arms = {
+            scope: json.loads((case_directory / scope / "response.json").read_bytes())
+            for scope in scopes
+        }
+        assert len({arm["input_sha256"] for arm in arms.values()}) == 1
+        pairs = {
+            scope: compare_pair(
+                case_directory / "none", case_directory / scope, is_held
+            )
+            for scope in ("first", "decode")
+        }
+        result = {
+            **case,
+            "used_frozen_h200_state": is_held,
+            "directory": case_directory.name,
+            "arms": arms,
+            "pairs": pairs,
+        }
+        results.append(result)
+        with (output / "generation.jsonl").open("a") as generated:
+            generated.write(json.dumps(result) + "\n")
 
     asr_port = find_available_port()
     asr_server = start_server_from_cmd(
@@ -416,6 +426,10 @@ def main() -> None:
         transcripts = {}
         for index, result in enumerate(results, 1):
             for scope, arm in result["arms"].items():
+                if "waveform_sha256" not in arm:
+                    continue
+                else:
+                    pass
                 path = output / result["directory"] / scope / "audio.wav"
                 digest = arm["waveform_sha256"]
                 if digest not in transcripts:
