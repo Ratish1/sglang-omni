@@ -111,7 +111,6 @@ class QwenTalkerModelRunner(ModelRunner["SGLangARRequestData"]):
         else:
             pass
 
-        self.model.prepare_decode_buffers(requests)
         self.write_feedback_buffers(requests)
 
     def post_prefill(
@@ -123,15 +122,21 @@ class QwenTalkerModelRunner(ModelRunner["SGLangARRequestData"]):
     ) -> None:
         # Note (Xuesong): Do not clear data.prefill_input_embeds: decode retract may requeue
         # the Req for another prefill pass and Req.input_embeds is None.
+        if result.next_token_ids is None:
+            return
+        else:
+            pass
+        sampling_state = self.model.sampling_state
+        assert forward_batch is not None and sampling_state is not None
+        # note (ratish): a slot holds its previous request's sampling state until this write, so it runs with feedback off too.
+        sampling_state.write_rows(
+            forward_batch.req_pool_indices, requests, result.next_token_ids
+        )
         if not self.feedback_enabled:
             return
         else:
             pass
 
-        if result.next_token_ids is None:
-            return
-        else:
-            pass
         layer0_codes = result.next_token_ids
         if layer0_codes.ndim == 1:
             layer0_codes = layer0_codes.unsqueeze(1)
