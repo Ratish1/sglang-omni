@@ -32,6 +32,8 @@ from sglang_omni.scheduling.message import IncomingMessage
 
 VIDEOS_IN_FLIGHT = 8
 SHORT_REQUESTS = 40
+# note (ratish): video answers are counted over the short requests' window, so it lasts long enough for many videos.
+MIN_LOAD_SECONDS = 30.0
 SAMPLE_RATE = 16000
 ANSWER_TIMEOUT_S = 600.0
 
@@ -154,10 +156,14 @@ class Stage:
             assert message_type == "result", request_id
             return answered_at - self.sent[request_id]
 
-    def run_short(self, window: str) -> tuple[dict[str, list[float]], dict[str, int]]:
+    def run_short(
+        self, window: str, min_seconds: float
+    ) -> tuple[dict[str, list[float]], dict[str, int]]:
         walls: dict[str, list[float]] = {"audio": [], "image": []}
         census: dict[str, int] = {}
-        for index in range(SHORT_REQUESTS):
+        started = time.perf_counter()
+        index = 0
+        while index < SHORT_REQUESTS or time.perf_counter() - started < min_seconds:
             modality, inputs = short_inputs(index)
             request_id = f"{window}-{modality}-{index}"
             self.submit(request_id, inputs)
@@ -166,6 +172,7 @@ class Stage:
                 census = thread_names()
             else:
                 pass
+            index += 1
         return walls, census
 
 
@@ -193,8 +200,8 @@ def main() -> None:
     for index in range(2):
         stage.submit_video()
         stage.wait(f"video-{stage.videos_sent}")
-    stage.run_short("warm")
-    alone, census_alone = stage.run_short("alone")
+    stage.run_short("warm", 0.0)
+    alone, census_alone = stage.run_short("alone", 0.0)
     stage.videos_on = True
     for _ in range(VIDEOS_IN_FLIGHT):
         stage.submit_video()
@@ -205,7 +212,7 @@ def main() -> None:
         )
     load_started = time.perf_counter()
     answers_before = len(stage.video_answers)
-    beside, census_beside = stage.run_short("beside")
+    beside, census_beside = stage.run_short("beside", MIN_LOAD_SECONDS)
     load_seconds = time.perf_counter() - load_started
     videos_answered = len(stage.video_answers) - answers_before
     stage.videos_on = False
