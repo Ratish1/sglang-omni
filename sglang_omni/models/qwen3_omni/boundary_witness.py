@@ -20,6 +20,8 @@ class WitnessControl(TypedDict):
     codec_override_frame: NotRequired[int]
     kv_override_file: NotRequired[str]
     prefill_probe_token_index: NotRequired[int]
+    paired_gate_frames: NotRequired[list[int]]
+    paired_stock_prefix_directory: NotRequired[str]
 
 
 def witness_control(request_id: str) -> WitnessControl | None:

@@ -56,9 +56,16 @@ def main() -> None:
     parser.add_argument("--projection-control-build", type=Path)
     parser.add_argument("--tactics-from", type=Path)
     parser.add_argument("--rounding-witnesses", action="store_true")
+    parser.add_argument("--paired-stock-prefix-directory", type=Path)
     arguments = parser.parse_args()
     if arguments.projection_control_build is None and "combined" in arguments.arms:
         parser.error("The combined arm requires --projection-control-build")
+    else:
+        pass
+    if arguments.paired_stock_prefix_directory is not None and (
+        not arguments.rounding_witnesses or arguments.projection_control_build is None
+    ):
+        parser.error("Paired decode needs rounding witnesses and a CUTLASS control")
     else:
         pass
     output = arguments.output.resolve()
@@ -164,6 +171,10 @@ def generate(arguments: argparse.Namespace, run_directories: list[Path]) -> None
         if arguments.rounding_witnesses:
             server_environment["OMNI_WITNESS_BATCH_CONTROL"] = str(witness_control_path)
             server_environment["OMNI_WITNESS_NATIVE_KV_AUDIT"] = "1"
+            if arguments.paired_stock_prefix_directory is not None:
+                server_environment["OMNI_WITNESS_PAIRED_DECODE"] = "1"
+            else:
+                pass
         else:
             pass
         talker_server = start_server_from_cmd(
@@ -246,6 +257,7 @@ def generate(arguments: argparse.Namespace, run_directories: list[Path]) -> None
                     MMSU_TTS_PROMPT,
                     REQUEST_SEED,
                     CLIENT_CONCURRENCY,
+                    stock_prefix_directory=arguments.paired_stock_prefix_directory,
                 )
                 continue
             else:

@@ -367,6 +367,177 @@ class QwenTalkerModelRunner(ModelRunner["SGLangARRequestData"]):
             {"embedding": combined_embedding, "position": position},
         )
 
+    @torch.inference_mode()
+    def custom_decode_forward(
+        self,
+        forward_batch: ForwardBatch | None,
+        schedule_batch: ScheduleBatch | None,
+        requests: list[SchedulerRequest],
+    ) -> GenerationBatchResult | None:
+        fixed_gate_switch = self.model.witness_fixed_gate_switch
+        if fixed_gate_switch is None:
+            return None
+        else:
+            pass
+        for row_index, request in enumerate(requests):
+            control = witness_control(request.request_id)
+            if control is None:
+                continue
+            else:
+                pass
+            frame_index = request.data.codec_frames_seen
+            stock_prefix_directory = control.get("paired_stock_prefix_directory")
+            if frame_index in control.get("paired_gate_frames", ()):
+                intervention = "gate"
+            elif frame_index == 1 and stock_prefix_directory is not None:
+                intervention = "prefix"
+            else:
+                continue
+            assert forward_batch is not None
+            assert self.tp_worker.server_args.tp_size == 1
+            model_runner = self.tp_worker.model_runner
+            pool = model_runner.token_to_kv_pool
+            assert isinstance(pool, MHATokenToKVPool)
+            buffers = (*pool.k_buffer, *pool.v_buffer)
+            write_slots = forward_batch.out_cache_loc.long()
+            assert write_slots.numel() == len(requests)
+            assert write_slots.unique().numel() == write_slots.numel()
+            previous_write_rows = [
+                buffer.index_select(0, write_slots) for buffer in buffers
+            ]
+            feedback_mask = self.model.feedback_mask.clone()
+            live_slots = None
+            original_prefix = []
+            donor_prefix = []
+            if intervention == "prefix":
+                assert stock_prefix_directory is not None and len(requests) == 1
+                directory = Path(stock_prefix_directory)
+                prefix = torch.load(
+                    directory / "first-decode-prefix-cache-000.pt",
+                    map_location=write_slots.device,
+                    weights_only=True,
+                )
+                operands = torch.load(
+                    directory / "backbone-decode-001.pt",
+                    map_location=write_slots.device,
+                    weights_only=True,
+                )
+                position = int(forward_batch.positions[row_index])
+                assert position == prefix["position"] == int(operands["position"])
+                if self.model.uses_mrope:
+                    assert torch.equal(
+                        operands["rotary_positions"],
+                        forward_batch.mrope_positions[:, row_index : row_index + 1],
+                    )
+                else:
+                    assert operands["rotary_positions"] is None
+                assert torch.equal(
+                    self.model.feedback_buffer[row_index],
+                    (operands["feedback_row"] + operands["text_row"]).reshape(-1),
+                )
+                live_slots = model_runner.req_to_token_pool.req_to_token[
+                    forward_batch.req_pool_indices[row_index], :position
+                ].long()
+                assert not torch.isin(live_slots, write_slots).any()
+                original_prefix = [
+                    buffer.index_select(0, live_slots) for buffer in buffers
+                ]
+                donor_prefix = [*prefix["key_rows"], *prefix["value_rows"]]
+            else:
+                pass
+            decode_results: list[dict[str, torch.Tensor]] = []
+            layer_trials: list[list[dict[str, torch.Tensor]]] = []
+            for use_alternative in (False, True, False):
+                fixed_gate_switch.fill_(intervention == "gate" and use_alternative)
+                self.model.feedback_mask.copy_(feedback_mask)
+                for buffer, write_rows in zip(
+                    buffers, previous_write_rows, strict=True
+                ):
+                    buffer.index_copy_(0, write_slots, write_rows)
+                if live_slots is not None:
+                    for buffer, prefix_rows in zip(
+                        buffers,
+                        donor_prefix if use_alternative else original_prefix,
+                        strict=True,
+                    ):
+                        buffer.index_copy_(0, live_slots, prefix_rows)
+                else:
+                    pass
+                self.model.backbone_recorders[0].step_counter.add_(1)
+                result = self.tp_worker.forward_batch_generation(forward_batch)
+                assert result.can_run_cuda_graph
+                decode_results.append(
+                    {
+                        "logits": result.logits_output.next_token_logits.clone(),
+                        "query": result.logits_output.hidden_states.clone(),
+                        "codes": self.model.output_codes[: len(requests)].clone(),
+                        "main_codes": self.model.sampled_token_ids[
+                            : len(requests)
+                        ].clone(),
+                    }
+                )
+                step = int(self.model.backbone_recorders[0].step_counter)
+                layer_trials.append(
+                    [
+                        recorder.read(step, row_index)
+                        for recorder in self.model.backbone_recorders
+                    ]
+                )
+            first, alternative, repeated = decode_results
+            assert all(
+                torch.equal(first[name], repeated[name]) for name in first
+            ), "Same-state reference replay was not exact"
+            record_boundary(
+                request.request_id,
+                f"paired-{intervention}",
+                {
+                    "batch_request_ids": [
+                        batch_row.request_id for batch_row in requests
+                    ],
+                    "row_index": row_index,
+                    "active_rows": len(requests),
+                    "reference_logits": first["logits"][row_index],
+                    "alternative_logits": alternative["logits"][row_index],
+                    "reference_codes": first["codes"][row_index],
+                    "alternative_codes": alternative["codes"][row_index],
+                    "query_max_abs_difference": (
+                        first["query"][row_index].float()
+                        - alternative["query"][row_index].float()
+                    )
+                    .abs()
+                    .max(),
+                    "layers_with_changed_gate": [
+                        layer_index
+                        for layer_index, (
+                            reference_layer,
+                            alternative_layer,
+                        ) in enumerate(
+                            zip(layer_trials[0], layer_trials[1], strict=True)
+                        )
+                        if not torch.equal(
+                            reference_layer["shared_gate"],
+                            alternative_layer["shared_gate"],
+                        )
+                    ],
+                    "layers_with_changed_output": [
+                        layer_index
+                        for layer_index, (
+                            reference_layer,
+                            alternative_layer,
+                        ) in enumerate(
+                            zip(layer_trials[0], layer_trials[1], strict=True)
+                        )
+                        if not torch.equal(
+                            reference_layer["mlp_output"],
+                            alternative_layer["mlp_output"],
+                        )
+                    ],
+                },
+                frame_index=frame_index,
+            )
+            return result
+        return None
+
     def process_sampling_logits(
         self, logits_output: LogitsProcessorOutput, requests: list[SchedulerRequest]
     ) -> None:

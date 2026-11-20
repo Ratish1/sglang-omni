@@ -310,6 +310,7 @@ class Qwen3OmniMoeTalkerSparseMoeBlock(Qwen3OmniMoeThinkerTextSparseMoeBlock):
     """
 
     operator_recorder: LayerOperandRecorder | None = None
+    witness_fixed_gate_switch: torch.Tensor | None = None
 
     def __init__(
         self,
@@ -364,12 +365,24 @@ class Qwen3OmniMoeTalkerSparseMoeBlock(Qwen3OmniMoeThinkerTextSparseMoeBlock):
         # Shared branch must consume the original MLP input before routed experts.
         # The fused MoE implementation mutates `hidden_states` in-place.
         shared_output = self.shared_expert(linear_hidden_states)
-        if (
-            self.use_fixed_shared_expert_gate
-            and linear_hidden_states.dtype == torch.bfloat16
+        can_use_fixed_gate = (
+            linear_hidden_states.dtype == torch.bfloat16
             and linear_hidden_states.is_contiguous()
             and guard_or_false(num_tokens > 0)
+        )
+        if (
+            self.witness_fixed_gate_switch is not None
+            and forward_batch.forward_mode.is_decode()
+            and can_use_fixed_gate
         ):
+            stock_gate, _ = self.shared_expert_gate(linear_hidden_states)
+            fixed_gate = project_shared_expert_gate(
+                linear_hidden_states, self.shared_expert_gate.weight
+            )
+            shared_gate = torch.where(
+                self.witness_fixed_gate_switch, fixed_gate, stock_gate
+            )
+        elif self.use_fixed_shared_expert_gate and can_use_fixed_gate:
             shared_gate = project_shared_expert_gate(
                 linear_hidden_states, self.shared_expert_gate.weight
             )
@@ -902,6 +915,16 @@ class Qwen3OmniTalker(nn.Module):
         )
 
         device = self.model.codec_embedding.weight.device
+        self.witness_fixed_gate_switch: torch.Tensor | None = None
+        if os.environ.get("OMNI_WITNESS_PAIRED_DECODE") == "1":
+            assert HAS_SHARED_GATE_TRITON and quant_config is None
+            self.witness_fixed_gate_switch = torch.zeros(
+                (), dtype=torch.bool, device=device
+            )
+            for layer in self.model.layers:
+                layer.mlp.witness_fixed_gate_switch = self.witness_fixed_gate_switch
+        else:
+            pass
         self.backbone_recorders: list[LayerOperandRecorder] = []
         has_batch_witness = os.environ.get("OMNI_WITNESS_BATCH_CONTROL") is not None
         audit_native_attention = os.environ.get("OMNI_WITNESS_NATIVE_KV_AUDIT") == "1"

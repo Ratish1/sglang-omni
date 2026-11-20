@@ -29,6 +29,8 @@ SEEDTTS_WITNESSES = (
     "common_voice_en_17256676-common_voice_en_17256678",
 )
 MMSU_WITNESS = "speech_stress_perception_f12a907a-291d-467a-9bbb-bd6ef2f2b09a"
+PAIRED_GATE_WITNESS = SEEDTTS_WITNESSES[2]
+PAIRED_GATE_FRAMES = (7, 8, 9)
 REQUEST_TIMEOUT_SECONDS = 500
 TRACE_BOUNDARIES = (
     "thinker-prefill-input",
@@ -70,22 +72,35 @@ def run_rounding_witnesses(
     mmsu_prompt: str,
     seed: int,
     client_concurrency: int,
+    *,
+    stock_prefix_directory: Path | None = None,
 ) -> None:
     seedtts_samples = load_seedtts_samples(SEEDTTS_DATASET_ID)
     endpoint = f"http://127.0.0.1:{server_port}/v1/chat/completions"
     results: list[WitnessResult] = []
-    with httpx.Client(timeout=REQUEST_TIMEOUT_SECONDS, trust_env=False) as client:
-        for samples, witness_ids in (
+    paired_results = []
+    if stock_prefix_directory is None:
+        workloads = (
             (seedtts_samples, SEEDTTS_WITNESSES),
             (mmsu_samples, (MMSU_WITNESS,)),
-        ):
+        )
+    else:
+        workloads = ((seedtts_samples, (*SEEDTTS_WITNESSES[:2], PAIRED_GATE_WITNESS)),)
+    with httpx.Client(timeout=REQUEST_TIMEOUT_SECONDS, trust_env=False) as client:
+        for samples, witness_ids in workloads:
             sample_index_by_id = {
                 sample.sample_id: index for index, sample in enumerate(samples)
             }
             for witness_id in witness_ids:
                 witness_index = sample_index_by_id[witness_id]
                 witness_sample = samples[witness_index]
-                for request_count in (1, client_concurrency):
+                request_counts = (
+                    (1,)
+                    if stock_prefix_directory is not None
+                    and witness_id != PAIRED_GATE_WITNESS
+                    else (1, client_concurrency)
+                )
+                for request_count in request_counts:
                     request_id = f"witness-{request_count}-{witness_id}"
                     trace_directory = run_directory / request_id
                     trace_directory.mkdir()
@@ -95,6 +110,19 @@ def run_rounding_witnesses(
                         "norm_scope": "none",
                         "held_input_directory": None,
                     }
+                    if stock_prefix_directory is None:
+                        paired_files = ()
+                    elif witness_id == PAIRED_GATE_WITNESS:
+                        control["paired_gate_frames"] = list(PAIRED_GATE_FRAMES)
+                        paired_files = tuple(
+                            f"paired-gate-{frame_index:03d}.pt"
+                            for frame_index in PAIRED_GATE_FRAMES
+                        )
+                    else:
+                        control["paired_stock_prefix_directory"] = str(
+                            (stock_prefix_directory / request_id).resolve()
+                        )
+                        paired_files = ("paired-prefix-001.pt",)
                     pending_control = control_path.with_suffix(".pending")
                     pending_control.write_text(json.dumps(control))
                     pending_control.replace(control_path)
@@ -167,11 +195,50 @@ def run_rounding_witnesses(
                             "completion_tokens": response["usage"]["completion_tokens"],
                         }
                     )
+                    for name in paired_files:
+                        paired = torch.load(trace_directory / name, weights_only=True)
+                        reference_codes = paired["reference_codes"].reshape(-1)
+                        alternative_codes = paired["alternative_codes"].reshape(-1)
+                        paired_results.append(
+                            {
+                                "sample_id": witness_id,
+                                "client_concurrency": request_count,
+                                "comparison": name,
+                                "active_rows": paired["active_rows"],
+                                "row_index": paired["row_index"],
+                                "batch_request_ids": paired["batch_request_ids"],
+                                "reference_codes": reference_codes.tolist(),
+                                "alternative_codes": alternative_codes.tolist(),
+                                "query_max_abs_difference": float(
+                                    paired["query_max_abs_difference"]
+                                ),
+                                "logit_max_abs_difference": float(
+                                    (
+                                        paired["reference_logits"]
+                                        - paired["alternative_logits"]
+                                    )
+                                    .abs()
+                                    .max()
+                                ),
+                                "layers_with_changed_gate": paired[
+                                    "layers_with_changed_gate"
+                                ],
+                                "layers_with_changed_output": paired[
+                                    "layers_with_changed_output"
+                                ],
+                            }
+                        )
                     print(
                         f"{run_directory.name}: witnessed {witness_id} c{request_count}",
                         flush=True,
                     )
     (run_directory / "witnesses.json").write_text(json.dumps(results, indent=2) + "\n")
+    if stock_prefix_directory is not None:
+        (run_directory / "paired-decode.json").write_text(
+            json.dumps(paired_results, indent=2) + "\n"
+        )
+    else:
+        pass
 
 
 def score_rounding_witnesses(
