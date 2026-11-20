@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import logging
 import os
+from pathlib import Path
 from typing import Iterable, Optional, Tuple
 
 import torch
@@ -33,6 +34,9 @@ from sglang_omni.models.qwen3_omni.components.thinker_model import (
     Qwen3OmniMoeThinkerTextAttention,
     Qwen3OmniMoeThinkerTextDecoderLayer,
     Qwen3OmniMoeThinkerTextSparseMoeBlock,
+)
+from sglang_omni.models.qwen3_omni.cutlass_projection_control import (
+    install_projection_control,
 )
 from sglang_omni.models.qwen3_omni.hf_config import (
     Qwen3OmniMoeTalkerConfig,
@@ -836,6 +840,14 @@ class Qwen3OmniTalker(nn.Module):
         prefix: str = "",
     ):
         super().__init__()
+        projection_control_source = os.environ.get(
+            "OMNI_WITNESS_CUTLASS_PROJECTION_SOURCE"
+        )
+        if projection_control_source is not None:
+            assert quant_config is None
+            install_projection_control(Path(projection_control_source))
+        else:
+            pass
         if not isinstance(config, Qwen3OmniMoeTalkerConfig):
             self.root_config = config
             config = Qwen3OmniMoeTalkerConfig(**config.talker_config.to_dict())

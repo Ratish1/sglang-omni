@@ -19,8 +19,10 @@ from sglang.srt.layers.moe.topk import fused_topk
 from sglang.srt.layers.rotary_embedding import get_rope
 from torch.nn.functional import linear, silu
 
-from scripts.debug_qwen3_omni_cutlass_projection import install_projection_control
 from scripts.debug_qwen3_omni_peer_shape import read_weights
+from sglang_omni.models.qwen3_omni.cutlass_projection_control import (
+    install_projection_control,
+)
 
 
 def cache_rows(

@@ -3,10 +3,13 @@
 
 import argparse
 import asyncio
+import hashlib
 import json
 import subprocess
 import sys
 from pathlib import Path
+
+import psutil
 
 from benchmarks.benchmarker.utils import start_server_from_cmd, stop_server
 from benchmarks.dataset.mmsu import load_mmsu_samples
@@ -42,6 +45,7 @@ def main() -> None:
         "--arms", choices=("baseline", "candidate"), nargs="+", required=True
     )
     parser.add_argument("--score-only", action="store_true")
+    parser.add_argument("--projection-control-build", type=Path)
     arguments = parser.parse_args()
     output = arguments.output.resolve()
     run_directories = [
@@ -90,10 +94,40 @@ def generate(arguments: argparse.Namespace, run_directories: list[Path]) -> None
     (output / "mmsu-input-order.json").write_text(
         json.dumps([sample.sample_id for sample in mmsu_samples]) + "\n"
     )
+    projection_control_build = arguments.projection_control_build
+    if projection_control_build is not None:
+        projection_control_build = projection_control_build.resolve()
+        build_result = json.loads(projection_control_build.read_bytes())
+        patched_library = Path(build_result["library"]).resolve()
+        with patched_library.open("rb") as library:
+            assert (
+                hashlib.file_digest(library, "sha256").hexdigest()
+                == build_result["library_sha256"]
+            )
+        assert arguments.arms[0] == "baseline"
+    else:
+        patched_library = None
+    tactic_cache_directory = output / "sglang-cache"
+    reference_tactics = None
     for run_directory, arm in zip(run_directories, arguments.arms, strict=True):
         run_directory.mkdir()
         print(f"{run_directory.name}: starting native inference", flush=True)
         server_port = find_available_port()
+        if projection_control_build is not None:
+            server_environment = {
+                "OMNI_WITNESS_FIXED_SHARED_GATE": "0",
+                "SGLANG_CACHE_DIR": str(tactic_cache_directory),
+            }
+            if arm == "candidate":
+                server_environment["OMNI_WITNESS_CUTLASS_PROJECTION_SOURCE"] = str(
+                    projection_control_build.parent / "csrc"
+                )
+            else:
+                pass
+        else:
+            server_environment = {
+                "OMNI_WITNESS_FIXED_SHARED_GATE": str(int(arm == "candidate"))
+            }
         talker_server = start_server_from_cmd(
             [
                 *server_command(),
@@ -109,10 +143,62 @@ def generate(arguments: argparse.Namespace, run_directories: list[Path]) -> None
             run_directory / "talker.log",
             server_port,
             timeout=SERVER_TIMEOUT_SECONDS,
-            env={"OMNI_WITNESS_FIXED_SHARED_GATE": str(int(arm == "candidate"))},
+            env=server_environment,
             strip_proxy=True,
         )
         try:
+            if patched_library is not None:
+                child_processes = psutil.Process(talker_server.pid).children(
+                    recursive=True
+                )
+                mapped_libraries = sorted(
+                    {
+                        mapping.path
+                        for process in child_processes
+                        for mapping in process.memory_maps()
+                        if Path(mapping.path).name.startswith("fused_moe_90")
+                        and mapping.path.endswith(".so")
+                    }
+                )
+                assert mapped_libraries, "No native CUTLASS library mapped"
+                assert (str(patched_library) in mapped_libraries) == (
+                    arm == "candidate"
+                )
+                tactic_files = sorted(
+                    (tactic_cache_directory / "flashinfer" / "autotune").rglob(
+                        "rank_*.json"
+                    )
+                )
+                tactics = {
+                    str(tactic_file.relative_to(tactic_cache_directory)): {
+                        operation: selection[:2]
+                        for operation, selection in json.loads(
+                            tactic_file.read_bytes()
+                        ).items()
+                        if operation.startswith("('trtllm::fused_moe::gemm")
+                    }
+                    for tactic_file in tactic_files
+                }
+                assert any(tactics.values()), "No saved CUTLASS tactic selections"
+                (run_directory / "cutlass-provider.json").write_text(
+                    json.dumps(
+                        {
+                            "mapped_libraries": mapped_libraries,
+                            "tactics": tactics,
+                            "fixed_shared_gate": False,
+                        },
+                        indent=2,
+                    )
+                    + "\n"
+                )
+                if reference_tactics is None:
+                    reference_tactics = tactics
+                else:
+                    assert (
+                        tactics == reference_tactics
+                    ), "Native tactic selections changed"
+            else:
+                pass
             subprocess.run(
                 [
                     *seedtts_command(),
@@ -128,6 +214,7 @@ def generate(arguments: argparse.Namespace, run_directories: list[Path]) -> None
                 (run_directory / "seedtts" / "generated.json").read_bytes()
             )
             assert len(seedtts_records) == SEEDTTS_SAMPLE_COUNT
+            assert all(record["is_success"] for record in seedtts_records)
             mmsu_output = asyncio.run(
                 run_mmsu(
                     argparse.Namespace(
@@ -153,6 +240,10 @@ def generate(arguments: argparse.Namespace, run_directories: list[Path]) -> None
                 )
             )
             assert len(mmsu_output["per_sample"]) == MMSU_SAMPLE_COUNT
+            assert all(
+                row["is_success"] and row["has_audio"]
+                for row in mmsu_output["per_sample"]
+            )
         finally:
             stop_server(talker_server)
         print(f"{run_directory.name}: completed both generation workloads", flush=True)
