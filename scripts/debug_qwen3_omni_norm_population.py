@@ -255,17 +255,55 @@ def main() -> None:
     parser.add_argument("--h100-history", type=Path, required=True)
     parser.add_argument("--held-input", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--transfer-from", type=Path)
     arguments = parser.parse_args()
     output = arguments.output.resolve()
     output.mkdir()
     cases = select_cases(arguments.h200_history, arguments.h100_history)
+    donor_population = arguments.transfer_from
+    donor_rows = {}
+    if donor_population is None:
+        scopes = ("none", "first", "decode")
+    else:
+        scopes = ("transfer", "restore")
+        eligible = []
+        for line in (donor_population / "scored.jsonl").read_text().splitlines():
+            row = json.loads(line)
+            before, after, pair = (
+                row["arms"]["none"],
+                row["arms"]["first"],
+                row["pairs"]["first"],
+            )
+            frame_index = pair.get("first_changed_codec_frame")
+            if (
+                pair["opening_state_equal"]
+                and pair["future_text_equal"]
+                and "spoken_wer" in before
+                and "spoken_wer" in after
+                and before["returned_text"] == after["returned_text"]
+                and frame_index is not None
+                and 0
+                < frame_index
+                < min(pair["before_frames"], pair["after_frames"]) - 1
+            ):
+                eligible.append(
+                    (after["word_errors"] - before["word_errors"], row["sample_id"])
+                )
+                donor_rows[row["sample_id"]] = row
+            else:
+                pass
+        worsening = sorted((entry for entry in eligible if entry[0] > 0), reverse=True)[
+            :2
+        ]
+        improving = sorted(entry for entry in eligible if entry[0] < 0)[:2]
+        selected = {sample_id for _, sample_id in (*worsening, *improving)}
+        cases = [case for case in cases if case["sample_id"] in selected]
     (output / "manifest.json").write_text(json.dumps(cases, indent=2) + "\n")
     samples = load_seedtts_samples(DATASETS["seedtts"])
     assert len(samples) == EXPECTED_SEEDTTS_SAMPLES
     samples_by_id = {sample.sample_id: sample for sample in samples}
     control_path = output / "control.json"
     control_path.write_text('{"request_id": ""}\n')
-    scopes = ("none", "first", "decode")
     for scope in scopes:
         control_path.write_text('{"request_id": ""}\n')
         talker_port = find_available_port()
@@ -329,11 +367,28 @@ def main() -> None:
                     control: WitnessControl = {
                         "request_id": case["request_id"],
                         "output_directory": str(arm_directory),
-                        "norm_scope": scope,
+                        "norm_scope": {"transfer": "none", "restore": "first"}.get(
+                            scope, scope
+                        ),
                         "held_input_directory": (
                             str(arguments.held_input.resolve()) if is_held else None
                         ),
                     }
+                    if donor_population is not None:
+                        donor_row = donor_rows[case["sample_id"]]
+                        donor_scope = "first" if scope == "transfer" else "none"
+                        frame_index = donor_row["pairs"]["first"][
+                            "first_changed_codec_frame"
+                        ]
+                        control["codec_override_frame"] = frame_index
+                        control["codec_override_file"] = str(
+                            donor_population
+                            / donor_row["directory"]
+                            / donor_scope
+                            / f"codec-{frame_index:03d}.pt"
+                        )
+                    else:
+                        pass
                     next_control = control_path.with_suffix(".next")
                     next_control.write_text(json.dumps(control))
                     next_control.replace(control_path)
@@ -378,12 +433,72 @@ def main() -> None:
             for scope in scopes
         }
         assert len({arm["input_sha256"] for arm in arms.values()}) == 1
-        pairs = {
-            scope: compare_pair(
-                case_directory / "none", case_directory / scope, is_held
-            )
-            for scope in ("first", "decode")
-        }
+        if donor_population is None:
+            pairs = {
+                scope: compare_pair(
+                    case_directory / "none", case_directory / scope, is_held
+                )
+                for scope in ("first", "decode")
+            }
+        else:
+            pairs = {}
+            donor_row = donor_rows[case["sample_id"]]
+            frame_index = donor_row["pairs"]["first"]["first_changed_codec_frame"]
+            for scope, recipient_scope, donor_scope in (
+                ("transfer", "none", "first"),
+                ("restore", "first", "none"),
+            ):
+                reference_directory = donor_population / donor_row["directory"]
+                recipient_frames, recipient_text, recipient_complete = (
+                    controlled_history(reference_directory / recipient_scope)
+                )
+                donor_frames, _, _ = controlled_history(
+                    reference_directory / donor_scope
+                )
+                replay_frames, replay_text, replay_complete = controlled_history(
+                    case_directory / scope
+                )
+                assert (
+                    case_directory / scope / f"codec-override-{frame_index:03d}.pt"
+                ).is_file()
+                assert torch.equal(
+                    replay_frames[frame_index], donor_frames[frame_index]
+                )
+                sampling_name = f"decode-sampling-{frame_index:03d}.pt"
+                recipient_sampling = torch.load(
+                    reference_directory / recipient_scope / sampling_name,
+                    weights_only=True,
+                )
+                replay_sampling = torch.load(
+                    case_directory / scope / sampling_name, weights_only=True
+                )
+                assert recipient_sampling.keys() == replay_sampling.keys()
+                pairs[scope] = {
+                    "overridden_frame": frame_index,
+                    "preintervention_sampling_exact": all(
+                        torch.equal(value, replay_sampling[name])
+                        for name, value in recipient_sampling.items()
+                    ),
+                    "preceding_codec_history_exact": all(
+                        torch.equal(left, right)
+                        for left, right in zip(
+                            recipient_frames[:frame_index],
+                            replay_frames[:frame_index],
+                            strict=True,
+                        )
+                    ),
+                    "future_text_equal": recipient_complete
+                    and replay_complete
+                    and len(recipient_text) == len(replay_text)
+                    and all(
+                        torch.equal(left, right)
+                        for left, right in zip(recipient_text, replay_text)
+                    ),
+                    "returned_text_equal": arms[scope].get("returned_text")
+                    == donor_row["arms"][recipient_scope]["returned_text"],
+                    "recipient_wer": donor_row["arms"][recipient_scope]["spoken_wer"],
+                    "donor_wer": donor_row["arms"][donor_scope]["spoken_wer"],
+                }
         result = {
             **case,
             "used_frozen_h200_state": is_held,

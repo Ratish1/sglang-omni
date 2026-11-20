@@ -407,6 +407,35 @@ class QwenTalkerModelRunner(ModelRunner["SGLangARRequestData"]):
                     pass
             else:
                 pass
+            if control is not None and request.data.codec_frames_seen == control.get(
+                "codec_override_frame"
+            ):
+                donor = torch.load(
+                    control["codec_override_file"],
+                    map_location=result.next_token_ids.device,
+                    weights_only=True,
+                )
+                donor_codes = donor["codec_ids"].reshape_as(
+                    self.model.output_codes[row_index]
+                )
+                donor_code = donor_codes.reshape(-1)[0]
+                assert donor_code != self.model.config.codec_eos_token_id
+                self.model.output_codes[row_index].copy_(donor_codes)
+                self.model.output_embeds[row_index].copy_(
+                    donor["feedback_embedding"].reshape_as(
+                        self.model.output_embeds[row_index]
+                    )
+                )
+                self.model.sampled_token_ids[row_index].copy_(donor_code)
+                result.next_token_ids[row_index].copy_(donor_code)
+                record_boundary(
+                    request.request_id,
+                    "codec-override",
+                    {"main_code": donor_code},
+                    frame_index=request.data.codec_frames_seen,
+                )
+            else:
+                pass
         self.stage_token_ids(result, result.next_token_ids)
         self.emit_code_chunks_and_feedback(
             schedule_batch=schedule_batch,

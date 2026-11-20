@@ -4,7 +4,7 @@
 import json
 import os
 from pathlib import Path
-from typing import Literal, TypedDict
+from typing import Literal, NotRequired, TypedDict
 
 import torch
 
@@ -16,6 +16,8 @@ class WitnessControl(TypedDict):
     output_directory: str
     norm_scope: Literal["none", "first", "decode"]
     held_input_directory: str | None
+    codec_override_file: NotRequired[str]
+    codec_override_frame: NotRequired[int]
 
 
 def witness_control(request_id: str) -> WitnessControl | None:
