@@ -77,6 +77,7 @@ def main() -> None:
     parser.add_argument("--rounding-witnesses", action="store_true")
     parser.add_argument("--seedtts-witness-id", action="append")
     parser.add_argument("--prefill-probe-token-index", type=int)
+    parser.add_argument("--prefill-probe-packed-experts", action="store_true")
     parser.add_argument("--prefill-gate-controls", action="store_true")
     parser.add_argument("--profile-prefill-samples", type=int)
     parser.add_argument("--seedtts-speed-only", action="store_true")
@@ -111,6 +112,11 @@ def main() -> None:
         arguments.prefill_probe_token_index < 0 or not arguments.seedtts_witness_id
     ):
         parser.error("A nonnegative prefill probe index needs SeedTTS witness IDs")
+    elif (
+        arguments.prefill_probe_packed_experts
+        and arguments.prefill_probe_token_index is None
+    ):
+        parser.error("Packed expert capture needs a prefill probe token")
     elif arguments.paired_prefix_donor_concurrency < 1 or (
         arguments.paired_prefix_donor_concurrency != 1
         and arguments.paired_stock_prefix_directory is None
@@ -311,6 +317,10 @@ def generate(arguments: argparse.Namespace, run_directories: list[Path]) -> None
                 or arguments.prefill_probe_token_index is not None
             ):
                 server_environment["OMNI_WITNESS_TRACE_PREFILL_TOKEN"] = "1"
+            else:
+                pass
+            if arguments.prefill_probe_packed_experts:
+                server_environment["OMNI_WITNESS_PACKED_PREFILL_EXPERTS"] = "1"
             else:
                 pass
             if arguments.paired_stock_prefix_directory is not None:

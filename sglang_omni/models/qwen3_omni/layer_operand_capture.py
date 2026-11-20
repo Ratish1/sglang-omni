@@ -11,6 +11,7 @@ class LayerOperandRecorder:
     step_counter: torch.Tensor
     capture_attention_geometry: bool = False
     prefill_token_index: torch.Tensor | None = None
+    records_packed_prefill_experts: bool = False
     is_recording_prefill: bool = False
     input_norm_override: torch.Tensor | None = None
     use_input_norm_override: torch.Tensor | None = None
@@ -48,6 +49,10 @@ class LayerOperandRecorder:
         else:
             self.current_snapshot[name] = tensor.clone()
 
+    def record_packed_prefill(self, name: str, tensor: torch.Tensor) -> None:
+        assert self.is_recording_prefill and self.records_packed_prefill_experts
+        self.current_snapshot[f"packed_{name}"] = tensor.clone()
+
     def read(
         self,
         expected_step: int,
@@ -82,7 +87,10 @@ class LayerOperandRecorder:
         )
         assert int(snapshot["step"]) == expected_step
         return {
-            name: tensor[0].detach().cpu().clone()
+            name: (tensor if name.startswith("packed_") else tensor[0])
+            .detach()
+            .cpu()
+            .clone()
             for name, tensor in snapshot.items()
             if name != "step"
         }

@@ -422,6 +422,18 @@ class Qwen3OmniMoeTalkerSparseMoeBlock(Qwen3OmniMoeThinkerTextSparseMoeBlock):
             self.operator_recorder.record(
                 "routed_expert_weights", topk_output.topk_weights
             )
+            if self.operator_recorder.records_packed_prefill_experts:
+                self.operator_recorder.record_packed_prefill(
+                    "expert_input", linear_hidden_states
+                )
+                self.operator_recorder.record_packed_prefill(
+                    "expert_ids", topk_output.topk_ids
+                )
+                self.operator_recorder.record_packed_prefill(
+                    "expert_weights", topk_output.topk_weights
+                )
+            else:
+                pass
         else:
             pass
         routed_output = self.experts(linear_hidden_states, topk_output)
@@ -429,6 +441,15 @@ class Qwen3OmniMoeTalkerSparseMoeBlock(Qwen3OmniMoeThinkerTextSparseMoeBlock):
             self.operator_recorder.record("router_logits", router_logits)
             self.operator_recorder.record("routed_output", routed_output)
             self.operator_recorder.record("shared_output", shared_output)
+            if (
+                self.operator_recorder.is_recording_prefill
+                and self.operator_recorder.records_packed_prefill_experts
+            ):
+                self.operator_recorder.record_packed_prefill(
+                    "expert_output", routed_output
+                )
+            else:
+                pass
         else:
             pass
 
@@ -956,6 +977,8 @@ class Qwen3OmniTalker(nn.Module):
                     capture_attention_geometry=audit_native_attention
                     and layer_index == 0,
                     prefill_token_index=prefill_token_index,
+                    records_packed_prefill_experts=layer_index == 0
+                    and os.environ.get("OMNI_WITNESS_PACKED_PREFILL_EXPERTS") == "1",
                 )
                 self.backbone_recorders.append(recorder)
                 layer.operator_recorder = recorder
