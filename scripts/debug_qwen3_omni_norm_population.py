@@ -14,6 +14,7 @@ from threading import Barrier
 
 import httpx
 import torch
+import yaml
 
 from benchmarks.benchmarker.utils import (
     get_wav_duration,
@@ -561,6 +562,25 @@ def main() -> None:
             sample for sample in samples if sample.sample_id not in witness_ids
         ][: NATIVE_AUDIT_CLIENT_CONCURRENCY - 1]
     control_path = output / "control.json"
+    server_config = arguments.server_config
+    if exact_prefill_reference is not None and not reuse_capture:
+        selected_samples = {case["sample_id"] for case in cases}
+        exact_buckets = sorted(
+            row["pairs"]["observe"]["cache_length"] - 1
+            for row in map(
+                json.loads,
+                (exact_prefill_reference / "generation.jsonl").read_text().splitlines(),
+            )
+            if row["sample_id"] in selected_samples
+        )
+        assert len(exact_buckets) == len(selected_samples)
+        resolved_config = yaml.safe_load(server_config.read_text())
+        talker_engine = resolved_config["stages"]["talker_ar"].setdefault("engine", {})
+        talker_engine["cuda_graph_bs_prefill"] = exact_buckets
+        server_config = output / "server-config.yaml"
+        server_config.write_text(yaml.safe_dump(resolved_config))
+    else:
+        pass
     for scope in () if reuse_capture else scopes:
         control_path.write_text('{"request_id": ""}\n')
         talker_port = find_available_port()
@@ -576,7 +596,7 @@ def main() -> None:
                 "--port",
                 str(talker_port),
                 "--config",
-                str(arguments.server_config),
+                str(server_config),
                 "--model-path",
                 arguments.model_path,
                 "--model-name",
@@ -584,11 +604,6 @@ def main() -> None:
                 *(
                     ["--talker_ar.engine.cuda_graph_backend_prefill", "disabled"]
                     if prefill_reference is not None or scope == "eager"
-                    else []
-                ),
-                *(
-                    ["--talker_ar.engine.cuda_graph_bs_prefill", "[134,151]"]
-                    if exact_prefill_reference is not None
                     else []
                 ),
             ],
