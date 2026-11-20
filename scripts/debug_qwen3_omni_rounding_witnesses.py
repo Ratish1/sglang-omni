@@ -39,8 +39,13 @@ TRACE_BOUNDARIES = (
     "backbone-decode",
     "codec",
 )
-GEOMETRY_FIELDS = {"batch_request_ids", "request_token_lengths", "request_row"}
-NON_SEMANTIC_FIELDS = {"request_pool_index", "active_rows"}
+GEOMETRY_FIELDS = {
+    "active_rows",
+    "batch_request_ids",
+    "request_token_lengths",
+    "request_row",
+}
+NON_SEMANTIC_FIELDS = {"request_pool_index"}
 
 
 class WitnessResult(TypedDict):
@@ -229,8 +234,8 @@ def score_rounding_witnesses(
 
 def compare_witnesses(
     baseline_trace: Path, candidate_trace: Path
-) -> dict[str, dict[str, int | str | list[str] | list[int] | None]]:
-    report: dict[str, dict[str, int | str | list[str] | list[int] | None]] = {}
+) -> dict[str, dict[str, int | bool | str | list[str] | None]]:
+    report: dict[str, dict[str, int | bool | str | list[str] | None]] = {}
     for boundary in TRACE_BOUNDARIES:
         baseline_frames = {
             path.name: path for path in baseline_trace.glob(f"{boundary}-*.pt")
@@ -239,21 +244,26 @@ def compare_witnesses(
             path.name: path for path in candidate_trace.glob(f"{boundary}-*.pt")
         }
         first_value_difference = first_geometry_difference = None
+        first_value_difference_geometry_matched = None
         differing_fields: list[str] = []
         matched_frame_count = 0
         for filename in sorted(baseline_frames.keys() & candidate_frames.keys()):
             baseline = torch.load(baseline_frames[filename], weights_only=True)
             candidate = torch.load(candidate_frames[filename], weights_only=True)
             assert baseline.keys() == candidate.keys()
-            if all(
-                baseline[field] == candidate[field]
-                for field in baseline.keys() & GEOMETRY_FIELDS
-            ):
-                matched_frame_count += 1
-            elif first_geometry_difference is None:
-                first_geometry_difference = filename
+            geometry_fields = baseline.keys() & GEOMETRY_FIELDS
+            if geometry_fields:
+                geometry_matched = all(
+                    baseline[field] == candidate[field] for field in geometry_fields
+                )
+                if geometry_matched:
+                    matched_frame_count += 1
+                elif first_geometry_difference is None:
+                    first_geometry_difference = filename
+                else:
+                    pass
             else:
-                pass
+                geometry_matched = None
             if first_value_difference is None:
                 for field in sorted(
                     baseline.keys() - GEOMETRY_FIELDS - NON_SEMANTIC_FIELDS
@@ -271,6 +281,7 @@ def compare_witnesses(
                         pass
                 if differing_fields:
                     first_value_difference = filename
+                    first_value_difference_geometry_matched = geometry_matched
                 else:
                     pass
             else:
@@ -281,6 +292,9 @@ def compare_witnesses(
             "matching_geometry_frames": matched_frame_count,
             "first_geometry_difference": first_geometry_difference,
             "first_value_difference": first_value_difference,
+            "first_value_difference_geometry_matched": (
+                first_value_difference_geometry_matched
+            ),
             "first_differing_fields": differing_fields,
         }
     return report
