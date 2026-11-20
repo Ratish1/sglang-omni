@@ -163,6 +163,7 @@ def generate(arguments: argparse.Namespace, run_directories: list[Path]) -> None
             }
         if arguments.rounding_witnesses:
             server_environment["OMNI_WITNESS_BATCH_CONTROL"] = str(witness_control_path)
+            server_environment["OMNI_WITNESS_NATIVE_KV_AUDIT"] = "1"
         else:
             pass
         talker_server = start_server_from_cmd(
