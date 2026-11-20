@@ -24,58 +24,50 @@ What the sizing covers: the cap counts a request until its result, or until the 
 
 ## Results
 
-The overload and SeedTTS tables ran on `d37692113` and main `2a66cb083`, one H100 at a time, each server alone on the card in alternating order, pinned to the card's half of the socket with the client on the other socket. This head adds only the two fixes above for a waiting whole request and a raised stream wait. The overload client sends only streams, so no whole request waits there and a stream asks for a row exactly as on `d37692113`. With the defaults no SeedTTS request finds every row held either, and the pair against `d37692113` below stays within run-to-run noise.
+Everything below ran on this head and on main `2a66cb083` on one H100, each server alone on the card with the first server alternating, pinned to the card's half of the socket with the client on the other socket.
 
 Overload: Nari Labs' open client, unmodified (`tts_bench` `a2d65e1`): 1.7B CustomVoice, Ryan, English, the SeedTTS EN sentences, Poisson arrivals, 30 s warm-up and 120 s measured, seeds 0, 1 and 2.
 
-| req/s | completed, main → branch | requests with underruns | first byte p50, ms | left-context decodes, main (branch 0) |
+| req/s | completed, main → this head | requests with underruns | first byte p50, ms | left-context decodes, main (this head 0) |
 |---|---|---|---|---|
-| 60 | 31.5 / 40.7 / 1.2 % → 100 / 100 / 100 % | 1,823 / 1,394 / 2,243 → 209 / 50 / 99 | 23 / 22 / 53 → 25 / 21 / 21 | 884 / 651 / 1,312 |
-| 70 | 54.2 / 80.5 / 83.3 % → 99.9 / 98.6 / 99.6 % | 795 / 248 / 53 → 5 / 87 / 23 | 1,073 / 1,083 / 1,029 → 47 / 32 / 105 | 499 / 308 / 333 |
-| 80 | 76.7 / 74.2 / 73.4 % → 83.4 / 90.1 / 88.6 % | 40 / 84 / 48 → 20 / 0 / 7 | 994 / 1,057 / 1,047 → 908 / 819 / 826 | 356 / 337 / 332 |
+| 60 | 0.4 / 0.9 / 0.6 % → 100 / 100 / 98.7 % | 2,067 / 2,085 / 1,972 → 55 / 105 / 340 | 59 / 55 / 56 → 21 / 21 / 326 | 1,213 / 1,258 / 1,183 |
+| 70 | 82.5 / 0.2 / 81.7 % → 89.9 / 94.7 / 98.1 % | 149 / 2,008 / 79 → 271 / 154 / 78 | 1,032 / 60 / 1,051 → 895 / 795 / 438 | 316 / 1,152 / 304 |
+| 80 | 66.2 / 72.0 / 0.4 % → 85.1 / 88.1 / 75.9 % | 301 / 155 / 1,962 → 16 / 28 / 143 | 1,170 / 1,080 / 57 → 882 / 840 / 1,007 | 310 / 332 / 1,119 |
 
-- Sampled every 2 s, the branch's arena held at most 65 to 66 of its 128 rows, while main's 64 rows were full at every rate.
-- Main is unstable at 60 req/s (31.5, 40.7 and 1.2 % across seeds): once its rows run out, whether it recovers depends on the arrival sequence. At 80 req/s main's first byte covers only the requests it completed.
-- Past capacity the branch serves at capacity, and the excess gets HTTP 503 at the in-flight cap.
-- Requests with underruns at 60 req/s move a lot between runs of the same code. On one card, interleaved, seeds 0 to 5: the shared rows 118 / 121 / 79 / 0 / 32 / 29, a second set of rows for whole requests (`4c41ba4c8`) 3 / 103 / 26 / 46 / 43 / 23, and that second set against itself on seeds 0 to 2, 23 / 4 / 70 against 75 / 23 / 42. Across those runs the second set spans 3 to 103 (median 34.5) and the shared rows 0 to 121 (median 55.5), a difference a rank test puts at p 0.3. At 80 req/s, seeds 0 to 2, the shared rows completed 91.6 / 96.2 / 87.4 % against 83.7 / 93.3 / 87.9 %.
+- Sampled every 2 s, this head held at most 62 to 67 of its 128 stream rows, while main's 64 stream rows were full in every cell.
+- Main is unstable past 60 req/s: once its rows run out, whether it recovers depends on the arrival sequence, and in five of the nine cells it completed under 1 %. In those cells its first byte covers only the requests it completed.
+- Past capacity this head serves at capacity, and the excess gets HTTP 503 at the in-flight cap.
+- The overload client sends only streams, and their path is main's except for the row count.
 
 Normal load: SeedTTS EN, 1.7B Base, the full 1,088 prompts, unseeded, two orders.
 
-| cell | first audio mean / median / p95, ms, main → branch | RTF |
+| cell | first audio mean / median / p95, ms, main → this head | RTF |
 |---|---|---|
-| streaming c16 | 32.5 / 29.9 / 55.0 → 31.3 / 29.3 / 52.4 | -0.9 % |
-| streaming c64 | 54.8 / 41.8 / 164.0 → 54.7 / 41.8 / 121.8 | +0.3 % |
-| streaming c64, three warm rounds per order | 55.8 / 42.0 / 164.5 → 54.4 / 41.4 / 157.1 | -3.0 % |
-| whole c16 (latency mean) | 381 → 376 ms | -0.9 % |
+| streaming c1 | 20.9 / 20.5 / 34.5 → 21.3 / 20.6 / 35.4 | +0.6 % |
+| streaming c16 | 35.8 / 30.7 / 67.2 → 33.4 / 30.5 / 52.8 | -5.1 % |
+| streaming c64 | 58.2 / 44.0 / 177.8 → 61.0 / 44.6 / 208.8 | +1.9 % |
+| streaming c64, three warm rounds per order | 59.9 / 43.2 / 203.1 → 58.8 / 44.2 / 182.5 | -0.3 % |
+| whole c1 (latency mean) | 250 → 251 ms | -0.2 % |
+| whole c16 (latency mean) | 397 → 401 ms | +0.7 % |
+| whole c64, three warm rounds per order (latency mean) | 828 → 834 ms | +0.7 % |
 
-- 54 seeded requests over Base, CustomVoice and VoiceDesign, 27 streamed and 27 whole, are byte-identical to main, so neither the arena size nor whole requests sharing it changes audio.
-- WER (streaming c16, Qwen3-ASR): 1.02 / 1.24 → 1.08 / 1.01 %. SIM 71.03 / 71.49 → 71.36 / 71.47. With byte-identical seeded audio, both differences are unseeded sampling.
-- The KV pool keeps main's size. On one H100 at the default memory fraction, 1.7B Base holds 546,401 to 546,404 tokens on main and on this head alike. 1.7B CustomVoice holds 554,009 on this head, against 551,103 with a second set of rows.
-
-This head against `d37692113`, the same corpus, one H100, each server alone, both orders:
-
-| cell | first audio mean / median / p95, ms, `d37692113` → this head | RTF |
-|---|---|---|
-| streaming c1 | 20.8 / 20.5 / 33.0 → 21.4 / 20.5 / 34.4 | +0.8 % |
-| streaming c16 | 37.1 / 30.6 / 69.4 → 32.2 / 29.8 / 52.4 | -7.2 % |
-| streaming c64 | 57.3 / 44.2 / 164.8 → 57.2 / 43.3 / 163.7 | -1.5 % |
-| whole c16 (latency mean) | 397 → 396 ms | +0.3 % |
-| whole c1 (latency mean) | 250 → 249 ms | +0.2 % |
-
-- The server that ran second in an order was faster at c64 and whole c16 in both orders, and `d37692113`'s first c16 cell after the first boot read 41.5 ms, so these differences are order and noise. At c1, `d37692113` alone read 20.2 and 21.3 ms in the two orders.
-- WER 1.06 / 1.14 → 1.10 / 0.98 %, SIM 71.35 / 71.26 → 71.57 / 71.42. The KV pool holds 546,401 tokens on both.
+- At c64 the server that ran second in an order was the slower one in both orders, by up to 30 % in RTF, so a single c64 cell moves with the order. Over six warm rounds each, this head's c64 first audio and RTF match main's.
+- At whole c64 the window graphs ran 3,094 and 3,068 replays on main and 3,081 and 3,062 on this head, and the tail graphs 2,379 and 2,350 against 2,383 and 2,361, for the same requests. Eight rows keep the replays as full as main's 64. Main's latency ranged 805 to 864 ms over its six rounds and this head's 795 to 882.
+- 54 seeded requests over Base, CustomVoice and VoiceDesign, with each `non_streaming_mode` value, 27 streamed and 27 whole, are byte-identical to main.
+- WER (streaming c16, Qwen3-ASR): 1.05 / 1.01 → 1.05 / 1.04 %. SIM 71.43 / 71.32 → 71.28 / 71.21. With byte-identical seeded audio, both differences are unseeded sampling.
+- On one H100 at the default memory fraction, 1.7B Base holds 546,401 and 546,475 KV tokens on main and 546,226 on this head.
 
 Streams and whole requests at once on a real server, on this head:
 
-- **1 row, 1.7B Base and 1.7B CustomVoice, six rounds each:** each round sent 16 streams, 2 whole requests, 6 clients that cancel before audio and 3 that drop after the first chunk. Every request that should finish did, and every row came back. Refused acquires equal left-context fallbacks, so a whole request waiting for a row counts none.
-- **4 rows, continuous arrivals, 1.7B Base:** for 60 s, 8 stream clients that each send a new stream as the last ends, and a whole request every second, this head and `d37692113` alternating, four runs each. Every request finished and every row came back. Whole requests averaged 1.27 / 1.00 / 1.11 / 1.04 s on this head against 0.97 / 1.07 / 1.01 / 1.04 s, a difference an exact rank test puts at p 0.4, and the two slowest runs are the two that completed the fewest streams in their minute. About half the streams decoded on the left-context path on both heads. At this arrival rate `d37692113` did not starve a whole request either, so the waiting-order test under Tests, which forces the interleaving, is what shows the fix.
-- **The defaults, 128 rows, both models, three rounds each:** the 1-row mix four times over, 108 clients at once, gave no refused acquire, no fallback, and every row back.
+- **1 stream row, 1.7B Base and 1.7B CustomVoice, six rounds each:** each round sent 16 streams, 2 whole requests, 6 clients that cancel before audio and 3 that drop after the first chunk. Every request that should finish did, and every row came back. Refused acquires equal left-context fallbacks.
+- **4 stream rows, continuous arrivals:** for 60 s, 8 stream clients that each send a new stream as the last ends, and a whole request every second. About half the streams decoded on the left-context path, and every whole request finished on its own rows: 1.7B Base in 0.80 s median and 1.08 s at most, beside 586 streams, and 1.7B CustomVoice in 0.94 and 1.43 s, beside 485. Every row came back.
+- **The defaults, 128 stream rows, both models, three rounds each:** the 1-row mix four times over, 108 clients at once, gave no refused acquire, no fallback, and every row back.
 
 Every mode on a real 1.7B CustomVoice server, one stream and one whole request each:
 
 - An uncapped asynchronous server, or `codec_state_slots` set to none, 0.5 or 0, refuses to start, with the error naming the slot count.
 - The uncapped synchronous and rollback servers serve both with no arena.
-- The default serves both with 128 rows.
+- The default serves both with 128 stream rows and 8 whole-request rows.
 
 ## Tests
 
