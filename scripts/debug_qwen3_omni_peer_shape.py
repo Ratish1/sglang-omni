@@ -11,23 +11,25 @@ from flashinfer.autotuner import AutoTuner
 from flashinfer.fused_moe import cutlass_fused_moe
 from flashinfer.fused_moe.core import ActivationType
 from safetensors import safe_open
-from sgl_kernel import fused_add_rmsnorm
+from sgl_kernel import fused_add_rmsnorm, rmsnorm
 from sglang.kernels.ops.attention.flash_attention import flash_attn_with_kvcache
 from sglang.srt.environ import envs
 from sglang.srt.layers.activation import silu_and_mul
+from sglang.srt.layers.rotary_embedding import get_rope
 from torch.nn import functional
 
-LAYER_PREFIX = "talker.model.layers.0"
 TOKEN_COUNTS = (151, 160, 296, 320, 1536, 1723, 1792)
 
 
-def read_weights(checkpoint: Path, names: tuple[str, ...]) -> list[torch.Tensor]:
+def read_weights(
+    checkpoint: Path, names: tuple[str, ...], layer_index: int = 0
+) -> list[torch.Tensor]:
     weight_index = json.loads(
         (checkpoint / "model.safetensors.index.json").read_text()
     )["weight_map"]
     tensors = []
     for name in names:
-        key = f"{LAYER_PREFIX}.{name}.weight"
+        key = f"talker.model.layers.{layer_index}.{name}.weight"
         with safe_open(checkpoint / weight_index[key], framework="pt") as shard:
             tensors.append(shard.get_tensor(key).cuda())
     return tensors
@@ -179,6 +181,79 @@ def replay_routed_experts(
             )
 
 
+def replay_next_cache(
+    checkpoint: Path, layer: dict[str, torch.Tensor], token_index: int
+) -> None:
+    config = json.loads((checkpoint / "config.json").read_bytes())["talker_config"][
+        "text_config"
+    ]
+    input_norm, q_weight, k_weight, v_weight, q_norm, k_norm = read_weights(
+        checkpoint,
+        (
+            "input_layernorm",
+            "self_attn.q_proj",
+            "self_attn.k_proj",
+            "self_attn.v_proj",
+            "self_attn.q_norm",
+            "self_attn.k_norm",
+        ),
+        layer_index=1,
+    )
+    qkv_weight = torch.cat((q_weight, k_weight, v_weight))
+    head_size = config["head_dim"]
+    contributions = layer["input_contribution"].flatten().cuda()
+    previous_residual = layer["previous_residual"].flatten().cuda()
+    rotary = get_rope(
+        head_size,
+        rotary_dim=head_size,
+        max_position=config["max_position_embeddings"],
+        base=config["rope_theta"],
+        rope_scaling=config.get("rope_scaling"),
+        dtype=contributions.dtype,
+    ).cuda()
+    for token_count in TOKEN_COUNTS:
+        x = contributions.new_zeros((token_count, contributions.numel()))
+        residual = torch.zeros_like(x)
+        x[token_index] = contributions
+        residual[token_index] = previous_residual
+        fused_add_rmsnorm(x, residual, input_norm, config["rms_norm_eps"])
+        projection = functional.linear(x, qkv_weight)
+        query, key, value = projection.split(
+            (q_weight.shape[0], k_weight.shape[0], v_weight.shape[0]), dim=-1
+        )
+        query = rmsnorm(
+            query.contiguous().view(-1, head_size), q_norm, config["rms_norm_eps"]
+        ).view_as(query)
+        key = rmsnorm(
+            key.contiguous().view(-1, head_size), k_norm, config["rms_norm_eps"]
+        ).view_as(key)
+        positions = torch.zeros(token_count, dtype=torch.long, device=x.device)
+        positions[token_index] = layer["positions"].flatten()[0].cuda()
+        _, rotary_key = rotary(positions, query, key)
+        print(
+            json.dumps(
+                {
+                    "layer_one_cache_token_count": token_count,
+                    "attention_norm": report_difference(
+                        x[token_index], layer["attention_normalized"]
+                    ),
+                    "attention_residual": report_difference(
+                        residual[token_index], layer["attention_residual"]
+                    ),
+                    "qkv": report_difference(projection[token_index], layer["qkv"]),
+                    "key_norm": report_difference(key[token_index], layer["key_norm"]),
+                    "cached_key": report_difference(
+                        rotary_key[token_index], layer["key_rope"]
+                    ),
+                    "cached_value": report_difference(
+                        value[token_index], layer["value"]
+                    ),
+                }
+            ),
+            flush=True,
+        )
+
+
 @torch.inference_mode()
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
@@ -190,7 +265,8 @@ def main() -> None:
     arguments = parser.parse_args()
     assert arguments.autotune_cache.is_file(), arguments.autotune_cache
     prefix = torch.load(arguments.prefix, weights_only=True)
-    first_layer = torch.load(arguments.layer, weights_only=True)[0]
+    layers = torch.load(arguments.layer, weights_only=True)
+    first_layer = layers[0]
     keys = prefix["key_rows"][0].cuda()
     values = prefix["value_rows"][0].cuda()
     target_length, key_head_count, head_dimension = keys.shape
@@ -295,6 +371,7 @@ def main() -> None:
         arguments.token_index,
         arguments.autotune_cache,
     )
+    replay_next_cache(arguments.checkpoint, layers[1], arguments.token_index)
 
 
 if __name__ == "__main__":
