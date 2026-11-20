@@ -5,22 +5,24 @@
 # and the rework on the other, and the next round swaps them. Each round starts when both cards finished the last.
 # Cells: the CI speech pipeline on one card, text Video-MME c1 and c16 and the CI talker test (oc); SeedTTS c16 beside
 # 8 looping Video-MME videos on that server (sv) and on the colocated config (cv).
-# usage: q1120_gpu.sh <card> <cpus> "<arm order>"
+# Ports: a server also binds its port plus 100, and torch.distributed's default 29500 is taken by a stage process of
+# the other card's server, so card 1 serves from 30000 and each cell's two ports stay apart from the next cell's.
+# usage: q1120_gpu.sh <card> <cpus> "<arm order>" "<cells>" <sync name>
 set -u
-CARD=$1 CPUS=$2 ORDER=$3
+CARD=$1 CPUS=$2 ORDER=$3 CELLS=$4 SYNC=$5
 O=/data/v1120/gpu
 K=/workspace/kit/tasks/runtime-perf-research/box
 MAIN=/workspace/main LANE=/workspace/vlane
 CONTEXT_32K="--preprocessing.factory.max_seq_len 32768 --thinker.factory.max_seq_len 32768"
-BASE_PORT=$((28000 + 1000 * CARD))
+BASE_PORT=$((28000 + 2000 * CARD))
 export SGLANG_OMNI_STARTUP_TIMEOUT=3600
-mkdir -p $O/sync
+mkdir -p $O/$SYNC
 log() { echo "$* card$CARD $(date -u +%T)" >> /data/v1120/queue.log; }
 note() { log "boot $1 $(git -C $2 rev-parse --short HEAD) $(git -C $2 rev-parse --short=12 HEAD:sglang_omni) $3 start"; }
 tree_of() { case $1 in m) echo $MAIN ;; l) echo $LANE ;; *) exit 2 ;; esac; }
 sync_round() {
-  touch $O/sync/$1.card$CARD
-  until [ -e $O/sync/$1.card$((1 - CARD)) ]; do sleep 10; done
+  touch $O/$SYNC/$1.card$CARD
+  until [ -e $O/$SYNC/$1.card$((1 - CARD)) ]; do sleep 10; done
 }
 
 ci_text_and_talker() {
@@ -64,7 +66,7 @@ mixed() {
 until grep -q "q1120_cpu3 done" /data/v1120/queue.log; do sleep 30; done
 log "q1120_gpu start order $ORDER cpus $CPUS"
 round=0
-for cell in oc sv cv; do
+for cell in $CELLS; do
   for arm in $ORDER; do
     round=$((round + 1))
     sync_round r$round
@@ -72,8 +74,8 @@ for cell in oc sv cv; do
     name=${cell}_${arm}$((index + 1))_c$CARD
     case $cell in
       oc) ci_text_and_talker $name $(tree_of $arm) ;;
-      sv) mixed $name $(tree_of $arm) omni_ci_onecard "" $((BASE_PORT + 500)) ;;
-      cv) mixed $name $(tree_of $arm) omni_colocated "$CONTEXT_32K" $((BASE_PORT + 600)) ;;
+      sv) mixed $name $(tree_of $arm) omni_ci_onecard "" $((BASE_PORT + 620)) ;;
+      cv) mixed $name $(tree_of $arm) omni_colocated "$CONTEXT_32K" $((BASE_PORT + 840)) ;;
     esac
   done
 done
