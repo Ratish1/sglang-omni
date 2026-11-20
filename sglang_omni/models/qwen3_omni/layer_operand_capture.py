@@ -15,7 +15,11 @@ class LayerOperandRecorder:
     input_norm_override: torch.Tensor | None = None
     use_input_norm_override: torch.Tensor | None = None
     graph_snapshots: list[dict[str, torch.Tensor]] = field(default_factory=list)
+    prefill_graph_snapshots: dict[int, dict[str, torch.Tensor]] = field(
+        default_factory=dict
+    )
     eager_snapshot: dict[str, torch.Tensor] = field(default_factory=dict)
+    eager_prefill_snapshot: dict[str, torch.Tensor] = field(default_factory=dict)
     current_snapshot: dict[str, torch.Tensor] = field(default_factory=dict)
 
     def records(self, is_decode: bool, is_extend: bool) -> bool:
@@ -25,7 +29,13 @@ class LayerOperandRecorder:
         self.is_recording_prefill = is_prefill
         self.current_snapshot = {"step": self.step_counter.clone()}
         self.record("positions", positions.movedim(-1, 0))
-        if torch.cuda.is_current_stream_capturing():
+        is_capturing = torch.cuda.is_current_stream_capturing()
+        if is_prefill and is_capturing:
+            bucket_tokens = positions.shape[-1]
+            self.prefill_graph_snapshots[bucket_tokens] = self.current_snapshot
+        elif is_prefill:
+            self.eager_prefill_snapshot = self.current_snapshot
+        elif is_capturing:
             self.graph_snapshots.append(self.current_snapshot)
         else:
             self.eager_snapshot = self.current_snapshot
@@ -58,5 +68,21 @@ class LayerOperandRecorder:
         return {
             name: tensor[row_index].detach().cpu().clone()
             for name, tensor in snapshots[0].items()
+            if name != "step"
+        }
+
+    def read_prefill(
+        self, expected_step: int, bucket_tokens: int | None
+    ) -> dict[str, torch.Tensor]:
+        """Use the executed shape because graphs can share snapshot addresses."""
+        snapshot = (
+            self.eager_prefill_snapshot
+            if bucket_tokens is None
+            else self.prefill_graph_snapshots[bucket_tokens]
+        )
+        assert int(snapshot["step"]) == expected_step
+        return {
+            name: tensor[0].detach().cpu().clone()
+            for name, tensor in snapshot.items()
             if name != "step"
         }

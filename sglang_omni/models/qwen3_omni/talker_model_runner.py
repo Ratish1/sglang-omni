@@ -670,13 +670,37 @@ class QwenTalkerModelRunner(ModelRunner["SGLangARRequestData"]):
             return
         else:
             pass
-        for request in requests:
+        for row_index, request in enumerate(requests):
             control = witness_control(request.request_id)
             if control is not None and "prefill_probe_token_index" in control:
+                assert forward_batch is not None
                 step = int(self.model.backbone_recorders[0].step_counter)
+                if result.can_run_cuda_graph:
+                    buckets = (
+                        self.tp_worker.model_runner.prefill_cuda_graph_runner.capture_num_tokens
+                    )
+                    raw_tokens = len(forward_batch.input_ids)
+                    bucket_tokens = int(buckets[bisect_left(buckets, raw_tokens)])
+                else:
+                    bucket_tokens = None
                 snapshots = [
-                    recorder.read(step, 0) for recorder in self.model.backbone_recorders
+                    recorder.read_prefill(step, bucket_tokens)
+                    for recorder in self.model.backbone_recorders
                 ]
+                token_index = (
+                    sum(forward_batch.extend_seq_lens_cpu[:row_index])
+                    + control["prefill_probe_token_index"]
+                )
+                positions = (
+                    forward_batch.mrope_positions
+                    if self.model.uses_mrope
+                    else forward_batch.positions
+                )
+                expected_position = positions[..., token_index].cpu()
+                assert all(
+                    torch.equal(snapshot["positions"], expected_position)
+                    for snapshot in snapshots
+                )
                 with (Path(control["output_directory"]) / "prefill-layers.pt").open(
                     "xb"
                 ) as output:
