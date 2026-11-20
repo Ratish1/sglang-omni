@@ -20,7 +20,15 @@ from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import add_prefix
 from sglang.srt.utils.common import async_h2d
 from torch import nn
+from torch.fx.experimental.symbolic_shapes import guard_or_false
 
+from sglang_omni.models.qwen3_omni.components.shared_expert_gate import (
+    HAS_TRITON as HAS_SHARED_GATE_TRITON,
+)
+from sglang_omni.models.qwen3_omni.components.shared_expert_gate import (
+    SHARED_GATE_HIDDEN_SIZE,
+    project_shared_expert_gate,
+)
 from sglang_omni.models.qwen3_omni.components.thinker_model import (
     Qwen3OmniMoeThinkerTextAttention,
     Qwen3OmniMoeThinkerTextDecoderLayer,
@@ -328,6 +336,12 @@ class Qwen3OmniMoeTalkerSparseMoeBlock(Qwen3OmniMoeThinkerTextSparseMoeBlock):
             quant_config=None,
             prefix=add_prefix("shared_expert_gate", prefix),
         )
+        self.use_fixed_shared_expert_gate = (
+            os.environ.get("OMNI_WITNESS_FIXED_SHARED_GATE") == "1"
+            and HAS_SHARED_GATE_TRITON
+            and current_platform.is_cuda()
+            and config.hidden_size == SHARED_GATE_HIDDEN_SIZE
+        )
 
     def forward(
         self,
@@ -346,7 +360,17 @@ class Qwen3OmniMoeTalkerSparseMoeBlock(Qwen3OmniMoeThinkerTextSparseMoeBlock):
         # Shared branch must consume the original MLP input before routed experts.
         # The fused MoE implementation mutates `hidden_states` in-place.
         shared_output = self.shared_expert(linear_hidden_states)
-        shared_gate, _ = self.shared_expert_gate(linear_hidden_states)
+        if (
+            self.use_fixed_shared_expert_gate
+            and linear_hidden_states.dtype == torch.bfloat16
+            and linear_hidden_states.is_contiguous()
+            and guard_or_false(num_tokens > 0)
+        ):
+            shared_gate = project_shared_expert_gate(
+                linear_hidden_states, self.shared_expert_gate.weight
+            )
+        else:
+            shared_gate, _ = self.shared_expert_gate(linear_hidden_states)
         record_operands = (
             self.operator_recorder is not None
             and self.operator_recorder.records(

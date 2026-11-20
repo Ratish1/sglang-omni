@@ -448,6 +448,7 @@ def main() -> None:
     parser.add_argument("--batched-native-reference", type=Path)
     parser.add_argument("--exact-talker-prefill-reference", type=Path)
     parser.add_argument("--prefill-token-probe", action="store_true")
+    parser.add_argument("--fixed-shared-gate", action="store_true")
     parser.add_argument("--audit-existing", action="store_true")
     parser.add_argument("--score-existing", action="store_true")
     arguments = parser.parse_args()
@@ -584,6 +585,23 @@ def main() -> None:
     for scope in () if reuse_capture else scopes:
         control_path.write_text('{"request_id": ""}\n')
         talker_port = find_available_port()
+        server_environment: dict[str, str] = {}
+        if scope != "plain":
+            server_environment["OMNI_WITNESS_BATCH_CONTROL"] = str(control_path)
+            if arguments.native_kv_audit:
+                server_environment["OMNI_WITNESS_NATIVE_KV_AUDIT"] = "1"
+            else:
+                pass
+            if arguments.prefill_token_probe:
+                server_environment["OMNI_WITNESS_TRACE_PREFILL_TOKEN"] = "1"
+            else:
+                pass
+        else:
+            pass
+        if arguments.fixed_shared_gate:
+            server_environment["OMNI_WITNESS_FIXED_SHARED_GATE"] = "1"
+        else:
+            pass
         talker_server = start_server_from_cmd(
             [
                 sys.executable,
@@ -610,23 +628,7 @@ def main() -> None:
             output / f"talker-{scope}.log",
             talker_port,
             timeout=SERVER_START_TIMEOUT_SECONDS,
-            env=(
-                {}
-                if scope == "plain"
-                else {
-                    "OMNI_WITNESS_BATCH_CONTROL": str(control_path),
-                    **(
-                        {"OMNI_WITNESS_NATIVE_KV_AUDIT": "1"}
-                        if arguments.native_kv_audit
-                        else {}
-                    ),
-                    **(
-                        {"OMNI_WITNESS_TRACE_PREFILL_TOKEN": "1"}
-                        if arguments.prefill_token_probe
-                        else {}
-                    ),
-                }
-            ),
+            env=server_environment,
             strip_proxy=True,
         )
         try:
