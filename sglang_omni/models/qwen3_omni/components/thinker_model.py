@@ -621,6 +621,12 @@ class Qwen3OmniMoeThinkerTextDecoderLayer(nn.Module):
                 self.operator_recorder.record(
                     "attention_normalized_before_override", hidden_states
                 )
+                self.operator_recorder.record(
+                    "norm_swap_applied",
+                    self.operator_recorder.use_input_norm_override.expand(
+                        hidden_states.shape[0]
+                    ),
+                )
                 hidden_states = torch.where(
                     self.operator_recorder.use_input_norm_override,
                     self.operator_recorder.input_norm_override,

@@ -3,7 +3,6 @@
 
 from __future__ import annotations
 
-import os
 from collections import deque
 from pathlib import Path
 from queue import Queue
@@ -19,7 +18,11 @@ from sglang_omni.model_runner.prefill_inputs import (
     OmniPrefillInputs,
     attach_omni_prefill_inputs,
 )
-from sglang_omni.models.qwen3_omni.boundary_witness import is_witness, record_boundary
+from sglang_omni.models.qwen3_omni.boundary_witness import (
+    is_witness,
+    record_boundary,
+    witness_control,
+)
 from sglang_omni.scheduling.message import OutgoingMessage, put_messages
 from sglang_omni.scheduling.pending_text_queue import PendingTextTensorQueue
 from sglang_omni.scheduling.sglang_backend.request_data import (
@@ -75,9 +78,6 @@ class QwenTalkerModelRunner(ModelRunner["SGLangARRequestData"]):
         self.codec_coalesce_frames = max(int(codec_coalesce_frames), 0)
         self.codec_coalesce_first_frames = max(int(codec_coalesce_first_frames), 0)
         self.codec_coalesce_early_frames = max(int(codec_coalesce_early_frames), 0)
-        self.held_input_directory: str | None = os.environ.get(
-            "OMNI_WITNESS_HELD_INPUT_DIRECTORY"
-        )
 
     def execute(self, scheduler_output: SchedulerOutput) -> ModelRunnerOutput:
         return super().execute(scheduler_output)
@@ -204,25 +204,46 @@ class QwenTalkerModelRunner(ModelRunner["SGLangARRequestData"]):
             else:
                 pass
         self.write_feedback_buffers(requests)
-        if self.held_input_directory is not None:
-            for row_index, request in enumerate(requests):
-                if (
-                    is_witness(request.request_id)
-                    and request.data.codec_frames_seen == 1
-                ):
-                    assert len(requests) == 1
-                    self.install_held_first_decode_inputs(
-                        forward_batch, row_index, request
-                    )
-                else:
-                    pass
-        else:
-            pass
+        for row_index, request in enumerate(requests):
+            control = witness_control(request.request_id)
+            if control is None or not self.model.backbone_recorders:
+                continue
+            else:
+                pass
+            frame_index = request.data.codec_frames_seen
+            held_directory = control["held_input_directory"]
+            assert len(requests) == 1 and forward_batch is not None
+            if held_directory is not None and frame_index == 1:
+                self.install_held_first_decode_inputs(
+                    forward_batch, row_index, request, Path(held_directory)
+                )
+            else:
+                pass
+            scope = control["norm_scope"]
+            if scope == "decode" or (scope == "first" and frame_index == 1):
+                opening_layer = self.model.backbone_recorders[0]
+                combined_embedding = self.model.feedback_buffer[row_index]
+                input_norm = self.model.model.layers[0].input_layernorm
+                assert input_norm.weight.dtype == combined_embedding.dtype
+                hidden_states = combined_embedding.float()
+                variance = hidden_states.pow(2).mean(-1, keepdim=True)
+                normalized = hidden_states * torch.rsqrt(
+                    variance + input_norm.variance_epsilon
+                )
+                opening_layer.input_norm_override.copy_(
+                    input_norm.weight * normalized.to(combined_embedding.dtype)
+                )
+                opening_layer.use_input_norm_override.fill_(True)
+            else:
+                pass
 
     def install_held_first_decode_inputs(
-        self, forward_batch: ForwardBatch, row_index: int, request: SchedulerRequest
+        self,
+        forward_batch: ForwardBatch,
+        row_index: int,
+        request: SchedulerRequest,
+        input_directory: Path,
     ) -> None:
-        input_directory = Path(self.held_input_directory)
         device = self.model.feedback_buffer.device
         prefix = torch.load(
             input_directory / "first-decode-prefix-cache-000.pt",
@@ -262,21 +283,6 @@ class QwenTalkerModelRunner(ModelRunner["SGLangARRequestData"]):
             "text_row"
         ].reshape(-1)
         self.model.feedback_buffer[row_index].copy_(combined_embedding)
-        opening_layer = self.model.backbone_recorders[0]
-        if opening_layer.input_norm_override is not None:
-            input_norm = self.model.model.layers[0].input_layernorm
-            assert input_norm.weight.dtype == combined_embedding.dtype
-            hidden_states = combined_embedding.float()
-            variance = hidden_states.pow(2).mean(-1, keepdim=True)
-            normalized = hidden_states * torch.rsqrt(
-                variance + input_norm.variance_epsilon
-            )
-            opening_layer.input_norm_override.copy_(
-                input_norm.weight * normalized.to(combined_embedding.dtype)
-            )
-            opening_layer.use_input_norm_override.fill_(True)
-        else:
-            pass
         for buffer, name in (
             (self.model.sampling_seeds, "seed"),
             (self.model.sampling_temperatures, "temperature"),
@@ -358,7 +364,8 @@ class QwenTalkerModelRunner(ModelRunner["SGLangARRequestData"]):
         batch_size = len(requests)
         result.next_token_ids = self.model.sampled_token_ids[:batch_size].clone()
         for row_index, request in enumerate(requests):
-            if is_witness(request.request_id):
+            control = witness_control(request.request_id)
+            if control is not None:
                 assert forward_batch is not None
                 record_boundary(
                     request.request_id,
@@ -391,7 +398,7 @@ class QwenTalkerModelRunner(ModelRunner["SGLangARRequestData"]):
                         recorder.read(step, row_index)
                         for recorder in self.model.backbone_recorders
                     ]
-                    output_directory = Path(os.environ["OMNI_WITNESS_DIRECTORY"])
+                    output_directory = Path(control["output_directory"])
                     with (output_directory / "first-decode-layers.pt").open(
                         "xb"
                     ) as output:
@@ -559,6 +566,7 @@ class QwenTalkerModelRunner(ModelRunner["SGLangARRequestData"]):
                         else pad_embedding.new_empty((0, pad_embedding.numel()))
                     ),
                     "thinker_done": int(req_data.thinker_chunks_done),
+                    "codec_frames_seen": req_data.codec_frames_seen,
                 },
             )
         else:
