@@ -41,6 +41,10 @@ CLEAN_CASE_COUNT = 9
 HELD_SAMPLE_ID = "common_voice_en_19690002-common_voice_en_19690001"
 HELD_AUDIO_SHA256 = "b3180f36dadd42f6381c106b0538b842a1fb38f684e44c8a5674f9f1b87e247c"
 NATIVE_AUDIT_CLIENT_CONCURRENCY = 16
+PREFILL_PROBE_TOKEN_BY_SAMPLE = {
+    "common_voice_en_19756059-common_voice_en_19756062": 117,
+    "common_voice_en_17817002-common_voice_en_17817003": 99,
+}
 
 
 def post_seedtts_sample(
@@ -362,9 +366,12 @@ def audit_first_decode_attention(
         "layer_input_matches_projected_text_and_feedback": torch.equal(
             combined_input, first_layer["input_contribution"]
         ),
-        "thinker_handoff_matches_talker": all(
-            torch.equal(thinker_publish[field], talker_prompt[field])
-            for field in ("media_positions", "media_hidden_states")
+        "thinker_handoff_matches_talker": (
+            thinker_publish["media_positions"].tolist()
+            == talker_prompt["media_positions"]
+        )
+        and torch.equal(
+            thinker_publish["media_hidden_states"], talker_prompt["media_hidden_states"]
         ),
         "attention_context_exact_after_rounding": torch.equal(
             actual_context, expected_context.to(actual_context)
@@ -438,10 +445,14 @@ def main() -> None:
     parser.add_argument("--native-kv-audit", action="store_true")
     parser.add_argument("--eager-talker-prefill-reference", type=Path)
     parser.add_argument("--batched-native-reference", type=Path)
+    parser.add_argument("--prefill-token-probe", action="store_true")
+    parser.add_argument("--audit-existing", action="store_true")
     parser.add_argument("--score-existing", action="store_true")
     arguments = parser.parse_args()
     output = arguments.output.resolve()
-    if arguments.score_existing:
+    reuse_capture = arguments.score_existing or arguments.audit_existing
+    assert not arguments.audit_existing or arguments.native_kv_audit
+    if reuse_capture:
         assert (output / "manifest.json").is_file()
         assert not (output / "generation.jsonl").exists()
         assert not (output / "scored.jsonl").exists()
@@ -466,6 +477,16 @@ def main() -> None:
                 if case["cohort"] == "historic_severe"
                 or case["sample_id"]
                 == "common_voice_en_19401124-common_voice_en_19401123"
+            ]
+        else:
+            pass
+        if arguments.prefill_token_probe:
+            assert native_reference is None
+            scopes = ("observe", "eager")
+            cases = [
+                case
+                for case in cases
+                if case["sample_id"] in PREFILL_PROBE_TOKEN_BY_SAMPLE
             ]
         else:
             pass
@@ -508,7 +529,7 @@ def main() -> None:
         improving = sorted(entry for entry in eligible if entry[0] < 0)[:2]
         selected = {sample_id for _, sample_id in (*worsening, *improving)}
         cases = [case for case in cases if case["sample_id"] in selected]
-    if arguments.score_existing:
+    if reuse_capture:
         assert json.loads((output / "manifest.json").read_bytes()) == cases
     else:
         (output / "manifest.json").write_text(json.dumps(cases, indent=2) + "\n")
@@ -520,7 +541,7 @@ def main() -> None:
             sample for sample in samples if sample.sample_id not in witness_ids
         ][: NATIVE_AUDIT_CLIENT_CONCURRENCY - 1]
     control_path = output / "control.json"
-    for scope in () if arguments.score_existing else scopes:
+    for scope in () if reuse_capture else scopes:
         control_path.write_text('{"request_id": ""}\n')
         talker_port = find_available_port()
         talker_server = start_server_from_cmd(
@@ -542,7 +563,7 @@ def main() -> None:
                 "qwen3-omni",
                 *(
                     ["--talker_ar.engine.cuda_graph_backend_prefill", "disabled"]
-                    if prefill_reference is not None
+                    if prefill_reference is not None or scope == "eager"
                     else []
                 ),
             ],
@@ -557,6 +578,11 @@ def main() -> None:
                     **(
                         {"OMNI_WITNESS_NATIVE_KV_AUDIT": "1"}
                         if arguments.native_kv_audit
+                        else {}
+                    ),
+                    **(
+                        {"OMNI_WITNESS_TRACE_PREFILL_TOKEN": "1"}
+                        if arguments.prefill_token_probe
                         else {}
                     ),
                 }
@@ -589,11 +615,18 @@ def main() -> None:
                             "restore": "first",
                             "plain": "none",
                             "observe": "none",
+                            "eager": "none",
                         }.get(scope, scope),
                         "held_input_directory": (
                             str(arguments.held_input.resolve()) if is_held else None
                         ),
                     }
+                    if arguments.prefill_token_probe:
+                        control["prefill_probe_token_index"] = (
+                            PREFILL_PROBE_TOKEN_BY_SAMPLE[case["sample_id"]]
+                        )
+                    else:
+                        pass
                     if donor_population is not None:
                         donor_row = donor_rows[case["sample_id"]]
                         donor_scope = "first" if scope == "transfer" else "none"
@@ -692,7 +725,41 @@ def main() -> None:
             for scope in scopes
         }
         assert len({arm["input_sha256"] for arm in arms.values()}) == 1
-        if arguments.native_kv_audit:
+        if arguments.prefill_token_probe:
+            assert all(arm["http_status"] == 200 for arm in arms.values())
+            graph_trace = case_directory / "observe"
+            eager_trace = case_directory / "eager"
+            graph_layers = torch.load(
+                graph_trace / "prefill-layers.pt", weights_only=True
+            )
+            eager_layers = torch.load(
+                eager_trace / "prefill-layers.pt", weights_only=True
+            )
+            differing_layers = {}
+            for layer_index, (graph_layer, eager_layer) in enumerate(
+                zip(graph_layers, eager_layers, strict=True)
+            ):
+                assert graph_layer.keys() == eager_layer.keys()
+                assert torch.equal(graph_layer["positions"], eager_layer["positions"])
+                changed_operands = [
+                    field
+                    for field, operand in graph_layer.items()
+                    if not torch.equal(operand, eager_layer[field])
+                ]
+                if changed_operands:
+                    differing_layers[layer_index] = changed_operands
+                else:
+                    pass
+            pairs = {
+                "prefill_probe": {
+                    **compare_native_prefill(graph_trace, eager_trace),
+                    "logical_token_index": PREFILL_PROBE_TOKEN_BY_SAMPLE[
+                        case["sample_id"]
+                    ],
+                    "different_operands_by_layer": differing_layers,
+                },
+            }
+        elif arguments.native_kv_audit:
             assert all(arm["http_status"] == 200 for arm in arms.values())
             if native_reference is None:
                 reference_arm = arms["plain"]

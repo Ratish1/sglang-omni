@@ -268,9 +268,9 @@ class Qwen3OmniMoeThinkerTextAttention(nn.Module):
         forward_batch: ForwardBatch,
     ):
         qkv, _ = self.qkv_proj(hidden_states)
-        if (
-            self.operator_recorder is not None
-            and forward_batch.forward_mode.is_decode()
+        if self.operator_recorder is not None and self.operator_recorder.records(
+            forward_batch.forward_mode.is_decode(),
+            forward_batch.forward_mode.is_extend(),
         ):
             self.operator_recorder.record("qkv", qkv)
         else:
@@ -329,9 +329,9 @@ class Qwen3OmniMoeThinkerTextAttention(nn.Module):
                 head_dim=self.head_dim,
                 alt_stream=self.alt_stream,
             )
-            if (
-                self.operator_recorder is not None
-                and forward_batch.forward_mode.is_decode()
+            if self.operator_recorder is not None and self.operator_recorder.records(
+                forward_batch.forward_mode.is_decode(),
+                forward_batch.forward_mode.is_extend(),
             ):
                 self.operator_recorder.record("query_norm", q)
                 self.operator_recorder.record("key_norm", k)
@@ -389,13 +389,19 @@ class Qwen3OmniMoeThinkerTextAttention(nn.Module):
 
         q, k, v, fb = inner_state
         record_operands = (
-            self.operator_recorder is not None and fb.forward_mode.is_decode()
+            self.operator_recorder is not None
+            and self.operator_recorder.records(
+                fb.forward_mode.is_decode(), fb.forward_mode.is_extend()
+            )
         )
         if record_operands:
             self.operator_recorder.record("query_rope", q)
             self.operator_recorder.record("key_rope", k)
             self.operator_recorder.record("value", v)
-            if self.operator_recorder.capture_attention_geometry:
+            if (
+                self.operator_recorder.capture_attention_geometry
+                and fb.forward_mode.is_decode()
+            ):
                 backend = get_attn_backend()
                 assert isinstance(backend, FlashAttentionBackend)
                 assert backend.fa_impl_ver == 3 and not backend.use_mla
@@ -625,10 +631,15 @@ class Qwen3OmniMoeThinkerTextDecoderLayer(nn.Module):
     ) -> torch.Tensor:
         record_operands = (
             self.operator_recorder is not None
-            and forward_batch.forward_mode.is_decode()
+            and self.operator_recorder.records(
+                forward_batch.forward_mode.is_decode(),
+                forward_batch.forward_mode.is_extend(),
+            )
         )
         if record_operands:
-            self.operator_recorder.begin(positions)
+            self.operator_recorder.begin(
+                positions, forward_batch.forward_mode.is_extend()
+            )
             self.operator_recorder.record("input_contribution", hidden_states)
             previous_residual = residual_batch.written_residual(forward_batch)
             if previous_residual is not None:

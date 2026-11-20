@@ -349,7 +349,10 @@ class Qwen3OmniMoeTalkerSparseMoeBlock(Qwen3OmniMoeThinkerTextSparseMoeBlock):
         shared_gate, _ = self.shared_expert_gate(linear_hidden_states)
         record_operands = (
             self.operator_recorder is not None
-            and forward_batch.forward_mode.is_decode()
+            and self.operator_recorder.records(
+                forward_batch.forward_mode.is_decode(),
+                forward_batch.forward_mode.is_extend(),
+            )
         )
         if record_operands:
             self.operator_recorder.record("shared_before_gate", shared_output)
@@ -361,6 +364,13 @@ class Qwen3OmniMoeTalkerSparseMoeBlock(Qwen3OmniMoeThinkerTextSparseMoeBlock):
         # --- Routed experts (no all-reduce yet) ---
         router_logits, _ = self.gate(linear_hidden_states)
         topk_output = self.topk(linear_hidden_states, router_logits)
+        if record_operands and self.operator_recorder.is_recording_prefill:
+            self.operator_recorder.record("routed_expert_ids", topk_output.topk_ids)
+            self.operator_recorder.record(
+                "routed_expert_weights", topk_output.topk_weights
+            )
+        else:
+            pass
         routed_output = self.experts(linear_hidden_states, topk_output)
         if record_operands:
             self.operator_recorder.record("router_logits", router_logits)
@@ -864,11 +874,17 @@ class Qwen3OmniTalker(nn.Module):
             or os.environ.get("OMNI_WITNESS_HELD_INPUT_DIRECTORY") is not None
         ):
             step_counter = torch.zeros((), dtype=torch.int64, device=device)
+            prefill_token_index = (
+                torch.zeros(1, dtype=torch.int64, device=device)
+                if os.environ.get("OMNI_WITNESS_TRACE_PREFILL_TOKEN") == "1"
+                else None
+            )
             for layer_index, layer in enumerate(self.model.layers):
                 recorder = LayerOperandRecorder(
                     step_counter=step_counter,
                     capture_attention_geometry=audit_native_attention
                     and layer_index == 0,
+                    prefill_token_index=prefill_token_index,
                 )
                 self.backbone_recorders.append(recorder)
                 layer.operator_recorder = recorder

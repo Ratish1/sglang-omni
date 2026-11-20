@@ -103,12 +103,22 @@ class QwenTalkerModelRunner(ModelRunner["SGLangARRequestData"]):
             ),
         )
         for row_index, request in enumerate(requests):
-            if is_witness(request.request_id):
+            control = witness_control(request.request_id)
+            if control is not None:
                 assert input_embeds_are_projected
                 assert forward_batch.extend_prefix_lens_cpu[row_index] == 0
                 sequence_lengths = forward_batch.extend_seq_lens_cpu
                 start_token = sum(sequence_lengths[:row_index])
                 end_token = start_token + sequence_lengths[row_index]
+                if "prefill_probe_token_index" in control:
+                    opening_layer = self.model.backbone_recorders[0]
+                    assert opening_layer.prefill_token_index is not None
+                    token_index = control["prefill_probe_token_index"]
+                    assert 0 <= token_index < sequence_lengths[row_index]
+                    opening_layer.prefill_token_index.fill_(start_token + token_index)
+                    opening_layer.step_counter.add_(1)
+                else:
+                    pass
                 parameters = request.data.req.sampling_params
                 record_boundary(
                     request.request_id,
@@ -374,6 +384,19 @@ class QwenTalkerModelRunner(ModelRunner["SGLangARRequestData"]):
             return
         else:
             pass
+        for request in requests:
+            control = witness_control(request.request_id)
+            if control is not None and "prefill_probe_token_index" in control:
+                step = int(self.model.backbone_recorders[0].step_counter)
+                snapshots = [
+                    recorder.read(step, 0) for recorder in self.model.backbone_recorders
+                ]
+                with (Path(control["output_directory"]) / "prefill-layers.pt").open(
+                    "xb"
+                ) as output:
+                    torch.save(snapshots, output)
+            else:
+                pass
         layer0_codes = result.next_token_ids
         if layer0_codes.ndim == 1:
             layer0_codes = layer0_codes.unsqueeze(1)
