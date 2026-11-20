@@ -8,7 +8,7 @@ from statistics import median
 from unittest.mock import patch
 
 import torch
-from flashinfer.autotuner import AutoTuner
+from flashinfer.autotuner import AutoTuner, OptimizationProfile
 
 from scripts.debug_qwen3_omni_peer_shape import read_weights
 from scripts.debug_qwen3_omni_prefill_prefix import (
@@ -27,6 +27,51 @@ def difference(first: torch.Tensor, second: torch.Tensor) -> dict[str, int | flo
     }
 
 
+def capture_replay(
+    expert_operands: tuple[
+        torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor
+    ],
+    profile_ids: list[int],
+    eager_output: torch.Tensor,
+) -> torch.cuda.CUDAGraph:
+    replay_graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(replay_graph):
+        graph_output = routed_experts(*expert_operands, tactics=profile_ids)
+    replay_graph.replay()
+    assert torch.equal(graph_output, eager_output)
+    return replay_graph
+
+
+def measure_replays(
+    graphs: dict[str, torch.cuda.CUDAGraph],
+    replays_per_observation: int,
+    paired_blocks: int,
+) -> dict[str, int | dict[str, list[float]] | dict[str, float]]:
+    timings_microseconds: dict[str, list[float]] = {
+        trial_name: [] for trial_name in graphs
+    }
+    names = tuple(graphs)
+    for trial_name in (*names, *reversed(names)) * paired_blocks:
+        start = torch.cuda.Event(enable_timing=True)
+        stop = torch.cuda.Event(enable_timing=True)
+        start.record()
+        for _ in range(replays_per_observation):
+            graphs[trial_name].replay()
+        stop.record()
+        stop.synchronize()
+        timings_microseconds[trial_name].append(
+            start.elapsed_time(stop) * 1000 / replays_per_observation
+        )
+    return {
+        "replays_per_observation": replays_per_observation,
+        "microseconds_per_replay": timings_microseconds,
+        "median_microseconds_per_replay": {
+            trial_name: median(values)
+            for trial_name, values in timings_microseconds.items()
+        },
+    }
+
+
 @torch.inference_mode()
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
@@ -37,9 +82,12 @@ def main() -> None:
     parser.add_argument("--gpu-id", type=int, required=True)
     parser.add_argument("--timing-replays", type=int, default=0)
     parser.add_argument("--timing-blocks", type=int, default=8)
+    parser.add_argument("--find-fastest-equivalent-peer-gemm1", action="store_true")
     arguments = parser.parse_args()
     if arguments.timing_replays < 0 or arguments.timing_blocks < 1:
         parser.error("Use a nonnegative replay count and a positive block count")
+    elif arguments.find_fastest_equivalent_peer_gemm1 and not arguments.timing_replays:
+        parser.error("Equivalent tactic search requires replay timing")
     else:
         pass
     torch.cuda.set_device(arguments.gpu_id)
@@ -77,6 +125,7 @@ def main() -> None:
     target_ranges = {}
     tactic_pairs = {}
     sequences = {}
+    valid_peer_profiles: list[int] = []
     for name, trace_directory in (
         ("serial", arguments.serial_trace),
         ("peers", arguments.peer_trace),
@@ -123,6 +172,23 @@ def main() -> None:
             int(choose_profile(*call.args, **call.kwargs)[1])
             for call in choices.call_args_list
         ]
+        if name == "peers" and arguments.find_fastest_equivalent_peer_gemm1:
+            first_call = choices.call_args_list[0]
+            _, (runner,), _, tuning_inputs = first_call.args
+            runner.gemm_idx_for_tuning = 1
+            optimization_profile = OptimizationProfile(
+                shapes=[
+                    list(tensor.shape) if tensor is not None else [0]
+                    for tensor in tuning_inputs
+                ],
+                tensor_initializers=[None] * len(tuning_inputs),
+            )
+            valid_peer_profiles = runner.get_valid_tactics(
+                tuning_inputs, optimization_profile
+            )
+            assert tactic_pairs[name][0] in valid_peer_profiles
+        else:
+            pass
 
     assert all(
         torch.equal(a[target_indices["serial"]], b[target_indices["peers"]])
@@ -173,12 +239,7 @@ def main() -> None:
                 "explicit_reference",
                 "swap_first_projection",
             ):
-                replay_graph = torch.cuda.CUDAGraph()
-                with torch.cuda.graph(replay_graph):
-                    graph_output = routed_experts(*operands[name], tactics=pair)
-                replay_graph.replay()
-                assert torch.equal(graph_output, result)
-                timed_graphs[trial_name] = replay_graph
+                timed_graphs[trial_name] = capture_replay(operands[name], pair, result)
             else:
                 pass
         assert trials["explicit_reference"]["vs_native"]["changed_elements"] == 0
@@ -189,28 +250,42 @@ def main() -> None:
             "trials": trials,
         }
         if timed_graphs:
-            timings_microseconds: dict[str, list[float]] = {
-                trial_name: [] for trial_name in timed_graphs
-            }
-            names = tuple(timed_graphs)
-            for trial_name in (*names, *reversed(names)) * arguments.timing_blocks:
-                start = torch.cuda.Event(enable_timing=True)
-                stop = torch.cuda.Event(enable_timing=True)
-                start.record()
-                for _ in range(arguments.timing_replays):
-                    timed_graphs[trial_name].replay()
-                stop.record()
-                stop.synchronize()
-                timings_microseconds[trial_name].append(
-                    start.elapsed_time(stop) * 1000 / arguments.timing_replays
+            effects[name]["graph_replay_timing"] = measure_replays(
+                timed_graphs, arguments.timing_replays, arguments.timing_blocks
+            )
+        else:
+            pass
+        if name == "peers" and valid_peer_profiles:
+            assert alternate_first in valid_peer_profiles
+            raw_tokens = sum(sequences[name])
+            anchor_output = routed_experts(
+                *operands[name], tactics=[alternate_first, native_second]
+            )
+            search_results = {}
+            for profile_id in valid_peer_profiles:
+                pair = [profile_id, native_second]
+                output = routed_experts(*operands[name], tactics=pair)
+                live_difference = difference(
+                    output[:raw_tokens], anchor_output[:raw_tokens]
                 )
-            effects[name]["graph_replay_timing"] = {
-                "replays_per_observation": arguments.timing_replays,
-                "microseconds_per_replay": timings_microseconds,
-                "median_microseconds_per_replay": {
-                    trial_name: median(values)
-                    for trial_name, values in timings_microseconds.items()
-                },
+                result = {"vs_anchor_live_prefix": live_difference}
+                if live_difference["changed_elements"] == 0:
+                    candidate = capture_replay(operands[name], pair, output)
+                    result["graph_replay_timing"] = measure_replays(
+                        {
+                            "native": timed_graphs["explicit_reference"],
+                            "candidate": candidate,
+                        },
+                        arguments.timing_replays,
+                        arguments.timing_blocks,
+                    )
+                else:
+                    pass
+                search_results[profile_id] = result
+            effects[name]["equivalent_gemm1_search"] = {
+                "anchor_gemm1_profile": alternate_first,
+                "native_gemm2_profile": native_second,
+                "profile_results": search_results,
             }
         else:
             pass

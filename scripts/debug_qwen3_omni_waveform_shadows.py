@@ -49,9 +49,10 @@ def main() -> None:
     native_transposed_convolution = incremental_codec.channels_last_conv_transpose1d
     module_names = {module: name for name, module in scheduler.model.named_modules()}
     operator_differences = {}
-    _, solo_activation, _ = decode_projection(scheduler, codes[:1])
+    _, solo_activation, solo_waveform = decode_projection(scheduler, codes[:1])
     _, _, expected_output = decode_projection(scheduler, codes, solo_activation[0])
     profiler_operands: list[torch.Tensor] = []
+    replaces_target_row = False
 
     def convolution_with_shadow(
         hidden_states: torch.Tensor,
@@ -64,9 +65,12 @@ def main() -> None:
         solo_output = native_convolution(
             hidden_states[:1], convolution, weight, bias, samples
         )
-        operator_differences[module_names[convolution]] = difference(
-            output[:1], solo_output
-        )
+        if replaces_target_row:
+            output[:1].copy_(solo_output)
+        else:
+            operator_differences[module_names[convolution]] = difference(
+                output[:1], solo_output
+            )
         return output
 
     def transposed_convolution_with_shadow(
@@ -80,14 +84,17 @@ def main() -> None:
             hidden_states[:1], convolution, weight, bias
         )
         name = module_names[convolution]
-        operator_differences[name] = difference(output[:1], solo_output)
-        if name == RESIDUAL_CONVOLUTION:
-            assert bias is None
-            profiler_operands.extend(
-                (hidden_states.clone(), output[:1].clone(), solo_output.clone())
-            )
+        if replaces_target_row:
+            output[:1].copy_(solo_output)
         else:
-            pass
+            operator_differences[name] = difference(output[:1], solo_output)
+            if name == RESIDUAL_CONVOLUTION:
+                assert bias is None
+                profiler_operands.extend(
+                    (hidden_states.clone(), output[:1].clone(), solo_output.clone())
+                )
+            else:
+                pass
         return output
 
     with (
@@ -101,7 +108,10 @@ def main() -> None:
         ),
     ):
         _, _, observed_output = decode_projection(scheduler, codes, solo_activation[0])
+        replaces_target_row = True
+        _, _, corrected_output = decode_projection(scheduler, codes, solo_activation[0])
     assert torch.equal(observed_output, expected_output)
+    assert torch.equal(corrected_output[1:], expected_output[1:])
     peer_input, peer_output, solo_output = profiler_operands
     convolution = scheduler.model.get_submodule(RESIDUAL_CONVOLUTION)
     assert isinstance(convolution, torch.nn.ConvTranspose1d)
@@ -142,6 +152,9 @@ def main() -> None:
                 "request_id": cold_window["request_id"],
                 "conv_with_held_row": operator_differences,
                 "profiled_convolution": RESIDUAL_CONVOLUTION,
+                "waveform_with_held_projection_and_convolutions": difference(
+                    corrected_output[:1], solo_waveform
+                ),
                 "profile": profiler_report,
             },
             sort_keys=True,
