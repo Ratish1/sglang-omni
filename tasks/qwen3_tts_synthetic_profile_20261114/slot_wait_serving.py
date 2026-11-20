@@ -8,17 +8,24 @@ chunk. After the round, one streaming request on the idle server (no later relea
 waiter then). A request that should finish must return audio within REQUEST_TIMEOUT_S. After every round
 the vocoder's own codec stats must show no active slot and no waiting stream.
 
-usage: python3 slot_wait_serving.py --tree TREE --card N --out DIR [--slots 1] [--rounds 6]
+With --sustained SECONDS the round is instead continuous arrivals: stream clients that each send a new stream as
+the last ends, and a whole request every SUSTAINED_WHOLE_INTERVAL_S, so freed slots meet first chunks while whole
+requests wait. Every request must finish, and the summary gives the whole requests' latencies.
+
+usage: python3 slot_wait_serving.py --tree TREE --card N --out DIR [--slots 1] [--rounds 6] [--sustained SECONDS]
 """
 
 import argparse
 import base64
+import contextlib
 import json
 import os
 import signal
+import statistics
 import subprocess
 import sys
 import time
+from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -43,6 +50,8 @@ HEALTH_TIMEOUT_S = 900
 ROUND_MIX = (("stream", 16), ("whole", 2), ("cancel_before_audio", 6), ("drop_after_first_chunk", 3))
 CANCEL_FIRST_S = 0.05
 CANCEL_STEP_S = 0.1
+SUSTAINED_STREAM_CLIENTS = 8
+SUSTAINED_WHOLE_INTERVAL_S = 1.0
 
 
 def request_body(model: str, kind: str, index: int, tree: Path) -> dict:
@@ -150,11 +159,9 @@ def wait_healthy(url: str, server: subprocess.Popen) -> None:
     raise TimeoutError("server never became healthy")
 
 
-def serve_rounds(
-    tree: Path, model: str, card: int, port: int, server_args: list[str], rounds: int, out: Path,
-    should_accept_refusals: bool,
-    round_mix: tuple[tuple[str, int], ...],
-) -> bool:
+@contextlib.contextmanager
+def served(tree: Path, model: str, card: int, port: int, server_args: list[str], out: Path) -> Iterator[str]:
+    """A healthy server for model on card, stopped by its process group on exit."""
     url = f"http://127.0.0.1:{port}"
     command = [
         "taskset", "-c", card_cpus(card), sys.executable, "-m", "sglang_omni.cli", "serve",
@@ -162,7 +169,6 @@ def serve_rounds(
         "--tts_engine.gpu", str(card), "--vocoder.gpu", str(card), *server_args,
     ]
     out.mkdir(parents=True, exist_ok=True)
-    is_ok = True
     with (out / f"{model}_serve.log").open("w") as log:
         server = subprocess.Popen(
             command, cwd=tree, env={**os.environ, "PYTHONPATH": str(tree), "SGLANG_OMNI_STRICT_PORT": "1"},
@@ -170,6 +176,70 @@ def serve_rounds(
         )
     try:
         wait_healthy(url, server)
+        yield url
+    finally:
+        if server.poll() is None:
+            os.killpg(server.pid, signal.SIGTERM)
+            try:
+                server.wait(timeout=120)
+            except subprocess.TimeoutExpired:
+                os.killpg(server.pid, signal.SIGKILL)
+                server.wait()
+        else:
+            pass
+
+
+def serve_sustained(tree: Path, model: str, card: int, port: int, server_args: list[str], seconds: float, out: Path) -> bool:
+    """Stream clients that restart as each stream ends and a whole request every SUSTAINED_WHOLE_INTERVAL_S, for seconds."""
+    with served(tree, model, card, port, server_args, out) as url:
+        deadline = time.monotonic() + seconds
+
+        def stream_client(client_index: int) -> list[dict]:
+            results: list[dict] = []
+            while time.monotonic() < deadline:
+                body = request_body(model, "stream", client_index + len(results), tree)
+                results.append(run_request(url, body, "stream"))
+            return results
+
+        whole_count = int(seconds / SUSTAINED_WHOLE_INTERVAL_S) + 1
+        with ThreadPoolExecutor(max_workers=SUSTAINED_STREAM_CLIENTS + whole_count) as pool:
+            stream_futures = [pool.submit(stream_client, index) for index in range(SUSTAINED_STREAM_CLIENTS)]
+            whole_futures = []
+            while time.monotonic() < deadline:
+                body = request_body(model, "whole", len(whole_futures), tree)
+                whole_futures.append(pool.submit(run_request, url, body, "whole"))
+                time.sleep(SUSTAINED_WHOLE_INTERVAL_S)
+            streams = [result for future in stream_futures for result in future.result()]
+            wholes = [future.result() for future in whole_futures]
+        followup = run_request(url, request_body(model, "stream", 0, tree), "stream")
+        time.sleep(1)
+        stats = codec_state(url)
+    failures = [r for r in [*streams, *wholes, followup] if r["outcome"] != "complete" or r["samples"] == 0]
+    whole_seconds = sorted(r["total_s"] for r in wholes)
+    is_ok = not failures and stats.get("active_slots") == 0
+    record = {
+        "model": model, "sustained_s": seconds, "ok": is_ok, "failures": failures, "streams": len(streams),
+        "whole_total_s": whole_seconds, "followup": followup, "codec_state": stats,
+    }
+    with (out / "sustained.jsonl").open("a") as handle:
+        handle.write(json.dumps(record) + "\n")
+    print(
+        f"{time.strftime('%T')} {model} sustained ok={is_ok} streams={len(streams)} wholes={len(wholes)} "
+        f"whole_median_s={statistics.median(whole_seconds):.2f} whole_max_s={whole_seconds[-1]:.2f} "
+        f"active={stats.get('active_slots')} exhausted={stats.get('exhausted')} "
+        f"fallbacks={stats.get('left_context_fallbacks')} failures={len(failures)}",
+        flush=True,
+    )
+    return is_ok
+
+
+def serve_rounds(
+    tree: Path, model: str, card: int, port: int, server_args: list[str], rounds: int, out: Path,
+    should_accept_refusals: bool,
+    round_mix: tuple[tuple[str, int], ...],
+) -> bool:
+    is_ok = True
+    with served(tree, model, card, port, server_args, out) as url:
         kinds = [kind for kind, count in round_mix for _ in range(count)]
         for round_index in range(rounds):
             deadlines = {}
@@ -209,16 +279,6 @@ def serve_rounds(
                 f"fallbacks={stats.get('left_context_fallbacks')} refusals={len(refusals)} failures={len(failures)}",
                 flush=True,
             )
-    finally:
-        if server.poll() is None:
-            os.killpg(server.pid, signal.SIGTERM)
-            try:
-                server.wait(timeout=120)
-            except subprocess.TimeoutExpired:
-                os.killpg(server.pid, signal.SIGKILL)
-                server.wait()
-        else:
-            pass
     return is_ok
 
 
@@ -251,9 +311,27 @@ def main() -> None:
         "--abort-wave", type=int, default=0,
         help="instead of the mixed round, this many clients at once that each drop after the first chunk and send a new stream",
     )
+    parser.add_argument(
+        "--sustained", type=float, default=0.0,
+        help="instead of rounds, this many seconds of continuous stream and whole arrivals on the few-slot server",
+    )
     parser.add_argument("--models", nargs="+", choices=sorted(MODELS), default=list(MODELS))
     args = parser.parse_args()
-    if args.abort_wave > 0:
+    if args.sustained > 0:
+        few_slot_args = [
+            "--tts_engine.engine.max_running_requests", "16",
+            "--vocoder.factory.codec_state_slots", str(args.slots),
+        ]
+        results = {
+            model: serve_sustained(
+                args.tree, model, args.card, args.port + 200 * index, [*few_slot_args, *args.server_arg],
+                args.sustained, args.out,
+            )
+            for index, model in enumerate(args.models)
+        }
+        print(f"{time.strftime('%T')} slot_wait_serving {'PASS' if all(results.values()) else 'FAIL'} {results}", flush=True)
+        return
+    elif args.abort_wave > 0:
         server_args: list[str] = []
         round_mix: tuple[tuple[str, int], ...] = (("drop_then_stream", args.abort_wave),)
     elif args.burst > 0:
