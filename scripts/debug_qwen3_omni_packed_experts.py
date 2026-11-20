@@ -5,16 +5,35 @@ import argparse
 import json
 from pathlib import Path
 from statistics import median
+from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
 import torch
 from flashinfer.autotuner import AutoTuner, OptimizationProfile
+from sglang.srt.distributed.parallel_state import (
+    destroy_distributed_environment,
+    destroy_model_parallel,
+    init_distributed_environment,
+    initialize_model_parallel,
+)
+from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
+from sglang.srt.layers.moe.moe_runner.triton_utils import override_config
+from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe import fused_experts
+from sglang.srt.layers.moe.topk import StandardTopKOutput
+from sglang.test.test_utils import publish_build_topology
 
 from scripts.debug_qwen3_omni_peer_shape import read_weights
 from scripts.debug_qwen3_omni_prefill_prefix import (
     compare_activation_store,
     routed_experts,
 )
+
+SGLANG_FIXED_MOE_TILES = {
+    "BLOCK_SIZE_M": 64,
+    "BLOCK_SIZE_N": 64,
+    "BLOCK_SIZE_K": 32,
+    "GROUP_SIZE_M": 8,
+}
 
 
 def difference(first: torch.Tensor, second: torch.Tensor) -> dict[str, int | float]:
@@ -83,11 +102,14 @@ def main() -> None:
     parser.add_argument("--timing-replays", type=int, default=0)
     parser.add_argument("--timing-blocks", type=int, default=8)
     parser.add_argument("--find-fastest-equivalent-peer-gemm1", action="store_true")
+    parser.add_argument("--sglang-fixed-tiles", action="store_true")
     arguments = parser.parse_args()
     if arguments.timing_replays < 0 or arguments.timing_blocks < 1:
         parser.error("Use a nonnegative replay count and a positive block count")
     elif arguments.find_fastest_equivalent_peer_gemm1 and not arguments.timing_replays:
         parser.error("Equivalent tactic search requires replay timing")
+    elif arguments.sglang_fixed_tiles and not arguments.timing_replays:
+        parser.error("Fixed-tile comparison requires replay timing")
     else:
         pass
     torch.cuda.set_device(arguments.gpu_id)
@@ -289,6 +311,80 @@ def main() -> None:
             }
         else:
             pass
+
+    if arguments.sglang_fixed_tiles:
+        assert all(full_prefix_inputs_equal.values())
+        up_weights, gate_weights = first_projection.chunk(2, dim=1)
+        triton_weights = torch.cat((gate_weights, up_weights), dim=1)
+        runner_config = MoeRunnerConfig(
+            num_experts=expert_count,
+            num_local_experts=expert_count,
+            inplace=False,
+            gate_up_interleaved=False,
+        )
+        with TemporaryDirectory() as rendezvous_directory:
+            init_distributed_environment(
+                world_size=1,
+                rank=0,
+                local_rank=arguments.gpu_id,
+                distributed_init_method=(Path(rendezvous_directory) / "rank").as_uri(),
+                backend="gloo",
+            )
+            publish_build_topology(tp_size=1, ep_size=1, pp_size=1)
+            initialize_model_parallel(backend="gloo")
+            try:
+                triton_outputs: dict[str, torch.Tensor] = {}
+                with override_config(SGLANG_FIXED_MOE_TILES.copy()):
+                    for name, expert_operands in operands.items():
+                        activation, expert_ids, routing_weights, _, _ = expert_operands
+                        assert activation.size(0) > 32
+                        live_rows = sum(sequences[name])
+                        topk = StandardTopKOutput(routing_weights, expert_ids, None)
+                        triton_output = fused_experts(
+                            activation,
+                            triton_weights,
+                            second_projection,
+                            topk,
+                            runner_config,
+                        )
+                        assert torch.isfinite(triton_output[:live_rows]).all()
+                        triton_outputs[name] = triton_output[
+                            target_ranges[name]
+                        ].clone()
+                        triton_graph = torch.cuda.CUDAGraph()
+                        with torch.cuda.graph(triton_graph):
+                            captured_output = fused_experts(
+                                activation,
+                                triton_weights,
+                                second_projection,
+                                topk,
+                                runner_config,
+                            )
+                        triton_graph.replay()
+                        assert torch.equal(
+                            captured_output[:live_rows], triton_output[:live_rows]
+                        )
+                        native_graph = capture_replay(
+                            expert_operands, tactic_pairs[name], outputs[name]
+                        )
+                        effects[name]["sglang_fixed_tiles"] = {
+                            "vs_sglang_serial": difference(
+                                triton_outputs[name], triton_outputs["serial"]
+                            ),
+                            "vs_native": difference(
+                                triton_outputs[name], outputs[name][target_ranges[name]]
+                            ),
+                            "timing": measure_replays(
+                                {"native": native_graph, "sglang": triton_graph},
+                                arguments.timing_replays,
+                                arguments.timing_blocks,
+                            ),
+                        }
+            finally:
+                destroy_model_parallel()
+                destroy_distributed_environment()
+    else:
+        pass
 
     print(
         json.dumps(
