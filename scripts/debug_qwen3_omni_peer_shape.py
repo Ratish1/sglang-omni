@@ -7,15 +7,14 @@ from itertools import accumulate
 from pathlib import Path
 
 import torch
+from flashinfer.autotuner import AutoTuner
+from flashinfer.fused_moe import cutlass_fused_moe
+from flashinfer.fused_moe.core import ActivationType
 from safetensors import safe_open
 from sgl_kernel import fused_add_rmsnorm
 from sglang.kernels.ops.attention.flash_attention import flash_attn_with_kvcache
+from sglang.srt.environ import envs
 from sglang.srt.layers.activation import silu_and_mul
-from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
-from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe import fused_experts
-from sglang.srt.layers.moe.topk import StandardTopKOutput
-from sglang.srt.runtime_context import publish
-from sglang.srt.server_args import ServerArgs
 from torch.nn import functional
 
 LAYER_PREFIX = "talker.model.layers.0"
@@ -90,7 +89,10 @@ def replay_expert_projections(
 
 
 def replay_routed_experts(
-    checkpoint: Path, first_layer: dict[str, torch.Tensor], token_index: int
+    checkpoint: Path,
+    first_layer: dict[str, torch.Tensor],
+    token_index: int,
+    autotune_cache: Path,
 ) -> None:
     config = json.loads((checkpoint / "config.json").read_bytes())["talker_config"][
         "text_config"
@@ -113,15 +115,13 @@ def replay_routed_experts(
                 f"mlp.experts.{expert}.{part}_proj" for part in ("gate", "up", "down")
             ),
         )
-        packed_up[expert] = torch.cat((gate, up))
+        # SGLang's unquantized CUTLASS loader stores up before gate in FC1.
+        packed_up[expert] = torch.cat((up, gate))
         packed_down[expert] = down
     (norm_weight,) = read_weights(checkpoint, ("post_attention_layernorm",))
-    args = ServerArgs(model_path="dummy", tp_size=1)
-    publish(args, role="test")
-    runner = MoeRunnerConfig(num_experts=expert_count, num_local_experts=expert_count)
+    AutoTuner.get().load_configs(str(autotune_cache))
     attention = first_layer["attention_output"].flatten().cuda()
     residual = first_layer["attention_residual"].flatten().cuda()
-    logits = first_layer["router_logits"].flatten().cuda()
     for token_count in TOKEN_COUNTS:
         contribution = attention.new_zeros((token_count, attention.numel()))
         residual_buffer = torch.zeros_like(contribution)
@@ -138,20 +138,27 @@ def replay_routed_experts(
             # tiles without reconstructing unavailable historical peer activations.
             inputs = source.roll(1).repeat(token_count, 1)
             inputs[token_index] = source
-            ids = peer_ids.repeat(token_count, 1)
+            ids = peer_ids.int().repeat(token_count, 1)
             ids[token_index] = expert_ids
-            weights = expert_weights.repeat(token_count, 1)
-            routed = fused_experts(
-                inputs,
-                packed_up,
-                packed_down,
-                StandardTopKOutput(weights, ids, logits.expand(token_count, -1)),
-                runner,
-            )[token_index]
+            weights = expert_weights.float().repeat(token_count, 1)
+            routed = cutlass_fused_moe(
+                input=inputs,
+                token_selected_experts=ids,
+                token_final_scales=weights,
+                fc1_expert_weights=packed_up,
+                fc2_expert_weights=packed_down,
+                output_dtype=inputs.dtype,
+                quant_scales=None,
+                output=torch.empty_like(inputs),
+                tune_max_num_tokens=8192,
+                activation_type=ActivationType.Swiglu,
+                use_fused_finalize=envs.SGLANG_FLASHINFER_MOE_FUSED_FINALIZE.get(),
+            )[0][token_index]
             print(
                 json.dumps(
                     {
                         "routed_token_count": token_count,
+                        "routed_backend": "flashinfer_cutlass",
                         "peers_share_target_experts": sharing,
                         "ffn_norm": report_difference(
                             contribution[token_index], source
@@ -179,7 +186,9 @@ def main() -> None:
     parser.add_argument("--prefix", type=Path, required=True)
     parser.add_argument("--layer", type=Path, required=True)
     parser.add_argument("--token-index", type=int, required=True)
+    parser.add_argument("--autotune-cache", type=Path, required=True)
     arguments = parser.parse_args()
+    assert arguments.autotune_cache.is_file(), arguments.autotune_cache
     prefix = torch.load(arguments.prefix, weights_only=True)
     first_layer = torch.load(arguments.layer, weights_only=True)[0]
     keys = prefix["key_rows"][0].cuda()
@@ -280,7 +289,12 @@ def main() -> None:
             flush=True,
         )
     replay_expert_projections(arguments.checkpoint, first_layer, arguments.token_index)
-    replay_routed_experts(arguments.checkpoint, first_layer, arguments.token_index)
+    replay_routed_experts(
+        arguments.checkpoint,
+        first_layer,
+        arguments.token_index,
+        arguments.autotune_cache,
+    )
 
 
 if __name__ == "__main__":
