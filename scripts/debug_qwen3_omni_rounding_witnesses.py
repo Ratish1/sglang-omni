@@ -25,6 +25,7 @@ from sglang_omni.models.qwen3_omni.boundary_witness import WitnessControl
 SEEDTTS_WITNESSES = (
     "common_voice_en_18229682-common_voice_en_18229679",
     "common_voice_en_21555942-common_voice_en_21555950",
+    "common_voice_en_19560742-common_voice_en_19560741",
     "common_voice_en_17256676-common_voice_en_17256678",
 )
 MMSU_WITNESS = "speech_stress_perception_f12a907a-291d-467a-9bbb-bd6ef2f2b09a"
