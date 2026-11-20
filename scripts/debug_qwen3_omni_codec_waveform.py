@@ -4,6 +4,7 @@
 import argparse
 import hashlib
 import json
+from contextlib import ExitStack
 from pathlib import Path
 from unittest.mock import patch
 
@@ -138,7 +139,18 @@ def capture_cold_window(
         record(f"{name}.output", output)
         return output
 
+    def record_convnext(
+        module: torch.nn.Module,
+        operands: tuple[torch.Tensor, ...],
+        output: torch.Tensor,
+    ) -> None:
+        (operand,) = operands
+        name = module_names[module]
+        record(f"{name}.input", operand)
+        record(f"{name}.output", output)
+
     with (
+        ExitStack() as hooks,
         patch.object(transformer, "projected_qkv", new=project_and_record),
         patch.object(transformer, "attend", new=attend_and_record),
         patch.object(transformer, "layer_output", new=layer_output_and_record),
@@ -152,6 +164,15 @@ def capture_cold_window(
             new=transposed_convolution_and_record,
         ),
     ):
+        for _, convnext in codec.model.upsample:
+            for module in (
+                convnext.dwconv.conv,
+                convnext.norm,
+                convnext.pwconv1,
+                convnext.act,
+                convnext.pwconv2,
+            ):
+                hooks.callback(module.register_forward_hook(record_convnext).remove)
         waveform = codec.decode_slots(
             codes,
             pool,
