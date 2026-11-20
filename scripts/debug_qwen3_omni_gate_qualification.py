@@ -5,6 +5,7 @@ import argparse
 import asyncio
 import hashlib
 import json
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -49,6 +50,7 @@ def main() -> None:
     )
     parser.add_argument("--score-only", action="store_true")
     parser.add_argument("--projection-control-build", type=Path)
+    parser.add_argument("--tactics-from", type=Path)
     arguments = parser.parse_args()
     if arguments.projection_control_build is None and "combined" in arguments.arms:
         parser.error("The combined arm requires --projection-control-build")
@@ -115,6 +117,13 @@ def generate(arguments: argparse.Namespace, run_directories: list[Path]) -> None
     else:
         patched_library = None
     tactic_cache_directory = output / "sglang-cache"
+    if arguments.tactics_from is not None:
+        shutil.copytree(
+            arguments.tactics_from / "flashinfer" / "autotune",
+            tactic_cache_directory / "flashinfer" / "autotune",
+        )
+    else:
+        pass
     reference_tactics = None
     for run_directory, arm in zip(run_directories, arguments.arms, strict=True):
         run_directory.mkdir()
