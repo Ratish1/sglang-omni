@@ -42,11 +42,18 @@ def main() -> None:
     parser.add_argument("--server-config", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument(
-        "--arms", choices=("baseline", "candidate"), nargs="+", required=True
+        "--arms",
+        choices=("baseline", "candidate", "gate", "combined"),
+        nargs="+",
+        required=True,
     )
     parser.add_argument("--score-only", action="store_true")
     parser.add_argument("--projection-control-build", type=Path)
     arguments = parser.parse_args()
+    if arguments.projection_control_build is None and "combined" in arguments.arms:
+        parser.error("The combined arm requires --projection-control-build")
+    else:
+        pass
     output = arguments.output.resolve()
     run_directories = [
         output / f"{index}-{arm}" for index, arm in enumerate(arguments.arms, 1)
@@ -114,11 +121,13 @@ def generate(arguments: argparse.Namespace, run_directories: list[Path]) -> None
         print(f"{run_directory.name}: starting native inference", flush=True)
         server_port = find_available_port()
         if projection_control_build is not None:
+            is_fixed_gate = arm in ("gate", "combined")
+            is_patched_cutlass = arm in ("candidate", "combined")
             server_environment = {
-                "OMNI_WITNESS_FIXED_SHARED_GATE": "0",
+                "OMNI_WITNESS_FIXED_SHARED_GATE": str(int(is_fixed_gate)),
                 "SGLANG_CACHE_DIR": str(tactic_cache_directory),
             }
-            if arm == "candidate":
+            if is_patched_cutlass:
                 server_environment["OMNI_WITNESS_CUTLASS_PROJECTION_SOURCE"] = str(
                     projection_control_build.parent / "csrc"
                 )
@@ -126,7 +135,7 @@ def generate(arguments: argparse.Namespace, run_directories: list[Path]) -> None
                 pass
         else:
             server_environment = {
-                "OMNI_WITNESS_FIXED_SHARED_GATE": str(int(arm == "candidate"))
+                "OMNI_WITNESS_FIXED_SHARED_GATE": str(int(arm in ("candidate", "gate")))
             }
         talker_server = start_server_from_cmd(
             [
@@ -162,7 +171,7 @@ def generate(arguments: argparse.Namespace, run_directories: list[Path]) -> None
                 )
                 assert mapped_libraries, "No native CUTLASS library mapped"
                 assert (str(patched_library) in mapped_libraries) == (
-                    arm == "candidate"
+                    is_patched_cutlass
                 )
                 tactic_files = sorted(
                     (tactic_cache_directory / "flashinfer" / "autotune").rglob(
@@ -185,7 +194,7 @@ def generate(arguments: argparse.Namespace, run_directories: list[Path]) -> None
                         {
                             "mapped_libraries": mapped_libraries,
                             "tactics": tactics,
-                            "fixed_shared_gate": False,
+                            "fixed_shared_gate": is_fixed_gate,
                         },
                         indent=2,
                     )
