@@ -4,11 +4,15 @@
 import argparse
 import json
 from pathlib import Path
+from unittest.mock import patch
 
 import torch
 import torch.nn.functional as F
 
-from scripts.debug_qwen3_omni_codec_waveform import load_native_scheduler
+from scripts.debug_qwen3_omni_codec_waveform import (
+    capture_cold_window,
+    load_native_scheduler,
+)
 from sglang_omni.models.qwen3_omni.components.code2wav_scheduler import (
     Code2WavScheduler,
 )
@@ -68,6 +72,7 @@ def main() -> None:
     parser.add_argument("--witness-directory", type=Path, required=True)
     parser.add_argument("--cold-window-report", type=Path, required=True)
     parser.add_argument("--gpu-id", type=int, required=True)
+    parser.add_argument("--trace-waveform-residual", action="store_true")
     arguments = parser.parse_args()
 
     scheduler = load_native_scheduler(
@@ -108,6 +113,36 @@ def main() -> None:
     assert torch.equal(peer_waveform[1:], restored_peer_waveform[1:])
 
     projection = scheduler.model.upsample[1][1].pwconv2
+    if arguments.trace_waveform_residual:
+        serial_boundaries = capture_cold_window(scheduler, codes[:1])
+        original_projection = projection.forward
+
+        def fixed_projection(hidden_states: torch.Tensor) -> torch.Tensor:
+            projected = original_projection(hidden_states)
+            projected[0].copy_(solo_output[0])
+            return projected
+
+        with patch.object(projection, "forward", new=fixed_projection):
+            restored_boundaries = capture_cold_window(scheduler, codes)
+        assert list(serial_boundaries) == list(restored_boundaries)
+        assert torch.equal(
+            restored_boundaries["waveform"], restored_peer_waveform[:1].cpu()
+        )
+        assert torch.equal(serial_boundaries["waveform"], solo_waveform.cpu())
+        print(
+            json.dumps(
+                {
+                    "request_id": cold_window["request_id"],
+                    "residual_boundaries": {
+                        name: difference(serial_boundaries[name], tensor)
+                        for name, tensor in restored_boundaries.items()
+                    },
+                }
+            )
+        )
+        return
+    else:
+        pass
     fp64_reference = F.linear(
         solo_input.double(), projection.weight.double(), projection.bias.double()
     )[0]
