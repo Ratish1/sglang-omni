@@ -1,0 +1,35 @@
+diff --git a/sglang_omni/preprocessing/video.py b/sglang_omni/preprocessing/video.py
+index 7847e311b..a695f0962 100644
+--- a/sglang_omni/preprocessing/video.py
++++ b/sglang_omni/preprocessing/video.py
+@@ -30,7 +30,7 @@ from sglang_omni.preprocessing.resource_connector import (
+ 
+ from .base import MediaIO, is_url
+ from .cache_key import compute_media_cache_key
+-from .resource_connector import await_media_cleanup
++from .resource_connector import await_media_cleanup, global_thread_pool
+ 
+ try:
+     from torchcodec.decoders import VideoDecoder
+@@ -255,7 +255,7 @@ async def ensure_video_list_async(
+             loop = asyncio.get_running_loop()
+             if not extract_audio:
+                 video_future = loop.run_in_executor(
+-                    resource_connector.executor, media_io.load_file, video_path
++                    global_thread_pool, media_io.load_file, video_path
+                 )
+ 
+                 async def cleanup_video_decoder() -> None:
+@@ -267,10 +267,10 @@ async def ensure_video_list_async(
+                     await await_media_cleanup(cleanup_video_decoder())
+             else:
+                 frames_future = loop.run_in_executor(
+-                    resource_connector.executor, media_io.load_path, video_path
++                    global_thread_pool, media_io.load_path, video_path
+                 )
+                 audio_future = loop.run_in_executor(
+-                    resource_connector.executor,
++                    global_thread_pool,
+                     extract_audio_from_path,
+                     video_path,
+                     audio_target_sr,

@@ -1,0 +1,28 @@
+diff --git a/sglang_omni/preprocessing/video.py b/sglang_omni/preprocessing/video.py
+index 7847e311b..f2e9ab87d 100644
+--- a/sglang_omni/preprocessing/video.py
++++ b/sglang_omni/preprocessing/video.py
+@@ -677,14 +677,16 @@ def load_video_path(
+             )
+         )
+ 
+-    slice_futures = [
+-        frame_pool.executor.submit(
+-            resize_frames,
+-            nframes * slice_index // slice_count,
+-            nframes * (slice_index + 1) // slice_count,
++    slice_futures = []
++    for slice_index in range(slice_count):
++        slice_futures.append(
++            frame_pool.executor.submit(
++                resize_frames,
++                nframes * slice_index // slice_count,
++                nframes * (slice_index + 1) // slice_count,
++            )
+         )
+-        for slice_index in range(slice_count)
+-    ]
++        slice_futures[-1].result()
+     wait(slice_futures)
+     for slice_future in slice_futures:
+         slice_future.result()

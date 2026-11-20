@@ -1,0 +1,13 @@
+diff --git a/sglang_omni/models/qwen3_omni/components/preprocessor.py b/sglang_omni/models/qwen3_omni/components/preprocessor.py
+index b5e8a3428..87010afab 100644
+--- a/sglang_omni/models/qwen3_omni/components/preprocessor.py
++++ b/sglang_omni/models/qwen3_omni/components/preprocessor.py
+@@ -903,7 +903,7 @@ class Qwen3OmniPreprocessor:
+         connector = MultiModalResourceConnector(
+             connection=connection,
+             executor=(
+-                global_thread_pool if video_lane is None else video_lane.media_executor
++                global_thread_pool
+             ),
+         )
+         loaders = [

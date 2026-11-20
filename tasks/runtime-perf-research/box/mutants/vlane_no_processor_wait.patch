@@ -1,0 +1,13 @@
+diff --git a/sglang_omni/models/qwen3_omni/components/preprocessor.py b/sglang_omni/models/qwen3_omni/components/preprocessor.py
+index b5e8a3428..42429bd6b 100644
+--- a/sglang_omni/models/qwen3_omni/components/preprocessor.py
++++ b/sglang_omni/models/qwen3_omni/components/preprocessor.py
+@@ -1068,7 +1068,7 @@ class Qwen3OmniPreprocessor:
+             try:
+                 video_cache_key = compute_video_cache_key(videos) if videos else None
+             finally:
+-                wait([processor_future])
++                pass
+             hf_inputs = processor_future.result()
+ 
+         input_ids = hf_inputs["input_ids"][0]
