@@ -512,7 +512,7 @@ def patch_preprocessor(module):
     call_impl = preprocessor.call_impl
 
     @functools.wraps(call_impl)
-    async def call_recorded(self, payload):
+    async def call_recorded(self, payload, *read_inputs):
         # note: a probe must not fail a request, so an input of another shape records no text
         try:
             content = payload.request.inputs["messages"][-1]["content"]
@@ -525,7 +525,7 @@ def patch_preprocessor(module):
                 "text": content[:300] if isinstance(content, str) else None,
             }
         )
-        return await call_impl(self, payload)
+        return await call_impl(self, payload, *read_inputs)
 
     preprocessor.call_impl = call_recorded
 
