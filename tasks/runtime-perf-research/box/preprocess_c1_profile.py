@@ -44,8 +44,7 @@ def run_one(threads: int, decode_threads: int) -> dict[str, object]:
         max_seq_len=32768,
         video_decode_threads=decode_threads,
     )
-    processor = scheduler.fn.processor
-    processor_class = type(processor)
+    processor_class = preprocessor_mod.Qwen3OmniMoeProcessor
     call_processor = processor_class.__call__
 
     def timed_processor(self, *args, **kwargs):
