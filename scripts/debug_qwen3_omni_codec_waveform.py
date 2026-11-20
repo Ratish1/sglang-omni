@@ -29,6 +29,24 @@ from sglang_omni.models.qwen3_omni.components.codec_state_pool import (
 )
 
 
+def load_native_scheduler(
+    server_config: Path, model_path: str, gpu_id: int
+) -> Code2WavScheduler:
+    torch.cuda.set_device(gpu_id)
+    config = ConfigManager.from_file(
+        str(server_config), model_path_override=model_path
+    ).config
+    assert config is not None
+    stage = config.stage_named("code2wav")
+    factory_parameters = resolve_stage_factory_args(stage, config, gpu_id=gpu_id)
+    scheduler = create_code2wav_scheduler(**factory_parameters)
+    graph_runner = scheduler.cuda_graph_runner
+    assert graph_runner is not None and graph_runner.enabled
+    assert scheduler.incremental_codec is not None
+    scheduler.on_serving_start()
+    return scheduler
+
+
 def capture_cold_window(
     scheduler: Code2WavScheduler, codes: torch.Tensor
 ) -> dict[str, torch.Tensor]:
@@ -225,20 +243,11 @@ def main() -> None:
     parser.add_argument("--gpu-id", type=int, required=True)
     parser.add_argument("--cold-window-boundaries", action="store_true")
     arguments = parser.parse_args()
-    torch.cuda.set_device(arguments.gpu_id)
-    config = ConfigManager.from_file(
-        str(arguments.server_config), model_path_override=arguments.model_path
-    ).config
-    assert config is not None
-    stage = config.stage_named("code2wav")
-    factory_parameters = resolve_stage_factory_args(
-        stage, config, gpu_id=arguments.gpu_id
+    scheduler = load_native_scheduler(
+        arguments.server_config, arguments.model_path, arguments.gpu_id
     )
-    scheduler = create_code2wav_scheduler(**factory_parameters)
     graph_runner = scheduler.cuda_graph_runner
-    assert graph_runner is not None and graph_runner.enabled
-    assert scheduler.incremental_codec is not None
-    scheduler.on_serving_start()
+    assert graph_runner is not None
     directory = arguments.witness_directory
     manifests = json.loads((directory / "witnesses.json").read_bytes())
     captured = json.loads((directory / "codec-histories.json").read_bytes())
@@ -377,7 +386,12 @@ def main() -> None:
     print(
         json.dumps(
             {
-                "code2wav_factory": factory_parameters,
+                "code2wav_shape": {
+                    "codec_state_slots": scheduler.codec_pool.num_slots,
+                    "gpu_id": scheduler.device.index,
+                    "new_frames_per_window": scheduler.stream_chunk_size,
+                    "talker_in_process": scheduler.decode_stream is not None,
+                },
                 "dtype": str(scheduler.model.dtype),
                 "uses_paged_attention": scheduler.incremental_codec.is_paged_attention,
                 "runs": runs,
