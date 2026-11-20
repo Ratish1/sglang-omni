@@ -119,7 +119,7 @@ def controlled_history(
 ) -> tuple[list[torch.Tensor], list[torch.Tensor], bool]:
     frames = [
         torch.load(path, weights_only=True)["codec_ids"].reshape(-1)
-        for path in sorted(trace_directory.glob("codec-*.pt"))
+        for path in sorted(trace_directory.glob("codec-[0-9][0-9][0-9].pt"))
     ]
     text_rows = []
     for path in sorted(trace_directory.glob("backbone-decode-*.pt")):
@@ -256,9 +256,15 @@ def main() -> None:
     parser.add_argument("--held-input", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--transfer-from", type=Path)
+    parser.add_argument("--score-existing", action="store_true")
     arguments = parser.parse_args()
     output = arguments.output.resolve()
-    output.mkdir()
+    if arguments.score_existing:
+        assert (output / "manifest.json").is_file()
+        assert not (output / "generation.jsonl").exists()
+        assert not (output / "scored.jsonl").exists()
+    else:
+        output.mkdir()
     cases = select_cases(arguments.h200_history, arguments.h100_history)
     donor_population = arguments.transfer_from
     donor_rows = {}
@@ -298,13 +304,15 @@ def main() -> None:
         improving = sorted(entry for entry in eligible if entry[0] < 0)[:2]
         selected = {sample_id for _, sample_id in (*worsening, *improving)}
         cases = [case for case in cases if case["sample_id"] in selected]
-    (output / "manifest.json").write_text(json.dumps(cases, indent=2) + "\n")
-    samples = load_seedtts_samples(DATASETS["seedtts"])
-    assert len(samples) == EXPECTED_SEEDTTS_SAMPLES
-    samples_by_id = {sample.sample_id: sample for sample in samples}
+    if arguments.score_existing:
+        assert json.loads((output / "manifest.json").read_bytes()) == cases
+    else:
+        (output / "manifest.json").write_text(json.dumps(cases, indent=2) + "\n")
+        samples = load_seedtts_samples(DATASETS["seedtts"])
+        assert len(samples) == EXPECTED_SEEDTTS_SAMPLES
+        samples_by_id = {sample.sample_id: sample for sample in samples}
     control_path = output / "control.json"
-    control_path.write_text('{"request_id": ""}\n')
-    for scope in scopes:
+    for scope in () if arguments.score_existing else scopes:
         control_path.write_text('{"request_id": ""}\n')
         talker_port = find_available_port()
         talker_server = start_server_from_cmd(
