@@ -36,6 +36,34 @@ SGLANG_FIXED_MOE_TILES = {
 }
 
 
+def load_cutlass_expert_weights(
+    checkpoint: Path, device: torch.device
+) -> tuple[torch.Tensor, torch.Tensor]:
+    config = json.loads((checkpoint / "config.json").read_bytes())["talker_config"][
+        "text_config"
+    ]
+    input_width = config["hidden_size"]
+    expert_width = config["moe_intermediate_size"]
+    expert_count = config["num_experts"]
+    first_projection = torch.empty(
+        expert_count, 2 * expert_width, input_width, dtype=torch.bfloat16, device=device
+    )
+    second_projection = torch.empty(
+        expert_count, input_width, expert_width, dtype=torch.bfloat16, device=device
+    )
+    for expert_index in range(expert_count):
+        gate, up, down = read_weights(
+            checkpoint,
+            tuple(
+                f"mlp.experts.{expert_index}.{projection}_proj"
+                for projection in ("gate", "up", "down")
+            ),
+        )
+        first_projection[expert_index] = torch.cat((up, gate))
+        second_projection[expert_index] = down
+    return first_projection, second_projection
+
+
 def difference(first: torch.Tensor, second: torch.Tensor) -> dict[str, int | float]:
     assert first.shape == second.shape
     delta = first.float() - second.float()
@@ -114,28 +142,10 @@ def main() -> None:
         pass
     torch.cuda.set_device(arguments.gpu_id)
     device = torch.device("cuda", arguments.gpu_id)
-    config = json.loads((arguments.checkpoint / "config.json").read_bytes())[
-        "talker_config"
-    ]["text_config"]
-    input_width = config["hidden_size"]
-    expert_width = config["moe_intermediate_size"]
-    expert_count = config["num_experts"]
-    first_projection = torch.empty(
-        expert_count, 2 * expert_width, input_width, dtype=torch.bfloat16, device=device
+    first_projection, second_projection = load_cutlass_expert_weights(
+        arguments.checkpoint, device
     )
-    second_projection = torch.empty(
-        expert_count, input_width, expert_width, dtype=torch.bfloat16, device=device
-    )
-    for expert_index in range(expert_count):
-        gate, up, down = read_weights(
-            arguments.checkpoint,
-            tuple(
-                f"mlp.experts.{expert_index}.{projection}_proj"
-                for projection in ("gate", "up", "down")
-            ),
-        )
-        first_projection[expert_index] = torch.cat((up, gate))
-        second_projection[expert_index] = down
+    expert_count = first_projection.size(0)
 
     tuner = AutoTuner.get()
     tuner.load_configs(str(arguments.autotune_cache))
