@@ -97,6 +97,30 @@ def row_difference(
     }
 
 
+def routed_experts(
+    inputs: torch.Tensor,
+    expert_ids: torch.Tensor,
+    weights: torch.Tensor,
+    fc1: torch.Tensor,
+    fc2: torch.Tensor,
+    tactics: list[int] | None = None,
+) -> torch.Tensor:
+    return cutlass_fused_moe(
+        input=inputs,
+        token_selected_experts=expert_ids,
+        token_final_scales=weights,
+        fc1_expert_weights=fc1,
+        fc2_expert_weights=fc2,
+        output_dtype=inputs.dtype,
+        output=torch.empty_like(inputs),
+        quant_scales=None,
+        tune_max_num_tokens=8192,
+        activation_type=ActivationType.Swiglu,
+        use_fused_finalize=envs.SGLANG_FLASHINFER_MOE_FUSED_FINALIZE.get(),
+        profile_ids=tactics,
+    )[0]
+
+
 @torch.inference_mode()
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
@@ -105,6 +129,8 @@ def main() -> None:
     parser.add_argument("--serial", type=Path, required=True)
     parser.add_argument("--historical-peer", type=Path, required=True)
     parser.add_argument("--autotune-cache", type=Path, required=True)
+    parser.add_argument("--gemm1-tactics", type=int, nargs=2)
+    parser.add_argument("--gemm2-tactic", type=int)
     args = parser.parse_args()
     state = torch.load(args.input, weights_only=True)
     serial = torch.load(args.serial, weights_only=True)
@@ -202,19 +228,7 @@ def main() -> None:
             text["num_experts_per_tok"],
             text["norm_topk_prob"],
         )
-        routed = cutlass_fused_moe(
-            input=ffn_input,
-            token_selected_experts=ids,
-            token_final_scales=weights,
-            fc1_expert_weights=packed_fc1,
-            fc2_expert_weights=packed_fc2,
-            output_dtype=ffn_input.dtype,
-            output=torch.empty_like(ffn_input),
-            quant_scales=None,
-            tune_max_num_tokens=8192,
-            activation_type=ActivationType.Swiglu,
-            use_fused_finalize=envs.SGLANG_FLASHINFER_MOE_FUSED_FINALIZE.get(),
-        )[0]
+        routed = routed_experts(ffn_input, ids, weights, packed_fc1, packed_fc2)
         block = routed + shared
         next_input = block.clone()
         fused_add_rmsnorm(next_input, x, next_norm, epsilon)
@@ -234,6 +248,42 @@ def main() -> None:
         }
         if physical_count == 160:
             serial_stages = {name: value.clone() for name, value in stages.items()}
+        else:
+            pass
+        if args.gemm1_tactics and physical_count in (1536, 1792):
+            assert args.gemm2_tactic is not None
+            for gemm1 in args.gemm1_tactics:
+                tactics = [gemm1, args.gemm2_tactic]
+                kernel_args = (ffn_input, ids, weights, packed_fc1, packed_fc2, tactics)
+                result = routed_experts(*kernel_args)
+                with torch.profiler.profile(
+                    activities=[torch.profiler.ProfilerActivity.CUDA]
+                ) as profile:
+                    routed_experts(*kernel_args)
+                    torch.cuda.synchronize()
+                kernels = sorted(
+                    {
+                        event.name
+                        for event in profile.events()
+                        if "gemm" in event.name.lower()
+                    }
+                )
+                print(
+                    json.dumps(
+                        {
+                            "tactic_swap_shape": physical_count,
+                            "tactics": tactics,
+                            "against_auto": row_difference(
+                                result[target], routed[target]
+                            ),
+                            "against_replayed_160": row_difference(
+                                result[target], serial_stages["routed_output"]
+                            ),
+                            "gemm_kernel_names": kernels,
+                        }
+                    ),
+                    flush=True,
+                )
         else:
             pass
         comparisons = (
