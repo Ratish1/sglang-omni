@@ -526,7 +526,13 @@ class QwenTalkerModelRunner(ModelRunner["SGLangARRequestData"]):
             layer_trials: list[list[dict[str, torch.Tensor]]] = []
             alternative_write_rows: list[torch.Tensor] = []
             capture_gate_cache = carry_gate_cache and frame_index == GATE_DONOR_FRAME
-            for use_alternative in (False, True, False):
+            carry_prefix = intervention == "prefix" and control.get(
+                "carry_paired_prefix", False
+            )
+            trial_order = (
+                (False, True, False, True) if carry_prefix else (False, True, False)
+            )
+            for use_alternative in trial_order:
                 fixed_gate_switch.fill_(intervention == "gate" and use_alternative)
                 self.model.feedback_mask.copy_(feedback_mask)
                 for buffer, write_rows in zip(
@@ -571,10 +577,17 @@ class QwenTalkerModelRunner(ModelRunner["SGLangARRequestData"]):
                         for recorder in self.model.backbone_recorders
                     ]
                 )
-            first, alternative, repeated = decode_results
+            first, alternative, repeated = decode_results[:3]
             assert all(
                 torch.equal(first[name], repeated[name]) for name in first
             ), "Same-state reference replay was not exact"
+            if carry_prefix:
+                assert all(
+                    torch.equal(alternative[name], decode_results[3][name])
+                    for name in alternative
+                ), "Repeated alternative-prefix replay was not exact"
+            else:
+                pass
             if capture_gate_cache:
                 assert all(
                     torch.equal(first[name][row_index], alternative[name][row_index])
@@ -596,6 +609,7 @@ class QwenTalkerModelRunner(ModelRunner["SGLangARRequestData"]):
                     "row_index": row_index,
                     "active_rows": len(requests),
                     "captured_rows": captured_rows,
+                    "carried_alternative_prefix": carry_prefix,
                     "reference_logits": first["logits"][row_index],
                     "alternative_logits": alternative["logits"][row_index],
                     "reference_codes": first["codes"][row_index],

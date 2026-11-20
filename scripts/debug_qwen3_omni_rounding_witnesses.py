@@ -80,6 +80,7 @@ def run_rounding_witnesses(
     stock_prefix_directory: Path | None = None,
     prefix_donor_request_count: int = 1,
     carry_gate_cache: bool = False,
+    carry_paired_prefix: bool = False,
     seedtts_witness_ids: list[str] | None = None,
     prefill_probe_token_index: int | None = None,
 ) -> None:
@@ -148,6 +149,7 @@ def run_rounding_witnesses(
                                 / f"witness-{prefix_donor_request_count}-{witness_id}"
                             ).resolve(strict=True)
                         )
+                        control["carry_paired_prefix"] = carry_paired_prefix
                         paired_files = ("paired-prefix-001.pt",)
                     pending_control = control_path.with_suffix(".pending")
                     pending_control.write_text(json.dumps(control))

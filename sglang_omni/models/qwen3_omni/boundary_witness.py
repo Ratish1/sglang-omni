@@ -23,6 +23,7 @@ class WitnessControl(TypedDict):
     paired_gate_frames: NotRequired[list[int]]
     paired_gate_kv: NotRequired[bool]
     paired_stock_prefix_directory: NotRequired[str]
+    carry_paired_prefix: NotRequired[bool]
 
 
 def witness_control(request_id: str) -> WitnessControl | None:

@@ -84,6 +84,7 @@ def main() -> None:
     parser.add_argument("--seedtts-request-profile", action="store_true")
     parser.add_argument("--paired-stock-prefix-directory", type=Path)
     parser.add_argument("--paired-prefix-donor-concurrency", type=int, default=1)
+    parser.add_argument("--carry-paired-prefix", action="store_true")
     parser.add_argument("--paired-gate-kv", action="store_true")
     arguments = parser.parse_args()
     if arguments.seedtts_speed_only and (
@@ -159,6 +160,12 @@ def main() -> None:
         pass
     if arguments.paired_gate_kv and arguments.paired_stock_prefix_directory is None:
         parser.error("Gate KV crossover needs paired decode")
+    elif arguments.carry_paired_prefix and (
+        arguments.paired_stock_prefix_directory is None
+        or not arguments.seedtts_witness_id
+        or arguments.paired_gate_kv
+    ):
+        parser.error("Carrying the alternative prefix needs explicit SeedTTS witnesses")
     else:
         pass
     if arguments.paired_stock_prefix_directory is not None and (
@@ -438,6 +445,7 @@ def generate(arguments: argparse.Namespace, run_directories: list[Path]) -> None
                     stock_prefix_directory=arguments.paired_stock_prefix_directory,
                     prefix_donor_request_count=arguments.paired_prefix_donor_concurrency,
                     carry_gate_cache=arguments.paired_gate_kv,
+                    carry_paired_prefix=arguments.carry_paired_prefix,
                     seedtts_witness_ids=arguments.seedtts_witness_id,
                     prefill_probe_token_index=arguments.prefill_probe_token_index,
                 )
