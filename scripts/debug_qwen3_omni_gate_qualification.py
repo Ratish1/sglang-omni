@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Run paired native BF16 SeedTTS and MMSU speech without trace hooks."""
+"""Check native BF16 prefill and qualify SeedTTS and MMSU speech."""
 
 import argparse
 import asyncio
@@ -19,6 +19,10 @@ from benchmarks.eval.benchmark_omni_mmsu import run as run_mmsu
 from benchmarks.tasks.asr import (
     QWEN3_ASR_MODEL_PATH,
     compute_text_audio_consistency_from_records,
+)
+from scripts.debug_qwen3_omni_prefill_gate_controls import (
+    capture_prefill_gate_controls,
+    verify_prefill_gate_controls,
 )
 from scripts.debug_qwen3_omni_rounding_witnesses import (
     run_rounding_witnesses,
@@ -48,7 +52,14 @@ def main() -> None:
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument(
         "--arms",
-        choices=("baseline", "candidate", "gate", "combined"),
+        choices=(
+            "baseline",
+            "baseline-eager",
+            "candidate",
+            "gate",
+            "prefill-gate",
+            "combined",
+        ),
         nargs="+",
         required=True,
     )
@@ -56,9 +67,25 @@ def main() -> None:
     parser.add_argument("--projection-control-build", type=Path)
     parser.add_argument("--tactics-from", type=Path)
     parser.add_argument("--rounding-witnesses", action="store_true")
+    parser.add_argument("--prefill-gate-controls", action="store_true")
     parser.add_argument("--paired-stock-prefix-directory", type=Path)
     parser.add_argument("--paired-gate-kv", action="store_true")
     arguments = parser.parse_args()
+    if arguments.prefill_gate_controls and (
+        arguments.arms != ["baseline", "baseline-eager", "prefill-gate"]
+        or arguments.rounding_witnesses
+    ):
+        parser.error("Prefill controls require baseline baseline-eager prefill-gate")
+    elif "baseline-eager" in arguments.arms and not arguments.prefill_gate_controls:
+        parser.error("Eager prefill is only used as a targeted control")
+    elif (
+        "prefill-gate" in arguments.arms and arguments.projection_control_build is None
+    ):
+        parser.error(
+            "Prefill gate qualification requires the CUTLASS provider manifest"
+        )
+    else:
+        pass
     if arguments.projection_control_build is None and "combined" in arguments.arms:
         parser.error("The combined arm requires --projection-control-build")
     else:
@@ -81,6 +108,11 @@ def main() -> None:
         generate(arguments, run_directories)
     else:
         assert all(directory.is_dir() for directory in run_directories)
+    if arguments.prefill_gate_controls:
+        verify_prefill_gate_controls(output)
+        return
+    else:
+        pass
     score(
         arguments.asr_path,
         output,
@@ -147,8 +179,9 @@ def generate(arguments: argparse.Namespace, run_directories: list[Path]) -> None
     else:
         pass
     reference_tactics = None
+    reference_stock_libraries = None
     witness_control_path = output / "witness-control.json"
-    if arguments.rounding_witnesses:
+    if arguments.rounding_witnesses or arguments.prefill_gate_controls:
         witness_control_path.write_text('{"request_id": ""}\n')
     else:
         pass
@@ -157,10 +190,14 @@ def generate(arguments: argparse.Namespace, run_directories: list[Path]) -> None
         print(f"{run_directory.name}: starting native inference", flush=True)
         server_port = find_available_port()
         if projection_control_build is not None:
-            is_fixed_gate = arm in ("gate", "combined")
+            gate_scope = (
+                "prefill"
+                if arm == "prefill-gate"
+                else str(int(arm in ("gate", "combined")))
+            )
             is_patched_cutlass = arm in ("candidate", "combined")
             server_environment = {
-                "OMNI_WITNESS_FIXED_SHARED_GATE": str(int(is_fixed_gate)),
+                "OMNI_WITNESS_FIXED_SHARED_GATE": gate_scope,
                 "SGLANG_CACHE_DIR": str(tactic_cache_directory),
             }
             if is_patched_cutlass:
@@ -173,9 +210,13 @@ def generate(arguments: argparse.Namespace, run_directories: list[Path]) -> None
             server_environment = {
                 "OMNI_WITNESS_FIXED_SHARED_GATE": str(int(arm in ("candidate", "gate")))
             }
-        if arguments.rounding_witnesses:
+        if arguments.rounding_witnesses or arguments.prefill_gate_controls:
             server_environment["OMNI_WITNESS_BATCH_CONTROL"] = str(witness_control_path)
             server_environment["OMNI_WITNESS_NATIVE_KV_AUDIT"] = "1"
+            if arguments.prefill_gate_controls:
+                server_environment["OMNI_WITNESS_TRACE_PREFILL_TOKEN"] = "1"
+            else:
+                pass
             if arguments.paired_stock_prefix_directory is not None:
                 server_environment["OMNI_WITNESS_PAIRED_DECODE"] = "1"
             else:
@@ -193,6 +234,11 @@ def generate(arguments: argparse.Namespace, run_directories: list[Path]) -> None
                 arguments.model_path,
                 "--model-name",
                 "qwen3-omni",
+                *(
+                    ["--talker_ar.engine.cuda_graph_backend_prefill", "disabled"]
+                    if arm == "baseline-eager"
+                    else []
+                ),
             ],
             run_directory / "talker.log",
             server_port,
@@ -218,6 +264,13 @@ def generate(arguments: argparse.Namespace, run_directories: list[Path]) -> None
                 assert (str(patched_library) in mapped_libraries) == (
                     is_patched_cutlass
                 )
+                if reference_stock_libraries is None:
+                    assert not is_patched_cutlass
+                    reference_stock_libraries = mapped_libraries
+                elif not is_patched_cutlass:
+                    assert mapped_libraries == reference_stock_libraries
+                else:
+                    pass
                 tactic_files = sorted(
                     (tactic_cache_directory / "flashinfer" / "autotune").rglob(
                         "rank_*.json"
@@ -239,7 +292,8 @@ def generate(arguments: argparse.Namespace, run_directories: list[Path]) -> None
                         {
                             "mapped_libraries": mapped_libraries,
                             "tactics": tactics,
-                            "fixed_shared_gate": is_fixed_gate,
+                            "fixed_shared_gate": gate_scope != "0",
+                            "shared_gate_scope": gate_scope,
                         },
                         indent=2,
                     )
@@ -251,6 +305,13 @@ def generate(arguments: argparse.Namespace, run_directories: list[Path]) -> None
                     assert (
                         tactics == reference_tactics
                     ), "Native tactic selections changed"
+            else:
+                pass
+            if arguments.prefill_gate_controls:
+                capture_prefill_gate_controls(
+                    server_port, run_directory, witness_control_path
+                )
+                continue
             else:
                 pass
             if arguments.rounding_witnesses:

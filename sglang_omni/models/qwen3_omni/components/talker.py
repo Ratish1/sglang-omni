@@ -13,6 +13,7 @@ import torch
 from sglang.kernels.fused_op import get_fused_op_backend
 from sglang.kernels.spec import KernelBackend
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.model_executor.runner_utils.capture_mode import get_is_capture_mode
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.runtime_context import get_context, get_schedule
@@ -341,12 +342,17 @@ class Qwen3OmniMoeTalkerSparseMoeBlock(Qwen3OmniMoeThinkerTextSparseMoeBlock):
             quant_config=None,
             prefix=add_prefix("shared_expert_gate", prefix),
         )
-        self.use_fixed_shared_expert_gate = (
-            os.environ.get("OMNI_WITNESS_FIXED_SHARED_GATE") == "1"
-            and HAS_SHARED_GATE_TRITON
+        self.fixed_shared_gate_scope = os.environ.get(
+            "OMNI_WITNESS_FIXED_SHARED_GATE", "0"
+        )
+        if not (
+            HAS_SHARED_GATE_TRITON
             and current_platform.is_cuda()
             and config.hidden_size == SHARED_GATE_HIDDEN_SIZE
-        )
+        ):
+            self.fixed_shared_gate_scope = "0"
+        else:
+            pass
 
     def forward(
         self,
@@ -382,7 +388,13 @@ class Qwen3OmniMoeTalkerSparseMoeBlock(Qwen3OmniMoeThinkerTextSparseMoeBlock):
             shared_gate = torch.where(
                 self.witness_fixed_gate_switch, fixed_gate, stock_gate
             )
-        elif self.use_fixed_shared_expert_gate and can_use_fixed_gate:
+        elif can_use_fixed_gate and (
+            self.fixed_shared_gate_scope == "1"
+            or (
+                self.fixed_shared_gate_scope == "prefill"
+                and forward_batch.forward_mode == ForwardMode.EXTEND
+            )
+        ):
             shared_gate = project_shared_expert_gate(
                 linear_hidden_states, self.shared_expert_gate.weight
             )
