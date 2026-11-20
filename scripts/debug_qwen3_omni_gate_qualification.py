@@ -75,6 +75,7 @@ def main() -> None:
     parser.add_argument("--projection-control-build", type=Path)
     parser.add_argument("--tactics-from", type=Path)
     parser.add_argument("--rounding-witnesses", action="store_true")
+    parser.add_argument("--seedtts-witness-id", action="append")
     parser.add_argument("--prefill-gate-controls", action="store_true")
     parser.add_argument("--profile-prefill-samples", type=int)
     parser.add_argument("--seedtts-speed-only", action="store_true")
@@ -98,6 +99,13 @@ def main() -> None:
         parser.error("Request profiling requires --seedtts-speed-only")
     else:
         pass
+    if arguments.seedtts_witness_id and (
+        not arguments.rounding_witnesses
+        or arguments.paired_stock_prefix_directory is not None
+    ):
+        parser.error("Select SeedTTS IDs only for uncrossed rounding witnesses")
+    else:
+        pass
     if arguments.profile_prefill_samples is not None and (
         not 0 < arguments.profile_prefill_samples <= SEEDTTS_SAMPLE_COUNT
         or arguments.prefill_gate_controls
@@ -113,7 +121,9 @@ def main() -> None:
         or arguments.rounding_witnesses
     ):
         parser.error("Prefill controls require baseline baseline-eager prefill-gate")
-    elif "baseline-eager" in arguments.arms and not arguments.prefill_gate_controls:
+    elif "baseline-eager" in arguments.arms and not (
+        arguments.prefill_gate_controls or arguments.seedtts_witness_id
+    ):
         parser.error("Eager prefill is only used as a targeted control")
     elif (
         "prefill-gate" in arguments.arms and arguments.projection_control_build is None
@@ -400,6 +410,7 @@ def generate(arguments: argparse.Namespace, run_directories: list[Path]) -> None
                     CLIENT_CONCURRENCY,
                     stock_prefix_directory=arguments.paired_stock_prefix_directory,
                     carry_gate_cache=arguments.paired_gate_kv,
+                    seedtts_witness_ids=arguments.seedtts_witness_id,
                 )
                 continue
             else:

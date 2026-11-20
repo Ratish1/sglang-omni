@@ -19,7 +19,10 @@ from benchmarks.metrics.accuracy import extract_answer_letter
 from benchmarks.metrics.wer import SampleOutput
 from benchmarks.tasks.asr import apply_wer, load_qwen3_asr, transcribe
 from benchmarks.tasks.audio_understanding import _build_request_payload
-from scripts.debug_qwen3_omni_norm_population import post_seedtts_sample
+from scripts.debug_qwen3_omni_norm_population import (
+    controlled_history,
+    post_seedtts_sample,
+)
 from sglang_omni.models.qwen3_omni.boundary_witness import WitnessControl
 
 SEEDTTS_WITNESSES = (
@@ -40,6 +43,7 @@ TRACE_BOUNDARIES = (
     "backbone-prefill",
     "first-decode-prefix-cache",
     "backbone-decode",
+    "decode-sampling",
     "codec",
 )
 GEOMETRY_FIELDS = {
@@ -75,12 +79,16 @@ def run_rounding_witnesses(
     *,
     stock_prefix_directory: Path | None = None,
     carry_gate_cache: bool = False,
+    seedtts_witness_ids: list[str] | None = None,
 ) -> None:
     seedtts_samples = load_seedtts_samples(SEEDTTS_DATASET_ID)
     endpoint = f"http://127.0.0.1:{server_port}/v1/chat/completions"
     results: list[WitnessResult] = []
+    codec_histories: dict[str, list[list[int]]] = {}
     paired_results = []
-    if stock_prefix_directory is None:
+    if seedtts_witness_ids:
+        workloads = ((seedtts_samples, seedtts_witness_ids),)
+    elif stock_prefix_directory is None:
         workloads = (
             (seedtts_samples, SEEDTTS_WITNESSES),
             (mmsu_samples, (MMSU_WITNESS,)),
@@ -175,6 +183,14 @@ def run_rounding_witnesses(
                     message = response["choices"][0]["message"]
                     waveform = base64.b64decode(message["audio"]["data"])
                     (trace_directory / "speech.wav").write_bytes(waveform)
+                    if seedtts_witness_ids:
+                        frames, _, complete = controlled_history(trace_directory)
+                        assert complete and frames, request_id
+                        codec_histories[request_id] = [
+                            frame.tolist() for frame in frames
+                        ]
+                    else:
+                        pass
                     returned_text = message.get("content") or ""
                     if isinstance(witness_sample, SampleInput):
                         target_text = witness_sample.target_text
@@ -241,6 +257,12 @@ def run_rounding_witnesses(
                         flush=True,
                     )
     (run_directory / "witnesses.json").write_text(json.dumps(results, indent=2) + "\n")
+    if codec_histories:
+        (run_directory / "codec-histories.json").write_text(
+            json.dumps(codec_histories) + "\n"
+        )
+    else:
+        pass
     if stock_prefix_directory is not None:
         (run_directory / "paired-decode.json").write_text(
             json.dumps(paired_results, indent=2) + "\n"
