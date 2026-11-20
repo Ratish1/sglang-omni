@@ -4,13 +4,17 @@
 import argparse
 import json
 from pathlib import Path
+from unittest.mock import patch
 
 import torch
 
 from scripts.debug_qwen3_omni_codec_waveform import load_native_scheduler
 from scripts.debug_qwen3_omni_convnext_projection import difference
 from sglang_omni.models.qwen3_omni.components.code2wav import Qwen3OmniIncrementalCodec
-from sglang_omni.models.qwen3_omni.components.codec_state_pool import CodecStatePool
+from sglang_omni.models.qwen3_omni.components.codec_state_pool import (
+    CodecStatePool,
+    RingAddresses,
+)
 
 
 def snapshot(
@@ -54,7 +58,9 @@ def main() -> None:
     parser.add_argument("--server-config", type=Path, required=True)
     parser.add_argument("--model-path", required=True)
     parser.add_argument("--witness-directory", type=Path, required=True)
-    parser.add_argument("--cold-window-report", type=Path, required=True)
+    request_selection = parser.add_mutually_exclusive_group(required=True)
+    request_selection.add_argument("--cold-window-report", type=Path)
+    request_selection.add_argument("--request-id", action="append")
     parser.add_argument("--gpu-id", type=int, required=True)
     arguments = parser.parse_args()
 
@@ -64,11 +70,16 @@ def main() -> None:
     codec = scheduler.incremental_codec
     pool = scheduler.codec_pool
     assert codec is not None and pool is not None
-    cold_report = json.loads(arguments.cold_window_report.read_bytes())
     codec_histories = json.loads(
         (arguments.witness_directory / "codec-histories.json").read_bytes()
     )
-    request_ids = cold_report["peer_request_ids"]
+    if arguments.cold_window_report is not None:
+        cold_report = json.loads(arguments.cold_window_report.read_bytes())
+        request_ids = cold_report["peer_request_ids"]
+    else:
+        cold_report = None
+        request_ids = arguments.request_id
+    assert len(request_ids) >= 2 and len(set(request_ids)) == len(request_ids)
     frame_rows = [
         torch.tensor(
             codec_histories[request_id],
@@ -87,7 +98,10 @@ def main() -> None:
     initial_codes = torch.stack(
         [frames[:first_frame_count].T for frames in frame_rows]
     ).contiguous()
-    assert list(initial_codes.shape) == cold_report["code_shape"]
+    if cold_report is not None:
+        assert list(initial_codes.shape) == cold_report["code_shape"]
+    else:
+        pass
     pool.zero_slots(pool.stage_index(slots))
     serial_window(codec, pool, initial_codes, slots, first_decode=True)
     slot_count = len(slots)
@@ -112,6 +126,28 @@ def main() -> None:
     windows = []
     window_frames = scheduler.stream_chunk_size
     final_frame = max(len(frames) - 1 for frames in frame_rows)
+    transformer = codec.model.pre_transformer
+    transform = transformer.forward_slot_frames
+    transformer_outputs: list[torch.Tensor] = []
+
+    def capture_transformer(
+        inputs_embeds: torch.Tensor,
+        pool: CodecStatePool,
+        addresses: RingAddresses,
+        *,
+        first_decode: bool,
+        is_paged_attention: bool,
+    ) -> torch.Tensor:
+        hidden_states = transform(
+            inputs_embeds,
+            pool,
+            addresses,
+            first_decode=first_decode,
+            is_paged_attention=is_paged_attention,
+        )
+        transformer_outputs.append(hidden_states.clone())
+        return hidden_states
+
     for start_frame in range(first_frame_count, final_frame, window_frames):
         end_frame = start_frame + window_frames
         active_slots = [
@@ -130,30 +166,47 @@ def main() -> None:
             [frame_rows[slot][start_frame:end_frame].T for slot in active_slots]
         ).contiguous()
         before = snapshot(state_views)
-        solo_waveforms = serial_window(
-            codec, pool, codes, active_slots, first_decode=False
-        )
-        serial_after = snapshot(state_views)
-        restore(state_views, before)
-        peer_waveforms = codec.decode_slots(
-            codes, pool, pool.stage_index(active_slots), first_decode=False
-        )
-        peer_after = snapshot(state_views)
-        restore(state_views, before)
-        repeated_waveforms = serial_window(
-            codec, pool, codes, active_slots, first_decode=False
+        transformer_outputs.clear()
+        with patch.object(
+            transformer, "forward_slot_frames", side_effect=capture_transformer
+        ):
+            solo_waveforms = serial_window(
+                codec, pool, codes, active_slots, first_decode=False
+            )
+            serial_after = snapshot(state_views)
+            restore(state_views, before)
+            peer_waveforms = codec.decode_slots(
+                codes, pool, pool.stage_index(active_slots), first_decode=False
+            )
+            peer_after = snapshot(state_views)
+            restore(state_views, before)
+            repeated_waveforms = serial_window(
+                codec, pool, codes, active_slots, first_decode=False
+            )
+        assert pool.frame_positions[active_slots].tolist() == [end_frame] * len(
+            active_slots
         )
         assert torch.equal(solo_waveforms, repeated_waveforms)
         assert all(
             torch.equal(tensor, serial_after[name])
             for name, tensor in state_views.items()
         )
+        active_count = len(active_slots)
+        assert len(transformer_outputs) == 2 * active_count + 1
+        solo_transformer_output = torch.cat(transformer_outputs[:active_count])
+        assert torch.equal(
+            solo_transformer_output, torch.cat(transformer_outputs[active_count + 1 :])
+        )
+        peer_transformer_output = transformer_outputs[active_count]
         windows.append(
             {
                 "start_frame": start_frame,
                 "end_frame": end_frame,
                 "rows": {
                     request_ids[slot]: {
+                        "transformer": difference(
+                            solo_transformer_output[row], peer_transformer_output[row]
+                        ),
                         "waveform": difference(
                             solo_waveforms[row], peer_waveforms[row]
                         ),
