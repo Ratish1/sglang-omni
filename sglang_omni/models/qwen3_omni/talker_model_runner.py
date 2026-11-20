@@ -143,7 +143,12 @@ class QwenTalkerModelRunner(ModelRunner["SGLangARRequestData"]):
 
         self.model.prepare_decode_buffers(requests)
         if self.model.backbone_recorders:
-            self.model.backbone_recorders[0].step_counter.add_(1)
+            opening_layer = self.model.backbone_recorders[0]
+            opening_layer.step_counter.add_(1)
+            if opening_layer.use_input_norm_override is not None:
+                opening_layer.use_input_norm_override.fill_(False)
+            else:
+                pass
         else:
             pass
         for row_index, request in enumerate(requests):
@@ -257,6 +262,21 @@ class QwenTalkerModelRunner(ModelRunner["SGLangARRequestData"]):
             "text_row"
         ].reshape(-1)
         self.model.feedback_buffer[row_index].copy_(combined_embedding)
+        opening_layer = self.model.backbone_recorders[0]
+        if opening_layer.input_norm_override is not None:
+            input_norm = self.model.model.layers[0].input_layernorm
+            assert input_norm.weight.dtype == combined_embedding.dtype
+            hidden_states = combined_embedding.float()
+            variance = hidden_states.pow(2).mean(-1, keepdim=True)
+            normalized = hidden_states * torch.rsqrt(
+                variance + input_norm.variance_epsilon
+            )
+            opening_layer.input_norm_override.copy_(
+                input_norm.weight * normalized.to(combined_embedding.dtype)
+            )
+            opening_layer.use_input_norm_override.fill_(True)
+        else:
+            pass
         for buffer, name in (
             (self.model.sampling_seeds, "seed"),
             (self.model.sampling_temperatures, "temperature"),

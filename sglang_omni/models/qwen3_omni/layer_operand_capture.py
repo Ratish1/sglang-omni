@@ -9,6 +9,8 @@ import torch
 @dataclass(kw_only=True)
 class LayerOperandRecorder:
     step_counter: torch.Tensor
+    input_norm_override: torch.Tensor | None = None
+    use_input_norm_override: torch.Tensor | None = None
     graph_snapshots: list[dict[str, torch.Tensor]] = field(default_factory=list)
     eager_snapshot: dict[str, torch.Tensor] = field(default_factory=dict)
     current_snapshot: dict[str, torch.Tensor] = field(default_factory=dict)

@@ -865,6 +865,16 @@ class Qwen3OmniTalker(nn.Module):
                 layer.operator_recorder = recorder
                 layer.self_attn.operator_recorder = recorder
                 layer.mlp.operator_recorder = recorder
+            if os.environ.get("OMNI_WITNESS_SWAP_FIRST_NORM") == "1":
+                opening_layer = self.backbone_recorders[0]
+                opening_layer.input_norm_override = torch.empty_like(
+                    self.model.feedback_buffer[0]
+                )
+                opening_layer.use_input_norm_override = torch.zeros(
+                    (), dtype=torch.bool, device=device
+                )
+            else:
+                pass
         else:
             pass
         hidden_size = config.text_config.hidden_size

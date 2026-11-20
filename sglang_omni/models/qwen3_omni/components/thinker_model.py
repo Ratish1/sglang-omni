@@ -617,6 +617,17 @@ class Qwen3OmniMoeThinkerTextDecoderLayer(nn.Module):
             **kwargs,
         )
         if record_operands:
+            if self.operator_recorder.input_norm_override is not None:
+                self.operator_recorder.record(
+                    "attention_normalized_before_override", hidden_states
+                )
+                hidden_states = torch.where(
+                    self.operator_recorder.use_input_norm_override,
+                    self.operator_recorder.input_norm_override,
+                    hidden_states,
+                )
+            else:
+                pass
             self.operator_recorder.record("attention_normalized", hidden_states)
             self.operator_recorder.record(
                 "attention_residual", residual_batch.written_residual(forward_batch)
