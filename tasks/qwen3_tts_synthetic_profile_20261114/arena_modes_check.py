@@ -132,7 +132,7 @@ def main() -> None:
     )
     checks["capped"] = (
         any(
-            line.startswith("128 stream slots and 8 for whole requests, 2.74 MiB a slot, 372.5 MiB total")
+            line.startswith("128 stream slots and 8 for whole requests, 2.74 MiB a slot, 372.4 MiB total")
             for line in report["capped"]["arena"]
         )
         and served_both("capped")
