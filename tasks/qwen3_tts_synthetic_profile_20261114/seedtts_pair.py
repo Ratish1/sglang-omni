@@ -17,6 +17,8 @@ import sys
 import time
 from pathlib import Path
 
+import httpx
+
 from served_baseline import MODELS, wait_healthy
 
 ASR_MODEL = "Qwen/Qwen3-ASR-1.7B"
@@ -190,6 +192,14 @@ def run_order(
             for arm, summary in summaries.items():
                 (out / f"order{order}" / arm / f"{cell}.json").write_text(json.dumps(summary, indent=1))
             print(f"{time.strftime('%T')} order {order} {cell} done", flush=True)
+        for arm in arms:
+            # note (ratish): the vocoder's codec counters after every cell, window and tail replays among them.
+            try:
+                info = httpx.get(f"http://127.0.0.1:{ports[arm]}/model_info", timeout=30).json()
+            except httpx.HTTPError as error:
+                print(f"{time.strftime('%T')} order {order} {arm} model_info failed: {error}", flush=True)
+            else:
+                (out / f"order{order}" / arm / "model_info.json").write_text(json.dumps(info, indent=1))
     finally:
         for server in servers.values():
             stop(server)
