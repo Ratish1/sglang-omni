@@ -5,17 +5,162 @@ import argparse
 import hashlib
 import json
 from pathlib import Path
+from unittest.mock import patch
 
 import numpy as np
 import torch
+from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import (
+    Qwen3OmniMoeCode2WavTransformerLayer,
+)
 
 from sglang_omni.client.audio import encode_wav
 from sglang_omni.config.manager import ConfigManager
 from sglang_omni.config.runtime import resolve_stage_factory_args
+from sglang_omni.models.qwen3_omni.components import incremental_codec
+from sglang_omni.models.qwen3_omni.components.code2wav import FusedCode2WavTransformer
 from sglang_omni.models.qwen3_omni.components.code2wav_scheduler import (
     Code2WavScheduler,
     create_code2wav_scheduler,
 )
+from sglang_omni.models.qwen3_omni.components.codec_state_pool import (
+    CodecStatePool,
+    RingAddresses,
+)
+
+
+def capture_cold_window(
+    scheduler: Code2WavScheduler, codes: torch.Tensor
+) -> dict[str, torch.Tensor]:
+    """Capture real cold-window boundaries without changing the decoder's operands."""
+    codec = scheduler.incremental_codec
+    pool = scheduler.codec_pool
+    assert codec is not None and pool is not None
+    transformer = codec.model.pre_transformer
+    assert isinstance(transformer, FusedCode2WavTransformer)
+    row_count = codes.size(0)
+    slot_indices = pool.stage_index(list(range(row_count)))
+    unobserved_waveform = codec.decode_slots(
+        codes, pool, slot_indices, first_decode=True
+    )
+    boundaries: dict[str, torch.Tensor] = {}
+    layer_indices = {
+        layer: index for index, layer in enumerate(transformer.transformer.layers)
+    }
+    module_names = {module: name for name, module in codec.model.named_modules()}
+    project = transformer.projected_qkv
+    attend = transformer.attend
+    layer_output = transformer.layer_output
+    slot_forward = transformer.forward_slot_frames
+    convolution = incremental_codec.channels_last_conv1d
+    transposed_convolution = incremental_codec.channels_last_conv_transpose1d
+
+    def record(name: str, tensor: torch.Tensor) -> None:
+        assert name not in boundaries, name
+        assert tensor.size(0) % row_count == 0, (name, tensor.shape)
+        boundaries[name] = tensor[: tensor.size(0) // row_count].detach().cpu()
+
+    def project_and_record(
+        layer: Qwen3OmniMoeCode2WavTransformerLayer, hidden_states: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        layer_name = f"transformer.{layer_indices[layer]}"
+        record(f"{layer_name}.input", hidden_states)
+        query, key, value = project(layer, hidden_states)
+        for operand_name, tensor in zip(
+            ("query", "key", "value"), (query, key, value), strict=True
+        ):
+            record(f"{layer_name}.{operand_name}", tensor)
+        return query, key, value
+
+    def attend_and_record(
+        layer: Qwen3OmniMoeCode2WavTransformerLayer,
+        query: torch.Tensor,
+        keys: torch.Tensor,
+        values: torch.Tensor,
+        window_mask: torch.Tensor | None,
+    ) -> torch.Tensor:
+        layer_name = f"transformer.{layer_indices[layer]}"
+        record(f"{layer_name}.rotary_query", query)
+        record(f"{layer_name}.rotary_key", keys)
+        attended = attend(layer, query, keys, values, window_mask)
+        record(f"{layer_name}.attention", attended)
+        return attended
+
+    def layer_output_and_record(
+        layer: Qwen3OmniMoeCode2WavTransformerLayer,
+        residual: torch.Tensor,
+        attended: torch.Tensor,
+    ) -> torch.Tensor:
+        output = layer_output(layer, residual, attended)
+        record(f"transformer.{layer_indices[layer]}.output", output)
+        return output
+
+    def slot_forward_and_record(
+        inputs_embeds: torch.Tensor,
+        pool: CodecStatePool,
+        addresses: RingAddresses,
+        *,
+        first_decode: bool,
+        is_paged_attention: bool,
+    ) -> torch.Tensor:
+        record("codec_embedding_mean", inputs_embeds)
+        output = slot_forward(
+            inputs_embeds,
+            pool,
+            addresses,
+            first_decode=first_decode,
+            is_paged_attention=is_paged_attention,
+        )
+        record("transformer.final_norm", output)
+        return output
+
+    def convolution_and_record(
+        hidden_states: torch.Tensor,
+        conv: torch.nn.Conv1d,
+        weight: torch.Tensor,
+        bias: torch.Tensor | None,
+        length: int,
+    ) -> torch.Tensor:
+        name = module_names[conv]
+        record(f"{name}.input", hidden_states)
+        output = convolution(hidden_states, conv, weight, bias, length)
+        record(f"{name}.output", output)
+        return output
+
+    def transposed_convolution_and_record(
+        hidden_states: torch.Tensor,
+        conv: torch.nn.ConvTranspose1d,
+        weight: torch.Tensor,
+        bias: torch.Tensor | None,
+    ) -> torch.Tensor:
+        name = module_names[conv]
+        record(f"{name}.input", hidden_states)
+        output = transposed_convolution(hidden_states, conv, weight, bias)
+        record(f"{name}.output", output)
+        return output
+
+    with (
+        patch.object(transformer, "projected_qkv", new=project_and_record),
+        patch.object(transformer, "attend", new=attend_and_record),
+        patch.object(transformer, "layer_output", new=layer_output_and_record),
+        patch.object(transformer, "forward_slot_frames", new=slot_forward_and_record),
+        patch.object(
+            incremental_codec, "channels_last_conv1d", new=convolution_and_record
+        ),
+        patch.object(
+            incremental_codec,
+            "channels_last_conv_transpose1d",
+            new=transposed_convolution_and_record,
+        ),
+    ):
+        waveform = codec.decode_slots(
+            codes,
+            pool,
+            slot_indices,
+            first_decode=True,
+        )
+    assert torch.equal(unobserved_waveform, waveform)
+    record("waveform", waveform)
+    return boundaries
 
 
 def replay(
@@ -57,6 +202,7 @@ def main() -> None:
     parser.add_argument("--model-path", required=True)
     parser.add_argument("--witness-directory", type=Path, required=True)
     parser.add_argument("--gpu-id", type=int, required=True)
+    parser.add_argument("--cold-window-boundaries", action="store_true")
     arguments = parser.parse_args()
     torch.cuda.set_device(arguments.gpu_id)
     config = ConfigManager.from_file(
@@ -87,6 +233,43 @@ def main() -> None:
         assert (
             frames[:, 0] == scheduler.codec_eos_token_id
         ).nonzero().flatten().tolist() == [len(frames) - 1]
+    if arguments.cold_window_boundaries:
+        request_id = next(iter(histories))
+        first_frame_count = (
+            scheduler.initial_codec_chunk_frames or scheduler.stream_chunk_size
+        )
+        codes = torch.stack(
+            [frames[:first_frame_count].T for frames in histories.values()]
+        ).contiguous()
+        solo = capture_cold_window(scheduler, codes[:1])
+        peers = capture_cold_window(scheduler, codes)
+        repeat = capture_cold_window(scheduler, codes[:1])
+        assert list(solo) == list(peers) == list(repeat)
+        assert all(torch.equal(solo[name], repeat[name]) for name in solo)
+        report = []
+        for name in solo:
+            delta = solo[name].float() - peers[name].float()
+            report.append(
+                {
+                    "boundary": name,
+                    "shape": list(delta.shape),
+                    "different_elements": int(delta.count_nonzero()),
+                    "max_abs_difference": float(delta.abs().max()),
+                }
+            )
+        print(
+            json.dumps(
+                {
+                    "request_id": request_id,
+                    "peer_request_ids": list(histories),
+                    "code_shape": list(codes.shape),
+                    "boundaries": report,
+                }
+            )
+        )
+        return
+    else:
+        pass
     waveforms: dict[str, dict[str, list[np.ndarray]]] = {}
     runs = {}
     for name, graph_enabled, batch_windows in (
