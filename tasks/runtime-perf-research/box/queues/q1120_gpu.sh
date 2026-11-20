@@ -44,10 +44,11 @@ mmsu() {
 }
 
 mixed() {
-  local name=$1 tree=$2 model=$3 extra=$4 port=$5
-  note $name $tree "$model seedtts c16 beside 8 videos"
+  local name=$1 tree=$2 model=$3 extra=$4 port=$5 probe=${6:-}
+  note $name $tree "$model seedtts c16 beside 8 videos $probe"
   taskset -c $CPUS python3 $K/baseline.py --tree $tree --model $model --card $CARD --port $port --out $O/$name \
-    --loads 16 --passes warm,events --serve-extra "$extra" > $O/$name.driver.log 2>&1 &
+    --loads 16 --passes warm,events --serve-extra "$extra" \
+    ${probe:+--probe --serve-env OMNI_HOP_PROBE_TALKER_BATCHES=1} > $O/$name.driver.log 2>&1 &
   local driver=$!
   until curl -sf --max-time 2 http://127.0.0.1:$port/health > /dev/null || ! kill -0 $driver 2>/dev/null; do sleep 5; done
   (
@@ -85,6 +86,7 @@ for cell in $CELLS; do
       sv) mixed $name $(tree_of $arm) omni_ci_onecard "" $((BASE_PORT + 620)) ;;
       cv) mixed $name $(tree_of $arm) omni_colocated "$CONTEXT_32K" $((BASE_PORT + 840)) ;;
       mm) mmsu $name $(tree_of $arm) ;;
+      cvp) mixed $name $(tree_of $arm) omni_colocated "$CONTEXT_32K" $((BASE_PORT + 1280)) probe ;;
     esac
   done
 done
