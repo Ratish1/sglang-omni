@@ -83,6 +83,7 @@ def run_rounding_witnesses(
     carry_paired_prefix: bool = False,
     seedtts_witness_ids: list[str] | None = None,
     prefill_probe_token_index: int | None = None,
+    request_id_suffix: str | None = None,
 ) -> None:
     seedtts_samples = load_seedtts_samples(SEEDTTS_DATASET_ID)
     endpoint = f"http://127.0.0.1:{server_port}/v1/chat/completions"
@@ -115,8 +116,13 @@ def run_rounding_witnesses(
                     else (1, client_concurrency)
                 )
                 for request_count in request_counts:
-                    request_id = f"witness-{request_count}-{witness_id}"
-                    trace_directory = run_directory / request_id
+                    trace_name = f"witness-{request_count}-{witness_id}"
+                    request_id = (
+                        trace_name
+                        if request_id_suffix is None
+                        else f"{trace_name}-{request_id_suffix}"
+                    )
+                    trace_directory = run_directory / trace_name
                     trace_directory.mkdir()
                     control: WitnessControl = {
                         "request_id": request_id,
@@ -199,7 +205,7 @@ def run_rounding_witnesses(
                     if seedtts_witness_ids:
                         frames, _, complete = controlled_history(trace_directory)
                         assert complete and frames, request_id
-                        codec_histories[request_id] = [
+                        codec_histories[trace_name] = [
                             frame.tolist() for frame in frames
                         ]
                     else:
