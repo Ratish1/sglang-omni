@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
-# 11-20, node-0000, both H200s: the talker's sampling state kept per request slot (SLOT fb2775d5a, tree ff8fe15204e1)
-# and its stack with the preprocessing video lane (STACK 25f64d381, tree 25377b37786d) against main (de4cb9f0f, tree
+# 11-20, node-0000, both H200s: the talker's sampling state kept per request slot (SLOT d3806fb6a, tree 1a7c0b0636ac)
+# and its stack with the preprocessing video lane (STACK 6149c714f, tree 0e5588dfb14c) against main (de4cb9f0f, tree
 # 847f8a122c6f). Same-time pairs, one server per card on its own socket, arms swapped each round, a round starting when
-# the host load is under 80. Seeded c1 identity first, then speech c16 and c64 with the talker probe (the step by row
-# list decides whether a changed list still costs more), then SeedTTS c16 beside 8 looping videos on the colocated
-# config (probed) and the CI layout, then WER and SIM of the speech cells.
+# the host load is under 80. Seeded c1 identity first, in both card orders, then speech c16 and c64 with the talker
+# probe (the step by row list decides whether a changed list still costs more), then SeedTTS c16 beside 8 looping videos
+# on the colocated config (probed) and the CI layout, then WER and SIM of the speech cells.
 set -u
-O=/data/v1120/slot
+O=/data/v1120/slot2
 K=/workspace/kit/tasks/runtime-perf-research/box
 MAIN=/workspace/tmain SLOT=/workspace/tslot STACK=/workspace/tstack
 CONTEXT_32K="--preprocessing.factory.max_seq_len 32768 --thinker.factory.max_seq_len 32768"
@@ -81,6 +81,9 @@ log "q1120_slot start"
 quiet_host
 both "seeded id_s0 $SLOT 0" "seeded id_m1 $MAIN 1"
 log "identity $(python3 $K/wav_identity.py $O c1_clean id_m1 id_s0 2>&1 | tail -1)"
+quiet_host
+both "seeded id2_m0 $MAIN 0" "seeded id2_s1 $SLOT 1"
+log "identity $(python3 $K/wav_identity.py $O c1_clean id2_m0 id2_s1 2>&1 | tail -1)"
 
 quiet_host
 both "speech p1_s0 $SLOT 0 16 220" "speech p1_m1 $MAIN 1 16 220"
