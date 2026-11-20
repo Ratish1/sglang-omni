@@ -403,19 +403,39 @@ class Qwen3OmniThinkerModelRunner(ThinkerModelRunner):
                 prefix_length = forward_batch.extend_prefix_lens_cpu[row_index]
                 start_token = sum(sequence_lengths[:row_index])
                 end_token = start_token + sequence_lengths[row_index]
-                record_boundary(
-                    request.request_id,
-                    "thinker-prefill-input",
-                    {
-                        "input_ids": forward_batch.input_ids[start_token:end_token],
-                        "embeddings": input_embeds[start_token:end_token],
-                        "positions": forward_batch.positions[start_token:end_token],
-                        "prefix_length": prefix_length,
-                        "request_token_lengths": list(sequence_lengths),
-                        "request_row": row_index,
-                        "batch_request_ids": [member.request_id for member in requests],
-                    },
-                )
+                scheduled_request = schedule_batch.reqs[row_index]
+                prompt_length = len(scheduled_request.origin_input_ids)
+                batch_request_ids = [member.request_id for member in requests]
+                if prefix_length >= prompt_length:
+                    assert sequence_lengths[row_index] == 1
+                    position = int(forward_batch.positions[start_token])
+                    record_boundary(
+                        request.request_id,
+                        "thinker-decode-input",
+                        {
+                            "input_token_id": forward_batch.input_ids[start_token],
+                            "position": position,
+                            "request_row": row_index,
+                            "batch_request_ids": batch_request_ids,
+                            "is_mixed_forward": 1,
+                        },
+                        frame_index=position - prompt_length,
+                    )
+                else:
+                    record_boundary(
+                        request.request_id,
+                        "thinker-prefill-input",
+                        {
+                            "input_ids": forward_batch.input_ids[start_token:end_token],
+                            "embeddings": input_embeds[start_token:end_token],
+                            "positions": forward_batch.positions[start_token:end_token],
+                            "prefix_length": prefix_length,
+                            "request_token_lengths": list(sequence_lengths),
+                            "request_row": row_index,
+                            "batch_request_ids": batch_request_ids,
+                        },
+                        frame_index=scheduled_request.extend_batch_idx - 1,
+                    )
             else:
                 pass
 
@@ -448,6 +468,7 @@ class Qwen3OmniThinkerModelRunner(ThinkerModelRunner):
                         "position": position,
                         "request_row": row_index,
                         "batch_request_ids": [member.request_id for member in requests],
+                        "is_mixed_forward": 0,
                     },
                     frame_index=decode_index,
                 )

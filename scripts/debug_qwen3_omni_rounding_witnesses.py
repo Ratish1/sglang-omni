@@ -43,6 +43,7 @@ TRACE_BOUNDARIES = (
 GEOMETRY_FIELDS = {
     "active_rows",
     "batch_request_ids",
+    "is_mixed_forward",
     "request_token_lengths",
     "request_row",
 }
