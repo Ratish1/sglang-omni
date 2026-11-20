@@ -4,6 +4,7 @@
 import argparse
 import json
 from pathlib import Path
+from statistics import median
 from unittest.mock import patch
 
 import torch
@@ -21,6 +22,7 @@ def difference(first: torch.Tensor, second: torch.Tensor) -> dict[str, int | flo
     delta = first.float() - second.float()
     return {
         "changed_elements": int(delta.count_nonzero()),
+        "changed_rows": int(delta.reshape(-1, delta.shape[-1]).ne(0).any(-1).sum()),
         "max_abs_difference": float(delta.abs().max()),
     }
 
@@ -33,7 +35,13 @@ def main() -> None:
     parser.add_argument("--peer-trace", type=Path, required=True)
     parser.add_argument("--autotune-cache", type=Path, required=True)
     parser.add_argument("--gpu-id", type=int, required=True)
+    parser.add_argument("--timing-replays", type=int, default=0)
+    parser.add_argument("--timing-blocks", type=int, default=8)
     arguments = parser.parse_args()
+    if arguments.timing_replays < 0 or arguments.timing_blocks < 1:
+        parser.error("Use a nonnegative replay count and a positive block count")
+    else:
+        pass
     torch.cuda.set_device(arguments.gpu_id)
     device = torch.device("cuda", arguments.gpu_id)
     config = json.loads((arguments.checkpoint / "config.json").read_bytes())[
@@ -66,6 +74,7 @@ def main() -> None:
     operands = {}
     outputs = {}
     target_indices = {}
+    target_ranges = {}
     tactic_pairs = {}
     sequences = {}
     for name, trace_directory in (
@@ -99,6 +108,9 @@ def main() -> None:
         )
         outputs[name] = recorded_output
         target_indices[name] = target_index
+        target_start = sum(geometry["request_token_lengths"][: geometry["request_row"]])
+        target_count = geometry["request_token_lengths"][geometry["request_row"]]
+        target_ranges[name] = slice(target_start, target_start + target_count)
         sequences[name] = geometry["request_token_lengths"]
         with patch.object(tuner, "choose_one", wraps=choose_profile) as choices:
             automatic = routed_experts(*operands[name])
@@ -116,6 +128,17 @@ def main() -> None:
         torch.equal(a[target_indices["serial"]], b[target_indices["peers"]])
         for a, b in zip(operands["serial"][:3], operands["peers"][:3], strict=True)
     ), sequences
+    full_prefix_inputs_equal = {
+        name: torch.equal(
+            first[target_ranges["serial"]], second[target_ranges["peers"]]
+        )
+        for name, first, second in zip(
+            ("activation", "expert_ids", "expert_weights"),
+            operands["serial"][:3],
+            operands["peers"][:3],
+            strict=True,
+        )
+    }
     effects = {}
     for name, other in (("serial", "peers"), ("peers", "serial")):
         target_index = target_indices[name]
@@ -123,18 +146,41 @@ def main() -> None:
         native_first, native_second = tactic_pairs[name]
         alternate_first, alternate_second = tactic_pairs[other]
         trials = {}
+        timed_graphs: dict[str, torch.cuda.CUDAGraph] = {}
         for trial_name, pair in (
             ("explicit_reference", [native_first, native_second]),
             ("swap_first_projection", [alternate_first, native_second]),
             ("swap_second_projection", [native_first, alternate_second]),
             ("swap_both", [alternate_first, alternate_second]),
         ):
-            result = routed_experts(*operands[name], tactics=pair)[target_index]
+            result = routed_experts(*operands[name], tactics=pair)
             trials[trial_name] = {
                 "profile_ids": pair,
-                "vs_native": difference(result, outputs[name][target_index]),
-                "vs_other": difference(result, outputs[other][other_index]),
+                "vs_native": difference(
+                    result[target_index], outputs[name][target_index]
+                ),
+                "vs_other": difference(
+                    result[target_index], outputs[other][other_index]
+                ),
+                "full_prefix_vs_native": difference(
+                    result[target_ranges[name]], outputs[name][target_ranges[name]]
+                ),
+                "full_prefix_vs_other": difference(
+                    result[target_ranges[name]], outputs[other][target_ranges[other]]
+                ),
             }
+            if arguments.timing_replays and trial_name in (
+                "explicit_reference",
+                "swap_first_projection",
+            ):
+                replay_graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(replay_graph):
+                    graph_output = routed_experts(*operands[name], tactics=pair)
+                replay_graph.replay()
+                assert torch.equal(graph_output, result)
+                timed_graphs[trial_name] = replay_graph
+            else:
+                pass
         assert trials["explicit_reference"]["vs_native"]["changed_elements"] == 0
         effects[name] = {
             "valid_sequence_lengths": sequences[name],
@@ -142,9 +188,42 @@ def main() -> None:
             "target_index": target_index,
             "trials": trials,
         }
+        if timed_graphs:
+            timings_microseconds: dict[str, list[float]] = {
+                trial_name: [] for trial_name in timed_graphs
+            }
+            names = tuple(timed_graphs)
+            for trial_name in (*names, *reversed(names)) * arguments.timing_blocks:
+                start = torch.cuda.Event(enable_timing=True)
+                stop = torch.cuda.Event(enable_timing=True)
+                start.record()
+                for _ in range(arguments.timing_replays):
+                    timed_graphs[trial_name].replay()
+                stop.record()
+                stop.synchronize()
+                timings_microseconds[trial_name].append(
+                    start.elapsed_time(stop) * 1000 / arguments.timing_replays
+                )
+            effects[name]["graph_replay_timing"] = {
+                "replays_per_observation": arguments.timing_replays,
+                "microseconds_per_replay": timings_microseconds,
+                "median_microseconds_per_replay": {
+                    trial_name: median(values)
+                    for trial_name, values in timings_microseconds.items()
+                },
+            }
+        else:
+            pass
 
     print(
-        json.dumps({"packed_replays_exact": True, "effects": effects}, sort_keys=True)
+        json.dumps(
+            {
+                "packed_replays_exact": True,
+                "full_prefix_inputs_equal": full_prefix_inputs_equal,
+                "effects": effects,
+            },
+            sort_keys=True,
+        )
     )
     peer_target = target_indices["peers"]
     peer_second = tactic_pairs["peers"][1]
