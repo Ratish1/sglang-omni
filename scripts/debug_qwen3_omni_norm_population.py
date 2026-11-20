@@ -246,6 +246,91 @@ def compare_pair(
     }
 
 
+def audit_first_decode_attention(
+    trace_directory: Path,
+) -> dict[str, bool | int | float]:
+    addresses = torch.load(
+        trace_directory / "first-decode-addresses-000.pt", weights_only=True
+    )
+    prefix = torch.load(
+        trace_directory / "first-decode-prefix-cache-000.pt", weights_only=True
+    )
+    operands = torch.load(trace_directory / "backbone-decode-001.pt", weights_only=True)
+    first_layer = torch.load(
+        trace_directory / "first-decode-layers.pt", weights_only=True
+    )[0]
+    cache_length = int(first_layer["attention_cache_lengths"])
+    page_size = int(first_layer["attention_page_sizes"])
+    logical_positions = torch.arange(cache_length)
+    attention_slots = (
+        first_layer["attention_page_table"][logical_positions // page_size] * page_size
+        + logical_positions % page_size
+    )
+    expected_slots = torch.cat(
+        (
+            addresses["scheduler_read_slots"],
+            addresses["scheduler_mapped_write_slot"].view(1),
+        )
+    )
+    prefix_keys = prefix["key_rows"][0]
+    prefix_values = prefix["value_rows"][0]
+    key_values = torch.cat(
+        (prefix_keys, first_layer["key_rope"].reshape_as(prefix_keys[:1]))
+    ).double()
+    value_values = torch.cat(
+        (prefix_values, first_layer["value"].reshape_as(prefix_values[:1]))
+    ).double()
+    head_dimension = prefix_keys.shape[-1]
+    query = first_layer["query_rope"].reshape(-1, head_dimension).double()
+    query_heads_per_key_head = query.shape[0] // prefix_keys.shape[1]
+    key_values = key_values.repeat_interleave(query_heads_per_key_head, dim=1)
+    value_values = value_values.repeat_interleave(query_heads_per_key_head, dim=1)
+    attention_weights = (
+        torch.einsum("hd,shd->hs", query, key_values)
+        .mul(head_dimension**-0.5)
+        .softmax(dim=-1)
+    )
+    expected_context = torch.einsum("hs,shd->hd", attention_weights, value_values)
+    permuted_context = torch.einsum(
+        "hs,shd->hd", attention_weights, value_values.roll(shifts=1, dims=0)
+    )
+    actual_context = first_layer["attention_context"].reshape_as(expected_context)
+    combined_input = operands["feedback_row"].reshape(-1) + operands[
+        "text_row"
+    ].reshape(-1)
+    return {
+        "cache_length": cache_length,
+        "page_size": page_size,
+        "captured_request_matches_scheduler": torch.equal(
+            first_layer["attention_request_indices"], addresses["request_pool_index"]
+        ),
+        "valid_attention_slots_match_scheduler": torch.equal(
+            attention_slots, expected_slots
+        ),
+        "write_slot_matches_scheduler_mapping": torch.equal(
+            first_layer["attention_write_slots"],
+            addresses["scheduler_write_slot"].to(first_layer["attention_write_slots"]),
+        )
+        and int(addresses["scheduler_write_slot"])
+        == int(addresses["scheduler_mapped_write_slot"]),
+        "cache_length_matches_position": cache_length
+        == int(addresses["scheduler_cache_length"])
+        == int(operands["position"]) + 1,
+        "layer_input_matches_projected_text_and_feedback": torch.equal(
+            combined_input, first_layer["input_contribution"]
+        ),
+        "attention_context_exact_after_rounding": torch.equal(
+            actual_context, expected_context.to(actual_context)
+        ),
+        "attention_context_max_abs_error": float(
+            (actual_context - expected_context).abs().max()
+        ),
+        "permuted_values_max_abs_error": float(
+            (actual_context - permuted_context).abs().max()
+        ),
+    }
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model-path", required=True)
@@ -260,6 +345,7 @@ def main() -> None:
         "--transfer-state", choices=("codec", "kv", "both"), default="codec"
     )
     parser.add_argument("--exclude-frozen-transfer-control", action="store_true")
+    parser.add_argument("--native-kv-audit", action="store_true")
     parser.add_argument("--score-existing", action="store_true")
     arguments = parser.parse_args()
     output = arguments.output.resolve()
@@ -272,7 +358,11 @@ def main() -> None:
     cases = select_cases(arguments.h200_history, arguments.h100_history)
     donor_population = arguments.transfer_from
     donor_rows = {}
-    if donor_population is None:
+    if arguments.native_kv_audit:
+        assert donor_population is None and not arguments.score_existing
+        scopes = ("plain", "observe")
+        cases = [case for case in cases if case["sample_id"] != HELD_SAMPLE_ID]
+    elif donor_population is None:
         scopes = ("none", "first", "decode")
     else:
         scopes = ("transfer", "restore")
@@ -343,7 +433,18 @@ def main() -> None:
             output / f"talker-{scope}.log",
             talker_port,
             timeout=SERVER_START_TIMEOUT_SECONDS,
-            env={"OMNI_WITNESS_BATCH_CONTROL": str(control_path)},
+            env=(
+                {}
+                if scope == "plain"
+                else {
+                    "OMNI_WITNESS_BATCH_CONTROL": str(control_path),
+                    **(
+                        {"OMNI_WITNESS_NATIVE_KV_AUDIT": "1"}
+                        if arguments.native_kv_audit
+                        else {}
+                    ),
+                }
+            ),
             strip_proxy=True,
         )
         try:
@@ -382,9 +483,12 @@ def main() -> None:
                     control: WitnessControl = {
                         "request_id": case["request_id"],
                         "output_directory": str(arm_directory),
-                        "norm_scope": {"transfer": "none", "restore": "first"}.get(
-                            scope, scope
-                        ),
+                        "norm_scope": {
+                            "transfer": "none",
+                            "restore": "first",
+                            "plain": "none",
+                            "observe": "none",
+                        }.get(scope, scope),
                         "held_input_directory": (
                             str(arguments.held_input.resolve()) if is_held else None
                         ),
@@ -432,7 +536,10 @@ def main() -> None:
                         waveform = base64.b64decode(
                             choice["message"]["audio"]["data"], validate=True
                         )
-                        (arm_directory / "audio.wav").write_bytes(waveform)
+                        if not arguments.native_kv_audit:
+                            (arm_directory / "audio.wav").write_bytes(waveform)
+                        else:
+                            pass
                         arm.update(
                             returned_text=choice["message"]["content"],
                             finish_reason=choice["finish_reason"],
@@ -458,7 +565,22 @@ def main() -> None:
             for scope in scopes
         }
         assert len({arm["input_sha256"] for arm in arms.values()}) == 1
-        if donor_population is None:
+        if arguments.native_kv_audit:
+            assert all(arm["http_status"] == 200 for arm in arms.values())
+            pairs = {
+                "observe": {
+                    **audit_first_decode_attention(case_directory / "observe"),
+                    "waveform_matches_uninstrumented": (
+                        arms["plain"]["waveform_sha256"]
+                        == arms["observe"]["waveform_sha256"]
+                    ),
+                    "returned_text_matches_uninstrumented": (
+                        arms["plain"]["returned_text"]
+                        == arms["observe"]["returned_text"]
+                    ),
+                },
+            }
+        elif donor_population is None:
             pairs = {
                 scope: compare_pair(
                     case_directory / "none", case_directory / scope, is_held
@@ -552,6 +674,10 @@ def main() -> None:
         with (output / "generation.jsonl").open("a") as generated:
             generated.write(json.dumps(result) + "\n")
 
+    if arguments.native_kv_audit:
+        return
+    else:
+        pass
     asr_port = find_available_port()
     asr_server = start_server_from_cmd(
         [

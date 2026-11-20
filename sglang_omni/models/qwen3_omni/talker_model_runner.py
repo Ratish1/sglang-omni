@@ -180,6 +180,34 @@ class QwenTalkerModelRunner(ModelRunner["SGLangARRequestData"]):
                     ].long()
                     pool = model_runner.token_to_kv_pool
                     assert isinstance(pool, MHATokenToKVPool)
+                    if (
+                        self.model.backbone_recorders
+                        and self.model.backbone_recorders[0].capture_attention_geometry
+                    ):
+                        record_boundary(
+                            request.request_id,
+                            "first-decode-addresses",
+                            {
+                                "request_pool_index": forward_batch.req_pool_indices[
+                                    row_index
+                                ],
+                                "scheduler_read_slots": live_slots,
+                                "scheduler_write_slot": forward_batch.out_cache_loc[
+                                    row_index
+                                ],
+                                "scheduler_mapped_write_slot": (
+                                    model_runner.req_to_token_pool.req_to_token[
+                                        forward_batch.req_pool_indices[row_index],
+                                        position,
+                                    ]
+                                ),
+                                "scheduler_cache_length": forward_batch.seq_lens[
+                                    row_index
+                                ],
+                            },
+                        )
+                    else:
+                        pass
                     record_boundary(
                         request.request_id,
                         "first-decode-prefix-cache",

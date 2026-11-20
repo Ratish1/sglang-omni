@@ -7,6 +7,8 @@ from typing import Iterable, Optional, Tuple
 import torch
 from sglang.kernels.fused_op import get_fused_op_backend
 from sglang.kernels.spec import KernelBackend
+from sglang.srt.layers.attention.flashattention_backend import FlashAttentionBackend
+from sglang.srt.model_executor.forward_context import get_attn_backend
 from sglang.srt.runtime_context import get_exec, get_parallel, get_stream
 from torch import nn
 from transformers import PretrainedConfig
@@ -393,6 +395,31 @@ class Qwen3OmniMoeThinkerTextAttention(nn.Module):
             self.operator_recorder.record("query_rope", q)
             self.operator_recorder.record("key_rope", k)
             self.operator_recorder.record("value", v)
+            if self.operator_recorder.capture_attention_geometry:
+                backend = get_attn_backend()
+                assert isinstance(backend, FlashAttentionBackend)
+                assert backend.fa_impl_ver == 3 and not backend.use_mla
+                assert self.attn.sliding_window_size == -1
+                assert not self.attn.is_cross_attention and fb.spec_info is None
+                metadata = backend.forward_metadata
+                assert metadata.local_attn_metadata is None
+                assert metadata.pa_swa_page_table is None
+                self.operator_recorder.record(
+                    "attention_page_table", metadata.page_table
+                )
+                self.operator_recorder.record(
+                    "attention_cache_lengths", metadata.cache_seqlens_int32
+                )
+                self.operator_recorder.record(
+                    "attention_request_indices", fb.req_pool_indices
+                )
+                self.operator_recorder.record("attention_write_slots", fb.out_cache_loc)
+                self.operator_recorder.record(
+                    "attention_page_sizes",
+                    torch.full_like(fb.req_pool_indices, backend.page_size),
+                )
+            else:
+                pass
         else:
             pass
 

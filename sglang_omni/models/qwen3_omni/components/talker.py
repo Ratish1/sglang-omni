@@ -858,21 +858,25 @@ class Qwen3OmniTalker(nn.Module):
         device = self.model.codec_embedding.weight.device
         self.backbone_recorders: list[LayerOperandRecorder] = []
         has_batch_witness = os.environ.get("OMNI_WITNESS_BATCH_CONTROL") is not None
+        audit_native_attention = os.environ.get("OMNI_WITNESS_NATIVE_KV_AUDIT") == "1"
         if (
             has_batch_witness
             or os.environ.get("OMNI_WITNESS_HELD_INPUT_DIRECTORY") is not None
         ):
             step_counter = torch.zeros((), dtype=torch.int64, device=device)
-            for layer in self.model.layers:
-                recorder = LayerOperandRecorder(step_counter=step_counter)
+            for layer_index, layer in enumerate(self.model.layers):
+                recorder = LayerOperandRecorder(
+                    step_counter=step_counter,
+                    capture_attention_geometry=audit_native_attention
+                    and layer_index == 0,
+                )
                 self.backbone_recorders.append(recorder)
                 layer.operator_recorder = recorder
                 layer.self_attn.operator_recorder = recorder
                 layer.mlp.operator_recorder = recorder
-            if (
-                has_batch_witness
-                or os.environ.get("OMNI_WITNESS_SWAP_FIRST_NORM") == "1"
-            ):
+            if (has_batch_witness and not audit_native_attention) or os.environ.get(
+                "OMNI_WITNESS_SWAP_FIRST_NORM"
+            ) == "1":
                 opening_layer = self.backbone_recorders[0]
                 opening_layer.input_norm_override = torch.empty_like(
                     self.model.feedback_buffer[0]
