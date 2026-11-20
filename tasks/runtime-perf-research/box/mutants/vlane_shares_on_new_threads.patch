@@ -1,0 +1,13 @@
+diff --git a/sglang_omni/preprocessing/video.py b/sglang_omni/preprocessing/video.py
+index 2d2cc2bf1..ebfabdb0d 100644
+--- a/sglang_omni/preprocessing/video.py
++++ b/sglang_omni/preprocessing/video.py
+@@ -544,7 +544,7 @@ def read_video_torchcodec(
+     ]
+     if len(busy_shares) == 1:
+         return first_decoder.get_frames_at(indices=frame_indices).data, sample_fps
+-    elif frame_pool is None:
++    elif True:
+         with ThreadPoolExecutor(max_workers=len(busy_shares)) as pool:
+             frames = torch.cat(list(pool.map(decode_share, busy_shares)))
+         return frames, sample_fps
