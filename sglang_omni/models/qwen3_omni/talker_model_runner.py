@@ -3,7 +3,9 @@
 
 from __future__ import annotations
 
+import os
 from collections import deque
+from pathlib import Path
 from queue import Queue
 from typing import TYPE_CHECKING, TypeAlias
 
@@ -73,6 +75,9 @@ class QwenTalkerModelRunner(ModelRunner["SGLangARRequestData"]):
         self.codec_coalesce_frames = max(int(codec_coalesce_frames), 0)
         self.codec_coalesce_first_frames = max(int(codec_coalesce_first_frames), 0)
         self.codec_coalesce_early_frames = max(int(codec_coalesce_early_frames), 0)
+        self.held_input_directory: str | None = os.environ.get(
+            "OMNI_WITNESS_HELD_INPUT_DIRECTORY"
+        )
 
     def execute(self, scheduler_output: SchedulerOutput) -> ModelRunnerOutput:
         return super().execute(scheduler_output)
@@ -137,6 +142,10 @@ class QwenTalkerModelRunner(ModelRunner["SGLangARRequestData"]):
             pass
 
         self.model.prepare_decode_buffers(requests)
+        if self.model.backbone_recorders:
+            self.model.backbone_recorders[0].step_counter.add_(1)
+        else:
+            pass
         for row_index, request in enumerate(requests):
             if is_witness(request.request_id):
                 assert forward_batch is not None
@@ -190,6 +199,79 @@ class QwenTalkerModelRunner(ModelRunner["SGLangARRequestData"]):
             else:
                 pass
         self.write_feedback_buffers(requests)
+        if self.held_input_directory is not None:
+            for row_index, request in enumerate(requests):
+                if (
+                    is_witness(request.request_id)
+                    and request.data.codec_frames_seen == 1
+                ):
+                    assert len(requests) == 1
+                    self.install_held_first_decode_inputs(
+                        forward_batch, row_index, request
+                    )
+                else:
+                    pass
+        else:
+            pass
+
+    def install_held_first_decode_inputs(
+        self, forward_batch: ForwardBatch, row_index: int, request: SchedulerRequest
+    ) -> None:
+        input_directory = Path(self.held_input_directory)
+        device = self.model.feedback_buffer.device
+        prefix = torch.load(
+            input_directory / "first-decode-prefix-cache-000.pt",
+            map_location=device,
+            weights_only=True,
+        )
+        operands = torch.load(
+            input_directory / "backbone-decode-001.pt",
+            map_location=device,
+            weights_only=True,
+        )
+        sampling = torch.load(
+            input_directory / "decode-sampling-001.pt",
+            map_location=device,
+            weights_only=True,
+        )
+        position = int(forward_batch.positions[row_index])
+        assert position == prefix["position"] == int(operands["position"])
+        if self.model.uses_mrope:
+            assert torch.equal(
+                forward_batch.mrope_positions[:, row_index : row_index + 1],
+                operands["rotary_positions"],
+            )
+        else:
+            assert operands["rotary_positions"] is None
+        model_runner = self.tp_worker.model_runner
+        live_slots = model_runner.req_to_token_pool.req_to_token[
+            forward_batch.req_pool_indices[row_index], :position
+        ].long()
+        pool = model_runner.token_to_kv_pool
+        assert isinstance(pool, MHATokenToKVPool)
+        for buffer, key_rows in zip(pool.k_buffer, prefix["key_rows"], strict=True):
+            buffer.index_copy_(0, live_slots, key_rows)
+        for buffer, value_rows in zip(pool.v_buffer, prefix["value_rows"], strict=True):
+            buffer.index_copy_(0, live_slots, value_rows)
+        combined_embedding = operands["feedback_row"].reshape(-1) + operands[
+            "text_row"
+        ].reshape(-1)
+        self.model.feedback_buffer[row_index].copy_(combined_embedding)
+        for buffer, name in (
+            (self.model.sampling_seeds, "seed"),
+            (self.model.sampling_temperatures, "temperature"),
+            (self.model.repetition_penalties, "repetition_penalty"),
+            (self.model.repetition_mask, "repetition_mask"),
+            (self.model.suppress_mask, "suppress_mask"),
+            (self.model.sampling_top_ks, "top_k"),
+            (self.model.sampling_top_ps, "top_p"),
+        ):
+            buffer[row_index].copy_(sampling[name])
+        record_boundary(
+            request.request_id,
+            "held-first-decode",
+            {"embedding": combined_embedding, "position": position},
+        )
 
     def process_sampling_logits(
         self, logits_output: LogitsProcessorOutput, requests: list[SchedulerRequest]
@@ -280,6 +362,22 @@ class QwenTalkerModelRunner(ModelRunner["SGLangARRequestData"]):
                     },
                     frame_index=request.data.codec_frames_seen,
                 )
+                if (
+                    self.model.backbone_recorders
+                    and request.data.codec_frames_seen == 1
+                ):
+                    step = int(self.model.backbone_recorders[0].step_counter)
+                    snapshots = [
+                        recorder.read(step, row_index)
+                        for recorder in self.model.backbone_recorders
+                    ]
+                    output_directory = Path(os.environ["OMNI_WITNESS_DIRECTORY"])
+                    with (output_directory / "first-decode-layers.pt").open(
+                        "xb"
+                    ) as output:
+                        torch.save(snapshots, output)
+                else:
+                    pass
             else:
                 pass
         self.stage_token_ids(result, result.next_token_ids)

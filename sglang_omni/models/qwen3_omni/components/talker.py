@@ -5,6 +5,7 @@ SGLang-native Talker model for Qwen3-Omni compatiable with hf formatting.
 from __future__ import annotations
 
 import logging
+import os
 from typing import Iterable, Optional, Tuple
 
 import torch
@@ -29,6 +30,7 @@ from sglang_omni.models.qwen3_omni.hf_config import (
     Qwen3OmniMoeTalkerConfig,
     Qwen3OmniMoeTalkerTextConfig,
 )
+from sglang_omni.models.qwen3_omni.layer_operand_capture import LayerOperandRecorder
 from sglang_omni.platforms import current_platform
 from sglang_omni.quantization import get_weight_preprocessor
 from sglang_omni.sampling.sampler_compile import (
@@ -295,6 +297,8 @@ class Qwen3OmniMoeTalkerSparseMoeBlock(Qwen3OmniMoeThinkerTextSparseMoeBlock):
     combined; the layer's FFN boundary completes the sum.
     """
 
+    operator_recorder: LayerOperandRecorder | None = None
+
     def __init__(
         self,
         layer_id: int,
@@ -343,12 +347,27 @@ class Qwen3OmniMoeTalkerSparseMoeBlock(Qwen3OmniMoeThinkerTextSparseMoeBlock):
         # The fused MoE implementation mutates `hidden_states` in-place.
         shared_output = self.shared_expert(linear_hidden_states)
         shared_gate, _ = self.shared_expert_gate(linear_hidden_states)
+        record_operands = (
+            self.operator_recorder is not None
+            and forward_batch.forward_mode.is_decode()
+        )
+        if record_operands:
+            self.operator_recorder.record("shared_before_gate", shared_output)
+            self.operator_recorder.record("shared_gate", shared_gate)
+        else:
+            pass
         shared_output = shared_output * torch.sigmoid(shared_gate)
 
         # --- Routed experts (no all-reduce yet) ---
         router_logits, _ = self.gate(linear_hidden_states)
         topk_output = self.topk(linear_hidden_states, router_logits)
         routed_output = self.experts(linear_hidden_states, topk_output)
+        if record_operands:
+            self.operator_recorder.record("router_logits", router_logits)
+            self.operator_recorder.record("routed_output", routed_output)
+            self.operator_recorder.record("shared_output", shared_output)
+        else:
+            pass
 
         final_hidden_states = routed_output + shared_output
         return final_hidden_states.view(num_tokens, hidden_dim)
@@ -837,6 +856,17 @@ class Qwen3OmniTalker(nn.Module):
         )
 
         device = self.model.codec_embedding.weight.device
+        self.backbone_recorders: list[LayerOperandRecorder] = []
+        if os.environ.get("OMNI_WITNESS_HELD_INPUT_DIRECTORY") is not None:
+            step_counter = torch.zeros((), dtype=torch.int64, device=device)
+            for layer in self.model.layers:
+                recorder = LayerOperandRecorder(step_counter=step_counter)
+                self.backbone_recorders.append(recorder)
+                layer.operator_recorder = recorder
+                layer.self_attn.operator_recorder = recorder
+                layer.mlp.operator_recorder = recorder
+        else:
+            pass
         hidden_size = config.text_config.hidden_size
         predictor_len = config.num_code_groups + 1
         server_args = get_context().server_args
