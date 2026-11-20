@@ -78,6 +78,7 @@ def run_rounding_witnesses(
     client_concurrency: int,
     *,
     stock_prefix_directory: Path | None = None,
+    prefix_donor_request_count: int = 1,
     carry_gate_cache: bool = False,
     seedtts_witness_ids: list[str] | None = None,
 ) -> None:
@@ -103,10 +104,12 @@ def run_rounding_witnesses(
             for witness_id in witness_ids:
                 witness_index = sample_index_by_id[witness_id]
                 witness_sample = samples[witness_index]
+                is_paired_gate = (
+                    not seedtts_witness_ids and witness_id == PAIRED_GATE_WITNESS
+                )
                 request_counts = (
                     (1,)
-                    if stock_prefix_directory is not None
-                    and witness_id != PAIRED_GATE_WITNESS
+                    if stock_prefix_directory is not None and not is_paired_gate
                     else (1, client_concurrency)
                 )
                 for request_count in request_counts:
@@ -121,7 +124,7 @@ def run_rounding_witnesses(
                     }
                     if stock_prefix_directory is None:
                         paired_files = ()
-                    elif witness_id == PAIRED_GATE_WITNESS:
+                    elif is_paired_gate:
                         control["paired_gate_frames"] = list(PAIRED_GATE_FRAMES)
                         control["paired_gate_kv"] = carry_gate_cache
                         paired_files = tuple(
@@ -135,7 +138,10 @@ def run_rounding_witnesses(
                         )
                     else:
                         control["paired_stock_prefix_directory"] = str(
-                            (stock_prefix_directory / request_id).resolve()
+                            (
+                                stock_prefix_directory
+                                / f"witness-{prefix_donor_request_count}-{witness_id}"
+                            ).resolve(strict=True)
                         )
                         paired_files = ("paired-prefix-001.pt",)
                     pending_control = control_path.with_suffix(".pending")

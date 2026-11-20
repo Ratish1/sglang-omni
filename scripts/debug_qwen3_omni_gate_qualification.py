@@ -81,6 +81,7 @@ def main() -> None:
     parser.add_argument("--seedtts-speed-only", action="store_true")
     parser.add_argument("--seedtts-request-profile", action="store_true")
     parser.add_argument("--paired-stock-prefix-directory", type=Path)
+    parser.add_argument("--paired-prefix-donor-concurrency", type=int, default=1)
     parser.add_argument("--paired-gate-kv", action="store_true")
     arguments = parser.parse_args()
     if arguments.seedtts_speed_only and (
@@ -100,10 +101,18 @@ def main() -> None:
     else:
         pass
     if arguments.seedtts_witness_id and (
-        not arguments.rounding_witnesses
-        or arguments.paired_stock_prefix_directory is not None
+        not arguments.rounding_witnesses or arguments.paired_gate_kv
     ):
-        parser.error("Select SeedTTS IDs only for uncrossed rounding witnesses")
+        parser.error(
+            "Select SeedTTS IDs only for rounding witnesses or prefix crossover"
+        )
+    elif arguments.paired_prefix_donor_concurrency < 1 or (
+        arguments.paired_prefix_donor_concurrency != 1
+        and arguments.paired_stock_prefix_directory is None
+    ):
+        parser.error(
+            "A non-serial prefix donor requires --paired-stock-prefix-directory"
+        )
     else:
         pass
     if arguments.profile_prefill_samples is not None and (
@@ -409,6 +418,7 @@ def generate(arguments: argparse.Namespace, run_directories: list[Path]) -> None
                     REQUEST_SEED,
                     CLIENT_CONCURRENCY,
                     stock_prefix_directory=arguments.paired_stock_prefix_directory,
+                    prefix_donor_request_count=arguments.paired_prefix_donor_concurrency,
                     carry_gate_cache=arguments.paired_gate_kv,
                     seedtts_witness_ids=arguments.seedtts_witness_id,
                 )
