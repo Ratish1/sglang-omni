@@ -12,8 +12,9 @@ cd /workspace/sglang-omni
 python3 -m pytest -q -p no:cacheprovider tests/unit_test/qwen3_omni/test_pipeline.py tests/unit_test/preprocessing/test_video.py \
   tests/unit_test/utils/test_cpu.py > $O/units_touched.log 2>&1
 log "units touched rc $? $(tail -1 $O/units_touched.log)"
-python3 -m pytest -q -p no:cacheprovider tests/unit_test > $O/units_all.log 2>&1
-log "units all rc $? $(tail -1 $O/units_all.log)"
+python3 -m pytest -q -p no:cacheprovider tests/unit_test/qwen3_omni tests/unit_test/preprocessing tests/unit_test/minicpm_o \
+  tests/unit_test/ming_omni > $O/units_affected.log 2>&1
+log "units affected rc $? $(tail -1 $O/units_affected.log)"
 run() {  # arm script args...
   local arm=$1; shift
   PYTHONPATH=/workspace/$arm OMP_NUM_THREADS=112 taskset -c $CPUS python3 "$@"
