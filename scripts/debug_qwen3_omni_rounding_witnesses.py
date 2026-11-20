@@ -112,7 +112,8 @@ def run_rounding_witnesses(
                 )
                 request_counts = (
                     (1,)
-                    if stock_prefix_directory is not None and not is_paired_gate
+                    if client_concurrency == 1
+                    or (stock_prefix_directory is not None and not is_paired_gate)
                     else (1, client_concurrency)
                 )
                 for request_count in request_counts:
