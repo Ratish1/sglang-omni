@@ -185,9 +185,11 @@ def main() -> None:
     parser.add_argument("--historical-peer", type=Path, required=True)
     parser.add_argument("--autotune-cache", type=Path)
     parser.add_argument("--projection-control-source", type=Path)
+    parser.add_argument("--gpu-index", type=int, default=0)
     parser.add_argument("--gemm1-tactics", type=int, nargs=2)
     parser.add_argument("--gemm2-tactic", type=int)
     args = parser.parse_args()
+    torch.cuda.set_device(args.gpu_index)
     if args.projection_control_source is not None:
         install_projection_control(args.projection_control_source)
     else:
