@@ -76,6 +76,7 @@ def main() -> None:
     parser.add_argument("--tactics-from", type=Path)
     parser.add_argument("--rounding-witnesses", action="store_true")
     parser.add_argument("--seedtts-witness-id", action="append")
+    parser.add_argument("--prefill-probe-token-index", type=int)
     parser.add_argument("--prefill-gate-controls", action="store_true")
     parser.add_argument("--profile-prefill-samples", type=int)
     parser.add_argument("--seedtts-speed-only", action="store_true")
@@ -106,6 +107,10 @@ def main() -> None:
         parser.error(
             "Select SeedTTS IDs only for rounding witnesses or prefix crossover"
         )
+    elif arguments.prefill_probe_token_index is not None and (
+        arguments.prefill_probe_token_index < 0 or not arguments.seedtts_witness_id
+    ):
+        parser.error("A nonnegative prefill probe index needs SeedTTS witness IDs")
     elif arguments.paired_prefix_donor_concurrency < 1 or (
         arguments.paired_prefix_donor_concurrency != 1
         and arguments.paired_stock_prefix_directory is None
@@ -301,7 +306,10 @@ def generate(arguments: argparse.Namespace, run_directories: list[Path]) -> None
         if arguments.rounding_witnesses or arguments.prefill_gate_controls:
             server_environment["OMNI_WITNESS_BATCH_CONTROL"] = str(witness_control_path)
             server_environment["OMNI_WITNESS_NATIVE_KV_AUDIT"] = "1"
-            if arguments.prefill_gate_controls:
+            if (
+                arguments.prefill_gate_controls
+                or arguments.prefill_probe_token_index is not None
+            ):
                 server_environment["OMNI_WITNESS_TRACE_PREFILL_TOKEN"] = "1"
             else:
                 pass
@@ -421,6 +429,7 @@ def generate(arguments: argparse.Namespace, run_directories: list[Path]) -> None
                     prefix_donor_request_count=arguments.paired_prefix_donor_concurrency,
                     carry_gate_cache=arguments.paired_gate_kv,
                     seedtts_witness_ids=arguments.seedtts_witness_id,
+                    prefill_probe_token_index=arguments.prefill_probe_token_index,
                 )
                 continue
             else:

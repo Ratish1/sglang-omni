@@ -81,6 +81,7 @@ def run_rounding_witnesses(
     prefix_donor_request_count: int = 1,
     carry_gate_cache: bool = False,
     seedtts_witness_ids: list[str] | None = None,
+    prefill_probe_token_index: int | None = None,
 ) -> None:
     seedtts_samples = load_seedtts_samples(SEEDTTS_DATASET_ID)
     endpoint = f"http://127.0.0.1:{server_port}/v1/chat/completions"
@@ -122,6 +123,10 @@ def run_rounding_witnesses(
                         "norm_scope": "none",
                         "held_input_directory": None,
                     }
+                    if prefill_probe_token_index is not None:
+                        control["prefill_probe_token_index"] = prefill_probe_token_index
+                    else:
+                        pass
                     if stock_prefix_directory is None:
                         paired_files = ()
                     elif is_paired_gate:
