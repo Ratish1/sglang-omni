@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import os
 from array import array
 from dataclasses import dataclass
 from numbers import Integral
@@ -19,6 +20,7 @@ from sglang_omni.model_runner.prefill_inputs import (
     get_omni_prefill_inputs,
 )
 from sglang_omni.model_runner.thinker_model_runner import ThinkerModelRunner
+from sglang_omni.models.qwen3_omni.boundary_witness import is_witness, record_boundary
 from sglang_omni.scheduling.types import SchedulerRequest
 
 _PREFILL_AUDIO_INPUT_KEYS = frozenset(
@@ -390,6 +392,67 @@ class Qwen3OmniThinkerModelRunner(ThinkerModelRunner):
             forward_batch,
             OmniPrefillInputs(input_embeds=input_embeds),
         )
+
+        if not os.environ.get("OMNI_WITNESS_BATCH_CONTROL"):
+            return
+        else:
+            pass
+        for row_index, request in enumerate(requests):
+            if is_witness(request.request_id):
+                sequence_lengths = forward_batch.extend_seq_lens_cpu
+                prefix_length = forward_batch.extend_prefix_lens_cpu[row_index]
+                start_token = sum(sequence_lengths[:row_index])
+                end_token = start_token + sequence_lengths[row_index]
+                record_boundary(
+                    request.request_id,
+                    "thinker-prefill-input",
+                    {
+                        "input_ids": forward_batch.input_ids[start_token:end_token],
+                        "embeddings": input_embeds[start_token:end_token],
+                        "positions": forward_batch.positions[start_token:end_token],
+                        "prefix_length": prefix_length,
+                        "request_token_lengths": list(sequence_lengths),
+                        "request_row": row_index,
+                        "batch_request_ids": [member.request_id for member in requests],
+                    },
+                )
+            else:
+                pass
+
+    def before_decode(
+        self,
+        forward_batch: ForwardBatch | None,
+        schedule_batch: ScheduleBatch,
+        requests: list[SchedulerRequest],
+        *,
+        is_lookahead: bool = False,
+    ) -> None:
+        super().before_decode(
+            forward_batch, schedule_batch, requests, is_lookahead=is_lookahead
+        )
+        if not os.environ.get("OMNI_WITNESS_BATCH_CONTROL"):
+            return
+        else:
+            pass
+        for row_index, request in enumerate(requests):
+            if is_witness(request.request_id):
+                assert forward_batch is not None
+                position = int(forward_batch.positions[row_index])
+                decode_index = position - len(request.data.req.origin_input_ids)
+                assert decode_index >= 0
+                record_boundary(
+                    request.request_id,
+                    "thinker-decode-input",
+                    {
+                        "input_token_id": forward_batch.input_ids[row_index],
+                        "position": position,
+                        "request_row": row_index,
+                        "batch_request_ids": [member.request_id for member in requests],
+                    },
+                    frame_index=decode_index,
+                )
+            else:
+                pass
 
     def custom_prefill_forward(
         self,

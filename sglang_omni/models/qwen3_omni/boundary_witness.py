@@ -49,7 +49,7 @@ def is_witness(request_id: str) -> bool:
 def record_boundary(
     request_id: str,
     boundary: str,
-    fields: dict[str, torch.Tensor | float | int | list[int] | None],
+    fields: dict[str, torch.Tensor | float | int | list[int] | list[str] | None],
     *,
     frame_index: int = 0,
 ) -> None:

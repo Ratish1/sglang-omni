@@ -20,6 +20,10 @@ from benchmarks.tasks.asr import (
     QWEN3_ASR_MODEL_PATH,
     compute_text_audio_consistency_from_records,
 )
+from scripts.debug_qwen3_omni_rounding_witnesses import (
+    run_rounding_witnesses,
+    score_rounding_witnesses,
+)
 from sglang_omni.utils import find_available_port
 
 MMSU_TTS_PROMPT = (
@@ -51,6 +55,7 @@ def main() -> None:
     parser.add_argument("--score-only", action="store_true")
     parser.add_argument("--projection-control-build", type=Path)
     parser.add_argument("--tactics-from", type=Path)
+    parser.add_argument("--rounding-witnesses", action="store_true")
     arguments = parser.parse_args()
     if arguments.projection_control_build is None and "combined" in arguments.arms:
         parser.error("The combined arm requires --projection-control-build")
@@ -64,7 +69,12 @@ def main() -> None:
         generate(arguments, run_directories)
     else:
         assert all(directory.is_dir() for directory in run_directories)
-    score(arguments.asr_path, output, run_directories)
+    score(
+        arguments.asr_path,
+        output,
+        run_directories,
+        rounding_witnesses=arguments.rounding_witnesses,
+    )
 
 
 def server_command() -> list[str]:
@@ -125,6 +135,11 @@ def generate(arguments: argparse.Namespace, run_directories: list[Path]) -> None
     else:
         pass
     reference_tactics = None
+    witness_control_path = output / "witness-control.json"
+    if arguments.rounding_witnesses:
+        witness_control_path.write_text('{"request_id": ""}\n')
+    else:
+        pass
     for run_directory, arm in zip(run_directories, arguments.arms, strict=True):
         run_directory.mkdir()
         print(f"{run_directory.name}: starting native inference", flush=True)
@@ -146,6 +161,10 @@ def generate(arguments: argparse.Namespace, run_directories: list[Path]) -> None
             server_environment = {
                 "OMNI_WITNESS_FIXED_SHARED_GATE": str(int(arm in ("candidate", "gate")))
             }
+        if arguments.rounding_witnesses:
+            server_environment["OMNI_WITNESS_BATCH_CONTROL"] = str(witness_control_path)
+        else:
+            pass
         talker_server = start_server_from_cmd(
             [
                 *server_command(),
@@ -217,6 +236,19 @@ def generate(arguments: argparse.Namespace, run_directories: list[Path]) -> None
                     ), "Native tactic selections changed"
             else:
                 pass
+            if arguments.rounding_witnesses:
+                run_rounding_witnesses(
+                    server_port,
+                    run_directory,
+                    witness_control_path,
+                    mmsu_samples,
+                    MMSU_TTS_PROMPT,
+                    REQUEST_SEED,
+                    CLIENT_CONCURRENCY,
+                )
+                continue
+            else:
+                pass
             subprocess.run(
                 [
                     *seedtts_command(),
@@ -267,7 +299,13 @@ def generate(arguments: argparse.Namespace, run_directories: list[Path]) -> None
         print(f"{run_directory.name}: completed both generation workloads", flush=True)
 
 
-def score(asr_path: str, output: Path, run_directories: list[Path]) -> None:
+def score(
+    asr_path: str,
+    output: Path,
+    run_directories: list[Path],
+    *,
+    rounding_witnesses: bool,
+) -> None:
     asr_port = find_available_port()
     asr_server = start_server_from_cmd(
         [
@@ -289,6 +327,11 @@ def score(asr_path: str, output: Path, run_directories: list[Path]) -> None:
         strip_proxy=True,
     )
     try:
+        if rounding_witnesses:
+            score_rounding_witnesses(asr_port, output, run_directories)
+            return
+        else:
+            pass
         for run_directory in run_directories:
             print(f"{run_directory.name}: scoring WER", flush=True)
             seedtts_directory = run_directory / "seedtts"

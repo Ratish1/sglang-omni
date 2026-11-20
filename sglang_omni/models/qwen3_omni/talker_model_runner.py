@@ -144,6 +144,9 @@ class QwenTalkerModelRunner(ModelRunner["SGLangARRequestData"]):
                         ),
                         "max_new_tokens": parameters.max_new_tokens,
                         "suppressed_tokens": request.data.suppress_tokens,
+                        "request_token_lengths": list(sequence_lengths),
+                        "request_row": row_index,
+                        "batch_request_ids": [member.request_id for member in requests],
                     },
                 )
             else:
@@ -192,6 +195,8 @@ class QwenTalkerModelRunner(ModelRunner["SGLangARRequestData"]):
                         "feedback_row": feedback_row,
                         "text_row": text_row,
                         "uses_pad": int(not request.data.pending_text_queue),
+                        "request_row": row_index,
+                        "batch_request_ids": [member.request_id for member in requests],
                     },
                     frame_index=request.data.codec_frames_seen,
                 )

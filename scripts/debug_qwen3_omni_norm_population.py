@@ -16,6 +16,7 @@ import httpx
 import torch
 import yaml
 
+from benchmarks.benchmarker.conditions import sampling_seed_field
 from benchmarks.benchmarker.utils import (
     get_wav_duration,
     start_server_from_cmd,
@@ -56,6 +57,8 @@ def post_seedtts_sample(
     sample: SampleInput,
     request_id: str,
     start_barrier: Barrier | None = None,
+    *,
+    seed: int | None = None,
 ) -> httpx.Response:
     prompt = (
         f'Listen to the audio above. The speaker is reading: "{sample.ref_text}". '
@@ -78,6 +81,7 @@ def post_seedtts_sample(
             "temperature": 0.7,
             "stream": False,
             "audios": [sample.ref_audio],
+            **sampling_seed_field(seed),
         },
     )
 
