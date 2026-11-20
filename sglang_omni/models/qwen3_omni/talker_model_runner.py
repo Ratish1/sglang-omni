@@ -124,35 +124,31 @@ class QwenTalkerModelRunner(ModelRunner["SGLangARRequestData"]):
         # the Req for another prefill pass and Req.input_embeds is None.
         if result.next_token_ids is None:
             return
+        elif self.feedback_enabled:
+            layer0_codes = result.next_token_ids
+            if layer0_codes.ndim == 1:
+                layer0_codes = layer0_codes.unsqueeze(1)
+            else:
+                pass
+            talker_hidden = result.logits_output.hidden_states
+            if isinstance(talker_hidden, torch.Tensor) and talker_hidden.ndim == 2:
+                talker_hidden = talker_hidden.unsqueeze(1)
+            else:
+                pass
+            # note (ratish): the layer 0 id is staged to the host ahead of the predictor, so the finalize wait covers the sample and not the predictor.
+            self.stage_token_ids(result, result.next_token_ids)
+            self.model.code_predictor_forward(layer0_codes, talker_hidden)
+            self.emit_code_chunks_and_feedback(
+                schedule_batch=schedule_batch,
+                requests=requests,
+            )
         else:
             pass
         sampling_state = self.model.sampling_state
         assert forward_batch is not None and sampling_state is not None
-        # note (ratish): a slot holds its previous request's sampling state until this write, so it runs with feedback off too.
+        # note (ratish): written after the first frame is emitted, off the first audio path; with feedback off too, since a slot holds its previous request's state until this write.
         sampling_state.write_rows(
             forward_batch.req_pool_indices, requests, result.next_token_ids
-        )
-        if not self.feedback_enabled:
-            return
-        else:
-            pass
-
-        layer0_codes = result.next_token_ids
-        if layer0_codes.ndim == 1:
-            layer0_codes = layer0_codes.unsqueeze(1)
-        else:
-            pass
-        talker_hidden = result.logits_output.hidden_states
-        if isinstance(talker_hidden, torch.Tensor) and talker_hidden.ndim == 2:
-            talker_hidden = talker_hidden.unsqueeze(1)
-        else:
-            pass
-        # note (ratish): the layer 0 id is staged to the host ahead of the predictor, so the finalize wait covers the sample and not the predictor.
-        self.stage_token_ids(result, result.next_token_ids)
-        self.model.code_predictor_forward(layer0_codes, talker_hidden)
-        self.emit_code_chunks_and_feedback(
-            schedule_batch=schedule_batch,
-            requests=requests,
         )
 
     def post_decode(
