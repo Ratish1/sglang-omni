@@ -6,19 +6,24 @@ from __future__ import annotations
 
 import logging
 import os
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Iterable, Optional, Tuple
+from typing import ClassVar, Iterable, Optional, Tuple
 
 import torch
 from sglang.kernels.fused_op import get_fused_op_backend
+from sglang.kernels.ops.layernorm.rmsnorm_hf import rmsnorm_hf
 from sglang.kernels.spec import KernelBackend
-from sglang.srt.layers.layer_boundary.residual.add_norm import UNFUSED_NORM_READOUT
+from sglang.srt.layers.layer_boundary.residual import ResidualUpdate
+from sglang.srt.layers.layer_boundary.residual.add_norm import (
+    UNFUSED_NORM_READOUT,
+    NormReadout,
+)
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.model_executor.runner_utils.capture_mode import get_is_capture_mode
 from sglang.srt.model_loader.weight_utils import default_weight_loader
-from sglang.srt.runtime_context import get_context, get_schedule
+from sglang.srt.runtime_context import get_context, get_parallel, get_schedule
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import add_prefix
@@ -465,6 +470,66 @@ class Qwen3OmniMoeTalkerSparseMoeBlock(Qwen3OmniMoeThinkerTextSparseMoeBlock):
 # ---------------------------------------------------------------------------
 
 
+@dataclass(frozen=True)
+class WitnessPrefillNormReadout(NormReadout):
+    """Use checkpoint residual arithmetic during Talker prefill only."""
+
+    is_plain_norm: ClassVar[bool] = False
+    uses_checkpoint_norm: bool = False
+
+    def bind(
+        self, forward_batch: ForwardBatch, read_context: None
+    ) -> "WitnessPrefillNormReadout":
+        assert read_context is None
+        if forward_batch.forward_mode == ForwardMode.EXTEND:
+            return CHECKPOINT_PREFILL_NORM_READOUT
+        else:
+            return NATIVE_DECODE_NORM_READOUT
+
+    def read(
+        self,
+        residual: torch.Tensor,
+        norm: RMSNorm,
+        quant_format: str = "",
+        post_residual_addition: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if self.uses_checkpoint_norm:
+            assert not quant_format and post_residual_addition is None
+            return rmsnorm_hf(residual, norm.weight, norm.variance_epsilon), residual
+        else:
+            return super().read(residual, norm, quant_format, post_residual_addition)
+
+    def update_and_read(
+        self,
+        update: ResidualUpdate,
+        hidden_states: torch.Tensor,
+        residual: torch.Tensor | None,
+        norm: RMSNorm,
+        quant_format: str = "",
+        post_residual_addition: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if not self.uses_checkpoint_norm:
+            return super().update_and_read(
+                update,
+                hidden_states,
+                residual,
+                norm,
+                quant_format,
+                post_residual_addition,
+            )
+        elif residual is None or hidden_states.shape[0] == 0:
+            return self.read(hidden_states, norm, quant_format, post_residual_addition)
+        else:
+            updated_residual = update.update(hidden_states, residual)
+            return self.read(
+                updated_residual, norm, quant_format, post_residual_addition
+            )
+
+
+CHECKPOINT_PREFILL_NORM_READOUT = WitnessPrefillNormReadout(uses_checkpoint_norm=True)
+NATIVE_DECODE_NORM_READOUT = WitnessPrefillNormReadout()
+
+
 class Qwen3OmniMoeTalkerDecoderLayer(Qwen3OmniMoeThinkerTextDecoderLayer):
     """Talker decoder layer with routed and gated shared experts."""
 
@@ -478,9 +543,14 @@ class Qwen3OmniMoeTalkerDecoderLayer(Qwen3OmniMoeThinkerTextDecoderLayer):
         attention, feed_forward = Qwen3OmniMoeThinkerTextDecoderLayer.stage_facts(
             config, layer_id
         )
+        readout = (
+            NATIVE_DECODE_NORM_READOUT
+            if os.environ.get("OMNI_WITNESS_PREFILL_NORM_ONLY") == "1"
+            else UNFUSED_NORM_READOUT
+        )
         return (
-            replace(attention, read=UNFUSED_NORM_READOUT),
-            replace(feed_forward, read=UNFUSED_NORM_READOUT),
+            replace(attention, read=readout),
+            replace(feed_forward, read=readout),
         )
 
 
@@ -530,12 +600,28 @@ class Qwen3OmniMoeTalkerTextModel(nn.Module):
         self.start_layer = 0
         self.end_layer = config.num_hidden_layers
 
+        self.witness_prefill_norm_only: bool = (
+            os.environ.get("OMNI_WITNESS_PREFILL_NORM_ONLY") == "1"
+        )
+        if self.witness_prefill_norm_only:
+            assert quant_config is None and current_platform.is_cuda()
+            assert get_parallel().tp_size == 1
+            assert self.codec_embedding.weight.dtype == torch.bfloat16
+            assert not get_schedule().chunked_prefill_size
+        else:
+            pass
         self.norm = RMSNorm(
-            config.hidden_size, eps=config.rms_norm_eps, cast_x_before_out_mul=True
+            config.hidden_size,
+            eps=config.rms_norm_eps,
+            cast_x_before_out_mul=not self.witness_prefill_norm_only,
         )
         for layer in self.layers:
-            layer.input_layernorm.cast_x_before_out_mul = True
-            layer.post_attention_layernorm.cast_x_before_out_mul = True
+            layer.input_layernorm.cast_x_before_out_mul = (
+                not self.witness_prefill_norm_only
+            )
+            layer.post_attention_layernorm.cast_x_before_out_mul = (
+                not self.witness_prefill_norm_only
+            )
         self.layers_to_capture = []
         max_batch_size = get_schedule().max_running_requests
         self.cp_enabled = True
@@ -606,10 +692,23 @@ class Qwen3OmniMoeTalkerTextModel(nn.Module):
                 ),
             )
 
-        hidden_states = residual_batch.fold(hidden_states, forward_batch)
-        hidden_states = residual_batch.final_norm(
-            hidden_states, forward_batch, self.norm, skip_empty=True
-        )
+        if (
+            self.witness_prefill_norm_only
+            and forward_batch.forward_mode == ForwardMode.EXTEND
+        ):
+            hidden_states = residual_batch.fold(hidden_states, forward_batch)
+            hidden_states = residual_batch.take_output(hidden_states, forward_batch)
+            hidden_states = rmsnorm_hf(
+                hidden_states, self.norm.weight, self.norm.variance_epsilon
+            )
+        else:
+            if not self.witness_prefill_norm_only:
+                hidden_states = residual_batch.fold(hidden_states, forward_batch)
+            else:
+                pass
+            hidden_states = residual_batch.final_norm(
+                hidden_states, forward_batch, self.norm, skip_empty=True
+            )
 
         if aux_hidden_states:
             return hidden_states, aux_hidden_states
