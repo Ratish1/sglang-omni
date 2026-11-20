@@ -227,8 +227,13 @@ def replay_next_cache(
         key = rmsnorm(
             key.contiguous().view(-1, head_size), k_norm, config["rms_norm_eps"]
         ).view_as(key)
-        positions = torch.zeros(token_count, dtype=torch.long, device=x.device)
-        positions[token_index] = layer["positions"].flatten()[0].cuda()
+        # This checkpoint uses multimodal RoPE even when all three axes agree.
+        # Passing only the temporal axis would select its Torch fallback.
+        target_positions = layer["positions"].flatten().to(x.device)
+        assert target_positions.numel() == 3
+        positions = target_positions.new_zeros((3, token_count))
+        positions[:, token_index] = target_positions
+        key_norm_difference = report_difference(key[token_index], layer["key_norm"])
         _, rotary_key = rotary(positions, query, key)
         print(
             json.dumps(
@@ -241,7 +246,7 @@ def replay_next_cache(
                         residual[token_index], layer["attention_residual"]
                     ),
                     "qkv": report_difference(projection[token_index], layer["qkv"]),
-                    "key_norm": report_difference(key[token_index], layer["key_norm"]),
+                    "key_norm": key_norm_difference,
                     "cached_key": report_difference(
                         rotary_key[token_index], layer["key_rope"]
                     ),
