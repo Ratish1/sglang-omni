@@ -35,6 +35,14 @@ ci_text_and_talker() {
   log "boot $name rc $?"
 }
 
+mmsu() {
+  local name=$1 tree=$2 port=$((BASE_PORT + 1060))
+  note $name $tree "omni_text_fused mmsu c96 c16"
+  taskset -c $CPUS python3 $K/baseline.py --tree $tree --model omni_text_fused --card $CARD --port $port --out $O/$name \
+    --bench mmsu --loads 96,16 --passes clean,events > $O/$name.driver.log 2>&1
+  log "boot $name rc $?"
+}
+
 mixed() {
   local name=$1 tree=$2 model=$3 extra=$4 port=$5
   note $name $tree "$model seedtts c16 beside 8 videos"
@@ -76,6 +84,7 @@ for cell in $CELLS; do
       oc) ci_text_and_talker $name $(tree_of $arm) ;;
       sv) mixed $name $(tree_of $arm) omni_ci_onecard "" $((BASE_PORT + 620)) ;;
       cv) mixed $name $(tree_of $arm) omni_colocated "$CONTEXT_32K" $((BASE_PORT + 840)) ;;
+      mm) mmsu $name $(tree_of $arm) ;;
     esac
   done
 done
