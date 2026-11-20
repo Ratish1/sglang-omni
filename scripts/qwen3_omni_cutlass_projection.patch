@@ -1,0 +1,20 @@
+--- a/nv_internal/tensorrt_llm/cutlass_extensions/include/cutlass_extensions/gemm/kernel/fused_moe_kernel_routine.cuh
++++ b/nv_internal/tensorrt_llm/cutlass_extensions/include/cutlass_extensions/gemm/kernel/fused_moe_kernel_routine.cuh
+@@ -399,7 +399,16 @@
+     ActivationFn fn{};
+     CUTLASS_PRAGMA_UNROLL
+     for (int temp_iter = 0; temp_iter < cute::size(accum); temp_iter++) {
+-      accum(temp_iter) = fn(accum_gate(temp_iter)) * accum(temp_iter);
++      if constexpr (std::is_same_v<typename KT::ElementOutput, cutlass::bfloat16_t> &&
++                    activation_type_ == Activation_Type::Swiglu) {
++        cutlass::NumericConverter<typename KT::ElementOutput, float> round;
++        cutlass::NumericConverter<float, typename KT::ElementOutput> expand;
++        float const gate = expand(round(accum_gate(temp_iter)));
++        float const up = expand(round(accum(temp_iter)));
++        accum(temp_iter) = fn(gate) * up;
++      } else {
++        accum(temp_iter) = fn(accum_gate(temp_iter)) * accum(temp_iter);
++      }
+     }
+
+     // (4) push all the result to smem

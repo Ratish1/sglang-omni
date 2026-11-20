@@ -2,6 +2,7 @@
 """Replay every token of a held Talker prefix through its first two K/V producers."""
 
 import argparse
+import hashlib
 import json
 from itertools import accumulate
 from pathlib import Path
@@ -18,6 +19,7 @@ from sglang.srt.layers.moe.topk import fused_topk
 from sglang.srt.layers.rotary_embedding import get_rope
 from torch.nn.functional import linear, silu
 
+from scripts.debug_qwen3_omni_cutlass_projection import install_projection_control
 from scripts.debug_qwen3_omni_peer_shape import read_weights
 
 
@@ -181,10 +183,15 @@ def main() -> None:
     parser.add_argument("--input", type=Path, required=True)
     parser.add_argument("--serial", type=Path, required=True)
     parser.add_argument("--historical-peer", type=Path, required=True)
-    parser.add_argument("--autotune-cache", type=Path, required=True)
+    parser.add_argument("--autotune-cache", type=Path)
+    parser.add_argument("--projection-control-source", type=Path)
     parser.add_argument("--gemm1-tactics", type=int, nargs=2)
     parser.add_argument("--gemm2-tactic", type=int)
     args = parser.parse_args()
+    if args.projection_control_source is not None:
+        install_projection_control(args.projection_control_source)
+    else:
+        pass
     state = torch.load(args.input, weights_only=True)
     serial = torch.load(args.serial, weights_only=True)
     peer = torch.load(args.historical_peer, weights_only=True)
@@ -241,7 +248,10 @@ def main() -> None:
         )
         packed_fc1[expert] = torch.cat((up, gate))
         packed_fc2[expert] = down
-    AutoTuner.get().load_configs(str(args.autotune_cache))
+    if args.autotune_cache is not None:
+        AutoTuner.get().load_configs(str(args.autotune_cache))
+    else:
+        pass
     layouts = (
         ((151,), 0, 151),
         ((151,), 0, 160),
@@ -305,6 +315,7 @@ def main() -> None:
             pass
         if args.gemm1_tactics and physical_count in (1536, 1792):
             assert args.gemm2_tactic is not None
+            tactic_outputs: list[torch.Tensor] = []
             if physical_count == 1792:
                 compare_activation_store(
                     ffn_input,
@@ -321,6 +332,8 @@ def main() -> None:
                 tactics = [gemm1, args.gemm2_tactic]
                 kernel_args = (ffn_input, ids, weights, packed_fc1, packed_fc2, tactics)
                 result = routed_experts(*kernel_args)
+                target_output = result[target].clone()
+                tactic_outputs.append(target_output)
                 with torch.profiler.profile(
                     activities=[torch.profiler.ProfilerActivity.CUDA]
                 ) as profile:
@@ -338,6 +351,9 @@ def main() -> None:
                         {
                             "tactic_swap_shape": physical_count,
                             "tactics": tactics,
+                            "target_output_sha256": hashlib.sha256(
+                                target_output.cpu().view(torch.uint8).numpy().tobytes()
+                            ).hexdigest(),
                             "against_auto": row_difference(
                                 result[target], routed[target]
                             ),
@@ -349,6 +365,16 @@ def main() -> None:
                     ),
                     flush=True,
                 )
+            print(
+                json.dumps(
+                    {
+                        "fixed_tactic_comparison_shape": physical_count,
+                        "gemm1_tactics": args.gemm1_tactics,
+                        "difference": row_difference(*tactic_outputs),
+                    }
+                ),
+                flush=True,
+            )
         else:
             pass
         comparisons = (
