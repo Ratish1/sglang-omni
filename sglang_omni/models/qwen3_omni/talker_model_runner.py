@@ -3,10 +3,13 @@
 
 from __future__ import annotations
 
+import os
+from bisect import bisect_left
 from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
 from queue import Queue
+from time import perf_counter_ns
 from typing import TYPE_CHECKING, TypeAlias
 
 import torch
@@ -23,6 +26,10 @@ from sglang_omni.models.qwen3_omni.boundary_witness import (
     is_witness,
     record_boundary,
     witness_control,
+)
+from sglang_omni.models.qwen3_omni.prefill_timing import (
+    PrefillTiming,
+    PrefillTimingRecorder,
 )
 from sglang_omni.scheduling.message import OutgoingMessage, put_messages
 from sglang_omni.scheduling.pending_text_queue import PendingTextTensorQueue
@@ -84,12 +91,57 @@ class QwenTalkerModelRunner(ModelRunner["SGLangARRequestData"]):
         self.code2wav_in_process = code2wav_in_process
         self.feedback_enabled = bool(feedback_enabled)
         self.paired_gate_cache_rows: dict[str, PairedGateCacheRows] = {}
+        prefill_timing_path = os.environ.get("OMNI_WITNESS_PREFILL_TIMING")
+        self.prefill_timing: PrefillTimingRecorder | None = (
+            PrefillTimingRecorder(Path(prefill_timing_path))
+            if prefill_timing_path is not None
+            else None
+        )
         self.codec_coalesce_frames = max(int(codec_coalesce_frames), 0)
         self.codec_coalesce_first_frames = max(int(codec_coalesce_first_frames), 0)
         self.codec_coalesce_early_frames = max(int(codec_coalesce_early_frames), 0)
 
     def execute(self, scheduler_output: SchedulerOutput) -> ModelRunnerOutput:
         return super().execute(scheduler_output)
+
+    def custom_prefill_forward(
+        self,
+        forward_batch: ForwardBatch | None,
+        schedule_batch: ScheduleBatch | None,
+        requests: list[SchedulerRequest],
+    ) -> GenerationBatchResult | None:
+        timing_recorder = self.prefill_timing
+        if timing_recorder is None:
+            return None
+        else:
+            pass
+        assert forward_batch is not None
+        start = torch.cuda.Event(enable_timing=True)
+        end = torch.cuda.Event(enable_timing=True)
+        start.record()
+        host_begin_ns = perf_counter_ns()
+        result = self.tp_worker.forward_batch_generation(forward_batch)
+        host_duration_us = (perf_counter_ns() - host_begin_ns) / 1000
+        end.record()
+        token_count = len(forward_batch.input_ids)
+        if result.can_run_cuda_graph:
+            buckets = (
+                self.tp_worker.model_runner.prefill_cuda_graph_runner.capture_num_tokens
+            )
+            bucket_tokens = int(buckets[bisect_left(buckets, token_count)])
+        else:
+            bucket_tokens = None
+        timing_recorder.pending.append(
+            PrefillTiming(
+                start=start,
+                end=end,
+                token_count=token_count,
+                bucket_tokens=bucket_tokens,
+                request_ids=[request.request_id for request in requests],
+                host_duration_us=host_duration_us,
+            )
+        )
+        return result
 
     def before_prefill(
         self,
@@ -922,6 +974,10 @@ class QwenTalkerModelRunner(ModelRunner["SGLangARRequestData"]):
     def on_request_finished(
         self, request_id: str, req_data: "SGLangARRequestData"
     ) -> None:
+        if self.prefill_timing is not None:
+            self.prefill_timing.flush_ready()
+        else:
+            pass
         if is_witness(request_id):
             assert req_data.tts_pad_embed is not None
             pad_embedding = req_data.tts_pad_embed.reshape(-1)

@@ -3,6 +3,7 @@
 
 import argparse
 import json
+import statistics
 from pathlib import Path
 
 import torch
@@ -13,8 +14,10 @@ from sglang_omni.models.qwen3_omni.components.shared_expert_gate import (
     project_shared_expert_gate,
 )
 
-PREFILL_SHAPES = (1, 16, 134, 144, 151, 160, 257, 1024)
-GRAPH_REPLAY_COUNT = 300
+PREFILL_SHAPES = (1, 16, 134, 144, 151, 160, 256, 512, 1024, 1536, 1792, 2048)
+GRAPH_REPLAY_COUNT = 200
+GATE_CALLS_PER_GRAPH = 20
+TIMING_ORDER = ("linear", "candidate", "candidate", "linear") * 2
 
 
 @torch.inference_mode()
@@ -36,6 +39,7 @@ def main() -> None:
             layer_index
         ]
         hidden_row = layer["mlp_normalized"].cuda()
+        shared_row = layer["shared_before_gate"].cuda()
         weight_name = f"talker.model.layers.{layer_index}.mlp.shared_expert_gate.weight"
         with safe_open(
             arguments.checkpoint / weight_index[weight_name], framework="pt"
@@ -70,24 +74,41 @@ def main() -> None:
             activations[token_index].copy_(hidden_row)
             graph.replay()
             assert torch.equal(captured_candidate, candidate)
-            timings = {}
+            shared_states = shared_row.reshape(1, -1).repeat(token_count, 1)
+            measured_graphs = {}
             for mode in ("candidate", "linear"):
                 measured_graph = torch.cuda.CUDAGraph()
                 with torch.cuda.graph(measured_graph):
-                    if mode == "candidate":
-                        measured_gate = project_shared_expert_gate(activations, weight)
-                    else:
-                        measured_gate = functional.linear(activations, weight)
+                    for _ in range(GATE_CALLS_PER_GRAPH):
+                        if mode == "candidate":
+                            measured_gate = project_shared_expert_gate(
+                                activations, weight
+                            )
+                        else:
+                            measured_gate = functional.linear(activations, weight)
+                        measured_output = shared_states * torch.sigmoid(measured_gate)
+                measured_graphs[mode] = measured_graph
+                assert measured_output.shape == activations.shape
+            for measured_graph in measured_graphs.values():
+                for _ in range(GATE_CALLS_PER_GRAPH):
+                    measured_graph.replay()
+            torch.cuda.synchronize()
+            timings: dict[str, list[float]] = {"candidate": [], "linear": []}
+            for mode in TIMING_ORDER:
+                measured_graph = measured_graphs[mode]
                 measured_graph.replay()
                 start = torch.cuda.Event(enable_timing=True)
                 end = torch.cuda.Event(enable_timing=True)
                 start.record()
-                for replay_index in range(GRAPH_REPLAY_COUNT):
+                for _ in range(GRAPH_REPLAY_COUNT):
                     measured_graph.replay()
                 end.record()
                 end.synchronize()
-                assert measured_gate.shape == (token_count, 1)
-                timings[mode] = start.elapsed_time(end) * 1000 / GRAPH_REPLAY_COUNT
+                timings[mode].append(
+                    start.elapsed_time(end)
+                    * 1000
+                    / (GRAPH_REPLAY_COUNT * GATE_CALLS_PER_GRAPH)
+                )
             shapes.append(
                 {
                     "token_count": token_count,
@@ -95,7 +116,11 @@ def main() -> None:
                     "fixed_gate": float(candidate[token_index]),
                     "whole_tensor_equal_in_graph": True,
                     "changed_input_updates_replay": True,
-                    "average_graph_replay_microseconds": timings,
+                    "shared_gate_and_apply_median_microseconds": {
+                        mode: statistics.median(samples)
+                        for mode, samples in timings.items()
+                    },
+                    "shared_gate_and_apply_microseconds_by_repeat": timings,
                 }
             )
         print(
