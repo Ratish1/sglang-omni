@@ -259,6 +259,7 @@ def main() -> None:
     parser.add_argument(
         "--transfer-state", choices=("codec", "kv", "both"), default="codec"
     )
+    parser.add_argument("--exclude-frozen-transfer-control", action="store_true")
     parser.add_argument("--score-existing", action="store_true")
     arguments = parser.parse_args()
     output = arguments.output.resolve()
@@ -286,11 +287,16 @@ def main() -> None:
             frame_index = pair.get("first_changed_codec_frame")
             if (
                 pair["opening_state_equal"]
+                and not (
+                    arguments.exclude_frozen_transfer_control
+                    and row["used_frozen_h200_state"]
+                )
                 and pair["future_text_equal"]
                 and "spoken_wer" in before
                 and "spoken_wer" in after
                 and before["returned_text"] == after["returned_text"]
                 and frame_index is not None
+                and (arguments.transfer_state == "codec" or frame_index == 1)
                 and 0
                 < frame_index
                 < min(pair["before_frames"], pair["after_frames"]) - 1
@@ -299,8 +305,6 @@ def main() -> None:
                     (after["word_errors"] - before["word_errors"], row["sample_id"])
                 )
                 donor_rows[row["sample_id"]] = row
-            else:
-                pass
         worsening = sorted((entry for entry in eligible if entry[0] > 0), reverse=True)[
             :2
         ]
