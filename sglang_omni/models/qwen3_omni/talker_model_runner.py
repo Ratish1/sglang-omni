@@ -204,6 +204,12 @@ class QwenTalkerModelRunner(ModelRunner["SGLangARRequestData"]):
                                 "scheduler_cache_length": forward_batch.seq_lens[
                                     row_index
                                 ],
+                                "prefill_graph_replays": (
+                                    self.tp_worker.prefill_cuda_graph_usage.replay_count
+                                ),
+                                "prefill_eager_forwards": (
+                                    self.tp_worker.prefill_cuda_graph_usage.standard_eager_count
+                                ),
                             },
                         )
                     else:

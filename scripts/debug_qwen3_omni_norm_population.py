@@ -325,10 +325,47 @@ def audit_first_decode_attention(
         "attention_context_max_abs_error": float(
             (actual_context - expected_context).abs().max()
         ),
+        "attention_context_relative_l2_error": float(
+            (actual_context - expected_context).norm() / expected_context.norm()
+        ),
         "permuted_values_max_abs_error": float(
             (actual_context - permuted_context).abs().max()
         ),
     }
+
+
+def compare_native_prefill(
+    breakable_trace: Path, eager_trace: Path
+) -> dict[str, bool | int | float | list[int] | None]:
+    comparison: dict[str, bool | int | float | list[int] | None] = {}
+    for boundary in (
+        "backbone-prefill-000.pt",
+        "prefill-sampling-000.pt",
+        "codec-000.pt",
+        "backbone-decode-001.pt",
+        "first-decode-prefix-cache-000.pt",
+    ):
+        breakable = torch.load(breakable_trace / boundary, weights_only=True)
+        eager = torch.load(eager_trace / boundary, weights_only=True)
+        assert breakable.keys() == eager.keys()
+        for name, value in breakable.items():
+            equivalent = (
+                value.dtype == eager[name].dtype and torch.equal(value, eager[name])
+                if isinstance(value, torch.Tensor)
+                else value == eager[name]
+            )
+            comparison[f"{boundary.removesuffix('.pt')}/{name}"] = equivalent
+    for trace, name in ((breakable_trace, "breakable"), (eager_trace, "eager")):
+        addresses = torch.load(
+            trace / "first-decode-addresses-000.pt", weights_only=True
+        )
+        comparison[f"{name}_prefill_graph_replays"] = addresses.get(
+            "prefill_graph_replays"
+        )
+        comparison[f"{name}_prefill_eager_forwards"] = addresses.get(
+            "prefill_eager_forwards"
+        )
+    return comparison
 
 
 def main() -> None:
@@ -346,6 +383,7 @@ def main() -> None:
     )
     parser.add_argument("--exclude-frozen-transfer-control", action="store_true")
     parser.add_argument("--native-kv-audit", action="store_true")
+    parser.add_argument("--eager-talker-prefill-reference", type=Path)
     parser.add_argument("--score-existing", action="store_true")
     arguments = parser.parse_args()
     output = arguments.output.resolve()
@@ -357,10 +395,12 @@ def main() -> None:
         output.mkdir()
     cases = select_cases(arguments.h200_history, arguments.h100_history)
     donor_population = arguments.transfer_from
+    prefill_reference = arguments.eager_talker_prefill_reference
+    assert prefill_reference is None or arguments.native_kv_audit
     donor_rows = {}
     if arguments.native_kv_audit:
         assert donor_population is None and not arguments.score_existing
-        scopes = ("plain", "observe")
+        scopes = ("plain", "observe") if prefill_reference is None else ("observe",)
         cases = [case for case in cases if case["sample_id"] != HELD_SAMPLE_ID]
     elif donor_population is None:
         scopes = ("none", "first", "decode")
@@ -429,6 +469,11 @@ def main() -> None:
                 arguments.model_path,
                 "--model-name",
                 "qwen3-omni",
+                *(
+                    ["--talker_ar.engine.cuda_graph_backend_prefill", "disabled"]
+                    if prefill_reference is not None
+                    else []
+                ),
             ],
             output / f"talker-{scope}.log",
             talker_port,
@@ -567,15 +612,28 @@ def main() -> None:
         assert len({arm["input_sha256"] for arm in arms.values()}) == 1
         if arguments.native_kv_audit:
             assert all(arm["http_status"] == 200 for arm in arms.values())
+            if prefill_reference is None:
+                reference_arm = arms["plain"]
+                prefill_comparison = {}
+            else:
+                reference_trace = prefill_reference / case_directory.name / "observe"
+                reference_arm = json.loads(
+                    (reference_trace / "response.json").read_bytes()
+                )
+                assert reference_arm["input_sha256"] == arms["observe"]["input_sha256"]
+                prefill_comparison = compare_native_prefill(
+                    reference_trace, case_directory / "observe"
+                )
             pairs = {
                 "observe": {
                     **audit_first_decode_attention(case_directory / "observe"),
-                    "waveform_matches_uninstrumented": (
-                        arms["plain"]["waveform_sha256"]
+                    **prefill_comparison,
+                    "waveform_matches_reference": (
+                        reference_arm["waveform_sha256"]
                         == arms["observe"]["waveform_sha256"]
                     ),
-                    "returned_text_matches_uninstrumented": (
-                        arms["plain"]["returned_text"]
+                    "returned_text_matches_reference": (
+                        reference_arm["returned_text"]
                         == arms["observe"]["returned_text"]
                     ),
                 },
