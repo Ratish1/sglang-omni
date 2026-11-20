@@ -31,12 +31,12 @@ Overload: Nari Labs' open client, unmodified (`tts_bench` `a2d65e1`): 1.7B Custo
 
 | req/s | completed, main → this head | requests with underruns | first byte p50, ms | left-context decodes, main (this head 0) |
 |---|---|---|---|---|
-| 60 | 0.4 / 0.9 / 0.6 % → 100 / 100 / 98.7 % | 2,067 / 2,085 / 1,972 → 55 / 105 / 340 | 59 / 55 / 56 → 21 / 21 / 326 | 1,213 / 1,258 / 1,183 |
-| 70 | 82.5 / 0.2 / 81.7 % → 89.9 / 94.7 / 98.1 % | 149 / 2,008 / 79 → 271 / 154 / 78 | 1,032 / 60 / 1,051 → 895 / 795 / 438 | 316 / 1,152 / 304 |
-| 80 | 66.2 / 72.0 / 0.4 % → 85.1 / 88.1 / 75.9 % | 301 / 155 / 1,962 → 16 / 28 / 143 | 1,170 / 1,080 / 57 → 882 / 840 / 1,007 | 310 / 332 / 1,119 |
+| 60 | 0.5 / 0.5 / 1.8 % → 100 / 100 / 100 % | 1,984 / 2,068 / 2,324 → 56 / 140 / 45 | 56 / 57 / 54 → 22 / 25 / 22 | 1,129 / 1,197 / 1,370 |
+| 70 | 79.7 / 77.9 / 80.2 % → 99.4 / 96.8 / 97.6 % | 127 / 153 / 170 → 38 / 14 / 3 | 1,091 / 1,128 / 1,067 → 323 / 715 / 673 | 306 / 310 / 318 |
+| 80 | 67.6 / 68.3 / 77.8 % → 78.6 / 84.7 / 88.5 % | 336 / 292 / 16 → 182 / 102 / 77 | 1,153 / 1,152 / 982 → 958 / 881 / 811 | 299 / 312 / 353 |
 
-- Sampled every 2 s, this head held at most 62 to 67 of its 128 stream rows, while main's 64 stream rows were full in every cell.
-- Main is unstable past 60 req/s: once its rows run out, whether it recovers depends on the arrival sequence, and in five of the nine cells it completed under 1 %. In those cells its first byte covers only the requests it completed.
+- Sampled every 2 s, this head held at most 64 to 66 of its 128 stream rows, while main's 64 stream rows were full in every cell.
+- Main collapses at 60 req/s: once its rows run out it completes under 2 % on every seed, and its first byte there covers only the requests it completed.
 - Past capacity this head serves at capacity, and the excess gets HTTP 503 at the in-flight cap.
 - The overload client sends only streams, and their path is main's except for the row count.
 
@@ -44,31 +44,33 @@ Normal load: SeedTTS EN, 1.7B Base, the full 1,088 prompts, unseeded, two orders
 
 | cell | first audio mean / median / p95, ms, main → this head | RTF |
 |---|---|---|
-| streaming c1 | 20.9 / 20.5 / 34.5 → 21.3 / 20.6 / 35.4 | +0.6 % |
-| streaming c16 | 35.8 / 30.7 / 67.2 → 33.4 / 30.5 / 52.8 | -5.1 % |
-| streaming c64 | 58.2 / 44.0 / 177.8 → 61.0 / 44.6 / 208.8 | +1.9 % |
-| streaming c64, three warm rounds per order | 59.9 / 43.2 / 203.1 → 58.8 / 44.2 / 182.5 | -0.3 % |
-| whole c1 (latency mean) | 250 → 251 ms | -0.2 % |
-| whole c16 (latency mean) | 397 → 401 ms | +0.7 % |
-| whole c64, three warm rounds per order (latency mean) | 828 → 834 ms | +0.7 % |
+| streaming c1 | 21.1 / 20.4 / 34.5 → 21.8 / 20.6 / 35.8 | +0.8 % |
+| streaming c16 | 35.0 / 30.2 / 64.0 → 32.3 / 29.1 / 54.3 | -5.4 % |
+| streaming c64 | 57.2 / 42.5 / 144.2 → 58.5 / 43.5 / 206.7 | +0.3 % |
+| streaming c64, three warm rounds per order | 60.5 / 43.9 / 207.1 → 62.8 / 44.5 / 192.3 | +3.6 % |
+| whole c1 (latency mean) | 250 → 250 ms | 0.0 % |
+| whole c16 (latency mean) | 394 → 385 ms | -2.4 % |
+| whole c64, three warm rounds per order (latency mean) | 812 → 835 ms | +2.7 % |
 
-- At c64 the server that ran second in an order was the slower one in both orders, by up to 30 % in RTF, so a single c64 cell moves with the order. Over six warm rounds each, this head's c64 first audio and RTF match main's.
-- At whole c64 the window graphs ran 3,094 and 3,068 replays on main and 3,081 and 3,062 on this head, and the tail graphs 2,379 and 2,350 against 2,383 and 2,361, for the same requests. Eight rows keep the replays as full as main's 64. Main's latency ranged 805 to 864 ms over its six rounds and this head's 795 to 882.
+- The c64 rounds move more between rounds of one server than between the servers: main's first audio mean ranged 53.7 to 70.3 ms over its six warm rounds and this head's 54.7 to 76.0, and whole c64 latency 784 to 852 against 788 to 890 ms. A rank test puts the streaming difference at p 0.7 and the whole one at p 0.4. With a row for every whole request on both servers, the window graphs ran 3,107 and 3,082 replays on main and 3,078 and 3,091 on this head, and the tail graphs 2,399 and 2,355 against 2,369 and 2,396, for the same requests.
+- At c1 one stream decodes at a time on the same row and graphs as main, and the median matches. Main's own c1 mean read 20.5 to 21.3 ms across runs on this card.
 - 54 seeded requests over Base, CustomVoice and VoiceDesign, with each `non_streaming_mode` value, 27 streamed and 27 whole, are byte-identical to main.
-- WER (streaming c16, Qwen3-ASR): 1.05 / 1.01 → 1.05 / 1.04 %. SIM 71.43 / 71.32 → 71.28 / 71.21. With byte-identical seeded audio, both differences are unseeded sampling.
-- On one H100 at the default memory fraction, 1.7B Base holds 546,401 and 546,475 KV tokens on main and 546,226 on this head.
+- WER (streaming c16, Qwen3-ASR): 1.05 / 0.99 → 0.90 / 0.95 %. SIM 71.57 / 71.47 → 71.33 / 71.48. With byte-identical seeded audio, both differences are unseeded sampling.
+- On one H100 at the default memory fraction, 1.7B Base holds 546,401 KV tokens on main and 543,736 on this head, 0.5 % fewer for the larger arena.
+
+Whole-request rows against the replay batch, on the real 1.7B Base codec with captured window graphs, 128 stream rows and replays of at most 8: eight 384-frame whole requests and then seven 16-frame ones finish the short ones on the second replay, 18.7 ms in, with this head's 128 whole-request rows, and the same with main's 64. In the review's run with one replay's batch of 8 rows, the short ones waited behind the long ones' windows and finished on the seventh replay, 92.6 ms in. Requests that end on different window widths take 3 replays with 128 or 64 rows, and took 10 with 8 in that run, eight of them a single row.
 
 Streams and whole requests at once on a real server, on this head:
 
 - **1 stream row, 1.7B Base and 1.7B CustomVoice, six rounds each:** each round sent 16 streams, 2 whole requests, 6 clients that cancel before audio and 3 that drop after the first chunk. Every request that should finish did, and every row came back. Refused acquires equal left-context fallbacks.
-- **4 stream rows, continuous arrivals:** for 60 s, 8 stream clients that each send a new stream as the last ends, and a whole request every second. About half the streams decoded on the left-context path, and every whole request finished on its own rows: 1.7B Base in 0.80 s median and 1.08 s at most, beside 586 streams, and 1.7B CustomVoice in 0.94 and 1.43 s, beside 485. Every row came back.
+- **4 stream rows, continuous arrivals:** for 60 s, 8 stream clients that each send a new stream as the last ends, and a whole request every second. About half the streams decoded on the left-context path, and every whole request finished on its own rows: 1.7B Base in 0.83 s median and 1.09 s at most, beside 558 streams, and 1.7B CustomVoice in 0.91 and 1.61 s, beside 518. Every row came back.
 - **The defaults, 128 stream rows, both models, three rounds each:** the 1-row mix four times over, 108 clients at once, gave no refused acquire, no fallback, and every row back.
 
 Every mode on a real 1.7B CustomVoice server, one stream and one whole request each:
 
 - An uncapped asynchronous server, or `codec_state_slots` set to none, 0.5 or 0, refuses to start, with the error naming the slot count.
 - The uncapped synchronous and rollback servers serve both with no arena.
-- The default serves both with 128 stream rows and 8 whole-request rows.
+- The default serves both with 128 stream rows and 128 whole-request rows.
 
 ## Tests
 
