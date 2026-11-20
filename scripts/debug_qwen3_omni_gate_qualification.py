@@ -41,17 +41,21 @@ def main() -> None:
     parser.add_argument(
         "--arms", choices=("baseline", "candidate"), nargs="+", required=True
     )
+    parser.add_argument("--score-only", action="store_true")
     arguments = parser.parse_args()
     output = arguments.output.resolve()
-    output.mkdir()
-    mmsu_samples = load_mmsu_samples(
-        max_samples=MMSU_SAMPLE_COUNT, repo_id=DATASETS["mmsu-ci-2000"]
-    )
-    assert len(mmsu_samples) == MMSU_SAMPLE_COUNT
-    (output / "mmsu-input-order.json").write_text(
-        json.dumps([sample.sample_id for sample in mmsu_samples]) + "\n"
-    )
-    server_command = [
+    run_directories = [
+        output / f"{index}-{arm}" for index, arm in enumerate(arguments.arms, 1)
+    ]
+    if not arguments.score_only:
+        generate(arguments, run_directories)
+    else:
+        assert all(directory.is_dir() for directory in run_directories)
+    score(arguments.asr_path, output, run_directories)
+
+
+def server_command() -> list[str]:
+    return [
         sys.executable,
         "-P",
         "-m",
@@ -60,7 +64,10 @@ def main() -> None:
         "--host",
         "127.0.0.1",
     ]
-    seedtts_command = [
+
+
+def seedtts_command() -> list[str]:
+    return [
         sys.executable,
         "-m",
         "benchmarks.eval.benchmark_omni_seedtts",
@@ -71,16 +78,25 @@ def main() -> None:
         str(REQUEST_SEED),
         "--disable-tqdm",
     ]
-    run_directories = []
-    for run_index, arm in enumerate(arguments.arms, 1):
-        run_directory = output / f"{run_index}-{arm}"
+
+
+def generate(arguments: argparse.Namespace, run_directories: list[Path]) -> None:
+    output = arguments.output.resolve()
+    output.mkdir()
+    mmsu_samples = load_mmsu_samples(
+        max_samples=MMSU_SAMPLE_COUNT, repo_id=DATASETS["mmsu-ci-2000"]
+    )
+    assert len(mmsu_samples) == MMSU_SAMPLE_COUNT
+    (output / "mmsu-input-order.json").write_text(
+        json.dumps([sample.sample_id for sample in mmsu_samples]) + "\n"
+    )
+    for run_directory, arm in zip(run_directories, arguments.arms, strict=True):
         run_directory.mkdir()
-        run_directories.append(run_directory)
         print(f"{run_directory.name}: starting native inference", flush=True)
         server_port = find_available_port()
         talker_server = start_server_from_cmd(
             [
-                *server_command,
+                *server_command(),
                 "--port",
                 str(server_port),
                 "--config",
@@ -99,7 +115,7 @@ def main() -> None:
         try:
             subprocess.run(
                 [
-                    *seedtts_command,
+                    *seedtts_command(),
                     "--port",
                     str(server_port),
                     "--output-dir",
@@ -141,14 +157,16 @@ def main() -> None:
             stop_server(talker_server)
         print(f"{run_directory.name}: completed both generation workloads", flush=True)
 
+
+def score(asr_path: str, output: Path, run_directories: list[Path]) -> None:
     asr_port = find_available_port()
     asr_server = start_server_from_cmd(
         [
-            *server_command,
+            *server_command(),
             "--port",
             str(asr_port),
             "--model-path",
-            arguments.asr_path,
+            asr_path,
             "--model-name",
             QWEN3_ASR_MODEL_PATH,
             "--asr.gpu",
@@ -163,31 +181,56 @@ def main() -> None:
     )
     try:
         for run_directory in run_directories:
-            print(f"{run_directory.name}: scoring saved audio", flush=True)
-            seedtts_score_command = [
-                *seedtts_command,
-                "--port",
-                str(asr_port),
-                "--output-dir",
-                str(run_directory / "seedtts"),
-            ]
-            subprocess.run([*seedtts_score_command, "--transcribe-only"], check=True)
-            subprocess.run([*seedtts_score_command, "--similarity-only"], check=True)
+            print(f"{run_directory.name}: scoring WER", flush=True)
+            seedtts_directory = run_directory / "seedtts"
+            if not (seedtts_directory / "wer_results.json").is_file():
+                subprocess.run(
+                    [
+                        *seedtts_command(),
+                        "--port",
+                        str(asr_port),
+                        "--output-dir",
+                        str(seedtts_directory),
+                        "--transcribe-only",
+                    ],
+                    check=True,
+                )
+            else:
+                pass
             mmsu_results_path = run_directory / "mmsu" / "mmsu_results.json"
             mmsu_results = json.loads(mmsu_results_path.read_bytes())
-            mmsu_results["wer"] = compute_text_audio_consistency_from_records(
-                mmsu_results["per_sample"],
-                "en",
-                "cuda:0",
-                audio_dir=str(run_directory / "mmsu" / "audio"),
-                asr_router_port=asr_port,
-            )
-            mmsu_results_path.write_text(json.dumps(mmsu_results) + "\n")
-            for generated_waveform in run_directory.rglob("*.wav"):
-                generated_waveform.unlink()
-            print(f"{run_directory.name}: finished quality scoring", flush=True)
+            if not mmsu_results.get("wer"):
+                mmsu_results["wer"] = compute_text_audio_consistency_from_records(
+                    mmsu_results["per_sample"],
+                    "en",
+                    "cuda:0",
+                    audio_dir=str(run_directory / "mmsu" / "audio"),
+                    asr_router_port=asr_port,
+                )
+                mmsu_results_path.write_text(json.dumps(mmsu_results) + "\n")
+            else:
+                pass
     finally:
         stop_server(asr_server)
+
+    for run_directory in run_directories:
+        print(f"{run_directory.name}: scoring speaker similarity", flush=True)
+        seedtts_directory = run_directory / "seedtts"
+        if not (seedtts_directory / "similarity_results.json").is_file():
+            subprocess.run(
+                [
+                    *seedtts_command(),
+                    "--output-dir",
+                    str(seedtts_directory),
+                    "--similarity-only",
+                ],
+                check=True,
+            )
+        else:
+            pass
+        for generated_waveform in run_directory.rglob("*.wav"):
+            generated_waveform.unlink()
+        print(f"{run_directory.name}: finished quality scoring", flush=True)
 
 
 if __name__ == "__main__":
