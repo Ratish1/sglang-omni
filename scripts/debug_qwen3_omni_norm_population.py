@@ -46,6 +46,8 @@ PREFILL_PROBE_TOKEN_BY_SAMPLE = {
     "common_voice_en_19756059-common_voice_en_19756062": 117,
     "common_voice_en_17817002-common_voice_en_17817003": 99,
 }
+SEVERE_PEER_SAMPLE_ID = "common_voice_en_18852076-common_voice_en_18852085"
+SEVERE_PEER_PROBE_TOKEN_INDEX = 117
 
 
 def post_seedtts_sample(
@@ -429,6 +431,43 @@ def compare_native_prefill(
     return comparison
 
 
+def compare_layer_zero_prefill_context(
+    serial_trace: Path, peer_trace: Path, token_index: int
+) -> dict[str, bool | float]:
+    matrices = []
+    for trace_directory in (serial_trace, peer_trace):
+        first_layer = torch.load(
+            trace_directory / "prefill-layers.pt", weights_only=True
+        )[0]
+        prefix = torch.load(
+            trace_directory / "first-decode-prefix-cache-000.pt", weights_only=True
+        )
+        keys = prefix["key_rows"][0, : token_index + 1].double()
+        values = prefix["value_rows"][0, : token_index + 1].double()
+        head_dimension = keys.shape[-1]
+        query = first_layer["query_rope"].reshape(-1, head_dimension).double()
+        query_heads_per_key_head = query.shape[0] // keys.shape[1]
+        keys = keys.repeat_interleave(query_heads_per_key_head, dim=1)
+        values = values.repeat_interleave(query_heads_per_key_head, dim=1)
+        scores = torch.einsum("hd,thd->ht", query, keys) * head_dimension**-0.5
+        reference = torch.einsum("ht,thd->hd", scores.softmax(dim=-1), values)
+        native = first_layer["attention_context"].reshape_as(reference).double()
+        matrices.append((reference, native))
+    (serial_reference, serial_native), (peer_reference, peer_native) = matrices
+    return {
+        "fp64_context_matches_exactly": torch.equal(serial_reference, peer_reference),
+        "serial_context_max_absolute_error": float(
+            (serial_reference - serial_native).abs().max()
+        ),
+        "peer_context_max_absolute_error": float(
+            (peer_reference - peer_native).abs().max()
+        ),
+        "native_context_max_absolute_difference": float(
+            (serial_native - peer_native).abs().max()
+        ),
+    }
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model-path", required=True)
@@ -448,10 +487,17 @@ def main() -> None:
     parser.add_argument("--batched-native-reference", type=Path)
     parser.add_argument("--exact-talker-prefill-reference", type=Path)
     parser.add_argument("--prefill-token-probe", action="store_true")
+    parser.add_argument("--severe-peer-prefill-probe", action="store_true")
     parser.add_argument("--fixed-shared-gate", action="store_true")
     parser.add_argument("--audit-existing", action="store_true")
     parser.add_argument("--score-existing", action="store_true")
     arguments = parser.parse_args()
+    probe_tokens = (
+        {SEVERE_PEER_SAMPLE_ID: SEVERE_PEER_PROBE_TOKEN_INDEX}
+        if arguments.severe_peer_prefill_probe
+        else PREFILL_PROBE_TOKEN_BY_SAMPLE if arguments.prefill_token_probe else {}
+    )
+    assert not probe_tokens or arguments.native_kv_audit
     output = arguments.output.resolve()
     reuse_capture = arguments.score_existing or arguments.audit_existing
     assert not arguments.audit_existing or arguments.native_kv_audit
@@ -502,14 +548,14 @@ def main() -> None:
             ]
         else:
             pass
-        if arguments.prefill_token_probe:
+        if probe_tokens:
             assert native_reference is None
-            scopes = ("observe", "eager")
-            cases = [
-                case
-                for case in cases
-                if case["sample_id"] in PREFILL_PROBE_TOKEN_BY_SAMPLE
-            ]
+            scopes = (
+                ("observe", "peers")
+                if arguments.severe_peer_prefill_probe
+                else ("observe", "eager")
+            )
+            cases = [case for case in cases if case["sample_id"] in probe_tokens]
         else:
             pass
     elif donor_population is None:
@@ -558,7 +604,20 @@ def main() -> None:
         samples = load_seedtts_samples(DATASETS["seedtts"])
         assert len(samples) == EXPECTED_SEEDTTS_SAMPLES
         samples_by_id = {sample.sample_id: sample for sample in samples}
-        witness_ids = {case["sample_id"] for case in cases}
+        witness_ids = (
+            {case["sample_id"] for case in cases}
+            if not arguments.severe_peer_prefill_probe
+            else {
+                case["sample_id"]
+                for case in select_cases(arguments.h200_history, arguments.h100_history)
+                if case["sample_id"] != HELD_SAMPLE_ID
+                and (
+                    case["cohort"] == "historic_severe"
+                    or case["sample_id"]
+                    == "common_voice_en_19401124-common_voice_en_19401123"
+                )
+            }
+        )
         peer_samples = [
             sample for sample in samples if sample.sample_id not in witness_ids
         ][: NATIVE_AUDIT_CLIENT_CONCURRENCY - 1]
@@ -592,7 +651,7 @@ def main() -> None:
                 server_environment["OMNI_WITNESS_NATIVE_KV_AUDIT"] = "1"
             else:
                 pass
-            if arguments.prefill_token_probe:
+            if probe_tokens:
                 server_environment["OMNI_WITNESS_TRACE_PREFILL_TOKEN"] = "1"
             else:
                 pass
@@ -658,15 +717,16 @@ def main() -> None:
                             "plain": "none",
                             "observe": "none",
                             "eager": "none",
+                            "peers": "none",
                         }.get(scope, scope),
                         "held_input_directory": (
                             str(arguments.held_input.resolve()) if is_held else None
                         ),
                     }
-                    if arguments.prefill_token_probe:
-                        control["prefill_probe_token_index"] = (
-                            PREFILL_PROBE_TOKEN_BY_SAMPLE[case["sample_id"]]
-                        )
+                    if probe_tokens:
+                        control["prefill_probe_token_index"] = probe_tokens[
+                            case["sample_id"]
+                        ]
                     else:
                         pass
                     if donor_population is not None:
@@ -697,7 +757,7 @@ def main() -> None:
                     next_control = control_path.with_suffix(".next")
                     next_control.write_text(json.dumps(control))
                     next_control.replace(control_path)
-                    if batched_reference is None:
+                    if batched_reference is None and scope != "peers":
                         response = post_seedtts_sample(
                             client, endpoint, sample, case["request_id"]
                         )
@@ -767,10 +827,10 @@ def main() -> None:
             for scope in scopes
         }
         assert len({arm["input_sha256"] for arm in arms.values()}) == 1
-        if arguments.prefill_token_probe:
+        if probe_tokens:
             assert all(arm["http_status"] == 200 for arm in arms.values())
             graph_trace = case_directory / "observe"
-            eager_trace = case_directory / "eager"
+            eager_trace = case_directory / scopes[1]
             graph_layers = torch.load(
                 graph_trace / "prefill-layers.pt", weights_only=True
             )
@@ -795,12 +855,24 @@ def main() -> None:
             pairs = {
                 "prefill_probe": {
                     **compare_native_prefill(graph_trace, eager_trace),
-                    "logical_token_index": PREFILL_PROBE_TOKEN_BY_SAMPLE[
-                        case["sample_id"]
-                    ],
+                    "logical_token_index": probe_tokens[case["sample_id"]],
                     "different_operands_by_layer": differing_layers,
+                    "serial_prefill_geometry": torch.load(
+                        graph_trace / "prefill-probe-geometry-000.pt", weights_only=True
+                    ),
+                    "comparison_prefill_geometry": torch.load(
+                        eager_trace / "prefill-probe-geometry-000.pt", weights_only=True
+                    ),
                 },
             }
+            if arguments.severe_peer_prefill_probe:
+                pairs["prefill_probe"]["layer_zero_prefill_attention"] = (
+                    compare_layer_zero_prefill_context(
+                        graph_trace, eager_trace, probe_tokens[case["sample_id"]]
+                    )
+                )
+            else:
+                pass
         elif arguments.native_kv_audit:
             assert all(arm["http_status"] == 200 for arm in arms.values())
             if native_reference is None:

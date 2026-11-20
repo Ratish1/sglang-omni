@@ -117,6 +117,16 @@ class QwenTalkerModelRunner(ModelRunner["SGLangARRequestData"]):
                     assert 0 <= token_index < sequence_lengths[row_index]
                     opening_layer.prefill_token_index.fill_(start_token + token_index)
                     opening_layer.step_counter.add_(1)
+                    record_boundary(
+                        request.request_id,
+                        "prefill-probe-geometry",
+                        {
+                            "request_token_lengths": list(sequence_lengths),
+                            "request_row": row_index,
+                            "packed_token_index": start_token + token_index,
+                            "request_token_index": token_index,
+                        },
+                    )
                 else:
                     pass
                 parameters = request.data.req.sampling_params
