@@ -69,9 +69,22 @@ def main() -> None:
     parser.add_argument("--rounding-witnesses", action="store_true")
     parser.add_argument("--prefill-gate-controls", action="store_true")
     parser.add_argument("--profile-prefill-samples", type=int)
+    parser.add_argument("--seedtts-speed-only", action="store_true")
     parser.add_argument("--paired-stock-prefix-directory", type=Path)
     parser.add_argument("--paired-gate-kv", action="store_true")
     arguments = parser.parse_args()
+    if arguments.seedtts_speed_only and (
+        arguments.prefill_gate_controls
+        or arguments.rounding_witnesses
+        or arguments.profile_prefill_samples is not None
+        or arguments.projection_control_build is None
+        or set(arguments.arms) != {"baseline", "prefill-gate"}
+    ):
+        parser.error(
+            "Speed-only repeats require stock and prefill gate without profiling"
+        )
+    else:
+        pass
     if arguments.profile_prefill_samples is not None and (
         not 0 < arguments.profile_prefill_samples <= SEEDTTS_SAMPLE_COUNT
         or arguments.prefill_gate_controls
@@ -124,7 +137,7 @@ def main() -> None:
         return
     else:
         pass
-    if arguments.profile_prefill_samples is not None:
+    if arguments.profile_prefill_samples is not None or arguments.seedtts_speed_only:
         return
     else:
         pass
@@ -373,13 +386,23 @@ def generate(arguments: argparse.Namespace, run_directories: list[Path]) -> None
                 arguments.profile_prefill_samples or SEEDTTS_SAMPLE_COUNT
             )
             assert all(record["is_success"] for record in seedtts_records)
-            if arguments.profile_prefill_samples is not None:
-                assert (run_directory / "prefill-timing.jsonl").stat().st_size > 0
+            if (
+                arguments.profile_prefill_samples is not None
+                or arguments.seedtts_speed_only
+            ):
                 for waveform in (run_directory / "seedtts").rglob("*.wav"):
                     waveform.unlink()
-                print(
-                    f"{run_directory.name}: native prefill profile complete", flush=True
-                )
+                if arguments.profile_prefill_samples is not None:
+                    assert (run_directory / "prefill-timing.jsonl").stat().st_size > 0
+                    print(
+                        f"{run_directory.name}: native prefill profile complete",
+                        flush=True,
+                    )
+                else:
+                    print(
+                        f"{run_directory.name}: uninstrumented SeedTTS complete",
+                        flush=True,
+                    )
                 continue
             else:
                 pass
