@@ -111,7 +111,10 @@ def test_talker_prefill_stages_its_tokens_before_the_predictor():
     runner = types.SimpleNamespace(
         feedback_enabled=True,
         model=types.SimpleNamespace(
-            code_predictor_forward=lambda codes, hidden: calls.append("predictor")
+            code_predictor_forward=lambda codes, hidden: calls.append("predictor"),
+            sampling_state=types.SimpleNamespace(
+                write_rows=lambda request_slots, requests, first_token_ids: None
+            ),
         ),
         stage_token_ids=lambda result, ids: calls.append("stage tokens"),
         emit_code_chunks_and_feedback=lambda **arguments: calls.append("emit"),
@@ -121,6 +124,12 @@ def test_talker_prefill_stages_its_tokens_before_the_predictor():
         logits_output=types.SimpleNamespace(hidden_states=torch.zeros(2, 4)),
     )
 
-    QwenTalkerModelRunner.post_prefill(runner, result, None, None, [])
+    QwenTalkerModelRunner.post_prefill(
+        runner,
+        result,
+        types.SimpleNamespace(req_pool_indices=torch.tensor([1, 2])),
+        None,
+        [],
+    )
 
     assert calls == ["stage tokens", "predictor", "emit"]
