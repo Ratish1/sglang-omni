@@ -8,8 +8,14 @@ from pathlib import Path
 
 import torch
 from safetensors import safe_open
+from sgl_kernel import fused_add_rmsnorm
 from sglang.kernels.ops.attention.flash_attention import flash_attn_with_kvcache
 from sglang.srt.layers.activation import silu_and_mul
+from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
+from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe import fused_experts
+from sglang.srt.layers.moe.topk import StandardTopKOutput
+from sglang.srt.runtime_context import publish
+from sglang.srt.server_args import ServerArgs
 from torch.nn import functional
 
 LAYER_PREFIX = "talker.model.layers.0"
@@ -81,6 +87,89 @@ def replay_expert_projections(
             ),
             flush=True,
         )
+
+
+def replay_routed_experts(
+    checkpoint: Path, first_layer: dict[str, torch.Tensor], token_index: int
+) -> None:
+    config = json.loads((checkpoint / "config.json").read_bytes())["talker_config"][
+        "text_config"
+    ]
+    expert_count = config["num_experts"]
+    expert_ids = first_layer["routed_expert_ids"].flatten().cuda()
+    expert_weights = first_layer["routed_expert_weights"].flatten().cuda()
+    selected_ids = expert_ids.tolist()
+    competing_ids = [
+        expert for expert in range(expert_count) if expert not in selected_ids
+    ][: len(selected_ids)]
+    source = first_layer["mlp_normalized"].flatten().cuda()
+    intermediate = config["moe_intermediate_size"]
+    packed_up = source.new_zeros((expert_count, 2 * intermediate, source.numel()))
+    packed_down = source.new_zeros((expert_count, source.numel(), intermediate))
+    for expert in selected_ids + competing_ids:
+        gate, up, down = read_weights(
+            checkpoint,
+            tuple(
+                f"mlp.experts.{expert}.{part}_proj" for part in ("gate", "up", "down")
+            ),
+        )
+        packed_up[expert] = torch.cat((gate, up))
+        packed_down[expert] = down
+    (norm_weight,) = read_weights(checkpoint, ("post_attention_layernorm",))
+    args = ServerArgs(model_path="dummy", tp_size=1)
+    publish(args, role="test")
+    runner = MoeRunnerConfig(num_experts=expert_count, num_local_experts=expert_count)
+    attention = first_layer["attention_output"].flatten().cuda()
+    residual = first_layer["attention_residual"].flatten().cuda()
+    logits = first_layer["router_logits"].flatten().cuda()
+    for token_count in TOKEN_COUNTS:
+        contribution = attention.new_zeros((token_count, attention.numel()))
+        residual_buffer = torch.zeros_like(contribution)
+        contribution[token_index] = attention
+        residual_buffer[token_index] = residual
+        fused_add_rmsnorm(
+            contribution, residual_buffer, norm_weight, config["rms_norm_eps"]
+        )
+        for sharing, peer_ids in (
+            (True, expert_ids),
+            (False, expert_ids.new_tensor(competing_ids)),
+        ):
+            # Hold the target route fixed. Move it between full and empty expert
+            # tiles without reconstructing unavailable historical peer activations.
+            inputs = source.roll(1).repeat(token_count, 1)
+            inputs[token_index] = source
+            ids = peer_ids.repeat(token_count, 1)
+            ids[token_index] = expert_ids
+            weights = expert_weights.repeat(token_count, 1)
+            routed = fused_experts(
+                inputs,
+                packed_up,
+                packed_down,
+                StandardTopKOutput(weights, ids, logits.expand(token_count, -1)),
+                runner,
+            )[token_index]
+            print(
+                json.dumps(
+                    {
+                        "routed_token_count": token_count,
+                        "peers_share_target_experts": sharing,
+                        "ffn_norm": report_difference(
+                            contribution[token_index], source
+                        ),
+                        "ffn_residual": report_difference(
+                            residual_buffer[token_index], first_layer["mlp_residual"]
+                        ),
+                        "routed_output": report_difference(
+                            routed, first_layer["routed_output"]
+                        ),
+                        "ffn_output": report_difference(
+                            routed + first_layer["shared_output"].flatten().cuda(),
+                            first_layer["mlp_output"],
+                        ),
+                    }
+                ),
+                flush=True,
+            )
 
 
 @torch.inference_mode()
@@ -191,6 +280,7 @@ def main() -> None:
             flush=True,
         )
     replay_expert_projections(arguments.checkpoint, first_layer, arguments.token_index)
+    replay_routed_experts(arguments.checkpoint, first_layer, arguments.token_index)
 
 
 if __name__ == "__main__":
