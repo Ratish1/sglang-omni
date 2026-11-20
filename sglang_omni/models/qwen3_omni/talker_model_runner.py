@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 from collections import deque
+from dataclasses import dataclass
 from pathlib import Path
 from queue import Queue
 from typing import TYPE_CHECKING, TypeAlias
@@ -52,6 +53,13 @@ else:
 TalkerInputQueue: TypeAlias = (
     PendingTextTensorQueue | deque[torch.Tensor] | list[torch.Tensor] | None
 )
+GATE_DONOR_FRAME = 8
+
+
+@dataclass(kw_only=True)
+class PairedGateCacheRows:
+    token_position: int
+    key_value_rows: list[torch.Tensor]
 
 
 class QwenTalkerModelRunner(ModelRunner["SGLangARRequestData"]):
@@ -75,6 +83,7 @@ class QwenTalkerModelRunner(ModelRunner["SGLangARRequestData"]):
         self.code2wav_target = code2wav_target
         self.code2wav_in_process = code2wav_in_process
         self.feedback_enabled = bool(feedback_enabled)
+        self.paired_gate_cache_rows: dict[str, PairedGateCacheRows] = {}
         self.codec_coalesce_frames = max(int(codec_coalesce_frames), 0)
         self.codec_coalesce_first_frames = max(int(codec_coalesce_first_frames), 0)
         self.codec_coalesce_early_frames = max(int(codec_coalesce_early_frames), 0)
@@ -387,7 +396,10 @@ class QwenTalkerModelRunner(ModelRunner["SGLangARRequestData"]):
                 pass
             frame_index = request.data.codec_frames_seen
             stock_prefix_directory = control.get("paired_stock_prefix_directory")
-            if frame_index in control.get("paired_gate_frames", ()):
+            carry_gate_cache = control.get("paired_gate_kv", False)
+            if carry_gate_cache and frame_index == GATE_DONOR_FRAME + 1:
+                intervention = "gate-kv"
+            elif frame_index in control.get("paired_gate_frames", ()):
                 intervention = "gate"
             elif frame_index == 1 and stock_prefix_directory is not None:
                 intervention = "prefix"
@@ -443,10 +455,25 @@ class QwenTalkerModelRunner(ModelRunner["SGLangARRequestData"]):
                     buffer.index_select(0, live_slots) for buffer in buffers
                 ]
                 donor_prefix = [*prefix["key_rows"], *prefix["value_rows"]]
+            elif intervention == "gate-kv":
+                position = int(forward_batch.positions[row_index])
+                live_slots = model_runner.req_to_token_pool.req_to_token[
+                    forward_batch.req_pool_indices[row_index], position - 1 : position
+                ].long()
+                assert live_slots.numel() == 1
+                assert not torch.isin(live_slots, write_slots).any()
+                donor = self.paired_gate_cache_rows.pop(request.request_id)
+                assert donor.token_position + 1 == position
+                donor_prefix = donor.key_value_rows
+                original_prefix = [
+                    buffer.index_select(0, live_slots) for buffer in buffers
+                ]
             else:
                 pass
             decode_results: list[dict[str, torch.Tensor]] = []
             layer_trials: list[list[dict[str, torch.Tensor]]] = []
+            alternative_write_rows: list[torch.Tensor] = []
+            capture_gate_cache = carry_gate_cache and frame_index == GATE_DONOR_FRAME
             for use_alternative in (False, True, False):
                 fixed_gate_switch.fill_(intervention == "gate" and use_alternative)
                 self.model.feedback_mask.copy_(feedback_mask)
@@ -466,11 +493,19 @@ class QwenTalkerModelRunner(ModelRunner["SGLangARRequestData"]):
                 self.model.backbone_recorders[0].step_counter.add_(1)
                 result = self.tp_worker.forward_batch_generation(forward_batch)
                 assert result.can_run_cuda_graph
+                if capture_gate_cache and use_alternative:
+                    target_slot = write_slots[row_index : row_index + 1]
+                    alternative_write_rows = [
+                        buffer.index_select(0, target_slot) for buffer in buffers
+                    ]
+                else:
+                    pass
                 decode_results.append(
                     {
                         "logits": result.logits_output.next_token_logits.clone(),
                         "query": result.logits_output.hidden_states.clone(),
                         "codes": self.model.output_codes[: len(requests)].clone(),
+                        "feedback": self.model.output_embeds[: len(requests)].clone(),
                         "main_codes": self.model.sampled_token_ids[
                             : len(requests)
                         ].clone(),
@@ -488,6 +523,17 @@ class QwenTalkerModelRunner(ModelRunner["SGLangARRequestData"]):
             assert all(
                 torch.equal(first[name], repeated[name]) for name in first
             ), "Same-state reference replay was not exact"
+            if capture_gate_cache:
+                assert all(
+                    torch.equal(first[name][row_index], alternative[name][row_index])
+                    for name in ("codes", "feedback")
+                ), "The gate changed the donor frame's explicit feedback"
+                self.paired_gate_cache_rows[request.request_id] = PairedGateCacheRows(
+                    token_position=int(forward_batch.positions[row_index]),
+                    key_value_rows=alternative_write_rows,
+                )
+            else:
+                pass
             record_boundary(
                 request.request_id,
                 f"paired-{intervention}",

@@ -57,9 +57,14 @@ def main() -> None:
     parser.add_argument("--tactics-from", type=Path)
     parser.add_argument("--rounding-witnesses", action="store_true")
     parser.add_argument("--paired-stock-prefix-directory", type=Path)
+    parser.add_argument("--paired-gate-kv", action="store_true")
     arguments = parser.parse_args()
     if arguments.projection_control_build is None and "combined" in arguments.arms:
         parser.error("The combined arm requires --projection-control-build")
+    else:
+        pass
+    if arguments.paired_gate_kv and arguments.paired_stock_prefix_directory is None:
+        parser.error("Gate KV crossover needs paired decode")
     else:
         pass
     if arguments.paired_stock_prefix_directory is not None and (
@@ -258,6 +263,7 @@ def generate(arguments: argparse.Namespace, run_directories: list[Path]) -> None
                     REQUEST_SEED,
                     CLIENT_CONCURRENCY,
                     stock_prefix_directory=arguments.paired_stock_prefix_directory,
+                    carry_gate_cache=arguments.paired_gate_kv,
                 )
                 continue
             else:

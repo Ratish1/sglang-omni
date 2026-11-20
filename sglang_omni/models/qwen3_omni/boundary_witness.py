@@ -21,6 +21,7 @@ class WitnessControl(TypedDict):
     kv_override_file: NotRequired[str]
     prefill_probe_token_index: NotRequired[int]
     paired_gate_frames: NotRequired[list[int]]
+    paired_gate_kv: NotRequired[bool]
     paired_stock_prefix_directory: NotRequired[str]
 
 

@@ -74,6 +74,7 @@ def run_rounding_witnesses(
     client_concurrency: int,
     *,
     stock_prefix_directory: Path | None = None,
+    carry_gate_cache: bool = False,
 ) -> None:
     seedtts_samples = load_seedtts_samples(SEEDTTS_DATASET_ID)
     endpoint = f"http://127.0.0.1:{server_port}/v1/chat/completions"
@@ -114,8 +115,14 @@ def run_rounding_witnesses(
                         paired_files = ()
                     elif witness_id == PAIRED_GATE_WITNESS:
                         control["paired_gate_frames"] = list(PAIRED_GATE_FRAMES)
+                        control["paired_gate_kv"] = carry_gate_cache
                         paired_files = tuple(
-                            f"paired-gate-{frame_index:03d}.pt"
+                            (
+                                f"paired-gate-kv-{frame_index:03d}.pt"
+                                if carry_gate_cache
+                                and frame_index == PAIRED_GATE_FRAMES[-1]
+                                else f"paired-gate-{frame_index:03d}.pt"
+                            )
                             for frame_index in PAIRED_GATE_FRAMES
                         )
                     else:
