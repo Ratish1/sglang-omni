@@ -1576,10 +1576,14 @@ def test_qwen_thinker_enables_and_attests_breakable_prefill_graphs(
     assert scheduler.server_args is server_args
 
 
+@pytest.mark.parametrize("want_cuda_graph", [True, False])
 @pytest.mark.parametrize("prefill_backend", ["breakable", "disabled"])
 @pytest.mark.parametrize("execution_mode", ["request", "session"])
 def test_qwen_talker_enables_and_attests_breakable_prefill_graphs(
-    monkeypatch: pytest.MonkeyPatch, prefill_backend: str, execution_mode: str
+    monkeypatch: pytest.MonkeyPatch,
+    prefill_backend: str,
+    execution_mode: str,
+    want_cuda_graph: bool,
 ) -> None:
     from sglang.srt.utils import hf_transformers_utils
 
@@ -1603,7 +1607,7 @@ def test_qwen_talker_enables_and_attests_breakable_prefill_graphs(
     )
     captured = {}
     attest_calls = []
-    graph_init_samplers = []
+    graph_inits = []
     talker_config = SimpleNamespace(
         text_config=SimpleNamespace(vocab_size=3072),
         codec_bos_id=1,
@@ -1633,13 +1637,20 @@ def test_qwen_talker_enables_and_attests_breakable_prefill_graphs(
         ),
     )
     model_runner = SimpleNamespace(
-        model=SimpleNamespace(), sampler=object(), model_config=model_config
+        model=SimpleNamespace(
+            model=SimpleNamespace(
+                codec_embedding=SimpleNamespace(weight=torch.zeros(1))
+            )
+        ),
+        sampler=object(),
+        model_config=model_config,
     )
     model_worker = SimpleNamespace(model_runner=model_runner, model_config=model_config)
+    req_to_token_pool = SimpleNamespace(req_to_token=torch.zeros(5, 1))
 
     def fake_create_infrastructure(*args, **kwargs):
         captured.update(kwargs)
-        return (model_worker, object(), object(), object(), model_config)
+        return (model_worker, object(), req_to_token_pool, object(), model_config)
 
     class FakeTalkerScheduler(SimpleNamespace):
         outbox = object()
@@ -1648,7 +1659,9 @@ def test_qwen_talker_enables_and_attests_breakable_prefill_graphs(
             self.model_runner = runner
 
     monkeypatch.setattr(
-        talker_scheduler, "configure_talker_server_args", lambda *a, **k: True
+        talker_scheduler,
+        "configure_talker_server_args",
+        lambda *a, **k: want_cuda_graph,
     )
     monkeypatch.setattr(
         scheduling_bootstrap, "create_sglang_infrastructure", fake_create_infrastructure
@@ -1656,13 +1669,18 @@ def test_qwen_talker_enables_and_attests_breakable_prefill_graphs(
     monkeypatch.setattr(
         scheduling_bootstrap,
         "init_sglang_cuda_graphs",
-        lambda worker: graph_init_samplers.append(worker.model_runner.model.sampler),
+        lambda worker: graph_inits.append(
+            (
+                worker.model_runner.model.sampler,
+                worker.model_runner.model.sampling_state.slot_rows.seeds.shape[0],
+            )
+        ),
     )
     monkeypatch.setattr(
         cuda_graph_batch_validator,
         "attest_prefill_cuda_graphs",
         lambda runner, *, operator_selected: attest_calls.append(
-            (runner, operator_selected, len(graph_init_samplers))
+            (runner, operator_selected, len(graph_inits))
         ),
     )
     monkeypatch.setattr(
@@ -1720,8 +1738,10 @@ def test_qwen_talker_enables_and_attests_breakable_prefill_graphs(
     is_breakable = prefill_backend == CudaGraphBackend.BREAKABLE
     assert captured["enable_prefill_input_embeds"] is is_breakable
     assert captured["defer_cuda_graph_capture"] is True
-    assert graph_init_samplers == [model_runner.sampler]
-    assert attest_calls == ([(model_runner, True, 1)] if is_breakable else [])
+    assert graph_inits == [(model_runner.sampler, 5)]
+    assert attest_calls == (
+        [(model_runner, True, 1)] if is_breakable and want_cuda_graph else []
+    )
 
 
 def test_qwen_cli_thinker_tp_override_applies_tp_size_and_gpus() -> None:
