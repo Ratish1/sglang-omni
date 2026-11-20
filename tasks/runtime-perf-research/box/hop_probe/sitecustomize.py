@@ -17,7 +17,7 @@ clock of the request event recorder, so records join its events per request.
               common types and owning packages, and the duration of one full collection over that heap
   kind "frozen" every OMNI_HOP_PROBE_FREEZE_COUNT_S seconds when set: objects in the permanent generation
   kind "tb"   with OMNI_HOP_PROBE_TALKER_BATCHES=1, each Qwen3-Omni talker decode step: its rows and their request
-              ids (Qwen3OmniTalker.prepare_decode_buffers)
+              ids, at the decode prep's start (QwenTalkerModelRunner.before_decode)
   kind "tr"   with OMNI_HOP_PROBE_TALKER_BATCHES=1, each talker step's result processing (decode and prefill): its
               forward mode and rows as it starts (ns0) and its end (ns), after the step's outputs reached the host
   kind "req"  with OMNI_HOP_PROBE_TALKER_BATCHES=1, each Qwen3-Omni request at preprocessing: its id and the text of
@@ -472,12 +472,13 @@ def patch_coordinator(module):
     coordinator.run_completion_loop = run_sampled
 
 
-def patch_talker(module):
-    talker = module.Qwen3OmniTalker
-    prepare = talker.prepare_decode_buffers
+def patch_talker_runner(module):
+    patch_put_messages(module)
+    runner = module.QwenTalkerModelRunner
+    before_decode = runner.before_decode
 
-    @functools.wraps(prepare)
-    def prepare_recorded(self, requests):
+    @functools.wraps(before_decode)
+    def before_decode_recorded(self, forward_batch, schedule_batch, requests, **kwargs):
         record(
             {
                 "k": "tb",
@@ -485,9 +486,9 @@ def patch_talker(module):
                 "rids": [request.data.req.rid for request in requests],
             }
         )
-        return prepare(self, requests)
+        return before_decode(self, forward_batch, schedule_batch, requests, **kwargs)
 
-    talker.prepare_decode_buffers = prepare_recorded
+    runner.before_decode = before_decode_recorded
 
 
 def patch_talker_scheduler(module):
@@ -573,7 +574,7 @@ if TALKER_BUILD_REFERENCE:
 else:
     pass
 if TALKER_BATCHES:
-    PATCHES["sglang_omni.models.qwen3_omni.components.talker"] = patch_talker
+    PATCHES["sglang_omni.models.qwen3_omni.talker_model_runner"] = patch_talker_runner
     PATCHES["sglang_omni.models.qwen3_omni.talker_scheduler"] = patch_talker_scheduler
     PATCHES["sglang_omni.models.qwen3_omni.components.preprocessor"] = (
         patch_preprocessor
