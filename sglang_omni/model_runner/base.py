@@ -948,6 +948,20 @@ class ModelRunner(Generic[RequestDataInput]):
         next-forward GPU token rail is published through SGLangExecutionBridge;
         async resolve must never stamp its lagged result onto a live batch."""
         host_token_ids = self.resolve_host_token_ids(batch_result)
+        device_token_ids = batch_result.next_token_ids
+        if (
+            host_token_ids is None
+            and process_engines().is_shared
+            and isinstance(device_token_ids, torch.Tensor)
+            and device_token_ids.is_cuda
+        ):
+            # note (ratish): the output processor reads these ids on the host, so in a shared process the wait for the step gives the turn up first.
+            with process_engines().released():
+                torch.get_device_module(device_token_ids.device).current_stream(
+                    device_token_ids.device
+                ).synchronize()
+        else:
+            pass
         if host_token_ids is None:
             outputs = self.output_processor.process(batch_result, scheduler_output)
         else:
