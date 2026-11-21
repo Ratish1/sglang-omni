@@ -29,6 +29,8 @@ clock of the request event recorder, so records join its events per request.
               forward mode and row request ids
   kind "tz"   with OMNI_HOP_PROBE_THINKER_STEPS=1, each lookahead step's resolve, from its start (ns0, the wait for the
               device) to the end of its stream output (ns); resolves run in launch order
+  kind "tq"   with OMNI_HOP_PROBE_THINKER_STEPS=1, each thinker loop pass that received inputs: their count (n) and the
+              time from the start of their processing (ns0, request builds run inline there) to its end (ns)
 """
 
 import atexit
@@ -575,11 +577,27 @@ def patch_thinker_scheduler(module):
         finally:
             record({"k": "tz", "ns0": started_ns, "rows": len(batch.reqs)})
 
+    process_input = scheduler.process_input_requests
+
+    @functools.wraps(process_input)
+    def process_input_recorded(self, recv_reqs):
+        if type(self) is not scheduler or not recv_reqs:
+            return process_input(self, recv_reqs)
+        else:
+            pass
+        started_ns = time.time_ns()
+        count = len(recv_reqs)
+        try:
+            return process_input(self, recv_reqs)
+        finally:
+            record({"k": "tq", "ns0": started_ns, "n": count})
+
     scheduler._run_batch, scheduler.run_batch_launch, scheduler.run_batch_resolve = (
         run_batch_recorded,
         launch_recorded,
         resolve_recorded,
     )
+    scheduler.process_input_requests = process_input_recorded
 
 
 def patch_preprocessor(module):

@@ -48,11 +48,13 @@ def describe(values: list[float]) -> str:
         )
 
 
-def load(boot: str, cell: str) -> tuple[list[dict], list[list], float, float]:
+def load(
+    boot: str, cell: str
+) -> tuple[list[dict], list[list], list[dict], float, float]:
     with open(os.path.join(boot, cell, "window.json"), encoding="utf-8") as source:
         window = json.load(source)
     start_ns, end_ns = window["start"] * 1e9, window["end"] * 1e9
-    steps, sends = [], []
+    steps, sends, inputs = [], [], []
     for path in glob.glob(os.path.join(boot, "probe", "*.jsonl")):
         launches, resolves = [], []
         with open(path, encoding="utf-8") as source:
@@ -66,6 +68,8 @@ def load(boot: str, cell: str) -> tuple[list[dict], list[list], float, float]:
                         launches.append(item)
                     elif kind == "tz":
                         resolves.append(item)
+                    elif kind == "tq" and start_ns <= item["ns"] <= end_ns:
+                        inputs.append(item)
                     else:
                         pass
                 elif (
@@ -96,7 +100,7 @@ def load(boot: str, cell: str) -> tuple[list[dict], list[list], float, float]:
             )
     steps.sort(key=lambda item: item["ns"])
     sends.sort(key=lambda item: item[0])
-    return steps, sends, start_ns, end_ns
+    return steps, sends, inputs, start_ns, end_ns
 
 
 def step_class(step: dict) -> str:
@@ -127,13 +131,15 @@ def row_bucket(rows: int) -> str:
 
 
 def report(boot: str, cell: str) -> None:
-    steps, sends, start_ns, end_ns = load(boot, cell)
+    steps, sends, inputs, start_ns, end_ns = load(boot, cell)
     speech = {item[4] for item in sends}
     in_window = [step for step in steps if start_ns <= step["ns"] <= end_ns]
     print(
         f"{boot}: {len(in_window)} thinker steps in a {(end_ns - start_ns) / 1e9:.1f} s window, {len(speech)} speech requests"
     )
     periods = collections.defaultdict(list)
+    before_step = collections.defaultdict(list)
+    in_step = collections.defaultdict(list)
     by_extend = collections.defaultdict(list)
     by_rows = collections.defaultdict(list)
     mixed_rows = collections.defaultdict(list)
@@ -143,6 +149,8 @@ def report(boot: str, cell: str) -> None:
             period_ms = (step["ns"] - previous_end) / 1e6
             kind = step_class(step)
             periods[kind].append(period_ms)
+            before_step[kind].append(max(0.0, (step["ns0"] - previous_end) / 1e6))
+            in_step[kind].append((step["ns"] - max(step["ns0"], previous_end)) / 1e6)
             if kind in ("mixed", "extend"):
                 by_extend[(kind, extend_bucket(step["ext"]))].append(period_ms)
             else:
@@ -172,6 +180,15 @@ def report(boot: str, cell: str) -> None:
         print(
             f"    {kind:18s} {100 * sum(periods[kind]) / window_ms:5.1f} %  {describe(periods[kind])}"
         )
+        print(
+            f"    {'':18s} before the step {statistics.fmean(before_step[kind]):7.2f} ms, "
+            f"the step {statistics.fmean(in_step[kind]):7.2f} ms (from its start, or the previous end on lookahead)"
+        )
+    input_ms = [(item["ns"] - item["ns0"]) / 1e6 for item in inputs]
+    print(
+        f"  input processing (request builds inline): {100 * sum(input_ms) / window_ms:5.1f} % of the window, "
+        f"{describe(input_ms)}, {sum(item['n'] for item in inputs)} inputs"
+    )
     print("  mixed and extend periods by extend tokens:")
     for key in sorted(
         by_extend, key=lambda item: (item[0], int(item[1].split("-")[0]))
