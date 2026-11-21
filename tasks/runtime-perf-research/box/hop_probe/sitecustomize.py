@@ -40,8 +40,9 @@ clock of the request event recorder, so records join its events per request.
   kind "tx"   with OMNI_HOP_PROBE_THINKER_PARTS=1, each synchronous Qwen3-Omni thinker execute: forward mode, rows,
               extend tokens, host ms in build_forward_batch, prepare_and_forward and finalize (its host token wait
               included), the whole execute from ns0 to ns (the rest is the post_prefill or post_decode hooks and token
-              publication), and the forward's device span in ms (gpu, CUDA events around prepare_and_forward, time the
-              card served other contexts included)
+              publication), the forward's device span in ms (gpu, CUDA events around prepare_and_forward, time the
+              card served other contexts included), whether the forward replayed a graph (graph), the longest row
+              context in tokens (kv) and the rows over 4,096 tokens (long)
 """
 
 import atexit
@@ -689,11 +690,14 @@ def patch_thinker_runner(module):
                 parts["gpu"][0].record()
             else:
                 pass
+            result = None
             try:
-                return method(self, *args, **kwargs)
+                result = method(self, *args, **kwargs)
+                return result
             finally:
                 if name == "prepare_and_forward":
                     parts["gpu"][1].record()
+                    parts["graph"] = bool(getattr(result, "can_run_cuda_graph", False))
                 else:
                     pass
                 parts[name] = (time.time_ns() - started_ns) / 1e6
@@ -710,6 +714,9 @@ def patch_thinker_runner(module):
         mode = batch.forward_mode.name
         rows = len(batch.reqs)
         ext = batch.extend_num_tokens if batch.forward_mode.is_extend() else rows
+        contexts = [
+            len(req.origin_input_ids) + len(req.output_ids) for req in batch.reqs
+        ]
         self.hop_probe_parts = {}
         started_ns = time.time_ns()
         try:
@@ -722,6 +729,8 @@ def patch_thinker_runner(module):
                 "mode": mode,
                 "rows": rows,
                 "ext": ext,
+                "kv": max(contexts, default=0),
+                "long": sum(context > 4096 for context in contexts),
             }
             item.update({name: value for name, value in parts.items() if name != "gpu"})
             events = parts.get("gpu")

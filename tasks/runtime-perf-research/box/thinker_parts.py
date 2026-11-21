@@ -67,10 +67,17 @@ def report(boot: str, cell: str) -> None:
             ),
             "more",
         )
+        if "graph" in item:
+            media = (
+                f"{media}/{'graph' if item['graph'] else 'eager'}/"
+                f"{'long' if item['long'] else 'short'}"
+            )
+        else:
+            pass
         groups[(item["mode"], media, bucket)].append(item)
     print(f"{boot}:")
     print(
-        "  mode     media   rows      n   build  launch finalize   rest  execute  device"
+        "  mode     media             rows      n   build  launch finalize   rest  execute  device"
     )
     for (mode, media, bucket), items in sorted(groups.items()):
         total = [(item["ns"] - item["ns0"]) / 1e6 for item in items]
@@ -80,7 +87,7 @@ def report(boot: str, cell: str) -> None:
         rest = [t - b - l - f for t, b, l, f in zip(total, build, launch, finalize)]
         device = [item["gpu"] for item in items if "gpu" in item]
         print(
-            f"  {mode:8s} {media:7s} {bucket:5s} {len(items):6d} {statistics.fmean(build):7.2f} "
+            f"  {mode:8s} {media:17s} {bucket:5s} {len(items):6d} {statistics.fmean(build):7.2f} "
             f"{statistics.fmean(launch):7.2f} {statistics.fmean(finalize):8.2f} {statistics.fmean(rest):6.2f} "
             f"{statistics.fmean(total):8.2f} {statistics.fmean(device) if device else float('nan'):7.2f}"
         )
