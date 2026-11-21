@@ -250,6 +250,7 @@ def test_start_runs_the_loop_on_the_top_priority_stream_only_when_asked(
     scheduler.enable_async_decode = False
     scheduler.enable_overlap = False
     scheduler.should_run_top_priority_stream = should_run_top_priority_stream
+    scheduler.engine_context = get_context()
     scheduler.device_module = torch.get_device_module("cuda")
     scheduler.prefill_start_done = set()
     scheduler.request_build_executor = None
