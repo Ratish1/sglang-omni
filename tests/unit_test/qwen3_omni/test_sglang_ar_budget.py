@@ -78,6 +78,7 @@ def make_configurator(
     configurator.total_gpu_memory_fraction = total_gpu_memory_fraction
     configurator.kv_cache_bytes = kv_cache_bytes
     configurator.mambaish_config = None
+    configurator.is_later_engine_in_process = False
     return configurator
 
 
