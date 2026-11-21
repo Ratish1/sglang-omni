@@ -12,6 +12,9 @@ Per boot:
   speech gaps  per speech request (one the thinker streams to the talker), the time between consecutive token sends,
                by the class of the step whose output carried the later send, with each class's share of all gap time
   mixed rows   the rows a mixed step carried: its prefill rows, speech decode rows and other decode rows
+  before       the time from the previous step's end to a synchronous mixed or extend step's start, and the part of it
+               in result processing, input processing, batch selection and lookahead drains (a drain holds the result
+               processing of the step it resolves, so those two can overlap)
 """
 
 import argparse
@@ -69,7 +72,8 @@ def load(
                     elif kind == "tz":
                         resolves.append(item)
                     elif (
-                        kind in ("tq", "tg", "td") and start_ns <= item["ns"] <= end_ns
+                        kind in ("tq", "tg", "td", "tp")
+                        and start_ns <= item["ns"] <= end_ns
                     ):
                         inputs.append(item)
                     else:
@@ -206,7 +210,12 @@ def report(boot: str, cell: str) -> None:
         ):
             low = bisect.bisect_left(part_ends, previous_end)
             high = bisect.bisect_right(part_ends, step["ns0"])
-            for name, kind in (("inputs", "tq"), ("selection", "tg"), ("drain", "td")):
+            for name, kind in (
+                ("result processing", "tp"),
+                ("inputs", "tq"),
+                ("selection", "tg"),
+                ("drain", "td"),
+            ):
                 before_parts[name].append(
                     sum(
                         (item["ns"] - max(item["ns0"], previous_end)) / 1e6

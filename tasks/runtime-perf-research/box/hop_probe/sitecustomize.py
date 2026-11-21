@@ -35,6 +35,8 @@ clock of the request event recorder, so records join its events per request.
               or took over 2 ms: the batch's forward mode, from its start (ns0) to its end (ns)
   kind "td"   with OMNI_HOP_PROBE_THINKER_STEPS=1, each drain of a pending lookahead step (resolve_pending_async), from
               its start (ns0) to its end (ns)
+  kind "tp"   with OMNI_HOP_PROBE_THINKER_STEPS=1, each thinker step's result processing (process_batch_result): the
+              step's forward mode, from its start (ns0) to its end (ns)
 """
 
 import atexit
@@ -597,6 +599,20 @@ def patch_thinker_scheduler(module):
             record({"k": "tq", "ns0": started_ns, "n": count})
 
     next_batch, drain = scheduler.get_next_batch_to_run, scheduler.resolve_pending_async
+    process_result = scheduler.process_batch_result
+
+    @functools.wraps(process_result)
+    def process_result_recorded(self, batch, result):
+        if type(self) is not scheduler:
+            return process_result(self, batch, result)
+        else:
+            pass
+        started_ns = time.time_ns()
+        mode = batch.forward_mode.name
+        try:
+            return process_result(self, batch, result)
+        finally:
+            record({"k": "tp", "ns0": started_ns, "mode": mode})
 
     @functools.wraps(next_batch)
     def next_batch_recorded(self):
@@ -633,6 +649,7 @@ def patch_thinker_scheduler(module):
     scheduler.process_input_requests = process_input_recorded
     scheduler.get_next_batch_to_run = next_batch_recorded
     scheduler.resolve_pending_async = drain_recorded
+    scheduler.process_batch_result = process_result_recorded
 
 
 def patch_preprocessor(module):
