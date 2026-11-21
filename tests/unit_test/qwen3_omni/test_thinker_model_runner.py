@@ -187,6 +187,7 @@ def test_only_a_prefill_chunk_computing_multimodal_rows_captures_hidden_states(
 @pytest.mark.accelerator
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="pinned host rows need CUDA")
 def test_a_capturing_prefill_stores_each_multimodal_row_at_its_kv_slot() -> None:
+    """Staging the rows moved their offsets with a blocking copy, which waited for the forward queued on the stream."""
     req_to_token = torch.zeros((1, 6), dtype=torch.int32, device="cuda")
     runner = ThinkerModelRunner.__new__(ThinkerModelRunner)
     schedule_batch = SimpleNamespace(
@@ -197,18 +198,25 @@ def test_a_capturing_prefill_stores_each_multimodal_row_at_its_kv_slot() -> None
     hidden_states = torch.arange(10.0, device="cuda").view(5, 2)
     out_cache_loc = torch.tensor([10, 11, 12, 13, 14], device="cuda")
 
+    sync_debug_mode = torch.cuda.get_sync_debug_mode()
     with cuda_prompt_hidden_store(slot_count=16, req_to_token=req_to_token) as store:
         runner.prompt_hidden_store = store
-        runner.post_prefill(
-            SimpleNamespace(logits_output=SimpleNamespace(hidden_states=hidden_states)),
-            SimpleNamespace(
-                capture_hidden_mode=CaptureHiddenMode.FULL,
-                out_cache_loc=out_cache_loc,
-                out_cache_loc_virtual=None,
-            ),
-            schedule_batch,
-            [],
-        )
+        torch.cuda.set_sync_debug_mode("error")
+        try:
+            runner.post_prefill(
+                SimpleNamespace(
+                    logits_output=SimpleNamespace(hidden_states=hidden_states)
+                ),
+                SimpleNamespace(
+                    capture_hidden_mode=CaptureHiddenMode.FULL,
+                    out_cache_loc=out_cache_loc,
+                    out_cache_loc_virtual=None,
+                ),
+                schedule_batch,
+                [],
+            )
+        finally:
+            torch.cuda.set_sync_debug_mode(sync_debug_mode)
         req_to_token[0, 3:6] = out_cache_loc[2:].to(torch.int32)
 
         assert torch.equal(
