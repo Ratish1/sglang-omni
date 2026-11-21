@@ -33,7 +33,7 @@ VIDEO_ID = 52
 AUDIO_ID = 53
 
 
-def make_runner() -> Qwen3OmniThinkerModelRunner:
+def make_runner(deepstack_buffer_rows: int = 64) -> Qwen3OmniThinkerModelRunner:
     runner = object.__new__(Qwen3OmniThinkerModelRunner)
     runner.tp_worker = SimpleNamespace(record_custom_prefill_eager=lambda: None)
     torch.manual_seed(0)
@@ -41,6 +41,9 @@ def make_runner() -> Qwen3OmniThinkerModelRunner:
     runner.image_token_id = IMAGE_ID
     runner.video_token_id = VIDEO_ID
     runner.audio_token_id = AUDIO_ID
+    runner.text_model = SimpleNamespace(
+        prefill_deepstack_rows=torch.zeros(deepstack_buffer_rows, HIDDEN)
+    )
     return runner
 
 
@@ -477,22 +480,97 @@ def test_a_chunk_past_every_visual_row_prefills_on_the_sidecar(form: str):
 
 
 @pytest.mark.parametrize(
-    ("prompt", "video_rows", "video_positions", "live_chunk", "prefix"),
+    ("form", "prompt", "chunk", "prefix", "visual_flat_rows"),
     [
-        ([VIDEO_ID, VIDEO_ID, 7], 2, (0, 1), [VIDEO_ID, 7], 1),
-        ([7, 8, VIDEO_ID], 1, (2,), [7, 8], 0),
-        ([VIDEO_ID, VIDEO_ID, 7, 8], 1, (0, 1), [8], 3),
+        ("video", [VIDEO_ID, VIDEO_ID, 7], [VIDEO_ID, 7], 1, {1: 1}),
+        ("video", [7, VIDEO_ID, VIDEO_ID], [7, VIDEO_ID, VIDEO_ID], 0, {2: 0, 3: 1}),
+        ("video", [7, 8, VIDEO_ID], [7, 8], 0, {}),
+        ("image", [IMAGE_ID, IMAGE_ID, 7], [IMAGE_ID, IMAGE_ID, 7], 0, {1: 0, 2: 1}),
+        (
+            "image_and_video",
+            [IMAGE_ID, VIDEO_ID, 7],
+            [IMAGE_ID, VIDEO_ID, 7],
+            0,
+            {1: 0, 2: 1},
+        ),
     ],
 )
-def test_a_chunk_with_live_or_unmatched_visual_rows_stays_eager(
+def test_a_chunk_computing_visual_rows_prefills_on_the_sidecar_with_its_deepstack(
+    form: str,
+    prompt: list[int],
+    chunk: list[int],
+    prefix: int,
+    visual_flat_rows: dict[int, int],
+):
+    runner = make_runner()
+    deepstack = torch.tensor([[10.0] * HIDDEN, [20.0] * HIDDEN])
+    visual_embeds = torch.tensor([[1.0] * HIDDEN, [2.0] * HIDDEN])
+    if form == "video":
+        video_positions = tuple(
+            i for i, token in enumerate(prompt) if token == VIDEO_ID
+        )
+        model_inputs = {
+            "video_embeds": visual_embeds[: len(video_positions)],
+            "deepstack_visual_embeds": [deepstack[: len(video_positions)]],
+        }
+        positions = make_positions(video=video_positions)
+    elif form == "image":
+        model_inputs = {
+            "image_embeds": visual_embeds,
+            "deepstack_visual_embeds": [deepstack],
+        }
+        positions = make_positions(image=(0, 1))
+    else:
+        model_inputs = {
+            "image_embeds": visual_embeds[:1],
+            "video_embeds": visual_embeds[1:],
+            "image_deepstack_visual_embeds": [deepstack[:1]],
+            "video_deepstack_visual_embeds": [deepstack[1:]],
+        }
+        positions = make_positions(image=(0,), video=(1,))
+    decode_row = make_request([9, 10], None)
+    request = make_request(prompt, model_inputs, positions=positions)
+    forward_batch, schedule_batch = make_batch(
+        [decode_row, request], chunks=[[10], chunk], prefix_lens=[1, prefix]
+    )
+
+    runner.before_prefill(forward_batch, schedule_batch, [decode_row, request])
+
+    sidecar = get_omni_prefill_inputs(forward_batch)
+    assert sidecar is not None
+    assert forward_batch.input_embeds is None
+    num_tokens = len(forward_batch.input_ids)
+    expected_rows = torch.zeros(num_tokens, HIDDEN)
+    for flat_row, visual_row in visual_flat_rows.items():
+        expected_rows[flat_row] = deepstack[visual_row]
+        torch.testing.assert_close(
+            sidecar.input_embeds[flat_row], visual_embeds[visual_row]
+        )
+    torch.testing.assert_close(
+        runner.prefill_deepstack_rows[:num_tokens], expected_rows
+    )
+    text_batch, text_schedule = make_batch([decode_row], chunks=[[10]], prefix_lens=[1])
+    runner.before_prefill(text_batch, text_schedule, [decode_row])
+    assert not runner.prefill_deepstack_rows.any()
+
+
+@pytest.mark.parametrize(
+    ("prompt", "video_rows", "video_positions", "live_chunk", "prefix", "buffer_rows"),
+    [
+        ([VIDEO_ID, VIDEO_ID, 7, 8], 1, (0, 1), [8], 3, 64),
+        ([VIDEO_ID, VIDEO_ID, 7], 2, (0, 1), [VIDEO_ID, 7], 1, 1),
+    ],
+)
+def test_a_chunk_with_unmatched_visual_rows_or_past_the_deepstack_rows_stays_eager(
     monkeypatch: pytest.MonkeyPatch,
     prompt: list[int],
     video_rows: int,
     video_positions: tuple[int, ...],
     live_chunk: list[int],
     prefix: int,
+    buffer_rows: int,
 ):
-    runner = make_runner()
+    runner = make_runner(buffer_rows)
     video_inputs = {
         "video_embeds": torch.ones(video_rows, HIDDEN),
         "deepstack_visual_embeds": [torch.ones(video_rows, HIDDEN)],
