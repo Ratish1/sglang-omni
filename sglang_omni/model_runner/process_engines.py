@@ -4,18 +4,20 @@
 SGLang reads one active runtime context per process, at init and at forward time, and an engine embedded beside
 another must serialize its host work. The first engine a process builds keeps the process context. Each later one gets
 a context of its own, active while its stage is built, and the process groups the first one built. While a process
-holds more than one engine, SGLang host work runs only inside hold(engine_context): the process's one turn lock, with
-that engine's context active. A thread waiting on its own device work or its inbox steps out with released(), so the
-other engine launches meanwhile.
+holds more than one engine, SGLang host work runs only inside hold(engine_context): the process's one turn, with that
+engine's context active. A thread waiting on its own device work or its inbox steps out with released(), and a
+lower-priority engine hands the turn to a waiting higher-priority one at yield_turn(), so the talker's short steps
+never queue behind the thinker's host work.
 """
 
 from __future__ import annotations
 
 import functools
+import itertools
 import threading
 from collections.abc import Iterator
 from contextlib import AbstractContextManager, ExitStack, contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from sglang.srt.runtime_context import (
     RuntimeContext,
@@ -41,8 +43,16 @@ PROCESS_GROUP_NAMES = (
 @dataclass(kw_only=True)
 class HeldEngine:
     engine_context: RuntimeContext
+    priority: int
     depth: int
     activation: AbstractContextManager[RuntimeContext] | None = None
+
+
+@dataclass(kw_only=True)
+class TurnWaiter:
+    priority: int
+    arrival: int
+    granted: threading.Event = field(default_factory=threading.Event)
 
 
 class ThreadHold(threading.local):
@@ -51,13 +61,16 @@ class ThreadHold(threading.local):
 
 
 class ProcessEngines:
-    """The SGLang engines this process holds and the turn lock their host work shares."""
+    """The SGLang engines this process holds and the one turn their host work shares."""
 
     def __init__(self) -> None:
         self.engine_contexts: list[RuntimeContext] = []
-        self.turn_lock = threading.Lock()
         self.thread_hold = ThreadHold()
         self.construction_stack: ExitStack | None = None
+        self.turn_state_lock = threading.Lock()
+        self.is_turn_held = False
+        self.turn_waiters: list[TurnWaiter] = []
+        self.arrivals = itertools.count()
 
     @property
     def is_shared(self) -> bool:
@@ -99,7 +112,7 @@ class ProcessEngines:
         return engine_context
 
     @contextmanager
-    def hold(self, engine_context: RuntimeContext) -> Iterator[None]:
+    def hold(self, engine_context: RuntimeContext, *, priority: int) -> Iterator[None]:
         """Run this thread's SGLang host work with the process's turn and the engine's context."""
         if not self.is_shared:
             yield
@@ -119,7 +132,9 @@ class ProcessEngines:
             return
         else:
             pass
-        held_engine = HeldEngine(engine_context=engine_context, depth=1)
+        held_engine = HeldEngine(
+            engine_context=engine_context, priority=priority, depth=1
+        )
         self.take_turn(held_engine)
         try:
             yield
@@ -141,20 +156,59 @@ class ProcessEngines:
         finally:
             self.take_turn(held_engine)
 
+    def yield_turn(self) -> None:
+        """Hand the turn to a waiting higher-priority engine and take it back after it."""
+        held_engine = self.thread_hold.held_engine
+        if held_engine is None:
+            return
+        else:
+            pass
+        with self.turn_state_lock:
+            is_outranked = any(
+                waiter.priority > held_engine.priority for waiter in self.turn_waiters
+            )
+        if is_outranked:
+            self.leave_turn(held_engine)
+            self.take_turn(held_engine)
+        else:
+            pass
+
     def take_turn(self, held_engine: HeldEngine) -> None:
-        self.turn_lock.acquire()
+        with self.turn_state_lock:
+            if not self.is_turn_held and not self.turn_waiters:
+                self.is_turn_held = True
+                waiter = None
+            else:
+                waiter = TurnWaiter(
+                    priority=held_engine.priority, arrival=next(self.arrivals)
+                )
+                self.turn_waiters.append(waiter)
+        if waiter is not None:
+            waiter.granted.wait()
+        else:
+            pass
         held_engine.activation = use_context(held_engine.engine_context)
         held_engine.activation.__enter__()
         self.thread_hold.held_engine = held_engine
 
     def leave_turn(self, held_engine: HeldEngine) -> None:
+        """Hand the turn straight to the highest-priority, earliest waiter, so the leaver cannot take it back first."""
         assert (
             self.thread_hold.held_engine is held_engine
         ), "the turn is left by the thread holding it"
         self.thread_hold.held_engine = None
         held_engine.activation.__exit__(None, None, None)
         held_engine.activation = None
-        self.turn_lock.release()
+        with self.turn_state_lock:
+            if self.turn_waiters:
+                next_waiter = max(
+                    self.turn_waiters,
+                    key=lambda waiter: (waiter.priority, -waiter.arrival),
+                )
+                self.turn_waiters.remove(next_waiter)
+                next_waiter.granted.set()
+            else:
+                self.is_turn_held = False
 
 
 @functools.cache

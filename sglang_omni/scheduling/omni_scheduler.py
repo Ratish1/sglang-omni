@@ -3664,7 +3664,10 @@ class OmniScheduler(Generic[RequestDataT]):
             else:
                 self.scheduler_thread_id = threading.get_ident()
                 self.running = True
-        with self.process_engines.hold(self.engine_context):
+        with self.process_engines.hold(
+            self.engine_context,
+            priority=1 if self.shared_process_priority == "top" else 0,
+        ):
             self.run_serving_loop()
 
     def run_serving_loop(self) -> None:
@@ -5084,6 +5087,7 @@ class OmniScheduler(Generic[RequestDataT]):
         else:
             pass
         while self.running:
+            self.process_engines.yield_turn()
             self.process_admin_requests()
             recv_reqs = self.recv_requests()
             recv_reqs.extend(self.take_deferred_request_payloads())
@@ -5096,6 +5100,7 @@ class OmniScheduler(Generic[RequestDataT]):
                 continue
             else:
                 pass
+            self.process_engines.yield_turn()
 
             if (
                 self.async_pending is not None
@@ -5147,6 +5152,7 @@ class OmniScheduler(Generic[RequestDataT]):
                         scheduler_output=sched_output,
                         device_step=pending_step,
                     )
+                    self.process_engines.yield_turn()
                     if prev_pending is not None:
                         if self.session_bridge is not None:
                             self.previous_pending_decode = prev_pending
@@ -5186,6 +5192,7 @@ class OmniScheduler(Generic[RequestDataT]):
                     pass
                 if batch:
                     result = self.run_batch(batch)
+                    self.process_engines.yield_turn()
                     if result is not _FAILED_BATCH_RESULT:
                         self.process_batch_result(batch, result)
                     else:
