@@ -38,7 +38,7 @@ Past capacity, on #4077's arena sizing (each arm alone on one H100, seeds 0 and 
 - The 80 req/s completion is past the knee, where four readings of the same pair moved by -305, -227, +535 and +24 requests.
 - Under that load the second chunk reaches the client 5 to 7 ms closer to the end of the first (margin p50 at 80 req/s 56.4 → 50.2 ms, p1 40.7 → 32.3 ms). The talker's first frame after a prefill comes about 10 ms after the prefill frame, and every later frame about 17 ms apart. With the silent frame played, the second chunk (frames 2 and 3) waits for one fast gap and one slow one. With it withheld, the second chunk (frames 3 and 4) waits for two slow gaps. The vocoder's own queue and decode times are equal on both arms.
 
-SeedTTS EN, CustomVoice, streaming and whole: the SeedTTS client sends no language, so no request is eligible and both arms run the same path. RESULTS_SEEDTTS_PLACEHOLDER
+SeedTTS EN sends no language, so no request is eligible and the changed lines never run. CustomVoice over all 1,088 prompts on main `eabad7188`, each arm alone on one H100 in both orders (streaming at 1, 16 and 64 concurrent requests, whole at 1 and 16): every row reads within main's own run-to-run spread, and WER is 1.98 / 2.39 % on main against 1.74 / 2.44 % with the change.
 
 ## Tests
 

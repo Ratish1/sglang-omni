@@ -22,7 +22,7 @@ Every value on every task: 1.7B Base, CustomVoice and VoiceDesign servers on one
 - The other value gives different bytes, so the prompt mode reaches the model. Main gives `true` and `false` the same bytes, since it drops the field.
 - Every streamed request streams at every value: 15 to 21 chunks, first byte 16 to 79 ms. That includes `true`, which the old reading would have turned into one response at the end.
 
-SEEDTTS_PLACEHOLDER
+A request that does not send the field takes main's path. SeedTTS EN over all 1,088 prompts, Base and CustomVoice, streaming at 1, 16 and 64 concurrent requests and whole at 1 and 16, each arm alone on one H100 in both orders: no row is worse in both orders. Base WER 1.00 / 1.06 % on main against 1.00 / 1.04 %, speaker similarity 71.31 / 71.06 against 71.41 / 71.49.
 
 What the streaming-text prompt does to CustomVoice output: SeedTTS EN, all 1,088 prompts, Ryan, streaming at 16 concurrent requests, main with the default prompt against this change with `non_streaming_mode: false`, each order on one H100.
 
