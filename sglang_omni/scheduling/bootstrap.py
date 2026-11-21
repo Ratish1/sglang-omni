@@ -135,14 +135,19 @@ def create_sglang_infrastructure(
     # ModelWorker publishes server_args as the process-wide runtime context
     # once its pre-publish declarations are made; publishing again would
     # silently reconfigure whatever already runs here, so an engine is only
-    # built where the context is unpublished. A construction that failed after
+    # built where the context is unpublished, or beside an engine this process
+    # holds, in a context of its own. A construction that failed after
     # publishing is therefore not retried here.
     from sglang_omni.model_runner.model_worker import ModelWorker, ModelWorkerConfig
+    from sglang_omni.model_runner.process_engines import process_engines
     from sglang_omni.scheduling.sglang_backend import create_tree_cache
     from sglang_omni.scheduling.stage_kv_budget import consume_stage_kv_cache_bytes
     from sglang_omni.speculative.target_worker import SpeculativeTargetWorker
 
-    if get_context().is_config_namespace_published("model"):
+    if (
+        get_context().is_config_namespace_published("model")
+        and not process_engines().has_engine
+    ):
         raise RuntimeError(
             "this process already holds a published SGLang runtime context; "
             "an SGLang AR engine must own its OS process. Place SGLang AR "
