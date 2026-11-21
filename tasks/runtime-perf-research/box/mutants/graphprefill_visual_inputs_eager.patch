@@ -1,0 +1,13 @@
+diff --git a/sglang_omni/models/qwen3_omni/thinker_model_runner.py b/sglang_omni/models/qwen3_omni/thinker_model_runner.py
+index 38e205f49..d91004abe 100644
+--- a/sglang_omni/models/qwen3_omni/thinker_model_runner.py
++++ b/sglang_omni/models/qwen3_omni/thinker_model_runner.py
+@@ -233,7 +233,7 @@ class Qwen3OmniThinkerModelRunner(ThinkerModelRunner):
+             # note (ratish): deepstack rows sit only at visual positions, so a chunk past all of them needs no custom forward.
+             if positions[modality].numel() != row_count:
+                 return False
+-            elif row_count and int(positions[modality][-1]) >= prefix:
++            elif row_count:
+                 return False
+             else:
+                 pass
