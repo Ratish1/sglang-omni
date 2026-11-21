@@ -29,6 +29,7 @@ These defaults describe the SGLang-Omni Python server. The [native Apple Silicon
 | `stream` | `false` | Stream raw WAV audio chunks by default; set `response_format="pcm"` for raw PCM |
 | `stream_format` | `audio` | Raw audio bytes by default; explicit `sse` enables SSE events even when `stream` is omitted |
 | `initial_codec_chunk_frames` | ramp `1 -> 2 -> 4` when omitted | First streaming vocoder chunk size in codec frames. An explicit value replaces the ramp's first chunk only. Smaller values lower TTFA but underrun more easily; `0` uses the steady stride from the start |
+| `non_streaming_mode` | `true` for CustomVoice and VoiceDesign, `false` for Base | Prompt mode. `true` puts the whole target text in the prompt. `false` feeds the text to the talker one token per codec frame |
 | `stream_codec_output` | `true` | Forward codec frames to the vocoder as they are generated. Set `false` to restore whole-utterance decoding for CustomVoice/VoiceDesign |
 | `suppress_bootstrap_silence` | `true` | Withhold the silent bootstrap codec frame's audio from streamed CustomVoice output (validated voice/language pairs only, guarded by a runtime silence check). Set `false` to keep the leading silence |
 

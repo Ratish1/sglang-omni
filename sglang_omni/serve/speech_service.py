@@ -88,6 +88,7 @@ class TTSParams(RequiredTTSParams, total=False):
     uploaded_voice_name: str
     uploaded_voice_created_at: int
     x_vector_only_mode: bool
+    non_streaming_mode: bool
     stream_codec_output: bool
     suppress_bootstrap_silence: bool
     initial_codec_chunk_frames: int
@@ -1048,6 +1049,7 @@ class SpeechRequestValidator:
         for field_name in (
             "stream",
             "x_vector_only_mode",
+            "non_streaming_mode",
             "stream_codec_output",
             "suppress_bootstrap_silence",
         ):
@@ -1220,6 +1222,10 @@ def build_tts_params(
         pass
     if request.x_vector_only_mode is not None:
         tts_params["x_vector_only_mode"] = request.x_vector_only_mode
+    else:
+        pass
+    if request.non_streaming_mode is not None:
+        tts_params["non_streaming_mode"] = request.non_streaming_mode
     else:
         pass
     if request.stream_codec_output is not None:

@@ -42,9 +42,10 @@ hf download mlx-community/Qwen3-TTS-12Hz-0.6B-CustomVoice-bf16 \
   --model-name Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice --port 8000
 ```
 
-The [CustomVoice request](../../basic_usage/tts.md#curl) works with the native model ID substituted, with the same speakers, `language` values, sampling defaults (`max_new_tokens` 2048), `stage_params.tts_engine` overrides and prompt: the whole text is in the prompt, as the CUDA server's CustomVoice requests are. The native server differs from the CUDA server in that:
+The [CustomVoice request](../../basic_usage/tts.md#curl) works with the native model ID substituted, with the same speakers, `language` values, sampling defaults (`max_new_tokens` 2048), `stage_params.tts_engine` overrides and default prompt: the whole text is in the prompt, as the CUDA server's CustomVoice requests are by default. The native server differs from the CUDA server in that:
 
 - `response_format` is `wav` or `pcm`; `stream_format` must be `audio`.
+- `non_streaming_mode` is ignored, so the whole text is always in the prompt.
 - The prompt and `max_new_tokens` must fit the talker's 8192 positions, as on CUDA: a larger `max_new_tokens` returns 400, and the default 2048 shrinks to fit. `instructions` are at most 4096 characters, and `repetition_penalty` must be above 0.
 - `seed` repeats a request's audio on the same chip and MLX version; it does not reproduce CUDA's audio.
 - A streamed request decodes a first chunk of `initial_codec_chunk_frames` frames (default 5, at most 25; `0` starts at 25, as on CUDA), then 25-frame chunks, each with 25 frames of left context; a whole request decodes in the CUDA vocoder's 300-frame chunks. Streamed and whole audio can differ slightly near chunk edges. `stream_codec_output` and `suppress_bootstrap_silence` are checked and then ignored.

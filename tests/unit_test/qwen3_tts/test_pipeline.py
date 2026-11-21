@@ -2577,6 +2577,42 @@ def test_qwen3_tts_text_only_defaults_to_custom_voice() -> None:
     assert state.stream_codec_output is True
 
 
+@pytest.mark.parametrize("non_streaming_mode", [True, False])
+@pytest.mark.parametrize(
+    ("inputs", "task_params", "task_type"),
+    [
+        ("target", {"task_type": "CustomVoice"}, "CustomVoice"),
+        (
+            "target",
+            {"task_type": "VoiceDesign", "instructions": "A warm adult voice."},
+            "VoiceDesign",
+        ),
+        (
+            {"text": "target", "references": [{"audio_path": "v.wav", "text": "r"}]},
+            {},
+            "Base",
+        ),
+    ],
+)
+def test_qwen3_tts_speech_api_prompt_mode_keeps_codec_streaming(
+    inputs: str | dict[str, object],
+    task_params: dict[str, str],
+    task_type: str,
+    non_streaming_mode: bool,
+) -> None:
+    """A speech request's prompt mode was ignored for named voices, and once honored, true stopped its codec streaming."""
+    payload = make_payload(
+        inputs=inputs,
+        tts_params={**task_params, "non_streaming_mode": non_streaming_mode},
+    )
+
+    state = build_qwen3_tts_state(payload)
+
+    assert state.task_type == task_type
+    assert state.non_streaming_mode is non_streaming_mode
+    assert state.stream_codec_output is True
+
+
 @pytest.mark.parametrize("source", ["params", "tts_params"])
 def test_qwen3_tts_stream_codec_output_request_override_disables_streaming(
     source: str,
