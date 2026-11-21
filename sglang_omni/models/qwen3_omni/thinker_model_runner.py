@@ -29,6 +29,18 @@ _PREFILL_AUDIO_INPUT_KEYS = frozenset(
         "pad_values",
     }
 )
+PREFILL_VISUAL_INPUT_KEYS = frozenset(
+    {
+        "image_embeds",
+        "video_embeds",
+        "deepstack_visual_embeds",
+        "image_deepstack_visual_embeds",
+        "video_deepstack_visual_embeds",
+        "image_grid_thw",
+        "video_grid_thw",
+        "video_second_per_grid",
+    }
+)
 
 _SIDECAR = "sidecar"
 _UNSUPPORTED = "unsupported"
@@ -37,11 +49,11 @@ _UNSUPPORTED = "unsupported"
 @dataclass(frozen=True)
 class PrefillDisposition:
     kind: str
-    has_audio: bool = False
+    has_model_inputs: bool = False
 
 
 class Qwen3OmniThinkerModelRunner(ThinkerModelRunner):
-    """Adopt the shared prefill sidecar for text/audio-to-text prefills.
+    """Adopt the shared prefill sidecar for prefill chunks that compute no image or video row.
 
     This class only qualifies Qwen request payloads. SGLang continues to own
     graph admission, bucket selection, padding, replay metadata, and eager
@@ -167,9 +179,9 @@ class Qwen3OmniThinkerModelRunner(ThinkerModelRunner):
             spans.append((prefix, length))
         return spans
 
-    def audio_inputs_are_supported(
+    def chunk_inputs_are_supported(
         self,
-        req: Req,
+        request: Req,
         model_inputs: object,
         chunk_span: tuple[int, int],
     ) -> bool:
@@ -177,11 +189,86 @@ class Qwen3OmniThinkerModelRunner(ThinkerModelRunner):
             return False
         else:
             pass
-        if set(model_inputs) - _PREFILL_AUDIO_INPUT_KEYS:
+        if set(model_inputs) - _PREFILL_AUDIO_INPUT_KEYS - PREFILL_VISUAL_INPUT_KEYS:
             return False
         else:
             pass
 
+        pad_values = model_inputs.get("pad_values", {})
+        if not isinstance(pad_values, dict) or set(pad_values) - {
+            "image",
+            "video",
+            "audio",
+        }:
+            return False
+        else:
+            pass
+        if any(
+            not isinstance(pad_value, Integral) or isinstance(pad_value, bool)
+            for pad_value in pad_values.values()
+        ):
+            return False
+        else:
+            pass
+        positions = self.mm_positions(request, pad_values)
+        if positions is None:
+            return False
+        else:
+            pass
+
+        prefix, length = chunk_span
+        embedding_dim = getattr(self.embed_tokens, "embedding_dim", None)
+        for modality in ("image", "video"):
+            visual_embeds = model_inputs.get(f"{modality}_embeds")
+            if visual_embeds is None:
+                row_count = 0
+            elif (
+                isinstance(visual_embeds, torch.Tensor)
+                and visual_embeds.ndim == 2
+                and (embedding_dim is None or visual_embeds.shape[1] == embedding_dim)
+            ):
+                row_count = visual_embeds.shape[0]
+            else:
+                return False
+            # note (ratish): deepstack rows sit only at visual positions, so a chunk past all of them needs no custom forward.
+            if positions[modality].numel() != row_count:
+                return False
+            elif row_count and int(positions[modality][-1]) >= prefix:
+                return False
+            else:
+                pass
+        has_image = "image_embeds" in model_inputs
+        has_video = "video_embeds" in model_inputs
+        if (
+            ("deepstack_visual_embeds" in model_inputs and not (has_image or has_video))
+            or ("image_deepstack_visual_embeds" in model_inputs and not has_image)
+            or ("video_deepstack_visual_embeds" in model_inputs and not has_video)
+        ):
+            return False
+        elif "audio_embeds" in model_inputs or positions["audio"].numel():
+            if not self.chunk_audio_is_supported(
+                request, model_inputs, positions["audio"], chunk_span
+            ):
+                return False
+            else:
+                pass
+        else:
+            pass
+
+        middle_chunks = getattr(request, "inflight_middle_chunks", None)
+        return (
+            isinstance(middle_chunks, Integral)
+            and not isinstance(middle_chunks, bool)
+            and middle_chunks >= 0
+        )
+
+    def chunk_audio_is_supported(
+        self,
+        request: Req,
+        model_inputs: dict[str, object],
+        audio_positions: torch.Tensor,
+        chunk_span: tuple[int, int],
+    ) -> bool:
         audio_embeds = model_inputs.get("audio_embeds")
         if (
             not isinstance(audio_embeds, torch.Tensor)
@@ -217,41 +304,18 @@ class Qwen3OmniThinkerModelRunner(ThinkerModelRunner):
             return False
         else:
             pass
-
-        pad_values = model_inputs.get("pad_values", {})
-        if not isinstance(pad_values, dict) or set(pad_values) - {"audio"}:
-            return False
-        else:
-            pass
-        if "audio" in pad_values and (
-            not isinstance(pad_values["audio"], Integral)
-            or isinstance(pad_values["audio"], bool)
-        ):
-            return False
-        else:
-            pass
-
-        positions = self.mm_positions(req, pad_values)
-        if positions is None:
-            return False
-        else:
-            pass
-        if positions["image"].numel() or positions["video"].numel():
-            return False
-        else:
-            pass
-        if positions["audio"].numel() != audio_embeds.shape[0]:
+        if audio_positions.numel() != audio_embeds.shape[0]:
             return False
         else:
             pass
 
         prefix, length = chunk_span
         consumed = getattr(
-            req, "_omni_consumed", None
+            request, "_omni_consumed", None
         )  # noqa: leading-underscore  # upstream spelling, or the public name is already taken
         if consumed is None:
-            cached_audio = positions["audio"][positions["audio"] < prefix]
-            future_audio = positions["audio"][positions["audio"] >= prefix]
+            cached_audio = audio_positions[audio_positions < prefix]
+            future_audio = audio_positions[audio_positions >= prefix]
             # note(chenye): A fresh radix prefix can hide prior audio rows without
             # advancing the shared multimodal cursor; keep that state outside the
             # Qwen sidecar.
@@ -265,23 +329,13 @@ class Qwen3OmniThinkerModelRunner(ThinkerModelRunner):
         else:
             return False
         _, audio_offset, live_audio_count = self.plan_modality_chunk(
-            positions["audio"], chunk_consumed, "audio", prefix, length
+            audio_positions, chunk_consumed, "audio", prefix, length
         )
-        if (
-            not isinstance(audio_offset, Integral)
-            or isinstance(audio_offset, bool)
-            or audio_offset < 0
-            or audio_offset + live_audio_count > audio_embeds.shape[0]
-        ):
-            return False
-        else:
-            pass
-
-        middle_chunks = getattr(req, "inflight_middle_chunks", None)
         return (
-            isinstance(middle_chunks, Integral)
-            and not isinstance(middle_chunks, bool)
-            and middle_chunks >= 0
+            isinstance(audio_offset, Integral)
+            and not isinstance(audio_offset, bool)
+            and audio_offset >= 0
+            and audio_offset + live_audio_count <= audio_embeds.shape[0]
         )
 
     def classify_prefill(
@@ -326,7 +380,6 @@ class Qwen3OmniThinkerModelRunner(ThinkerModelRunner):
             return PrefillDisposition(_UNSUPPORTED)
         else:
             pass
-        has_audio = False
         for request_index, (req, model_inputs) in enumerate(
             zip(schedule_reqs, model_inputs_by_request)
         ):
@@ -334,17 +387,14 @@ class Qwen3OmniThinkerModelRunner(ThinkerModelRunner):
                 isinstance(model_inputs, dict) and not model_inputs
             ):
                 continue
-            else:
-                pass
-            if not self.audio_inputs_are_supported(
+            elif not self.chunk_inputs_are_supported(
                 req, model_inputs, chunk_spans[request_index]
             ):
                 return PrefillDisposition(_UNSUPPORTED)
             else:
                 pass
-            has_audio = True
 
-        return PrefillDisposition(_SIDECAR, has_audio=has_audio)
+        return PrefillDisposition(_SIDECAR, has_model_inputs=True)
 
     def text_input_embeds(self, forward_batch: ForwardBatch) -> torch.Tensor:
         return self.embed_tokens(forward_batch.input_ids)
@@ -361,11 +411,11 @@ class Qwen3OmniThinkerModelRunner(ThinkerModelRunner):
         else:
             pass
 
-        if disposition.has_audio:
+        if disposition.has_model_inputs:
             omni_result = self.inject_multimodal_embeds(forward_batch, schedule_batch)
             if omni_result is None:
                 raise RuntimeError(
-                    "Qwen audio prefill was classified as sidecar-compatible, "
+                    "Qwen multimodal prefill was classified as sidecar-compatible, "
                     "but multimodal embedding composition returned no result"
                 )
             else:
@@ -373,7 +423,7 @@ class Qwen3OmniThinkerModelRunner(ThinkerModelRunner):
             input_embeds, deepstack_embeds, visual_masks = omni_result
             if input_embeds is None:
                 raise RuntimeError(
-                    "Qwen audio prefill composition returned no input embeddings"
+                    "Qwen multimodal prefill composition returned no input embeddings"
                 )
             else:
                 pass
