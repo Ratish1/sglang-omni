@@ -79,6 +79,9 @@ THINKER_STEPS = os.environ.get("OMNI_HOP_PROBE_THINKER_STEPS") == "1"
 # OMNI_HOP_PROBE_THINKER_PARTS=1 times the parts of each synchronous Qwen3-Omni thinker step and its forward's device span
 # from two CUDA events; reading the span adds one event wait after the step's own finalize wait
 THINKER_PARTS = os.environ.get("OMNI_HOP_PROBE_THINKER_PARTS") == "1"
+# OMNI_HOP_PROBE_TURNS=1 records each wait for a shared process's engine turn over 0.05 ms (kind "tw") and each leave
+# that hands the turn to a waiter (kind "th": the leaver's priority, its hold span and the sglang_omni frames it left from)
+TURNS = os.environ.get("OMNI_HOP_PROBE_TURNS") == "1"
 PAYLOAD_READS = os.environ.get("OMNI_HOP_PROBE_PAYLOAD_READS") == "1"
 # OMNI_HOP_PROBE_SYNC_SITES=1 sets torch's sync debug mode to warn in every process and counts each synchronizing
 # CUDA call by thread and by its innermost sglang frames (kind "sync", the running counts once a second); a check
@@ -830,6 +833,67 @@ def bind_thread_device(fixed_device):
     threading.Thread.start, threading.Thread.run = start_capturing, run_bound
 
 
+def leave_site(frame):
+    """The first three sglang_omni frames above the registry, innermost first, as name:line."""
+    site = []
+    while frame is not None and len(site) < 3:
+        path = frame.f_code.co_filename
+        if (
+            "sglang_omni" in path
+            and not path.endswith("process_engines.py")
+            and "hop_probe" not in path
+        ):
+            site.append(f"{frame.f_code.co_name}:{frame.f_lineno}")
+        else:
+            pass
+        frame = frame.f_back
+    return " < ".join(site)
+
+
+def patch_process_engines(module):
+    engines = module.ProcessEngines
+    take_turn, leave_turn = engines.take_turn, engines.leave_turn
+
+    @functools.wraps(take_turn)
+    def take_recorded(self, held_engine):
+        started_ns = time.time_ns()
+        take_turn(self, held_engine)
+        taken_ns = time.time_ns()
+        held_engine.hop_probe_taken_ns = taken_ns
+        if taken_ns - started_ns > 50_000:
+            record(
+                {
+                    "k": "tw",
+                    "ns0": started_ns,
+                    "ns": taken_ns,
+                    "p": held_engine.priority,
+                }
+            )
+        else:
+            pass
+
+    @functools.wraps(leave_turn)
+    def leave_recorded(self, held_engine):
+        with self.turn_state_lock:
+            handing = bool(self.turn_waiters)
+        if handing:
+            left_ns = time.time_ns()
+            record(
+                {
+                    "k": "th",
+                    "ns0": getattr(held_engine, "hop_probe_taken_ns", left_ns),
+                    "ns": left_ns,
+                    "p": held_engine.priority,
+                    "site": leave_site(sys._getframe(1)),
+                }
+            )
+        else:
+            pass
+        leave_turn(self, held_engine)
+
+    engines.take_turn, engines.leave_turn = take_recorded, leave_recorded
+
+
 PATCHES = {
     "sglang_omni.pipeline.stage.runtime": patch_runtime,
     "sglang_omni.scheduling.omni_scheduler": patch_put_messages,
@@ -864,6 +928,10 @@ else:
     pass
 if PAYLOAD_READS:
     PATCHES["sglang_omni.comm.stage_io"] = patch_stage_io
+else:
+    pass
+if TURNS:
+    PATCHES["sglang_omni.model_runner.process_engines"] = patch_process_engines
 else:
     pass
 
