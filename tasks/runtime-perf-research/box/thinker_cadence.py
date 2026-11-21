@@ -112,7 +112,7 @@ def load(
 def step_class(step: dict) -> str:
     if step["mode"] in ("DECODE", "IDLE"):
         return f"decode {step['path']}"
-    elif step["mode"] == "MIXED" or len(step.get("pre", ())) < len(step["rids"]):
+    elif step["mode"] == "MIXED":
         return "mixed"
     else:
         return "extend"
