@@ -781,7 +781,7 @@ def test_cached_audio_eager_cursor_preserves_existing_cursor():
     image_embeds = torch.full((1, HIDDEN), 3.0)
     image_request = make_request(
         [IMAGE_ID],
-        {"image_embeds": image_embeds},
+        {"image_embeds": image_embeds, "future_aux": object()},
         positions=make_positions(image=(0,)),
     )
     existing_cursor = {"audio": 1}
@@ -827,51 +827,45 @@ def test_cached_audio_eager_cursor_preserves_existing_cursor():
 
 
 @pytest.mark.parametrize(
+    ("visual_id", "visual_key"), [(IMAGE_ID, "image"), (VIDEO_ID, "video")]
+)
+def test_a_chunk_with_visual_and_audio_rows_prefills_on_the_sidecar(
+    visual_id: int, visual_key: str
+):
+    runner = make_runner()
+    visual_embeds = torch.full((1, HIDDEN), 5.0)
+    audio_embeds = torch.full((1, HIDDEN), 7.0)
+    request = make_request(
+        [visual_id, AUDIO_ID],
+        {f"{visual_key}_embeds": visual_embeds, "audio_embeds": audio_embeds},
+        positions=make_positions(audio=(1,), **{visual_key: (0,)}),
+    )
+    forward_batch, schedule_batch = make_batch([request])
+
+    runner.before_prefill(forward_batch, schedule_batch, [request])
+
+    sidecar = get_omni_prefill_inputs(forward_batch)
+    assert sidecar is not None
+    torch.testing.assert_close(sidecar.input_embeds[0], visual_embeds[0])
+    torch.testing.assert_close(sidecar.input_embeds[1], audio_embeds[0])
+    assert not runner.prefill_deepstack_rows.any()
+
+
+@pytest.mark.parametrize(
     "case",
-    [
-        "image",
-        "video",
-        "deepstack",
-        "image_audio",
-        "video_audio",
-        "audio_in_video",
-        "unknown",
-        "malformed_audio",
-    ],
+    ["deepstack", "audio_in_video", "unknown", "malformed_audio"],
 )
 def test_unsupported_payloads_delegate_to_the_inherited_eager_path(
     monkeypatch: pytest.MonkeyPatch, case: str
 ):
     runner = make_runner()
-    if case == "image":
-        input_ids = [7, IMAGE_ID, 8]
-        model_inputs = {"image_embeds": torch.ones(1, HIDDEN)}
-        positions = make_positions(image=(1,))
-    elif case == "video":
-        input_ids = [7, VIDEO_ID, 8]
-        model_inputs = {"video_embeds": torch.ones(1, HIDDEN)}
-        positions = make_positions(video=(1,))
-    elif case == "deepstack":
+    if case == "deepstack":
         input_ids = [7, AUDIO_ID, 8]
         model_inputs = {
             "audio_embeds": torch.ones(1, HIDDEN),
             "deepstack_visual_embeds": [torch.ones(1, HIDDEN)],
         }
         positions = make_positions(audio=(1,))
-    elif case == "image_audio":
-        input_ids = [IMAGE_ID, AUDIO_ID]
-        model_inputs = {
-            "image_embeds": torch.ones(1, HIDDEN),
-            "audio_embeds": torch.ones(1, HIDDEN),
-        }
-        positions = make_positions(image=(0,), audio=(1,))
-    elif case == "video_audio":
-        input_ids = [VIDEO_ID, AUDIO_ID]
-        model_inputs = {
-            "video_embeds": torch.ones(1, HIDDEN),
-            "audio_embeds": torch.ones(1, HIDDEN),
-        }
-        positions = make_positions(video=(0,), audio=(1,))
     elif case == "audio_in_video":
         input_ids = [7, AUDIO_ID, 8]
         model_inputs = {

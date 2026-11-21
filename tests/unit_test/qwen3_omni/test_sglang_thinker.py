@@ -96,7 +96,7 @@ def test_real_qwen_config_drives_prefill_positions(
 
     monkeypatch.setattr(
         sglang_thinker_module,
-        "Qwen3MoeLLMModel",
+        "Qwen3OmniThinkerTextModel",
         LightweightTextModel,
     )
     monkeypatch.setattr(
@@ -538,7 +538,9 @@ def test_thinker_routes_every_unquantized_moe_layer_through_the_shared_decode_ma
                 [make_layer(moe_block), make_layer(dense_mlp)]
             )
 
-    monkeypatch.setattr(sglang_thinker_module, "Qwen3MoeLLMModel", LayeredTextModel)
+    monkeypatch.setattr(
+        sglang_thinker_module, "Qwen3OmniThinkerTextModel", LayeredTextModel
+    )
     monkeypatch.setattr(
         sglang_thinker_module, "LogitsProcessor", lambda config: torch.nn.Identity()
     )
@@ -589,7 +591,9 @@ def thinker_with_moe(
     layer.mlp = moe_block
     wrapper = object.__new__(Qwen3OmniThinkerForCausalLM)
     torch.nn.Module.__init__(wrapper)
-    wrapper.model = SimpleNamespace(layers=[layer])
+    wrapper.model = SimpleNamespace(
+        layers=[layer], allocate_prefill_deepstack_rows=lambda: None
+    )
     wrapper.lm_head = SimpleNamespace(weight=w13_weight)
     wrapper.config = SimpleNamespace(
         num_experts_per_tok=top_k, hidden_size=w13_weight.shape[2], vocab_size=64

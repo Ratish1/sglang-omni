@@ -113,13 +113,16 @@ class Qwen3OmniThinkerTextModel(Qwen3MoeLLMModel):
         prefix: str = "",
     ) -> None:
         super().__init__(config=config, quant_config=quant_config, prefix=prefix)
-        self.register_buffer(
-            "prefill_deepstack_rows",
-            torch.zeros(
-                max_prefill_buffer_tokens(),
-                config.hidden_size * len(self.deepstack_embed_to_decoder_layer),
-            ),
-            persistent=False,
+        self.register_buffer("prefill_deepstack_rows", None, persistent=False)
+
+    def allocate_prefill_deepstack_rows(self) -> None:
+        """Size the rows to the engine's prefill ceiling once its weights are loaded, before the pool and graphs."""
+        weight = self.embed_tokens.weight
+        self.prefill_deepstack_rows = torch.zeros(
+            max_prefill_buffer_tokens(),
+            self.hidden_size * len(self.deepstack_embed_to_decoder_layer),
+            device=weight.device,
+            dtype=weight.dtype,
         )
 
     def forward(
@@ -132,16 +135,16 @@ class Qwen3OmniThinkerTextModel(Qwen3MoeLLMModel):
         input_deepstack_embeds: torch.Tensor | None = None,
     ) -> torch.Tensor | PPProxyTensors:
         token_source = input_ids if input_embeds is None else input_embeds
+        rows = self.prefill_deepstack_rows
         if (
             input_deepstack_embeds is None
+            and rows is not None
             and token_source is not None
             and forward_batch.forward_mode.is_extend()
-            and token_source.shape[0] <= self.prefill_deepstack_rows.shape[0]
+            and token_source.shape[0] <= rows.shape[0]
         ):
             # note (ratish): zero rows add exactly nothing, so a chunk without visual rows keeps its numerics.
-            input_deepstack_embeds = self.prefill_deepstack_rows[
-                : token_source.shape[0]
-            ]
+            input_deepstack_embeds = rows[: token_source.shape[0]]
         else:
             pass
         return super().forward(
@@ -323,6 +326,7 @@ class Qwen3OmniThinkerForCausalLM(nn.Module):
         """Load FlashInfer's sampling module when it draws the unseeded requests, and run
         one MoE layer on zero rows once per fused MoE kernel variant that a forward up to
         the prefill ceiling reaches, so no request waits for either."""
+        self.model.allocate_prefill_deepstack_rows()
         compile_sampler_functions(
             SamplerCompileForms(
                 device=self.lm_head.weight.device,
