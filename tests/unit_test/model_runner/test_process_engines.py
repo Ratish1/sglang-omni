@@ -115,6 +115,30 @@ def test_a_left_turn_goes_to_the_talker_before_an_earlier_thinker() -> None:
     assert order == ["talker", "thinker"]
 
 
+def test_an_engine_that_raises_inside_its_turn_hands_it_to_the_waiting_engine() -> None:
+    engines, (thinker_context, talker_context) = make_engines(2)
+    process_context = get_context()
+    order: list[str] = []
+
+    def talker() -> None:
+        with engines.hold(talker_context, priority=TALKER_PRIORITY):
+            order.append("talker")
+            assert get_context() is talker_context
+
+    talker_thread = threading.Thread(target=talker)
+    try:
+        with engines.hold(thinker_context, priority=THINKER_PRIORITY):
+            talker_thread.start()
+            wait_until_waiting(engines, 1)
+            raise RuntimeError("thinker step failed")
+    except RuntimeError:
+        order.append("thinker raised")
+    talker_thread.join()
+    assert sorted(order) == ["talker", "thinker raised"]
+    assert get_context() is process_context
+    assert not engines.is_turn_held
+
+
 def test_a_nested_hold_releases_and_leaves_the_turn_once() -> None:
     engines, (thinker_context, talker_context) = make_engines(2)
     talker_held = threading.Event()

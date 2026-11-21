@@ -15,6 +15,7 @@ from unittest.mock import AsyncMock, Mock
 
 import httpx
 import pytest
+from sglang.srt.runtime_context import get_context
 
 from sglang_omni.client import Client
 from sglang_omni.config.schema import PipelineConfig
@@ -161,6 +162,7 @@ def run_failing_spec_scheduler(
     scheduler.session_bridge = None
     scheduler.gpu_id = 0
     scheduler.should_run_top_priority_stream = False
+    scheduler.engine_context = get_context()
     scheduler.forward_stream = SimpleNamespace(cuda_stream=1)
     scheduler.copy_stream = SimpleNamespace(cuda_stream=2)
     scheduler.device_module = SimpleNamespace(
