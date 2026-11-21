@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 # 11-21, node-0001, card 0 after q1121_final2's F2. The answer to the original question in its final form: #3452's stack
 # (preprocessing video lane and talker slot state) with both changes, part 1, part 2 and the index copy fix (SOCVG
-# 26224b691, tree 26547072a361) against main, card 0 alone, B A A B, speech 8/s seed 3451 beside video 1/s seed 7 (cap 8), every video
+# 9ca07fb99, tree df0fe47b70ed, its part 2 reading the staged hidden rows outside the turn) against main, card 0 alone, B A A B, speech 8/s seed 3451 beside video 1/s seed 7 (cap 8), every video
 # boot gated (stack-based trees 445 ms, main 580); then speech alone c16, B A A B.
 set -u
 O=/data/v1121
 K=/workspace/kit/tasks/runtime-perf-research/box
 NMAIN=/workspace/nmain SOCVG=/workspace/socvg
-SOCVG_SHA=26224b691
+SOCVG_SHA=9ca07fb99
 CONTEXT_32K="--preprocessing.factory.max_seq_len 32768 --thinker.factory.max_seq_len 32768"
 CPUS=0-55,112-167
 export SGLANG_OMNI_STARTUP_TIMEOUT=3600
