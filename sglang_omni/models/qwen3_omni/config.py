@@ -314,10 +314,14 @@ SPEECH_DEFAULT_PROCESSES = {
     "code2wav": "code2wav",
 }
 
-# note (ratish): on one card the GPU time-slices between the stage processes,
-# so code2wav decodes inside the talker's process on a priority stream instead
-# of waiting for its own turn.
-COLOCATED_SPEECH_PROCESSES = {**SPEECH_DEFAULT_PROCESSES, "code2wav": "talker_ar"}
+# note (ratish): on one card the GPU time-slices between the stage processes, so the
+# thinker, the talker and code2wav share one process and context, each on its own
+# stream, instead of waiting for each other's turn.
+COLOCATED_SPEECH_PROCESSES = {
+    **SPEECH_DEFAULT_PROCESSES,
+    "thinker": "talker_ar",
+    "code2wav": "talker_ar",
+}
 
 WARMUP_IMAGE_PNG_BASE64 = (
     "iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAYAAABzenr0AAAACXBIWXMAAA7EAAAOxAGVKw4bAAAA"

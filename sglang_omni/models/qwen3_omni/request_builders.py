@@ -15,6 +15,7 @@ from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.tokenizer.tiktoken_tokenizer import TiktokenTokenizer
 from transformers import PreTrainedTokenizerBase
 
+from sglang_omni.model_runner.process_engines import process_engines
 from sglang_omni.models.qwen3_omni.components.talker_prefill import TalkerPrefillBuilder
 from sglang_omni.models.qwen3_omni.mrope_positions import talker_can_use_linear_mrope
 from sglang_omni.models.qwen3_omni.payload_types import (
@@ -1215,6 +1216,16 @@ def make_thinker_stream_output_builder(
                 message.metadata["prompt_hidden_positions"] = (
                     req_data.req.prompt_hidden_positions.tolist()
                 )
+                if process_engines().is_shared and message.data.is_cuda:
+                    # note (ratish): a talker in this process reads the rows on its own stream, ordered after this read by the event.
+                    device_module = torch.get_device_module(message.data.device)
+                    ready_event = device_module.Event()
+                    ready_event.record(
+                        device_module.current_stream(message.data.device)
+                    )
+                    message.metadata["prompt_hidden_ready"] = ready_event
+                else:
+                    pass
                 req_data.req.is_prompt_hidden_handed_off = True
             else:
                 pass

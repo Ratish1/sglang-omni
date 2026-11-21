@@ -103,6 +103,7 @@ class ModelWorker:
         from sglang.srt.distributed import bootstrap
         from sglang.srt.runtime_context import (
             SpawnRanks,
+            create_context,
             get_device,
             get_parallel,
             publish,
@@ -110,25 +111,30 @@ class ModelWorker:
         )
         from sglang.srt.utils import broadcast_pyobj, set_random_seed
 
-        publish(
-            self.server_args,
-            role="scheduler",
-            ranks=SpawnRanks(
-                world_rank=spawn_world_rank(
-                    self.server_args, tp_rank=tp_rank, pp_rank=0
-                ),
-                gpu_id=gpu_id,
-            ),
+        from sglang_omni.model_runner.process_engines import process_engines
+
+        engines = process_engines()
+        ranks = SpawnRanks(
+            world_rank=spawn_world_rank(self.server_args, tp_rank=tp_rank, pp_rank=0),
+            gpu_id=gpu_id,
         )
-        if self.nccl_port is None:
-            self.nccl_port = resolve_nccl_port()
+        if engines.has_engine:
+            # note (ratish): SGLang builds the process groups once a process, so a later engine shares the first's.
+            engines.enter_later_engine_context(
+                create_context(self.server_args, role="scheduler", ranks=ranks)
+            )
         else:
-            pass
-        bootstrap.init_parallel_runtime(
-            server_args=self.server_args,
-            device=get_device().device,
-            dist_port=self.nccl_port,
-        )
+            publish(self.server_args, role="scheduler", ranks=ranks)
+            if self.nccl_port is None:
+                self.nccl_port = resolve_nccl_port()
+            else:
+                pass
+            bootstrap.init_parallel_runtime(
+                server_args=self.server_args,
+                device=get_device().device,
+                dist_port=self.nccl_port,
+            )
+        self.is_later_engine_in_process = engines.has_engine
         bootstrap.init_layer_runtime(model_config=self.model_config)
         initialize_model_worker_backend_globals(
             self.model_config, effective_quantization
@@ -145,6 +151,7 @@ class ModelWorker:
             get_parallel().tp_group.cpu_group,
         )[0]
         set_random_seed(self.random_seed)
+        self.runtime_context = engines.register_engine()
 
     def init_model_config(self):
         if self.model_arch_override == "BailingMoeV2ForCausalLM":
@@ -337,6 +344,7 @@ class ModelWorker:
             weight_prefix=self.weight_prefix,
             total_gpu_memory_fraction=self.total_gpu_memory_fraction,
             kv_cache_bytes=self.kv_cache_bytes,
+            is_later_engine_in_process=self.is_later_engine_in_process,
         )
 
     def init_dllm_algorithm(self):

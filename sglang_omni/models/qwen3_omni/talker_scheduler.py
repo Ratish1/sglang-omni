@@ -58,6 +58,7 @@ class QwenTalkerScheduler(OmniScheduler[SGLangARRequestData]):
 
     excluded_row_steps: int = 0
     excluded_batch: ScheduleBatch | None = None
+    shared_process_priority = "top"
 
     def __init__(
         self,

@@ -197,6 +197,7 @@ class OmniKVCacheConfigurator(KVCacheConfigurator):
 
     total_gpu_memory_fraction: float | None = None
     kv_cache_bytes: int | None = None
+    is_later_engine_in_process: bool = False
 
     def _resolve_kv_pool_class(  # noqa: leading-underscore  # upstream spelling, or the public name is already taken
         self, *, kind: KVPoolKind, default: type[KVCache]
@@ -293,7 +294,12 @@ class OmniKVCacheConfigurator(KVCacheConfigurator):
         else:
             pass
 
-        if process_memory is None or process_memory <= 0:
+        # note (ratish): the process's memory counts every engine already built in it, so a later engine counts its own load.
+        if (
+            process_memory is None
+            or process_memory <= 0
+            or self.is_later_engine_in_process
+        ):
             available_bytes = self.profile_available_bytes_from_stage_load_delta(
                 pre_model_load_memory,
                 total_memory,
@@ -511,10 +517,12 @@ class SGLModelRunner(ModelRunner):
         weight_prefix: str | None = None,
         total_gpu_memory_fraction: float | None = None,
         kv_cache_bytes: int | None = None,
+        is_later_engine_in_process: bool = False,
     ) -> None:
         self.weight_prefix = weight_prefix
         self.total_gpu_memory_fraction = total_gpu_memory_fraction
         self.kv_cache_bytes = kv_cache_bytes
+        self.is_later_engine_in_process = is_later_engine_in_process
         self.model_arch_override = model_arch_override
         self.weight_share_config = None
         self.weight_share_record = None
@@ -960,4 +968,5 @@ class SGLModelRunner(ModelRunner):
             },
             total_gpu_memory_fraction=self.total_gpu_memory_fraction,
             kv_cache_bytes=self.kv_cache_bytes,
+            is_later_engine_in_process=self.is_later_engine_in_process,
         )
