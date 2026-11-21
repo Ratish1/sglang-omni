@@ -479,7 +479,9 @@ class ThinkerModelRunner(ModelRunner):
             combined_mask = torch.zeros(
                 len(forward_batch.input_ids), dtype=torch.bool, device=device
             )
-            combined_mask[host_to_device(torch.cat(visual_rows), device)] = True
+            combined_mask.index_fill_(
+                0, host_to_device(torch.cat(visual_rows), device), True
+            )
             visual_masks_out = combined_mask
             if len(deepstack_visual_embeds_list) == 1:
                 ds_embeds_out = deepstack_visual_embeds_list[0]
