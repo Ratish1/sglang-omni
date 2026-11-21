@@ -207,6 +207,38 @@ def report(boot: str, cell: str) -> None:
         )
     else:
         pass
+    fits = collections.defaultdict(list)
+    for step in in_window:
+        kind = step_class(step)
+        step_ms = (step["ns"] - step["ns0"]) / 1e6
+        if kind in ("mixed", "extend"):
+            prefill_rids = [step["rids"][row] for row, _ in step["pre"]]
+            source = (
+                "video" if any(rid not in speech for rid in prefill_rids) else "speech"
+            )
+            fits[f"{kind} with {source} prefill, ms on extend tokens"].append(
+                (step["ext"], step_ms)
+            )
+        elif step["path"] == "sync":
+            fits["decode sync, ms on rows"].append((len(step["rids"]), step_ms))
+        else:
+            pass
+    print("  step duration (its start to its stream output) fitted on its size:")
+    for name in sorted(fits):
+        points = fits[name]
+        if len(points) < 3 or len({x for x, _ in points}) < 2:
+            print(f"    {name}: {len(points)} steps, too few sizes to fit")
+            continue
+        else:
+            pass
+        slope, intercept = statistics.linear_regression(
+            [float(x) for x, _ in points], [y for _, y in points]
+        )
+        sizes = [x for x, _ in points]
+        print(
+            f"    {name}: {len(points)} steps, {intercept:.2f} ms + {1000 * slope:.3f} ms per 1000, "
+            f"sizes {min(sizes)} to {max(sizes)} (median {quantile(sizes, 0.5)})"
+        )
     ends = [step["ns"] for step in steps]
     gaps = collections.defaultdict(list)
     gaps_by_extend = collections.defaultdict(list)
