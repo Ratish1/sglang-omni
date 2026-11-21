@@ -3,17 +3,20 @@
 usage: python3 ctxsw_read.py trace.sqlite [trace.sqlite ...]
 
 Context residency runs from a context's RESTORE_START (or CONTEXT_START) to its next SAVE_END. A hardware context maps to the
-process whose kernels start inside its residencies. The thinker and talker are told apart by the code2wav kernels the talker
-process runs. A thinker step is one cudaGraphLaunch in the thinker process; its kernels carry the launch's correlation id.
+process whose kernels start inside its residencies. Roles come from the sglang_ar_startup lines of the serve.log two levels
+above the trace (boot/c64_nsys/trace.sqlite); a process without one is named by its threads and kernels. A thinker step is one cudaGraphLaunch in the thinker process; its kernels carry the launch's correlation id.
 """
 
 import bisect
 import collections
+import os
+import re
 import sqlite3
 import statistics
 import sys
 
 SAVE_END, RESTORE_START, CONTEXT_START = 7, 8, 9
+STARTUP = re.compile(r"sglang_ar_startup stage=(\w+) gpu_id=\d+ .*pid=(\d+)")
 
 
 def pid_of(global_id: int) -> int:
@@ -90,8 +93,25 @@ def read(path: str) -> None:
     for _, _, global_pid, short_name, _ in kernels:
         kernel_names[pid_of(global_pid)][names[short_name]] += 1
     roles: dict[int, str] = {}
+    serve_log = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(path))), "serve.log"
+    )
+    started: dict[int, str] = {}
+    if os.path.exists(serve_log):
+        with open(serve_log, encoding="utf-8", errors="replace") as log:
+            for line in log:
+                if match := STARTUP.search(line):
+                    started[int(match[2])] = (
+                        "talker" if match[1] == "talker_ar" else match[1]
+                    )
+                else:
+                    pass
+    else:
+        pass
     for pid in kernel_names:
-        if "scheduler-image" in thread_names[pid]:
+        if pid in started:
+            roles[pid] = started[pid]
+        elif "scheduler-image" in thread_names[pid]:
             roles[pid] = "image"
         elif "scheduler-audio" in thread_names[pid]:
             roles[pid] = "audio"
