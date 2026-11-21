@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # 11-21, node-0001, card 0 after q1121_oc3 (WER on card 1 after q1121_vg). The combined form against main: both changes,
 # part 1 (every thinker prefill chunk on the graph, deepstack rows included) and part 2 (thinker, talker and code2wav in
-# one process and context, the talker first on the card): OCVG 85ba60a52, tree e9ab4004b74c. Card 0 alone, B A A B,
+# one process and context, the talker first on the card) and the thinker's index copies without stream waits: OCVG
+# 6c8168a28, tree 56d7e7db0fbc. Starts on a "go final2" line after the card 1 check of that head. Card 0 alone, B A A B,
 # every video boot gated:
 #   F1  speech 8/s seed 3451 beside video 1/s seed 7 (cap 8), warm pass (every video new) and events pass
 #   F2  speech alone c1, c16 and c64
@@ -11,7 +12,7 @@ set -u
 O=/data/v1121
 K=/workspace/kit/tasks/runtime-perf-research/box
 NMAIN=/workspace/nmain OCVG=/workspace/ocvg
-OCVG_SHA=85ba60a52
+OCVG_SHA=6c8168a28
 CONTEXT_32K="--preprocessing.factory.max_seq_len 32768 --thinker.factory.max_seq_len 32768"
 CPUS=0-55,112-167
 ASR_PORT=30500
@@ -96,7 +97,7 @@ seeded() {
     --loads 1 --passes clean "--bench-extra=--seed 3451" > $O/$name.driver.log 2>&1
   log "boot $name rc $?"
 }
-until grep -q "q1121_oc3 done" $O/queue.log 2>/dev/null; do sleep 20; done
+until grep -q "^go final2" $O/queue.log 2>/dev/null; do sleep 20; done
 until ! pgrep -f "box/baseline.py .*--card 0 " > /dev/null; do sleep 20; done
 cd /workspace/sglang-omni
 git fetch -q origin dev/qwen3-omni-one-context-visual-graph
