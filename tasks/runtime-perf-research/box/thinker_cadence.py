@@ -68,7 +68,9 @@ def load(
                         launches.append(item)
                     elif kind == "tz":
                         resolves.append(item)
-                    elif kind == "tq" and start_ns <= item["ns"] <= end_ns:
+                    elif (
+                        kind in ("tq", "tg", "td") and start_ns <= item["ns"] <= end_ns
+                    ):
                         inputs.append(item)
                     else:
                         pass
@@ -184,11 +186,48 @@ def report(boot: str, cell: str) -> None:
             f"    {'':18s} before the step {statistics.fmean(before_step[kind]):7.2f} ms, "
             f"the step {statistics.fmean(in_step[kind]):7.2f} ms (from its start, or the previous end on lookahead)"
         )
-    input_ms = [(item["ns"] - item["ns0"]) / 1e6 for item in inputs]
+    input_ms = [
+        (item["ns"] - item["ns0"]) / 1e6 for item in inputs if item["k"] == "tq"
+    ]
     print(
         f"  input processing (request builds inline): {100 * sum(input_ms) / window_ms:5.1f} % of the window, "
-        f"{describe(input_ms)}, {sum(item['n'] for item in inputs)} inputs"
+        f"{describe(input_ms)}, {sum(item['n'] for item in inputs if item['k'] == 'tq')} inputs"
     )
+    parts = sorted(inputs, key=lambda item: item["ns"])
+    part_ends = [item["ns"] for item in parts]
+    before_parts = collections.defaultdict(list)
+    previous_end = None
+    for step in steps:
+        if (
+            previous_end is not None
+            and start_ns <= step["ns"] <= end_ns
+            and step_class(step) in ("mixed", "extend")
+            and step["path"] == "sync"
+        ):
+            low = bisect.bisect_left(part_ends, previous_end)
+            high = bisect.bisect_right(part_ends, step["ns0"])
+            for name, kind in (("inputs", "tq"), ("selection", "tg"), ("drain", "td")):
+                before_parts[name].append(
+                    sum(
+                        (item["ns"] - max(item["ns0"], previous_end)) / 1e6
+                        for item in parts[low:high]
+                        if item["k"] == kind
+                    )
+                )
+            before_parts["all"].append((step["ns0"] - previous_end) / 1e6)
+        else:
+            pass
+        previous_end = step["ns"]
+    if before_parts["all"]:
+        print(
+            "  before a mixed or extend step: "
+            + ", ".join(
+                f"{name} {statistics.fmean(values):.2f} ms"
+                for name, values in before_parts.items()
+            )
+        )
+    else:
+        pass
     print("  mixed and extend periods by extend tokens:")
     for key in sorted(
         by_extend, key=lambda item: (item[0], int(item[1].split("-")[0]))

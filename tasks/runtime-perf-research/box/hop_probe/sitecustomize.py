@@ -31,6 +31,10 @@ clock of the request event recorder, so records join its events per request.
               device) to the end of its stream output (ns); resolves run in launch order
   kind "tq"   with OMNI_HOP_PROBE_THINKER_STEPS=1, each thinker loop pass that received inputs: their count (n) and the
               time from the start of their processing (ns0, request builds run inline there) to its end (ns)
+  kind "tg"   with OMNI_HOP_PROBE_THINKER_STEPS=1, each thinker batch selection that returned an extend or mixed batch,
+              or took over 2 ms: the batch's forward mode, from its start (ns0) to its end (ns)
+  kind "td"   with OMNI_HOP_PROBE_THINKER_STEPS=1, each drain of a pending lookahead step (resolve_pending_async), from
+              its start (ns0) to its end (ns)
 """
 
 import atexit
@@ -592,12 +596,43 @@ def patch_thinker_scheduler(module):
         finally:
             record({"k": "tq", "ns0": started_ns, "n": count})
 
+    next_batch, drain = scheduler.get_next_batch_to_run, scheduler.resolve_pending_async
+
+    @functools.wraps(next_batch)
+    def next_batch_recorded(self):
+        if type(self) is not scheduler:
+            return next_batch(self)
+        else:
+            pass
+        started_ns = time.time_ns()
+        batch = next_batch(self)
+        mode = None if batch is None else batch.forward_mode.name
+        if mode not in (None, "DECODE") or time.time_ns() - started_ns > 2_000_000:
+            record({"k": "tg", "ns0": started_ns, "mode": mode})
+        else:
+            pass
+        return batch
+
+    @functools.wraps(drain)
+    def drain_recorded(self):
+        if type(self) is not scheduler or self.async_pending is None:
+            return drain(self)
+        else:
+            pass
+        started_ns = time.time_ns()
+        try:
+            return drain(self)
+        finally:
+            record({"k": "td", "ns0": started_ns})
+
     scheduler._run_batch, scheduler.run_batch_launch, scheduler.run_batch_resolve = (
         run_batch_recorded,
         launch_recorded,
         resolve_recorded,
     )
     scheduler.process_input_requests = process_input_recorded
+    scheduler.get_next_batch_to_run = next_batch_recorded
+    scheduler.resolve_pending_async = drain_recorded
 
 
 def patch_preprocessor(module):
