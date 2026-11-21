@@ -1,0 +1,9 @@
+diff --git a/sglang_omni/comm/stage_io.py b/sglang_omni/comm/stage_io.py
+index 50116fa6c..91c930af4 100644
+--- a/sglang_omni/comm/stage_io.py
++++ b/sglang_omni/comm/stage_io.py
+@@ -835,3 +835,3 @@ async def read_transfer_buffer(
+         # note (ratish): zero-filling a host buffer of hundreds of MB on the stage loop holds every message the loop would send meanwhile.
+-        buf = await asyncio.to_thread(torch.zeros, length, dtype=torch.uint8)
++        buf = torch.zeros(length, dtype=torch.uint8)
+     else:

@@ -1,0 +1,9 @@
+diff --git a/sglang_omni/relay/shm.py b/sglang_omni/relay/shm.py
+index 62d11c2a7..fb48d94a8 100644
+--- a/sglang_omni/relay/shm.py
++++ b/sglang_omni/relay/shm.py
+@@ -160,3 +160,3 @@ class ShmGetOperation(ShmOperation):
+         try:
+-            if self.transfer_info["size"] > SHM_LOOP_COPY_LIMIT_BYTES:
++            if self.transfer_info["size"] >= 0:
+                 # note (ratish): a block of hundreds of MB copied on the stage loop holds every message the loop would send meanwhile.
