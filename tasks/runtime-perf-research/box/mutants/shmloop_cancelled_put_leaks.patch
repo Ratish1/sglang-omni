@@ -1,0 +1,13 @@
+diff --git a/sglang_omni/relay/shm.py b/sglang_omni/relay/shm.py
+index a72dbb59c..0e01739e4 100644
+--- a/sglang_omni/relay/shm.py
++++ b/sglang_omni/relay/shm.py
+@@ -258,7 +258,7 @@ class ShmRelay(Relay):
+             return self.put_operation(shm, size_bytes, request_id)
+         except BaseException:
+             if creation is not None:
+-                creation.add_done_callback(discard_created_block)
++                pass
+             else:
+                 pass
+             self.sem.release()

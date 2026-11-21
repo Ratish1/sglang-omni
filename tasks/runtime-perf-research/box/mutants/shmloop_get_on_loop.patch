@@ -1,0 +1,12 @@
+diff --git a/sglang_omni/relay/shm.py b/sglang_omni/relay/shm.py
+index a72dbb59c..7f2e0de3c 100644
+--- a/sglang_omni/relay/shm.py
++++ b/sglang_omni/relay/shm.py
+@@ -172,7 +172,7 @@ class ShmGetOperation(ShmOperation):
+             pass
+         try:
+             # note (ratish): a payload of hundreds of MB copied on the stage loop holds every message the loop would send meanwhile.
+-            await asyncio.to_thread(self.copy_from_block)
++            self.copy_from_block()
+         finally:
+             self.completed = True

@@ -1,0 +1,14 @@
+diff --git a/sglang_omni/relay/shm.py b/sglang_omni/relay/shm.py
+index a72dbb59c..96b54a73b 100644
+--- a/sglang_omni/relay/shm.py
++++ b/sglang_omni/relay/shm.py
+@@ -253,7 +253,8 @@ class ShmRelay(Relay):
+         creation: asyncio.Future[_shm.SharedMemory] | None = None
+         try:
+             # note (ratish): the block's copy runs off the stage loop, and a sender cancelled while it runs leaves the block to discard_created_block.
+-            creation = asyncio.get_running_loop().run_in_executor(None, copy_block)
++            creation = asyncio.get_running_loop().create_future()
++            creation.set_result(copy_block())
+             shm = await asyncio.shield(creation)
+             return self.put_operation(shm, size_bytes, request_id)
+         except BaseException:
