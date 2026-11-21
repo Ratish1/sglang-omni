@@ -185,6 +185,8 @@ class Qwen3OmniThinkerModelRunner(ThinkerModelRunner):
         request: Req,
         model_inputs: object,
         chunk_span: tuple[int, int],
+        *,
+        can_carry_visual_rows: bool,
     ) -> bool:
         if not isinstance(model_inputs, dict) or not model_inputs:
             return False
@@ -231,7 +233,12 @@ class Qwen3OmniThinkerModelRunner(ThinkerModelRunner):
                 row_count = visual_embeds.shape[0]
             else:
                 return False
+            live_positions = (positions[modality] >= prefix) & (
+                positions[modality] < prefix + length
+            )
             if positions[modality].numel() != row_count:
+                return False
+            elif bool(live_positions.any()) and not can_carry_visual_rows:
                 return False
             else:
                 pass
@@ -376,10 +383,12 @@ class Qwen3OmniThinkerModelRunner(ThinkerModelRunner):
         chunk_spans = self.batch_chunk_spans(forward_batch, len(schedule_reqs))
         if chunk_spans is None:
             return PrefillDisposition(_UNSUPPORTED)
-        elif len(forward_batch.input_ids) > self.prefill_deepstack_rows.shape[0]:
-            return PrefillDisposition(_UNSUPPORTED)
         else:
             pass
+        rows = self.prefill_deepstack_rows
+        can_carry_visual_rows = (
+            rows is not None and len(forward_batch.input_ids) <= rows.shape[0]
+        )
         for request_index, (req, model_inputs) in enumerate(
             zip(schedule_reqs, model_inputs_by_request)
         ):
@@ -388,7 +397,10 @@ class Qwen3OmniThinkerModelRunner(ThinkerModelRunner):
             ):
                 continue
             elif not self.chunk_inputs_are_supported(
-                req, model_inputs, chunk_spans[request_index]
+                req,
+                model_inputs,
+                chunk_spans[request_index],
+                can_carry_visual_rows=can_carry_visual_rows,
             ):
                 return PrefillDisposition(_UNSUPPORTED)
             else:
@@ -400,7 +412,7 @@ class Qwen3OmniThinkerModelRunner(ThinkerModelRunner):
         return self.embed_tokens(forward_batch.input_ids)
 
     @property
-    def prefill_deepstack_rows(self) -> torch.Tensor:
+    def prefill_deepstack_rows(self) -> torch.Tensor | None:
         return self.text_model.prefill_deepstack_rows
 
     def write_prefill_deepstack_rows(
