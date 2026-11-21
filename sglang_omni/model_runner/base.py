@@ -21,6 +21,7 @@ from sglang_omni.model_runner.prefill_inputs import (
     clear_omni_prefill_inputs,
     get_omni_prefill_inputs,
 )
+from sglang_omni.model_runner.process_engines import process_engines
 from sglang_omni.model_runner.sglang_execution import SGLangExecutionBridge
 from sglang_omni.platforms import current_platform
 from sglang_omni.sampling.seed import (
@@ -304,7 +305,8 @@ class ModelRunner(Generic[RequestDataInput]):
             result, "_host_token_ids_event", None
         )  # noqa: leading-underscore  # upstream spelling, or the public name is already taken
         if event is not None:
-            event.synchronize()
+            with process_engines().released():
+                event.synchronize()
             result._host_token_ids_event = None  # noqa: leading-underscore  # upstream spelling, or the public name is already taken
         else:
             pass

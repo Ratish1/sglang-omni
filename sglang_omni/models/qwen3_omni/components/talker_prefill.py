@@ -220,9 +220,17 @@ class TalkerPrefillBuilder:
             ), "the thinker's prompt hidden rows are not the prompt's multimodal rows"
             if captured_positions:
                 hidden_rows = prompt_chunk.data
+                ready_event = (prompt_chunk.metadata or {}).get("prompt_hidden_ready")
                 # note (ratish): rows relayed through shared memory arrive on the CPU, where a pageable copy waits for the device.
                 if hidden_rows.is_cpu:
                     hidden_rows = host_tensor_to_device(hidden_rows, self.device)
+                elif ready_event is not None:
+                    # note (ratish): a thinker in this process wrote the rows on its own stream and may reuse the memory once this one lets go.
+                    talker_stream = torch.get_device_module(
+                        hidden_rows.device
+                    ).current_stream(hidden_rows.device)
+                    talker_stream.wait_event(ready_event)
+                    hidden_rows.record_stream(talker_stream)
                 else:
                     pass
                 prompt_hidden.index_copy_(
