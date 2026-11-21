@@ -726,6 +726,35 @@ def test_no_host_syncs_on_deepstack_path(monkeypatch):
         torch.testing.assert_close(ds[layer_index], expected_layer)
 
 
+@pytest.mark.accelerator
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="a stream wait needs CUDA")
+@pytest.mark.parametrize("make_batch", [mixed_mm_batch, deepstack_mm_batch])
+def test_a_cuda_merge_matches_the_host_merge_without_a_stream_wait(make_batch):
+    """The merge moved its row indices with blocking copies, which waited for every kernel queued on the stream."""
+    runner = make_runner()
+    torch.manual_seed(1)
+    reference = runner.inject_multimodal_embeds(*make_batch())
+    torch.manual_seed(1)
+    fb, sb = make_batch()
+    runner.embed_tokens.cuda()
+    fb.input_ids = fb.input_ids.cuda()
+    sync_debug_mode = torch.cuda.get_sync_debug_mode()
+    torch.cuda.set_sync_debug_mode("error")
+    try:
+        merged = runner.inject_multimodal_embeds(fb, sb)
+    finally:
+        torch.cuda.set_sync_debug_mode(sync_debug_mode)
+
+    out, ds, mask = merged
+    expected_out, expected_ds, expected_mask = reference
+    assert torch.equal(out.cpu(), expected_out)
+    assert (mask is None) == (expected_mask is None)
+    assert mask is None or torch.equal(mask.cpu(), expected_mask)
+    assert (ds is None) == (expected_ds is None)
+    for layer, expected_layer in zip(ds or [], expected_ds or [], strict=True):
+        assert torch.equal(layer.cpu(), expected_layer)
+
+
 def test_no_host_syncs_with_cpu_tensor_extend_lens(monkeypatch):
     runner = make_runner()
     fb, sb = mixed_mm_batch()
