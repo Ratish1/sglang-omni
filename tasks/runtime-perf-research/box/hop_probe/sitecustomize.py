@@ -37,6 +37,11 @@ clock of the request event recorder, so records join its events per request.
               its start (ns0) to its end (ns)
   kind "tp"   with OMNI_HOP_PROBE_THINKER_STEPS=1, each thinker step's result processing (process_batch_result): the
               step's forward mode, from its start (ns0) to its end (ns)
+  kind "tx"   with OMNI_HOP_PROBE_THINKER_PARTS=1, each synchronous Qwen3-Omni thinker execute: forward mode, rows,
+              extend tokens, host ms in build_forward_batch, prepare_and_forward and finalize (its host token wait
+              included), the whole execute from ns0 to ns (the rest is the post_prefill or post_decode hooks and token
+              publication), and the forward's device span in ms (gpu, CUDA events around prepare_and_forward, time the
+              card served other contexts included)
 """
 
 import atexit
@@ -67,6 +72,9 @@ FREEZE_STARTUP_GC = os.environ.get("OMNI_FREEZE_STARTUP_GC") == "1"
 FREEZE_COUNT_PERIOD_S = float(os.environ.get("OMNI_HOP_PROBE_FREEZE_COUNT_S", "0"))
 TALKER_BATCHES = os.environ.get("OMNI_HOP_PROBE_TALKER_BATCHES") == "1"
 THINKER_STEPS = os.environ.get("OMNI_HOP_PROBE_THINKER_STEPS") == "1"
+# OMNI_HOP_PROBE_THINKER_PARTS=1 times the parts of each synchronous Qwen3-Omni thinker step and its forward's device span
+# from two CUDA events; reading the span adds one event wait after the step's own finalize wait
+THINKER_PARTS = os.environ.get("OMNI_HOP_PROBE_THINKER_PARTS") == "1"
 # OMNI_HOP_PROBE_SYNC_SITES=1 sets torch's sync debug mode to warn in every process and counts each synchronizing
 # CUDA call by thread and by its innermost sglang frames (kind "sync", the running counts once a second); a check
 # boot, not a measured one, since every count walks the Python stack
@@ -652,6 +660,83 @@ def patch_thinker_scheduler(module):
     scheduler.process_batch_result = process_result_recorded
 
 
+THINKER_RUNNERS = ("Qwen3OmniThinkerModelRunner",)
+
+
+def patch_thinker_runner(module):
+    runner = module.ModelRunner
+    execute = runner.execute
+    timed = {
+        name: getattr(runner, name)
+        for name in ("build_forward_batch", "prepare_and_forward", "finalize")
+    }
+
+    def timed_part(name, method):
+        @functools.wraps(method)
+        def part_recorded(self, *args, **kwargs):
+            parts = getattr(self, "hop_probe_parts", None)
+            if parts is None:
+                return method(self, *args, **kwargs)
+            else:
+                pass
+            torch = sys.modules["torch"]
+            started_ns = time.time_ns()
+            if name == "prepare_and_forward":
+                parts["gpu"] = (
+                    torch.cuda.Event(enable_timing=True),
+                    torch.cuda.Event(enable_timing=True),
+                )
+                parts["gpu"][0].record()
+            else:
+                pass
+            try:
+                return method(self, *args, **kwargs)
+            finally:
+                if name == "prepare_and_forward":
+                    parts["gpu"][1].record()
+                else:
+                    pass
+                parts[name] = (time.time_ns() - started_ns) / 1e6
+
+        return part_recorded
+
+    @functools.wraps(execute)
+    def execute_recorded(self, scheduler_output):
+        batch = scheduler_output.batch_data
+        if type(self).__name__ not in THINKER_RUNNERS or batch is None:
+            return execute(self, scheduler_output)
+        else:
+            pass
+        mode = batch.forward_mode.name
+        rows = len(batch.reqs)
+        ext = batch.extend_num_tokens if batch.forward_mode.is_extend() else rows
+        self.hop_probe_parts = {}
+        started_ns = time.time_ns()
+        try:
+            return execute(self, scheduler_output)
+        finally:
+            parts, self.hop_probe_parts = self.hop_probe_parts, None
+            item = {
+                "k": "tx",
+                "ns0": started_ns,
+                "mode": mode,
+                "rows": rows,
+                "ext": ext,
+            }
+            item.update({name: value for name, value in parts.items() if name != "gpu"})
+            events = parts.get("gpu")
+            if events is not None:
+                events[1].synchronize()
+                item["gpu"] = events[0].elapsed_time(events[1])
+            else:
+                pass
+            record(item)
+
+    for name, method in timed.items():
+        setattr(runner, name, timed_part(name, method))
+    runner.execute = execute_recorded
+
+
 def patch_preprocessor(module):
     preprocessor = module.Qwen3OmniPreprocessor
     call_impl = preprocessor.call_impl
@@ -727,6 +812,10 @@ else:
     pass
 if THINKER_STEPS:
     PATCHES["sglang_omni.scheduling.omni_scheduler"] = patch_thinker_scheduler
+else:
+    pass
+if THINKER_PARTS:
+    PATCHES["sglang_omni.model_runner.base"] = patch_thinker_runner
 else:
     pass
 
