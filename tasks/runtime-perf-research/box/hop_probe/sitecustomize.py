@@ -22,6 +22,13 @@ clock of the request event recorder, so records join its events per request.
               forward mode and rows as it starts (ns0) and its end (ns), after the step's outputs reached the host
   kind "req"  with OMNI_HOP_PROBE_TALKER_BATCHES=1, each Qwen3-Omni request at preprocessing: its id and the text of
               its last message, which joins a benchmark sample to its request id
+  kind "ts"   with OMNI_HOP_PROBE_THINKER_STEPS=1, each thinker step run on the synchronous path (prefill, mixed, and
+              decode below the lookahead size): its forward mode, row request ids, extend tokens and the rows whose
+              extend is longer than one token as [row, tokens], from its start (ns0) to the end of its stream output (ns)
+  kind "tl"   with OMNI_HOP_PROBE_THINKER_STEPS=1, each thinker step launched on the lookahead path, at its launch: its
+              forward mode and row request ids
+  kind "tz"   with OMNI_HOP_PROBE_THINKER_STEPS=1, each lookahead step's resolve, from its start (ns0, the wait for the
+              device) to the end of its stream output (ns); resolves run in launch order
 """
 
 import atexit
@@ -51,6 +58,7 @@ FREEZE_STARTUP_GC = os.environ.get("OMNI_FREEZE_STARTUP_GC") == "1"
 # generation under the GIL, so it is for a check boot and not for a measured one
 FREEZE_COUNT_PERIOD_S = float(os.environ.get("OMNI_HOP_PROBE_FREEZE_COUNT_S", "0"))
 TALKER_BATCHES = os.environ.get("OMNI_HOP_PROBE_TALKER_BATCHES") == "1"
+THINKER_STEPS = os.environ.get("OMNI_HOP_PROBE_THINKER_STEPS") == "1"
 # OMNI_HOP_PROBE_SYNC_SITES=1 sets torch's sync debug mode to warn in every process and counts each synchronizing
 # CUDA call by thread and by its innermost sglang frames (kind "sync", the running counts once a second); a check
 # boot, not a measured one, since every count walks the Python stack
@@ -508,6 +516,72 @@ def patch_talker_scheduler(module):
     scheduler.process_batch_result = process_recorded
 
 
+def thinker_step_shape(batch):
+    mode = batch.forward_mode
+    shape = {
+        "mode": mode.name,
+        "rids": [request.rid for request in batch.reqs],
+    }
+    if mode.is_extend():
+        extend_lens = list(batch.extend_lens or ())
+        shape["ext"] = batch.extend_num_tokens
+        shape["pre"] = [
+            [row, tokens] for row, tokens in enumerate(extend_lens) if tokens > 1
+        ]
+    else:
+        pass
+    return shape
+
+
+def patch_thinker_scheduler(module):
+    patch_put_messages(module)
+    scheduler = module.OmniScheduler
+    run_batch, launch, resolve = (
+        scheduler._run_batch,
+        scheduler.run_batch_launch,
+        scheduler.run_batch_resolve,
+    )
+
+    @functools.wraps(run_batch)
+    def run_batch_recorded(self, batch, pp_proxy_tensors=None):
+        if type(self) is not scheduler:
+            return run_batch(self, batch, pp_proxy_tensors)
+        else:
+            pass
+        started_ns = time.time_ns()
+        shape = thinker_step_shape(batch)
+        try:
+            return run_batch(self, batch, pp_proxy_tensors)
+        finally:
+            record({"k": "ts", "ns0": started_ns, **shape})
+
+    @functools.wraps(launch)
+    def launch_recorded(self, batch):
+        if type(self) is scheduler:
+            record({"k": "tl", **thinker_step_shape(batch)})
+        else:
+            pass
+        return launch(self, batch)
+
+    @functools.wraps(resolve)
+    def resolve_recorded(self, batch, sched_output, pending_step, skip_rids=()):
+        if type(self) is not scheduler:
+            return resolve(self, batch, sched_output, pending_step, skip_rids)
+        else:
+            pass
+        started_ns = time.time_ns()
+        try:
+            return resolve(self, batch, sched_output, pending_step, skip_rids)
+        finally:
+            record({"k": "tz", "ns0": started_ns, "rows": len(batch.reqs)})
+
+    scheduler._run_batch, scheduler.run_batch_launch, scheduler.run_batch_resolve = (
+        run_batch_recorded,
+        launch_recorded,
+        resolve_recorded,
+    )
+
+
 def patch_preprocessor(module):
     preprocessor = module.Qwen3OmniPreprocessor
     call_impl = preprocessor.call_impl
@@ -579,6 +653,10 @@ if TALKER_BATCHES:
     PATCHES["sglang_omni.models.qwen3_omni.components.preprocessor"] = (
         patch_preprocessor
     )
+else:
+    pass
+if THINKER_STEPS:
+    PATCHES["sglang_omni.scheduling.omni_scheduler"] = patch_thinker_scheduler
 else:
     pass
 
