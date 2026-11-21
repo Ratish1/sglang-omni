@@ -108,7 +108,7 @@ abba() {
   log "$tag read"
 }
 until grep -q "q1121_v6 done" $O/queue.log 2>/dev/null; do sleep 20; done
-until ! pgrep -f "kit/tasks/runtime-perf-research/box/baseline.py" > /dev/null; do sleep 20; done
+until ! pgrep -f "box/baseline.py .*--card 0 " > /dev/null; do sleep 20; done
 log "q1121_v7 start, $(node_free)"
 mixed w25_b $NSBOTH2 rate
 b5=$LAST
