@@ -88,7 +88,7 @@ class ProcessEngines:
         for group_name in PROCESS_GROUP_NAMES:
             try:
                 built_groups[group_name] = getattr(first_parallel, group_name)
-            except AttributeError:
+            except RuntimeError:
                 # note (ratish): a group the first engine's topology left unbuilt raises on read, and stays unset here.
                 continue
         get_parallel().override_permanently(**built_groups)
