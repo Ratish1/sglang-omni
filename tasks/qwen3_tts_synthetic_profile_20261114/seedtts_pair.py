@@ -231,8 +231,9 @@ def main() -> None:
     parser.add_argument("--b-client-arg", action="append", default=[], help="one more client argument for arm b")
     parser.add_argument(
         "--one-card", action="store_true",
-        help="run each arm alone on card 0, a then b in order 0 and b then a in order 1, when one card is held",
+        help="run each arm alone on --card, a then b in order 0 and b then a in order 1, when one card is held",
     )
+    parser.add_argument("--card", type=int, default=0, help="the card --one-card runs on")
     parser.add_argument(
         "--cells", nargs="+", choices=[cell for cell, _, _ in CELLS], default=None,
         help="only these cells, in the protocol's order",
@@ -249,7 +250,9 @@ def main() -> None:
     for order, cards in enumerate(({"a": 0, "b": 1}, {"a": 1, "b": 0})):
         if args.one_card:
             for arm in ("a", "b") if order == 0 else ("b", "a"):
-                run_order(order, (arm,), trees, {arm: 0}, model, extras, args.port, args.out, cells, args.rounds == 0)
+                run_order(
+                    order, (arm,), trees, {arm: args.card}, model, extras, args.port, args.out, cells, args.rounds == 0
+                )
         else:
             run_order(order, ("a", "b"), trees, cards, model, extras, args.port, args.out, cells, args.rounds == 0)
     print(f"{time.strftime('%T')} seedtts_pair done", flush=True)

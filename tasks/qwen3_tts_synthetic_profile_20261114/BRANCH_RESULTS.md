@@ -39,6 +39,15 @@ Against the slot fix at the same time on the two cards. Nari's client, 180 s mea
 | `ddd52d694` default 256 on `dade67035` | `f6d2c8198` | seeds 0 / 1: 69.7 / 69.8 % and 85.8 / 87.3 %, underruns 4, 3 / 3, 7 against 2, 4 / 7, 6; first byte 4.6 s against 0.9 s | SeedTTS Base both orders inside the A/A band, WER 1.03 / 1.07 %, SIM 71.39 / 71.36; whole c64 RTF -0.4 % | ready to open on the user's word; bound trade-off for the user |
 | `3e07f76e4` rebuilt on the sizing branch `33bde3fa9` (`fix/qwen3-tts-admission-waits-on-arena`), then `a941cd93a` on `95a524770`, then `23fa9ea59` on `758506aef` | `7dab90093`, `75e445466`, `88ac8e2c6` | `a941cd93a` against the sizing head `95a524770`, one card, each arm alone, 180 s, seeds 0 / 1: 80 req/s 92.7 / 95.0 → 96.0 / 94.7 %, underrun requests 1 / 7 → 4 / 5, first byte p50 0.77 / 0.73 → 4.0 / 4.2 s; 100 req/s 75.0 / 76.1 → 74.4 / 76.4 %, 4 / 4 → 2 / 5, 0.82 / 0.82 → 4.2 / 4.2 s; arena peak 65 to 66 rows on both arms, 0 exhausted | | 11-19 one card: CPU 2,745 passed (4 failures main shares), accelerator 286 passed; 384 streams at once two rounds and the mixed round times 8 three rounds both models complete, 0 refused; `a941cd93a`: 128 clients dropping after the first chunk and streaming again, two rounds, all complete, 0 refused, 0 exhausted |
 
+# Branch results: prompt mode and opening rebuilt on main `eabad7188` (11-21, host-221 GPUs [4 5])
+
+Main `eabad7188` (tree `bbe6df1fe`). Host load average about 117 from other tenants during the round.
+
+| Head | sglang_omni tree | Affected tests | Serving | Read |
+|---|---|---|---|---|
+| `fix/qwen3-tts-request-prompt-mode` `2e039324e` | `3785981af` | 492 passed, 1 skipped (macOS libproc), plus 68 speech tests in `test_openai_api.py`; on main the new tests fail 9 of 10 (true stops codec streaming, false kept true on CustomVoice and VoiceDesign, field dropped by the protocol, no benchmark flag) | `prompt_mode_serving.py` on both trees, card 0, `prompt_mode_compare.py` by request position: absent and default values byte-identical to main on Base, CustomVoice and VoiceDesign, streamed and whole; the other value differs; every streamed request 15 to 21 chunks, first byte 16 to 79 ms; main gives true and false the same bytes. SeedTTS pair pending | the first streamed Base and VoiceDesign requests after a boot give other bytes than later repeats of the same seeded request, on both trees alike (pre-existing; whole requests repeat), so identity is read by request position |
+| `fix/qwen3-tts-trim-opening-at-any-load` `2245d379f` | `69d129890` | 59 passed, 1 skipped (real-checkpoint gate, unreached); the new test fails on main (`1 == 1 + 1`: the stream past 24 keeps its silent frame) | pending | |
+
 # Branch results: load-independent opening (11-19, host-221 card 3, one card)
 
 `test/qwen3-tts-opening-on-arena` (`fix/qwen3-tts-opening-load-independent` `b45d01067` merged on the sizing head), each arm alone, seeds 0 / 1, against the sizing head `95a524770`.
