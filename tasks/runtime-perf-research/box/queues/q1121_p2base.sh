@@ -1,15 +1,15 @@
 #!/usr/bin/env bash
-# 11-21, node-0001, card 0 after q1121_stackoc. Part 2 alone on its landing base: the combined form (OCVG 6c8168a28,
-# tree 56d7e7db0fbc: both changes, part 1, the index copy fix, part 2) against the same without part 2 in two processes
-# (BVG da504ceff, tree 53e5be1a562c). Card 0 alone, B A A B, speech 8/s seed 3451 beside video 1/s seed 7 (cap 8),
-# every video boot gated; then speech alone c1 and c16 B A A B. Then the index copy fix alone on main (IXC 01b8568c0,
-# tree 65d0d1f6c257, against NMAIN e0482a08c), speech beside video B A A B. Then, with every measurement done, the unit
+# 11-21, node-0001, card 0 after q1121_stackoc. Part 2 alone on its landing base: the combined form (OCVG 20d57c8b4,
+# tree 3fdf8496fd26: both changes, part 1, the index copy fix, part 2) against the same without part 2 in two processes
+# (BVG 6aff09f46, tree 32cb9d81e911). Card 0 alone, B A A B, speech 8/s seed 3451 beside video 1/s seed 7 (cap 8),
+# every video boot gated; then speech alone c1 and c16 B A A B. Then the index copy fix alone on main (IXC 4ca23252e,
+# tree 03e7268c8857, against NMAIN e0482a08c), speech beside video B A A B. Then, with every measurement done, the unit
 # suites the stack touches on the combined and stack heads (they run kernels on card 0).
 set -u
 O=/data/v1121
 K=/workspace/kit/tasks/runtime-perf-research/box
 OCVG=/workspace/ocvg BVG=/workspace/bvg SOCVG=/workspace/socvg IXC=/workspace/ixc NMAIN=/workspace/nmain
-OCVG_SHA=6c8168a28 BVG_SHA=da504ceff SOCVG_SHA=5e23b36a6 IXC_SHA=01b8568c0 NMAIN_SHA=e0482a08c
+OCVG_SHA=20d57c8b4 BVG_SHA=6aff09f46 SOCVG_SHA=26224b691 IXC_SHA=4ca23252e NMAIN_SHA=e0482a08c
 CONTEXT_32K="--preprocessing.factory.max_seq_len 32768 --thinker.factory.max_seq_len 32768"
 CPUS=0-55,112-167
 UNIT_SUITES="tests/unit_test/model_runner tests/unit_test/qwen3_omni tests/unit_test/pipeline tests/unit_test/preprocessing tests/unit_test/relay tests/unit_test/scheduling"
@@ -136,7 +136,7 @@ mixed ix3_a $NMAIN 649
 a3=$LAST
 mixed ix4_b $IXC 649
 b4=$LAST
-python3 $K/body_table.py $O c64 "index copy fix alone (01b8568c0) against main (e0482a08c), card 0 B A A B, speech 8/s and video 1/s" \
+python3 $K/body_table.py $O c64 "index copy fix alone (4ca23252e) against main (e0482a08c), card 0 B A A B, speech 8/s and video 1/s" \
   main=$a2,$a3 fix=$b1,$b4 >> $O/queue.log 2>&1
 python3 $K/first_chunk_gap.py --cell c64_events $O main=$a2,$a3 fix=$b1,$b4 2>&1 | grep gaps >> $O/queue.log
 python3 $K/mixed_cell_load.py $O $b1 $b4 $a2 $a3 >> $O/queue.log 2>&1
