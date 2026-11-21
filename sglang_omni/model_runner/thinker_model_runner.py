@@ -403,8 +403,8 @@ class ThinkerModelRunner(ModelRunner):
                             visual_count, device=slots.device
                         )
                         n_image = img_pos.numel()
-                        img_idx = slots[:n_image].to(device)
-                        vid_idx = slots[n_image:].to(device)
+                        img_idx = host_to_device(slots[:n_image], device)
+                        vid_idx = host_to_device(slots[n_image:], device)
                         merged = []
                         for img_e, vid_e in zip(image_ds, video_ds):
                             img_e = img_e[image_offset : image_offset + image_count]
