@@ -53,7 +53,7 @@ class PrefillDisposition:
 
 
 class Qwen3OmniThinkerModelRunner(ThinkerModelRunner):
-    """Adopt the shared prefill sidecar for prefill chunks that compute no image or video row.
+    """Adopt the shared prefill sidecar, deepstack rows included, for every chunk whose payload it can qualify.
 
     This class only qualifies Qwen request payloads. SGLang continues to own
     graph admission, bucket selection, padding, replay metadata, and eager
@@ -62,6 +62,7 @@ class Qwen3OmniThinkerModelRunner(ThinkerModelRunner):
     """
 
     supports_speculative_async_decode: bool = True
+    dirty_deepstack_tokens: int = 0
 
     @staticmethod
     def origin_num_tokens(value: object) -> int | None:
@@ -184,6 +185,8 @@ class Qwen3OmniThinkerModelRunner(ThinkerModelRunner):
         request: Req,
         model_inputs: object,
         chunk_span: tuple[int, int],
+        *,
+        can_carry_visual_rows: bool,
     ) -> bool:
         if not isinstance(model_inputs, dict) or not model_inputs:
             return False
@@ -230,10 +233,12 @@ class Qwen3OmniThinkerModelRunner(ThinkerModelRunner):
                 row_count = visual_embeds.shape[0]
             else:
                 return False
-            # note (ratish): deepstack rows sit only at visual positions, so a chunk past all of them needs no custom forward.
+            live_positions = (positions[modality] >= prefix) & (
+                positions[modality] < prefix + length
+            )
             if positions[modality].numel() != row_count:
                 return False
-            elif row_count and int(positions[modality][-1]) >= prefix:
+            elif bool(live_positions.any()) and not can_carry_visual_rows:
                 return False
             else:
                 pass
@@ -380,6 +385,10 @@ class Qwen3OmniThinkerModelRunner(ThinkerModelRunner):
             return PrefillDisposition(_UNSUPPORTED)
         else:
             pass
+        rows = self.prefill_deepstack_rows
+        can_carry_visual_rows = (
+            rows is not None and len(forward_batch.input_ids) <= rows.shape[0]
+        )
         for request_index, (req, model_inputs) in enumerate(
             zip(schedule_reqs, model_inputs_by_request)
         ):
@@ -388,7 +397,10 @@ class Qwen3OmniThinkerModelRunner(ThinkerModelRunner):
             ):
                 continue
             elif not self.chunk_inputs_are_supported(
-                req, model_inputs, chunk_spans[request_index]
+                req,
+                model_inputs,
+                chunk_spans[request_index],
+                can_carry_visual_rows=can_carry_visual_rows,
             ):
                 return PrefillDisposition(_UNSUPPORTED)
             else:
@@ -399,12 +411,51 @@ class Qwen3OmniThinkerModelRunner(ThinkerModelRunner):
     def text_input_embeds(self, forward_batch: ForwardBatch) -> torch.Tensor:
         return self.embed_tokens(forward_batch.input_ids)
 
+    @property
+    def prefill_deepstack_rows(self) -> torch.Tensor | None:
+        return self.text_model.prefill_deepstack_rows
+
+    def write_prefill_deepstack_rows(
+        self,
+        deepstack_embeds: list[torch.Tensor],
+        visual_masks: torch.Tensor,
+        num_tokens: int,
+    ) -> None:
+        """Lay the chunk's deepstack rows over its first num_tokens rows, zero at every non-visual token."""
+        rows = self.prefill_deepstack_rows
+        visual_deepstack = torch.cat(
+            [
+                layer.to(device=rows.device, dtype=rows.dtype)
+                for layer in deepstack_embeds
+            ],
+            dim=-1,
+        )
+        visual_count = visual_deepstack.shape[0]
+        source_rows = torch.cat(
+            [visual_deepstack, visual_deepstack.new_zeros(1, rows.shape[1])]
+        )
+        # note (ratish): the k-th visual token takes the k-th deepstack row and every other token the zero row, with no host read of the mask.
+        source_index = torch.where(
+            visual_masks, visual_masks.cumsum(0) - 1, visual_count
+        )
+        torch.index_select(source_rows, 0, source_index, out=rows[:num_tokens])
+        self.dirty_deepstack_tokens = num_tokens
+
+    def clear_prefill_deepstack_rows(self) -> None:
+        if self.dirty_deepstack_tokens:
+            self.prefill_deepstack_rows[: self.dirty_deepstack_tokens].zero_()
+            self.dirty_deepstack_tokens = 0
+        else:
+            pass
+
     def before_prefill(
         self,
         forward_batch: ForwardBatch | None,
         schedule_batch: ScheduleBatch | None,
         requests: list[SchedulerRequest],
     ) -> None:
+        # note (ratish): every prefill reads the rows, and the last chunk's are cleared on the stream before this one runs.
+        self.clear_prefill_deepstack_rows()
         disposition = self.classify_prefill(forward_batch, schedule_batch, requests)
         if disposition.kind != _SIDECAR:
             return
@@ -427,9 +478,9 @@ class Qwen3OmniThinkerModelRunner(ThinkerModelRunner):
                 )
             else:
                 pass
-            if deepstack_embeds is not None or visual_masks is not None:
-                raise RuntimeError(
-                    "Qwen text-output sidecar cannot carry visual deepstack embeddings"
+            if deepstack_embeds is not None:
+                self.write_prefill_deepstack_rows(
+                    deepstack_embeds, visual_masks, input_embeds.shape[0]
                 )
             else:
                 pass

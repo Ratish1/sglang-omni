@@ -98,6 +98,65 @@ class PaddedRowsTopK(nn.Module):
         return self.topk.empty_topk_output(device, layer_id=layer_id)
 
 
+class Qwen3OmniThinkerTextModel(Qwen3MoeLLMModel):
+    """The thinker's text stack, whose prefill reads deepstack rows a captured graph can replay.
+
+    A prefill given no deepstack reads prefill_deepstack_rows, which stays zero except the rows the runner writes for
+    the chunk about to run, so a chunk that computes image or video rows replays the prefill graph.
+    """
+
+    def __init__(
+        self,
+        *,
+        config: PretrainedConfig,
+        quant_config: QuantizationConfig | None = None,
+        prefix: str = "",
+    ) -> None:
+        super().__init__(config=config, quant_config=quant_config, prefix=prefix)
+        self.register_buffer("prefill_deepstack_rows", None, persistent=False)
+
+    def allocate_prefill_deepstack_rows(self) -> None:
+        """Size the rows to the engine's prefill ceiling once its weights are loaded, before the pool and graphs."""
+        weight = self.embed_tokens.weight
+        self.prefill_deepstack_rows = torch.zeros(
+            max_prefill_buffer_tokens(),
+            self.hidden_size * len(self.deepstack_embed_to_decoder_layer),
+            device=weight.device,
+            dtype=weight.dtype,
+        )
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+        input_embeds: torch.Tensor | None = None,
+        pp_proxy_tensors: PPProxyTensors | None = None,
+        input_deepstack_embeds: torch.Tensor | None = None,
+    ) -> torch.Tensor | PPProxyTensors:
+        token_source = input_ids if input_embeds is None else input_embeds
+        rows = self.prefill_deepstack_rows
+        if (
+            input_deepstack_embeds is None
+            and rows is not None
+            and token_source is not None
+            and forward_batch.forward_mode.is_extend()
+            and token_source.shape[0] <= rows.shape[0]
+        ):
+            # note (ratish): zero rows add exactly nothing, so a chunk without visual rows keeps its numerics.
+            input_deepstack_embeds = rows[: token_source.shape[0]]
+        else:
+            pass
+        return super().forward(
+            input_ids,
+            positions,
+            forward_batch,
+            input_embeds=input_embeds,
+            pp_proxy_tensors=pp_proxy_tensors,
+            input_deepstack_embeds=input_deepstack_embeds,
+        )
+
+
 class Qwen3OmniThinkerForCausalLM(nn.Module):
     """Qwen3-Omni thinker text model without duplicated audio/vision towers."""
 
@@ -116,7 +175,7 @@ class Qwen3OmniThinkerForCausalLM(nn.Module):
         self.config = getattr(self.thinker_config, "text_config", self.thinker_config)
         self.is_mrope_enabled = config_uses_mrope(self.config)
 
-        self.model = Qwen3MoeLLMModel(
+        self.model = Qwen3OmniThinkerTextModel(
             config=self.config,
             quant_config=quant_config,
             prefix=add_prefix("model", prefix),
@@ -267,6 +326,7 @@ class Qwen3OmniThinkerForCausalLM(nn.Module):
         """Load FlashInfer's sampling module when it draws the unseeded requests, and run
         one MoE layer on zero rows once per fused MoE kernel variant that a forward up to
         the prefill ceiling reaches, so no request waits for either."""
+        self.model.allocate_prefill_deepstack_rows()
         compile_sampler_functions(
             SamplerCompileForms(
                 device=self.lm_head.weight.device,
