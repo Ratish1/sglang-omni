@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import asyncio
 import os
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from multiprocessing import shared_memory
 
 import pytest
@@ -130,5 +132,131 @@ def test_shm_round_trips_zero_byte_tensor() -> None:
         get = await relay.get_async(put.metadata, dest)
         await get.wait_for_completion(timeout=1.0)
         assert dest.numel() == 0
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("gated_side", ["send", "receive"])
+def test_shm_copies_leave_the_event_loop_running(
+    monkeypatch: pytest.MonkeyPatch, gated_side: str
+) -> None:
+    release = threading.Event()
+
+    class GatedSharedMemory(shared_memory.SharedMemory):
+        def __init__(
+            self, name: str | None = None, create: bool = False, size: int = 0
+        ) -> None:
+            if create == (gated_side == "send"):
+                assert release.wait(timeout=5.0)
+            else:
+                pass
+            super().__init__(name=name, create=create, size=size)
+
+    async def scenario() -> None:
+        relay = ShmRelay(engine_id="e", device="cpu")
+        chunks = [torch.arange(8, dtype=torch.uint8)]
+        destination = torch.empty(8, dtype=torch.uint8)
+        monkeypatch.setattr(shared_memory, "SharedMemory", GatedSharedMemory)
+        if gated_side == "send":
+            transfer = asyncio.ensure_future(
+                relay.put_chunks_async(chunks, request_id="r0")
+            )
+        else:
+            put_operation = await relay.put_chunks_async(chunks, request_id="r0")
+            get_operation = await relay.get_async(put_operation.metadata, destination)
+            transfer = asyncio.ensure_future(get_operation.wait_for_completion())
+        await asyncio.sleep(0)
+        assert not transfer.done()
+        release.set()
+        await transfer
+        if gated_side == "send":
+            get_operation = await relay.get_async(
+                transfer.result().metadata, destination
+            )
+            await get_operation.wait_for_completion()
+        else:
+            pass
+        assert torch.equal(destination, chunks[0])
+
+    asyncio.run(scenario())
+
+
+def test_shm_payload_read_allocates_its_host_buffer_off_the_event_loop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    release = threading.Event()
+    transfer_bytes = 4099
+    zeros = torch.zeros
+
+    def gated_zeros(*size: int, **options: object) -> torch.Tensor:
+        if size == (transfer_bytes,):
+            assert release.wait(timeout=5.0)
+        else:
+            pass
+        return zeros(*size, **options)
+
+    async def scenario() -> None:
+        relay = ShmRelay(engine_id="e", device="cpu")
+        payload = make_stage_payload(
+            data={"bytes": torch.arange(transfer_bytes, dtype=torch.uint8)},
+            request_id="r0",
+        )
+        data_ref, put_operation = await stage_io.write_payload(
+            relay, "r0", payload, transport=TransportKind.SHM
+        )
+        assert data_ref.buffer.length == transfer_bytes
+        monkeypatch.setattr(torch, "zeros", gated_zeros)
+        read = asyncio.ensure_future(stage_io.read_payload(relay, "r0", data_ref))
+        await asyncio.sleep(0)
+        assert not read.done()
+        release.set()
+        restored = await read
+        assert torch.equal(restored.data["bytes"], payload.data["bytes"])
+        put_operation.mark_receiver_done()
+        await put_operation.wait_for_completion(timeout=1.0)
+
+    asyncio.run(scenario())
+
+
+def test_a_cancelled_shm_put_unlinks_its_block_and_returns_its_credit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    release = threading.Event()
+    created_names: list[str] = []
+
+    class GatedSharedMemory(shared_memory.SharedMemory):
+        def __init__(
+            self, name: str | None = None, create: bool = False, size: int = 0
+        ) -> None:
+            if create and not created_names:
+                assert release.wait(timeout=5.0)
+            else:
+                pass
+            super().__init__(name=name, create=create, size=size)
+            if create:
+                created_names.append(self.name)
+            else:
+                pass
+
+    async def scenario() -> None:
+        asyncio.get_running_loop().set_default_executor(ThreadPoolExecutor(1))
+        relay = ShmRelay(engine_id="sender", device="cpu", credits=1)
+        chunks = [torch.arange(16, dtype=torch.uint8)]
+        monkeypatch.setattr(shared_memory, "SharedMemory", GatedSharedMemory)
+        cancelled = asyncio.ensure_future(
+            relay.put_chunks_async(chunks, request_id="r0")
+        )
+        await asyncio.sleep(0)
+        cancelled.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await cancelled
+        release.set()
+        put_operation = await asyncio.wait_for(
+            relay.put_chunks_async(chunks, request_id="r1"), 5.0
+        )
+        assert len(created_names) == 2
+        assert not os.path.exists(f"/dev/shm/{created_names[0]}")
+        with pytest.raises(TimeoutError):
+            await put_operation.wait_for_completion(timeout=0.0)
 
     asyncio.run(scenario())

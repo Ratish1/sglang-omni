@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import io
 import pickle
 from dataclasses import dataclass, fields, is_dataclass
@@ -828,11 +829,14 @@ async def read_transfer_buffer(
     request_id: str,
     data_ref: DataRef,
 ) -> torch.Tensor:
-    buf = torch.zeros(
-        data_ref.buffer.length,
-        dtype=torch.uint8,
-        device=relay_device(relay),
-    )
+    device = relay_device(relay)
+    if torch.device(device).type == "cpu":
+        # note (ratish): zero-filling a host buffer of hundreds of MB on the stage loop holds every message the loop would send meanwhile.
+        buf = await asyncio.to_thread(
+            torch.zeros, data_ref.buffer.length, dtype=torch.uint8
+        )
+    else:
+        buf = torch.zeros(data_ref.buffer.length, dtype=torch.uint8, device=device)
     op = await relay.get_async(
         metadata=data_ref.buffer.info,
         dest_tensor=buf,
