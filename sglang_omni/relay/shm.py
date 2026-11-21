@@ -22,6 +22,9 @@ from .base import Relay, RelayOperation, register_relay
 
 logger = logging.getLogger(__name__)
 
+# note (ratish): handing a read to a worker thread costs about 0.3 ms (H200 host, Qwen3-Omni stages), what copying 1 MiB costs, so smaller reads stay on the loop.
+SHM_LOOP_COPY_LIMIT_BYTES = 1 << 20
+
 
 class ShmTransferInfo(TypedDict):
     shm_name: str
@@ -154,39 +157,43 @@ class ShmGetOperation(ShmOperation):
             return
         else:
             pass
-
-        shm_name = self.transfer_info["shm_name"]
-        size = self.transfer_info["size"]
-
         try:
-            try:
-                existing_shm = _shm.SharedMemory(name=shm_name)
-            except FileNotFoundError:
-                raise RuntimeError(f"SHM block {shm_name} not found.")
-
-            try:
-                shm_array = np.ndarray((size,), dtype=np.uint8, buffer=existing_shm.buf)
-                src_tensor = torch.from_numpy(shm_array)
-
-                dest_view = self.dest_tensor.view(torch.uint8).reshape(-1)
-                if dest_view.numel() < size:
-                    raise ValueError(
-                        f"SHM destination has {dest_view.numel()} bytes, "
-                        f"but transfer requires {size} bytes"
-                    )
-                else:
-                    pass
-                dest_view[:size].copy_(src_tensor[:size])
-
-            finally:
-                existing_shm.close()
-                try:
-                    existing_shm.unlink()
-                except FileNotFoundError:
-                    logger.debug("SHM block %s was already unlinked", shm_name)
-
+            if self.transfer_info["size"] > SHM_LOOP_COPY_LIMIT_BYTES:
+                # note (ratish): a block of hundreds of MB copied on the stage loop holds every message the loop would send meanwhile.
+                await asyncio.to_thread(self.copy_from_block)
+            else:
+                self.copy_from_block()
         finally:
             self.completed = True
+
+    def copy_from_block(self) -> None:
+        shm_name = self.transfer_info["shm_name"]
+        size = self.transfer_info["size"]
+        try:
+            existing_shm = _shm.SharedMemory(name=shm_name)
+        except FileNotFoundError:
+            raise RuntimeError(f"SHM block {shm_name} not found.")
+
+        try:
+            shm_array = np.ndarray((size,), dtype=np.uint8, buffer=existing_shm.buf)
+            src_tensor = torch.from_numpy(shm_array)
+
+            dest_view = self.dest_tensor.view(torch.uint8).reshape(-1)
+            if dest_view.numel() < size:
+                raise ValueError(
+                    f"SHM destination has {dest_view.numel()} bytes, "
+                    f"but transfer requires {size} bytes"
+                )
+            else:
+                pass
+            dest_view[:size].copy_(src_tensor[:size])
+
+        finally:
+            existing_shm.close()
+            try:
+                existing_shm.unlink()
+            except FileNotFoundError:
+                logger.debug("SHM block %s was already unlinked", shm_name)
 
 
 @register_relay("shm")
