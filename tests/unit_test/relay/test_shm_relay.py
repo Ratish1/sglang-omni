@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import threading
 from multiprocessing import shared_memory
 
 import pytest
@@ -10,7 +11,7 @@ import torch
 
 from sglang_omni.comm import stage_io
 from sglang_omni.comm.data_ref import TransportKind
-from sglang_omni.relay.shm import ShmRelay
+from sglang_omni.relay.shm import SHM_LOOP_COPY_LIMIT_BYTES, ShmRelay
 from tests.unit_test.fixtures.pipeline_fakes import make_stage_payload
 
 
@@ -115,6 +116,59 @@ def test_shm_payload_round_trips_tensors_of_mixed_dtypes() -> None:
         restored = await stage_io.read_payload(relay, "r0", data_ref)
         for name, tensor in data.items():
             assert torch.equal(restored.data[name], tensor)
+        put_operation.mark_receiver_done()
+        await put_operation.wait_for_completion(timeout=1.0)
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(
+    ("transfer_bytes", "off_the_loop"),
+    [(SHM_LOOP_COPY_LIMIT_BYTES + 1, True), (4099, False)],
+)
+def test_a_large_payload_read_copies_off_the_event_loop_and_a_small_one_on_it(
+    monkeypatch: pytest.MonkeyPatch, transfer_bytes: int, off_the_loop: bool
+) -> None:
+    reading_threads: dict[str, int] = {}
+    zeros = torch.zeros
+
+    class RecordingSharedMemory(shared_memory.SharedMemory):
+        def __init__(
+            self, name: str | None = None, create: bool = False, size: int = 0
+        ) -> None:
+            if not create:
+                reading_threads["copy"] = threading.get_ident()
+            else:
+                pass
+            super().__init__(name=name, create=create, size=size)
+
+    def recording_zeros(*size: int, **options: object) -> torch.Tensor:
+        if size == (transfer_bytes,):
+            reading_threads["buffer"] = threading.get_ident()
+        else:
+            pass
+        return zeros(*size, **options)
+
+    async def scenario() -> None:
+        relay = ShmRelay(engine_id="e", device="cpu")
+        payload = make_stage_payload(
+            data={"bytes": torch.arange(transfer_bytes, dtype=torch.uint8)},
+            request_id="r0",
+        )
+        data_ref, put_operation = await stage_io.write_payload(
+            relay, "r0", payload, transport=TransportKind.SHM
+        )
+        assert data_ref.buffer.length == transfer_bytes
+        monkeypatch.setattr(shared_memory, "SharedMemory", RecordingSharedMemory)
+        monkeypatch.setattr(torch, "zeros", recording_zeros)
+        restored = await stage_io.read_payload(relay, "r0", data_ref)
+        assert torch.equal(restored.data["bytes"], payload.data["bytes"])
+        loop_thread = threading.get_ident()
+        assert reading_threads.keys() == {"copy", "buffer"}
+        assert all(
+            (thread != loop_thread) == off_the_loop
+            for thread in reading_threads.values()
+        )
         put_operation.mark_receiver_done()
         await put_operation.wait_for_completion(timeout=1.0)
 
