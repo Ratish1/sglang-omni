@@ -5373,6 +5373,7 @@ def test_omni_scheduler_start_closes_active_model_paths(
     scheduler.enable_async_decode = False
     scheduler.enable_overlap = False
     scheduler.should_run_top_priority_stream = False
+    scheduler.engine_context = get_context()
     scheduler.prefill_start_done = {"req-1", "req-2"}
     scheduler.prefill_end_done = set()
     scheduler.request_build_executor = None
