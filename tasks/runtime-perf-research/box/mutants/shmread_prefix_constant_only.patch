@@ -1,0 +1,8 @@
+diff --git a/sglang_omni/relay/shm.py b/sglang_omni/relay/shm.py
+index 3fdec4d09..4f7ad4c6a 100644
+--- a/sglang_omni/relay/shm.py
++++ b/sglang_omni/relay/shm.py
+@@ -24,2 +24,4 @@ logger = logging.getLogger(__name__)
+
++SHM_LOOP_COPY_LIMIT_BYTES = 1 << 20
++
