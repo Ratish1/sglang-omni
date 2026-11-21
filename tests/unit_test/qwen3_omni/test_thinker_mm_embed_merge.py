@@ -738,6 +738,15 @@ def test_a_cuda_merge_matches_the_host_merge_without_a_stream_wait(make_batch):
     fb, sb = make_batch()
     runner.embed_tokens.cuda()
     fb.input_ids = fb.input_ids.cuda()
+    for request in sb.reqs:
+        request.omni_model_inputs = {
+            key: (
+                [layer.cuda() for layer in value]
+                if isinstance(value, list)
+                else value.cuda()
+            )
+            for key, value in request.omni_model_inputs.items()
+        }
     sync_debug_mode = torch.cuda.get_sync_debug_mode()
     torch.cuda.set_sync_debug_mode("error")
     try:
