@@ -15,6 +15,7 @@ from sglang_omni.models.yue2.generation import masked_scores
 from sglang_omni.models.yue2.request import SamplingConfig
 from sglang_omni.models.yue2.sglang_request_builder import Yue2ARRequestData
 from sglang_omni.scheduling.types import SchedulerRequest
+from sglang_omni.utils.cuda_staging import host_to_device
 
 
 @dataclass(frozen=True, eq=False)
@@ -61,19 +62,11 @@ def rewind_sampling(data: Yue2ARRequestData, output_ids: list[int]) -> None:
         values = torch.full((window,), -1, dtype=torch.long)
         for position in range(max(0, len(output_ids) - window), len(output_ids)):
             values[position % window] = output_ids[position]
-        data.recent_tokens = to_device(values, recent.device)
-
-
-def to_device(values: torch.Tensor, device: torch.device) -> torch.Tensor:
-    """Copy a small host tensor without blocking the stream on CUDA."""
-    if device.type == "cuda":
-        return values.pin_memory().to(device, non_blocking=True)
-    else:
-        return values.to(device)
+        data.recent_tokens = host_to_device(values, recent.device)
 
 
 def device_index(values: list[int], device: torch.device) -> torch.Tensor:
-    return to_device(torch.tensor(values, dtype=torch.long), device)
+    return host_to_device(torch.tensor(values, dtype=torch.long), device)
 
 
 def sampling_group_key(data: Yue2ARRequestData) -> tuple[str, str, bool]:
@@ -149,7 +142,7 @@ class Yue2ModelRunner(ModelRunner[Yue2ARRequestData]):
             twin_rows = device_index(
                 [rows[position].unconditional_row_index for position in guided], device
             )
-            scales = to_device(
+            scales = host_to_device(
                 torch.tensor(
                     [rows[position].request_data.cfg_scale for position in guided],
                     dtype=logits.dtype,
@@ -218,7 +211,7 @@ class Yue2ModelRunner(ModelRunner[Yue2ARRequestData]):
                 pass
         # note (ruiling): one copy per step; building each row tensor on the device would sync the stream per tensor.
         # note (ruiling): the seeded sampler reads positions through a raw pointer, so each field is one contiguous row.
-        row_values = to_device(
+        row_values = host_to_device(
             torch.tensor(
                 [
                     [

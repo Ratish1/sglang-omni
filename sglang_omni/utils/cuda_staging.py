@@ -27,6 +27,14 @@ def allocate_pinned(numel: int, dtype: torch.dtype) -> torch.Tensor:
         return torch.empty(numel, dtype=dtype, pin_memory=True)
 
 
+def host_to_device(values: torch.Tensor, device: torch.device) -> torch.Tensor:
+    """Copy a host tensor through pinned memory on CUDA, so the copy waits for no kernel already queued on the stream."""
+    if device.type == "cuda":
+        return values.pin_memory().to(device, non_blocking=True)
+    else:
+        return values.to(device)
+
+
 def new_device_event(device: torch.device, *, blocking: bool = False) -> torch.Event:
     """The device's completion event type, resolved through its torch module. A
     blocking event makes synchronize() sleep until the device signals instead of
