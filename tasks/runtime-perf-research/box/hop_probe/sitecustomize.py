@@ -43,6 +43,9 @@ clock of the request event recorder, so records join its events per request.
               publication), the forward's device span in ms (gpu, CUDA events around prepare_and_forward, time the
               card served other contexts included), whether the forward replayed a graph (graph), the longest row
               context in tokens (kv) and the rows over 4,096 tokens (long)
+  kind "rp"   with OMNI_HOP_PROBE_PAYLOAD_READS=1, each stage payload read (comm.stage_io.read_payload) in every
+              process: request id, transfer bytes, the tensors of 1 MiB or more as [path, MiB], the reading thread, from
+              its start (ns0) to its end (ns)
 """
 
 import atexit
@@ -76,6 +79,7 @@ THINKER_STEPS = os.environ.get("OMNI_HOP_PROBE_THINKER_STEPS") == "1"
 # OMNI_HOP_PROBE_THINKER_PARTS=1 times the parts of each synchronous Qwen3-Omni thinker step and its forward's device span
 # from two CUDA events; reading the span adds one event wait after the step's own finalize wait
 THINKER_PARTS = os.environ.get("OMNI_HOP_PROBE_THINKER_PARTS") == "1"
+PAYLOAD_READS = os.environ.get("OMNI_HOP_PROBE_PAYLOAD_READS") == "1"
 # OMNI_HOP_PROBE_SYNC_SITES=1 sets torch's sync debug mode to warn in every process and counts each synchronizing
 # CUDA call by thread and by its innermost sglang frames (kind "sync", the running counts once a second); a check
 # boot, not a measured one, since every count walks the Python stack
@@ -661,6 +665,37 @@ def patch_thinker_scheduler(module):
     scheduler.process_batch_result = process_result_recorded
 
 
+def patch_stage_io(module):
+    read_payload = module.read_payload
+
+    @functools.wraps(read_payload)
+    async def read_payload_recorded(relay, request_id, data_ref, *args, **kwargs):
+        started_ns = time.time_ns()
+        try:
+            return await read_payload(relay, request_id, data_ref, *args, **kwargs)
+        finally:
+            record(
+                {
+                    "k": "rp",
+                    "ns0": started_ns,
+                    "rid": request_id,
+                    "bytes": (
+                        int(data_ref.buffer.length)
+                        if data_ref.buffer is not None
+                        else 0
+                    ),
+                    "tensors": [
+                        [entry.path, round(entry.size / 2**20, 1)]
+                        for entry in data_ref.tensors
+                        if entry.size >= 2**20
+                    ],
+                    "thread": threading.current_thread().name,
+                }
+            )
+
+    module.read_payload = read_payload_recorded
+
+
 THINKER_RUNNERS = ("Qwen3OmniThinkerModelRunner",)
 
 
@@ -825,6 +860,10 @@ else:
     pass
 if THINKER_PARTS:
     PATCHES["sglang_omni.model_runner.base"] = patch_thinker_runner
+else:
+    pass
+if PAYLOAD_READS:
+    PATCHES["sglang_omni.comm.stage_io"] = patch_stage_io
 else:
     pass
 
