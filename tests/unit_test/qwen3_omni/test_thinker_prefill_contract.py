@@ -423,6 +423,100 @@ def test_cached_prefix_mixed_audio_image_uses_live_rows_in_inherited_eager_path(
     torch.testing.assert_close(forward_batch.input_embeds[1], image_embeds[1])
 
 
+@pytest.mark.parametrize("form", ["video", "image", "image_and_video"])
+def test_a_chunk_past_every_visual_row_prefills_on_the_sidecar(form: str):
+    runner = make_runner()
+    if form == "video":
+        prompt = [VIDEO_ID, VIDEO_ID, 7, 8]
+        model_inputs = {
+            "video_embeds": torch.full((2, HIDDEN), 5.0),
+            "deepstack_visual_embeds": [torch.full((2, HIDDEN), 6.0)],
+            "video_grid_thw": torch.tensor([[1, 2, 4]]),
+            "video_second_per_grid": torch.tensor([0.5]),
+        }
+        positions = make_positions(video=(0, 1))
+    elif form == "image":
+        prompt = [IMAGE_ID, IMAGE_ID, 7, 8]
+        model_inputs = {
+            "image_embeds": torch.full((2, HIDDEN), 5.0),
+            "deepstack_visual_embeds": [torch.full((2, HIDDEN), 6.0)],
+            "image_grid_thw": torch.tensor([[1, 2, 4]]),
+        }
+        positions = make_positions(image=(0, 1))
+    else:
+        prompt = [IMAGE_ID, VIDEO_ID, 7, 8]
+        model_inputs = {
+            "image_embeds": torch.full((1, HIDDEN), 5.0),
+            "video_embeds": torch.full((1, HIDDEN), 4.0),
+            "image_deepstack_visual_embeds": [torch.full((1, HIDDEN), 6.0)],
+            "video_deepstack_visual_embeds": [torch.full((1, HIDDEN), 3.0)],
+        }
+        positions = make_positions(image=(0,), video=(1,))
+    decode_row = make_request([9, 10], None)
+    request = make_request(prompt, model_inputs, positions=positions)
+    forward_batch, schedule_batch = make_batch(
+        [decode_row, request], chunks=[[10], [8]], prefix_lens=[1, 3]
+    )
+
+    runner.before_prefill(forward_batch, schedule_batch, [decode_row, request])
+
+    sidecar = get_omni_prefill_inputs(forward_batch)
+    assert sidecar is not None
+    torch.testing.assert_close(
+        sidecar.input_embeds, runner.embed_tokens(forward_batch.input_ids)
+    )
+    assert forward_batch.input_embeds is None
+    assert request.omni_model_inputs is None
+    assert request._omni_consumed is None  # noqa: leading-underscore  # production name
+    assert (
+        runner.custom_prefill_forward(
+            forward_batch, schedule_batch, [decode_row, request]
+        )
+        is None
+    )
+
+
+@pytest.mark.parametrize(
+    ("prompt", "video_rows", "video_positions", "live_chunk", "prefix"),
+    [
+        ([VIDEO_ID, VIDEO_ID, 7], 2, (0, 1), [VIDEO_ID, 7], 1),
+        ([7, 8, VIDEO_ID], 1, (2,), [7, 8], 0),
+        ([VIDEO_ID, VIDEO_ID, 7, 8], 1, (0, 1), [8], 3),
+    ],
+)
+def test_a_chunk_with_live_or_unmatched_visual_rows_stays_eager(
+    monkeypatch: pytest.MonkeyPatch,
+    prompt: list[int],
+    video_rows: int,
+    video_positions: tuple[int, ...],
+    live_chunk: list[int],
+    prefix: int,
+):
+    runner = make_runner()
+    video_inputs = {
+        "video_embeds": torch.ones(video_rows, HIDDEN),
+        "deepstack_visual_embeds": [torch.ones(video_rows, HIDDEN)],
+    }
+    request = make_request(
+        prompt, video_inputs, positions=make_positions(video=video_positions)
+    )
+    forward_batch, schedule_batch = make_batch(
+        [request], chunks=[live_chunk], prefix_lens=[prefix]
+    )
+    monkeypatch.setattr(
+        ThinkerModelRunner, "custom_prefill_forward", lambda *args: "eager"
+    )
+
+    runner.before_prefill(forward_batch, schedule_batch, [request])
+
+    assert get_omni_prefill_inputs(forward_batch) is None
+    assert request.omni_model_inputs is video_inputs
+    assert (
+        runner.custom_prefill_forward(forward_batch, schedule_batch, [request])
+        == "eager"
+    )
+
+
 @pytest.mark.parametrize(
     ("input_ids", "audio_positions", "prefix", "live_chunk", "expected_audio_row"),
     [

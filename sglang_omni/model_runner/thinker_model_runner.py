@@ -390,7 +390,9 @@ class ThinkerModelRunner(ModelRunner):
                 visual_pos, visual_order = torch.sort(torch.cat([img_pos, vid_pos]))
                 visual_count = visual_pos.numel()
 
-                if ds_embeds is None:
+                if visual_count == 0:
+                    ds_embeds = None
+                elif ds_embeds is None:
                     if image_ds and video_ds:
                         image_offset, image_count = chunk_offsets.get("image", (0, 0))
                         video_offset, video_count = chunk_offsets.get("video", (0, 0))
@@ -426,7 +428,7 @@ class ThinkerModelRunner(ModelRunner):
                         ]
                     else:
                         pass
-                elif visual_count > 0:
+                else:
                     if not img_pos.numel():
                         visual_offset = chunk_offsets.get("video", (0, 0))[0]
                     elif not vid_pos.numel():
@@ -438,8 +440,6 @@ class ThinkerModelRunner(ModelRunner):
                         for layer in ds_embeds
                     ]
                     consumed["_visual"] = visual_offset + visual_count
-                else:
-                    ds_embeds = None
 
                 if ds_embeds is not None:
                     deepstack_visual_embeds_list.append(ds_embeds)
