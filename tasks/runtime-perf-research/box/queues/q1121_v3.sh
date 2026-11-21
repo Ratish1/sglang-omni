@@ -8,6 +8,9 @@
 #          other processes' device time inside) and the thinker's eager steps per arm
 #   P      the graph change on its other landing base: both changes (PBOTH2) against the receive-only change (PSHM2)
 #   A      main against main at the same time, the card bias of a same-time pair in this cell
+# First, V2's first pair again: v2a_m1 ran its video preprocessing at 890 ms against 569 to 589 on every other main boot
+# (its socket loaded from outside, host load 19 to 27), which voids that pair. Every pair is gated on video
+# preprocessing per boot (video_preprocess_gate.py).
 set -u
 O=/data/v1121
 K=/workspace/kit/tasks/runtime-perf-research/box
@@ -75,9 +78,18 @@ mixed() {
 pair_read() {
   local title=$1 cell=$2 base=$3 change=$4
   python3 $K/body_table.py $O $cell "$title" "$base" "$change" >> $O/queue.log 2>&1
+  python3 $K/video_preprocess_gate.py --cell ${cell}_events $O $(echo "${base#*=},${change#*=}" | tr , ' ') \
+    >> $O/queue.log 2>&1
+}
+gate() {
+  python3 $K/video_preprocess_gate.py --cell c64_events $O "$@" >> $O/queue.log 2>&1
 }
 until grep -q "q1121_v2 done" $O/queue.log 2>/dev/null; do sleep 20; done
 log "q1121_v3 start"
+gate v2a_m1 v2a_x0 v2b_m0 v2b_x1 v3a_b0 v3a_m1 v3b_m0 v3b_b1 v4a_b0 v4a_m1 v4b_m0 v4b_b1 v5a_b0 v5a_m1 v5b_m0 v5b_b1
+quiet_host
+both "mixed v2c_x0 $PSHM2 0 1150 events" "mixed v2c_m1 $NMAIN 1 1150 events"
+gate v2c_x0 v2c_m1
 quiet_host
 both "mixed n1_m1 $NMAIN 1 150 nsys" "mixed n1_p0 $PFIX 0 150 nsys"
 quiet_host
