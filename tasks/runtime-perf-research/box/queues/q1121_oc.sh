@@ -15,7 +15,7 @@ export OMNI_ARRIVAL_SEED=3451
 export OMNI_VIDEO_ARRIVAL_SEED=7
 log() { echo "$* $(date -u +%T)" >> $O/queue.log; }
 node_free() { numactl --hardware | awk '/free:/ {printf "node%s %s MB ", $2, $4}'; }
-name=oc1_x1
+name=${1:-oc1_x1}
 port=31590
 log "boot $name $(git -C $ONECTX rev-parse --short HEAD) $(git -C $ONECTX rev-parse --short=12 HEAD:sglang_omni) one-context smoke card 1 port $port start, $(node_free)"
 taskset -c $CPUS python3 $K/baseline.py --tree $ONECTX --model omni_colocated --card 1 --port $port --out $O/$name \
