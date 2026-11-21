@@ -241,6 +241,9 @@ def create_talker_scheduler(
     del speech_enabled
     from sglang.srt.utils.hf_transformers_utils import get_tokenizer
 
+    from sglang_omni.models.qwen3_omni.components.talker_sampling_state import (
+        TalkerSamplingStatePool,
+    )
     from sglang_omni.models.qwen3_omni.request_builders import (
         make_talker_scheduler_adapters,
     )
@@ -280,7 +283,7 @@ def create_talker_scheduler(
         model_arch_override="Qwen3OmniTalker",
         weight_prefix=weight_prefix,
         total_gpu_memory_fraction=total_gpu_memory_fraction,
-        defer_cuda_graph_capture=want_cuda_graph,
+        defer_cuda_graph_capture=True,
         enable_prefill_input_embeds=prefill_graph_backend == CudaGraphBackend.BREAKABLE,
     )
     # Note:(Chenchen Hong) align the talker vocab to the codec vocab: post1 sizes
@@ -293,17 +296,20 @@ def create_talker_scheduler(
         _runner_cfg.vocab_size = _codec_vocab_size
     else:
         pass
-    model_worker.model_runner.model.sampler = model_worker.model_runner.sampler
-    if want_cuda_graph:
-        # note (ratish): capture after binding the sampler so decode graphs record it.
-        init_sglang_cuda_graphs(model_worker)
-        if prefill_graph_backend == CudaGraphBackend.BREAKABLE:
-            cuda_graph_batch_validator.attest_prefill_cuda_graphs(
-                model_worker.model_runner,
-                operator_selected=operator_selected_prefill_backend,
-            )
-        else:
-            pass
+    talker = model_worker.model_runner.model
+    talker.sampler = model_worker.model_runner.sampler
+    talker.sampling_state = TalkerSamplingStatePool.allocate(
+        slot_count=req_to_token_pool.req_to_token.shape[0],
+        vocab_size=_codec_vocab_size,
+        device=talker.model.codec_embedding.weight.device,
+    )
+    # note (ratish): graphs, or the eager runner when they are off, come after the sampler and the sampling state: a capture records both, and the eager runner's warmup can run a decode forward.
+    init_sglang_cuda_graphs(model_worker)
+    if want_cuda_graph and prefill_graph_backend == CudaGraphBackend.BREAKABLE:
+        cuda_graph_batch_validator.attest_prefill_cuda_graphs(
+            model_worker.model_runner,
+            operator_selected=operator_selected_prefill_backend,
+        )
     else:
         pass
 

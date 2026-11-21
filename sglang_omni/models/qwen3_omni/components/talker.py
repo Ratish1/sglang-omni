@@ -17,9 +17,12 @@ from sglang.srt.runtime_context import get_context, get_schedule
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import add_prefix
-from sglang.srt.utils.common import async_h2d
 from torch import nn
 
+from sglang_omni.models.qwen3_omni.components.talker_sampling_state import (
+    TalkerSamplingRows,
+    TalkerSamplingStatePool,
+)
 from sglang_omni.models.qwen3_omni.components.thinker_model import (
     Qwen3OmniMoeThinkerTextAttention,
     Qwen3OmniMoeThinkerTextDecoderLayer,
@@ -34,11 +37,6 @@ from sglang_omni.quantization import get_weight_preprocessor
 from sglang_omni.sampling.sampler_compile import (
     SamplerCompileForms,
     compile_sampler_functions,
-)
-from sglang_omni.sampling.seed import (
-    SAMPLING_SEED_MASK,
-    derive_sampling_seed,
-    resolve_row_seed,
 )
 from sglang_omni.utils.predictor_layers import (
     add_rmsnorm_rounded,
@@ -924,80 +922,6 @@ class Qwen3OmniTalker(nn.Module):
             dtype=torch.long,
             device=device,
         )
-        self.repetition_mask = torch.zeros(
-            max_batch_size,
-            config.text_config.vocab_size,
-            dtype=torch.bool,
-            device=device,
-        )
-        # note (ratish): an indexed write of a Python bool copies it to the device and waits for the stream; a device value is a kernel argument.
-        self.mask_set_value = torch.ones((), dtype=torch.bool, device=device)
-        self.repetition_penalties = torch.ones(
-            max_batch_size,
-            1,
-            dtype=torch.float32,
-            device=device,
-        )
-        self.suppress_mask = torch.zeros(
-            max_batch_size,
-            config.text_config.vocab_size,
-            dtype=torch.bool,
-            device=device,
-        )
-        self.suppress_token_cache: dict[tuple[int, ...], torch.Tensor | None] = {}
-        self.suppress_token_ids_by_request: dict[
-            str, tuple[list[int] | tuple[int, ...] | None, torch.Tensor | None]
-        ] = {}
-        self.sampling_temperatures = torch.ones(
-            max_batch_size,
-            1,
-            dtype=torch.float32,
-            device=device,
-        )
-        self.sampling_top_ps = torch.ones(
-            max_batch_size,
-            dtype=torch.float32,
-            device=device,
-        )
-        self.sampling_top_ks = torch.full(
-            (max_batch_size,),
-            1,
-            dtype=torch.int32,
-            device=device,
-        )
-        self.sampling_min_ps = torch.zeros(
-            max_batch_size,
-            dtype=torch.float32,
-            device=device,
-        )
-        self.sampling_seeds = torch.zeros(
-            max_batch_size,
-            dtype=torch.int64,
-            device=device,
-        )
-        # Note (akazaakane): int64-typed; rows 0-3 hold floats bit-cast via
-        # .view(torch.float64) so one copy covers both float and int params.
-        # Note (akazaakane): device="cpu" is required — model init runs under
-        # a cuda default-device context, and only CPU tensors can be pinned.
-        self.sampling_staging_cpu = torch.zeros(
-            6,
-            max_batch_size,
-            dtype=torch.int64,
-            device="cpu",
-            pin_memory=device.type == "cuda",
-        )
-        self.sampling_staging_gpu = torch.zeros(
-            6,
-            max_batch_size,
-            dtype=torch.int64,
-            device=device,
-        )
-        self.sampling_staging_event = (
-            torch.get_device_module().Event() if device.type != "cpu" else None
-        )
-        self.decode_prep_rids: list[str] | None = None
-        self.decode_prep_out_lens: list[int] = []
-        self.decode_prep_rep_rows: torch.Tensor | None = None
         self.output_codes = torch.zeros(
             max_batch_size,
             config.num_code_groups,
@@ -1023,6 +947,8 @@ class Qwen3OmniTalker(nn.Module):
         bind_default_weight_loaders(self)
         self.cached_params_dict = dict(self.named_parameters())
         self.sampler = None
+        # note (ratish): sized by the request pool, so it is allocated once the pool exists and before graph capture records its reads.
+        self.sampling_state: TalkerSamplingStatePool | None = None
 
     def get_input_embeddings(self) -> nn.Embedding:
         return self.model.get_input_embeddings()
@@ -1041,222 +967,6 @@ class Qwen3OmniTalker(nn.Module):
         else:
             pass
         return next_code
-
-    def reuse_decode_buffers(self, requests: list) -> bool:
-        # Note (akazaakane): sampling params/suppress mask are static per
-        # request, so only the repetition mask needs updating here.
-        prev_rids = self.decode_prep_rids
-        if prev_rids is None or len(prev_rids) != len(requests):
-            return False
-        else:
-            pass
-        prev_lens = self.decode_prep_out_lens
-        for row_idx, sched_req in enumerate(requests):
-            req = sched_req.data.req
-            if req.rid != prev_rids[row_idx]:
-                return False
-            else:
-                pass
-            out_len = len(req.output_ids) if req.output_ids else 0
-            if out_len != prev_lens[row_idx] + 1:
-                return False
-            else:
-                pass
-
-        rep_rows = self.decode_prep_rep_rows
-        if rep_rows is not None:
-            self.repetition_mask.index_put_(
-                (rep_rows, self.sampled_token_ids[rep_rows]), self.mask_set_value
-            )
-        else:
-            pass
-        for row_idx in range(len(prev_lens)):
-            prev_lens[row_idx] += 1
-        return True
-
-    def invalidate_decode_buffers(self) -> None:
-        # Note (akazaakane): a prefill's sampled token bypasses
-        # _sampled_token_ids, so the fast path must not run right after one.
-        self.decode_prep_rids = None
-
-    def prepare_decode_buffers(self, requests: list) -> None:
-        batch_size = len(requests)
-        if batch_size == 0:
-            return
-        else:
-            pass
-
-        if self.reuse_decode_buffers(requests):
-            return
-        else:
-            pass
-
-        device = self.repetition_mask.device
-        rep_vocab = self.repetition_mask.shape[1]
-        sup_vocab = self.suppress_mask.shape[1]
-
-        self.repetition_mask[:batch_size] = False
-        self.suppress_mask[:batch_size] = False
-
-        rep_penalties: list[float] = []
-        temperatures: list[float] = []
-        top_ps: list[float] = []
-        top_ks: list[int] = []
-        min_ps: list[float] = []
-        sampling_seeds: list[int] = []
-        rep_rows: list[int] = []
-        rep_toks: list[int] = []
-        suppress_groups: dict[int, tuple[torch.Tensor, list[int]]] = {}
-        suppress_token_ids_by_request: dict[
-            str, tuple[list[int] | tuple[int, ...] | None, torch.Tensor | None]
-        ] = {}
-
-        for row_idx, sched_req in enumerate(requests):
-            data = sched_req.data
-            req = data.req
-            sp = req.sampling_params
-
-            penalty = float(sp.repetition_penalty)
-            rep_penalties.append(penalty)
-            temperatures.append(float(sp.temperature))
-            top_ps.append(float(sp.top_p))
-            top_ks.append(int(sp.top_k))
-            min_ps.append(float(sp.min_p))
-            # Unseeded: rank-shared seed from the request id (same on every TP
-            # rank), not os.urandom, else the ranks desync.
-            seed = sp.sampling_seed
-            if seed is None:
-                seed = derive_sampling_seed("sglang-omni-unseeded-row", req.rid)
-            elif not (0 <= seed <= SAMPLING_SEED_MASK):
-                seed = resolve_row_seed(seed)
-                sp.sampling_seed = seed
-            else:
-                pass
-            sampling_seeds.append(seed)
-
-            if penalty != 1.0 and req.output_ids:
-                unique = {
-                    t
-                    for t in (int(tok) for tok in req.output_ids)
-                    if 0 <= t < rep_vocab
-                }
-                if unique:
-                    rep_rows.extend([row_idx] * len(unique))
-                    rep_toks.extend(unique)
-                else:
-                    pass
-            else:
-                pass
-
-            suppress_tokens = (
-                data.suppress_tokens or req._codec_suppress_tokens
-            )  # noqa: leading-underscore  # upstream spelling, or the public name is already taken
-            # note (ratish): each request's set resolves once, so a batch change does not expand or hash every row's ids again.
-            resolved_suppress = self.suppress_token_ids_by_request.get(req.rid)
-            if (
-                resolved_suppress is not None
-                and resolved_suppress[0] is suppress_tokens
-            ):
-                suppress_token_ids = resolved_suppress[1]
-            elif suppress_tokens:
-                suppress_content = tuple(int(token_id) for token_id in suppress_tokens)
-                if suppress_content not in self.suppress_token_cache:
-                    valid_token_ids = [
-                        token_id
-                        for token_id in suppress_content
-                        if 0 <= token_id < sup_vocab
-                    ]
-                    self.suppress_token_cache[suppress_content] = (
-                        torch.tensor(valid_token_ids, dtype=torch.long, device=device)
-                        if valid_token_ids
-                        else None
-                    )
-                else:
-                    pass
-                suppress_token_ids = self.suppress_token_cache[suppress_content]
-            else:
-                suppress_token_ids = None
-            suppress_token_ids_by_request[req.rid] = (
-                suppress_tokens,
-                suppress_token_ids,
-            )
-            if suppress_token_ids is None:
-                pass
-            elif id(suppress_token_ids) in suppress_groups:
-                suppress_groups[id(suppress_token_ids)][1].append(row_idx)
-            else:
-                suppress_groups[id(suppress_token_ids)] = (
-                    suppress_token_ids,
-                    [row_idx],
-                )
-
-        if self.sampling_staging_event is not None:
-            # Note (akazaakane): guards the prior async copy still reading
-            # this buffer before we overwrite it.
-            self.sampling_staging_event.synchronize()
-        else:
-            pass
-        staging_cpu = self.sampling_staging_cpu
-        staging_cpu_f64 = staging_cpu.view(torch.float64)
-        staging_cpu_f64[0, :batch_size] = torch.tensor(
-            rep_penalties, dtype=torch.float64
-        )
-        staging_cpu_f64[1, :batch_size] = torch.tensor(
-            temperatures, dtype=torch.float64
-        )
-        staging_cpu_f64[2, :batch_size] = torch.tensor(top_ps, dtype=torch.float64)
-        staging_cpu_f64[3, :batch_size] = torch.tensor(min_ps, dtype=torch.float64)
-        staging_cpu[4, :batch_size] = torch.tensor(top_ks, dtype=torch.int64)
-        staging_cpu[5, :batch_size] = torch.tensor(sampling_seeds, dtype=torch.int64)
-        staging_gpu = self.sampling_staging_gpu
-        staging_gpu.copy_(staging_cpu, non_blocking=True)
-        if self.sampling_staging_event is not None:
-            self.sampling_staging_event.record()
-        else:
-            pass
-        staging_gpu_f64 = staging_gpu.view(torch.float64)
-        self.repetition_penalties[:batch_size, 0].copy_(staging_gpu_f64[0, :batch_size])
-        self.sampling_temperatures[:batch_size, 0].copy_(
-            staging_gpu_f64[1, :batch_size]
-        )
-        self.sampling_top_ps[:batch_size].copy_(staging_gpu_f64[2, :batch_size])
-        self.sampling_min_ps[:batch_size].copy_(staging_gpu_f64[3, :batch_size])
-        self.sampling_top_ks[:batch_size].copy_(staging_gpu[4, :batch_size])
-        self.sampling_seeds[:batch_size].copy_(staging_gpu[5, :batch_size])
-
-        if rep_rows:
-            rep_pairs = async_h2d(rep_rows + rep_toks, dtype=torch.long, device=device)
-            self.repetition_mask.index_put_(
-                (rep_pairs[: len(rep_rows)], rep_pairs[len(rep_rows) :]),
-                self.mask_set_value,
-            )
-        else:
-            pass
-
-        for suppress_token_ids, suppress_rows in suppress_groups.values():
-            if len(suppress_rows) == batch_size:
-                self.suppress_mask[:batch_size].index_fill_(1, suppress_token_ids, True)
-            else:
-                row_ids = async_h2d(suppress_rows, dtype=torch.long, device=device)
-                self.suppress_mask.index_put_(
-                    (row_ids[:, None], suppress_token_ids[None, :]),
-                    self.mask_set_value,
-                )
-        self.suppress_token_ids_by_request = suppress_token_ids_by_request
-
-        self.decode_prep_rids = [sched_req.data.req.rid for sched_req in requests]
-        self.decode_prep_out_lens = [
-            len(sched_req.data.req.output_ids) if sched_req.data.req.output_ids else 0
-            for sched_req in requests
-        ]
-        rep_active_rows = [
-            row_idx for row_idx, penalty in enumerate(rep_penalties) if penalty != 1.0
-        ]
-        self.decode_prep_rep_rows = (
-            async_h2d(rep_active_rows, dtype=torch.long, device=device)
-            if rep_active_rows
-            else None
-        )
 
     def prepare_input_embeds(
         self,
@@ -1332,11 +1042,6 @@ class Qwen3OmniTalker(nn.Module):
             LogitsProcessorOutput with codec logits
         """
         del omni_prefill_rids
-        if forward_batch.forward_mode.is_extend():
-            self.invalidate_decode_buffers()
-        else:
-            pass
-
         if input_embeds is not None and not input_embeds_are_projected:
             # Prefill: project thinker hidden states → talker dimension
             deepstack_hidden = input_deepstack_embeds
@@ -1371,12 +1076,19 @@ class Qwen3OmniTalker(nn.Module):
             pass
         logits_output = self.manual_decode_logits(hidden_states)
         if forward_batch.forward_mode.is_decode():
+            sampling_state = self.sampling_state
+            assert sampling_state is not None
+            request_slots = forward_batch.req_pool_indices
             sampled_token_ids = self.sample_decode_tokens(
                 logits_output.next_token_logits,
                 forward_batch,
+                sampling_state.gather(request_slots),
             )
             batch_size = sampled_token_ids.shape[0]
             self.sampled_token_ids[:batch_size].copy_(sampled_token_ids)
+            sampling_state.mark_output_tokens(
+                request_slots, self.sampled_token_ids[:batch_size]
+            )
             self.code_predictor_forward(
                 sampled_token_ids.unsqueeze(1),
                 hidden_states.unsqueeze(1),
@@ -1421,16 +1133,15 @@ class Qwen3OmniTalker(nn.Module):
         self,
         logits: torch.Tensor,
         forward_batch: ForwardBatch,
+        sampling_rows: TalkerSamplingRows,
     ) -> torch.Tensor:
         batch_size = logits.shape[0]
-        penalties = self.repetition_penalties[:batch_size]
+        penalties = sampling_rows.repetition_penalties
         penalized_logits = torch.where(
             logits > 0, logits / penalties, logits * penalties
         )
-        logits = torch.where(
-            self.repetition_mask[:batch_size], penalized_logits, logits
-        )
-        logits = logits.masked_fill(self.suppress_mask[:batch_size], float("-inf"))
+        logits = torch.where(sampling_rows.output_token_mask, penalized_logits, logits)
+        logits = logits.masked_fill(sampling_rows.suppress_mask, float("-inf"))
 
         logits_output = LogitsProcessorOutput(
             next_token_logits=logits,
@@ -1440,7 +1151,7 @@ class Qwen3OmniTalker(nn.Module):
             return torch.argmax(logits, dim=-1)
         else:
             pass
-        sampling_info = self.build_static_sampling_info(batch_size)
+        sampling_info = self.build_static_sampling_info(sampling_rows)
         sampled = self.sampler(
             logits_output,
             sampling_info,
@@ -1455,12 +1166,14 @@ class Qwen3OmniTalker(nn.Module):
             pass
         return sampled
 
-    def build_static_sampling_info(self, batch_size: int) -> SamplingBatchInfo:
+    def build_static_sampling_info(
+        self, sampling_rows: TalkerSamplingRows
+    ) -> SamplingBatchInfo:
         return SamplingBatchInfo(
-            temperatures=self.sampling_temperatures[:batch_size],
-            top_ps=self.sampling_top_ps[:batch_size],
-            top_ks=self.sampling_top_ks[:batch_size],
-            min_ps=self.sampling_min_ps[:batch_size],
+            temperatures=sampling_rows.temperatures,
+            top_ps=sampling_rows.top_ps,
+            top_ks=sampling_rows.top_ks,
+            min_ps=sampling_rows.min_ps,
             # Keep sampler control flow static during graph capture while
             # preserving SGLang's actual sampling kernel semantics.
             is_all_greedy=False,
@@ -1480,7 +1193,7 @@ class Qwen3OmniTalker(nn.Module):
             has_custom_logit_processor=False,
             custom_params=None,
             custom_logit_processor=None,
-            sampling_seed=self.sampling_seeds[:batch_size],
+            sampling_seed=sampling_rows.seeds,
             device=current_platform.device_type,
             logit_bias=None,
         )
