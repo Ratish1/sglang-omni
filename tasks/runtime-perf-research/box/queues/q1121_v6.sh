@@ -2,12 +2,17 @@
 # 11-21, node-0001, card 0, after q1121_v4's W3 traces. The receive-only transport change alone slows the talker's
 # back-to-back steps in all four W1 boots (p25 7.73 / 7.60 against 6.84 / 6.94 ms, mean 9.43 / 9.39 against 9.02 / 9.04,
 # rows 2.30 to 2.34 alike) while it adds no GPU work, and the graph change does the same (E4). Validation of the current
-# heads (W4 to W7) waits for the mechanism: q1121_v4 stops after W3, and the transport change gets its own trace on
-# card 0 beside W3's main and graph traces, plus an events pass for the gate.
+# heads (W4 to W7) waits for the mechanism. The steps it slows are the talker's unchanged-row-list steps (mean 9.57 /
+# 9.42 against 8.53 / 8.66 ms; changed steps 9.38 against 9.20), and the thinker is not idler on main during its loop
+# holds (only 37 to 40 of 126 holds overlap a thinker gap over 50 ms). Graph-level spans include time sliced out, so
+# the traces collect context switches: q1121_v4 stops after W2 (its W3 is replaced here), then main, the transport
+# change and the graph change are traced on card 0 one after another (one context switch session at a time), each
+# with an events pass for the gate. Per trace: card residency per process, switches, the talker's end-of-step waits,
+# talker steps and the thinker's eager steps.
 set -u
 O=/data/v1121
 K=/workspace/kit/tasks/runtime-perf-research/box
-PSHM2=/workspace/pshm2
+NMAIN=/workspace/nmain PFIX=/workspace/pfix PSHM2=/workspace/pshm2
 CONTEXT_32K="--preprocessing.factory.max_seq_len 32768 --thinker.factory.max_seq_len 32768"
 CPUS=0-55,112-167
 export SGLANG_OMNI_STARTUP_TIMEOUT=3600
@@ -39,8 +44,8 @@ traced() {
   note $name $tree "seedtts 8/s seed $OMNI_ARRIVAL_SEED beside video 1/s card 0 nsys then events port $port"
   taskset -c $CPUS python3 $K/baseline.py --tree $tree --model omni_colocated --card 0 --port $port --out $O/$name \
     --loads 64 --serve-extra "$CONTEXT_32K" --omni-chunk-audio "--bench-extra=--request-rate=8" \
-    --passes warm,nsys,events --nsys-session $name --nsys-trace cuda --nsys-graph-trace graph --nsys-delay 20 \
-    --nsys-seconds 15 > $O/$name.driver.log 2>&1 &
+    --passes warm,nsys,events --nsys-session $name --nsys-trace cuda --nsys-graph-trace graph --nsys-gpuctxsw \
+    --nsys-delay 20 --nsys-seconds 15 > $O/$name.driver.log 2>&1 &
   local driver=$!
   until curl -sf --max-time 2 http://127.0.0.1:$port/health > /dev/null || ! kill -0 $driver 2>/dev/null; do sleep 5; done
   video_loop $name $tree $port $driver &
@@ -50,13 +55,21 @@ traced() {
   wait $looper
   log "$(python3 $K/video_preprocess_gate.py --cell c64_events $O $name), $(node_free)"
   (cd $O/$name && python3 - c64_nsys/trace.sqlite serve.log < $K/talker_steps.py > talker_steps.txt 2>&1
-    python3 - c64_nsys/trace.sqlite serve.log < $K/thinker_steps.py > thinker_steps.txt 2>&1)
-  log "trace read $name: $(grep -c . $O/$name/talker_steps.txt) talker lines, $(grep -c . $O/$name/thinker_steps.txt) thinker lines"
+    python3 - c64_nsys/trace.sqlite serve.log < $K/thinker_steps.py > thinker_steps.txt 2>&1
+    python3 $K/ctxsw_read.py c64_nsys/trace.sqlite > ctxsw.txt 2>&1)
+  log "trace read $name: $(grep -c . $O/$name/talker_steps.txt) talker, $(grep -c . $O/$name/thinker_steps.txt) thinker, $(grep -c . $O/$name/ctxsw.txt) ctxsw lines"
 }
-until grep -q "^w3 read" $O/queue.log 2>/dev/null; do sleep 20; done
+until grep -q "^boot w24_a .* start" $O/queue.log 2>/dev/null; do sleep 10; done
 pkill -f "^bash /data/v1121/q1121_v4.sh"
-log "q1121_v4 stopped after W3; W4 to W7 wait for the talker mechanism"
+log "q1121_v4 stopped during W2's last boot (it runs on); W3 moves here with context switches, W4 to W7 wait for the talker mechanism"
 until ! pgrep -f "kit/tasks/runtime-perf-research/box/baseline.py" > /dev/null; do sleep 20; done
+log "$(python3 $K/video_preprocess_gate.py --cell c64_events $O w24_a)"
+python3 $K/body_table.py $O c64 "stack with both changes against main, card 0 A B B A, speech 8/s and video 1/s" \
+  base=w21_a,w24_a change=w22_b,w23_b >> $O/queue.log 2>&1
+python3 $K/first_chunk_gap.py --cell c64_events $O base=w21_a,w24_a change=w22_b,w23_b 2>&1 | grep gaps >> $O/queue.log
+log "w2 read"
 log "q1121_v6 start, $(node_free)"
-traced w3_x $PSHM2 28170
+traced c1_m $NMAIN 28170
+traced c2_x $PSHM2 28370
+traced c3_p $PFIX 28570
 log "q1121_v6 done"
