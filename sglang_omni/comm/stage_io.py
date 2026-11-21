@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import io
 import pickle
 from dataclasses import dataclass, fields, is_dataclass
@@ -28,7 +29,7 @@ from sglang_omni.proto.messages import (
     StreamChunkBatchMessage,
 )
 from sglang_omni.relay.base import Relay, RelayOperation
-from sglang_omni.relay.shm import ShmRelay
+from sglang_omni.relay.shm import SHM_LOOP_COPY_LIMIT_BYTES, ShmRelay
 
 
 class StageMessageSender(Protocol):
@@ -828,11 +829,13 @@ async def read_transfer_buffer(
     request_id: str,
     data_ref: DataRef,
 ) -> torch.Tensor:
-    buf = torch.zeros(
-        data_ref.buffer.length,
-        dtype=torch.uint8,
-        device=relay_device(relay),
-    )
+    device = relay_device(relay)
+    length = data_ref.buffer.length
+    if torch.device(device).type == "cpu" and length > SHM_LOOP_COPY_LIMIT_BYTES:
+        # note (ratish): zero-filling a host buffer of hundreds of MB on the stage loop holds every message the loop would send meanwhile.
+        buf = await asyncio.to_thread(torch.zeros, length, dtype=torch.uint8)
+    else:
+        buf = torch.zeros(length, dtype=torch.uint8, device=device)
     op = await relay.get_async(
         metadata=data_ref.buffer.info,
         dest_tensor=buf,
