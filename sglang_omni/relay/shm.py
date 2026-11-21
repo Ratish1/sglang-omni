@@ -9,11 +9,12 @@ with ``device="cpu"``. Buffers therefore arrive here already on the host.
 from __future__ import annotations
 
 import asyncio
+import functools
 import logging
 import uuid
 from collections.abc import Mapping
 from multiprocessing import shared_memory as _shm
-from typing import Callable, TypedDict
+from typing import Callable, Protocol, TypedDict
 
 import numpy as np
 import torch
@@ -32,6 +33,10 @@ class ShmTransferInfo(TypedDict):
 class ShmPutMetadata(TypedDict):
     engine_id: str
     transfer_info: ShmTransferInfo
+
+
+class SharedMemoryBlockCopy(Protocol):
+    def __call__(self) -> _shm.SharedMemory: ...
 
 
 def shm_create_from_tensor(tensor: torch.Tensor) -> _shm.SharedMemory:
@@ -64,6 +69,17 @@ def shm_create_from_chunks(chunks: list[torch.Tensor]) -> _shm.SharedMemory:
     else:
         pass
     return shm
+
+
+def discard_created_block(creation: asyncio.Future[_shm.SharedMemory]) -> None:
+    """Unlink a block its cancelled sender never took."""
+    if creation.cancelled() or creation.exception() is not None:
+        return
+    else:
+        pass
+    shm = creation.result()
+    shm.close()
+    shm.unlink()
 
 
 class ShmOperation(RelayOperation):
@@ -154,39 +170,40 @@ class ShmGetOperation(ShmOperation):
             return
         else:
             pass
-
-        shm_name = self.transfer_info["shm_name"]
-        size = self.transfer_info["size"]
-
         try:
-            try:
-                existing_shm = _shm.SharedMemory(name=shm_name)
-            except FileNotFoundError:
-                raise RuntimeError(f"SHM block {shm_name} not found.")
-
-            try:
-                shm_array = np.ndarray((size,), dtype=np.uint8, buffer=existing_shm.buf)
-                src_tensor = torch.from_numpy(shm_array)
-
-                dest_view = self.dest_tensor.view(torch.uint8).reshape(-1)
-                if dest_view.numel() < size:
-                    raise ValueError(
-                        f"SHM destination has {dest_view.numel()} bytes, "
-                        f"but transfer requires {size} bytes"
-                    )
-                else:
-                    pass
-                dest_view[:size].copy_(src_tensor[:size])
-
-            finally:
-                existing_shm.close()
-                try:
-                    existing_shm.unlink()
-                except FileNotFoundError:
-                    logger.debug("SHM block %s was already unlinked", shm_name)
-
+            # note (ratish): a payload of hundreds of MB copied on the stage loop holds every message the loop would send meanwhile.
+            await asyncio.to_thread(self.copy_from_block)
         finally:
             self.completed = True
+
+    def copy_from_block(self) -> None:
+        shm_name = self.transfer_info["shm_name"]
+        size = self.transfer_info["size"]
+        try:
+            existing_shm = _shm.SharedMemory(name=shm_name)
+        except FileNotFoundError:
+            raise RuntimeError(f"SHM block {shm_name} not found.")
+
+        try:
+            shm_array = np.ndarray((size,), dtype=np.uint8, buffer=existing_shm.buf)
+            src_tensor = torch.from_numpy(shm_array)
+
+            dest_view = self.dest_tensor.view(torch.uint8).reshape(-1)
+            if dest_view.numel() < size:
+                raise ValueError(
+                    f"SHM destination has {dest_view.numel()} bytes, "
+                    f"but transfer requires {size} bytes"
+                )
+            else:
+                pass
+            dest_view[:size].copy_(src_tensor[:size])
+
+        finally:
+            existing_shm.close()
+            try:
+                existing_shm.unlink()
+            except FileNotFoundError:
+                logger.debug("SHM block %s was already unlinked", shm_name)
 
 
 @register_relay("shm")
@@ -210,29 +227,40 @@ class ShmRelay(Relay):
         dst_rank: int | None = None,
         receiver_id: str | None = None,
     ) -> ShmPutOperation:
-        await self.sem.acquire()
-
-        try:
-            shm = shm_create_from_tensor(tensor)
-            return self.put_operation(
-                shm, tensor.numel() * tensor.element_size(), request_id
-            )
-        except Exception:
-            self.sem.release()
-            raise
+        return await self.put_block(
+            functools.partial(shm_create_from_tensor, tensor),
+            tensor.numel() * tensor.element_size(),
+            request_id,
+        )
 
     async def put_chunks_async(
         self, chunks: list[torch.Tensor], request_id: str | None = None
     ) -> ShmPutOperation:
         """Sends byte chunks as one block, copying each chunk into it once."""
-        await self.sem.acquire()
+        return await self.put_block(
+            functools.partial(shm_create_from_chunks, chunks),
+            sum(chunk.numel() for chunk in chunks),
+            request_id,
+        )
 
+    async def put_block(
+        self,
+        copy_block: SharedMemoryBlockCopy,
+        size_bytes: int,
+        request_id: str | None,
+    ) -> ShmPutOperation:
+        await self.sem.acquire()
+        creation: asyncio.Future[_shm.SharedMemory] | None = None
         try:
-            shm = shm_create_from_chunks(chunks)
-            return self.put_operation(
-                shm, sum(chunk.numel() for chunk in chunks), request_id
-            )
-        except Exception:
+            # note (ratish): the block's copy runs off the stage loop, and a sender cancelled while it runs leaves the block to discard_created_block.
+            creation = asyncio.get_running_loop().run_in_executor(None, copy_block)
+            shm = await asyncio.shield(creation)
+            return self.put_operation(shm, size_bytes, request_id)
+        except BaseException:
+            if creation is not None:
+                creation.add_done_callback(discard_created_block)
+            else:
+                pass
             self.sem.release()
             raise
 
