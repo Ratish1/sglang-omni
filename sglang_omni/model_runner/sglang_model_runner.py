@@ -7,11 +7,13 @@ import functools
 import logging
 from collections.abc import Iterator
 from dataclasses import dataclass
+from os import environ
 from threading import Lock
 
 import torch
 from sglang.srt.configs.draft_parallel import DraftParallelLayout
 from sglang.srt.configs.model_config import ModelConfig
+from sglang.srt.layers.attention.flashattention_backend import FlashAttentionBackend
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.sampler import (
     Sampler,
@@ -429,6 +431,24 @@ class SGLModelRunner(ModelRunner):
     """Thin wrapper to bootstrap SGLang ModelRunner from backend args."""
 
     plain_decode_runner: SGLModelRunner | None = None
+
+    def init_attention_backends(self) -> None:
+        super().init_attention_backends()
+        if (
+            self.model_config.hf_config.architectures == ["Qwen3OmniTalker"]
+            and environ.get("OMNI_NATIVE_SINGLE_ATTENTION_SPLIT") == "1"
+        ):
+            assert isinstance(self.attn_backend, FlashAttentionBackend)
+            assert self.attn_backend.fa_impl_ver == 3
+            assert self.decode_attn_backend is None
+            assert not self.decode_attn_backend_group
+            self.attn_backend.num_splits = 1
+            self.attn_backend.decode_num_splits = 1
+            logger.info(
+                "Diagnostic Talker attention uses one split before graph capture"
+            )
+        else:
+            pass
 
     def init_plain_decode_graphs(self) -> None:
         """Capture ordinary decode with shared weights and separate attention state."""
