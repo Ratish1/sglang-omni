@@ -8,6 +8,7 @@ from queue import Queue
 from typing import TYPE_CHECKING, TypeAlias
 
 import torch
+from qwen3_omni_native_trajectory import NativeTalkerTrajectory
 
 from sglang_omni.model_runner.base import ModelRunner
 from sglang_omni.model_runner.model_worker import ModelWorker
@@ -70,6 +71,7 @@ class QwenTalkerModelRunner(ModelRunner["SGLangARRequestData"]):
         self.codec_coalesce_frames = max(int(codec_coalesce_frames), 0)
         self.codec_coalesce_first_frames = max(int(codec_coalesce_first_frames), 0)
         self.codec_coalesce_early_frames = max(int(codec_coalesce_early_frames), 0)
+        self.native_trajectory = NativeTalkerTrajectory()
 
     def execute(self, scheduler_output: SchedulerOutput) -> ModelRunnerOutput:
         return super().execute(scheduler_output)
@@ -87,6 +89,7 @@ class QwenTalkerModelRunner(ModelRunner["SGLangARRequestData"]):
         else:
             pass
         input_embeds, input_embeds_are_projected = composed
+        self.native_trajectory.before_forward(forward_batch, requests, input_embeds)
         attach_omni_prefill_inputs(
             forward_batch,
             OmniPrefillInputs(
@@ -104,7 +107,6 @@ class QwenTalkerModelRunner(ModelRunner["SGLangARRequestData"]):
         is_lookahead: bool = False,
     ) -> None:
         del is_lookahead
-        del forward_batch
         del schedule_batch
         if not self.feedback_enabled:
             return
@@ -112,6 +114,7 @@ class QwenTalkerModelRunner(ModelRunner["SGLangARRequestData"]):
             pass
 
         self.model.prepare_decode_buffers(requests)
+        self.native_trajectory.before_forward(forward_batch, requests, None)
         self.write_feedback_buffers(requests)
 
     def post_prefill(
@@ -145,6 +148,14 @@ class QwenTalkerModelRunner(ModelRunner["SGLangARRequestData"]):
         # note (ratish): the layer 0 id is staged to the host ahead of the predictor, so the finalize wait covers the sample and not the predictor.
         self.stage_token_ids(result, result.next_token_ids)
         self.model.code_predictor_forward(layer0_codes, talker_hidden)
+        self.native_trajectory.after_forward(
+            forward_batch,
+            requests,
+            self.tp_worker.model_runner,
+            result.logits_output.hidden_states,
+            result.logits_output.next_token_logits,
+            result.can_run_cuda_graph,
+        )
         self.emit_code_chunks_and_feedback(
             schedule_batch=schedule_batch,
             requests=requests,
@@ -165,6 +176,14 @@ class QwenTalkerModelRunner(ModelRunner["SGLangARRequestData"]):
         batch_size = len(requests)
         result.next_token_ids = self.model.sampled_token_ids[:batch_size].clone()
         self.stage_token_ids(result, result.next_token_ids)
+        self.native_trajectory.after_forward(
+            forward_batch,
+            requests,
+            self.tp_worker.model_runner,
+            result.logits_output.hidden_states,
+            result.logits_output.next_token_logits,
+            result.can_run_cuda_graph,
+        )
         self.emit_code_chunks_and_feedback(
             schedule_batch=schedule_batch,
             requests=requests,
@@ -294,6 +313,7 @@ class QwenTalkerModelRunner(ModelRunner["SGLangARRequestData"]):
     def on_request_finished(
         self, request_id: str, req_data: "SGLangARRequestData"
     ) -> None:
+        self.native_trajectory.finish(request_id, req_data)
         pending = req_data.pending_codec_rows
         if not pending:
             return
