@@ -110,6 +110,9 @@ def main(
         assert set(selected_samples) <= mmsu_ids
     else:
         assert set(selected_samples) <= sample_ids
+        assert (
+            samples[0].sample_id not in selected_samples
+        ), "Concurrent warmup copies must not share a trace request ID"
     shutil.copytree(tactic_cache, output / "cache")
     captures = output / "captures"
     captures.mkdir()
@@ -170,6 +173,8 @@ def main(
                     port,
                     sample_ids,
                     trace_phase=None if mmsu else "native",
+                    trace_sample_ids=set(selected_samples),
+                    warmup_requests=client_concurrency,
                 )
             )
         if mmsu:
