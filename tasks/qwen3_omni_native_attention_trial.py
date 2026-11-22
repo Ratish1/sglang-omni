@@ -109,6 +109,7 @@ def compare_attention_schedules(
         with context:
             result = worker.forward_batch_generation(forward_batch)
         assert result.can_run_cuda_graph
+        snapshot = model.native_layer_probe.snapshot_for_batch(graph_runner.bs, True)
         outputs.append(
             {
                 "logits": result.logits_output.next_token_logits[
@@ -118,6 +119,13 @@ def compare_attention_schedules(
                 "codes": model.output_codes[: len(requests)].clone(),
                 "feedback": model.output_embeds[: len(requests)].clone(),
                 "main_codes": model.sampled_token_ids[: len(requests)].clone(),
+                "predictor_logits": torch.stack(
+                    [
+                        snapshot[f"predictor_logits_{group}"][: len(requests), -1]
+                        for group in range(1, model.config.num_code_groups)
+                    ],
+                    dim=1,
+                ),
             }
         )
         writes.append([buffer.index_select(0, write_slots) for buffer in buffers])
@@ -136,6 +144,12 @@ def compare_attention_schedules(
     reference, alternative, repeated = outputs
     for name in reference:
         assert torch.equal(reference[name], repeated[name]), name
+        assert torch.isfinite(reference[name]).all(), name
+        assert torch.isfinite(alternative[name]).all(), name
+    for output in outputs:
+        assert torch.equal(
+            output["predictor_logits"].argmax(dim=-1), output["codes"][:, 1:]
+        )
     assert all(
         torch.equal(first, last)
         for first, last in zip(writes[0], writes[2], strict=True)
@@ -170,6 +184,17 @@ def compare_attention_schedules(
             {
                 "values": output["logits"][selected_row].topk(2).values.tolist(),
                 "ids": output["logits"][selected_row].topk(2).indices.tolist(),
+            }
+            for output in (reference, alternative)
+        ],
+        "predictor_top2": [
+            {
+                "values": output["predictor_logits"][selected_row]
+                .topk(2)
+                .values.tolist(),
+                "ids": output["predictor_logits"][selected_row]
+                .topk(2)
+                .indices.tolist(),
             }
             for output in (reference, alternative)
         ],

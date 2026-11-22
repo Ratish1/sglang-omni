@@ -21,8 +21,10 @@ class OutputRecorder(Protocol):
 
 
 class NativeLayerProbe:
-    def __init__(self, layer: nn.Module) -> None:
+    def __init__(self, layer: nn.Module, predictor_heads: nn.ModuleList) -> None:
         self.active: dict[str, torch.Tensor] | None = None
+        self.decode_snapshot: dict[str, torch.Tensor] | None = None
+        self.predictor_groups = len(predictor_heads)
         self.snapshots: list[dict[str, torch.Tensor]] = []
         self.eager: dict[str, torch.Tensor] = {}
         layer.register_forward_pre_hook(self.begin, with_kwargs=True)
@@ -40,6 +42,8 @@ class NativeLayerProbe:
         layer.mlp.shared_expert.register_forward_hook(self.output("shared_expert"))
         layer.mlp.shared_expert_gate.register_forward_hook(self.output("shared_gate"))
         layer.register_forward_hook(self.finish)
+        for group, head in enumerate(predictor_heads, start=1):
+            head.register_forward_hook(self.predictor_output(group))
 
     def begin(
         self,
@@ -50,11 +54,13 @@ class NativeLayerProbe:
         forward_batch = named_inputs["forward_batch"]
         assert isinstance(forward_batch, ForwardBatch)
         if not forward_batch.forward_mode.is_decode():
+            self.decode_snapshot = None
             return
         else:
             pass
         assert self.active is None
         self.active = {}
+        self.decode_snapshot = self.active
         hidden_states = named_inputs["hidden_states"]
         positions = named_inputs["positions"]
         assert isinstance(hidden_states, torch.Tensor)
@@ -144,8 +150,28 @@ class NativeLayerProbe:
         self.record("layer_output", output)
         self.active = None
 
-    def read(
-        self, row: int, graph_rows: int, graph_replay: bool
+    def predictor_output(self, group: int) -> OutputRecorder:
+        def record_output(
+            module: nn.Module,
+            inputs: tuple[torch.Tensor, ...],
+            output: torch.Tensor | tuple[torch.Tensor, torch.Tensor | None],
+        ) -> None:
+            if self.decode_snapshot is not None:
+                assert isinstance(output, tuple)
+                self.decode_snapshot[f"predictor_logits_{group}"] = (
+                    output[0].detach().clone()
+                )
+                if group == self.predictor_groups:
+                    self.decode_snapshot = None
+                else:
+                    pass
+            else:
+                pass
+
+        return record_output
+
+    def snapshot_for_batch(
+        self, graph_rows: int, graph_replay: bool
     ) -> dict[str, torch.Tensor]:
         if graph_replay:
             matches = [
@@ -154,12 +180,18 @@ class NativeLayerProbe:
                 if snapshot["contribution"].shape[0] == graph_rows
             ]
             assert len(matches) == 1, (graph_rows, len(matches))
-            source = matches[0]
+            return matches[0]
         else:
-            source = self.eager
+            return self.eager
+
+    def read(
+        self, row: int, graph_rows: int, graph_replay: bool
+    ) -> dict[str, torch.Tensor]:
+        source = self.snapshot_for_batch(graph_rows, graph_replay)
         result = {
             f"layer0_{name}": values[row].detach().clone()
             for name, values in source.items()
+            if not name.startswith("predictor_logits_")
         }
         for name in ("mlp_normalized", "expert_ids", "expert_weights"):
             result[f"layer0_peer_{name}"] = source[name].detach().clone()

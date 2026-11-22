@@ -838,7 +838,9 @@ class Qwen3OmniTalker(nn.Module):
         )
 
         device = self.model.codec_embedding.weight.device
-        self.native_layer_probe = NativeLayerProbe(self.model.layers[0])
+        self.native_layer_probe = NativeLayerProbe(
+            self.model.layers[0], self.code_predictor.lm_head
+        )
         hidden_size = config.text_config.hidden_size
         predictor_len = config.num_code_groups + 1
         server_args = get_context().server_args
