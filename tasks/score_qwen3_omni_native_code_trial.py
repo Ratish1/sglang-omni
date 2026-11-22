@@ -6,6 +6,7 @@ import json
 from dataclasses import asdict
 from hashlib import sha256
 from pathlib import Path
+from typing import Literal
 
 import torch
 from compare_qwen3_omni_native_trajectories import validate
@@ -21,8 +22,13 @@ from benchmarks.tasks.asr import (
 from sglang_omni.utils import find_available_port
 
 
-def main(baseline: Path, intervention: Path, asr_checkpoint: Path) -> None:
-    trial = json.loads((intervention / "captures/code-trial.json").read_text())
+def main(
+    baseline: Path,
+    intervention: Path,
+    asr_checkpoint: Path,
+    trial_kind: Literal["code", "cache"],
+) -> None:
+    trial = json.loads((intervention / f"captures/{trial_kind}-trial.json").read_text())
     sample_id = trial["request_id"].removeprefix("feedback-trace-native-")
     roots = (baseline, intervention)
     frames = [validate(root / "captures" / sample_id) for root in roots]
@@ -44,9 +50,15 @@ def main(baseline: Path, intervention: Path, asr_checkpoint: Path) -> None:
                     pass
             else:
                 pass
-    assert first_differences["codec_ids"] == trial["frame_index"]
-    assert first_differences["feedback"] == trial["frame_index"]
-    assert first_differences["queued_feedback"] == trial["frame_index"] + 1
+    if trial_kind == "code":
+        assert first_differences["codec_ids"] == trial["frame_index"]
+        assert first_differences["feedback"] == trial["frame_index"]
+        assert first_differences["queued_feedback"] == trial["frame_index"] + 1
+    else:
+        assert first_differences["stored_keys"] == trial["frame_index"]
+        assert first_differences["stored_values"] == trial["frame_index"]
+        for name in ("codec_ids", "feedback", "queued_feedback"):
+            assert first_differences.get(name, len(frames[1])) > trial["frame_index"]
     assert (
         first_differences.get("predictor_query", len(frames[1])) > trial["frame_index"]
     )
@@ -106,6 +118,7 @@ def main(baseline: Path, intervention: Path, asr_checkpoint: Path) -> None:
         stop_server(server)
     report = {
         "roots": [str(root) for root in roots],
+        "trial_kind": trial_kind,
         "sample_id": sample_id,
         "frames": [len(trajectory) for trajectory in frames],
         "first_differences": first_differences,
@@ -122,7 +135,13 @@ if __name__ == "__main__":
     parser.add_argument("baseline", type=Path)
     parser.add_argument("intervention", type=Path)
     parser.add_argument("asr_checkpoint", type=Path)
+    parser.add_argument("--trial-kind", choices=("code", "cache"), default="code")
     arguments = parser.parse_args()
-    main(arguments.baseline, arguments.intervention, arguments.asr_checkpoint)
+    main(
+        arguments.baseline,
+        arguments.intervention,
+        arguments.asr_checkpoint,
+        arguments.trial_kind,
+    )
 else:
     pass

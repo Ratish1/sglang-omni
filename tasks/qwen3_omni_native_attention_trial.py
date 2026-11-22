@@ -3,11 +3,13 @@
 
 import json
 from contextlib import nullcontext
+from dataclasses import dataclass
 from pathlib import Path
 from unittest.mock import patch
 
 import torch
 from compare_qwen3_omni_native_trajectories import difference
+from qwen3_omni_native_code_trial import assert_native_prefix
 from replay_qwen3_omni_scheduler_bounds import physical_schedule
 from sglang.srt.layers.attention.flashattention_backend import FlashAttentionBackend
 from sglang.srt.managers.scheduler import GenerationBatchResult
@@ -18,6 +20,111 @@ from sglang_omni.model_runner.model_worker import ModelWorker
 from sglang_omni.scheduling.types import SchedulerRequest
 
 
+@dataclass(kw_only=True)
+class AttentionTrial:
+    result: GenerationBatchResult
+    selected_cache: list[torch.Tensor]
+    selected_outputs_equal: bool
+
+
+class NativeCacheTrial:
+    def __init__(self, reference: Path, destination: Path) -> None:
+        self.reference: list[dict[str, torch.Tensor]] = torch.load(
+            reference / "trajectory.pt", map_location="cpu", weights_only=True
+        )
+        self.request_id: str = json.loads((reference / "trajectory.json").read_text())[
+            "request_id"
+        ]
+        self.destination = destination
+        self.applied = False
+
+    @torch.inference_mode()
+    def apply(
+        self,
+        worker: ModelWorker,
+        forward_batch: ForwardBatch,
+        trial: AttentionTrial,
+        selected_row: int,
+        frames: list[dict[str, torch.Tensor]],
+    ) -> None:
+        assert not self.applied
+        assert trial.selected_outputs_equal
+        assert_native_prefix(frames, self.reference)
+        runner = worker.model_runner
+        pool = runner.token_to_kv_pool
+        assert isinstance(pool, MHATokenToKVPool)
+        buffers = (*pool.k_buffer, *pool.v_buffer)
+        selected_slot = forward_batch.out_cache_loc[
+            selected_row : selected_row + 1
+        ].long()
+        slots = (
+            torch.cat(
+                [
+                    runner.req_to_token_pool.req_to_token[
+                        forward_batch.req_pool_indices[row], : int(length)
+                    ]
+                    for row, length in enumerate(forward_batch.seq_lens_cpu)
+                ]
+            )
+            .long()
+            .unique()
+        )
+        preserved_slots = slots[slots != selected_slot[0]]
+        preserved_cache = [
+            buffer.index_select(0, preserved_slots) for buffer in buffers
+        ]
+        original_cache = [buffer.index_select(0, selected_slot) for buffer in buffers]
+        original_codes = runner.model.output_codes.clone()
+        original_feedback = runner.model.output_embeds.clone()
+        changed_buffers = [
+            index
+            for index, (original, alternative) in enumerate(
+                zip(original_cache, trial.selected_cache, strict=True)
+            )
+            if not torch.equal(original, alternative)
+        ]
+        assert changed_buffers
+        assert 0 not in changed_buffers and len(pool.k_buffer) not in changed_buffers
+        for buffer, alternative in zip(buffers, trial.selected_cache, strict=True):
+            buffer.index_copy_(0, selected_slot, alternative)
+            assert torch.equal(buffer.index_select(0, selected_slot), alternative)
+        for buffer, preserved in zip(buffers, preserved_cache, strict=True):
+            assert torch.equal(buffer.index_select(0, preserved_slots), preserved)
+        assert torch.equal(runner.model.output_codes, original_codes)
+        assert torch.equal(runner.model.output_embeds, original_feedback)
+        torch.save(
+            {
+                "original_cache": [tensor.cpu() for tensor in original_cache],
+                "alternative_cache": [tensor.cpu() for tensor in trial.selected_cache],
+                "codes": original_codes[selected_row].cpu(),
+                "feedback": original_feedback[selected_row].cpu(),
+            },
+            self.destination.with_suffix(".pt"),
+        )
+        with self.destination.open("x") as receipt:
+            json.dump(
+                {
+                    "request_id": self.request_id,
+                    "sequence_tokens": int(forward_batch.seq_lens_cpu[selected_row]),
+                    "frame_index": len(frames) - 1,
+                    "prefix_exact": True,
+                    "selected_outputs_equal": True,
+                    "old_prefixes_and_peers_unchanged": True,
+                    "changed_key_layers": [
+                        index for index in changed_buffers if index < len(pool.k_buffer)
+                    ],
+                    "changed_value_layers": [
+                        index - len(pool.k_buffer)
+                        for index in changed_buffers
+                        if index >= len(pool.k_buffer)
+                    ],
+                },
+                receipt,
+                indent=2,
+            )
+        self.applied = True
+
+
 @torch.inference_mode()
 def compare_attention_schedules(
     worker: ModelWorker,
@@ -26,7 +133,7 @@ def compare_attention_schedules(
     selected_row: int,
     destination: Path,
     attention_splits: int,
-) -> GenerationBatchResult:
+) -> AttentionTrial:
     runner = worker.model_runner
     model = runner.model
     pool = runner.token_to_kv_pool
@@ -258,4 +365,13 @@ def compare_attention_schedules(
     )
     with destination.open("x") as receipt:
         json.dump(report, receipt, indent=2)
-    return result
+    return AttentionTrial(
+        result=result,
+        selected_cache=[
+            buffer[selected_row : selected_row + 1].clone() for buffer in writes[1]
+        ],
+        selected_outputs_equal=all(
+            torch.equal(reference[name][selected_row], alternative[name][selected_row])
+            for name in ("codes", "feedback", "main_codes")
+        ),
+    )

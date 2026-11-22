@@ -14,6 +14,38 @@ from sglang_omni.model_runner.model_worker import ModelWorker
 from sglang_omni.utils.predictor_layers import codebook_step
 
 
+def assert_native_prefix(
+    frames: list[dict[str, torch.Tensor]],
+    reference: list[dict[str, torch.Tensor]],
+) -> None:
+    fields = (
+        "prefill_embeddings",
+        "input_ids",
+        "positions",
+        "rotary_positions",
+        "predictor_query",
+        "logits",
+        "codec_ids",
+        "feedback",
+        "queued_feedback",
+        "text_embedding",
+        "consumed_input",
+        "stored_keys",
+        "stored_values",
+    )
+    assert len(frames) <= len(reference)
+    for frame_index, (actual, expected) in enumerate(zip(frames, reference)):
+        for name in fields:
+            assert (name in actual) == (name in expected), (frame_index, name)
+            if name in expected:
+                assert torch.equal(actual[name].cpu(), expected[name]), (
+                    frame_index,
+                    name,
+                )
+            else:
+                pass
+
+
 class NativeCodeTrial:
     def __init__(
         self,
@@ -59,32 +91,7 @@ class NativeCodeTrial:
         assert model.predictor_fused_layers.covers(2 * batch_rows)
         assert 0 < self.residual_group < model.config.num_code_groups
         assert self.expected_code != self.replacement_code
-        fields = (
-            "prefill_embeddings",
-            "input_ids",
-            "positions",
-            "rotary_positions",
-            "predictor_query",
-            "logits",
-            "codec_ids",
-            "feedback",
-            "queued_feedback",
-            "text_embedding",
-            "consumed_input",
-            "stored_keys",
-            "stored_values",
-        )
-        assert len(frames) <= len(self.reference)
-        for frame_index, (actual, expected) in enumerate(zip(frames, self.reference)):
-            for name in fields:
-                assert (name in actual) == (name in expected), (frame_index, name)
-                if name in expected:
-                    assert torch.equal(actual[name].cpu(), expected[name]), (
-                        frame_index,
-                        name,
-                    )
-                else:
-                    pass
+        assert_native_prefix(frames, self.reference)
         current = frames[-1]
         assert int(current["positions"].flatten()[0]) + 1 == self.sequence_tokens
         original_codes = model.output_codes[:batch_rows].clone()

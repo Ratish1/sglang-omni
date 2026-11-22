@@ -6,7 +6,10 @@ from os import environ
 from pathlib import Path
 
 import torch
-from qwen3_omni_native_attention_trial import compare_attention_schedules
+from qwen3_omni_native_attention_trial import (
+    NativeCacheTrial,
+    compare_attention_schedules,
+)
 from qwen3_omni_native_code_trial import NativeCodeTrial
 from sglang.srt.layers.attention.flashattention_backend import FlashAttentionBackend
 from sglang.srt.managers.scheduler import GenerationBatchResult
@@ -55,6 +58,18 @@ class NativeTalkerTrajectory:
                 self.directory / "code-trial.json",
             )
             assert self.code_trial.request_id in self.request_ids
+        else:
+            pass
+        self.cache_trial: NativeCacheTrial | None = None
+        cache_reference = environ.get("OMNI_NATIVE_CACHE_TRIAL_REFERENCE")
+        if cache_reference:
+            assert self.code_trial is None
+            assert len(self.attention_trial_sequences) == 1
+            assert self.attention_trial_splits == 1
+            self.cache_trial = NativeCacheTrial(
+                Path(cache_reference), self.directory / "cache-trial.json"
+            )
+            assert self.request_ids == {self.cache_trial.request_id}
         else:
             pass
         assert self.directory.is_dir()
@@ -107,7 +122,7 @@ class NativeTalkerTrajectory:
         request_id = requests[selected_row].request_id
         sequence_tokens = int(forward_batch.seq_lens_cpu[selected_row])
         destination = self.directory / f"{request_id}-sequence-{sequence_tokens}.json"
-        return compare_attention_schedules(
+        trial = compare_attention_schedules(
             worker,
             forward_batch,
             requests,
@@ -115,6 +130,22 @@ class NativeTalkerTrajectory:
             destination,
             self.attention_trial_splits,
         )
+        if self.cache_trial is not None:
+            result = trial.result
+            self.after_forward(
+                forward_batch,
+                requests,
+                worker.model_runner,
+                result.logits_output.hidden_states,
+                result.logits_output.next_token_logits,
+                result.can_run_cuda_graph,
+            )
+            self.cache_trial.apply(
+                worker, forward_batch, trial, selected_row, self.tensors[request_id]
+            )
+        else:
+            pass
+        return trial.result
 
     def before_forward(
         self,
@@ -321,6 +352,10 @@ class NativeTalkerTrajectory:
             pass
         if self.code_trial is not None and request_id == self.code_trial.request_id:
             assert self.code_trial.applied
+        else:
+            pass
+        if self.cache_trial is not None and request_id == self.cache_trial.request_id:
+            assert self.cache_trial.applied
         else:
             pass
         snapshots = self.tensors.pop(request_id)

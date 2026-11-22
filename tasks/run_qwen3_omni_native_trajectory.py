@@ -69,11 +69,18 @@ def main(
     attention_trial_splits: int,
     code_trial_reference: Path | None,
     code_trial_choice: list[int],
+    cache_trial_reference: Path | None,
 ) -> None:
     assert (code_trial_reference is None) == (not code_trial_choice)
     if code_trial_reference is not None:
         assert not attention_trial_sequences
         assert len(selected_samples) == 1
+    else:
+        pass
+    if cache_trial_reference is not None:
+        assert code_trial_reference is None
+        assert len(selected_samples) == len(attention_trial_sequences) == 1
+        assert attention_trial_splits == 1
     else:
         pass
     output.mkdir()
@@ -120,6 +127,9 @@ def main(
             ),
             "OMNI_NATIVE_CODE_TRIAL_CHOICE": ",".join(
                 str(value) for value in code_trial_choice
+            ),
+            "OMNI_NATIVE_CACHE_TRIAL_REFERENCE": (
+                str(cache_trial_reference) if cache_trial_reference else ""
             ),
         },
         strip_proxy=True,
@@ -190,6 +200,10 @@ def main(
         assert (captures / "code-trial.json").is_file()
     else:
         pass
+    if cache_trial_reference is not None:
+        assert (captures / "cache-trial.json").is_file()
+    else:
+        pass
     print(json.dumps({"seedtts_samples": len(samples), "captures": selected_samples}))
 
 
@@ -205,6 +219,7 @@ if __name__ == "__main__":
     parser.add_argument("--attention-trial-splits", type=int, choices=(0, 1), default=0)
     parser.add_argument("--code-trial-reference", type=Path)
     parser.add_argument("--code-trial-choice", type=int, nargs=4, default=[])
+    parser.add_argument("--cache-trial-reference", type=Path)
     arguments = parser.parse_args()
     main(
         arguments.output,
@@ -216,6 +231,7 @@ if __name__ == "__main__":
         arguments.attention_trial_splits,
         arguments.code_trial_reference,
         arguments.code_trial_choice,
+        arguments.cache_trial_reference,
     )
 else:
     pass
