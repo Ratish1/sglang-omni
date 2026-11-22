@@ -5123,6 +5123,7 @@ class OmniScheduler(Generic[RequestDataT]):
 
             batch = self.get_next_batch_to_run()
             self.cur_batch = batch
+            process_engines().yield_turn()
 
             # Route through sync when the runner's collect has a sync-only
             # fallback (default True for runners not overriding lookahead_eligible).
