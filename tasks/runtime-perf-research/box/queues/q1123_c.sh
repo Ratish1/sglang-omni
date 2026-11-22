@@ -30,7 +30,7 @@ gil() {
     --passes warm,pyspygil --pyspy-delay 20 --pyspy-seconds 15 > $O/$name.driver.log 2>&1
   log "boot $name rc $?"
 }
-until grep -q "q1123_b done" $O/queue.log 2>/dev/null; do sleep 20; done
+until grep -q "q1123_d done" $O/queue.log 2>/dev/null; do sleep 20; done
 log "q1123_c start"
 PYTHONPATH=$F taskset -c 3 python3 $K/process_engines_noop_bench.py >> $O/queue.log 2>&1
 until awk '{exit !($1 < 80)}' /proc/loadavg; do sleep 30; done
