@@ -163,7 +163,7 @@ class NativeTalkerTrajectory:
                 {
                     "request_id": request_id,
                     "finish_reason": request.finish_reason,
-                    "output_ids": request.req.output_ids,
+                    "output_ids": list(request.req.output_ids),
                     "frames": metadata,
                 },
                 report,
