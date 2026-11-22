@@ -437,6 +437,25 @@ class SGLModelRunner(ModelRunner):
         attention_split_count = environ.get("OMNI_NATIVE_ATTENTION_SPLITS")
         if (
             self.model_config.hf_config.architectures == ["Qwen3OmniTalker"]
+            and environ.get("OMNI_NATIVE_TIGHT_ATTENTION_BOUND") == "1"
+        ):
+            assert attention_split_count is None
+            assert isinstance(self.attn_backend, FlashAttentionBackend)
+            assert self.attn_backend.fa_impl_ver == 3
+            assert self.decode_attn_backend is None
+            assert not self.decode_attn_backend_group
+            assert self.spec_algorithm.is_none()
+            assert (
+                self.attn_backend.num_splits == self.attn_backend.decode_num_splits == 0
+            )
+            self.attn_backend.needs_cpu_seq_lens = True
+            logger.info(
+                "Diagnostic Talker attention retains CPU sequence lengths before graph capture"
+            )
+        else:
+            pass
+        if (
+            self.model_config.hf_config.architectures == ["Qwen3OmniTalker"]
             and attention_split_count is not None
         ):
             split_count = int(attention_split_count)
