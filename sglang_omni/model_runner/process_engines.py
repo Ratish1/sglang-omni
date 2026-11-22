@@ -50,6 +50,7 @@ class HeldEngine:
 
 @dataclass(kw_only=True)
 class TurnWaiter:
+    engine_context: RuntimeContext
     priority: int
     arrival: int
     granted: threading.Event = field(default_factory=threading.Event)
@@ -71,6 +72,7 @@ class ProcessEngines:
         self.is_turn_held = False
         self.turn_waiters: list[TurnWaiter] = []
         self.arrivals = itertools.count()
+        self.deferring_contexts: list[RuntimeContext] = []
 
     @property
     def is_shared(self) -> bool:
@@ -156,16 +158,42 @@ class ProcessEngines:
         finally:
             self.take_turn(held_engine)
 
+    def defer(self, engine_context: RuntimeContext, *, is_deferring: bool) -> None:
+        """Rank an engine below every other while it waits on their output, so they go first."""
+        with self.turn_state_lock:
+            is_listed = any(
+                listed is engine_context for listed in self.deferring_contexts
+            )
+            if is_deferring and not is_listed:
+                self.deferring_contexts.append(engine_context)
+            elif not is_deferring and is_listed:
+                self.deferring_contexts = [
+                    listed
+                    for listed in self.deferring_contexts
+                    if listed is not engine_context
+                ]
+            else:
+                pass
+
+    def rank(self, engine_context: RuntimeContext, priority: int) -> tuple[bool, int]:
+        """An engine's place in the turn order, read under turn_state_lock: engines not deferring first, then by priority."""
+        is_deferring = any(
+            listed is engine_context for listed in self.deferring_contexts
+        )
+        return (not is_deferring, priority)
+
     def yield_turn(self) -> None:
-        """Hand the turn to a waiting higher-priority engine and take it back after it."""
+        """Hand the turn to a waiting engine that outranks this one and take it back after it."""
         held_engine = self.thread_hold.held_engine
         if held_engine is None:
             return
         else:
             pass
         with self.turn_state_lock:
+            held_rank = self.rank(held_engine.engine_context, held_engine.priority)
             is_outranked = any(
-                waiter.priority > held_engine.priority for waiter in self.turn_waiters
+                self.rank(waiter.engine_context, waiter.priority) > held_rank
+                for waiter in self.turn_waiters
             )
         if is_outranked:
             self.leave_turn(held_engine)
@@ -180,7 +208,9 @@ class ProcessEngines:
                 waiter = None
             else:
                 waiter = TurnWaiter(
-                    priority=held_engine.priority, arrival=next(self.arrivals)
+                    engine_context=held_engine.engine_context,
+                    priority=held_engine.priority,
+                    arrival=next(self.arrivals),
                 )
                 self.turn_waiters.append(waiter)
         if waiter is not None:
@@ -192,7 +222,7 @@ class ProcessEngines:
         self.thread_hold.held_engine = held_engine
 
     def leave_turn(self, held_engine: HeldEngine) -> None:
-        """Hand the turn straight to the highest-priority, earliest waiter, so the leaver cannot take it back first."""
+        """Hand the turn straight to the highest-ranked, earliest waiter, so the leaver cannot take it back first."""
         assert (
             self.thread_hold.held_engine is held_engine
         ), "the turn is left by the thread holding it"
@@ -203,7 +233,10 @@ class ProcessEngines:
             if self.turn_waiters:
                 next_waiter = max(
                     self.turn_waiters,
-                    key=lambda waiter: (waiter.priority, -waiter.arrival),
+                    key=lambda waiter: (
+                        *self.rank(waiter.engine_context, waiter.priority),
+                        -waiter.arrival,
+                    ),
                 )
                 self.turn_waiters.remove(next_waiter)
                 next_waiter.granted.set()

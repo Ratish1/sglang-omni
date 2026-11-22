@@ -115,6 +115,55 @@ def test_a_left_turn_goes_to_the_talker_before_an_earlier_thinker() -> None:
     assert order == ["talker", "thinker"]
 
 
+def test_a_deferring_talker_lets_the_thinker_keep_the_turn_until_it_stops_deferring() -> (
+    None
+):
+    engines, (thinker_context, talker_context) = make_engines(2)
+    order: list[str] = []
+
+    def talker() -> None:
+        with engines.hold(talker_context, priority=TALKER_PRIORITY):
+            order.append("talker")
+
+    engines.defer(talker_context, is_deferring=True)
+    with engines.hold(thinker_context, priority=THINKER_PRIORITY):
+        talker_thread = threading.Thread(target=talker)
+        talker_thread.start()
+        wait_until_waiting(engines, 1)
+        engines.yield_turn()
+        order.append("thinker kept the turn")
+        engines.defer(talker_context, is_deferring=False)
+        engines.yield_turn()
+        order.append("thinker after")
+    talker_thread.join()
+    assert order == ["thinker kept the turn", "talker", "thinker after"]
+
+
+def test_a_left_turn_goes_to_a_waiting_thinker_before_a_deferring_talker() -> None:
+    engines, (holder_context, thinker_context, talker_context) = make_engines(3)
+    order: list[str] = []
+
+    def hold_and_record(context: RuntimeContext, priority: int, name: str) -> None:
+        with engines.hold(context, priority=priority):
+            order.append(name)
+
+    engines.defer(talker_context, is_deferring=True)
+    with engines.hold(holder_context, priority=THINKER_PRIORITY):
+        talker_thread = threading.Thread(
+            target=hold_and_record, args=(talker_context, TALKER_PRIORITY, "talker")
+        )
+        talker_thread.start()
+        wait_until_waiting(engines, 1)
+        thinker_thread = threading.Thread(
+            target=hold_and_record, args=(thinker_context, THINKER_PRIORITY, "thinker")
+        )
+        thinker_thread.start()
+        wait_until_waiting(engines, 2)
+    talker_thread.join()
+    thinker_thread.join()
+    assert order == ["thinker", "talker"]
+
+
 def test_an_engine_that_raises_inside_its_turn_hands_it_to_the_waiting_engine() -> None:
     engines, (thinker_context, talker_context) = make_engines(2)
     process_context = get_context()

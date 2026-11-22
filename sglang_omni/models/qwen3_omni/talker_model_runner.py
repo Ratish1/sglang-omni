@@ -588,6 +588,16 @@ class QwenTalkerModelRunner(ModelRunner["SGLangARRequestData"]):
         return bool(data.thinker_chunks_done and data.tts_pad_embed is not None)
 
     @staticmethod
+    def data_awaits_thinker_text(data: SGLangARRequestData | None) -> bool:
+        """Whether a row's next decode input waits only on the thinker's next text row."""
+        return bool(
+            data is not None
+            and data.pending_feedback_queue
+            and not data.pending_text_queue
+            and not data.thinker_chunks_done
+        )
+
+    @staticmethod
     def pop_left(queue: TalkerInputQueue) -> torch.Tensor | None:
         if not queue:
             return None

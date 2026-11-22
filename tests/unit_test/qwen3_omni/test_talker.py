@@ -19,7 +19,7 @@ from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool, ReqToTokenPool
 from sglang.srt.mem_cache.radix_cache import RadixCache
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
-from sglang.srt.runtime_context import get_context
+from sglang.srt.runtime_context import ParallelContext, RuntimeContext, get_context
 from sglang.srt.sampling.penaltylib.repetition_penalty import apply_scaling_penalties
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_params import SamplingParams
@@ -29,7 +29,9 @@ from torch import nn
 from torch._dynamo.utils import counters
 
 import sglang_omni.models.qwen3_omni.components.talker as talker_module
+import sglang_omni.models.qwen3_omni.talker_scheduler as talker_scheduler_module
 from sglang_omni.model_runner.prefill_inputs import get_omni_prefill_inputs
+from sglang_omni.model_runner.process_engines import ProcessEngines
 from sglang_omni.model_runner.thinker_model_runner import ThinkerModelRunner
 from sglang_omni.models.qwen3_omni.components.talker import (
     Qwen3OmniTalker,
@@ -1183,7 +1185,8 @@ def row_readiness_scheduler(
             row_index
             for row_index, request in enumerate(batch.reqs)
             if request.rid not in request_ids_without_text
-        ]
+        ],
+        data_awaits_thinker_text=lambda data: False,
     )
     scheduler.excluded_batch = None
     scheduler.excluded_row_steps = 0
@@ -1284,6 +1287,84 @@ def running_talker_batch(scheduler: QwenTalkerScheduler) -> ScheduleBatch:
     batch.sampling_info = SamplingBatchInfo.from_schedule_batch(batch, 64)
     scheduler.running_batch = batch
     return batch
+
+
+@pytest.mark.parametrize(
+    ("data", "awaits"),
+    [
+        (None, False),
+        (
+            SimpleNamespace(
+                pending_feedback_queue=[1],
+                pending_text_queue=[],
+                thinker_chunks_done=False,
+            ),
+            True,
+        ),
+        (
+            SimpleNamespace(
+                pending_feedback_queue=[1],
+                pending_text_queue=[2],
+                thinker_chunks_done=False,
+            ),
+            False,
+        ),
+        (
+            SimpleNamespace(
+                pending_feedback_queue=[1],
+                pending_text_queue=[],
+                thinker_chunks_done=True,
+            ),
+            False,
+        ),
+        (
+            SimpleNamespace(
+                pending_feedback_queue=[],
+                pending_text_queue=[],
+                thinker_chunks_done=False,
+            ),
+            False,
+        ),
+    ],
+    ids=["no-data", "text-missing", "text-ready", "thinker-done", "feedback-missing"],
+)
+def test_a_row_awaits_thinker_text_only_while_its_feedback_is_ready_and_the_stream_is_open(
+    data: SimpleNamespace | None, awaits: bool
+) -> None:
+    assert QwenTalkerModelRunner.data_awaits_thinker_text(data) is awaits
+
+
+@pytest.mark.usefixtures("talker_server_args")
+def test_a_talker_waiting_on_thinker_text_defers_its_turn_until_the_text_arrives(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """With the talker first, the thinker's next step, which a stream's first audio waits on, sat behind talker steps."""
+    engines = ProcessEngines()
+    talker_context = RuntimeContext(parallel=ParallelContext())
+    monkeypatch.setattr(talker_scheduler_module, "process_engines", lambda: engines)
+    scheduler = row_readiness_scheduler(monkeypatch, {"second"})
+    scheduler.engine_context = talker_context
+    scheduler.model_runner.data_awaits_thinker_text = (
+        QwenTalkerModelRunner.data_awaits_thinker_text
+    )
+    batch = running_talker_batch(scheduler)
+    batch.reqs[1].omni_data = SimpleNamespace(
+        pending_feedback_queue=[1], pending_text_queue=[], thinker_chunks_done=False
+    )
+    monkeypatch.setattr(
+        OmniScheduler,
+        "get_next_batch_to_run",
+        lambda self: self.update_running_batch(self.running_batch),
+    )
+
+    decode_batch = scheduler.get_next_batch_to_run()
+    deferring_while_waiting = list(engines.deferring_contexts)
+    scheduler.process_batch_result(decode_batch, None)
+    batch.reqs[-1].omni_data.pending_text_queue.append(2)
+    scheduler.get_next_batch_to_run()
+
+    assert deferring_while_waiting == [talker_context]
+    assert engines.deferring_contexts == []
 
 
 @pytest.mark.usefixtures("talker_server_args")
