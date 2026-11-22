@@ -3663,10 +3663,7 @@ class OmniScheduler(Generic[RequestDataT]):
             else:
                 self.scheduler_thread_id = threading.get_ident()
                 self.running = True
-        with process_engines().hold(
-            self.engine_context,
-            priority=1 if self.shared_process_priority == "top" else 0,
-        ):
+        with process_engines().hold(self.engine_context, priority=0):
             self.run_serving_loop()
 
     def run_serving_loop(self) -> None:
