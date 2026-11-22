@@ -23,8 +23,8 @@ MMSU_SAMPLE_COUNT = 5000
 MMSU_ASR_CONCURRENCY = 4
 
 
-def main(root: Path, checkpoint: Path, mmsu: bool) -> None:
-    arms = (root / "first", root / "second")
+def main(root: Path, checkpoint: Path, mmsu: bool, single_arm: bool) -> None:
+    arms = (root,) if single_arm else (root / "first", root / "second")
     stages = ("seedtts", "mmsu") if mmsu else ("seedtts",)
     waveforms = sorted(
         waveform
@@ -104,7 +104,8 @@ if __name__ == "__main__":
     parser.add_argument("root", type=Path)
     parser.add_argument("checkpoint", type=Path)
     parser.add_argument("--mmsu", action="store_true")
+    parser.add_argument("--single-arm", action="store_true")
     arguments = parser.parse_args()
-    main(arguments.root, arguments.checkpoint, arguments.mmsu)
+    main(arguments.root, arguments.checkpoint, arguments.mmsu, arguments.single_arm)
 else:
     pass
