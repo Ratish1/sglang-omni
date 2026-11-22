@@ -59,10 +59,11 @@ def main(root: Path, maximum_context_tokens: int) -> None:
             maximum_sequence_tokens = int(sequence_lengths.max())
             assert maximum_sequence_tokens <= maximum_context_tokens
             schedules: list[torch.Tensor] = []
-            for sequence_bound_tokens in (
+            sequence_bounds = (
                 maximum_context_tokens,
                 maximum_sequence_tokens,
-            ):
+            )
+            for sequence_bound_tokens in sequence_bounds:
                 metadata = get_scheduler_metadata(
                     batch_size=batch_requests,
                     max_seqlen_q=1,
@@ -82,7 +83,12 @@ def main(root: Path, maximum_context_tokens: int) -> None:
             native_schedule = physical_schedule(
                 frame["attention_scheduler_metadata"], batch_requests
             )
-            assert torch.equal(schedules[0], native_schedule), (capture, frame_index)
+            native_bound_index = int(step["attention_uses_cpu_lengths"])
+            assert step["attention_bound_tokens"] == sequence_bounds[native_bound_index]
+            assert torch.equal(schedules[native_bound_index], native_schedule), (
+                capture,
+                frame_index,
+            )
             request_row = step["request_row"]
             comparisons.append(
                 FrameComparison(
