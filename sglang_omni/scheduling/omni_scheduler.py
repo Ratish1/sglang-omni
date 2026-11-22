@@ -5128,10 +5128,8 @@ class OmniScheduler(Generic[RequestDataT]):
             # Route through sync when the runner's collect has a sync-only
             # fallback (default True for runners not overriding lookahead_eligible).
             runner = self.model_runner
-            # note (ratish): in a shared process the other engine's kernels fill this one's host gaps, and the next step's setup waits on the launched one inside SGLang (decode mrope deltas), which would hold the turn through it.
             use_lookahead = (
                 batch is not None
-                and not process_engines().is_shared
                 and (
                     (
                         len(batch.reqs) >= self.async_decode_min_batch_size
