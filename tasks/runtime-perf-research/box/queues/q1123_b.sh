@@ -2,7 +2,9 @@
 # 11-23, node-0001, both cards, after q1123_a. Part 2 bisect: the final combined head F (085064564) against F with one
 # mechanism removed (or, for the talker slot state, added), speech alone colocated c16 then c64 in one boot, same-time
 # pairs on the two cards, swapped, after an F against F pair for the band. Then one traced c16 boot per arm (turn,
-# thinker step and talker batch probes) for the mechanism reads.
+# thinker step and talker batch probes) for the mechanism reads. The blocking-copies arm puts fix A's four index copies
+# back to blocking: on its landing base fix A shows no served gain in two processes (q1123_a, q1123_a2), so its place
+# is decided by what it buys inside one context. q1123_a3 (fix A's c16 lean read on main) is dropped for that reason.
 # Decision rules, written before the runs: a row moves when both swapped pairs move it the same way past the F/F pair's
 # delta for that row. Removal makes a row worse: the mechanism is needed, its traced read names what it buys. Removal
 # makes a row better and none worse: the mechanism is dropped from part 2. No row moves and the traced read is level:
@@ -13,7 +15,7 @@ K=/workspace/kit/tasks/runtime-perf-research/box
 F=/workspace/ocvg7
 CONTEXT_32K="--preprocessing.factory.max_seq_len 32768 --thinker.factory.max_seq_len 32768"
 TRACE_PROBES="OMNI_HOP_PROBE_TALKER_BATCHES=1 OMNI_HOP_PROBE_THINKER_STEPS=1 OMNI_HOP_PROBE_TURNS=1"
-ARMS="no-yields no-step-yields no-defer no-backlog talker-slot equal-turn no-stream-priority lookahead read-in-turn"
+ARMS="blocking-copies no-yields no-step-yields no-defer no-backlog talker-slot equal-turn no-stream-priority lookahead read-in-turn"
 export SGLANG_OMNI_STARTUP_TIMEOUT=3600
 log() { echo "$* $(date -u +%T)" >> $O/queue.log; }
 note() { log "boot $1 $(git -C $2 rev-parse --short HEAD) $(git -C $2 rev-parse --short=12 HEAD:sglang_omni) $3 start"; }
@@ -58,7 +60,7 @@ for arm in $ARMS; do
     || git -C /workspace/x-$arm checkout -q --detach origin/dev/qwen3-omni-oc-bisect-$arm
   log "tree x-$arm $(git -C /workspace/x-$arm rev-parse --short HEAD) $(git -C /workspace/x-$arm rev-parse --short=12 HEAD:sglang_omni)"
 done
-until grep -q "q1123_a3 done" $O/queue.log 2>/dev/null; do sleep 20; done
+until grep -q "q1123_a2 done" $O/queue.log 2>/dev/null; do sleep 20; done
 log "q1123_b start"
 quiet_host
 both "speech ff_f0 $F 0 210" "speech ff_f1 $F 1 210"
