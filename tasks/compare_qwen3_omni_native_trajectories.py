@@ -91,6 +91,26 @@ def validate(directory: Path) -> list[dict[str, torch.Tensor]]:
                     int(frame["attention_sequence_lengths"][step["request_row"]])
                     == step["sequence_length"]
                 )
+                if "scheduled_sequence_lengths_cpu" in frame:
+                    assert torch.equal(
+                        frame["scheduled_sequence_lengths_cpu"],
+                        frame["attention_sequence_lengths"][: len(step["request_ids"])],
+                    )
+                    if step["cuda_graph"]:
+                        assert torch.equal(
+                            frame["graph_sequence_lengths_cpu"],
+                            frame["attention_sequence_lengths"],
+                        )
+                    else:
+                        pass
+                    if step["attention_uses_cpu_lengths"]:
+                        assert step["attention_bound_tokens"] == int(
+                            frame["attention_sequence_lengths"].max()
+                        )
+                    else:
+                        pass
+                else:
+                    pass
                 for field in ("keys", "values"):
                     expected_prefix = torch.cat(
                         [

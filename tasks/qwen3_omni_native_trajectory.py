@@ -74,6 +74,9 @@ class NativeTalkerTrajectory:
                         forward_batch.extend_prefix_lens_cpu[request_row]
                     )
                 else:
+                    snapshot["scheduled_sequence_lengths_cpu"] = (
+                        forward_batch.seq_lens_cpu.detach().clone()
+                    )
                     snapshot["queued_feedback"] = (
                         request.data.pending_feedback_queue[0].detach().clone()
                     )
@@ -161,6 +164,20 @@ class NativeTalkerTrajectory:
                     assert attention.sliding_window_size in (None, -1)
                     assert attention.k_scale is None and attention.v_scale is None
                     attention_metadata = backend.forward_metadata
+                    metadata["attention_bound_tokens"] = (
+                        attention_metadata.max_seq_len_k
+                    )
+                    metadata["attention_uses_cpu_lengths"] = backend.needs_cpu_seq_lens
+                    if can_run_cuda_graph:
+                        snapshot["graph_sequence_lengths_cpu"] = (
+                            model_runner.decode_cuda_graph_runner.buffers.seq_lens_cpu[
+                                : metadata["graph_batch_rows"]
+                            ]
+                            .detach()
+                            .clone()
+                        )
+                    else:
+                        pass
                     assert attention_metadata.local_attn_metadata is None
                     assert attention_metadata.max_seq_len_q == 1
                     sequence_length = metadata["sequence_length"]
