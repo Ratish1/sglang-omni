@@ -128,6 +128,17 @@ def compare_attention_schedules(
                 ),
             }
         )
+        outputs[-1].update(
+            {
+                f"layer0_{name}": snapshot[name][: len(requests)].clone()
+                for name in (
+                    "attention_context",
+                    "mlp_normalized",
+                    "expert_ids",
+                    "layer_output",
+                )
+            }
+        )
         writes.append([buffer.index_select(0, write_slots) for buffer in buffers])
         for buffer, expected in zip(buffers, prefix_values, strict=True):
             assert torch.equal(buffer.index_select(0, prefix_slots), expected)
@@ -214,6 +225,21 @@ def compare_attention_schedules(
             if not torch.equal(
                 writes[0][index + len(pool.k_buffer)],
                 writes[1][index + len(pool.k_buffer)],
+            )
+        ],
+        "changed_selected_key_layers": [
+            index
+            for index in range(len(pool.k_buffer))
+            if not torch.equal(
+                writes[0][index][selected_row], writes[1][index][selected_row]
+            )
+        ],
+        "changed_selected_value_layers": [
+            index
+            for index in range(len(pool.v_buffer))
+            if not torch.equal(
+                writes[0][index + len(pool.k_buffer)][selected_row],
+                writes[1][index + len(pool.k_buffer)][selected_row],
             )
         ],
     }
