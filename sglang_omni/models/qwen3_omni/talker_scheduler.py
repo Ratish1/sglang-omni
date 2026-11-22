@@ -161,6 +161,7 @@ class QwenTalkerScheduler(OmniScheduler[SGLangARRequestData]):
         ready = set(ready_rows)
         self.awaits_thinker_text = any(
             self.model_runner.data_awaits_thinker_text(request.omni_data)
+            and len(request.output_ids) < 10
             for row_index, request in enumerate(batch.reqs)
             if row_index not in ready
         )
