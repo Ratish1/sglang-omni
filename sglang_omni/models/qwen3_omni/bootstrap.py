@@ -66,7 +66,7 @@ def create_thinker_scheduler(
     from sglang_omni.vendor.sglang.server_args import override_server_args
 
     prefill_graph_backend = get_prefill_cuda_graph_backend(server_args)
-    enable_prefill_input_embeds = prefill_graph_backend == CudaGraphBackend.BREAKABLE
+    enable_prefill_input_embeds = prefill_graph_backend != CudaGraphBackend.DISABLED
 
     # note (ratish): a session turn's prefill does not write its rows to the prompt hidden store,
     # so its talker keeps zeros at multimodal prompt rows.
@@ -129,7 +129,7 @@ def create_thinker_scheduler(
         model_config,
     ) = infrastructure
 
-    if prefill_graph_backend == CudaGraphBackend.BREAKABLE:
+    if prefill_graph_backend != CudaGraphBackend.DISABLED:
         cuda_graph_batch_validator.attest_prefill_cuda_graphs(
             model_worker.model_runner,
             operator_selected=operator_selected_prefill_backend,
@@ -143,7 +143,7 @@ def create_thinker_scheduler(
         model_runner = QwenSessionThinkerModelRunner(
             model_worker, output_proc, capture_prompt_hidden_states=False
         )
-    elif speech_enabled and prefill_graph_backend != CudaGraphBackend.BREAKABLE:
+    elif speech_enabled and prefill_graph_backend == CudaGraphBackend.DISABLED:
         model_runner = ThinkerModelRunner(
             model_worker,
             output_proc,
