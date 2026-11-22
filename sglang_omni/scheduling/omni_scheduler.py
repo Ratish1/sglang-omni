@@ -2542,25 +2542,6 @@ class OmniScheduler(Generic[RequestDataT]):
                 self.last_batch = None
         return None
 
-    def expedite_for_first_emits(self) -> None:
-        """In a shared process, rank this engine first while a speaking request it holds has not emitted yet."""
-        if not process_engines().is_shared:
-            return
-        else:
-            pass
-        held_requests = [*self.waiting_queue, *self.running_batch.reqs]
-        if self.chunked_req is not None:
-            held_requests.append(self.chunked_req)
-        else:
-            pass
-        awaits_first_emit = any(
-            request.omni_data is not None
-            and request.omni_data.speaks
-            and request.rid not in self.first_emit_done
-            for request in held_requests
-        )
-        process_engines().expedite(self.engine_context, is_expedited=awaits_first_emit)
-
     def update_running_batch(self, batch: ScheduleBatch) -> ScheduleBatch | None:
         if not self.enable_plain_fallback:
             return _Upstream.update_running_batch(self, batch)
@@ -5118,7 +5099,6 @@ class OmniScheduler(Generic[RequestDataT]):
                 continue
             else:
                 pass
-            self.expedite_for_first_emits()
             process_engines().yield_turn()
 
             if (

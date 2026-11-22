@@ -45,12 +45,11 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     CacheRequestOutcome,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
-from sglang.srt.runtime_context import ParallelContext, RuntimeContext, get_context
+from sglang.srt.runtime_context import get_context
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
 from sglang_omni.admission import ContextExhaustedError, QueueFullError
-from sglang_omni.model_runner.process_engines import ProcessEngines
 from sglang_omni.model_runner.thinker_model_runner import ThinkerModelRunner
 from sglang_omni.proto import OmniRequest, StagePayload
 from sglang_omni.proto.session import (
@@ -239,41 +238,6 @@ def test_route_session_input_records_authoritative_ar_bypass(
     assert (message.request_id, message.type) == (payload.request_id, "result")
     assert message.data is (payload if bypass_generation else eos_payload)
     assert scheduler.outbox.empty()
-
-
-def test_a_shared_engine_is_expedited_only_while_a_speaking_request_awaits_its_first_emit(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A speech request's prefill waited behind the talker's turns, though its first audio waits on that first emit."""
-    engines = ProcessEngines()
-    thinker_context, talker_context = (
-        RuntimeContext(parallel=ParallelContext()) for _ in range(2)
-    )
-    engines.engine_contexts.extend([thinker_context, talker_context])
-    monkeypatch.setattr(omni_scheduler_module, "process_engines", lambda: engines)
-    scheduler = object.__new__(OmniScheduler)
-    scheduler.engine_context = thinker_context
-    scheduler.first_emit_done = set()
-    scheduler.chunked_req = None
-    speaking = SimpleNamespace(rid="speaking", omni_data=SimpleNamespace(speaks=True))
-    silent = SimpleNamespace(rid="silent", omni_data=SimpleNamespace(speaks=False))
-    scheduler.waiting_queue = [silent]
-    scheduler.running_batch = SimpleNamespace(reqs=[speaking])
-    seen: list[list[RuntimeContext]] = []
-
-    scheduler.expedite_for_first_emits()
-    seen.append(list(engines.expedited_contexts))
-    scheduler.first_emit_done.add("speaking")
-    scheduler.expedite_for_first_emits()
-    seen.append(list(engines.expedited_contexts))
-    scheduler.running_batch = SimpleNamespace(reqs=[])
-    scheduler.chunked_req = SimpleNamespace(
-        rid="chunked", omni_data=SimpleNamespace(speaks=True)
-    )
-    scheduler.expedite_for_first_emits()
-    seen.append(list(engines.expedited_contexts))
-
-    assert seen == [[thinker_context], [], [thinker_context]]
 
 
 @pytest.mark.accelerator

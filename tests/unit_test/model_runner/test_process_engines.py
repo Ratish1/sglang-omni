@@ -164,7 +164,7 @@ def test_a_left_turn_goes_to_a_waiting_thinker_before_a_deferring_talker() -> No
     assert order == ["thinker", "talker"]
 
 
-def test_an_expedited_thinker_keeps_the_turn_and_is_handed_it_before_the_talker() -> (
+def test_an_expedited_lower_priority_engine_is_handed_the_turn_before_the_talker() -> (
     None
 ):
     engines, (holder_context, thinker_context, talker_context) = make_engines(3)
