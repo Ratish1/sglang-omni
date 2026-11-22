@@ -88,6 +88,8 @@ class SGLangARRequestData(ARRequestData):
     """Per-request state for SGLang-backed AR stages."""
 
     req: Req | None = None
+    # note (ratish): a speaking request's first audio waits on this stage's first emit.
+    speaks: bool = False
     # note (Junnan Li): The bridge binds unit-relative spans to retained session history.
     unit_embedding_spans: list[EmbeddingSpan] = field(default_factory=list)
     session_embedding_spans: list[EmbeddingSpan] = field(default_factory=list)

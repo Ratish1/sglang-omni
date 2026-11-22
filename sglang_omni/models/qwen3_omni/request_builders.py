@@ -940,6 +940,7 @@ def build_sglang_thinker_request(
         temperature=temperature,
         output_ids=req.output_ids,
         req=req,
+        speaks=speaks,
     )
     data.return_logprob = bool(params.get("return_logprob"))
     return data
