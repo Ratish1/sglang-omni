@@ -149,10 +149,7 @@ class ThinkerModelRunner(ModelRunner):
             return
         else:
             pass
-        # note (ratish): a blocking copy here would wait for the whole forward just launched on this stream.
-        batch_rows = host_to_device(
-            torch.cat(request_rows), forward_batch.out_cache_loc.device
-        )
+        batch_rows = torch.cat(request_rows).to(forward_batch.out_cache_loc.device)
         # note (ratish): req_to_token holds the virtual slot ids when the KV index is translated.
         slot_ids = (
             forward_batch.out_cache_loc
@@ -405,8 +402,8 @@ class ThinkerModelRunner(ModelRunner):
                             visual_count, device=slots.device
                         )
                         n_image = img_pos.numel()
-                        img_idx = host_to_device(slots[:n_image], device)
-                        vid_idx = host_to_device(slots[n_image:], device)
+                        img_idx = slots[:n_image].to(device)
+                        vid_idx = slots[n_image:].to(device)
                         merged = []
                         for img_e, vid_e in zip(image_ds, video_ds):
                             img_e = img_e[image_offset : image_offset + image_count]
@@ -463,7 +460,7 @@ class ThinkerModelRunner(ModelRunner):
         if scatter_rows:
             # note (chenrui): one index_copy_ keeps the kernel count independent
             # of batch mix; avoid concatenating the common single-source case.
-            row_idx = host_to_device(torch.cat(scatter_rows), device)
+            row_idx = torch.cat(scatter_rows).to(device=device)
             srcs = [
                 s.to(device=device, dtype=input_embeds.dtype, non_blocking=True)
                 for s in scatter_srcs
@@ -479,9 +476,7 @@ class ThinkerModelRunner(ModelRunner):
             combined_mask = torch.zeros(
                 len(forward_batch.input_ids), dtype=torch.bool, device=device
             )
-            combined_mask.index_fill_(
-                0, host_to_device(torch.cat(visual_rows), device), True
-            )
+            combined_mask[torch.cat(visual_rows).to(device=device)] = True
             visual_masks_out = combined_mask
             if len(deepstack_visual_embeds_list) == 1:
                 ds_embeds_out = deepstack_visual_embeds_list[0]
