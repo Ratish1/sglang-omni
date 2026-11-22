@@ -82,6 +82,9 @@ THINKER_PARTS = os.environ.get("OMNI_HOP_PROBE_THINKER_PARTS") == "1"
 # OMNI_HOP_PROBE_TURNS=1 records each wait for a shared process's engine turn over 0.05 ms (kind "tw") and each leave
 # that hands the turn to a waiter (kind "th": the leaver's priority, its hold span and the sglang_omni frames it left from)
 TURNS = os.environ.get("OMNI_HOP_PROBE_TURNS") == "1"
+# OMNI_HOP_PROBE_FA_NUM_SPLITS=<n> sets every FlashAttention backend's KV split count to n, a measurement arm only: it
+# removes the split count as a rounding channel so two trees' quality can be compared without it
+FA_NUM_SPLITS = os.environ.get("OMNI_HOP_PROBE_FA_NUM_SPLITS", "")
 PAYLOAD_READS = os.environ.get("OMNI_HOP_PROBE_PAYLOAD_READS") == "1"
 # OMNI_HOP_PROBE_SYNC_SITES=1 sets torch's sync debug mode to warn in every process and counts each synchronizing
 # CUDA call by thread and by its innermost sglang frames (kind "sync", the running counts once a second); a check
@@ -850,6 +853,18 @@ def leave_site(frame):
     return " < ".join(site)
 
 
+def patch_flash_attention(module):
+    backend = module.FlashAttentionBackend
+    init = backend.__init__
+
+    @functools.wraps(init)
+    def init_with_splits(self, *args, **kwargs):
+        init(self, *args, **kwargs)
+        self.num_splits = int(FA_NUM_SPLITS)
+
+    backend.__init__ = init_with_splits
+
+
 def patch_process_engines(module):
     engines = module.ProcessEngines
     take_turn, leave_turn = engines.take_turn, engines.leave_turn
@@ -932,6 +947,12 @@ else:
     pass
 if TURNS:
     PATCHES["sglang_omni.model_runner.process_engines"] = patch_process_engines
+else:
+    pass
+if FA_NUM_SPLITS:
+    PATCHES["sglang.srt.layers.attention.flashattention_backend"] = (
+        patch_flash_attention
+    )
 else:
     pass
 
