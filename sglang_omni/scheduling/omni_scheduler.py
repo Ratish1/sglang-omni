@@ -3675,9 +3675,7 @@ class OmniScheduler(Generic[RequestDataT]):
             loop_priority: int | None = self.device_module.Stream.priority_range()[1]
         elif process_engines().is_shared:
             # note (ratish): engines sharing a process share its context, so the talker's steps go first on the card.
-            loop_priority = self.device_module.Stream.priority_range()[
-                1 if self.shared_process_priority == "top" else 0
-            ]
+            loop_priority = self.device_module.Stream.priority_range()[0]
         else:
             loop_priority = None
         try:
