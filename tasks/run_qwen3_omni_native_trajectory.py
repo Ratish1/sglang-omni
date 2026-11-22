@@ -71,6 +71,9 @@ def main(
     code_trial_choice: list[int],
     cache_trial_reference: list[Path],
     cache_target_reference: Path | None,
+    continuation_reference: Path | None,
+    continuation_target: Path | None,
+    continuation_sequences: list[int],
 ) -> None:
     assert (code_trial_reference is None) == (not code_trial_choice)
     if code_trial_reference is not None:
@@ -86,6 +89,15 @@ def main(
         assert attention_trial_splits == 1
     else:
         assert cache_target_reference is None
+    if continuation_reference is not None:
+        assert continuation_target is not None
+        assert len(continuation_sequences) == 2
+        assert continuation_sequences[0] < continuation_sequences[1]
+        assert len(selected_samples) == 1
+        assert code_trial_reference is None and not cache_trial_reference
+        assert not attention_trial_sequences
+    else:
+        assert continuation_target is None and not continuation_sequences
     output.mkdir()
     samples = load_seedtts_samples(SEEDTTS_DATASET_ID)
     sample_ids = {sample.sample_id for sample in samples}
@@ -136,6 +148,15 @@ def main(
             ),
             "OMNI_NATIVE_CACHE_TARGET_REFERENCE": (
                 str(cache_target_reference) if cache_target_reference else ""
+            ),
+            "OMNI_NATIVE_CONTINUATION_REFERENCE": (
+                str(continuation_reference) if continuation_reference else ""
+            ),
+            "OMNI_NATIVE_CONTINUATION_TARGET": (
+                str(continuation_target) if continuation_target else ""
+            ),
+            "OMNI_NATIVE_CONTINUATION_SEQUENCES": ",".join(
+                str(value) for value in continuation_sequences
             ),
         },
         strip_proxy=True,
@@ -212,6 +233,10 @@ def main(
             assert (captures / f"cache-trial-{sequence_tokens}.json").is_file()
     else:
         pass
+    if continuation_reference is not None:
+        assert (captures / "continuation-trial.json").is_file()
+    else:
+        pass
     print(json.dumps({"seedtts_samples": len(samples), "captures": selected_samples}))
 
 
@@ -229,6 +254,9 @@ if __name__ == "__main__":
     parser.add_argument("--code-trial-choice", type=int, nargs=4, default=[])
     parser.add_argument("--cache-trial-reference", type=Path, nargs="+", default=[])
     parser.add_argument("--cache-target-reference", type=Path)
+    parser.add_argument("--continuation-reference", type=Path)
+    parser.add_argument("--continuation-target", type=Path)
+    parser.add_argument("--continuation-sequences", type=int, nargs=2, default=[])
     arguments = parser.parse_args()
     main(
         arguments.output,
@@ -242,6 +270,9 @@ if __name__ == "__main__":
         arguments.code_trial_choice,
         arguments.cache_trial_reference,
         arguments.cache_target_reference,
+        arguments.continuation_reference,
+        arguments.continuation_target,
+        arguments.continuation_sequences,
     )
 else:
     pass

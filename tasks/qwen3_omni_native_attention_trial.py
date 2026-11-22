@@ -25,6 +25,10 @@ class AttentionTrial:
     result: GenerationBatchResult
     selected_cache: list[torch.Tensor]
     selected_outputs_equal: bool
+    selected_outputs: dict[str, torch.Tensor]
+    selected_probe: dict[str, torch.Tensor]
+    scheduler_metadata: torch.Tensor
+    sequence_bound_tokens: int
 
 
 class NativeCacheTrial:
@@ -165,6 +169,7 @@ def compare_attention_schedules(
     selected_row: int,
     destination: Path,
     attention_splits: int,
+    save_tensors: bool = True,
 ) -> AttentionTrial:
     runner = worker.model_runner
     model = runner.model
@@ -236,6 +241,8 @@ def compare_attention_schedules(
     outputs: list[dict[str, torch.Tensor]] = []
     writes: list[list[torch.Tensor]] = []
     schedules: list[list[int]] = []
+    selected_probe: dict[str, torch.Tensor] = {}
+    alternative_scheduler_metadata: torch.Tensor | None = None
     for alternative in (False, True, False):
         for buffer, previous in zip(buffers, previous_writes, strict=True):
             buffer.index_copy_(0, write_slots, previous)
@@ -249,6 +256,12 @@ def compare_attention_schedules(
             result = worker.forward_batch_generation(forward_batch)
         assert result.can_run_cuda_graph
         snapshot = model.native_layer_probe.snapshot_for_batch(graph_runner.bs, True)
+        if alternative:
+            selected_probe = model.native_layer_probe.read(
+                selected_row, graph_runner.bs, True
+            )
+        else:
+            pass
         outputs.append(
             {
                 "logits": result.logits_output.next_token_logits[
@@ -285,6 +298,10 @@ def compare_attention_schedules(
             assert torch.equal(getattr(model, name), expected), name
         metadata = backend.forward_metadata
         assert metadata.scheduler_metadata is not None
+        if alternative:
+            alternative_scheduler_metadata = metadata.scheduler_metadata.clone()
+        else:
+            pass
         schedules.append(
             physical_schedule(metadata.scheduler_metadata.cpu(), graph_runner.bs)[
                 0
@@ -382,23 +399,31 @@ def compare_attention_schedules(
             )
         ],
     }
-    torch.save(
-        {
-            "reference": {name: value.cpu() for name, value in reference.items()},
-            "alternative": {name: value.cpu() for name, value in alternative.items()},
-            "reference_cache": [buffer[selected_row].cpu() for buffer in writes[0]],
-            "alternative_cache": [buffer[selected_row].cpu() for buffer in writes[1]],
-            "sampling": {
-                name: value[: len(requests)].cpu()
-                for name, value in input_buffers.items()
-                if name != "feedback_buffer"
+    if save_tensors:
+        torch.save(
+            {
+                "reference": {name: value.cpu() for name, value in reference.items()},
+                "alternative": {
+                    name: value.cpu() for name, value in alternative.items()
+                },
+                "reference_cache": [buffer[selected_row].cpu() for buffer in writes[0]],
+                "alternative_cache": [
+                    buffer[selected_row].cpu() for buffer in writes[1]
+                ],
+                "sampling": {
+                    name: value[: len(requests)].cpu()
+                    for name, value in input_buffers.items()
+                    if name != "feedback_buffer"
+                },
+                "positions": forward_batch.positions.cpu(),
             },
-            "positions": forward_batch.positions.cpu(),
-        },
-        destination.with_suffix(".pt"),
-    )
+            destination.with_suffix(".pt"),
+        )
+    else:
+        pass
     with destination.open("x") as receipt:
         json.dump(report, receipt, indent=2)
+    assert alternative_scheduler_metadata is not None
     return AttentionTrial(
         result=result,
         selected_cache=[
@@ -408,4 +433,11 @@ def compare_attention_schedules(
             torch.equal(reference[name][selected_row], alternative[name][selected_row])
             for name in ("codes", "feedback", "main_codes")
         ),
+        selected_outputs={
+            name: alternative[name][selected_row].clone()
+            for name in ("logits", "query", "codes", "feedback", "main_codes")
+        },
+        selected_probe=selected_probe,
+        scheduler_metadata=alternative_scheduler_metadata,
+        sequence_bound_tokens=tight_bounds[0],
     )

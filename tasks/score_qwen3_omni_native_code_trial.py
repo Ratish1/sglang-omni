@@ -26,7 +26,7 @@ def main(
     baseline: Path,
     intervention: Path,
     asr_checkpoint: Path,
-    trial_kind: Literal["code", "cache"],
+    trial_kind: Literal["code", "cache", "continuation"],
 ) -> None:
     trial = json.loads((intervention / f"captures/{trial_kind}-trial.json").read_text())
     sample_id = trial["request_id"].removeprefix("feedback-trace-native-")
@@ -59,9 +59,13 @@ def main(
         assert first_differences["stored_values"] == trial["frame_index"]
         for name in ("codec_ids", "feedback", "queued_feedback"):
             assert first_differences.get(name, len(frames[1])) > trial["frame_index"]
-    assert (
-        first_differences.get("predictor_query", len(frames[1])) > trial["frame_index"]
-    )
+    if trial_kind == "continuation":
+        assert first_differences["predictor_query"] == trial["frame_index"]
+    else:
+        assert (
+            first_differences.get("predictor_query", len(frames[1]))
+            > trial["frame_index"]
+        )
     records = []
     for root in roots:
         matches = [
@@ -135,7 +139,9 @@ if __name__ == "__main__":
     parser.add_argument("baseline", type=Path)
     parser.add_argument("intervention", type=Path)
     parser.add_argument("asr_checkpoint", type=Path)
-    parser.add_argument("--trial-kind", choices=("code", "cache"), default="code")
+    parser.add_argument(
+        "--trial-kind", choices=("code", "cache", "continuation"), default="code"
+    )
     arguments = parser.parse_args()
     main(
         arguments.baseline,

@@ -11,6 +11,7 @@ from qwen3_omni_native_attention_trial import (
     compare_attention_schedules,
 )
 from qwen3_omni_native_code_trial import NativeCodeTrial
+from qwen3_omni_native_continuation_trial import NativeContinuationTrial
 from sglang.srt.layers.attention.flashattention_backend import FlashAttentionBackend
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
@@ -90,6 +91,25 @@ class NativeTalkerTrajectory:
                 self.cache_trials[sequence_tokens] = trial
         else:
             pass
+        self.continuation_trial: NativeContinuationTrial | None = None
+        continuation_reference = environ.get("OMNI_NATIVE_CONTINUATION_REFERENCE")
+        if continuation_reference:
+            assert self.code_trial is None and not self.cache_trials
+            assert not self.attention_trial_sequences
+            start_tokens, stop_tokens = (
+                int(value)
+                for value in environ["OMNI_NATIVE_CONTINUATION_SEQUENCES"].split(",")
+            )
+            self.continuation_trial = NativeContinuationTrial(
+                Path(continuation_reference),
+                Path(environ["OMNI_NATIVE_CONTINUATION_TARGET"]),
+                start_tokens,
+                stop_tokens,
+                self.directory / "continuation-trial.json",
+            )
+            assert self.request_ids == {self.continuation_trial.request_id}
+        else:
+            pass
         assert self.directory.is_dir()
 
     def paired_attention_forward(
@@ -130,7 +150,15 @@ class NativeTalkerTrajectory:
             row
             for row, request in enumerate(requests)
             if request.request_id in self.request_ids
-            and int(forward_batch.seq_lens_cpu[row]) in self.attention_trial_sequences
+            and (
+                int(forward_batch.seq_lens_cpu[row]) in self.attention_trial_sequences
+                or (
+                    self.continuation_trial is not None
+                    and self.continuation_trial.start_sequence_tokens
+                    <= int(forward_batch.seq_lens_cpu[row])
+                    < self.continuation_trial.stop_sequence_tokens
+                )
+            )
         ]
         if not selected_rows:
             return None
@@ -146,9 +174,29 @@ class NativeTalkerTrajectory:
             requests,
             selected_row,
             destination,
-            self.attention_trial_splits,
+            1 if self.continuation_trial is not None else self.attention_trial_splits,
+            save_tensors=(
+                self.continuation_trial is None
+                or not self.continuation_trial.sequence_tokens
+            ),
         )
-        if sequence_tokens in self.cache_trials:
+        if self.continuation_trial is not None:
+            result = trial.result
+            if not self.continuation_trial.sequence_tokens:
+                self.after_forward(
+                    forward_batch,
+                    requests,
+                    worker.model_runner,
+                    result.logits_output.hidden_states,
+                    result.logits_output.next_token_logits,
+                    result.can_run_cuda_graph,
+                )
+            else:
+                pass
+            self.continuation_trial.publish(
+                worker, forward_batch, trial, selected_row, self.tensors[request_id]
+            )
+        elif sequence_tokens in self.cache_trials:
             result = trial.result
             self.after_forward(
                 forward_batch,
@@ -289,6 +337,16 @@ class NativeTalkerTrajectory:
                             can_run_cuda_graph,
                         )
                     )
+                    if (
+                        self.continuation_trial is not None
+                        and self.continuation_trial.sequence_tokens
+                        and self.continuation_trial.sequence_tokens[-1]
+                        == metadata["sequence_length"]
+                    ):
+                        snapshot.update(self.continuation_trial.probe)
+                        metadata["selected_continuation_intervention"] = True
+                    else:
+                        pass
                     backend = (
                         model_runner.decode_cuda_graph_runner.attn_backend
                         if can_run_cuda_graph
@@ -354,6 +412,21 @@ class NativeTalkerTrajectory:
                     else:
                         pass
                     metadata["attention_num_splits"] = backend.decode_num_splits
+                    if metadata.get("selected_continuation_intervention", False):
+                        assert self.continuation_trial is not None
+                        assert self.continuation_trial.scheduler_metadata is not None
+                        snapshot["stock_attention_scheduler_metadata"] = snapshot[
+                            "attention_scheduler_metadata"
+                        ]
+                        snapshot["attention_scheduler_metadata"] = (
+                            self.continuation_trial.scheduler_metadata
+                        )
+                        metadata["attention_bound_tokens"] = (
+                            self.continuation_trial.sequence_bound_tokens
+                        )
+                        metadata["attention_num_splits"] = 1
+                    else:
+                        pass
                 snapshot["stored_keys"] = torch.stack(
                     [layer.index_select(0, token_slots) for layer in pool.k_buffer]
                 )
@@ -375,6 +448,10 @@ class NativeTalkerTrajectory:
         for trial in self.cache_trials.values():
             assert request_id == trial.request_id and trial.applied
         snapshots = self.tensors.pop(request_id)
+        if self.continuation_trial is not None:
+            self.continuation_trial.finish(snapshots)
+        else:
+            pass
         metadata = self.metadata.pop(request_id)
         destination = self.directory / request_id.removeprefix("feedback-trace-native-")
         destination.mkdir()
