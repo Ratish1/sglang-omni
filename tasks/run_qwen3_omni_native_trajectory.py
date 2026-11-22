@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Capture selected speech trajectories under full c32 speech workloads."""
+"""Capture selected speech trajectories under full speech workloads."""
 
 import argparse
 import asyncio
@@ -64,6 +64,7 @@ def main(
     checkpoint: Path,
     tactic_cache: Path,
     selected_samples: list[str],
+    client_concurrency: int,
     mmsu: bool,
     attention_trial_sequences: list[int],
     attention_trial_splits: int,
@@ -162,7 +163,7 @@ def main(
         strip_proxy=True,
     )
     try:
-        with patch.object(benchmark, "CLIENT_CONCURRENCY", 32):
+        with patch.object(benchmark, "CLIENT_CONCURRENCY", client_concurrency):
             asyncio.run(
                 benchmark.run_seedtts(
                     output / "seedtts",
@@ -188,7 +189,7 @@ def main(
                             temperature=0.0,
                             seed=REQUEST_SEED,
                             warmup=0,
-                            max_concurrency=32,
+                            max_concurrency=client_concurrency,
                             request_rate=float("inf"),
                             timeout_s=500,
                             disable_tqdm=False,
@@ -248,6 +249,7 @@ if __name__ == "__main__":
     parser.add_argument("tactic_cache", type=Path)
     parser.add_argument("--mmsu", action="store_true")
     parser.add_argument("--selected-samples", nargs="+", default=list(SELECTED_SAMPLES))
+    parser.add_argument("--client-concurrency", type=int, default=32)
     parser.add_argument("--attention-trial-sequences", type=int, nargs="*", default=[])
     parser.add_argument("--attention-trial-splits", type=int, choices=(0, 1), default=0)
     parser.add_argument("--code-trial-reference", type=Path)
@@ -263,6 +265,7 @@ if __name__ == "__main__":
         arguments.checkpoint,
         arguments.tactic_cache,
         arguments.selected_samples,
+        arguments.client_concurrency,
         arguments.mmsu,
         arguments.attention_trial_sequences,
         arguments.attention_trial_splits,
