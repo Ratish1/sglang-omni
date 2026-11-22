@@ -17,9 +17,46 @@ from sglang.srt.environ import envs
 from sglang.srt.layers.activation import silu_and_mul
 
 
+def evaluate_experts(
+    inputs: torch.Tensor,
+    expert_ids: torch.Tensor,
+    expert_weights: torch.Tensor,
+    projections: dict[str, torch.Tensor],
+    tune_max_tokens: int,
+) -> dict[str, torch.Tensor]:
+    shared_gate = functional.linear(inputs, projections["shared_gate"])
+    shared_output = functional.linear(
+        silu_and_mul(functional.linear(inputs, projections["shared_gate_up"])),
+        projections["shared_down"],
+    )
+    router_logits = functional.linear(inputs, projections["router"])
+    output = cutlass_fused_moe(
+        input=inputs,
+        token_selected_experts=expert_ids,
+        token_final_scales=expert_weights,
+        fc1_expert_weights=projections["routed_up_gate"],
+        fc2_expert_weights=projections["routed_down"],
+        output_dtype=inputs.dtype,
+        quant_scales=None,
+        use_fused_finalize=False,
+        tune_max_num_tokens=tune_max_tokens,
+    )[0]
+    return {
+        "routed_experts": output,
+        "shared_gate": shared_gate,
+        "shared_expert": shared_output,
+        "router_logits": router_logits,
+        "layer_output": output + shared_output * torch.sigmoid(shared_gate),
+    }
+
+
 @torch.inference_mode()
 def main(
-    root: Path, checkpoint: Path, autotune_cache: Path, tune_max_tokens: int
+    root: Path,
+    checkpoint: Path,
+    autotune_cache: Path,
+    tune_max_tokens: int,
+    exchange_peer_batches: bool,
 ) -> None:
     torch.set_num_threads(1)
     assert not envs.SGLANG_FLASHINFER_MOE_FUSED_FINALIZE.get()
@@ -84,10 +121,19 @@ def main(
             weights[f"{shared_prefix}shared_expert.up_proj.weight"],
         )
     )
+    projections = {
+        "routed_up_gate": up_gate_weights,
+        "routed_down": down_weights,
+        "shared_gate_up": shared_gate_up_weights,
+        "shared_down": weights[f"{shared_prefix}shared_expert.down_proj.weight"],
+        "shared_gate": weights[f"{shared_prefix}shared_expert_gate.weight"],
+        "router": weights[f"{shared_prefix}gate.weight"],
+    }
     report = {
         "checkpoint": str(checkpoint),
         "autotune_cache_sha256": sha256(autotune_cache.read_bytes()).hexdigest(),
         "tune_max_tokens": tune_max_tokens,
+        "exchange_peer_batches": exchange_peer_batches,
         "scope": "Whole recorded padded input batch, original IDs and scales, selected-row routed/shared outputs, gates and combine. Layer zero only; no generated speech or performance claim.",
         "captures": {},
     }
@@ -96,7 +142,21 @@ def main(
     for capture in sorted(root.glob("*/captures/*/trajectory.pt")):
         frames = validate(capture.parent)
         metadata = json.loads(capture.with_suffix(".json").read_text())["frames"]
+        if exchange_peer_batches:
+            arm = capture.relative_to(root).parts[0]
+            assert arm in ("first", "second")
+            other_arm = "second" if arm == "first" else "first"
+            peer_directory = root / other_arm / "captures" / capture.parent.name
+            peer_frames = validate(peer_directory)
+            peer_metadata = json.loads(
+                (peer_directory / "trajectory.json").read_text()
+            )["frames"]
+        else:
+            peer_frames = []
+            peer_metadata = []
         mismatches = []
+        peer_changes = []
+        exchanged_frames = 0
         checked_frames = 0
         for frame_index, (frame, step) in enumerate(zip(frames, metadata, strict=True)):
             if step["phase"] == "prefill":
@@ -122,35 +182,10 @@ def main(
                 frame["layer0_peer_mlp_normalized"][step["request_row"]],
                 frame["layer0_mlp_normalized"],
             )
-            shared_gate = functional.linear(
-                inputs, weights[f"{shared_prefix}shared_expert_gate.weight"]
+            outputs = evaluate_experts(
+                inputs, expert_ids, expert_weights, projections, tune_max_tokens
             )
-            shared_output = functional.linear(
-                silu_and_mul(functional.linear(inputs, shared_gate_up_weights)),
-                weights[f"{shared_prefix}shared_expert.down_proj.weight"],
-            )
-            router_logits = functional.linear(
-                inputs, weights[f"{shared_prefix}gate.weight"]
-            )
-            output = cutlass_fused_moe(
-                input=inputs,
-                token_selected_experts=expert_ids,
-                token_final_scales=expert_weights,
-                fc1_expert_weights=up_gate_weights,
-                fc2_expert_weights=down_weights,
-                output_dtype=inputs.dtype,
-                quant_scales=None,
-                use_fused_finalize=False,
-                tune_max_num_tokens=tune_max_tokens,
-            )[0]
-            combined_output = output + shared_output * torch.sigmoid(shared_gate)
-            for name, values in (
-                ("routed_experts", output),
-                ("shared_gate", shared_gate),
-                ("shared_expert", shared_output),
-                ("router_logits", router_logits),
-                ("layer_output", combined_output),
-            ):
+            for name, values in outputs.items():
                 selected = values[step["request_row"]].cpu()
                 actual = frame[f"layer0_{name}"]
                 assert torch.isfinite(selected).all()
@@ -164,10 +199,50 @@ def main(
                     )
                 else:
                     pass
+            if frame_index < len(peer_frames):
+                peer_frame = peer_frames[frame_index]
+                peer_step = peer_metadata[frame_index]
+                assert peer_step["phase"] == "decode"
+                peer_row = peer_step["request_row"]
+                source_row = step["request_row"]
+                peer_inputs = peer_frame["layer0_peer_mlp_normalized"].cuda()
+                peer_ids = peer_frame["layer0_peer_expert_ids"].cuda().int()
+                peer_weights = peer_frame["layer0_peer_expert_weights"].cuda().float()
+                peer_inputs[peer_row].copy_(
+                    frame["layer0_peer_mlp_normalized"][source_row]
+                )
+                peer_ids[peer_row].copy_(frame["layer0_peer_expert_ids"][source_row])
+                peer_weights[peer_row].copy_(
+                    frame["layer0_peer_expert_weights"][source_row]
+                )
+                exchanged = evaluate_experts(
+                    peer_inputs, peer_ids, peer_weights, projections, tune_max_tokens
+                )
+                for name, values in exchanged.items():
+                    selected = values[peer_row].cpu()
+                    control = outputs[name][source_row].cpu()
+                    assert torch.isfinite(selected).all()
+                    if not torch.equal(selected, control):
+                        peer_changes.append(
+                            {
+                                "frame": frame_index,
+                                "field": name,
+                                "source_batch_rows": inputs.shape[0],
+                                "peer_batch_rows": peer_inputs.shape[0],
+                                **difference(control, selected),
+                            }
+                        )
+                    else:
+                        pass
+                exchanged_frames += 1
+            else:
+                pass
             checked_frames += 1
         report["captures"][str(capture.relative_to(root))] = {
             "checked_frames": checked_frames,
             "mismatches": mismatches,
+            "exchanged_frames": exchanged_frames,
+            "peer_changes": peer_changes,
         }
         total_frames += checked_frames
         total_mismatches += len(mismatches)
@@ -178,7 +253,10 @@ def main(
     assert total_frames > 0
     report["total_frames"] = total_frames
     report["total_mismatches"] = total_mismatches
-    with (root / "moe-replay.json").open("x") as receipt:
+    report_name = (
+        "peer-batch-replay.json" if exchange_peer_batches else "moe-replay.json"
+    )
+    with (root / report_name).open("x") as receipt:
         json.dump(report, receipt, indent=2)
     assert total_mismatches == 0, "Native expert replay did not reproduce its control"
 
@@ -189,12 +267,14 @@ if __name__ == "__main__":
     parser.add_argument("checkpoint", type=Path)
     parser.add_argument("autotune_cache", type=Path)
     parser.add_argument("--tune-max-tokens", type=int, required=True)
+    parser.add_argument("--exchange-peer-batches", action="store_true")
     arguments = parser.parse_args()
     main(
         arguments.root,
         arguments.checkpoint,
         arguments.autotune_cache,
         arguments.tune_max_tokens,
+        arguments.exchange_peer_batches,
     )
 else:
     pass
