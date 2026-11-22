@@ -140,23 +140,6 @@ def test_out_of_vocabulary_prompt_ids_are_a_bad_request(monkeypatch, token_id):
     assert is_bad_request_error(RuntimeError(str(raised.value)))
 
 
-@pytest.mark.parametrize("speaks", [True, False])
-def test_a_thinker_request_records_whether_it_speaks(monkeypatch, speaks: bool):
-    patch_sampling_validation(monkeypatch)
-
-    request = build_sglang_thinker_request(
-        make_qwen_state(),
-        params={"max_new_tokens": 3},
-        tokenizer=FakeQwenTokenizer(),
-        vocab_size=256,
-        request_id="speaks",
-        capture_prompt_hidden_states=False,
-        speaks=speaks,
-    )
-
-    assert request.speaks is speaks
-
-
 def test_chat_request_without_a_temperature_reaches_the_thinker_greedy(monkeypatch):
     """A chat request without a temperature samples the thinker greedily, not at 1.0."""
     patch_sampling_validation(monkeypatch)

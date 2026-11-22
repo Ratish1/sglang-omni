@@ -167,7 +167,7 @@ class ProcessEngines:
             )
 
     def expedite(self, engine_context: RuntimeContext, *, is_expedited: bool) -> None:
-        """Rank an engine above every other while it holds work a request's first output waits on."""
+        """Rank an engine above every other while its work is what the rest of the pipeline waits on."""
         with self.turn_state_lock:
             self.expedited_contexts = listed_if(
                 self.expedited_contexts, engine_context, is_listed=is_expedited
