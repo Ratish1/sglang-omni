@@ -73,6 +73,7 @@ class ProcessEngines:
         self.turn_waiters: list[TurnWaiter] = []
         self.arrivals = itertools.count()
         self.deferring_contexts: list[RuntimeContext] = []
+        self.expedited_contexts: list[RuntimeContext] = []
 
     @property
     def is_shared(self) -> bool:
@@ -161,26 +162,28 @@ class ProcessEngines:
     def defer(self, engine_context: RuntimeContext, *, is_deferring: bool) -> None:
         """Rank an engine below every other while it waits on their output, so they go first."""
         with self.turn_state_lock:
-            is_listed = any(
-                listed is engine_context for listed in self.deferring_contexts
+            self.deferring_contexts = listed_if(
+                self.deferring_contexts, engine_context, is_listed=is_deferring
             )
-            if is_deferring and not is_listed:
-                self.deferring_contexts.append(engine_context)
-            elif not is_deferring and is_listed:
-                self.deferring_contexts = [
-                    listed
-                    for listed in self.deferring_contexts
-                    if listed is not engine_context
-                ]
-            else:
-                pass
 
-    def rank(self, engine_context: RuntimeContext, priority: int) -> tuple[bool, int]:
-        """An engine's place in the turn order, read under turn_state_lock: engines not deferring first, then by priority."""
+    def expedite(self, engine_context: RuntimeContext, *, is_expedited: bool) -> None:
+        """Rank an engine above every other while it holds work a request's first output waits on."""
+        with self.turn_state_lock:
+            self.expedited_contexts = listed_if(
+                self.expedited_contexts, engine_context, is_listed=is_expedited
+            )
+
+    def rank(
+        self, engine_context: RuntimeContext, priority: int
+    ) -> tuple[bool, bool, int]:
+        """An engine's place in the turn order, read under turn_state_lock: expedited first, deferring last, then by priority."""
+        is_expedited = any(
+            listed is engine_context for listed in self.expedited_contexts
+        )
         is_deferring = any(
             listed is engine_context for listed in self.deferring_contexts
         )
-        return (not is_deferring, priority)
+        return (is_expedited, not is_deferring, priority)
 
     def yield_turn(self) -> None:
         """Hand the turn to a waiting engine that outranks this one and take it back after it."""
@@ -242,6 +245,14 @@ class ProcessEngines:
                 next_waiter.granted.set()
             else:
                 self.is_turn_held = False
+
+
+def listed_if(
+    contexts: list[RuntimeContext], engine_context: RuntimeContext, *, is_listed: bool
+) -> list[RuntimeContext]:
+    """The contexts with engine_context in them exactly when is_listed, compared by identity."""
+    others = [listed for listed in contexts if listed is not engine_context]
+    return [*others, engine_context] if is_listed else others
 
 
 @functools.cache

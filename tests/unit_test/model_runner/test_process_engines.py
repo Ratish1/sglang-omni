@@ -164,6 +164,33 @@ def test_a_left_turn_goes_to_a_waiting_thinker_before_a_deferring_talker() -> No
     assert order == ["thinker", "talker"]
 
 
+def test_an_expedited_thinker_keeps_the_turn_and_is_handed_it_before_the_talker() -> (
+    None
+):
+    engines, (holder_context, thinker_context, talker_context) = make_engines(3)
+    order: list[str] = []
+
+    def hold_and_record(context: RuntimeContext, priority: int, name: str) -> None:
+        with engines.hold(context, priority=priority):
+            order.append(name)
+
+    engines.expedite(thinker_context, is_expedited=True)
+    with engines.hold(holder_context, priority=THINKER_PRIORITY):
+        talker_thread = threading.Thread(
+            target=hold_and_record, args=(talker_context, TALKER_PRIORITY, "talker")
+        )
+        talker_thread.start()
+        wait_until_waiting(engines, 1)
+        thinker_thread = threading.Thread(
+            target=hold_and_record, args=(thinker_context, THINKER_PRIORITY, "thinker")
+        )
+        thinker_thread.start()
+        wait_until_waiting(engines, 2)
+    talker_thread.join()
+    thinker_thread.join()
+    assert order == ["thinker", "talker"]
+
+
 def test_an_engine_that_raises_inside_its_turn_hands_it_to_the_waiting_engine() -> None:
     engines, (thinker_context, talker_context) = make_engines(2)
     process_context = get_context()
