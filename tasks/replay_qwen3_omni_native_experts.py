@@ -8,11 +8,13 @@ from hashlib import sha256
 from pathlib import Path
 
 import torch
+import torch.nn.functional as functional
 from compare_qwen3_omni_native_trajectories import difference, validate
 from flashinfer.autotuner import AutoTuner
 from flashinfer.fused_moe import cutlass_fused_moe
 from safetensors import safe_open
 from sglang.srt.environ import envs
+from sglang.srt.layers.activation import silu_and_mul
 
 
 @torch.inference_mode()
@@ -36,6 +38,17 @@ def main(
         for expert in range(expert_count)
         for projection in ("up", "gate", "down")
     ]
+    shared_prefix = "talker.model.layers.0.mlp."
+    names.extend(
+        f"{shared_prefix}{name}.weight"
+        for name in (
+            "shared_expert.gate_proj",
+            "shared_expert.up_proj",
+            "shared_expert.down_proj",
+            "shared_expert_gate",
+            "gate",
+        )
+    )
     with ExitStack() as stack:
         shards = {
             shard: stack.enter_context(
@@ -65,11 +78,17 @@ def main(
             for expert in range(expert_count)
         ]
     )
+    shared_gate_up_weights = torch.cat(
+        (
+            weights[f"{shared_prefix}shared_expert.gate_proj.weight"],
+            weights[f"{shared_prefix}shared_expert.up_proj.weight"],
+        )
+    )
     report = {
         "checkpoint": str(checkpoint),
         "autotune_cache_sha256": sha256(autotune_cache.read_bytes()).hexdigest(),
         "tune_max_tokens": tune_max_tokens,
-        "scope": "Whole recorded padded input batch, original IDs and scales, selected-row output. Layer zero only; no generated speech or performance claim.",
+        "scope": "Whole recorded padded input batch, original IDs and scales, selected-row routed/shared outputs, gates and combine. Layer zero only; no generated speech or performance claim.",
         "captures": {},
     }
     total_frames = 0
@@ -103,6 +122,16 @@ def main(
                 frame["layer0_peer_mlp_normalized"][step["request_row"]],
                 frame["layer0_mlp_normalized"],
             )
+            shared_gate = functional.linear(
+                inputs, weights[f"{shared_prefix}shared_expert_gate.weight"]
+            )
+            shared_output = functional.linear(
+                silu_and_mul(functional.linear(inputs, shared_gate_up_weights)),
+                weights[f"{shared_prefix}shared_expert.down_proj.weight"],
+            )
+            router_logits = functional.linear(
+                inputs, weights[f"{shared_prefix}gate.weight"]
+            )
             output = cutlass_fused_moe(
                 input=inputs,
                 token_selected_experts=expert_ids,
@@ -114,15 +143,27 @@ def main(
                 use_fused_finalize=False,
                 tune_max_num_tokens=tune_max_tokens,
             )[0]
-            selected = output[step["request_row"]].cpu()
-            actual = frame["layer0_routed_experts"]
-            assert torch.isfinite(selected).all()
-            if not torch.equal(selected, actual):
-                mismatches.append(
-                    {"frame": frame_index, **difference(actual, selected)}
-                )
-            else:
-                pass
+            combined_output = output + shared_output * torch.sigmoid(shared_gate)
+            for name, values in (
+                ("routed_experts", output),
+                ("shared_gate", shared_gate),
+                ("shared_expert", shared_output),
+                ("router_logits", router_logits),
+                ("layer_output", combined_output),
+            ):
+                selected = values[step["request_row"]].cpu()
+                actual = frame[f"layer0_{name}"]
+                assert torch.isfinite(selected).all()
+                if not torch.equal(selected, actual):
+                    mismatches.append(
+                        {
+                            "frame": frame_index,
+                            "field": name,
+                            **difference(actual, selected),
+                        }
+                    )
+                else:
+                    pass
             checked_frames += 1
         report["captures"][str(capture.relative_to(root))] = {
             "checked_frames": checked_frames,
@@ -137,7 +178,7 @@ def main(
     assert total_frames > 0
     report["total_frames"] = total_frames
     report["total_mismatches"] = total_mismatches
-    with (root / "expert-replay.json").open("x") as receipt:
+    with (root / "moe-replay.json").open("x") as receipt:
         json.dump(report, receipt, indent=2)
     assert total_mismatches == 0, "Native expert replay did not reproduce its control"
 
