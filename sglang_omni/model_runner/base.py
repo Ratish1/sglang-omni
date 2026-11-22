@@ -453,9 +453,12 @@ class ModelRunner(Generic[RequestDataInput]):
             else:
                 pass
             forward_batch, schedule_batch, is_prefill = built
+            # note (ratish): an engine sharing its process hands a waiting higher-priority engine the turn between phases, so no wait spans a whole step.
+            process_engines().yield_turn()
             batch_result = self.prepare_and_forward(
                 forward_batch, schedule_batch, scheduler_output.requests, is_prefill
             )
+            process_engines().yield_turn()
             if is_prefill:
                 self.post_prefill(
                     batch_result,
