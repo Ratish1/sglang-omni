@@ -27,7 +27,7 @@ Pipeshift's benchmark on one H100, main `bac76771a` against this change, seeds 0
 - At 40 req/s the three seeds' audible p95 are 36.8 to 37.6 ms with the change.
 - The first byte comes one frame later above 24 streams (+1.3 ms p50 at 40 req/s). That byte was the silent frame.
 
-Past capacity, on #4077's arena sizing (each arm alone on one H100, seeds 0 and 1, 120 s per rate):
+Past capacity, on #4077's arena sizing, now in main (each arm alone on one H100, seeds 0 and 1, 120 s per rate):
 
 | req/s | 60 | 70 | 80 |
 |---|---|---|---|
