@@ -112,10 +112,8 @@ class PromptHiddenStore:
     def read(self, request_pool_index: int, positions: torch.Tensor) -> torch.Tensor:
         """The rows at a request's prompt positions, through the slots its KV holds now."""
         req_to_token = self.req_to_token_pool.req_to_token
-        # note (ratish): the staged copies can sit behind a long prefill on the stream, so a shared process waits outside the turn.
-        with process_engines().released():
-            slot_ids = req_to_token[
-                request_pool_index, positions.to(req_to_token.device)
-            ].cpu()
-            self.store_copied(wait=True)
+        slot_ids = req_to_token[
+            request_pool_index, positions.to(req_to_token.device)
+        ].cpu()
+        self.store_copied(wait=True)
         return self.hidden_states[slot_ids]
