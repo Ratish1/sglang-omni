@@ -28,7 +28,9 @@ class AttentionTrial:
 
 
 class NativeCacheTrial:
-    def __init__(self, reference: Path, destination: Path) -> None:
+    def __init__(
+        self, reference: Path, destination: Path, target_reference: Path | None
+    ) -> None:
         self.reference: list[dict[str, torch.Tensor]] = torch.load(
             reference / "trajectory.pt", map_location="cpu", weights_only=True
         )
@@ -37,6 +39,24 @@ class NativeCacheTrial:
         ]
         self.destination = destination
         self.applied = False
+        self.target: list[dict[str, torch.Tensor]] | None = (
+            torch.load(
+                target_reference / "trajectory.pt",
+                map_location="cpu",
+                weights_only=True,
+            )
+            if target_reference is not None
+            else None
+        )
+        if target_reference is not None:
+            assert (
+                json.loads((target_reference / "trajectory.json").read_text())[
+                    "request_id"
+                ]
+                == self.request_id
+            )
+        else:
+            pass
 
     @torch.inference_mode()
     def apply(
@@ -54,6 +74,17 @@ class NativeCacheTrial:
         pool = runner.token_to_kv_pool
         assert isinstance(pool, MHATokenToKVPool)
         buffers = (*pool.k_buffer, *pool.v_buffer)
+        if self.target is not None:
+            target = self.target[len(frames) - 1]
+            for field, tensors in (
+                ("stored_keys", trial.selected_cache[: len(pool.k_buffer)]),
+                ("stored_values", trial.selected_cache[len(pool.k_buffer) :]),
+            ):
+                assert torch.equal(torch.stack(tensors).cpu(), target[field]), field
+            for field in ("positions", "rotary_positions", "codec_ids", "feedback"):
+                assert torch.equal(frames[-1][field].cpu(), target[field]), field
+        else:
+            pass
         selected_slot = forward_batch.out_cache_loc[
             selected_row : selected_row + 1
         ].long()
@@ -109,6 +140,7 @@ class NativeCacheTrial:
                     "frame_index": len(frames) - 1,
                     "prefix_exact": True,
                     "selected_outputs_equal": True,
+                    "target_state_exact": self.target is not None,
                     "old_prefixes_and_peers_unchanged": True,
                     "changed_key_layers": [
                         index for index in changed_buffers if index < len(pool.k_buffer)
@@ -354,6 +386,8 @@ def compare_attention_schedules(
         {
             "reference": {name: value.cpu() for name, value in reference.items()},
             "alternative": {name: value.cpu() for name, value in alternative.items()},
+            "reference_cache": [buffer[selected_row].cpu() for buffer in writes[0]],
+            "alternative_cache": [buffer[selected_row].cpu() for buffer in writes[1]],
             "sampling": {
                 name: value[: len(requests)].cpu()
                 for name, value in input_buffers.items()

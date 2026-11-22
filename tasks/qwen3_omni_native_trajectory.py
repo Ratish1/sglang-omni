@@ -60,16 +60,34 @@ class NativeTalkerTrajectory:
             assert self.code_trial.request_id in self.request_ids
         else:
             pass
-        self.cache_trial: NativeCacheTrial | None = None
-        cache_reference = environ.get("OMNI_NATIVE_CACHE_TRIAL_REFERENCE")
-        if cache_reference:
+        self.cache_trials: dict[int, NativeCacheTrial] = {}
+        cache_references = json.loads(
+            environ.get("OMNI_NATIVE_CACHE_TRIAL_REFERENCES", "[]")
+        )
+        target_reference = environ.get("OMNI_NATIVE_CACHE_TARGET_REFERENCE")
+        if cache_references:
             assert self.code_trial is None
-            assert len(self.attention_trial_sequences) == 1
+            assert len(self.attention_trial_sequences) == len(cache_references)
             assert self.attention_trial_splits == 1
-            self.cache_trial = NativeCacheTrial(
-                Path(cache_reference), self.directory / "cache-trial.json"
-            )
-            assert self.request_ids == {self.cache_trial.request_id}
+            for index, (sequence_tokens, reference) in enumerate(
+                zip(
+                    sorted(self.attention_trial_sequences),
+                    cache_references,
+                    strict=True,
+                )
+            ):
+                filename = (
+                    "cache-trial.json"
+                    if index == 0
+                    else f"cache-trial-{sequence_tokens}.json"
+                )
+                trial = NativeCacheTrial(
+                    Path(reference),
+                    self.directory / filename,
+                    Path(target_reference) if target_reference else None,
+                )
+                assert self.request_ids == {trial.request_id}
+                self.cache_trials[sequence_tokens] = trial
         else:
             pass
         assert self.directory.is_dir()
@@ -130,7 +148,7 @@ class NativeTalkerTrajectory:
             destination,
             self.attention_trial_splits,
         )
-        if self.cache_trial is not None:
+        if sequence_tokens in self.cache_trials:
             result = trial.result
             self.after_forward(
                 forward_batch,
@@ -140,7 +158,7 @@ class NativeTalkerTrajectory:
                 result.logits_output.next_token_logits,
                 result.can_run_cuda_graph,
             )
-            self.cache_trial.apply(
+            self.cache_trials[sequence_tokens].apply(
                 worker, forward_batch, trial, selected_row, self.tensors[request_id]
             )
         else:
@@ -354,10 +372,8 @@ class NativeTalkerTrajectory:
             assert self.code_trial.applied
         else:
             pass
-        if self.cache_trial is not None and request_id == self.cache_trial.request_id:
-            assert self.cache_trial.applied
-        else:
-            pass
+        for trial in self.cache_trials.values():
+            assert request_id == trial.request_id and trial.applied
         snapshots = self.tensors.pop(request_id)
         metadata = self.metadata.pop(request_id)
         destination = self.directory / request_id.removeprefix("feedback-trace-native-")

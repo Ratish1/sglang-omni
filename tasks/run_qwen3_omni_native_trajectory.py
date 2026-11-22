@@ -69,7 +69,8 @@ def main(
     attention_trial_splits: int,
     code_trial_reference: Path | None,
     code_trial_choice: list[int],
-    cache_trial_reference: Path | None,
+    cache_trial_reference: list[Path],
+    cache_target_reference: Path | None,
 ) -> None:
     assert (code_trial_reference is None) == (not code_trial_choice)
     if code_trial_reference is not None:
@@ -77,12 +78,14 @@ def main(
         assert len(selected_samples) == 1
     else:
         pass
-    if cache_trial_reference is not None:
+    if cache_trial_reference:
         assert code_trial_reference is None
-        assert len(selected_samples) == len(attention_trial_sequences) == 1
+        assert len(selected_samples) == 1
+        assert len(cache_trial_reference) == len(attention_trial_sequences)
+        assert attention_trial_sequences == sorted(set(attention_trial_sequences))
         assert attention_trial_splits == 1
     else:
-        pass
+        assert cache_target_reference is None
     output.mkdir()
     samples = load_seedtts_samples(SEEDTTS_DATASET_ID)
     sample_ids = {sample.sample_id for sample in samples}
@@ -128,8 +131,11 @@ def main(
             "OMNI_NATIVE_CODE_TRIAL_CHOICE": ",".join(
                 str(value) for value in code_trial_choice
             ),
-            "OMNI_NATIVE_CACHE_TRIAL_REFERENCE": (
-                str(cache_trial_reference) if cache_trial_reference else ""
+            "OMNI_NATIVE_CACHE_TRIAL_REFERENCES": json.dumps(
+                [str(reference) for reference in cache_trial_reference]
+            ),
+            "OMNI_NATIVE_CACHE_TARGET_REFERENCE": (
+                str(cache_target_reference) if cache_target_reference else ""
             ),
         },
         strip_proxy=True,
@@ -200,8 +206,10 @@ def main(
         assert (captures / "code-trial.json").is_file()
     else:
         pass
-    if cache_trial_reference is not None:
+    if cache_trial_reference:
         assert (captures / "cache-trial.json").is_file()
+        for sequence_tokens in attention_trial_sequences[1:]:
+            assert (captures / f"cache-trial-{sequence_tokens}.json").is_file()
     else:
         pass
     print(json.dumps({"seedtts_samples": len(samples), "captures": selected_samples}))
@@ -219,7 +227,8 @@ if __name__ == "__main__":
     parser.add_argument("--attention-trial-splits", type=int, choices=(0, 1), default=0)
     parser.add_argument("--code-trial-reference", type=Path)
     parser.add_argument("--code-trial-choice", type=int, nargs=4, default=[])
-    parser.add_argument("--cache-trial-reference", type=Path)
+    parser.add_argument("--cache-trial-reference", type=Path, nargs="+", default=[])
+    parser.add_argument("--cache-target-reference", type=Path)
     arguments = parser.parse_args()
     main(
         arguments.output,
@@ -232,6 +241,7 @@ if __name__ == "__main__":
         arguments.code_trial_reference,
         arguments.code_trial_choice,
         arguments.cache_trial_reference,
+        arguments.cache_target_reference,
     )
 else:
     pass
