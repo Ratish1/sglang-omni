@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Capture selected speech trajectories under a full c32 SeedTTS workload."""
+"""Capture selected speech trajectories under full c32 speech workloads."""
 
 import argparse
 import asyncio
@@ -10,11 +10,21 @@ from pathlib import Path
 from unittest.mock import patch
 
 import run_qwen3_omni_rounded_add_screen as benchmark
-from qwen3_omni_corpus_support import SERVER_TIMEOUT_SECONDS, server_command
+from qwen3_omni_corpus_support import (
+    MMSU_TTS_PROMPT,
+    REQUEST_SEED,
+    SERVER_TIMEOUT_SECONDS,
+    server_command,
+)
 
 from benchmarks.benchmarker.utils import start_server_from_cmd, stop_server
+from benchmarks.dataset.mmsu import MmsuSample, load_mmsu_samples
 from benchmarks.dataset.prepare import SEEDTTS_DATASET_ID
 from benchmarks.dataset.seedtts import load_seedtts_samples
+from benchmarks.eval.benchmark_omni_mmsu import run as run_mmsu
+from benchmarks.tasks.audio_understanding import (
+    _build_request_payload as build_request_payload,
+)
 from sglang_omni.utils import find_available_port
 
 SELECTED_SAMPLES = (
@@ -26,12 +36,47 @@ SELECTED_SAMPLES = (
 STAGES = ("image_encoder", "audio_encoder", "thinker", "talker_ar", "code2wav")
 
 
-def main(output: Path, checkpoint: Path, tactic_cache: Path) -> None:
+def identified_mmsu_payload(
+    sample: MmsuSample,
+    *,
+    model_name: str,
+    prompt: str,
+    modalities: list[str],
+    max_tokens: int,
+    temperature: float,
+    seed: int | None = None,
+) -> dict[str, object]:
+    payload = build_request_payload(
+        sample,
+        model_name=model_name,
+        prompt=prompt,
+        modalities=modalities,
+        max_tokens=max_tokens,
+        temperature=temperature,
+        seed=seed,
+    )
+    payload["request_id"] = f"feedback-trace-native-{sample.sample_id}"
+    return payload
+
+
+def main(
+    output: Path,
+    checkpoint: Path,
+    tactic_cache: Path,
+    selected_samples: list[str],
+    mmsu: bool,
+) -> None:
     output.mkdir()
     samples = load_seedtts_samples(SEEDTTS_DATASET_ID)
     sample_ids = {sample.sample_id for sample in samples}
     assert len(samples) == len(sample_ids) == 1088
-    assert set(SELECTED_SAMPLES) <= sample_ids
+    if mmsu:
+        mmsu_samples = load_mmsu_samples(repo_id="ddwang2000/MMSU")
+        mmsu_ids = {sample.sample_id for sample in mmsu_samples}
+        assert len(mmsu_samples) == len(mmsu_ids) == 5000
+        assert set(selected_samples) <= mmsu_ids
+    else:
+        assert set(selected_samples) <= sample_ids
     shutil.copytree(tactic_cache, output / "cache")
     captures = output / "captures"
     captures.mkdir()
@@ -55,7 +100,7 @@ def main(output: Path, checkpoint: Path, tactic_cache: Path) -> None:
         env={
             "SGLANG_CACHE_DIR": str(output / "cache"),
             "OMNI_NATIVE_TRAJECTORY_DIRECTORY": str(captures),
-            "OMNI_NATIVE_TRAJECTORY_SAMPLES": ",".join(SELECTED_SAMPLES),
+            "OMNI_NATIVE_TRAJECTORY_SAMPLES": ",".join(selected_samples),
         },
         strip_proxy=True,
     )
@@ -63,17 +108,60 @@ def main(output: Path, checkpoint: Path, tactic_cache: Path) -> None:
         with patch.object(benchmark, "CLIENT_CONCURRENCY", 32):
             asyncio.run(
                 benchmark.run_seedtts(
-                    output / "seedtts", port, sample_ids, trace_phase="native"
+                    output / "seedtts",
+                    port,
+                    sample_ids,
+                    trace_phase=None if mmsu else "native",
                 )
             )
+        if mmsu:
+            with patch(
+                "benchmarks.tasks.audio_understanding._build_request_payload",
+                identified_mmsu_payload,
+            ):
+                result = asyncio.run(
+                    run_mmsu(
+                        argparse.Namespace(
+                            base_url=f"http://127.0.0.1:{port}",
+                            model="qwen3-omni",
+                            modalities="text+audio",
+                            output_dir=str(output / "mmsu"),
+                            max_samples=None,
+                            max_tokens=256,
+                            temperature=0.0,
+                            seed=REQUEST_SEED,
+                            warmup=0,
+                            max_concurrency=32,
+                            request_rate=float("inf"),
+                            timeout_s=500,
+                            disable_tqdm=False,
+                            fingerprint=False,
+                            save_audio=True,
+                            prompt=MMSU_TTS_PROMPT,
+                        ),
+                        samples=mmsu_samples,
+                        compute_wer=False,
+                    )
+                )
+            assert [row["sample_id"] for row in result["per_sample"]] == [
+                sample.sample_id for sample in mmsu_samples
+            ]
+            assert all(
+                row["is_success"] and row["has_audio"] for row in result["per_sample"]
+            )
+        else:
+            pass
     finally:
         stop_server(server)
-    for sample_id in SELECTED_SAMPLES:
+    for sample_id in selected_samples:
         assert (captures / sample_id / "trajectory.pt").is_file()
         report = json.loads((captures / sample_id / "trajectory.json").read_text())
-        assert report["finish_reason"] == "stop"
+        if not mmsu:
+            assert report["finish_reason"] == "stop"
+        else:
+            pass
         assert len(report["frames"]) == len(report["output_ids"])
-    print(json.dumps({"samples": len(samples), "captures": list(SELECTED_SAMPLES)}))
+    print(json.dumps({"seedtts_samples": len(samples), "captures": selected_samples}))
 
 
 if __name__ == "__main__":
@@ -82,7 +170,15 @@ if __name__ == "__main__":
     parser.add_argument("output", type=Path)
     parser.add_argument("checkpoint", type=Path)
     parser.add_argument("tactic_cache", type=Path)
+    parser.add_argument("--mmsu", action="store_true")
+    parser.add_argument("--selected-samples", nargs="+", default=list(SELECTED_SAMPLES))
     arguments = parser.parse_args()
-    main(arguments.output, arguments.checkpoint, arguments.tactic_cache)
+    main(
+        arguments.output,
+        arguments.checkpoint,
+        arguments.tactic_cache,
+        arguments.selected_samples,
+        arguments.mmsu,
+    )
 else:
     pass
