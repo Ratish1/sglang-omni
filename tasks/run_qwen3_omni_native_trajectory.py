@@ -67,7 +67,15 @@ def main(
     mmsu: bool,
     attention_trial_sequences: list[int],
     attention_trial_splits: int,
+    code_trial_reference: Path | None,
+    code_trial_choice: list[int],
 ) -> None:
+    assert (code_trial_reference is None) == (not code_trial_choice)
+    if code_trial_reference is not None:
+        assert not attention_trial_sequences
+        assert len(selected_samples) == 1
+    else:
+        pass
     output.mkdir()
     samples = load_seedtts_samples(SEEDTTS_DATASET_ID)
     sample_ids = {sample.sample_id for sample in samples}
@@ -107,6 +115,12 @@ def main(
                 str(value) for value in attention_trial_sequences
             ),
             "OMNI_NATIVE_ATTENTION_TRIAL_SPLITS": str(attention_trial_splits),
+            "OMNI_NATIVE_CODE_TRIAL_REFERENCE": (
+                str(code_trial_reference) if code_trial_reference else ""
+            ),
+            "OMNI_NATIVE_CODE_TRIAL_CHOICE": ",".join(
+                str(value) for value in code_trial_choice
+            ),
         },
         strip_proxy=True,
     )
@@ -172,6 +186,10 @@ def main(
                 captures
                 / f"feedback-trace-native-{sample_id}-sequence-{sequence_tokens}.json"
             ).is_file()
+    if code_trial_reference is not None:
+        assert (captures / "code-trial.json").is_file()
+    else:
+        pass
     print(json.dumps({"seedtts_samples": len(samples), "captures": selected_samples}))
 
 
@@ -185,6 +203,8 @@ if __name__ == "__main__":
     parser.add_argument("--selected-samples", nargs="+", default=list(SELECTED_SAMPLES))
     parser.add_argument("--attention-trial-sequences", type=int, nargs="*", default=[])
     parser.add_argument("--attention-trial-splits", type=int, choices=(0, 1), default=0)
+    parser.add_argument("--code-trial-reference", type=Path)
+    parser.add_argument("--code-trial-choice", type=int, nargs=4, default=[])
     arguments = parser.parse_args()
     main(
         arguments.output,
@@ -194,6 +214,8 @@ if __name__ == "__main__":
         arguments.mmsu,
         arguments.attention_trial_sequences,
         arguments.attention_trial_splits,
+        arguments.code_trial_reference,
+        arguments.code_trial_choice,
     )
 else:
     pass
