@@ -148,11 +148,6 @@ class QwenTalkerScheduler(OmniScheduler[SGLangARRequestData]):
         # note (ratish): requests still waiting after selection wait for talker capacity, so the talker is the bottleneck and keeps its turn.
         is_backlogged = bool(self.waiting_queue)
         process_engines().expedite(self.engine_context, is_expedited=is_backlogged)
-        # note (ratish): otherwise a row waiting on the thinker's text makes the thinker's next step this stream's first audio, so the talker goes after it.
-        process_engines().defer(
-            self.engine_context,
-            is_deferring=self.awaits_thinker_text and not is_backlogged,
-        )
         return batch
 
     def update_running_batch(self, batch: ScheduleBatch) -> ScheduleBatch | None:
