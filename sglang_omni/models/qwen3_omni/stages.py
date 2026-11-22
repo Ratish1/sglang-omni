@@ -1279,7 +1279,7 @@ def create_sglang_thinker_executor_from_config(
         disable_cuda_graph=False,
         # note (zhaochenyang20): MoE CUDA graph capture fails on topk_ids dtype under torch compile.
         enable_torch_compile=False,
-        enable_mixed_chunk=True,
+        enable_mixed_chunk=False,
         chunked_prefill_size=8192,
         sampling_backend="flashinfer" if current_platform.is_cuda() else "pytorch",
         cuda_graph_backend_prefill=prefill_graph_backend,
