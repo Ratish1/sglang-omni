@@ -6,6 +6,7 @@ from os import environ
 from pathlib import Path
 
 import torch
+from sglang.srt.layers.attention.flashattention_backend import FlashAttentionBackend
 from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.model_runner import ModelRunner
@@ -139,6 +140,64 @@ class NativeTalkerTrajectory:
                         if can_run_cuda_graph
                         else len(requests)
                     )
+                    snapshot.update(
+                        model_runner.model.native_layer_probe.read(
+                            request_row,
+                            metadata["graph_batch_rows"],
+                            can_run_cuda_graph,
+                        )
+                    )
+                    backend = (
+                        model_runner.decode_cuda_graph_runner.attn_backend
+                        if can_run_cuda_graph
+                        else forward_batch.attn_backend
+                    )
+                    assert isinstance(backend, FlashAttentionBackend)
+                    assert backend.fa_impl_ver == 3 and backend.page_size == 1
+                    assert not backend.use_mla and not backend.is_prefill_aware_swa
+                    assert forward_batch.spec_info is None
+                    attention = model_runner.model.model.layers[0].self_attn.attn
+                    assert not attention.is_cross_attention
+                    assert attention.sliding_window_size in (None, -1)
+                    assert attention.k_scale is None and attention.v_scale is None
+                    attention_metadata = backend.forward_metadata
+                    assert attention_metadata.local_attn_metadata is None
+                    assert attention_metadata.max_seq_len_q == 1
+                    sequence_length = metadata["sequence_length"]
+                    read_slots = attention_metadata.page_table[
+                        request_row, :sequence_length
+                    ].long()
+                    snapshot["attention_read_slots"] = read_slots.detach().clone()
+                    snapshot["attention_owned_slots"] = (
+                        model_runner.req_to_token_pool.req_to_token.index_select(
+                            0,
+                            forward_batch.req_pool_indices[
+                                request_row : request_row + 1
+                            ].long(),
+                        )[0, :sequence_length]
+                        .detach()
+                        .clone()
+                    )
+                    key_cache, value_cache = backend.get_paged_mha_kv_cache(attention)
+                    snapshot["attention_read_keys"] = key_cache[:, 0].index_select(
+                        0, read_slots
+                    )
+                    snapshot["attention_read_values"] = value_cache[:, 0].index_select(
+                        0, read_slots
+                    )
+                    snapshot["attention_sequence_lengths"] = (
+                        attention_metadata.cache_seqlens_int32.detach().clone()
+                    )
+                    snapshot["attention_query_offsets"] = (
+                        attention_metadata.cu_seqlens_q.detach().clone()
+                    )
+                    if attention_metadata.scheduler_metadata is not None:
+                        snapshot["attention_scheduler_metadata"] = (
+                            attention_metadata.scheduler_metadata.detach().clone()
+                        )
+                    else:
+                        pass
+                    metadata["attention_num_splits"] = backend.decode_num_splits
                 snapshot["stored_keys"] = torch.stack(
                     [layer.index_select(0, token_slots) for layer in pool.k_buffer]
                 )

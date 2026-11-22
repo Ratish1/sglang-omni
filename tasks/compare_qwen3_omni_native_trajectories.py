@@ -73,6 +73,40 @@ def validate(directory: Path) -> list[dict[str, torch.Tensor]]:
             )
             assert frame["stored_keys"].shape[1] == 1
             assert step["graph_batch_rows"] >= len(step["request_ids"])
+            if "layer0_contribution" in frame:
+                assert torch.equal(
+                    frame["layer0_contribution"], frame["consumed_input"]
+                )
+                assert torch.equal(
+                    frame["attention_read_slots"], frame["attention_owned_slots"]
+                )
+                assert torch.equal(
+                    frame["attention_read_slots"][-1:], frame["output_slots"]
+                )
+                assert (
+                    int(frame["attention_sequence_lengths"][step["request_row"]])
+                    == step["sequence_length"]
+                )
+                for field in ("keys", "values"):
+                    expected_prefix = torch.cat(
+                        [
+                            previous[f"stored_{field}"][0]
+                            for previous in frames[: frame_index + 1]
+                        ]
+                    )
+                    assert torch.equal(
+                        frame[f"attention_read_{field}"], expected_prefix
+                    ), (frame_index, field)
+                assert torch.equal(
+                    frame["layer0_key_after_rope"].flatten(),
+                    frame["attention_read_keys"][-1].flatten(),
+                )
+                assert torch.equal(
+                    frame["layer0_value_before_cache"].flatten(),
+                    frame["attention_read_values"][-1].flatten(),
+                )
+            else:
+                pass
     return frames
 
 
@@ -106,6 +140,27 @@ def main(root: Path) -> None:
             "consumed_input",
             "stored_keys",
             "stored_values",
+            "attention_read_keys",
+            "attention_read_values",
+            "layer0_contribution",
+            "layer0_positions",
+            "layer0_attention_normalized",
+            "layer0_attention_residual",
+            "layer0_qkv_projection",
+            "layer0_query_after_rope",
+            "layer0_key_after_rope",
+            "layer0_value_before_cache",
+            "layer0_attention_context",
+            "layer0_attention_projection",
+            "layer0_mlp_normalized",
+            "layer0_mlp_residual",
+            "layer0_router_logits",
+            "layer0_expert_ids",
+            "layer0_expert_weights",
+            "layer0_routed_experts",
+            "layer0_shared_expert",
+            "layer0_shared_gate",
+            "layer0_layer_output",
         )
         first_differences = {}
         for frame_index, (left, right) in enumerate(zip(first, second)):

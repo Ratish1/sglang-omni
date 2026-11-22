@@ -8,6 +8,7 @@ import logging
 from typing import Iterable, Optional, Tuple
 
 import torch
+from qwen3_omni_native_layer_probe import NativeLayerProbe
 from sglang.kernels.fused_op import get_fused_op_backend
 from sglang.kernels.spec import KernelBackend
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
@@ -837,6 +838,7 @@ class Qwen3OmniTalker(nn.Module):
         )
 
         device = self.model.codec_embedding.weight.device
+        self.native_layer_probe = NativeLayerProbe(self.model.layers[0])
         hidden_size = config.text_config.hidden_size
         predictor_len = config.num_code_groups + 1
         server_args = get_context().server_args
