@@ -58,7 +58,7 @@ for arm in $ARMS; do
     || git -C /workspace/x-$arm checkout -q --detach origin/dev/qwen3-omni-oc-bisect-$arm
   log "tree x-$arm $(git -C /workspace/x-$arm rev-parse --short HEAD) $(git -C /workspace/x-$arm rev-parse --short=12 HEAD:sglang_omni)"
 done
-until grep -q "q1123_a done" $O/queue.log 2>/dev/null; do sleep 20; done
+until grep -q "q1123_a2 done" $O/queue.log 2>/dev/null; do sleep 20; done
 log "q1123_b start"
 quiet_host
 both "speech ff_f0 $F 0 210" "speech ff_f1 $F 1 210"
