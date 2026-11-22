@@ -1368,6 +1368,36 @@ def test_a_talker_waiting_on_thinker_text_defers_its_turn_until_the_text_arrives
 
 
 @pytest.mark.usefixtures("talker_server_args")
+def test_a_backlogged_talker_keeps_its_turn_while_a_row_waits_on_thinker_text(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """At 64 streams the talker is the bottleneck, and handing the thinker its turns starved the stage every request queued on."""
+    engines = ProcessEngines()
+    talker_context = RuntimeContext(parallel=ParallelContext())
+    monkeypatch.setattr(talker_scheduler_module, "process_engines", lambda: engines)
+    scheduler = row_readiness_scheduler(monkeypatch, {"second"})
+    scheduler.engine_context = talker_context
+    scheduler.model_runner.data_awaits_thinker_text = (
+        QwenTalkerModelRunner.data_awaits_thinker_text
+    )
+    scheduler.waiting_queue = [SimpleNamespace(rid="queued")]
+    batch = running_talker_batch(scheduler)
+    batch.reqs[1].omni_data = SimpleNamespace(
+        pending_feedback_queue=[1], pending_text_queue=[], thinker_chunks_done=False
+    )
+    monkeypatch.setattr(
+        OmniScheduler,
+        "get_next_batch_to_run",
+        lambda self: self.update_running_batch(self.running_batch),
+    )
+
+    scheduler.get_next_batch_to_run()
+
+    assert engines.expedited_contexts == [talker_context]
+    assert engines.deferring_contexts == []
+
+
+@pytest.mark.usefixtures("talker_server_args")
 def test_row_without_text_is_excluded_and_rejoins_with_its_kv(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
