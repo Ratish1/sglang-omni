@@ -78,6 +78,10 @@ def validate(directory: Path) -> list[dict[str, torch.Tensor]]:
                     frame["layer0_contribution"], frame["consumed_input"]
                 )
                 assert torch.equal(
+                    frame["layer0_positions"].flatten(),
+                    frame["rotary_positions"].flatten(),
+                )
+                assert torch.equal(
                     frame["attention_read_slots"], frame["attention_owned_slots"]
                 )
                 assert torch.equal(
