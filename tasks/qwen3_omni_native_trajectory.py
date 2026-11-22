@@ -6,11 +6,14 @@ from os import environ
 from pathlib import Path
 
 import torch
+from qwen3_omni_native_attention_trial import compare_attention_schedules
 from sglang.srt.layers.attention.flashattention_backend import FlashAttentionBackend
+from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.model_runner import ModelRunner
 
+from sglang_omni.model_runner.model_worker import ModelWorker
 from sglang_omni.scheduling.sglang_backend.request_data import SGLangARRequestData
 from sglang_omni.scheduling.types import SchedulerRequest
 
@@ -24,7 +27,38 @@ class NativeTalkerTrajectory:
         }
         self.tensors: dict[str, list[dict[str, torch.Tensor]]] = {}
         self.metadata: dict[str, list[dict[str, str | int | bool | list[str]]]] = {}
+        self.attention_trial_sequences = {
+            int(value)
+            for value in environ.get("OMNI_NATIVE_ATTENTION_TRIAL_SEQUENCES", "").split(
+                ","
+            )
+            if value
+        }
         assert self.directory.is_dir()
+
+    def paired_attention_forward(
+        self,
+        worker: ModelWorker,
+        forward_batch: ForwardBatch,
+        requests: list[SchedulerRequest],
+    ) -> GenerationBatchResult | None:
+        selected_rows = [
+            row
+            for row, request in enumerate(requests)
+            if request.request_id in self.request_ids
+            and int(forward_batch.seq_lens_cpu[row]) in self.attention_trial_sequences
+        ]
+        if not selected_rows:
+            return None
+        else:
+            assert len(selected_rows) == 1
+        selected_row = selected_rows[0]
+        request_id = requests[selected_row].request_id
+        sequence_tokens = int(forward_batch.seq_lens_cpu[selected_row])
+        destination = self.directory / f"{request_id}-sequence-{sequence_tokens}.json"
+        return compare_attention_schedules(
+            worker, forward_batch, requests, selected_row, destination
+        )
 
     def before_forward(
         self,

@@ -117,6 +117,17 @@ class QwenTalkerModelRunner(ModelRunner["SGLangARRequestData"]):
         self.native_trajectory.before_forward(forward_batch, requests, None)
         self.write_feedback_buffers(requests)
 
+    def custom_decode_forward(
+        self,
+        forward_batch: ForwardBatch | None,
+        schedule_batch: ScheduleBatch | None,
+        requests: list[SchedulerRequest],
+    ) -> GenerationBatchResult | None:
+        assert forward_batch is not None
+        return self.native_trajectory.paired_attention_forward(
+            self.tp_worker, forward_batch, requests
+        )
+
     def post_prefill(
         self,
         result: GenerationBatchResult,

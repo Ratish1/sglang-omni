@@ -65,6 +65,7 @@ def main(
     tactic_cache: Path,
     selected_samples: list[str],
     mmsu: bool,
+    attention_trial_sequences: list[int],
 ) -> None:
     output.mkdir()
     samples = load_seedtts_samples(SEEDTTS_DATASET_ID)
@@ -101,6 +102,9 @@ def main(
             "SGLANG_CACHE_DIR": str(output / "cache"),
             "OMNI_NATIVE_TRAJECTORY_DIRECTORY": str(captures),
             "OMNI_NATIVE_TRAJECTORY_SAMPLES": ",".join(selected_samples),
+            "OMNI_NATIVE_ATTENTION_TRIAL_SEQUENCES": ",".join(
+                str(value) for value in attention_trial_sequences
+            ),
         },
         strip_proxy=True,
     )
@@ -161,6 +165,11 @@ def main(
         else:
             pass
         assert len(report["frames"]) == len(report["output_ids"])
+        for sequence_tokens in attention_trial_sequences:
+            assert (
+                captures
+                / f"feedback-trace-native-{sample_id}-sequence-{sequence_tokens}.json"
+            ).is_file()
     print(json.dumps({"seedtts_samples": len(samples), "captures": selected_samples}))
 
 
@@ -172,6 +181,7 @@ if __name__ == "__main__":
     parser.add_argument("tactic_cache", type=Path)
     parser.add_argument("--mmsu", action="store_true")
     parser.add_argument("--selected-samples", nargs="+", default=list(SELECTED_SAMPLES))
+    parser.add_argument("--attention-trial-sequences", type=int, nargs="*", default=[])
     arguments = parser.parse_args()
     main(
         arguments.output,
@@ -179,6 +189,7 @@ if __name__ == "__main__":
         arguments.tactic_cache,
         arguments.selected_samples,
         arguments.mmsu,
+        arguments.attention_trial_sequences,
     )
 else:
     pass
