@@ -25,6 +25,7 @@ def compare_attention_schedules(
     requests: list[SchedulerRequest],
     selected_row: int,
     destination: Path,
+    attention_splits: int,
 ) -> GenerationBatchResult:
     runner = worker.model_runner
     model = runner.model
@@ -88,9 +89,10 @@ def compare_attention_schedules(
         sequence_bound = int(cache_seqlens.max())
         assert sequence_bound <= max_seq_len_k
         tight_bounds.append(sequence_bound)
-        return original_schedule(
-            batch_size, sequence_bound, cache_seqlens, cu_seqlens_q
-        )
+        with patch.object(backend, "num_splits", attention_splits):
+            return original_schedule(
+                batch_size, sequence_bound, cache_seqlens, cu_seqlens_q
+            )
 
     outputs: list[dict[str, torch.Tensor]] = []
     writes: list[list[torch.Tensor]] = []
@@ -139,6 +141,10 @@ def compare_attention_schedules(
         for first, last in zip(writes[0], writes[2], strict=True)
     )
     assert schedules[0] == schedules[2]
+    if attention_splits:
+        assert schedules[1][: len(requests)] == [attention_splits] * len(requests)
+    else:
+        pass
     assert torch.equal(
         forward_batch.seq_lens[: len(requests)].cpu(), forward_batch.seq_lens_cpu
     )
@@ -148,6 +154,7 @@ def compare_attention_schedules(
         "sequence_tokens": forward_batch.seq_lens_cpu.tolist(),
         "graph_rows": graph_runner.bs,
         "tight_bound_tokens": tight_bounds[0],
+        "requested_attention_splits": attention_splits,
         "splits": schedules,
         "stock_repeat_exact": True,
         "prefix_unchanged": True,

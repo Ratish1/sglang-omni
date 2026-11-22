@@ -34,6 +34,9 @@ class NativeTalkerTrajectory:
             )
             if value
         }
+        self.attention_trial_splits = int(
+            environ.get("OMNI_NATIVE_ATTENTION_TRIAL_SPLITS", "0")
+        )
         assert self.directory.is_dir()
 
     def paired_attention_forward(
@@ -57,7 +60,12 @@ class NativeTalkerTrajectory:
         sequence_tokens = int(forward_batch.seq_lens_cpu[selected_row])
         destination = self.directory / f"{request_id}-sequence-{sequence_tokens}.json"
         return compare_attention_schedules(
-            worker, forward_batch, requests, selected_row, destination
+            worker,
+            forward_batch,
+            requests,
+            selected_row,
+            destination,
+            self.attention_trial_splits,
         )
 
     def before_forward(

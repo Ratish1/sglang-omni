@@ -66,6 +66,7 @@ def main(
     selected_samples: list[str],
     mmsu: bool,
     attention_trial_sequences: list[int],
+    attention_trial_splits: int,
 ) -> None:
     output.mkdir()
     samples = load_seedtts_samples(SEEDTTS_DATASET_ID)
@@ -105,6 +106,7 @@ def main(
             "OMNI_NATIVE_ATTENTION_TRIAL_SEQUENCES": ",".join(
                 str(value) for value in attention_trial_sequences
             ),
+            "OMNI_NATIVE_ATTENTION_TRIAL_SPLITS": str(attention_trial_splits),
         },
         strip_proxy=True,
     )
@@ -182,6 +184,7 @@ if __name__ == "__main__":
     parser.add_argument("--mmsu", action="store_true")
     parser.add_argument("--selected-samples", nargs="+", default=list(SELECTED_SAMPLES))
     parser.add_argument("--attention-trial-sequences", type=int, nargs="*", default=[])
+    parser.add_argument("--attention-trial-splits", type=int, choices=(0, 1), default=0)
     arguments = parser.parse_args()
     main(
         arguments.output,
@@ -190,6 +193,7 @@ if __name__ == "__main__":
         arguments.selected_samples,
         arguments.mmsu,
         arguments.attention_trial_sequences,
+        arguments.attention_trial_splits,
     )
 else:
     pass
