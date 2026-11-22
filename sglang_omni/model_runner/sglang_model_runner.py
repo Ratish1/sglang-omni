@@ -434,18 +434,21 @@ class SGLModelRunner(ModelRunner):
 
     def init_attention_backends(self) -> None:
         super().init_attention_backends()
+        attention_split_count = environ.get("OMNI_NATIVE_ATTENTION_SPLITS")
         if (
             self.model_config.hf_config.architectures == ["Qwen3OmniTalker"]
-            and environ.get("OMNI_NATIVE_SINGLE_ATTENTION_SPLIT") == "1"
+            and attention_split_count is not None
         ):
+            split_count = int(attention_split_count)
+            assert split_count in (1, 2)
             assert isinstance(self.attn_backend, FlashAttentionBackend)
             assert self.attn_backend.fa_impl_ver == 3
             assert self.decode_attn_backend is None
             assert not self.decode_attn_backend_group
-            self.attn_backend.num_splits = 1
-            self.attn_backend.decode_num_splits = 1
+            self.attn_backend.num_splits = split_count
+            self.attn_backend.decode_num_splits = split_count
             logger.info(
-                "Diagnostic Talker attention uses one split before graph capture"
+                f"Diagnostic Talker attention uses {split_count} splits before graph capture"
             )
         else:
             pass
