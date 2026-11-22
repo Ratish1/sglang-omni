@@ -445,13 +445,55 @@ class SGLModelRunner(ModelRunner):
             assert self.attn_backend.fa_impl_ver == 3
             assert self.decode_attn_backend is None
             assert not self.decode_attn_backend_group
-            self.attn_backend.num_splits = split_count
+            phase = environ.get("OMNI_NATIVE_ATTENTION_PHASE", "all")
+            assert phase in ("all", "decode")
+            if phase == "all":
+                self.attn_backend.num_splits = split_count
+            else:
+                assert self.attn_backend.num_splits == 0
+                self.attn_backend._compute_scheduler_metadata = (  # noqa: leading-underscore - backend integration seam
+                    self.compute_native_decode_scheduler_metadata
+                )
             self.attn_backend.decode_num_splits = split_count
             logger.info(
-                f"Diagnostic Talker attention uses {split_count} splits before graph capture"
+                f"Diagnostic Talker attention uses split bound {split_count} for {phase} before graph capture"
             )
         else:
             pass
+
+    def compute_native_decode_scheduler_metadata(
+        self,
+        batch_size: int,
+        max_seq_len_k: int,
+        cache_seqlens: torch.Tensor,
+        cu_seqlens_q: torch.Tensor,
+    ) -> torch.Tensor | None:
+        backend = self.attn_backend
+        assert isinstance(backend, FlashAttentionBackend)
+        if (
+            backend._get_scheduler_metadata is None or backend.use_mla
+        ):  # noqa: leading-underscore - backend contract
+            return None
+        elif (
+            backend._disable_scheduler_metadata_precompute
+        ):  # noqa: leading-underscore - backend contract
+            return None
+        else:
+            return backend._get_scheduler_metadata(  # noqa: leading-underscore - backend contract
+                batch_size=batch_size,
+                max_seqlen_q=1,
+                max_seqlen_k=max_seq_len_k,
+                num_heads=backend.num_attention_heads,
+                num_heads_k=backend.num_kv_heads,
+                headdim=backend.head_dim,
+                cache_seqlens=cache_seqlens,
+                qkv_dtype=backend.kv_cache_dtype,
+                cu_seqlens_q=cu_seqlens_q,
+                page_size=backend.page_size,
+                causal=True,
+                has_softcap=backend.has_softcap,
+                num_splits=backend.decode_num_splits,
+            )
 
     def init_plain_decode_graphs(self) -> None:
         """Capture ordinary decode with shared weights and separate attention state."""
