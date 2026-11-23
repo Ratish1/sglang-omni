@@ -39,7 +39,7 @@ class NativeSamplingAudit:
             assert isinstance(request_data, SGLangARRequestData)
             sampling = request_data.req.sampling_params
             history = self.emitted_codes[request.request_id]
-            assert request_data.req.output_ids == history, request.request_id
+            assert list(request_data.req.output_ids) == history, request.request_id
             expected_parameters = torch.tensor(
                 [
                     sampling.repetition_penalty,
@@ -129,7 +129,7 @@ class NativeSamplingAudit:
             request_data = request.data
             assert isinstance(request_data, SGLangARRequestData)
             history = self.emitted_codes.setdefault(request.request_id, [])
-            assert request_data.req.output_ids == history, request.request_id
+            assert list(request_data.req.output_ids) == history, request.request_id
             history.append(code)
             self.request_counts.setdefault(
                 request.request_id,
@@ -143,7 +143,7 @@ class NativeSamplingAudit:
 
     def finish(self, request_id: str, request: SGLangARRequestData) -> None:
         history = self.emitted_codes.pop(request_id)
-        assert request.req.output_ids == history, request_id
+        assert list(request.req.output_ids) == history, request_id
         counts = self.request_counts.pop(request_id)
         with (self.directory / "sampling-audit.jsonl").open("a") as report:
             report.write(
