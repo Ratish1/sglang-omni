@@ -18,6 +18,7 @@ from transformers.conversion_mapping import (
     register_checkpoint_conversion_mapping,
 )
 from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import (
+    Qwen3OmniMoeCode2Wav,
     Qwen3OmniMoeTalkerForConditionalGeneration,
 )
 
@@ -153,15 +154,18 @@ def load_conditioning(
 
 
 def audit_weights(
-    model: Qwen3OmniMoeTalkerForConditionalGeneration,
+    model: Qwen3OmniMoeTalkerForConditionalGeneration | Qwen3OmniMoeCode2Wav,
     checkpoint: Path,
     destination: Path,
 ) -> None:
     index = json.loads((checkpoint / "model.safetensors.index.json").read_text())
+    checkpoint_prefix = (
+        "code2wav." if isinstance(model, Qwen3OmniMoeCode2Wav) else "talker."
+    )
     tensors = model.state_dict(keep_vars=True)
     shards: dict[str, list[str]] = {}
     for name, shard in index["weight_map"].items():
-        if name.startswith("talker."):
+        if name.startswith(checkpoint_prefix):
             shards.setdefault(shard, []).append(name)
         else:
             pass
@@ -171,7 +175,7 @@ def audit_weights(
         with safe_open(checkpoint / shard, framework="pt", device="cpu") as weights:
             for checkpoint_name in names:
                 expected = weights.get_tensor(checkpoint_name)
-                name = checkpoint_name.removeprefix("talker.")
+                name = checkpoint_name.removeprefix(checkpoint_prefix)
                 expert = EXPERT_WEIGHT.fullmatch(name)
                 if expert is None:
                     tensor = tensors[name]
