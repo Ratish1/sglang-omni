@@ -29,6 +29,7 @@ class ConditioningComparison:
     frame_counts: list[int]
     paired_frames: int
     changed_frames: dict[str, list[int]]
+    peer_changed_frames: dict[str, list[int]]
     first_differences: dict[str, int]
     divergence_metadata: list[dict[str, str | int | bool | list[str]]]
     waveform_hashes: dict[str, str] = field(default_factory=dict)
@@ -67,6 +68,7 @@ def main(baseline: Path, intervention: Path, asr_checkpoint: Path) -> None:
         ]
         assert receipt["outcomes"]["emitted_frames"] == len(frames[1])
         changed_frames: dict[str, list[int]] = {}
+        peer_changed_frames: dict[str, list[int]] = {}
         for frame_index, (original, forced) in enumerate(zip(*frames)):
             for name in (
                 "predictor_query",
@@ -78,13 +80,25 @@ def main(baseline: Path, intervention: Path, asr_checkpoint: Path) -> None:
                 "text_embedding",
                 "stored_keys",
                 "stored_values",
-                *(name for name in original if name.startswith("layer0_")),
+                *(
+                    name
+                    for name in original
+                    if name.startswith("layer0_")
+                    and not name.startswith("layer0_peer_")
+                ),
             ):
                 if name in original:
                     if not torch.equal(original[name], forced[name]):
                         changed_frames.setdefault(name, []).append(frame_index)
                     else:
                         pass
+                else:
+                    pass
+            for name in original:
+                if name.startswith("layer0_peer_") and not torch.equal(
+                    original[name], forced[name]
+                ):
+                    peer_changed_frames.setdefault(name, []).append(frame_index)
                 else:
                     pass
             for name in ("stored_keys", "stored_values"):
@@ -111,6 +125,7 @@ def main(baseline: Path, intervention: Path, asr_checkpoint: Path) -> None:
                 frame_counts=[len(trajectory) for trajectory in frames],
                 paired_frames=min(len(trajectory) for trajectory in frames),
                 changed_frames=changed_frames,
+                peer_changed_frames=peer_changed_frames,
                 first_differences=first_differences,
                 divergence_metadata=(
                     [report["frames"][first_difference] for report in metadata]
