@@ -27,6 +27,8 @@ class ConditioningComparison:
     original_text: str
     live_returned_text: str
     frame_counts: list[int]
+    paired_frames: int
+    changed_frames: dict[str, list[int]]
     first_differences: dict[str, int]
     divergence_metadata: list[dict[str, str | int | bool | list[str]]]
     waveform_hashes: dict[str, str] = field(default_factory=dict)
@@ -64,7 +66,7 @@ def main(baseline: Path, intervention: Path, asr_checkpoint: Path) -> None:
             for root in roots
         ]
         assert receipt["outcomes"]["emitted_frames"] == len(frames[1])
-        first_differences: dict[str, int] = {}
+        changed_frames: dict[str, list[int]] = {}
         for frame_index, (original, forced) in enumerate(zip(*frames)):
             for name in (
                 "predictor_query",
@@ -76,14 +78,28 @@ def main(baseline: Path, intervention: Path, asr_checkpoint: Path) -> None:
                 "text_embedding",
                 "stored_keys",
                 "stored_values",
+                *(name for name in original if name.startswith("layer0_")),
             ):
-                if name in original and name not in first_differences:
+                if name in original:
                     if not torch.equal(original[name], forced[name]):
-                        first_differences[name] = frame_index
+                        changed_frames.setdefault(name, []).append(frame_index)
                     else:
                         pass
                 else:
                     pass
+            for name in ("stored_keys", "stored_values"):
+                for layer_index, (original_rows, forced_rows) in enumerate(
+                    zip(original[name], forced[name], strict=True)
+                ):
+                    if not torch.equal(original_rows, forced_rows):
+                        changed_frames.setdefault(
+                            f"layer{layer_index}_{name}", []
+                        ).append(frame_index)
+                    else:
+                        pass
+        first_differences = {
+            name: indices[0] for name, indices in changed_frames.items()
+        }
         assert "text_embedding" not in first_differences
         first_difference = min(first_differences.values(), default=None)
         assert all(records[sample_id]["is_success"] for records in responses)
@@ -93,6 +109,8 @@ def main(baseline: Path, intervention: Path, asr_checkpoint: Path) -> None:
                 original_text=responses[0][sample_id]["raw_response"],
                 live_returned_text=responses[1][sample_id]["raw_response"],
                 frame_counts=[len(trajectory) for trajectory in frames],
+                paired_frames=min(len(trajectory) for trajectory in frames),
+                changed_frames=changed_frames,
                 first_differences=first_differences,
                 divergence_metadata=(
                     [report["frames"][first_difference] for report in metadata]
