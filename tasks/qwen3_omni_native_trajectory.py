@@ -32,6 +32,12 @@ class NativeTalkerTrajectory:
         }
         self.tensors: dict[str, list[dict[str, torch.Tensor]]] = {}
         self.metadata: dict[str, list[dict[str, str | int | bool | list[str]]]] = {}
+        self.layer_frames = {
+            int(frame)
+            for frame in environ.get("OMNI_NATIVE_LAYER_FRAMES", "").split(",")
+            if frame
+        }
+        assert all(frame > 0 for frame in self.layer_frames)
         self.attention_trial_sequences = {
             int(value)
             for value in environ.get("OMNI_NATIVE_ATTENTION_TRIAL_SEQUENCES", "").split(
@@ -337,6 +343,24 @@ class NativeTalkerTrajectory:
                             can_run_cuda_graph,
                         )
                     )
+                    if len(self.tensors[request.request_id]) - 1 in self.layer_frames:
+                        probes = (
+                            model_runner.model.native_layer_probe,
+                            *model_runner.model.native_deeper_layer_probes,
+                        )
+                        assert len(probes) == len(pool.k_buffer)
+                        for probe in probes:
+                            snapshot.update(
+                                probe.read(
+                                    request_row,
+                                    metadata["graph_batch_rows"],
+                                    can_run_cuda_graph,
+                                    include_peer_operators=True,
+                                )
+                            )
+                        metadata["captured_layers"] = len(probes)
+                    else:
+                        pass
                     if (
                         self.continuation_trial is not None
                         and self.continuation_trial.sequence_tokens

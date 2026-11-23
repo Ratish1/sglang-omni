@@ -5,6 +5,7 @@ SGLang-native Talker model for Qwen3-Omni compatiable with hf formatting.
 from __future__ import annotations
 
 import logging
+from os import environ
 from typing import Iterable, Optional, Tuple
 
 import torch
@@ -839,7 +840,16 @@ class Qwen3OmniTalker(nn.Module):
 
         device = self.model.codec_embedding.weight.device
         self.native_layer_probe = NativeLayerProbe(
-            self.model.layers[0], self.code_predictor.lm_head
+            self.model.layers[0], self.code_predictor.lm_head, 0
+        )
+        self.native_deeper_layer_probes = (
+            [
+                NativeLayerProbe(layer, nn.ModuleList(), layer_index)
+                for layer_index, layer in enumerate(self.model.layers)
+                if layer_index > 0
+            ]
+            if environ.get("OMNI_NATIVE_LAYER_FRAMES")
+            else []
         )
         hidden_size = config.text_config.hidden_size
         predictor_len = config.num_code_groups + 1

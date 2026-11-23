@@ -129,6 +129,45 @@ def validate(directory: Path) -> list[dict[str, torch.Tensor]]:
                     frame["layer0_value_before_cache"].flatten(),
                     frame["attention_read_values"][-1].flatten(),
                 )
+                if "captured_layers" in step:
+                    assert step["captured_layers"] == frame["stored_keys"].shape[0]
+                    for layer_index in range(step["captured_layers"]):
+                        prefix = f"layer{layer_index}_"
+                        assert torch.equal(
+                            frame[f"{prefix}positions"].flatten(),
+                            frame["rotary_positions"].flatten(),
+                        )
+                        for operand, field in (
+                            ("key_after_rope", "stored_keys"),
+                            ("value_before_cache", "stored_values"),
+                        ):
+                            assert torch.equal(
+                                frame[f"{prefix}{operand}"].flatten(),
+                                frame[field][layer_index].flatten(),
+                            ), (frame_index, layer_index, operand)
+                        if layer_index > 0:
+                            previous = f"layer{layer_index - 1}_"
+                            assert torch.equal(
+                                frame[f"{prefix}contribution"],
+                                frame[f"{previous}layer_output"],
+                            ), (frame_index, layer_index, "contribution")
+                            assert torch.equal(
+                                frame[f"{prefix}previous_residual"],
+                                frame[f"{previous}mlp_residual"],
+                            ), (frame_index, layer_index, "residual")
+                        else:
+                            pass
+                        for name, values in frame.items():
+                            if name.startswith(f"{prefix}peer_"):
+                                selected = name.replace(f"{prefix}peer_", prefix, 1)
+                                assert values.shape[0] == step["graph_batch_rows"]
+                                assert torch.equal(
+                                    values[step["request_row"]], frame[selected]
+                                ), (frame_index, layer_index, name)
+                            else:
+                                pass
+                else:
+                    pass
             else:
                 pass
     return frames

@@ -75,7 +75,9 @@ def main(
     continuation_reference: Path | None,
     continuation_target: Path | None,
     continuation_sequences: list[int],
+    layer_frames: list[int],
 ) -> None:
+    assert all(frame > 0 for frame in layer_frames)
     assert (code_trial_reference is None) == (not code_trial_choice)
     if code_trial_reference is not None:
         assert not attention_trial_sequences
@@ -137,6 +139,7 @@ def main(
             "SGLANG_CACHE_DIR": str(output / "cache"),
             "OMNI_NATIVE_TRAJECTORY_DIRECTORY": str(captures),
             "OMNI_NATIVE_TRAJECTORY_SAMPLES": ",".join(selected_samples),
+            "OMNI_NATIVE_LAYER_FRAMES": ",".join(str(frame) for frame in layer_frames),
             "OMNI_NATIVE_ATTENTION_TRIAL_SEQUENCES": ",".join(
                 str(value) for value in attention_trial_sequences
             ),
@@ -255,6 +258,7 @@ if __name__ == "__main__":
     parser.add_argument("--mmsu", action="store_true")
     parser.add_argument("--selected-samples", nargs="+", default=list(SELECTED_SAMPLES))
     parser.add_argument("--client-concurrency", type=int, default=32)
+    parser.add_argument("--layer-frames", type=int, nargs="+", default=[])
     parser.add_argument("--attention-trial-sequences", type=int, nargs="*", default=[])
     parser.add_argument("--attention-trial-splits", type=int, choices=(0, 1), default=0)
     parser.add_argument("--code-trial-reference", type=Path)
@@ -281,6 +285,7 @@ if __name__ == "__main__":
         arguments.continuation_reference,
         arguments.continuation_target,
         arguments.continuation_sequences,
+        arguments.layer_frames,
     )
 else:
     pass

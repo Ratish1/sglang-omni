@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Copy layer-zero decode boundaries without replacing model operands."""
+"""Copy native decode boundaries without replacing model operands."""
 
 from typing import Protocol
 
@@ -21,7 +21,10 @@ class OutputRecorder(Protocol):
 
 
 class NativeLayerProbe:
-    def __init__(self, layer: nn.Module, predictor_heads: nn.ModuleList) -> None:
+    def __init__(
+        self, layer: nn.Module, predictor_heads: nn.ModuleList, layer_index: int
+    ) -> None:
+        self.layer_index = layer_index
         self.active: dict[str, torch.Tensor] | None = None
         self.decode_snapshot: dict[str, torch.Tensor] | None = None
         self.predictor_groups = len(predictor_heads)
@@ -32,6 +35,7 @@ class NativeLayerProbe:
             self.attention_input, with_kwargs=True
         )
         layer.self_attn.qkv_proj.register_forward_hook(self.output("qkv_projection"))
+        layer.self_attn.rotary_emb.register_forward_pre_hook(self.before_rope)
         layer.self_attn.attn.register_forward_pre_hook(self.qkv_after_rope)
         layer.self_attn.attn.register_forward_hook(self.output("attention_context"))
         layer.self_attn.register_forward_hook(self.output("attention_projection"))
@@ -67,6 +71,11 @@ class NativeLayerProbe:
         assert isinstance(positions, torch.Tensor)
         self.record("contribution", hidden_states)
         self.record("positions", positions.movedim(-1, 0))
+        previous_residual = residual_batch.written_residual(forward_batch)
+        if previous_residual is not None:
+            self.record("previous_residual", previous_residual)
+        else:
+            pass
         if torch.cuda.is_current_stream_capturing():
             self.snapshots.append(self.active)
         else:
@@ -106,6 +115,15 @@ class NativeLayerProbe:
         self.record("query_after_rope", query)
         self.record("key_after_rope", key)
         self.record("value_before_cache", value)
+
+    def before_rope(
+        self,
+        module: nn.Module,
+        inputs: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+    ) -> None:
+        positions, query, key = inputs
+        self.record("query_before_rope", query)
+        self.record("key_before_rope", key)
 
     def feed_forward_input(
         self, module: nn.Module, inputs: tuple[torch.Tensor, ForwardBatch]
@@ -185,14 +203,25 @@ class NativeLayerProbe:
             return self.eager
 
     def read(
-        self, row: int, graph_rows: int, graph_replay: bool
+        self,
+        row: int,
+        graph_rows: int,
+        graph_replay: bool,
+        include_peer_operators: bool = False,
     ) -> dict[str, torch.Tensor]:
         source = self.snapshot_for_batch(graph_rows, graph_replay)
         result = {
-            f"layer0_{name}": values[row].detach().clone()
+            f"layer{self.layer_index}_{name}": values[row].detach().clone()
             for name, values in source.items()
             if not name.startswith("predictor_logits_")
         }
-        for name in ("mlp_normalized", "expert_ids", "expert_weights"):
-            result[f"layer0_peer_{name}"] = source[name].detach().clone()
+        peer_fields = (
+            tuple(name for name in source if not name.startswith("predictor_logits_"))
+            if include_peer_operators
+            else ("mlp_normalized", "expert_ids", "expert_weights")
+        )
+        for name in peer_fields:
+            result[f"layer{self.layer_index}_peer_{name}"] = (
+                source[name].detach().clone()
+            )
         return result
