@@ -364,6 +364,7 @@ def main(arguments: argparse.Namespace) -> None:
     model = load_talker(arguments.checkpoint, arguments.gpu, arguments.output)
     if arguments.native_predictor_config is None:
         assert arguments.predictor_batch_rows is None
+        assert not arguments.checkpoint_predictor_control
         native_predictor = None
     else:
         assert arguments.predictor_batch_rows is not None
@@ -387,7 +388,7 @@ def main(arguments: argparse.Namespace) -> None:
                 arguments.output / sample_id / f"reference-{repeat}.pt",
                 arguments.native_prefix,
                 arguments.sequential_feedback,
-                native_predictor,
+                None if arguments.checkpoint_predictor_control else native_predictor,
                 arguments.predictor_batch_rows,
             )
             report = {
@@ -395,7 +396,9 @@ def main(arguments: argparse.Namespace) -> None:
                 "repeat": repeat,
                 "native_prefix": arguments.native_prefix,
                 "sequential_feedback": arguments.sequential_feedback,
-                "native_predictor": native_predictor is not None,
+                "native_predictor": native_predictor is not None
+                and not arguments.checkpoint_predictor_control,
+                "checkpoint_predictor_control": arguments.checkpoint_predictor_control,
                 "predictor_batch_rows": arguments.predictor_batch_rows,
                 "frames_including_eos": len(generated_codes),
                 "same_codes_as_previous": (
@@ -433,6 +436,7 @@ if __name__ == "__main__":
     parser.add_argument("--sequential-feedback", action="store_true")
     parser.add_argument("--native-predictor-config", type=Path)
     parser.add_argument("--predictor-batch-rows", type=int)
+    parser.add_argument("--checkpoint-predictor-control", action="store_true")
     main(parser.parse_args())
 else:
     pass
