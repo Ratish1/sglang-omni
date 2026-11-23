@@ -7,6 +7,7 @@ from collections import Counter
 from contextlib import ExitStack
 from dataclasses import asdict, dataclass
 from hashlib import sha256
+from os import environ
 from pathlib import Path
 
 import torch
@@ -74,6 +75,12 @@ def verify_weights(model: Qwen3OmniTalker, checkpoint: Path) -> list[str]:
 @torch.inference_mode()
 def main(arguments: argparse.Namespace) -> None:
     arguments.output.mkdir()
+    captures = sorted(arguments.root.glob("captures/*/trajectory.pt"))
+    assert captures
+    environ["OMNI_NATIVE_TRAJECTORY_DIRECTORY"] = str(arguments.output)
+    environ["OMNI_NATIVE_TRAJECTORY_SAMPLES"] = ",".join(
+        capture.parent.name for capture in captures
+    )
     torch.set_num_threads(1)
     torch.cuda.set_device(arguments.gpu)
     scheduler = load_native_talker(
@@ -83,8 +90,6 @@ def main(arguments: argparse.Namespace) -> None:
     assert isinstance(model, Qwen3OmniTalker)
     verified_weights = verify_weights(model, arguments.checkpoint)
     reports = {}
-    captures = sorted(arguments.root.glob("captures/*/trajectory.pt"))
-    assert captures
     for capture in captures:
         frames = validate(capture.parent)
         steps = json.loads(capture.with_suffix(".json").read_text())["frames"]
