@@ -4,10 +4,13 @@
 from __future__ import annotations
 
 from collections import deque
+from os import environ
+from pathlib import Path
 from queue import Queue
 from typing import TYPE_CHECKING, TypeAlias
 
 import torch
+from qwen3_omni_native_sampling_audit import NativeSamplingAudit
 from qwen3_omni_native_trajectory import NativeTalkerTrajectory
 
 from sglang_omni.model_runner.base import ModelRunner
@@ -72,6 +75,11 @@ class QwenTalkerModelRunner(ModelRunner["SGLangARRequestData"]):
         self.codec_coalesce_first_frames = max(int(codec_coalesce_first_frames), 0)
         self.codec_coalesce_early_frames = max(int(codec_coalesce_early_frames), 0)
         self.native_trajectory = NativeTalkerTrajectory()
+        self.sampling_audit: NativeSamplingAudit | None = (
+            NativeSamplingAudit(Path(environ["OMNI_NATIVE_TRAJECTORY_DIRECTORY"]))
+            if environ.get("OMNI_NATIVE_SAMPLING_AUDIT") == "1"
+            else None
+        )
 
     def execute(self, scheduler_output: SchedulerOutput) -> ModelRunnerOutput:
         return super().execute(scheduler_output)
@@ -114,6 +122,10 @@ class QwenTalkerModelRunner(ModelRunner["SGLangARRequestData"]):
             pass
 
         self.model.prepare_decode_buffers(requests)
+        if self.sampling_audit is not None:
+            self.sampling_audit.check(self.model, requests)
+        else:
+            pass
         self.native_trajectory.before_forward(forward_batch, requests, None)
         self.write_feedback_buffers(requests)
 
@@ -147,6 +159,10 @@ class QwenTalkerModelRunner(ModelRunner["SGLangARRequestData"]):
         else:
             pass
         layer0_codes = result.next_token_ids
+        if self.sampling_audit is not None:
+            self.sampling_audit.record_samples(layer0_codes, requests)
+        else:
+            pass
         if layer0_codes.ndim == 1:
             layer0_codes = layer0_codes.unsqueeze(1)
         else:
@@ -186,6 +202,10 @@ class QwenTalkerModelRunner(ModelRunner["SGLangARRequestData"]):
 
         batch_size = len(requests)
         result.next_token_ids = self.model.sampled_token_ids[:batch_size].clone()
+        if self.sampling_audit is not None:
+            self.sampling_audit.record_samples(result.next_token_ids, requests)
+        else:
+            pass
         self.stage_token_ids(result, result.next_token_ids)
         self.native_trajectory.after_forward(
             forward_batch,
@@ -325,6 +345,10 @@ class QwenTalkerModelRunner(ModelRunner["SGLangARRequestData"]):
         self, request_id: str, req_data: "SGLangARRequestData"
     ) -> None:
         self.native_trajectory.finish(request_id, req_data)
+        if self.sampling_audit is not None:
+            self.sampling_audit.finish(request_id, req_data)
+        else:
+            pass
         pending = req_data.pending_codec_rows
         if not pending:
             return
