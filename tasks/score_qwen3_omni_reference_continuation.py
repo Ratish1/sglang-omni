@@ -8,8 +8,8 @@ from hashlib import sha256
 from pathlib import Path
 
 import torch
+from qwen3_omni_checkpoint_weights import audit_weights
 from qwen3_omni_corpus_support import SERVER_TIMEOUT_SECONDS, server_command
-from replay_qwen3_omni_reference_continuation import audit_weights
 from transformers import Qwen3OmniMoeConfig
 from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import (
     Qwen3OmniMoeCode2Wav,

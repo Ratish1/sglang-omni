@@ -3,28 +3,24 @@
 
 import argparse
 import json
-import re
 from dataclasses import asdict, dataclass
 from hashlib import sha256
 from pathlib import Path
 
 import torch
 from compare_qwen3_omni_native_trajectories import validate
-from safetensors import safe_open
+from qwen3_omni_checkpoint_weights import audit_weights
 from sglang.srt.layers.sampler import top_k_top_p_min_p_sampling_from_probs_torch
 from transformers import Qwen3OmniMoeConfig
+from transformers.cache_utils import DynamicCache, DynamicLayer
 from transformers.conversion_mapping import (
     get_checkpoint_conversion_mapping,
     register_checkpoint_conversion_mapping,
 )
 from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import (
-    Qwen3OmniMoeCode2Wav,
     Qwen3OmniMoeTalkerForConditionalGeneration,
 )
 
-EXPERT_WEIGHT = re.compile(
-    r"(.+\.experts)\.(\d+)\.(gate_proj|up_proj|down_proj)\.weight"
-)
 RESERVED_CODEC_TOKENS = 1024
 
 
@@ -78,6 +74,9 @@ class NativeConditioning:
     text_embeddings: torch.Tensor
     padding_embedding: torch.Tensor
     codec_ids: torch.Tensor
+    prefill_keys: torch.Tensor
+    prefill_values: torch.Tensor
+    first_feedback: torch.Tensor
 
 
 def load_conditioning(
@@ -135,6 +134,9 @@ def load_conditioning(
         text_embeddings=torch.cat(text_rows),
         padding_embedding=padding,
         codec_ids=codes,
+        prefill_keys=frames[0]["stored_keys"],
+        prefill_values=frames[0]["stored_values"],
+        first_feedback=frames[0]["feedback"],
     )
     destination.mkdir()
     torch.save(asdict(conditioning), destination / "conditioning.pt")
@@ -153,59 +155,14 @@ def load_conditioning(
     return conditioning
 
 
-def audit_weights(
-    model: Qwen3OmniMoeTalkerForConditionalGeneration | Qwen3OmniMoeCode2Wav,
-    checkpoint: Path,
-    destination: Path,
-) -> None:
-    index = json.loads((checkpoint / "model.safetensors.index.json").read_text())
-    checkpoint_prefix = (
-        "code2wav." if isinstance(model, Qwen3OmniMoeCode2Wav) else "talker."
-    )
-    tensors = model.state_dict(keep_vars=True)
-    shards: dict[str, list[str]] = {}
-    for name, shard in index["weight_map"].items():
-        if name.startswith(checkpoint_prefix):
-            shards.setdefault(shard, []).append(name)
-        else:
-            pass
-    visited: set[int] = set()
-    checked_tensors = 0
-    for shard, names in sorted(shards.items()):
-        with safe_open(checkpoint / shard, framework="pt", device="cpu") as weights:
-            for checkpoint_name in names:
-                expected = weights.get_tensor(checkpoint_name)
-                name = checkpoint_name.removeprefix(checkpoint_prefix)
-                expert = EXPERT_WEIGHT.fullmatch(name)
-                if expert is None:
-                    tensor = tensors[name]
-                    actual = tensor
-                else:
-                    prefix, expert_index, projection = expert.groups()
-                    if projection == "down_proj":
-                        tensor = tensors[f"{prefix}.down_proj"]
-                        actual = tensor[int(expert_index)]
-                    else:
-                        tensor = tensors[f"{prefix}.gate_up_proj"]
-                        rows = expected.shape[0]
-                        start = 0 if projection == "gate_proj" else rows
-                        actual = tensor[int(expert_index), start : start + rows]
-                assert actual.dtype == expected.dtype, checkpoint_name
-                assert torch.equal(actual, expected.to(actual.device)), checkpoint_name
-                visited.add(id(tensor))
-                checked_tensors += 1
-    assert all(id(tensor) in visited for tensor in tensors.values())
-    (destination / "weights.json").write_text(
-        json.dumps({"raw_checkpoint_tensors_verified": checked_tensors}, indent=2)
-    )
-
-
 def generate(
     model: Qwen3OmniMoeTalkerForConditionalGeneration,
     conditioning: NativeConditioning,
     policy: SamplingPolicy,
     max_frames: int,
     destination: Path,
+    use_native_prefix: bool,
+    use_sequential_feedback: bool,
 ) -> torch.Tensor:
     prefill = conditioning.prefill_embeddings.to(policy.device)[None]
     text_rows = conditioning.text_embeddings.to(policy.device)[None]
@@ -263,6 +220,64 @@ def generate(
             )
             frame_codes = prepared["residual_codes"][0]
             assert int(frame_codes[0]) == int(sampled[0])
+            embeddings = [model.get_input_embeddings()(frame_codes[:1])[None]]
+            for codebook_index, embedding_table in enumerate(
+                model.code_predictor.get_input_embeddings()
+            ):
+                embeddings.append(
+                    embedding_table(
+                        frame_codes[codebook_index + 1 : codebook_index + 2]
+                    )[None]
+                )
+            sequential_feedback = torch.zeros_like(embeddings[0])
+            for embedding in embeddings:
+                assert embedding.dtype == torch.bfloat16
+                sequential_feedback.add_(embedding)
+            checkpoint_feedback = torch.cat(embeddings, dim=1).sum(1, keepdim=True)
+            text_embedding = (
+                text_rows[:, frame_index : frame_index + 1]
+                if frame_index < text_rows.shape[1]
+                else padding
+            )
+            assert torch.equal(
+                prepared["inputs_embeds"], checkpoint_feedback + text_embedding
+            ), frame_index
+            if frame_index == 0:
+                assert torch.equal(frame_codes.cpu(), conditioning.codec_ids[0])
+                assert torch.equal(
+                    sequential_feedback.cpu().reshape(-1),
+                    conditioning.first_feedback.reshape(-1),
+                )
+                if use_native_prefix:
+                    cache = output.past_key_values
+                    assert isinstance(cache, DynamicCache)
+                    assert prepared["past_key_values"] is cache
+                    assert len(cache.layers) == len(conditioning.prefill_keys)
+                    for layer, keys, values in zip(
+                        cache.layers,
+                        conditioning.prefill_keys,
+                        conditioning.prefill_values,
+                        strict=True,
+                    ):
+                        assert type(layer) is DynamicLayer
+                        for actual, native in (
+                            (layer.keys, keys),
+                            (layer.values, values),
+                        ):
+                            expected = native.transpose(0, 1)[None].to(policy.device)
+                            assert actual.shape == expected.shape
+                            assert actual.dtype == expected.dtype == torch.bfloat16
+                            actual.copy_(expected)
+                            assert torch.equal(actual, expected)
+                    assert cache.get_seq_length() == prefill_tokens
+                else:
+                    pass
+            else:
+                pass
+            if use_sequential_feedback:
+                prepared["inputs_embeds"] = sequential_feedback + text_embedding
+            else:
+                pass
             codes.append(frame_codes.cpu())
     else:
         raise RuntimeError(
@@ -333,10 +348,14 @@ def main(arguments: argparse.Namespace) -> None:
                 policy,
                 arguments.max_frames,
                 arguments.output / sample_id / f"reference-{repeat}.pt",
+                arguments.native_prefix,
+                arguments.sequential_feedback,
             )
             report = {
                 "sample_id": sample_id,
                 "repeat": repeat,
+                "native_prefix": arguments.native_prefix,
+                "sequential_feedback": arguments.sequential_feedback,
                 "frames_including_eos": len(generated_codes),
                 "same_codes_as_previous": (
                     torch.equal(previous_codes, generated_codes)
@@ -365,6 +384,8 @@ if __name__ == "__main__":
     parser.add_argument("--top-p", type=float, required=True)
     parser.add_argument("--max-frames", type=int, required=True)
     parser.add_argument("--audit-only", action="store_true")
+    parser.add_argument("--native-prefix", action="store_true")
+    parser.add_argument("--sequential-feedback", action="store_true")
     main(parser.parse_args())
 else:
     pass
