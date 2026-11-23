@@ -25,6 +25,10 @@ MMSU_ASR_CONCURRENCY = 4
 
 def main(root: Path, checkpoint: Path, mmsu: bool, single_arm: bool) -> None:
     arms = (root,) if single_arm else (root / "first", root / "second")
+    assert not any((arm / "conditioning-references.json").exists() for arm in arms), (
+        "Fixed-conditioning speech must be scored against its original captured text, "
+        "not the live returned answer"
+    )
     stages = ("seedtts", "mmsu") if mmsu else ("seedtts",)
     waveforms = sorted(
         waveform

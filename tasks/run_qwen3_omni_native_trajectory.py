@@ -76,6 +76,7 @@ def main(
     continuation_target: Path | None,
     continuation_sequences: list[int],
     layer_frames: list[int],
+    conditioning_reference: list[Path],
 ) -> None:
     assert all(frame > 0 for frame in layer_frames)
     assert (code_trial_reference is None) == (not code_trial_choice)
@@ -101,7 +102,29 @@ def main(
         assert not attention_trial_sequences
     else:
         assert continuation_target is None and not continuation_sequences
+    if conditioning_reference:
+        assert {reference.name for reference in conditioning_reference} == set(
+            selected_samples
+        )
+        assert len(conditioning_reference) == len(selected_samples)
+        assert code_trial_reference is None and not cache_trial_reference
+        assert continuation_reference is None and not attention_trial_sequences
+    else:
+        pass
     output.mkdir()
+    if conditioning_reference:
+        (output / "conditioning-references.json").write_text(
+            json.dumps(
+                {
+                    reference.name: str(reference)
+                    for reference in conditioning_reference
+                },
+                indent=2,
+            )
+            + "\n"
+        )
+    else:
+        pass
     samples = load_seedtts_samples(SEEDTTS_DATASET_ID)
     sample_ids = {sample.sample_id for sample in samples}
     assert len(samples) == len(sample_ids) == 1088
@@ -140,6 +163,9 @@ def main(
             "OMNI_NATIVE_TRAJECTORY_DIRECTORY": str(captures),
             "OMNI_NATIVE_TRAJECTORY_SAMPLES": ",".join(selected_samples),
             "OMNI_NATIVE_LAYER_FRAMES": ",".join(str(frame) for frame in layer_frames),
+            "OMNI_NATIVE_CONDITIONING_REFERENCES": json.dumps(
+                [str(reference) for reference in conditioning_reference]
+            ),
             "OMNI_NATIVE_ATTENTION_TRIAL_SEQUENCES": ",".join(
                 str(value) for value in attention_trial_sequences
             ),
@@ -220,6 +246,14 @@ def main(
     finally:
         stop_server(server)
     for sample_id in selected_samples:
+        if conditioning_reference:
+            conditioning_report = json.loads(
+                (captures / f"{sample_id}-conditioning.json").read_text()
+            )
+            assert all(conditioning_report["checks"].values())
+            assert conditioning_report["outcomes"]["emitted_frames"] > 0
+        else:
+            pass
         assert (captures / sample_id / "trajectory.pt").is_file()
         report = json.loads((captures / sample_id / "trajectory.json").read_text())
         if not mmsu:
@@ -259,6 +293,7 @@ if __name__ == "__main__":
     parser.add_argument("--selected-samples", nargs="+", default=list(SELECTED_SAMPLES))
     parser.add_argument("--client-concurrency", type=int, default=32)
     parser.add_argument("--layer-frames", type=int, nargs="+", default=[])
+    parser.add_argument("--conditioning-reference", type=Path, nargs="+", default=[])
     parser.add_argument("--attention-trial-sequences", type=int, nargs="*", default=[])
     parser.add_argument("--attention-trial-splits", type=int, choices=(0, 1), default=0)
     parser.add_argument("--code-trial-reference", type=Path)
@@ -286,6 +321,7 @@ if __name__ == "__main__":
         arguments.continuation_target,
         arguments.continuation_sequences,
         arguments.layer_frames,
+        arguments.conditioning_reference,
     )
 else:
     pass

@@ -11,6 +11,7 @@ from qwen3_omni_native_attention_trial import (
     compare_attention_schedules,
 )
 from qwen3_omni_native_code_trial import NativeCodeTrial
+from qwen3_omni_native_conditioning_trial import NativeConditioningTrial
 from qwen3_omni_native_continuation_trial import NativeContinuationTrial
 from sglang.srt.layers.attention.flashattention_backend import FlashAttentionBackend
 from sglang.srt.managers.scheduler import GenerationBatchResult
@@ -114,6 +115,26 @@ class NativeTalkerTrajectory:
                 self.directory / "continuation-trial.json",
             )
             assert self.request_ids == {self.continuation_trial.request_id}
+        else:
+            pass
+        conditioning_references = json.loads(
+            environ.get("OMNI_NATIVE_CONDITIONING_REFERENCES", "[]")
+        )
+        self.conditioning_trials: dict[str, NativeConditioningTrial] = {}
+        if conditioning_references:
+            assert self.code_trial is None and not self.cache_trials
+            assert (
+                self.continuation_trial is None and not self.attention_trial_sequences
+            )
+            for reference in conditioning_references:
+                directory = Path(reference)
+                trial = NativeConditioningTrial(
+                    directory, self.directory / f"{directory.name}-conditioning.json"
+                )
+                assert trial.request_id in self.request_ids
+                assert trial.request_id not in self.conditioning_trials
+                self.conditioning_trials[trial.request_id] = trial
+            assert self.request_ids == set(self.conditioning_trials)
         else:
             pass
         assert self.directory.is_dir()
@@ -266,6 +287,13 @@ class NativeTalkerTrajectory:
                     request_metadata["prefix_length"] = (
                         forward_batch.extend_prefix_lens_cpu[request_row]
                     )
+                    if request.request_id in self.conditioning_trials:
+                        assert request_metadata["prefix_length"] == 0
+                        self.conditioning_trials[request.request_id].before_prefill(
+                            request.data, snapshot
+                        )
+                    else:
+                        pass
                 else:
                     snapshot["scheduled_sequence_lengths_cpu"] = (
                         forward_batch.seq_lens_cpu.detach().clone()
@@ -457,6 +485,10 @@ class NativeTalkerTrajectory:
                 snapshot["stored_values"] = torch.stack(
                     [layer.index_select(0, token_slots) for layer in pool.v_buffer]
                 )
+                if is_prefill and request.request_id in self.conditioning_trials:
+                    self.conditioning_trials[request.request_id].after_prefill(snapshot)
+                else:
+                    pass
             else:
                 pass
 
@@ -490,3 +522,7 @@ class NativeTalkerTrajectory:
                 },
                 report,
             )
+        if request_id in self.conditioning_trials:
+            self.conditioning_trials[request_id].finish(snapshots)
+        else:
+            pass
