@@ -20,6 +20,16 @@ class NativeConditioningTrial:
         self.conditioning: dict[str, torch.Tensor] = torch.load(
             reference / "conditioning.pt", weights_only=True, map_location="cpu"
         )
+        assert self.conditioning.keys() == {
+            "prefill_embeddings",
+            "input_ids",
+            "text_embeddings",
+            "padding_embedding",
+            "codec_ids",
+            "prefill_keys",
+            "prefill_values",
+            "first_feedback",
+        }, f"Incomplete conditioning extraction: {reference}"
         receipt = json.loads((reference / "conditioning.json").read_text())
         self.policy: dict[str, int | float | str] = receipt["sampling_policy"]
         assert receipt["native_frames"] == receipt["verified_native_draws"]
