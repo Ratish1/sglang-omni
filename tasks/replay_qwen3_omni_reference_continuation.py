@@ -9,14 +9,10 @@ from pathlib import Path
 
 import torch
 from compare_qwen3_omni_native_trajectories import validate
-from qwen3_omni_checkpoint_weights import audit_weights
+from qwen3_omni_checkpoint_weights import load_talker
 from sglang.srt.layers.sampler import top_k_top_p_min_p_sampling_from_probs_torch
 from transformers import Qwen3OmniMoeConfig
 from transformers.cache_utils import DynamicCache, DynamicLayer
-from transformers.conversion_mapping import (
-    get_checkpoint_conversion_mapping,
-    register_checkpoint_conversion_mapping,
-)
 from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import (
     Qwen3OmniMoeTalkerForConditionalGeneration,
 )
@@ -321,23 +317,7 @@ def main(arguments: argparse.Namespace) -> None:
         return
     else:
         pass
-    register_checkpoint_conversion_mapping(
-        config.model_type, get_checkpoint_conversion_mapping("qwen3_omni_moe")
-    )
-    model, loading = Qwen3OmniMoeTalkerForConditionalGeneration.from_pretrained(
-        arguments.checkpoint,
-        config=config,
-        dtype=torch.bfloat16,
-        device_map={"": arguments.gpu},
-        attn_implementation="eager",
-        experts_implementation="eager",
-        use_kernels=False,
-        output_loading_info=True,
-    )
-    assert not loading["missing_keys"] and not loading["mismatched_keys"], loading
-    model.eval()
-    model.code_predictor.generation_config.do_sample = False
-    audit_weights(model, arguments.checkpoint, arguments.output)
+    model = load_talker(arguments.checkpoint, arguments.gpu, arguments.output)
     reports = []
     for sample_id, conditioning in captures.items():
         previous_codes: torch.Tensor | None = None

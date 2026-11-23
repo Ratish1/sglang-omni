@@ -7,6 +7,11 @@ from pathlib import Path
 
 import torch
 from safetensors import safe_open
+from transformers import Qwen3OmniMoeConfig
+from transformers.conversion_mapping import (
+    get_checkpoint_conversion_mapping,
+    register_checkpoint_conversion_mapping,
+)
 from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import (
     Qwen3OmniMoeCode2Wav,
     Qwen3OmniMoeTalkerForConditionalGeneration,
@@ -15,6 +20,30 @@ from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import (
 EXPERT_WEIGHT = re.compile(
     r"(.+\.experts)\.(\d+)\.(gate_proj|up_proj|down_proj)\.weight"
 )
+
+
+def load_talker(
+    checkpoint: Path, gpu_index: int, destination: Path
+) -> Qwen3OmniMoeTalkerForConditionalGeneration:
+    config = Qwen3OmniMoeConfig.from_pretrained(checkpoint).talker_config
+    register_checkpoint_conversion_mapping(
+        config.model_type, get_checkpoint_conversion_mapping("qwen3_omni_moe")
+    )
+    model, loading = Qwen3OmniMoeTalkerForConditionalGeneration.from_pretrained(
+        checkpoint,
+        config=config,
+        dtype=torch.bfloat16,
+        device_map={"": gpu_index},
+        attn_implementation="eager",
+        experts_implementation="eager",
+        use_kernels=False,
+        output_loading_info=True,
+    )
+    assert not loading["missing_keys"] and not loading["mismatched_keys"], loading
+    model.eval()
+    model.code_predictor.generation_config.do_sample = False
+    audit_weights(model, checkpoint, destination)
+    return model
 
 
 def audit_weights(
