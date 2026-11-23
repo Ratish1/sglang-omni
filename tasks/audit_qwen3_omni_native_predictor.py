@@ -14,7 +14,8 @@ from sglang_omni.config.manager import ConfigManager
 from sglang_omni.config.runtime import resolve_stage_factory_args
 from sglang_omni.models.qwen3_omni.stages import create_talker_ar_executor_from_config
 from sglang_omni.models.qwen3_omni.talker_model_runner import QwenTalkerModelRunner
-from sglang_omni.utils import find_available_port
+from sglang_omni.models.qwen3_omni.talker_scheduler import QwenTalkerScheduler
+from sglang_omni.utils.connection import find_available_port
 
 
 @dataclass(kw_only=True)
@@ -30,24 +31,22 @@ class FrameReplay:
     feedback_sha256: str
 
 
-@torch.inference_mode()
-def main(arguments: argparse.Namespace) -> None:
-    arguments.output.mkdir()
-    device = torch.device("cuda", arguments.gpu)
-    torch.cuda.set_device(device)
+def load_native_talker(
+    checkpoint: Path, config_path: Path, gpu_index: int, destination: Path
+) -> QwenTalkerScheduler:
     config = ConfigManager.from_file(
-        str(arguments.config), model_path_override=str(arguments.checkpoint)
+        str(config_path), model_path_override=str(checkpoint)
     ).config
     assert config is not None
     factory_arguments = resolve_stage_factory_args(
-        config.stage_named("talker_ar"), config, gpu_id=arguments.gpu
+        config.stage_named("talker_ar"), config, gpu_id=gpu_index
     )
     factory_arguments["nccl_port"] = find_available_port()
     scheduler = create_talker_ar_executor_from_config(**factory_arguments)
     runner = scheduler.model_runner
     assert isinstance(runner, QwenTalkerModelRunner)
     model = runner.model
-    (arguments.output / "runtime.json").write_text(
+    (destination / "native-runtime.json").write_text(
         json.dumps(
             {
                 "factory_arguments": factory_arguments,
@@ -56,12 +55,24 @@ def main(arguments: argparse.Namespace) -> None:
                 "exact_add_norm": model.predictor_exact_add_norm,
                 "triton_attention": model.predictor_triton_attention,
                 "rope_stores_kv": model.predictor_rope_stores_kv,
-                "peer_inputs": "zero or duplicated selected query, not captured peers",
-                "main_code_dtype": "int64; original sampler index dtype not captured",
             },
             indent=2,
         )
     )
+    return scheduler
+
+
+@torch.inference_mode()
+def main(arguments: argparse.Namespace) -> None:
+    arguments.output.mkdir()
+    device = torch.device("cuda", arguments.gpu)
+    torch.cuda.set_device(device)
+    scheduler = load_native_talker(
+        arguments.checkpoint, arguments.config, arguments.gpu, arguments.output
+    )
+    runner = scheduler.model_runner
+    assert isinstance(runner, QwenTalkerModelRunner)
+    model = runner.model
     comparisons: dict[str, dict[tuple[int, bool], FrameReplay]] = {}
     for repeat in range(2):
         directories = arguments.capture if repeat == 0 else arguments.capture[::-1]
@@ -79,7 +90,10 @@ def main(arguments: argparse.Namespace) -> None:
                 frame = frames[frame_index]
                 state = metadata["frames"][frame_index]
                 request_row = state["request_row"]
-                if state["phase"] == "prefill":
+                if arguments.fixed_batch_rows is not None:
+                    batch_rows = live_rows = arguments.fixed_batch_rows
+                    use_graph = True
+                elif state["phase"] == "prefill":
                     live_rows = len(state["request_ids"])
                     batch_rows = model.predictor_decode_graph_bucket_size(live_rows)
                     assert batch_rows is not None
@@ -123,6 +137,16 @@ def main(arguments: argparse.Namespace) -> None:
                         )
                     actual_codes = codes[request_row].flatten().cpu()
                     actual_feedback = feedback[request_row].flatten().cpu()
+                    if duplicate_peers:
+                        assert torch.equal(
+                            codes, codes[request_row : request_row + 1].expand_as(codes)
+                        )
+                        assert torch.equal(
+                            feedback,
+                            feedback[request_row : request_row + 1].expand_as(feedback),
+                        )
+                    else:
+                        pass
                     expected_codes = frame["codec_ids"].flatten()
                     expected_feedback = frame["feedback"].flatten()
                     assert torch.isfinite(actual_feedback).all()
@@ -170,6 +194,9 @@ def main(arguments: argparse.Namespace) -> None:
             report = {
                 "sample_id": directory.name,
                 "repeat": repeat,
+                "fixed_batch_rows": arguments.fixed_batch_rows,
+                "peer_inputs": "zero or duplicated selected query, not captured peers",
+                "main_code_dtype": "int64; original sampler index dtype not captured",
                 "capture_sha256": sha256(
                     (directory / "trajectory.pt").read_bytes()
                 ).hexdigest(),
@@ -198,6 +225,7 @@ if __name__ == "__main__":
     parser.add_argument("output", type=Path)
     parser.add_argument("--capture", type=Path, action="append", required=True)
     parser.add_argument("--gpu", type=int, required=True)
+    parser.add_argument("--fixed-batch-rows", type=int)
     main(parser.parse_args())
 else:
     pass

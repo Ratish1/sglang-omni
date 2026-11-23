@@ -8,14 +8,19 @@ from hashlib import sha256
 from pathlib import Path
 
 import torch
+from audit_qwen3_omni_native_predictor import load_native_talker
 from compare_qwen3_omni_native_trajectories import validate
 from qwen3_omni_checkpoint_weights import load_talker
 from sglang.srt.layers.sampler import top_k_top_p_min_p_sampling_from_probs_torch
 from transformers import Qwen3OmniMoeConfig
 from transformers.cache_utils import DynamicCache, DynamicLayer
+from transformers.generation.utils import GenerationMixin
 from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import (
     Qwen3OmniMoeTalkerForConditionalGeneration,
 )
+
+from sglang_omni.models.qwen3_omni.components.talker import Qwen3OmniTalker
+from sglang_omni.models.qwen3_omni.talker_model_runner import QwenTalkerModelRunner
 
 RESERVED_CODEC_TOKENS = 1024
 
@@ -159,6 +164,8 @@ def generate(
     destination: Path,
     use_native_prefix: bool,
     use_sequential_feedback: bool,
+    native_predictor: Qwen3OmniTalker | None,
+    predictor_batch_rows: int | None,
 ) -> torch.Tensor:
     prefill = conditioning.prefill_embeddings.to(policy.device)[None]
     text_rows = conditioning.text_embeddings.to(policy.device)[None]
@@ -198,8 +205,7 @@ def generate(
             codes.append(eos)
             break
         else:
-            prepared = model.prepare_inputs_for_generation(
-                generated_ids,
+            preparation = dict(
                 next_sequence_length=1,
                 past_key_values=output.past_key_values,
                 attention_mask=torch.ones_like(generated_ids),
@@ -207,13 +213,44 @@ def generate(
                 position_ids=torch.tensor(
                     [[[prefill_tokens + frame_index]]], device=policy.device
                 ).expand(4, 1, 1),
-                hidden_states=output.hidden_states,
                 generation_step=output.generation_step,
                 trailing_text_hidden=text_rows,
                 tts_pad_embed=padding,
                 output_hidden_states=True,
                 use_cache=True,
             )
+            if native_predictor is None:
+                prepared = model.prepare_inputs_for_generation(
+                    generated_ids, hidden_states=output.hidden_states, **preparation
+                )
+                native_feedback = None
+            else:
+                assert predictor_batch_rows is not None
+                assert (
+                    native_predictor.predictor_decode_graph_bucket_size(
+                        predictor_batch_rows
+                    )
+                    == predictor_batch_rows
+                )
+                query = output.hidden_states[0][-1][:, -1:]
+                result = native_predictor.code_predictor_forward_single_token_graph(
+                    layer0_codes=sampled[:, None].repeat(predictor_batch_rows, 1),
+                    talker_hidden=query.repeat(predictor_batch_rows, 1, 1),
+                    batch_size=predictor_batch_rows,
+                    code_dtype=sampled.dtype,
+                )
+                assert result is not None
+                native_codes, native_feedback = result
+                assert torch.equal(
+                    native_codes, native_codes[:1].expand_as(native_codes)
+                )
+                assert torch.equal(
+                    native_feedback, native_feedback[:1].expand_as(native_feedback)
+                )
+                prepared = GenerationMixin.prepare_inputs_for_generation(
+                    model, generated_ids, **preparation
+                )
+                prepared["residual_codes"] = native_codes[:1, :, 0].clone()
             frame_codes = prepared["residual_codes"][0]
             assert int(frame_codes[0]) == int(sampled[0])
             embeddings = [model.get_input_embeddings()(frame_codes[:1])[None]]
@@ -235,9 +272,16 @@ def generate(
                 if frame_index < text_rows.shape[1]
                 else padding
             )
-            assert torch.equal(
-                prepared["inputs_embeds"], checkpoint_feedback + text_embedding
-            ), frame_index
+            if native_predictor is None:
+                assert torch.equal(
+                    prepared["inputs_embeds"], checkpoint_feedback + text_embedding
+                ), frame_index
+            else:
+                assert native_feedback is not None
+                assert torch.equal(
+                    native_feedback[:1], sequential_feedback
+                ), frame_index
+                prepared["inputs_embeds"] = checkpoint_feedback + text_embedding
             if frame_index == 0:
                 assert torch.equal(frame_codes.cpu(), conditioning.codec_ids[0])
                 assert torch.equal(
@@ -318,6 +362,19 @@ def main(arguments: argparse.Namespace) -> None:
     else:
         pass
     model = load_talker(arguments.checkpoint, arguments.gpu, arguments.output)
+    if arguments.native_predictor_config is None:
+        assert arguments.predictor_batch_rows is None
+        native_predictor = None
+    else:
+        assert arguments.predictor_batch_rows is not None
+        native_scheduler = load_native_talker(
+            arguments.checkpoint,
+            arguments.native_predictor_config,
+            arguments.gpu,
+            arguments.output,
+        )
+        assert isinstance(native_scheduler.model_runner, QwenTalkerModelRunner)
+        native_predictor = native_scheduler.model_runner.model
     reports = []
     for sample_id, conditioning in captures.items():
         previous_codes: torch.Tensor | None = None
@@ -330,12 +387,16 @@ def main(arguments: argparse.Namespace) -> None:
                 arguments.output / sample_id / f"reference-{repeat}.pt",
                 arguments.native_prefix,
                 arguments.sequential_feedback,
+                native_predictor,
+                arguments.predictor_batch_rows,
             )
             report = {
                 "sample_id": sample_id,
                 "repeat": repeat,
                 "native_prefix": arguments.native_prefix,
                 "sequential_feedback": arguments.sequential_feedback,
+                "native_predictor": native_predictor is not None,
+                "predictor_batch_rows": arguments.predictor_batch_rows,
                 "frames_including_eos": len(generated_codes),
                 "same_codes_as_previous": (
                     torch.equal(previous_codes, generated_codes)
@@ -349,6 +410,10 @@ def main(arguments: argparse.Namespace) -> None:
                 json.dumps(reports, indent=2)
             )
             print(json.dumps(report), flush=True)
+    if native_predictor is not None:
+        torch.distributed.destroy_process_group()
+    else:
+        pass
 
 
 if __name__ == "__main__":
@@ -366,6 +431,8 @@ if __name__ == "__main__":
     parser.add_argument("--audit-only", action="store_true")
     parser.add_argument("--native-prefix", action="store_true")
     parser.add_argument("--sequential-feedback", action="store_true")
+    parser.add_argument("--native-predictor-config", type=Path)
+    parser.add_argument("--predictor-batch-rows", type=int)
     main(parser.parse_args())
 else:
     pass
