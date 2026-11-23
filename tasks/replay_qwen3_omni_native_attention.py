@@ -3,11 +3,122 @@
 
 import argparse
 import json
+from hashlib import sha256
 from pathlib import Path
 
 import torch
 from compare_qwen3_omni_native_trajectories import difference, validate
+from replay_qwen3_omni_scheduler_bounds import physical_schedule
 from sglang.kernels.ops.attention.flash_attention import flash_attn_with_kvcache
+
+
+def replay_attention(
+    query: torch.Tensor,
+    keys: torch.Tensor,
+    values: torch.Tensor,
+    split_count: int,
+) -> torch.Tensor:
+    sequence_tokens, key_heads, head_width = keys.shape
+    assert keys.shape == values.shape and query.shape[-1] == head_width
+    assert query.shape[0] == 1 and query.shape[1] % key_heads == 0
+    assert query.dtype == keys.dtype == values.dtype == torch.bfloat16
+    assert split_count > 0
+    return flash_attn_with_kvcache(
+        q=query,
+        k_cache=keys[:, None],
+        v_cache=values[:, None],
+        page_table=torch.arange(sequence_tokens, dtype=torch.int32, device="cuda")[
+            None
+        ],
+        cache_seqlens=torch.tensor([sequence_tokens], dtype=torch.int32, device="cuda"),
+        cu_seqlens_q=torch.tensor([0, 1], dtype=torch.int32, device="cuda"),
+        max_seqlen_q=1,
+        softmax_scale=head_width**-0.5,
+        causal=True,
+        window_size=(-1, -1),
+        softcap=0.0,
+        num_splits=split_count,
+        ver=3,
+    )
+
+
+@torch.inference_mode()
+def audit_layers(root: Path) -> None:
+    torch.set_num_threads(1)
+    captures = sorted(root.glob("captures/*/trajectory.pt"))
+    assert captures
+    report = {}
+    for capture in captures:
+        frames = validate(capture.parent)
+        steps = json.loads(capture.with_suffix(".json").read_text())["frames"]
+        keys = torch.cat([frame["stored_keys"] for frame in frames], dim=1).cuda()
+        values = torch.cat([frame["stored_values"] for frame in frames], dim=1).cuda()
+        prefill_tokens = frames[0]["stored_keys"].shape[1]
+        assert keys.shape == values.shape
+        assert keys.shape[1] == prefill_tokens + len(frames) - 1
+        checked_by_layer = [0] * keys.shape[0]
+        mismatches = []
+        for frame_index, (frame, step) in enumerate(zip(frames, steps, strict=True)):
+            if frame_index == 0:
+                continue
+            else:
+                assert step["phase"] == "decode" and step["attention_num_splits"] == 0
+            sequence_tokens = step["sequence_length"]
+            assert sequence_tokens == prefill_tokens + frame_index
+            schedule = physical_schedule(
+                frame["attention_scheduler_metadata"], step["graph_batch_rows"]
+            )
+            split_count = int(schedule[0, step["request_row"]])
+            for layer_index in range(step.get("captured_layers", 1)):
+                query = frame[f"layer{layer_index}_query_after_rope"].cuda()
+                query = query.reshape(1, -1, keys.shape[-1])
+                actual = (
+                    replay_attention(
+                        query,
+                        keys[layer_index, :sequence_tokens],
+                        values[layer_index, :sequence_tokens],
+                        split_count,
+                    )
+                    .cpu()
+                    .flatten()
+                )
+                expected = frame[f"layer{layer_index}_attention_context"].flatten()
+                assert torch.isfinite(actual).all() and torch.isfinite(expected).all()
+                checked_by_layer[layer_index] += 1
+                if not torch.equal(actual, expected):
+                    mismatches.append(
+                        {
+                            "frame": frame_index,
+                            "layer": layer_index,
+                            "sequence_tokens": sequence_tokens,
+                            "splits": split_count,
+                            **difference(actual, expected),
+                        }
+                    )
+                else:
+                    pass
+        for field, actual in (("stored_keys", keys), ("stored_values", values)):
+            assert torch.equal(
+                actual.cpu(), torch.cat([frame[field] for frame in frames], dim=1)
+            )
+        assert all(checked_by_layer)
+        report[capture.parent.name] = {
+            "capture_sha256": sha256(capture.read_bytes()).hexdigest(),
+            "checked_by_layer": checked_by_layer,
+            "mismatches": mismatches,
+            "cache_unchanged": True,
+        }
+        print(json.dumps(report[capture.parent.name]), flush=True)
+    with (root / "attention-layer-replay.json").open("x") as receipt:
+        json.dump(
+            {
+                "scope": "Selected request at every recorded layer boundary, using its native query, reconstructed native KV prefix and recorded split count. Equality checks effective attention output, not unrecorded physical reads or speech quality.",
+                "captures": report,
+            },
+            receipt,
+            indent=2,
+        )
+    assert all(not comparison["mismatches"] for comparison in report.values())
 
 
 def main(root: Path) -> None:
@@ -29,13 +140,6 @@ def main(root: Path) -> None:
         sequence_length, key_heads, head_width = keys.shape
         query = first["layer0_query_after_rope"].cuda().reshape(1, -1, head_width)
         query_heads = query.shape[1]
-        page_table = torch.arange(sequence_length, dtype=torch.int32, device="cuda")[
-            None
-        ]
-        sequence_lengths = torch.tensor(
-            [sequence_length], dtype=torch.int32, device="cuda"
-        )
-        query_offsets = torch.tensor([0, 1], dtype=torch.int32, device="cuda")
         expanded_keys = keys.double().repeat_interleave(query_heads // key_heads, dim=1)
         expanded_values = values.double().repeat_interleave(
             query_heads // key_heads, dim=1
@@ -49,21 +153,7 @@ def main(root: Path) -> None:
         ).cpu()
         results = {}
         for split_count in (1, 2):
-            output = flash_attn_with_kvcache(
-                q=query,
-                k_cache=keys[:, None],
-                v_cache=values[:, None],
-                page_table=page_table,
-                cache_seqlens=sequence_lengths,
-                cu_seqlens_q=query_offsets,
-                max_seqlen_q=1,
-                softmax_scale=head_width**-0.5,
-                causal=True,
-                window_size=(-1, -1),
-                softcap=0.0,
-                num_splits=split_count,
-                ver=3,
-            )
+            output = replay_attention(query, keys, values, split_count)
             actual = output.cpu()
             results[str(split_count)] = {
                 "first_native": difference(
@@ -89,7 +179,11 @@ def main(root: Path) -> None:
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("root", type=Path)
+    parser.add_argument("--all-layers", action="store_true")
     arguments = parser.parse_args()
-    main(arguments.root)
+    if arguments.all_layers:
+        audit_layers(arguments.root)
+    else:
+        main(arguments.root)
 else:
     pass
