@@ -690,11 +690,14 @@ def test_qwen_thinker_threads_explicit_generation_batch_policy(monkeypatch) -> N
             torch_compile_max_bs=overrides["torch_compile_max_bs"],
         )
 
-    def fake_validate_generation_batch_policy(*, model_name, server_args):
+    def fake_validate_generation_batch_policy(
+        *, model_name, server_args, allowed_prefill_backends
+    ):
         validation_calls.append((model_name, server_args))
         validate_generation_batch_policy(
             model_name=model_name,
             server_args=server_args,
+            allowed_prefill_backends=allowed_prefill_backends,
         )
 
     monkeypatch.setattr(
@@ -905,25 +908,13 @@ def test_a_full_thinker_prefill_graph_holds_every_running_request(
     server_args_overrides: dict[str, object],
     expected_slots: int | None,
 ) -> None:
-    built: list[object] = []
-    patch_thinker_startup(monkeypatch)
-    inner = qwen_stages.build_sglang_server_args
-
-    def recording_builder(model_path, context_length, **overrides):
-        built.append(inner(model_path, context_length, **overrides))
-        return built[-1]
-
-    monkeypatch.setattr(qwen_stages, "build_sglang_server_args", recording_builder)
-    monkeypatch.setattr(current_platform, "enable_thinker_decode_graph", lambda: True)
     monkeypatch.setattr(current_platform, "is_cuda", lambda: True)
-    qwen_stages.create_sglang_thinker_executor_from_config(
-        "dummy",
-        total_gpu_memory_fraction=0.75,
-        server_args_overrides=server_args_overrides,
+    overrides = thinker_overrides(
+        monkeypatch, allows=True, server_args_overrides=server_args_overrides
     )
 
-    prefill = resolved_view(built[-1]).cuda_graph_config.prefill
-    assert prefill.full_prefill_max_req == expected_slots
+    prefill = overrides.get("cuda_graph_config", {}).get("prefill", {})
+    assert prefill.get("full_prefill_max_req") == expected_slots
 
 
 @pytest.mark.parametrize(
