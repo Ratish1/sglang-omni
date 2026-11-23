@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Replay recorded layer-zero expert batches without synthesizing peer rows."""
+"""Replay recorded expert batches without synthesizing peer rows."""
 
 import argparse
 import json
@@ -57,6 +57,7 @@ def main(
     autotune_cache: Path,
     tune_max_tokens: int,
     exchange_peer_batches: bool,
+    layer_index: int,
 ) -> None:
     torch.set_num_threads(1)
     assert not envs.SGLANG_FLASHINFER_MOE_FUSED_FINALIZE.get()
@@ -65,8 +66,9 @@ def main(
         "talker_config"
     ]["text_config"]
     assert configuration["hidden_act"] == "silu"
+    assert 0 <= layer_index < configuration["num_hidden_layers"]
     expert_count = configuration["num_experts"]
-    prefix = "talker.model.layers.0.mlp.experts."
+    prefix = f"talker.model.layers.{layer_index}.mlp.experts."
     weight_map = json.loads((checkpoint / "model.safetensors.index.json").read_text())[
         "weight_map"
     ]
@@ -75,7 +77,7 @@ def main(
         for expert in range(expert_count)
         for projection in ("up", "gate", "down")
     ]
-    shared_prefix = "talker.model.layers.0.mlp."
+    shared_prefix = f"talker.model.layers.{layer_index}.mlp."
     names.extend(
         f"{shared_prefix}{name}.weight"
         for name in (
@@ -134,12 +136,19 @@ def main(
         "autotune_cache_sha256": sha256(autotune_cache.read_bytes()).hexdigest(),
         "tune_max_tokens": tune_max_tokens,
         "exchange_peer_batches": exchange_peer_batches,
-        "scope": "Whole recorded padded input batch, original IDs and scales, selected-row routed/shared outputs, gates and combine. Layer zero only; no generated speech or performance claim.",
+        "layer_index": layer_index,
+        "scope": "Whole recorded padded input batch, original IDs and scales, selected-row routed/shared outputs, gates and combine. No generated speech or performance claim.",
         "captures": {},
     }
     total_frames = 0
     total_mismatches = 0
-    for capture in sorted(root.glob("*/captures/*/trajectory.pt")):
+    if (root / "captures").is_dir():
+        assert not exchange_peer_batches
+        captures = sorted(root.glob("captures/*/trajectory.pt"))
+    else:
+        captures = sorted(root.glob("*/captures/*/trajectory.pt"))
+    field_prefix = f"layer{layer_index}_"
+    for capture in captures:
         frames = validate(capture.parent)
         metadata = json.loads(capture.with_suffix(".json").read_text())["frames"]
         if exchange_peer_batches:
@@ -163,9 +172,13 @@ def main(
                 continue
             else:
                 assert step["phase"] == "decode"
-            inputs = frame["layer0_peer_mlp_normalized"].cuda()
-            expert_ids = frame["layer0_peer_expert_ids"].cuda().int()
-            expert_weights = frame["layer0_peer_expert_weights"].cuda().float()
+            if layer_index > 0 and "captured_layers" not in step:
+                continue
+            else:
+                pass
+            inputs = frame[f"{field_prefix}peer_mlp_normalized"].cuda()
+            expert_ids = frame[f"{field_prefix}peer_expert_ids"].cuda().int()
+            expert_weights = frame[f"{field_prefix}peer_expert_weights"].cuda().float()
             assert inputs.shape == (
                 step["graph_batch_rows"],
                 configuration["hidden_size"],
@@ -179,15 +192,15 @@ def main(
                 )
             )
             assert torch.equal(
-                frame["layer0_peer_mlp_normalized"][step["request_row"]],
-                frame["layer0_mlp_normalized"],
+                frame[f"{field_prefix}peer_mlp_normalized"][step["request_row"]],
+                frame[f"{field_prefix}mlp_normalized"],
             )
             outputs = evaluate_experts(
                 inputs, expert_ids, expert_weights, projections, tune_max_tokens
             )
             for name, values in outputs.items():
                 selected = values[step["request_row"]].cpu()
-                actual = frame[f"layer0_{name}"]
+                actual = frame[f"{field_prefix}{name}"]
                 assert torch.isfinite(selected).all()
                 if not torch.equal(selected, actual):
                     mismatches.append(
@@ -199,21 +212,43 @@ def main(
                     )
                 else:
                     pass
-            if frame_index < len(peer_frames):
+                peer_field = f"{field_prefix}peer_{name}"
+                if peer_field in frame:
+                    replayed_peers = values.cpu()
+                    assert torch.isfinite(replayed_peers).all()
+                    if not torch.equal(replayed_peers, frame[peer_field]):
+                        mismatches.append(
+                            {
+                                "frame": frame_index,
+                                "field": peer_field,
+                                **difference(frame[peer_field], replayed_peers),
+                            }
+                        )
+                    else:
+                        pass
+                else:
+                    pass
+            if frame_index < len(peer_frames) and (
+                layer_index == 0 or "captured_layers" in peer_metadata[frame_index]
+            ):
                 peer_frame = peer_frames[frame_index]
                 peer_step = peer_metadata[frame_index]
                 assert peer_step["phase"] == "decode"
                 peer_row = peer_step["request_row"]
                 source_row = step["request_row"]
-                peer_inputs = peer_frame["layer0_peer_mlp_normalized"].cuda()
-                peer_ids = peer_frame["layer0_peer_expert_ids"].cuda().int()
-                peer_weights = peer_frame["layer0_peer_expert_weights"].cuda().float()
-                peer_inputs[peer_row].copy_(
-                    frame["layer0_peer_mlp_normalized"][source_row]
+                peer_inputs = peer_frame[f"{field_prefix}peer_mlp_normalized"].cuda()
+                peer_ids = peer_frame[f"{field_prefix}peer_expert_ids"].cuda().int()
+                peer_weights = (
+                    peer_frame[f"{field_prefix}peer_expert_weights"].cuda().float()
                 )
-                peer_ids[peer_row].copy_(frame["layer0_peer_expert_ids"][source_row])
+                peer_inputs[peer_row].copy_(
+                    frame[f"{field_prefix}peer_mlp_normalized"][source_row]
+                )
+                peer_ids[peer_row].copy_(
+                    frame[f"{field_prefix}peer_expert_ids"][source_row]
+                )
                 peer_weights[peer_row].copy_(
-                    frame["layer0_peer_expert_weights"][source_row]
+                    frame[f"{field_prefix}peer_expert_weights"][source_row]
                 )
                 exchanged = evaluate_experts(
                     peer_inputs, peer_ids, peer_weights, projections, tune_max_tokens
@@ -238,6 +273,7 @@ def main(
             else:
                 pass
             checked_frames += 1
+        assert checked_frames > 0, (capture, layer_index)
         report["captures"][str(capture.relative_to(root))] = {
             "checked_frames": checked_frames,
             "mismatches": mismatches,
@@ -253,8 +289,11 @@ def main(
     assert total_frames > 0
     report["total_frames"] = total_frames
     report["total_mismatches"] = total_mismatches
+    report_stem = "peer-batch-replay" if exchange_peer_batches else "moe-replay"
     report_name = (
-        "peer-batch-replay.json" if exchange_peer_batches else "moe-replay.json"
+        f"{report_stem}.json"
+        if layer_index == 0
+        else f"{report_stem}-layer-{layer_index}.json"
     )
     with (root / report_name).open("x") as receipt:
         json.dump(report, receipt, indent=2)
@@ -268,6 +307,7 @@ if __name__ == "__main__":
     parser.add_argument("autotune_cache", type=Path)
     parser.add_argument("--tune-max-tokens", type=int, required=True)
     parser.add_argument("--exchange-peer-batches", action="store_true")
+    parser.add_argument("--layer-index", type=int, default=0)
     arguments = parser.parse_args()
     main(
         arguments.root,
@@ -275,6 +315,7 @@ if __name__ == "__main__":
         arguments.autotune_cache,
         arguments.tune_max_tokens,
         arguments.exchange_peer_batches,
+        arguments.layer_index,
     )
 else:
     pass
