@@ -16,6 +16,8 @@ from typing import TYPE_CHECKING, Literal, TypedDict
 
 import torch
 import torch.nn.functional as F
+from sglang.srt.arg_groups.model_override_base import resolved_view
+from sglang.srt.model_executor.cuda_graph_config import Phase, with_phase
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from transformers import AutoConfig
@@ -57,6 +59,7 @@ from sglang_omni.scheduling.threaded_simple_scheduler import ThreadedSimpleSched
 from sglang_omni.utils.cpu import automatic_video_decode_threads
 from sglang_omni.utils.gpu_memory import format_bytes_gib, get_process_gpu_memory_bytes
 from sglang_omni.utils.misc import avail_gpu_mem
+from sglang_omni.vendor.sglang.server_args import override_server_args
 
 if TYPE_CHECKING:
 
@@ -1269,7 +1272,8 @@ def create_sglang_thinker_executor_from_config(
     from sglang_omni.platforms import current_platform
 
     if current_platform.is_cuda():
-        prefill_graph_backend = CudaGraphBackend.BREAKABLE
+        # note (ratish): the full graph replays a prefill chunk in one launch, where the breakable graph runs attention eagerly between layer segments.
+        prefill_graph_backend = CudaGraphBackend.FULL
     else:
         prefill_graph_backend = CudaGraphBackend.DISABLED
     server_args_overrides = disable_torch_compile_on_npu(server_args_overrides)
@@ -1377,9 +1381,28 @@ def create_sglang_thinker_executor_from_config(
         context_length=max_seq_len,
         **overrides,
     )
+    resolved_args = resolved_view(server_args)
+    prefill = resolved_args.cuda_graph_config.prefill
+    if (
+        prefill.backend == CudaGraphBackend.FULL
+        and prefill.full_prefill_max_req is None
+    ):
+        # note (ratish): a mixed prefill step carries every running request, and a full batch past its request slots runs eagerly.
+        override_server_args(
+            server_args,
+            "qwen3_omni.thinker_full_prefill_slots",
+            cuda_graph_config=with_phase(
+                resolved_args.cuda_graph_config,
+                Phase.PREFILL,
+                full_prefill_max_req=resolved_args.max_running_requests,
+            ),
+        )
+    else:
+        pass
     validate_generation_batch_policy(
         model_name="Qwen3-Omni thinker",
         server_args=server_args,
+        allowed_prefill_backends=(CudaGraphBackend.BREAKABLE, CudaGraphBackend.FULL),
     )
     if total_gpu_memory_fraction is None:
         from sglang_omni.scheduling.stage_kv_budget import peek_stage_kv_cache_bytes
@@ -1409,8 +1432,6 @@ def create_sglang_thinker_executor_from_config(
             memory_contract.effective_total_gpu_memory_fraction
         )
         applied_encoder_reserve = memory_contract.applied_encoder_mem_reserve
-
-    from sglang.srt.arg_groups.model_override_base import resolved_view
 
     cfg = resolved_view(server_args)
     pre_load_avail_mem = avail_gpu_mem(gpu_id)
@@ -1552,8 +1573,6 @@ def create_talker_ar_executor_from_config(
         model_name="Qwen3-Omni talker_ar",
         server_args=server_args,
     )
-    from sglang.srt.arg_groups.model_override_base import resolved_view
-
     cfg = resolved_view(server_args)
     pre_load_avail_mem = avail_gpu_mem(gpu_id)
     pre_load_process_mem = get_process_gpu_memory_bytes(gpu_id)

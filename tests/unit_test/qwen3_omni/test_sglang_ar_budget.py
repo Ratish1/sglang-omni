@@ -875,10 +875,8 @@ def test_thinker_decode_graph_stays_available_to_an_explicit_override(
     assert overrides["disable_decode_cuda_graph"] is False
 
 
-@pytest.mark.parametrize(
-    "is_cuda, expected", [(True, "breakable"), (False, "disabled")]
-)
-def test_thinker_prefill_graph_defaults_to_breakable_on_cuda(
+@pytest.mark.parametrize("is_cuda, expected", [(True, "full"), (False, "disabled")])
+def test_thinker_prefill_graph_defaults_to_full_on_cuda(
     monkeypatch, is_cuda: bool, expected: str
 ) -> None:
     monkeypatch.setattr(current_platform, "is_cuda", lambda: is_cuda)
@@ -891,6 +889,41 @@ def test_thinker_prefill_graph_defaults_to_breakable_on_cuda(
         assert token_buckets[-1] == overrides["cuda_graph_max_bs_prefill"] == 8192
     else:
         assert "cuda_graph_bs_prefill" not in overrides
+
+
+@pytest.mark.parametrize(
+    ("server_args_overrides", "expected_slots"),
+    [
+        ({}, 64),
+        ({"max_running_requests": 32}, 32),
+        ({"cuda_graph_config": {"prefill": {"full_prefill_max_req": 16}}}, 16),
+        ({"cuda_graph_backend_prefill": "breakable"}, None),
+    ],
+)
+def test_a_full_thinker_prefill_graph_holds_every_running_request(
+    monkeypatch: pytest.MonkeyPatch,
+    server_args_overrides: dict[str, object],
+    expected_slots: int | None,
+) -> None:
+    built: list[object] = []
+    patch_thinker_startup(monkeypatch)
+    inner = qwen_stages.build_sglang_server_args
+
+    def recording_builder(model_path, context_length, **overrides):
+        built.append(inner(model_path, context_length, **overrides))
+        return built[-1]
+
+    monkeypatch.setattr(qwen_stages, "build_sglang_server_args", recording_builder)
+    monkeypatch.setattr(current_platform, "enable_thinker_decode_graph", lambda: True)
+    monkeypatch.setattr(current_platform, "is_cuda", lambda: True)
+    qwen_stages.create_sglang_thinker_executor_from_config(
+        "dummy",
+        total_gpu_memory_fraction=0.75,
+        server_args_overrides=server_args_overrides,
+    )
+
+    prefill = resolved_view(built[-1]).cuda_graph_config.prefill
+    assert prefill.full_prefill_max_req == expected_slots
 
 
 @pytest.mark.parametrize(
@@ -929,8 +962,8 @@ def test_thinker_single_token_prefill_replays_with_operator_caps(
 @pytest.mark.parametrize(
     ("server_args_overrides", "expected_backend", "expected_token_buckets"),
     [
-        ({"cuda_graph_bs_prefill": [4, 8]}, "breakable", [4, 8]),
-        ({"cuda_graph_config": {"prefill": {"bs": [4, 8]}}}, "breakable", [4, 8]),
+        ({"cuda_graph_bs_prefill": [4, 8]}, "full", [4, 8]),
+        ({"cuda_graph_config": {"prefill": {"bs": [4, 8]}}}, "full", [4, 8]),
         ({"disable_prefill_cuda_graph": True}, "disabled", None),
         ({"disable_cuda_graph": True}, "disabled", None),
         ({"cuda_graph_config": {"prefill": {"backend": "disabled"}}}, "disabled", None),
@@ -972,7 +1005,7 @@ def test_a_speculative_thinker_keeps_the_prefill_graph_on_cuda(
         },
     )
 
-    assert overrides["cuda_graph_backend_prefill"] == "breakable"
+    assert overrides["cuda_graph_backend_prefill"] == "full"
     token_buckets = overrides["cuda_graph_bs_prefill"]
     assert token_buckets[:2] == [1, 4]
     assert token_buckets[-1] == overrides["cuda_graph_max_bs_prefill"] == 8192
