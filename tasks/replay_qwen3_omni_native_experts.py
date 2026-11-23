@@ -137,7 +137,7 @@ def main(
         "tune_max_tokens": tune_max_tokens,
         "exchange_peer_batches": exchange_peer_batches,
         "layer_index": layer_index,
-        "scope": "Whole recorded padded input batch, original IDs and scales, selected-row routed/shared outputs, gates and combine. No generated speech or performance claim.",
+        "scope": "Whole recorded padded input batch, original IDs and scales, selected-row and captured live-peer routed/shared outputs, gates and combine. Padding outputs are not request results. No generated speech or performance claim.",
         "captures": {},
     }
     total_frames = 0
@@ -214,14 +214,16 @@ def main(
                     pass
                 peer_field = f"{field_prefix}peer_{name}"
                 if peer_field in frame:
-                    replayed_peers = values.cpu()
+                    live_rows = len(step["request_ids"])
+                    replayed_peers = values[:live_rows].cpu()
+                    actual_peers = frame[peer_field][:live_rows]
                     assert torch.isfinite(replayed_peers).all()
-                    if not torch.equal(replayed_peers, frame[peer_field]):
+                    if not torch.equal(replayed_peers, actual_peers):
                         mismatches.append(
                             {
                                 "frame": frame_index,
                                 "field": peer_field,
-                                **difference(frame[peer_field], replayed_peers),
+                                **difference(actual_peers, replayed_peers),
                             }
                         )
                     else:
