@@ -25,6 +25,8 @@ class RoutingComparison:
     checkpoint_changed_set_without_probability_tie_rows: int | None
     checkpoint_probability_cutoff_tie_rows: int | None
     checkpoint_weight_rounding_error: float | None
+    checkpoint_changed_rounded_weight_rows: int | None
+    checkpoint_order_changes_rounded_weight_rows: int | None
 
 
 @torch.inference_mode()
@@ -84,6 +86,8 @@ def main(root: Path, output: Path, gpu_index: int | None) -> None:
                     checkpoint_changed_set_without_probability_tie_rows = None
                     checkpoint_probability_cutoff_tie_rows = None
                     checkpoint_weight_rounding_error = None
+                    checkpoint_changed_rounded_weight_rows = None
+                    checkpoint_order_changes_rounded_weight_rows = None
                 else:
                     checkpoint_logits = padded_logits.to(
                         torch.device("cuda", gpu_index)
@@ -107,6 +111,39 @@ def main(root: Path, output: Path, gpu_index: int | None) -> None:
                         : logits.shape[0]
                     ]
                     checkpoint_ids = checkpoint_ids[: logits.shape[0]].cpu()
+                    checkpoint_order = checkpoint_ids.argsort(dim=-1)
+                    native_order = selected_ids.argsort(dim=-1)
+                    sorted_checkpoint_weights = (
+                        rounded_weights[: logits.shape[0]]
+                        .cpu()
+                        .gather(1, checkpoint_order)
+                    )
+                    checkpoint_changed_rounded_weight_rows = int(
+                        (
+                            sorted_checkpoint_weights
+                            != selected_weights.to(checkpoint_logits.dtype).gather(
+                                1, native_order
+                            )
+                        )
+                        .any(dim=-1)
+                        .sum()
+                    )
+                    native_order_weights = probabilities[: logits.shape[0]].gather(
+                        1, selected_ids.to(probabilities.device).long()
+                    )
+                    native_order_weights /= native_order_weights.sum(
+                        dim=-1, keepdim=True
+                    )
+                    checkpoint_order_changes_rounded_weight_rows = int(
+                        (
+                            sorted_checkpoint_weights
+                            != native_order_weights.to(checkpoint_logits.dtype)
+                            .cpu()
+                            .gather(1, native_order)
+                        )
+                        .any(dim=-1)
+                        .sum()
+                    )
                     changed_sets = (
                         checkpoint_ids.sort(dim=-1).values
                         != selected_ids.sort(dim=-1).values
@@ -148,6 +185,8 @@ def main(root: Path, output: Path, gpu_index: int | None) -> None:
                         checkpoint_changed_set_without_probability_tie_rows=checkpoint_changed_set_without_probability_tie_rows,
                         checkpoint_probability_cutoff_tie_rows=checkpoint_probability_cutoff_tie_rows,
                         checkpoint_weight_rounding_error=checkpoint_weight_rounding_error,
+                        checkpoint_changed_rounded_weight_rows=checkpoint_changed_rounded_weight_rows,
+                        checkpoint_order_changes_rounded_weight_rows=checkpoint_order_changes_rounded_weight_rows,
                     )
                 )
         assert comparisons
@@ -183,6 +222,13 @@ def main(root: Path, output: Path, gpu_index: int | None) -> None:
                 ),
                 "maximum_weight_rounding_error": max(
                     row.checkpoint_weight_rounding_error for row in comparisons
+                ),
+                "changed_rounded_weight_rows": sum(
+                    row.checkpoint_changed_rounded_weight_rows for row in comparisons
+                ),
+                "order_changes_rounded_weight_rows": sum(
+                    row.checkpoint_order_changes_rounded_weight_rows
+                    for row in comparisons
                 ),
             }
         else:
