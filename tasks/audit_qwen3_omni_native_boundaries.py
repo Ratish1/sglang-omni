@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Replay captured normalization and projection boundaries with native modules."""
+"""Replay captured normalization, projection and routing with native modules."""
 
 import argparse
 import json
@@ -14,6 +14,7 @@ import torch
 from audit_qwen3_omni_native_predictor import load_native_talker
 from compare_qwen3_omni_native_trajectories import validate
 from safetensors import safe_open
+from sglang.srt.layers.moe.topk import TopKOutputChecker
 
 from sglang_omni.models.qwen3_omni.components.talker import Qwen3OmniTalker
 from sglang_omni.vendor.sglang.layers import MRotaryEmbedding
@@ -100,6 +101,7 @@ def main(arguments: argparse.Namespace) -> None:
             else:
                 assert step["captured_layers"] == len(model.model.layers)
             live_rows = len(step["request_ids"])
+            live_row_count = torch.tensor(live_rows, dtype=torch.int32, device="cuda")
             for layer_index, layer in enumerate(model.model.layers):
                 prefix = f"layer{layer_index}_peer_"
                 operands = {
@@ -160,6 +162,14 @@ def main(arguments: argparse.Namespace) -> None:
                 )
                 actual["mlp_normalized"] = normalized
                 actual["mlp_residual"] = residual
+                routing = layer.mlp.topk(
+                    operands["mlp_normalized"],
+                    operands["router_logits"],
+                    num_token_non_padded=live_row_count,
+                )
+                assert TopKOutputChecker.format_is_standard(routing)
+                actual["expert_ids"] = routing.topk_ids
+                actual["expert_weights"] = routing.topk_weights
                 expected = operands
                 if layer_index == len(model.model.layers) - 1:
                     final_query, _ = model.model.norm(
