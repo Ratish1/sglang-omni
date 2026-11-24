@@ -20,11 +20,20 @@ class RoutingComparison:
     cutoff_tie_rows: int
     maximum_weight_error: float
     maximum_weight_sum_error: float
+    checkpoint_changed_order_rows: int | None
+    checkpoint_changed_set_rows: int | None
+    checkpoint_changed_set_without_probability_tie_rows: int | None
+    checkpoint_probability_cutoff_tie_rows: int | None
+    checkpoint_weight_rounding_error: float | None
 
 
 @torch.inference_mode()
-def main(root: Path, output: Path) -> None:
+def main(root: Path, output: Path, gpu_index: int | None) -> None:
     torch.set_num_threads(1)
+    if gpu_index is not None:
+        torch.cuda.set_device(gpu_index)
+    else:
+        pass
     captures = sorted(root.glob("captures/*/trajectory.pt"))
     assert captures
     reports = {}
@@ -44,11 +53,13 @@ def main(root: Path, output: Path) -> None:
                 elif f"{prefix}peer_router_logits" in frame:
                     prefix += "peer_"
                     live_rows = len(step["request_ids"])
-                    logits = frame[f"{prefix}router_logits"][:live_rows]
+                    padded_logits = frame[f"{prefix}router_logits"]
+                    logits = padded_logits[:live_rows]
                     selected_ids = frame[f"{prefix}expert_ids"][:live_rows]
                     selected_weights = frame[f"{prefix}expert_weights"][:live_rows]
                 else:
                     logits = frame[f"{prefix}router_logits"].unsqueeze(0)
+                    padded_logits = logits
                     selected_ids = frame[f"{prefix}expert_ids"].unsqueeze(0)
                     selected_weights = frame[f"{prefix}expert_weights"].unsqueeze(0)
                 assert torch.isfinite(logits).all()
@@ -67,6 +78,54 @@ def main(root: Path, output: Path) -> None:
                 cutoff_logits = logits.gather(
                     1, sorted_ids[:, expert_count : expert_count + 1]
                 )
+                if gpu_index is None:
+                    checkpoint_changed_order_rows = None
+                    checkpoint_changed_set_rows = None
+                    checkpoint_changed_set_without_probability_tie_rows = None
+                    checkpoint_probability_cutoff_tie_rows = None
+                    checkpoint_weight_rounding_error = None
+                else:
+                    checkpoint_logits = padded_logits.to(
+                        torch.device("cuda", gpu_index)
+                    )
+                    assert checkpoint_logits.dtype == torch.bfloat16
+                    probabilities = checkpoint_logits.softmax(
+                        dim=-1, dtype=torch.float32
+                    )
+                    checkpoint_weights, checkpoint_ids = torch.topk(
+                        probabilities, expert_count, dim=-1
+                    )
+                    checkpoint_weights /= checkpoint_weights.sum(dim=-1, keepdim=True)
+                    rounded_weights = checkpoint_weights.to(checkpoint_logits.dtype)
+                    probability_order = torch.argsort(
+                        probabilities, descending=True, stable=True
+                    )
+                    cutoff_values = probabilities.gather(
+                        1, probability_order[:, expert_count - 1 : expert_count + 1]
+                    )
+                    probability_ties = (cutoff_values[:, 0] == cutoff_values[:, 1])[
+                        : logits.shape[0]
+                    ]
+                    checkpoint_ids = checkpoint_ids[: logits.shape[0]].cpu()
+                    changed_sets = (
+                        checkpoint_ids.sort(dim=-1).values
+                        != selected_ids.sort(dim=-1).values
+                    ).any(dim=-1)
+                    checkpoint_changed_order_rows = int(
+                        (checkpoint_ids != selected_ids).any(dim=-1).sum()
+                    )
+                    checkpoint_changed_set_rows = int(changed_sets.sum())
+                    checkpoint_changed_set_without_probability_tie_rows = int(
+                        (changed_sets & ~probability_ties.cpu()).sum()
+                    )
+                    checkpoint_probability_cutoff_tie_rows = int(probability_ties.sum())
+                    checkpoint_weight_rounding_error = float(
+                        (checkpoint_weights - rounded_weights.float())[
+                            : logits.shape[0]
+                        ]
+                        .abs()
+                        .max()
+                    )
                 comparisons.append(
                     RoutingComparison(
                         frame_index=frame_index,
@@ -84,6 +143,11 @@ def main(root: Path, output: Path) -> None:
                         maximum_weight_sum_error=float(
                             (selected_weights.double().sum(dim=-1) - 1).abs().max()
                         ),
+                        checkpoint_changed_order_rows=checkpoint_changed_order_rows,
+                        checkpoint_changed_set_rows=checkpoint_changed_set_rows,
+                        checkpoint_changed_set_without_probability_tie_rows=checkpoint_changed_set_without_probability_tie_rows,
+                        checkpoint_probability_cutoff_tie_rows=checkpoint_probability_cutoff_tie_rows,
+                        checkpoint_weight_rounding_error=checkpoint_weight_rounding_error,
                     )
                 )
         assert comparisons
@@ -102,6 +166,27 @@ def main(root: Path, output: Path) -> None:
             ),
             "comparisons": [asdict(row) for row in comparisons],
         }
+        if gpu_index is not None:
+            reports[capture.parent.name]["checkpoint_selection"] = {
+                "changed_order_rows": sum(
+                    row.checkpoint_changed_order_rows for row in comparisons
+                ),
+                "changed_set_rows": sum(
+                    row.checkpoint_changed_set_rows for row in comparisons
+                ),
+                "changed_set_without_probability_tie_rows": sum(
+                    row.checkpoint_changed_set_without_probability_tie_rows
+                    for row in comparisons
+                ),
+                "probability_cutoff_tie_rows": sum(
+                    row.checkpoint_probability_cutoff_tie_rows for row in comparisons
+                ),
+                "maximum_weight_rounding_error": max(
+                    row.checkpoint_weight_rounding_error for row in comparisons
+                ),
+            }
+        else:
+            pass
         print(
             json.dumps(
                 {
@@ -115,7 +200,9 @@ def main(root: Path, output: Path) -> None:
     with output.open("x") as receipt:
         json.dump(
             {
-                "scope": "Recorded live rows where logits and selections exist. Plain softmax, top-k, renormalize, lowest-ID tie breaking. Float64 softmax over selected logits is the mathematical reference. Weight errors are measured, not a speech-quality acceptance threshold.",
+                "scope": "Recorded live rows where logits and selections exist. Plain softmax, top-k, renormalize, lowest-ID tie breaking. Float64 softmax over selected logits is the mathematical reference. Optional GPU comparison uses the checkpoint router's FP32 softmax, torch.topk, renormalization and activation-dtype weight cast on identical recorded logits. It isolates selection from gate projection; it is not free continuation or a speech-quality test.",
+                "checkpoint_comparison_gpu": gpu_index,
+                "torch_version": torch.__version__,
                 "captures": reports,
             },
             receipt,
@@ -128,7 +215,8 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("root", type=Path)
     parser.add_argument("output", type=Path)
+    parser.add_argument("--gpu", type=int)
     arguments = parser.parse_args()
-    main(arguments.root, arguments.output)
+    main(arguments.root, arguments.output, arguments.gpu)
 else:
     pass
