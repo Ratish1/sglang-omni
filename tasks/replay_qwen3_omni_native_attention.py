@@ -42,8 +42,23 @@ def replay_attention(
     )
 
 
+def reference_attention(
+    query: torch.Tensor, keys: torch.Tensor, values: torch.Tensor
+) -> torch.Tensor:
+    query_heads = query.shape[1]
+    key_heads = keys.shape[1]
+    head_width = keys.shape[-1]
+    assert query_heads % key_heads == 0
+    expanded_keys = keys.double().repeat_interleave(query_heads // key_heads, dim=1)
+    expanded_values = values.double().repeat_interleave(query_heads // key_heads, dim=1)
+    scores = (
+        torch.einsum("qhd,khd->hqk", query.double(), expanded_keys) * head_width**-0.5
+    )
+    return torch.einsum("hqk,khd->qhd", scores.softmax(-1), expanded_values).cpu()
+
+
 @torch.inference_mode()
-def audit_layers(root: Path) -> None:
+def audit_layers(root: Path, fp64_reference: bool) -> None:
     torch.set_num_threads(1)
     captures = sorted(root.glob("captures/*/trajectory.pt"))
     assert captures
@@ -58,6 +73,7 @@ def audit_layers(root: Path) -> None:
         assert keys.shape[1] == prefill_tokens + len(frames) - 1
         checked_by_layer = [0] * keys.shape[0]
         mismatches = []
+        reference_errors = []
         for frame_index, (frame, step) in enumerate(zip(frames, steps, strict=True)):
             if frame_index == 0:
                 continue
@@ -97,6 +113,30 @@ def audit_layers(root: Path) -> None:
                     )
                 else:
                     pass
+                if fp64_reference:
+                    reference = reference_attention(
+                        query,
+                        keys[layer_index, :sequence_tokens],
+                        values[layer_index, :sequence_tokens],
+                    ).flatten()
+                    error = actual.double() - reference
+                    assert torch.isfinite(reference).all() and reference.norm() > 0
+                    reference_errors.append(
+                        {
+                            "frame": frame_index,
+                            "layer": layer_index,
+                            "sequence_tokens": sequence_tokens,
+                            "splits": split_count,
+                            "mean_absolute_error": float(error.abs().mean()),
+                            "maximum_absolute_error": float(error.abs().max()),
+                            "relative_l2_error": float(error.norm() / reference.norm()),
+                            "rounded_reference_changed_values": int(
+                                (actual != reference.to(actual.dtype)).count_nonzero()
+                            ),
+                        }
+                    )
+                else:
+                    pass
         for field, actual in (("stored_keys", keys), ("stored_values", values)):
             assert torch.equal(
                 actual.cpu(), torch.cat([frame[field] for frame in frames], dim=1)
@@ -107,12 +147,27 @@ def audit_layers(root: Path) -> None:
             "checked_by_layer": checked_by_layer,
             "mismatches": mismatches,
             "cache_unchanged": True,
+            "fp64_reference_errors": reference_errors,
         }
-        print(json.dumps(report[capture.parent.name]), flush=True)
-    with (root / "attention-layer-replay.json").open("x") as receipt:
+        print(
+            json.dumps(
+                {
+                    name: value
+                    for name, value in report[capture.parent.name].items()
+                    if name != "fp64_reference_errors"
+                }
+            ),
+            flush=True,
+        )
+    report_name = (
+        "attention-layer-reference.json"
+        if fp64_reference
+        else "attention-layer-replay.json"
+    )
+    with (root / report_name).open("x") as receipt:
         json.dump(
             {
-                "scope": "Selected request at every recorded layer boundary, using its native query, reconstructed native KV prefix and recorded split count. Equality checks effective attention output, not unrecorded physical reads or speech quality.",
+                "scope": "Selected request at every recorded layer boundary, using its native query, reconstructed native KV prefix and recorded split count. Equality checks effective attention output, not unrecorded physical reads or speech quality. Optional float64 errors compare with direct grouped-query scaled dot-product attention over the same complete causal prefix, not a speech-quality threshold.",
                 "captures": report,
             },
             receipt,
@@ -137,20 +192,9 @@ def main(root: Path) -> None:
             assert torch.equal(first[field], second[field]), (sample_id, field)
         keys = first["attention_read_keys"].cuda()
         values = first["attention_read_values"].cuda()
-        sequence_length, key_heads, head_width = keys.shape
+        head_width = keys.shape[-1]
         query = first["layer0_query_after_rope"].cuda().reshape(1, -1, head_width)
-        query_heads = query.shape[1]
-        expanded_keys = keys.double().repeat_interleave(query_heads // key_heads, dim=1)
-        expanded_values = values.double().repeat_interleave(
-            query_heads // key_heads, dim=1
-        )
-        scores = (
-            torch.einsum("qhd,khd->hqk", query.double(), expanded_keys)
-            * head_width**-0.5
-        )
-        reference = torch.einsum(
-            "hqk,khd->qhd", scores.softmax(-1), expanded_values
-        ).cpu()
+        reference = reference_attention(query, keys, values)
         results = {}
         for split_count in (1, 2):
             output = replay_attention(query, keys, values, split_count)
@@ -180,9 +224,12 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("root", type=Path)
     parser.add_argument("--all-layers", action="store_true")
+    parser.add_argument("--fp64-reference", action="store_true")
     arguments = parser.parse_args()
     if arguments.all_layers:
-        audit_layers(arguments.root)
+        audit_layers(arguments.root, arguments.fp64_reference)
+    elif arguments.fp64_reference:
+        parser.error("--fp64-reference requires --all-layers")
     else:
         main(arguments.root)
 else:
