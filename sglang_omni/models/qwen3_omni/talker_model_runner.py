@@ -122,6 +122,10 @@ class QwenTalkerModelRunner(ModelRunner["SGLangARRequestData"]):
             pass
 
         self.model.prepare_decode_buffers(requests)
+        if self.model.native_qk_trial is not None:
+            self.model.native_qk_trial.select(requests)
+        else:
+            pass
         if self.sampling_audit is not None:
             self.sampling_audit.check(self.model, requests)
         else:

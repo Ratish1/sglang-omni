@@ -77,6 +77,7 @@ def main(
     continuation_sequences: list[int],
     layer_frames: list[int],
     conditioning_reference: list[Path],
+    qk_trial: str | None,
 ) -> None:
     assert all(frame > 0 for frame in layer_frames)
     assert (code_trial_reference is None) == (not code_trial_choice)
@@ -109,6 +110,10 @@ def main(
         assert len(conditioning_reference) == len(selected_samples)
         assert code_trial_reference is None and not cache_trial_reference
         assert continuation_reference is None and not attention_trial_sequences
+    else:
+        pass
+    if qk_trial is not None:
+        assert conditioning_reference and layer_frames
     else:
         pass
     output.mkdir()
@@ -163,6 +168,7 @@ def main(
             "OMNI_NATIVE_TRAJECTORY_DIRECTORY": str(captures),
             "OMNI_NATIVE_TRAJECTORY_SAMPLES": ",".join(selected_samples),
             "OMNI_NATIVE_LAYER_FRAMES": ",".join(str(frame) for frame in layer_frames),
+            "OMNI_NATIVE_QK_TRIAL": qk_trial or "",
             "OMNI_NATIVE_CONDITIONING_REFERENCES": json.dumps(
                 [str(reference) for reference in conditioning_reference]
             ),
@@ -294,6 +300,7 @@ if __name__ == "__main__":
     parser.add_argument("--client-concurrency", type=int, default=32)
     parser.add_argument("--layer-frames", type=int, nargs="+", default=[])
     parser.add_argument("--conditioning-reference", type=Path, nargs="+", default=[])
+    parser.add_argument("--qk-trial", choices=("control", "checkpoint"))
     parser.add_argument("--attention-trial-sequences", type=int, nargs="*", default=[])
     parser.add_argument("--attention-trial-splits", type=int, choices=(0, 1), default=0)
     parser.add_argument("--code-trial-reference", type=Path)
@@ -322,6 +329,7 @@ if __name__ == "__main__":
         arguments.continuation_sequences,
         arguments.layer_frames,
         arguments.conditioning_reference,
+        arguments.qk_trial,
     )
 else:
     pass

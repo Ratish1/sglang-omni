@@ -10,6 +10,7 @@ from typing import Iterable, Optional, Tuple
 
 import torch
 from qwen3_omni_native_layer_probe import NativeLayerProbe
+from qwen3_omni_native_qk_trial import NativeQkTrial
 from sglang.kernels.fused_op import get_fused_op_backend
 from sglang.kernels.spec import KernelBackend
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
@@ -839,6 +840,25 @@ class Qwen3OmniTalker(nn.Module):
         )
 
         device = self.model.codec_embedding.weight.device
+        normalization_mode = environ.get("OMNI_NATIVE_QK_TRIAL")
+        self.native_qk_trial: NativeQkTrial | None = None
+        if normalization_mode:
+            assert normalization_mode in ("control", "checkpoint")
+            assert environ.get("OMNI_NATIVE_CONDITIONING_REFERENCES")
+            self.native_qk_trial = NativeQkTrial(
+                "control" if normalization_mode == "control" else "checkpoint",
+                {
+                    f"feedback-trace-native-{sample_id}"
+                    for sample_id in environ["OMNI_NATIVE_TRAJECTORY_SAMPLES"].split(
+                        ","
+                    )
+                },
+                get_schedule().max_running_requests,
+                device,
+                [layer.self_attn for layer in self.model.layers],
+            )
+        else:
+            pass
         self.native_layer_probe = NativeLayerProbe(
             self.model.layers[0], self.code_predictor.lm_head, 0
         )

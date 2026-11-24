@@ -278,6 +278,7 @@ class NativeTalkerTrajectory:
                     "sequence_length": int(forward_batch.seq_lens_cpu[request_row]),
                     "generation_steps": request.data.generation_steps,
                     "thinker_done": request.data.thinker_chunks_done,
+                    "qk_trial": environ.get("OMNI_NATIVE_QK_TRIAL", ""),
                 }
                 if is_prefill:
                     assert prefill_embeddings is not None
