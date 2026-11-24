@@ -34,6 +34,7 @@ class NativeQkLayerTrial:
         self.is_decode: bool = False
         self.projection: torch.Tensor | None = None
         attention.register_forward_pre_hook(self.begin, with_kwargs=True)
+        attention.register_forward_hook(self.finish)
         attention.qkv_proj.register_forward_hook(self.save_projection)
         attention.rotary_emb.register_forward_pre_hook(self.before_rotary)
 
@@ -46,6 +47,16 @@ class NativeQkLayerTrial:
         forward_batch = named_inputs["forward_batch"]
         assert isinstance(forward_batch, ForwardBatch)
         self.is_decode = forward_batch.forward_mode.is_decode()
+        self.projection = None
+
+    def finish(
+        self,
+        module: nn.Module,
+        inputs: tuple[torch.Tensor, ...],
+        output: torch.Tensor,
+    ) -> None:
+        # note (ratish): rotary modules are shared across layers and predictor calls.
+        self.is_decode = False
         self.projection = None
 
     def save_projection(

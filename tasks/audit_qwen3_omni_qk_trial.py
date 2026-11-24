@@ -11,7 +11,6 @@ import torch
 from audit_qwen3_omni_native_boundaries import verify_weights
 from audit_qwen3_omni_native_predictor import load_native_talker
 from compare_qwen3_omni_native_trajectories import validate
-from qwen3_omni_native_qk_trial import NativeQkLayerTrial
 from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import (
     Qwen3OmniMoeThinkerTextRMSNorm,
 )
@@ -23,6 +22,11 @@ def main(arguments: argparse.Namespace) -> None:
     environ["OMNI_NATIVE_TRAJECTORY_DIRECTORY"] = str(arguments.output)
     environ["OMNI_NATIVE_TRAJECTORY_SAMPLES"] = arguments.capture.name
     assert not environ.get("OMNI_NATIVE_QK_TRIAL")
+    assert arguments.conditioning.name == arguments.capture.name
+    environ["OMNI_NATIVE_QK_TRIAL"] = "control"
+    environ["OMNI_NATIVE_CONDITIONING_REFERENCES"] = json.dumps(
+        [str(arguments.conditioning)]
+    )
     torch.set_num_threads(1)
     torch.cuda.set_device(arguments.gpu)
     scheduler = load_native_talker(
@@ -32,13 +36,9 @@ def main(arguments: argparse.Namespace) -> None:
     verified_weights = verify_weights(model, arguments.checkpoint)
     frames = validate(arguments.capture)
     metadata = json.loads((arguments.capture / "trajectory.json").read_text())
-    selected_rows = torch.zeros(
-        model.feedback_buffer.shape[0], dtype=torch.bool, device="cuda"
-    )
-    trials = [
-        NativeQkLayerTrial(layer.self_attn, selected_rows)
-        for layer in model.model.layers
-    ]
+    assert model.native_qk_trial is not None
+    selected_rows = model.native_qk_trial.selected_rows
+    trials = model.native_qk_trial.layers
     comparisons: list[dict[str, int]] = []
     for frame_index, (frame, state) in enumerate(
         zip(frames, metadata["frames"], strict=True)
@@ -106,6 +106,9 @@ def main(arguments: argparse.Namespace) -> None:
                 assert torch.equal(result[1], query) and torch.equal(result[2], key)
             for actual, before in zip((projection, query, key), original, strict=True):
                 assert torch.equal(actual, before)
+            trial.finish(layer.self_attn, (), frame[prefix + "attention_projection"])
+            assert trial.before_rotary(layer.self_attn.rotary_emb, inputs) is None
+            assert trial.projection is None
             comparisons.append(
                 {"frame": frame_index, "layer": layer_index, "batch_rows": len(query)}
             )
@@ -116,12 +119,17 @@ def main(arguments: argparse.Namespace) -> None:
         ).hexdigest(),
         "verified_weights": len(verified_weights),
         "checked_layer_frames": len(comparisons),
+        "distinct_rotary_modules": len(
+            {id(layer.self_attn.rotary_emb) for layer in model.model.layers}
+        ),
         "checks": {
             "control_exact": True,
             "checkpoint_selected_row_exact": True,
             "unselected_rows_unchanged": True,
             "graph_mask_moves_and_resets": True,
             "operands_unchanged": True,
+            "inactive_after_attention_returns": True,
+            "native_factory_control_graph_capture": True,
         },
         "scope": "Held Q/K input preflight only; native serving control still required.",
         "comparisons": comparisons,
@@ -142,6 +150,7 @@ if __name__ == "__main__":
     parser.add_argument("capture", type=Path)
     parser.add_argument("output", type=Path)
     parser.add_argument("--gpu", type=int, required=True)
+    parser.add_argument("--conditioning", type=Path, required=True)
     main(parser.parse_args())
 else:
     pass
