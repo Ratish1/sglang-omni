@@ -1212,7 +1212,9 @@ def create_audio_encoder_executor(
     return SimpleScheduler(
         _encode,
         batch_compute_fn=_encode_batch,
-        max_batch_size=32,
+        max_batch_size=(
+            1 if os.environ.get("OMNI_NATIVE_AUDIO_SINGLE_REQUEST") == "1" else 32
+        ),
         max_batch_wait_ms=encoder_batch_wait_ms(),
         batch_wait_when_idle=False,
     )
