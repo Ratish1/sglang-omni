@@ -2,6 +2,7 @@
 """Compare two recorded audio inputs in one held native Thinker prefill."""
 
 import json
+from bisect import bisect_left
 from hashlib import sha256
 from pathlib import Path
 
@@ -14,6 +15,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.runtime_context import get_parallel
 
 from sglang_omni.model_runner.model_worker import ModelWorker
+from sglang_omni.model_runner.prefill_inputs import get_omni_prefill_inputs
 
 
 class ThinkerInputTrial:
@@ -91,8 +93,10 @@ class ThinkerInputTrial:
         assert extend_lengths[selected_request] == self.extend_tokens
         start = sum(extend_lengths[:selected_request])
         end = start + self.extend_tokens
-        input_embeddings = forward_batch.input_embeds
-        assert input_embeddings is not None and input_embeddings.dtype == torch.bfloat16
+        prefill_inputs = get_omni_prefill_inputs(forward_batch)
+        assert prefill_inputs is not None and forward_batch.input_embeds is None
+        input_embeddings = prefill_inputs.input_embeds
+        assert input_embeddings.dtype == torch.bfloat16
         assert sum(extend_lengths) == input_embeddings.shape[0]
         native_embeddings = input_embeddings.clone()
         for field in ("input_ids", "positions"):
@@ -151,6 +155,7 @@ class ThinkerInputTrial:
         original_writes = [
             buffer.index_select(0, write_slots).cpu() for buffer in buffers
         ]
+        original_padding = [buffer[:1].clone() for buffer in buffers]
         original_prefix = [
             buffer.index_select(0, prefix_slots).cpu() for buffer in buffers
         ]
@@ -178,6 +183,8 @@ class ThinkerInputTrial:
         write_controls: dict[str, list[torch.Tensor]] = {}
         selected_writes: dict[str, list[torch.Tensor]] = {}
         peer_write_changes: dict[str, list[int]] = {}
+        graph_modes: list[bool] = []
+        graph_buckets: list[int | None] = []
         order = ("native", "first", "second", "first", "second", "native")
         for phase in order:
             input_embeddings.copy_(native_embeddings)
@@ -188,11 +195,23 @@ class ThinkerInputTrial:
                     alternatives[0 if phase == "first" else 1]
                 )
             expected_embeddings = input_embeddings.clone()
-            for buffer, saved in zip(buffers, original_writes, strict=True):
+            for buffer, saved, padding in zip(
+                buffers, original_writes, original_padding, strict=True
+            ):
                 buffer.index_copy_(0, write_slots, saved.to(buffer.device))
+                buffer[:1].copy_(padding)
             result = worker.forward_batch_generation(forward_batch)
             assert result.next_token_ids is None
-            assert not result.can_run_cuda_graph
+            graph_modes.append(bool(result.can_run_cuda_graph))
+            if result.can_run_cuda_graph:
+                buckets = runner.prefill_cuda_graph_runner.capture_num_tokens
+                graph_buckets.append(buckets[bisect_left(buckets, write_slots.numel())])
+            else:
+                graph_buckets.append(None)
+            assert graph_modes[-1] == graph_modes[0]
+            assert graph_buckets[-1] == graph_buckets[0]
+            assert get_omni_prefill_inputs(forward_batch) is prefill_inputs
+            assert forward_batch.input_embeds is None
             assert torch.equal(input_embeddings, expected_embeddings)
             for field, saved in held_fields.items():
                 assert torch.equal(getattr(forward_batch, field), saved), field
@@ -300,7 +319,9 @@ class ThinkerInputTrial:
                     "peer_write_changes": peer_write_changes,
                     "prefix_and_input_metadata_unchanged": True,
                     "published_native_state": True,
-                    "cuda_graph": False,
+                    "cuda_graph": graph_modes,
+                    "graph_bucket_tokens": graph_buckets,
+                    "input_transport": "omni_prefill_sidecar",
                     "input_difference": difference(
                         self.captures[0]["input_embeds"],
                         self.captures[1]["input_embeds"],

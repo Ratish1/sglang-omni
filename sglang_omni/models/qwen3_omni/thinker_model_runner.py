@@ -3,22 +3,28 @@
 
 from __future__ import annotations
 
+import json
 from array import array
 from dataclasses import dataclass
 from numbers import Integral
+from os import environ
+from pathlib import Path
 from typing import TypeGuard
 
 import torch
+from qwen3_omni_thinker_input_trial import ThinkerInputTrial
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
+from sglang_omni.model_runner.model_worker import ModelWorker
 from sglang_omni.model_runner.prefill_inputs import (
     OmniPrefillInputs,
     attach_omni_prefill_inputs,
     get_omni_prefill_inputs,
 )
 from sglang_omni.model_runner.thinker_model_runner import ThinkerModelRunner
+from sglang_omni.scheduling.sglang_backend.output_processor import SGLangOutputProcessor
 from sglang_omni.scheduling.types import SchedulerRequest
 
 _PREFILL_AUDIO_INPUT_KEYS = frozenset(
@@ -50,6 +56,33 @@ class Qwen3OmniThinkerModelRunner(ThinkerModelRunner):
     """
 
     supports_speculative_async_decode: bool = True
+
+    def __init__(
+        self,
+        tp_worker: ModelWorker,
+        output_processor: SGLangOutputProcessor,
+        *,
+        capture_prompt_hidden_states: bool,
+    ) -> None:
+        super().__init__(
+            tp_worker,
+            output_processor,
+            capture_prompt_hidden_states=capture_prompt_hidden_states,
+        )
+        trial_paths = json.loads(
+            environ.get("OMNI_NATIVE_THINKER_INPUT_REFERENCES", "[]")
+        )
+        self.input_trial: ThinkerInputTrial | None = None
+        if trial_paths:
+            assert len(trial_paths) == 2
+            self.input_trial = ThinkerInputTrial(
+                Path(trial_paths[0]),
+                Path(trial_paths[1]),
+                Path(environ["OMNI_NATIVE_TRAJECTORY_DIRECTORY"])
+                / "thinker-input-trial.json",
+            )
+        else:
+            pass
 
     @staticmethod
     def origin_num_tokens(value: object) -> int | None:
@@ -398,7 +431,17 @@ class Qwen3OmniThinkerModelRunner(ThinkerModelRunner):
         requests: list[SchedulerRequest],
     ) -> GenerationBatchResult | None:
         if get_omni_prefill_inputs(forward_batch) is not None:
-            return None
+            if (
+                self.input_trial is not None
+                and not self.input_trial.applied
+                and self.input_trial.request_id
+                in [request.rid for request in schedule_batch.reqs]
+            ):
+                return self.input_trial.forward(
+                    self.tp_worker, forward_batch, schedule_batch
+                )
+            else:
+                return None
         else:
             pass
 

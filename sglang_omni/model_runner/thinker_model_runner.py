@@ -7,18 +7,14 @@ visual embeddings for Qwen3-Omni's thinker stage.
 
 from __future__ import annotations
 
-import json
 import logging
 from numbers import Integral
-from os import environ
-from pathlib import Path
 
 import torch
 from qwen3_omni_conditioning_provenance import (
     record_conditioning_boundary,
     selected_conditioning_request,
 )
-from qwen3_omni_thinker_input_trial import ThinkerInputTrial
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
@@ -53,20 +49,6 @@ class ThinkerModelRunner(ModelRunner):
         self.embed_tokens = self.text_model.embed_tokens
         self.th_host_bufs: list[torch.Tensor] | None = None
         self.th_slot = 0
-        trial_paths = json.loads(
-            environ.get("OMNI_NATIVE_THINKER_INPUT_REFERENCES", "[]")
-        )
-        self.input_trial: ThinkerInputTrial | None = None
-        if trial_paths:
-            assert len(trial_paths) == 2
-            self.input_trial = ThinkerInputTrial(
-                Path(trial_paths[0]),
-                Path(trial_paths[1]),
-                Path(environ["OMNI_NATIVE_TRAJECTORY_DIRECTORY"])
-                / "thinker-input-trial.json",
-            )
-        else:
-            pass
 
         sglang_model_runner = tp_worker.model_runner
         thinker_cfg = sglang_model_runner.model_config.hf_config.thinker_config
@@ -106,17 +88,6 @@ class ThinkerModelRunner(ModelRunner):
             # cannot carry its residual embeddings.
             if ds_embeds is None:
                 forward_batch.input_embeds = input_embeds
-                if (
-                    self.input_trial is not None
-                    and not self.input_trial.applied
-                    and self.input_trial.request_id
-                    in [request.rid for request in schedule_batch.reqs]
-                ):
-                    return self.input_trial.forward(
-                        self.tp_worker, forward_batch, schedule_batch
-                    )
-                else:
-                    pass
                 return None
             else:
                 pass
