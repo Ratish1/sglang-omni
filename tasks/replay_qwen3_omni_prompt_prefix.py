@@ -153,13 +153,24 @@ def main(root: Path, sample_id: str) -> None:
             "first_decode_split_count": split_counts[0],
             "layer0_prefix_crosses": prefix_crosses,
             "layers": layers,
-            "first_changed_expert_layer": next(
+            "first_changed_expert_order_layer": next(
                 (
                     layer_index
                     for layer_index in range(layer_count)
                     if not torch.equal(
                         frames[0][f"layer{layer_index}_expert_ids"],
                         frames[1][f"layer{layer_index}_expert_ids"],
+                    )
+                ),
+                None,
+            ),
+            "first_changed_expert_membership_layer": next(
+                (
+                    layer_index
+                    for layer_index in range(layer_count)
+                    if not torch.equal(
+                        frames[0][f"layer{layer_index}_expert_ids"].sort().values,
+                        frames[1][f"layer{layer_index}_expert_ids"].sort().values,
                     )
                 ),
                 None,
@@ -171,8 +182,11 @@ def main(root: Path, sample_id: str) -> None:
                 {
                     "policy": policy,
                     "native_attention_replays_exact": 2 * layer_count,
-                    "first_changed_expert_layer": report[policy][
-                        "first_changed_expert_layer"
+                    "first_changed_expert_order_layer": report[policy][
+                        "first_changed_expert_order_layer"
+                    ],
+                    "first_changed_expert_membership_layer": report[policy][
+                        "first_changed_expert_membership_layer"
                     ],
                     "layer0_prefix_crosses": prefix_crosses,
                 }
