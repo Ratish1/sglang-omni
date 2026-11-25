@@ -106,10 +106,13 @@ class NativeTalkerTrajectory:
         continuation_reference = environ.get("OMNI_NATIVE_CONTINUATION_REFERENCE")
         if continuation_reference:
             assert self.code_trial is None and not self.cache_trials
-            assert not self.attention_trial_sequences
             start_tokens, stop_tokens = (
                 int(value)
                 for value in environ["OMNI_NATIVE_CONTINUATION_SEQUENCES"].split(",")
+            )
+            assert all(
+                not start_tokens <= sequence < stop_tokens
+                for sequence in self.attention_trial_sequences
             )
             self.continuation_trial = NativeContinuationTrial(
                 Path(continuation_reference),
@@ -135,9 +138,12 @@ class NativeTalkerTrajectory:
         self.conditioning_trials: dict[str, NativeConditioningTrial] = {}
         if conditioning_references:
             assert self.code_trial is None and not self.cache_trials
-            assert not self.attention_trial_sequences
-            if self.continuation_trial is not None:
+            if self.continuation_trial is not None or self.attention_trial_sequences:
                 assert conditioning_mode == "hold_prompt_verify_opening"
+                assert not environ.get("OMNI_NATIVE_QK_TRIAL")
+                assert not json.loads(
+                    environ.get("OMNI_NATIVE_PREFIX_REFERENCES", "[]")
+                )
             else:
                 pass
             for reference in conditioning_references:
@@ -240,6 +246,12 @@ class NativeTalkerTrajectory:
         selected_row = selected_rows[0]
         request_id = requests[selected_row].request_id
         sequence_tokens = int(forward_batch.seq_lens_cpu[selected_row])
+        continue_selected = (
+            self.continuation_trial is not None
+            and self.continuation_trial.start_sequence_tokens
+            <= sequence_tokens
+            < self.continuation_trial.stop_sequence_tokens
+        )
         destination = self.directory / f"{request_id}-sequence-{sequence_tokens}.json"
         trial = compare_attention_schedules(
             worker,
@@ -247,13 +259,13 @@ class NativeTalkerTrajectory:
             requests,
             selected_row,
             destination,
-            1 if self.continuation_trial is not None else self.attention_trial_splits,
+            1 if continue_selected else self.attention_trial_splits,
             save_tensors=(
-                self.continuation_trial is None
-                or not self.continuation_trial.sequence_tokens
+                not continue_selected or not self.continuation_trial.sequence_tokens
             ),
         )
-        if self.continuation_trial is not None:
+        if continue_selected:
+            assert self.continuation_trial is not None
             result = trial.result
             if not self.continuation_trial.sequence_tokens:
                 self.after_forward(

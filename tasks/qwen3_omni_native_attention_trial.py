@@ -239,6 +239,7 @@ def compare_attention_schedules(
             )
 
     outputs: list[dict[str, torch.Tensor]] = []
+    layer_operands: list[list[dict[str, torch.Tensor]]] = []
     writes: list[list[torch.Tensor]] = []
     schedules: list[list[int]] = []
     selected_probe: dict[str, torch.Tensor] = {}
@@ -256,6 +257,21 @@ def compare_attention_schedules(
             result = worker.forward_batch_generation(forward_batch)
         assert result.can_run_cuda_graph
         snapshot = model.native_layer_probe.snapshot_for_batch(graph_runner.bs, True)
+        if save_tensors:
+            probes = (model.native_layer_probe, *model.native_deeper_layer_probes)
+            layer_operands.append(
+                [
+                    {
+                        name: tensor.detach().clone()
+                        for name, tensor in probe.snapshot_for_batch(
+                            graph_runner.bs, True
+                        ).items()
+                    }
+                    for probe in probes
+                ]
+            )
+        else:
+            pass
         if alternative:
             selected_probe = model.native_layer_probe.read(
                 selected_row, graph_runner.bs, True
@@ -322,6 +338,16 @@ def compare_attention_schedules(
         for first, last in zip(writes[0], writes[2], strict=True)
     )
     assert schedules[0] == schedules[2]
+    if save_tensors:
+        assert len(layer_operands) == 3
+        for first_layer, last_layer in zip(
+            layer_operands[0], layer_operands[2], strict=True
+        ):
+            assert first_layer.keys() == last_layer.keys()
+            for name in first_layer:
+                assert torch.equal(first_layer[name], last_layer[name]), name
+    else:
+        pass
     if attention_splits:
         assert schedules[1][: len(requests)] == [attention_splits] * len(requests)
     else:
@@ -338,6 +364,7 @@ def compare_attention_schedules(
         "requested_attention_splits": attention_splits,
         "splits": schedules,
         "stock_repeat_exact": True,
+        "captured_layer_count": len(layer_operands[0]) if save_tensors else 0,
         "prefix_unchanged": True,
         "selected": {
             name: difference(
@@ -416,6 +443,13 @@ def compare_attention_schedules(
                     if name != "feedback_buffer"
                 },
                 "positions": forward_batch.positions.cpu(),
+                "layer_operands": [
+                    [
+                        {name: tensor.cpu() for name, tensor in layer.items()}
+                        for layer in forward_layers
+                    ]
+                    for forward_layers in layer_operands
+                ],
             },
             destination.with_suffix(".pt"),
         )

@@ -111,7 +111,10 @@ def main(
         assert continuation_sequences[0] < continuation_sequences[1]
         assert len(selected_samples) == 1
         assert code_trial_reference is None and not cache_trial_reference
-        assert not attention_trial_sequences
+        assert all(
+            not continuation_sequences[0] <= sequence < continuation_sequences[1]
+            for sequence in attention_trial_sequences
+        )
         assert qk_trial is None and not prefix_references
     else:
         assert continuation_target is None and not continuation_sequences
@@ -121,9 +124,9 @@ def main(
         )
         assert len(conditioning_reference) == len(selected_samples)
         assert code_trial_reference is None and not cache_trial_reference
-        assert not attention_trial_sequences
-        if continuation_reference is not None:
+        if continuation_reference is not None or attention_trial_sequences:
             assert conditioning_mode == "hold_prompt_verify_opening"
+            assert qk_trial is None and not prefix_references
         else:
             pass
     else:
@@ -378,7 +381,9 @@ if __name__ == "__main__":
         "--qk-restore-query", nargs=3, default=[], metavar=("SAMPLE", "FRAME", "LAYER")
     )
     parser.add_argument("--attention-trial-sequences", type=int, nargs="*", default=[])
-    parser.add_argument("--attention-trial-splits", type=int, choices=(0, 1), default=0)
+    parser.add_argument(
+        "--attention-trial-splits", type=int, choices=(0, 1, 2), default=0
+    )
     parser.add_argument("--code-trial-reference", type=Path)
     parser.add_argument("--code-trial-choice", type=int, nargs=4, default=[])
     parser.add_argument("--cache-trial-reference", type=Path, nargs="+", default=[])
