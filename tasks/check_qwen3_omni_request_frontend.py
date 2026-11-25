@@ -2,7 +2,9 @@
 """Verify request-local audio computation against native captures and singleton calls."""
 
 import argparse
+import cProfile
 import json
+import pstats
 import statistics
 import time
 from dataclasses import dataclass, field
@@ -188,6 +190,41 @@ def main(root: Path, checkpoint: Path, sample_id: str, output: Path) -> None:
                 policy: statistics.median(values) for policy, values in timings.items()
             },
         }
+        if name == "native_cohort":
+            profiles = {}
+            for policy in ("native", "request_local"):
+                profiler = cProfile.Profile()
+                profiler.enable()
+                for _ in range(20):
+                    if policy == "native":
+                        encoder(
+                            input_features=packed_features,
+                            audio_feature_lengths=clip_lengths,
+                        )
+                    else:
+                        request_frontend_forward(
+                            encoder, packed_features, clip_lengths, request_clip_counts
+                        )
+                profiler.disable()
+                torch.cuda.synchronize()
+                profiles[policy] = [
+                    {
+                        "file": location[0],
+                        "line": location[1],
+                        "function": location[2],
+                        "calls": measurements[1],
+                        "self_seconds": measurements[2],
+                        "inclusive_seconds": measurements[3],
+                    }
+                    for location, measurements in sorted(
+                        pstats.Stats(profiler).stats.items(),
+                        key=lambda entry: entry[1][2],
+                        reverse=True,
+                    )[:35]
+                ]
+            reports[name]["host_profiles"] = profiles
+        else:
+            pass
     encoder.audio_tower.conv_chunksize = original_chunk_limit
     witness_outputs = {}
     for arm, (packed_features, clip_lengths, metadata) in snapshots.items():
