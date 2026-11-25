@@ -43,8 +43,12 @@ def main(
     concurrency: int,
     seedtts_only: bool,
     cache_directory: Path | None,
+    audio_single_request: bool,
 ) -> None:
     output.mkdir()
+    (output / "encoder-policy.json").write_text(
+        json.dumps({"audio_single_request": audio_single_request}) + "\n"
+    )
     seedtts = load_seedtts_samples(SEEDTTS_DATASET_ID)
     sample_ids = {sample.sample_id for sample in seedtts}
     assert len(sample_ids) == len(seedtts) == SEEDTTS_SAMPLE_COUNT
@@ -112,7 +116,10 @@ def main(
         output / "server.log",
         port,
         timeout=SERVER_TIMEOUT_SECONDS,
-        env={"SGLANG_CACHE_DIR": str(cache_directory or output / "cache")},
+        env={
+            "SGLANG_CACHE_DIR": str(cache_directory or output / "cache"),
+            "OMNI_NATIVE_AUDIO_SINGLE_REQUEST": "1" if audio_single_request else "0",
+        },
         strip_proxy=True,
     )
     try:
@@ -172,6 +179,7 @@ if __name__ == "__main__":
     parser.add_argument("--concurrency", required=True, type=int)
     parser.add_argument("--seedtts-only", action="store_true")
     parser.add_argument("--cache-directory", type=Path)
+    parser.add_argument("--audio-single-request", action="store_true")
     arguments = parser.parse_args()
     main(
         arguments.output,
@@ -180,6 +188,7 @@ if __name__ == "__main__":
         arguments.concurrency,
         arguments.seedtts_only,
         arguments.cache_directory,
+        arguments.audio_single_request,
     )
 else:
     pass
