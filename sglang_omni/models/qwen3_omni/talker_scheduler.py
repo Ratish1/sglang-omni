@@ -97,6 +97,13 @@ class QwenTalkerScheduler(OmniScheduler[SGLangARRequestData]):
     def is_request_build_ready(
         self, payload: StagePayload, *, pending_stream_done: bool
     ) -> bool:
+        trial = self.model_runner.native_trajectory.conditioning_trials.get(
+            payload.request_id
+        )
+        if trial is not None and trial.mode != "verify":
+            return pending_stream_done
+        else:
+            pass
         if pending_stream_done:
             return True
         else:
