@@ -22,9 +22,13 @@ def main(root: Path, output: Path, device: str) -> None:
     scorer_source = Path(similarity_module.__file__)
     assert sha256(scorer_source.read_bytes()).hexdigest() == SIMILARITY_SHA256
     arms = (root / "first", root / "second")
-    sample_ids = sorted(path.name for path in (arms[0] / "captures").iterdir())
+    sample_ids = sorted(
+        path.parent.name for path in (arms[0] / "captures").glob("*/trajectory.json")
+    )
     assert sample_ids
-    assert sample_ids == sorted(path.name for path in (arms[1] / "captures").iterdir())
+    assert sample_ids == sorted(
+        path.parent.name for path in (arms[1] / "captures").glob("*/trajectory.json")
+    )
     samples = {
         sample.sample_id: sample for sample in load_seedtts_samples(SEEDTTS_DATASET_ID)
     }
