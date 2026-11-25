@@ -6,10 +6,12 @@ import json
 from dataclasses import asdict, dataclass, field
 from hashlib import sha256
 from pathlib import Path
+from typing import Literal
 
 import torch
 from compare_qwen3_omni_native_trajectories import validate
 from qwen3_omni_corpus_support import SERVER_TIMEOUT_SECONDS, server_command
+from score_qwen3_omni_reference_continuation import RenderedClip, render
 
 from benchmarks.benchmarker.utils import start_server_from_cmd, stop_server
 from benchmarks.metrics.wer import SampleOutput
@@ -35,6 +37,8 @@ class ConditioningComparison:
     peer_changed_frames: dict[str, list[int]]
     first_differences: dict[str, int]
     divergence_metadata: list[dict[str, str | int | bool | list[str]]]
+    waveform_source: Literal["native", "common_decoder"] = "native"
+    rendered_clips: list[RenderedClip] = field(default_factory=list)
     waveform_hashes: dict[str, str] = field(default_factory=dict)
     scores: dict[str, SampleOutput] = field(default_factory=dict)
 
@@ -194,10 +198,44 @@ def main(
     intervention: Path,
     asr_checkpoint: Path,
     original_results: Path | None,
+    decoder_checkpoint: Path | None,
+    sample_rate: int | None,
 ) -> None:
+    assert (decoder_checkpoint is None) == (sample_rate is None)
     roots = (baseline, intervention)
     comparisons = compare_conditioning(baseline, intervention, original_results)
-    output = intervention / "fixed-conditioning-comparison.json"
+    if decoder_checkpoint is not None:
+        assert sample_rate is not None and sample_rate > 0
+        histories = {
+            comparison.sample_id: {
+                root.name: torch.stack(
+                    [
+                        frame["codec_ids"]
+                        for frame in torch.load(
+                            root / "captures" / comparison.sample_id / "trajectory.pt",
+                            weights_only=True,
+                            map_location="cpu",
+                        )
+                    ]
+                )
+                for root in roots
+            }
+            for comparison in comparisons
+        }
+        render_directory = intervention / "common-decoder"
+        render_directory.mkdir()
+        torch.cuda.set_device(0)
+        clips = render(decoder_checkpoint, histories, render_directory, 0, sample_rate)
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
+        for comparison in comparisons:
+            comparison.waveform_source = "common_decoder"
+            comparison.rendered_clips = [
+                clip for clip in clips if clip.sample_id == comparison.sample_id
+            ]
+        output = intervention / "common-decoder-comparison.json"
+    else:
+        output = intervention / "fixed-conditioning-comparison.json"
     output.write_text(json.dumps([asdict(report) for report in comparisons], indent=2))
     port = find_available_port()
     server = start_server_from_cmd(
@@ -222,26 +260,42 @@ def main(
     try:
         asr = load_qwen3_asr(port)
         for comparison in comparisons:
-            for root, audio_duration_seconds in zip(
-                roots, comparison.audio_duration_seconds, strict=True
-            ):
-                waveform = root / "mmsu/audio" / f"{comparison.sample_id}.wav"
-                comparison.waveform_hashes[root.name] = sha256(
-                    waveform.read_bytes()
-                ).hexdigest()
+            if decoder_checkpoint is None:
+                clips = []
+                for root, audio_duration_seconds in zip(
+                    roots, comparison.audio_duration_seconds, strict=True
+                ):
+                    waveform = root / "mmsu/audio" / f"{comparison.sample_id}.wav"
+                    clips.append(
+                        RenderedClip(
+                            sample_id=comparison.sample_id,
+                            arm=root.name,
+                            waveform_path=str(waveform),
+                            waveform_sha256=sha256(waveform.read_bytes()).hexdigest(),
+                            audio_duration_seconds=audio_duration_seconds,
+                        )
+                    )
+            else:
+                clips = comparison.rendered_clips
+            for clip in clips:
+                assert (
+                    sha256(Path(clip.waveform_path).read_bytes()).hexdigest()
+                    == clip.waveform_sha256
+                )
+                comparison.waveform_hashes[clip.arm] = clip.waveform_sha256
                 score = transcribe_and_compute_wer(
                     SampleOutput(
                         sample_id=comparison.sample_id,
                         target_text=comparison.original_text,
-                        audio_duration_s=audio_duration_seconds,
+                        audio_duration_s=clip.audio_duration_seconds,
                     ),
-                    str(waveform),
+                    clip.waveform_path,
                     asr,
                     "en",
                     "cuda:0",
                 )
                 assert score.is_success and score.is_transcribed, score.error
-                comparison.scores[root.name] = score
+                comparison.scores[clip.arm] = score
                 output.write_text(
                     json.dumps([asdict(report) for report in comparisons], indent=2)
                 )
@@ -249,7 +303,7 @@ def main(
                     json.dumps(
                         {
                             "sample_id": comparison.sample_id,
-                            "arm": root.name,
+                            "arm": clip.arm,
                             "wer": score.wer,
                         }
                     ),
@@ -270,12 +324,16 @@ if __name__ == "__main__":
         type=Path,
         help="Original MMSU results when both compared runs use held conditioning.",
     )
+    parser.add_argument("--decoder-checkpoint", type=Path)
+    parser.add_argument("--sample-rate", type=int)
     arguments = parser.parse_args()
     main(
         arguments.baseline,
         arguments.intervention,
         arguments.asr_checkpoint,
         arguments.original_results,
+        arguments.decoder_checkpoint,
+        arguments.sample_rate,
     )
 else:
     pass

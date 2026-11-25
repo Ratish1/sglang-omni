@@ -39,8 +39,7 @@ class RenderedClip:
 @torch.inference_mode()
 def render(
     checkpoint: Path,
-    reference_root: Path,
-    sample_ids: list[str],
+    histories: dict[str, dict[str, torch.Tensor]],
     output: Path,
     gpu_index: int,
     sample_rate: int,
@@ -60,19 +59,10 @@ def render(
     model.eval()
     audit_weights(model, checkpoint, output)
     clips: list[RenderedClip] = []
-    for sample_id in sample_ids:
+    for sample_id, arms in histories.items():
         sample_directory = output / sample_id
         sample_directory.mkdir()
-        for arm, filename in (
-            ("native_codes", "conditioning.pt"),
-            ("reference_0", "reference-0.pt"),
-            ("reference_1", "reference-1.pt"),
-        ):
-            codes = torch.load(
-                reference_root / sample_id / filename,
-                weights_only=True,
-                map_location="cpu",
-            )["codec_ids"]
+        for arm, codes in arms.items():
             assert int(codes[-1, 0]) == config.talker_config.codec_eos_token_id
             speech_codes = codes[:-1].T.unsqueeze(0).to(model.device)
             assert speech_codes.shape[1] == config.code2wav_config.num_quantizers
@@ -108,10 +98,24 @@ def main(arguments: argparse.Namespace) -> None:
         assert sorted(
             row["repeat"] for row in results if row["sample_id"] == sample_id
         ) == [0, 1]
+    histories = {
+        sample_id: {
+            arm: torch.load(
+                arguments.reference_root / sample_id / filename,
+                weights_only=True,
+                map_location="cpu",
+            )["codec_ids"]
+            for arm, filename in (
+                ("native_codes", "conditioning.pt"),
+                ("reference_0", "reference-0.pt"),
+                ("reference_1", "reference-1.pt"),
+            )
+        }
+        for sample_id in sample_ids
+    }
     clips = render(
         arguments.checkpoint,
-        arguments.reference_root,
-        sample_ids,
+        histories,
         arguments.output,
         arguments.gpu,
         arguments.sample_rate,
