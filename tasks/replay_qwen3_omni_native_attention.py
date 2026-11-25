@@ -65,7 +65,31 @@ def audit_layers(root: Path, fp64_reference: bool) -> None:
     report = {}
     for capture in captures:
         frames = validate(capture.parent)
-        steps = json.loads(capture.with_suffix(".json").read_text())["frames"]
+        metadata = json.loads(capture.with_suffix(".json").read_text())
+        steps = metadata["frames"]
+        continuation_sequence_tokens = [
+            step["sequence_length"]
+            for step in steps
+            if step.get("selected_continuation_intervention", False)
+        ]
+        continuation_path = root / "captures" / "continuation-trial.json"
+        if continuation_path.exists():
+            continuation = json.loads(continuation_path.read_text())
+            assert continuation["request_id"] == metadata["request_id"]
+            assert continuation["prefix_exact"]
+            assert continuation["old_prefixes_and_peers_unchanged"]
+            assert continuation_sequence_tokens == continuation["sequence_tokens"]
+            assert continuation_sequence_tokens == list(
+                range(
+                    steps[continuation["frame_index"]]["sequence_length"],
+                    min(
+                        continuation["requested_stop_sequence_tokens"],
+                        steps[-1]["sequence_length"] + 1,
+                    ),
+                )
+            )
+        else:
+            assert not continuation_sequence_tokens
         prefixes = {
             field: torch.cat(
                 [frames[0].get(f"decode_prefix_{field}", frames[0][f"stored_{field}"])]
@@ -86,13 +110,19 @@ def audit_layers(root: Path, fp64_reference: bool) -> None:
             if frame_index == 0:
                 continue
             else:
-                assert step["phase"] == "decode" and step["attention_num_splits"] == 0
+                assert step["phase"] == "decode"
             sequence_tokens = step["sequence_length"]
             assert sequence_tokens == prefill_tokens + frame_index
+            expected_splits = int(sequence_tokens in continuation_sequence_tokens)
+            assert step["attention_num_splits"] == expected_splits
             schedule = physical_schedule(
                 frame["attention_scheduler_metadata"], step["graph_batch_rows"]
             )
             split_count = int(schedule[0, step["request_row"]])
+            if expected_splits:
+                assert split_count == expected_splits
+            else:
+                pass
             for layer_index in range(step.get("captured_layers", 1)):
                 query = frame[f"layer{layer_index}_query_after_rope"].cuda()
                 query = query.reshape(1, -1, keys.shape[-1])
@@ -151,6 +181,7 @@ def audit_layers(root: Path, fp64_reference: bool) -> None:
         report[capture.parent.name] = {
             "capture_sha256": sha256(capture.read_bytes()).hexdigest(),
             "checked_by_layer": checked_by_layer,
+            "continuation_sequence_tokens": continuation_sequence_tokens,
             "mismatches": mismatches,
             "cache_unchanged": True,
             "fp64_reference_errors": reference_errors,
