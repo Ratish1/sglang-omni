@@ -37,7 +37,9 @@ class FrontendCapture:
 
 
 @torch.inference_mode()
-def main(root: Path, checkpoint: Path, sample_id: str, output: Path) -> None:
+def main(
+    root: Path, checkpoint: Path, sample_id: str, output: Path, integrated: bool
+) -> None:
     assert not output.exists()
     torch.set_num_threads(1)
     encoder = Qwen3OmniAudioEncoder(
@@ -135,6 +137,15 @@ def main(root: Path, checkpoint: Path, sample_id: str, output: Path) -> None:
                 [len(request)],
             ).cpu()
             assert torch.equal(local_output, native_output), name
+            if integrated:
+                integrated_output = encoder(
+                    input_features=request_features,
+                    audio_feature_lengths=request_lengths,
+                    request_clip_counts=[len(request)],
+                )["audio_embeds"].cpu()
+                assert torch.equal(integrated_output, native_output), name
+            else:
+                pass
             singleton_outputs.append(native_output)
         frontend = batched_request_frontend(
             encoder,
@@ -161,6 +172,15 @@ def main(root: Path, checkpoint: Path, sample_id: str, output: Path) -> None:
             clip_lengths,
             request_clip_counts,
         ).cpu()
+        if integrated:
+            integrated_output = encoder(
+                input_features=packed_features,
+                audio_feature_lengths=clip_lengths,
+                request_clip_counts=request_clip_counts,
+            )["audio_embeds"].cpu()
+            assert torch.equal(integrated_output, local_output), name
+        else:
+            pass
         native_output = encoder(
             input_features=packed_features,
             audio_feature_lengths=clip_lengths,
@@ -182,6 +202,12 @@ def main(root: Path, checkpoint: Path, sample_id: str, output: Path) -> None:
                         result = encoder(
                             input_features=packed_features,
                             audio_feature_lengths=clip_lengths,
+                        )["audio_embeds"]
+                    elif integrated:
+                        result = encoder(
+                            input_features=packed_features,
+                            audio_feature_lengths=clip_lengths,
+                            request_clip_counts=request_clip_counts,
                         )["audio_embeds"]
                     else:
                         result = request_frontend_forward(
@@ -219,6 +245,12 @@ def main(root: Path, checkpoint: Path, sample_id: str, output: Path) -> None:
                             input_features=packed_features,
                             audio_feature_lengths=clip_lengths,
                         )
+                    elif integrated:
+                        encoder(
+                            input_features=packed_features,
+                            audio_feature_lengths=clip_lengths,
+                            request_clip_counts=request_clip_counts,
+                        )
                     else:
                         request_frontend_forward(
                             encoder, packed_features, clip_lengths, request_clip_counts
@@ -255,6 +287,7 @@ def main(root: Path, checkpoint: Path, sample_id: str, output: Path) -> None:
     assert torch.equal(witness_outputs["first"], witness_outputs["second"])
     report = {
         "capture_sha256": captures,
+        "integrated_serving_component": integrated,
         "witness_cross_cohort_exact": True,
         "cases": reports,
     }
@@ -270,7 +303,14 @@ if __name__ == "__main__":
     parser.add_argument("checkpoint", type=Path)
     parser.add_argument("sample_id")
     parser.add_argument("output", type=Path)
+    parser.add_argument("--integrated", action="store_true")
     arguments = parser.parse_args()
-    main(arguments.root, arguments.checkpoint, arguments.sample_id, arguments.output)
+    main(
+        arguments.root,
+        arguments.checkpoint,
+        arguments.sample_id,
+        arguments.output,
+        arguments.integrated,
+    )
 else:
     pass
