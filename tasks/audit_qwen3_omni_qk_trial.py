@@ -11,6 +11,7 @@ import torch
 from audit_qwen3_omni_native_boundaries import verify_weights
 from audit_qwen3_omni_native_predictor import load_native_talker
 from compare_qwen3_omni_native_trajectories import validate
+from sglang.kernels.ops.layernorm.rmsnorm_hf import rmsnorm_hf
 from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import (
     Qwen3OmniMoeThinkerTextRMSNorm,
 )
@@ -40,6 +41,7 @@ def main(arguments: argparse.Namespace) -> None:
     selected_rows = model.native_qk_trial.selected_rows
     trials = model.native_qk_trial.layers
     comparisons: list[dict[str, int]] = []
+    kernel_comparisons: list[dict[str, int | float | str]] = []
     for frame_index, (frame, state) in enumerate(
         zip(frames, metadata["frames"], strict=True)
     ):
@@ -77,7 +79,8 @@ def main(arguments: argparse.Namespace) -> None:
                 dim=-1,
             )[:2]
             expected: list[torch.Tensor] = []
-            for raw, normalization in zip(
+            for operand_name, raw, normalization in zip(
+                ("query", "key"),
                 raw_operands,
                 (layer.self_attn.q_norm, layer.self_attn.k_norm),
                 strict=True,
@@ -90,6 +93,48 @@ def main(arguments: argparse.Namespace) -> None:
                     reference(raw.reshape(len(raw), -1, layer.self_attn.head_dim))
                     .reshape_as(raw)
                     .clone()
+                )
+                kernel_input = raw.reshape(-1, layer.self_attn.head_dim).contiguous()
+                kernel_output = rmsnorm_hf(
+                    kernel_input, normalization.weight, normalization.variance_epsilon
+                )
+                kernel_graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(kernel_graph):
+                    captured_kernel_output = rmsnorm_hf(
+                        kernel_input,
+                        normalization.weight,
+                        normalization.variance_epsilon,
+                    )
+                kernel_graph.replay()
+                assert torch.equal(captured_kernel_output, kernel_output)
+                kernel_output = kernel_output.reshape_as(raw)
+                selected_kernel_output = rmsnorm_hf(
+                    raw[row].reshape(-1, layer.self_attn.head_dim).contiguous(),
+                    normalization.weight,
+                    normalization.variance_epsilon,
+                ).reshape_as(raw[row])
+                assert torch.equal(selected_kernel_output, kernel_output[row])
+                live_rows = len(state["request_ids"])
+                assert torch.isfinite(kernel_output[:live_rows]).all()
+                changed_values = kernel_output != expected[-1]
+                absolute_difference = (
+                    kernel_output.float() - expected[-1].float()
+                ).abs()
+                kernel_comparisons.append(
+                    {
+                        "frame": frame_index,
+                        "layer": layer_index,
+                        "operand": operand_name,
+                        "live_rows": live_rows,
+                        "selected_changed_values": int(changed_values[row].sum()),
+                        "live_changed_values": int(changed_values[:live_rows].sum()),
+                        "selected_max_absolute_difference": float(
+                            absolute_difference[row].max()
+                        ),
+                        "live_max_absolute_difference": float(
+                            absolute_difference[:live_rows].max()
+                        ),
+                    }
                 )
             # note (ratish): moving the mask tests a graph buffer, not a capture-time Python choice.
             for selected_row in (row, (row + 1) % len(state["request_ids"]), row):
@@ -130,14 +175,21 @@ def main(arguments: argparse.Namespace) -> None:
             "operands_unchanged": True,
             "inactive_after_attention_returns": True,
             "native_factory_control_graph_capture": True,
+            "hf_kernel_graph_matches_eager": True,
+            "hf_kernel_selected_row_matches_batched": True,
         },
         "scope": "Held Q/K input preflight only; native serving control still required.",
         "comparisons": comparisons,
+        "hf_kernel_comparisons": kernel_comparisons,
     }
     (arguments.output / "qk-trial.json").write_text(json.dumps(report, indent=2) + "\n")
     print(
         json.dumps(
-            {name: value for name, value in report.items() if name != "comparisons"}
+            {
+                name: value
+                for name, value in report.items()
+                if name not in ("comparisons", "hf_kernel_comparisons")
+            }
         )
     )
     torch.distributed.destroy_process_group()
