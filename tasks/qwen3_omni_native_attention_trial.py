@@ -349,7 +349,11 @@ def compare_attention_schedules(
     else:
         pass
     if attention_splits:
-        assert schedules[1][: len(requests)] == [attention_splits] * len(requests)
+        # note (ratish): FA3 treats explicit split counts as an upper bound.
+        assert all(
+            1 <= split_count <= attention_splits
+            for split_count in schedules[1][: len(requests)]
+        )
     else:
         pass
     assert torch.equal(
