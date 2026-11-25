@@ -83,7 +83,13 @@ def main(
     conditioning_mode: ConditioningMode,
     prefix_references: list[Path],
     conditioning_provenance: bool,
+    thinker_input_references: list[Path],
 ) -> None:
+    if thinker_input_references:
+        assert len(thinker_input_references) == 2 and len(selected_samples) == 1
+        assert not conditioning_reference and not prefix_references and qk_trial is None
+    else:
+        pass
     assert all(frame > 0 for frame in layer_frames)
     assert (code_trial_reference is None) == (not code_trial_choice)
     if code_trial_reference is not None:
@@ -187,6 +193,9 @@ def main(
             "SGLANG_CACHE_DIR": str(output / "cache"),
             "OMNI_NATIVE_TRAJECTORY_DIRECTORY": str(captures),
             "OMNI_NATIVE_TRAJECTORY_SAMPLES": ",".join(selected_samples),
+            "OMNI_NATIVE_THINKER_INPUT_REFERENCES": json.dumps(
+                [str(path) for path in thinker_input_references]
+            ),
             "OMNI_NATIVE_CONDITIONING_PROVENANCE": (
                 "1" if conditioning_provenance else "0"
             ),
@@ -325,6 +334,10 @@ def main(
         assert (captures / "prefix-trial.json").is_file()
     else:
         pass
+    if thinker_input_references:
+        assert (captures / "thinker-input-trial.json").is_file()
+    else:
+        pass
     print(json.dumps({"seedtts_samples": len(samples), "captures": selected_samples}))
 
 
@@ -336,6 +349,7 @@ if __name__ == "__main__":
     parser.add_argument("tactic_cache", type=Path)
     parser.add_argument("--mmsu", action="store_true")
     parser.add_argument("--conditioning-provenance", action="store_true")
+    parser.add_argument("--thinker-input-references", type=Path, nargs=2, default=[])
     parser.add_argument("--selected-samples", nargs="+", default=list(SELECTED_SAMPLES))
     parser.add_argument("--client-concurrency", type=int, default=32)
     parser.add_argument("--layer-frames", type=int, nargs="+", default=[])
@@ -391,6 +405,7 @@ if __name__ == "__main__":
         arguments.conditioning_mode,
         arguments.prefix_references,
         arguments.conditioning_provenance,
+        arguments.thinker_input_references,
     )
 else:
     pass
