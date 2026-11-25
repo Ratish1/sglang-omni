@@ -75,6 +75,24 @@ def audit(root: Path, native: Path) -> list[PromptResult]:
             == sha256((reference / "conditioning.json").read_bytes()).hexdigest()
         )
         frames = validate(directory / "captures" / sample_id)
+        expected_mode = (
+            "hold_prompt_verify_opening"
+            if arm in ("stock-prompt-first", "candidate-prompt-second")
+            else "hold_prompt"
+        )
+        assert receipt["conditioning_mode"] == expected_mode
+        for actual_name, expected in (
+            ("stored_keys", fixture["prefill_keys"]),
+            ("stored_values", fixture["prefill_values"]),
+            ("codec_ids", fixture["codec_ids"][0]),
+            ("feedback", fixture["first_feedback"]),
+        ):
+            matches = torch.equal(frames[0][actual_name], expected)
+            assert receipt["opening_matches"][actual_name] == matches
+            if expected_mode == "hold_prompt_verify_opening":
+                assert matches
+            else:
+                pass
         metadata = json.loads(
             (directory / "captures" / sample_id / "trajectory.json").read_text()
         )
