@@ -25,7 +25,7 @@ class EncoderLaunch:
 
 
 @torch.inference_mode()
-def main(root: Path, checkpoint: Path, sample_id: str) -> None:
+def main(root: Path, checkpoint: Path, sample_id: str, boundary_carry: bool) -> None:
     torch.set_num_threads(1)
     encoder = Qwen3OmniAudioEncoder(
         str(checkpoint),
@@ -103,6 +103,75 @@ def main(root: Path, checkpoint: Path, sample_id: str) -> None:
         assert launches.keys() == operators.keys()
         assert all(count == int(chunk_counts.sum()) for count in offsets.values())
         captured[arm] = launches
+
+    if boundary_carry:
+        sources = [
+            root / arm / "captures" / "provenance" / sample_id
+            for arm in ("first", "second")
+        ]
+        snapshots = [
+            torch.load(
+                source / "audio-encoder.pt", map_location="cpu", weights_only=True
+            )
+            for source in sources
+        ]
+        metadata = [
+            json.loads((source / "audio-encoder.json").read_text())
+            for source in sources
+        ]
+        target_slices = [
+            slice(record["token_start"], record["token_end"]) for record in metadata
+        ]
+        reports = {}
+        for name in ("conv2d2", "conv_out"):
+            recipient, donor = (captured[arm][name] for arm in ("first", "second"))
+            calls = 0
+
+            def carry(
+                module: nn.Module, inputs: tuple[torch.Tensor], output: torch.Tensor
+            ) -> torch.Tensor:
+                nonlocal calls
+                assert module is operators[name]
+                assert torch.equal(inputs[0], recipient.inputs)
+                assert torch.equal(output, recipient.outputs)
+                calls += 1
+                substituted = output.clone()
+                substituted[recipient.selected_chunks].copy_(
+                    donor.outputs[donor.selected_chunks]
+                )
+                return substituted
+
+            hook = operators[name].register_forward_hook(carry)
+            try:
+                result = encoder(
+                    input_features=snapshots[0]["input_features"],
+                    feature_attention_mask=snapshots[0]["feature_attention_mask"],
+                    audio_feature_lengths=snapshots[0]["audio_feature_lengths"],
+                )["audio_embeds"].cpu()
+            finally:
+                hook.remove()
+            assert calls == 1
+            peers = torch.ones(result.shape[0], dtype=torch.bool)
+            peers[target_slices[0]] = False
+            assert torch.equal(result[peers], snapshots[0]["audio_embeds"][peers])
+            reports[name] = {
+                "peer_outputs_unchanged": True,
+                "versus_recipient": difference(
+                    result[target_slices[0]],
+                    snapshots[0]["audio_embeds"][target_slices[0]],
+                ),
+                "versus_donor": difference(
+                    result[target_slices[0]],
+                    snapshots[1]["audio_embeds"][target_slices[1]],
+                ),
+            }
+        with (root / "encoder-boundary-carry.json").open("x") as output:
+            json.dump(reports, output, indent=2)
+            output.write("\n")
+        print(json.dumps(reports, indent=2))
+        return
+    else:
+        pass
 
     reports = {}
     for name, module in operators.items():
@@ -216,7 +285,13 @@ if __name__ == "__main__":
     parser.add_argument("root", type=Path)
     parser.add_argument("checkpoint", type=Path)
     parser.add_argument("sample_id")
+    parser.add_argument("--boundary-carry", action="store_true")
     arguments = parser.parse_args()
-    main(arguments.root, arguments.checkpoint, arguments.sample_id)
+    main(
+        arguments.root,
+        arguments.checkpoint,
+        arguments.sample_id,
+        arguments.boundary_carry,
+    )
 else:
     pass
