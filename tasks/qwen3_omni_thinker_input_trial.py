@@ -11,7 +11,7 @@ from compare_qwen3_omni_native_trajectories import difference
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.runtime_context import get_parallel
 
 from sglang_omni.model_runner.model_worker import ModelWorker
@@ -76,10 +76,7 @@ class ThinkerInputTrial:
         schedule_batch: ScheduleBatch,
     ) -> GenerationBatchResult:
         assert not self.applied
-        assert (
-            forward_batch.forward_mode.is_extend()
-            and not forward_batch.forward_mode.is_mixed()
-        )
+        assert forward_batch.forward_mode in (ForwardMode.EXTEND, ForwardMode.MIXED)
         assert (
             forward_batch.spec_info is None and forward_batch.spec_algorithm.is_none()
         )
@@ -307,6 +304,7 @@ class ThinkerInputTrial:
             json.dump(
                 {
                     "request_id": self.request_id,
+                    "forward_mode": forward_batch.forward_mode.name,
                     "request_ids": request_ids,
                     "prefix_lengths": list(prefix_lengths),
                     "extend_lengths": list(extend_lengths),
