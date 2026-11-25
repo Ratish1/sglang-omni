@@ -1,9 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Hold captured future text fixed after the native Thinker has completed."""
+"""Hold captured conditioning after the native Thinker has completed."""
 
 import json
 from hashlib import sha256
 from pathlib import Path
+from typing import Literal
 
 import torch
 
@@ -11,10 +12,17 @@ from sglang_omni.scheduling.pending_text_queue import PendingTextTensorQueue
 from sglang_omni.scheduling.sglang_backend.request_data import SGLangARRequestData
 
 RESERVED_CODEC_TOKENS = 1024
+ConditioningMode = Literal["verify", "hold_prompt", "hold_prompt_verify_opening"]
 
 
 class NativeConditioningTrial:
-    def __init__(self, reference: Path, destination: Path) -> None:
+    def __init__(
+        self,
+        reference: Path,
+        destination: Path,
+        mode: ConditioningMode = "verify",
+    ) -> None:
+        self.mode = mode
         self.request_id = f"feedback-trace-native-{reference.name}"
         self.destination = destination
         self.conditioning: dict[str, torch.Tensor] = torch.load(
@@ -39,11 +47,13 @@ class NativeConditioningTrial:
             self.conditioning["text_embeddings"]
         )
         self.applied = False
-        self.opening_verified = False
+        self.opening_recorded = False
+        self.opening_matches: dict[str, bool] = {}
         self.checks: dict[str, bool] = {}
         self.outcomes: dict[str, int | bool] = {}
         self.provenance: dict[str, str] = {
             "request_id": self.request_id,
+            "conditioning_mode": mode,
             "conditioning_sha256": sha256(
                 (reference / "conditioning.pt").read_bytes()
             ).hexdigest(),
@@ -51,13 +61,18 @@ class NativeConditioningTrial:
                 (reference / "conditioning.json").read_bytes()
             ).hexdigest(),
             "original_capture_sha256": receipt["capture_sha256"],
-            "scope": "Future text replacement only; opening state must match. Score against original captured text, not the live returned answer. No performance qualification.",
+            "scope": "Verify mode changes future text only and requires the native opening. Hold-prompt modes also replace the selected projected prompt, with opening equality required only by hold_prompt_verify_opening. Score against captured text. No performance qualification.",
         }
 
     def record_checks(self, snapshot: dict[str, torch.Tensor]) -> None:
         self.destination.write_text(
             json.dumps(
-                {**self.provenance, "checks": self.checks, "outcomes": self.outcomes},
+                {
+                    **self.provenance,
+                    "checks": self.checks,
+                    "opening_matches": self.opening_matches,
+                    "outcomes": self.outcomes,
+                },
                 indent=2,
             )
             + "\n"
@@ -71,12 +86,25 @@ class NativeConditioningTrial:
             )
 
     def before_prefill(
-        self, request: SGLangARRequestData, snapshot: dict[str, torch.Tensor]
+        self,
+        request: SGLangARRequestData,
+        snapshot: dict[str, torch.Tensor],
+        prefill_embeddings: torch.Tensor,
     ) -> None:
         assert not self.applied
         assert request.thinker_chunks_done
         assert not request.req.output_ids and not request.pending_feedback_queue
         assert request.tts_pad_embed is not None and request.tts_eos_embed is not None
+        if self.mode != "verify":
+            assert request.input_embeds_are_projected
+            expected_prompt = self.conditioning["prefill_embeddings"]
+            assert prefill_embeddings.shape == expected_prompt.shape
+            assert prefill_embeddings.dtype == expected_prompt.dtype
+            snapshot["original_prefill_embeddings"] = snapshot["prefill_embeddings"]
+            prefill_embeddings.copy_(expected_prompt)
+            snapshot["prefill_embeddings"] = prefill_embeddings.detach().clone()
+        else:
+            pass
         sampling = request.req.sampling_params
         actual_policy = {
             "seed": sampling.sampling_seed,
@@ -128,7 +156,7 @@ class NativeConditioningTrial:
         self.applied = True
 
     def after_prefill(self, snapshot: dict[str, torch.Tensor]) -> None:
-        assert self.applied and not self.opening_verified
+        assert self.applied and not self.opening_recorded
         for name, expected in (
             ("stored_keys", self.conditioning["prefill_keys"]),
             ("stored_values", self.conditioning["prefill_values"]),
@@ -136,14 +164,18 @@ class NativeConditioningTrial:
             ("feedback", self.conditioning["first_feedback"]),
         ):
             actual = snapshot[name].cpu()
-            self.checks[f"opening_{name}"] = (
-                actual.dtype == expected.dtype and torch.equal(actual, expected)
+            self.opening_matches[name] = actual.dtype == expected.dtype and torch.equal(
+                actual, expected
             )
+            if self.mode == "hold_prompt":
+                pass
+            else:
+                self.checks[f"opening_{name}"] = self.opening_matches[name]
         self.record_checks(snapshot)
-        self.opening_verified = True
+        self.opening_recorded = True
 
     def finish(self, snapshots: list[dict[str, torch.Tensor]]) -> None:
-        assert self.applied and self.opening_verified
+        assert self.applied and self.opening_recorded
         text_embeddings = self.conditioning["text_embeddings"]
         self.outcomes = {
             "emitted_frames": len(snapshots),

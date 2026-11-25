@@ -11,7 +11,10 @@ from qwen3_omni_native_attention_trial import (
     compare_attention_schedules,
 )
 from qwen3_omni_native_code_trial import NativeCodeTrial
-from qwen3_omni_native_conditioning_trial import NativeConditioningTrial
+from qwen3_omni_native_conditioning_trial import (
+    ConditioningMode,
+    NativeConditioningTrial,
+)
 from qwen3_omni_native_continuation_trial import NativeContinuationTrial
 from sglang.srt.layers.attention.flashattention_backend import FlashAttentionBackend
 from sglang.srt.managers.scheduler import GenerationBatchResult
@@ -120,6 +123,14 @@ class NativeTalkerTrajectory:
         conditioning_references = json.loads(
             environ.get("OMNI_NATIVE_CONDITIONING_REFERENCES", "[]")
         )
+        conditioning_mode: ConditioningMode = environ.get(
+            "OMNI_NATIVE_CONDITIONING_MODE", "verify"
+        )
+        assert conditioning_mode in (
+            "verify",
+            "hold_prompt",
+            "hold_prompt_verify_opening",
+        )
         self.conditioning_trials: dict[str, NativeConditioningTrial] = {}
         if conditioning_references:
             assert self.code_trial is None and not self.cache_trials
@@ -129,7 +140,9 @@ class NativeTalkerTrajectory:
             for reference in conditioning_references:
                 directory = Path(reference)
                 trial = NativeConditioningTrial(
-                    directory, self.directory / f"{directory.name}-conditioning.json"
+                    directory,
+                    self.directory / f"{directory.name}-conditioning.json",
+                    conditioning_mode,
                 )
                 assert trial.request_id in self.request_ids
                 assert trial.request_id not in self.conditioning_trials
@@ -291,7 +304,10 @@ class NativeTalkerTrajectory:
                     if request.request_id in self.conditioning_trials:
                         assert request_metadata["prefix_length"] == 0
                         self.conditioning_trials[request.request_id].before_prefill(
-                            request.data, snapshot
+                            request.data, snapshot, prefill_embeddings[token_slice]
+                        )
+                        request_metadata["conditioning_mode"] = (
+                            self.conditioning_trials[request.request_id].mode
                         )
                     else:
                         pass

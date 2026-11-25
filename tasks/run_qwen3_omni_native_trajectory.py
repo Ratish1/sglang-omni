@@ -16,6 +16,7 @@ from qwen3_omni_corpus_support import (
     SERVER_TIMEOUT_SECONDS,
     server_command,
 )
+from qwen3_omni_native_conditioning_trial import ConditioningMode
 
 from benchmarks.benchmarker.utils import start_server_from_cmd, stop_server
 from benchmarks.dataset.mmsu import MmsuSample, load_mmsu_samples
@@ -79,6 +80,7 @@ def main(
     conditioning_reference: list[Path],
     qk_trial: str | None,
     qk_restore_query: list[str],
+    conditioning_mode: ConditioningMode,
 ) -> None:
     assert all(frame > 0 for frame in layer_frames)
     assert (code_trial_reference is None) == (not code_trial_choice)
@@ -112,7 +114,7 @@ def main(
         assert code_trial_reference is None and not cache_trial_reference
         assert continuation_reference is None and not attention_trial_sequences
     else:
-        pass
+        assert conditioning_mode == "verify"
     if qk_trial is not None:
         assert conditioning_reference and layer_frames
     else:
@@ -181,6 +183,7 @@ def main(
             "OMNI_NATIVE_CONDITIONING_REFERENCES": json.dumps(
                 [str(reference) for reference in conditioning_reference]
             ),
+            "OMNI_NATIVE_CONDITIONING_MODE": conditioning_mode,
             "OMNI_NATIVE_ATTENTION_TRIAL_SEQUENCES": ",".join(
                 str(value) for value in attention_trial_sequences
             ),
@@ -317,6 +320,11 @@ if __name__ == "__main__":
     parser.add_argument("--layer-frames", type=int, nargs="+", default=[])
     parser.add_argument("--conditioning-reference", type=Path, nargs="+", default=[])
     parser.add_argument(
+        "--conditioning-mode",
+        choices=("verify", "hold_prompt", "hold_prompt_verify_opening"),
+        default="verify",
+    )
+    parser.add_argument(
         "--qk-trial", choices=("control", "checkpoint", "fused_checkpoint")
     )
     parser.add_argument(
@@ -352,6 +360,7 @@ if __name__ == "__main__":
         arguments.conditioning_reference,
         arguments.qk_trial,
         arguments.qk_restore_query,
+        arguments.conditioning_mode,
     )
 else:
     pass
