@@ -135,9 +135,11 @@ class NativeTalkerTrajectory:
         self.conditioning_trials: dict[str, NativeConditioningTrial] = {}
         if conditioning_references:
             assert self.code_trial is None and not self.cache_trials
-            assert (
-                self.continuation_trial is None and not self.attention_trial_sequences
-            )
+            assert not self.attention_trial_sequences
+            if self.continuation_trial is not None:
+                assert conditioning_mode == "hold_prompt_verify_opening"
+            else:
+                pass
             for reference in conditioning_references:
                 directory = Path(reference)
                 trial = NativeConditioningTrial(
@@ -158,6 +160,7 @@ class NativeTalkerTrajectory:
         if prefix_references:
             assert len(prefix_references) == 2 and len(self.conditioning_trials) == 1
             assert conditioning_mode == "hold_prompt_verify_opening"
+            assert self.continuation_trial is None
             self.prefix_trial = NativePrefixTrial(
                 Path(prefix_references[0]),
                 Path(prefix_references[1]),

@@ -112,6 +112,7 @@ def main(
         assert len(selected_samples) == 1
         assert code_trial_reference is None and not cache_trial_reference
         assert not attention_trial_sequences
+        assert qk_trial is None and not prefix_references
     else:
         assert continuation_target is None and not continuation_sequences
     if conditioning_reference:
@@ -120,7 +121,11 @@ def main(
         )
         assert len(conditioning_reference) == len(selected_samples)
         assert code_trial_reference is None and not cache_trial_reference
-        assert continuation_reference is None and not attention_trial_sequences
+        assert not attention_trial_sequences
+        if continuation_reference is not None:
+            assert conditioning_mode == "hold_prompt_verify_opening"
+        else:
+            pass
     else:
         assert conditioning_mode == "verify"
     if qk_trial is not None:
