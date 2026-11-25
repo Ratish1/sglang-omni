@@ -22,6 +22,9 @@ from sglang_omni.models.qwen3_omni.components.audio_layer_graph import (
     packed_attention_forward,
     stack_qkv_projection,
 )
+from sglang_omni.models.qwen3_omni.components.audio_request_frontend import (
+    encode_request_frontends,
+)
 from sglang_omni.models.qwen3_omni.components.common import load_thinker_config
 from sglang_omni.models.qwen3_omni.components.packed_attention import (
     PackedAttention,
@@ -273,6 +276,7 @@ class Qwen3OmniAudioEncoder(nn.Module):
         input_features: torch.Tensor,
         feature_attention_mask: torch.Tensor | None = None,
         audio_feature_lengths: torch.Tensor | None = None,
+        request_clip_counts: list[int] | None = None,
     ) -> dict[str, torch.Tensor]:
         if feature_attention_mask is not None:
             audio_feature_lengths = torch.sum(feature_attention_mask, dim=1)
@@ -291,6 +295,11 @@ class Qwen3OmniAudioEncoder(nn.Module):
             pass
 
         lengths_cpu = audio_feature_lengths.to("cpu", dtype=torch.long)
+        if request_clip_counts is not None:
+            assert sum(request_clip_counts) == lengths_cpu.numel()
+            assert all(count > 0 for count in request_clip_counts)
+        else:
+            pass
         audio_feature_lengths = lengths_cpu.to(self.device, non_blocking=True)
         input_features = input_features.to(
             device=self.device, dtype=self.audio_tower.dtype
@@ -318,19 +327,36 @@ class Qwen3OmniAudioEncoder(nn.Module):
             else None
         )
         try:
-            outputs = tower(
-                input_features,
-                feature_lens=audio_feature_lengths,
-                padded_feature=padded_feature,
-                chunk_lengths=chunk_lengths,
-                valid_indices=valid_indices,
-                cu_seqlens=cu_seqlens,
-                max_seqlen=max_sequence_length,
-            )
+            if request_clip_counts is None or len(request_clip_counts) == 1:
+                outputs = tower(
+                    input_features,
+                    feature_lens=audio_feature_lengths,
+                    padded_feature=padded_feature,
+                    chunk_lengths=chunk_lengths,
+                    valid_indices=valid_indices,
+                    cu_seqlens=cu_seqlens,
+                    max_seqlen=max_sequence_length,
+                )
+                audio_embeds = outputs.last_hidden_state
+            else:
+                hidden_states = encode_request_frontends(
+                    tower,
+                    padded_feature,
+                    lengths_cpu,
+                    request_clip_counts,
+                    valid_indices,
+                    int(self.downsample_lengths(chunk_lengths, tower.n_window).max()),
+                )
+                for layer in tower.layers:
+                    hidden_states = layer(
+                        hidden_states, cu_seqlens, max_seqlen=max_sequence_length
+                    )[0]
+                audio_embeds = tower.proj2(
+                    tower.act(tower.proj1(tower.ln_post(hidden_states)))
+                )
         finally:
             self.segment_splits.value = None
             self.segment_splits.attention_metadata = None
-        audio_embeds = outputs.last_hidden_state
         audio_output_lengths = self.downsample_lengths(
             audio_feature_lengths, tower.n_window
         )

@@ -948,6 +948,7 @@ def batch_audio_encoder_payloads(
             input_features=batched_features,
             feature_attention_mask=batched_mask,
             audio_feature_lengths=batched_lengths,
+            request_clip_counts=[item["count"] for item in normalized],
         )
 
     output_lengths = combined["audio_output_lengths"]
