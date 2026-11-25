@@ -42,6 +42,7 @@ def main(arguments: argparse.Namespace) -> None:
     trials = model.native_qk_trial.layers
     comparisons: list[dict[str, int]] = []
     kernel_comparisons: list[dict[str, int | float | str]] = []
+    checkpoint_recorded_comparisons = 0
     for frame_index, (frame, state) in enumerate(
         zip(frames, metadata["frames"], strict=True)
     ):
@@ -79,9 +80,10 @@ def main(arguments: argparse.Namespace) -> None:
                 dim=-1,
             )[:2]
             expected: list[torch.Tensor] = []
-            for operand_name, raw, normalization in zip(
+            for operand_name, raw, recorded, normalization in zip(
                 ("query", "key"),
                 raw_operands,
+                (query, key),
                 (layer.self_attn.q_norm, layer.self_attn.k_norm),
                 strict=True,
             ):
@@ -94,6 +96,11 @@ def main(arguments: argparse.Namespace) -> None:
                     .reshape_as(raw)
                     .clone()
                 )
+                if state.get("qk_trial") == "checkpoint":
+                    assert torch.equal(recorded[row], expected[-1][row])
+                    checkpoint_recorded_comparisons += 1
+                else:
+                    pass
                 kernel_input = raw.reshape(-1, layer.self_attn.head_dim).contiguous()
                 kernel_output = rmsnorm_hf(
                     kernel_input, normalization.weight, normalization.variance_epsilon
@@ -164,6 +171,7 @@ def main(arguments: argparse.Namespace) -> None:
         ).hexdigest(),
         "verified_weights": len(verified_weights),
         "checked_layer_frames": len(comparisons),
+        "checkpoint_recorded_comparisons": checkpoint_recorded_comparisons,
         "distinct_rotary_modules": len(
             {id(layer.self_attn.rotary_emb) for layer in model.model.layers}
         ),
