@@ -300,7 +300,9 @@ if __name__ == "__main__":
     parser.add_argument("--client-concurrency", type=int, default=32)
     parser.add_argument("--layer-frames", type=int, nargs="+", default=[])
     parser.add_argument("--conditioning-reference", type=Path, nargs="+", default=[])
-    parser.add_argument("--qk-trial", choices=("control", "checkpoint"))
+    parser.add_argument(
+        "--qk-trial", choices=("control", "checkpoint", "fused_checkpoint")
+    )
     parser.add_argument("--attention-trial-sequences", type=int, nargs="*", default=[])
     parser.add_argument("--attention-trial-splits", type=int, choices=(0, 1), default=0)
     parser.add_argument("--code-trial-reference", type=Path)

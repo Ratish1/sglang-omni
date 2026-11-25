@@ -843,10 +843,10 @@ class Qwen3OmniTalker(nn.Module):
         normalization_mode = environ.get("OMNI_NATIVE_QK_TRIAL")
         self.native_qk_trial: NativeQkTrial | None = None
         if normalization_mode:
-            assert normalization_mode in ("control", "checkpoint")
+            assert normalization_mode in ("control", "checkpoint", "fused_checkpoint")
             assert environ.get("OMNI_NATIVE_CONDITIONING_REFERENCES")
             self.native_qk_trial = NativeQkTrial(
-                "control" if normalization_mode == "control" else "checkpoint",
+                normalization_mode,
                 {
                     f"feedback-trace-native-{sample_id}"
                     for sample_id in environ["OMNI_NATIVE_TRAJECTORY_SAMPLES"].split(

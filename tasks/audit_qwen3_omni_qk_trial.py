@@ -24,7 +24,7 @@ def main(arguments: argparse.Namespace) -> None:
     environ["OMNI_NATIVE_TRAJECTORY_SAMPLES"] = arguments.capture.name
     assert not environ.get("OMNI_NATIVE_QK_TRIAL")
     assert arguments.conditioning.name == arguments.capture.name
-    environ["OMNI_NATIVE_QK_TRIAL"] = "control"
+    environ["OMNI_NATIVE_QK_TRIAL"] = arguments.qk_trial
     environ["OMNI_NATIVE_CONDITIONING_REFERENCES"] = json.dumps(
         [str(arguments.conditioning)]
     )
@@ -43,6 +43,7 @@ def main(arguments: argparse.Namespace) -> None:
     comparisons: list[dict[str, int]] = []
     kernel_comparisons: list[dict[str, int | float | str]] = []
     checkpoint_recorded_comparisons = 0
+    fused_recorded_comparisons = 0
     for frame_index, (frame, state) in enumerate(
         zip(frames, metadata["frames"], strict=True)
     ):
@@ -115,6 +116,11 @@ def main(arguments: argparse.Namespace) -> None:
                 kernel_graph.replay()
                 assert torch.equal(captured_kernel_output, kernel_output)
                 kernel_output = kernel_output.reshape_as(raw)
+                if state.get("qk_trial") == "fused_checkpoint":
+                    assert torch.equal(recorded[row], kernel_output[row])
+                    fused_recorded_comparisons += 1
+                else:
+                    pass
                 selected_kernel_output = rmsnorm_hf(
                     raw[row].reshape(-1, layer.self_attn.head_dim).contiguous(),
                     normalization.weight,
@@ -143,6 +149,10 @@ def main(arguments: argparse.Namespace) -> None:
                         ),
                     }
                 )
+                if arguments.qk_trial == "fused_checkpoint":
+                    expected[-1] = kernel_output
+                else:
+                    pass
             # note (ratish): moving the mask tests a graph buffer, not a capture-time Python choice.
             for selected_row in (row, (row + 1) % len(state["request_ids"]), row):
                 selected_rows.zero_()
@@ -172,17 +182,19 @@ def main(arguments: argparse.Namespace) -> None:
         "verified_weights": len(verified_weights),
         "checked_layer_frames": len(comparisons),
         "checkpoint_recorded_comparisons": checkpoint_recorded_comparisons,
+        "fused_recorded_comparisons": fused_recorded_comparisons,
+        "qk_trial": arguments.qk_trial,
         "distinct_rotary_modules": len(
             {id(layer.self_attn.rotary_emb) for layer in model.model.layers}
         ),
         "checks": {
             "control_exact": True,
-            "checkpoint_selected_row_exact": True,
+            "selected_implementation_exact": True,
             "unselected_rows_unchanged": True,
             "graph_mask_moves_and_resets": True,
             "operands_unchanged": True,
             "inactive_after_attention_returns": True,
-            "native_factory_control_graph_capture": True,
+            "native_factory_graph_capture": True,
             "hf_kernel_graph_matches_eager": True,
             "hf_kernel_selected_row_matches_batched": True,
         },
@@ -211,6 +223,9 @@ if __name__ == "__main__":
     parser.add_argument("output", type=Path)
     parser.add_argument("--gpu", type=int, required=True)
     parser.add_argument("--conditioning", type=Path, required=True)
+    parser.add_argument(
+        "--qk-trial", choices=("control", "fused_checkpoint"), default="control"
+    )
     main(parser.parse_args())
 else:
     pass
