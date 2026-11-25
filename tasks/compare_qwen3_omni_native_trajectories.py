@@ -112,10 +112,15 @@ def validate(directory: Path) -> list[dict[str, torch.Tensor]]:
                 else:
                     pass
                 for field in ("keys", "values"):
+                    opening_prefix = frames[0].get(
+                        f"decode_prefix_{field}", frames[0][f"stored_{field}"]
+                    )
+                    assert opening_prefix.shape == frames[0][f"stored_{field}"].shape
                     expected_prefix = torch.cat(
-                        [
+                        [opening_prefix[0]]
+                        + [
                             previous[f"stored_{field}"][0]
-                            for previous in frames[: frame_index + 1]
+                            for previous in frames[1 : frame_index + 1]
                         ]
                     )
                     assert torch.equal(

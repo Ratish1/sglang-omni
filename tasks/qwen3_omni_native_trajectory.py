@@ -16,6 +16,7 @@ from qwen3_omni_native_conditioning_trial import (
     NativeConditioningTrial,
 )
 from qwen3_omni_native_continuation_trial import NativeContinuationTrial
+from qwen3_omni_native_prefix_trial import NativePrefixTrial
 from sglang.srt.layers.attention.flashattention_backend import FlashAttentionBackend
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
@@ -150,6 +151,21 @@ class NativeTalkerTrajectory:
             assert self.request_ids == set(self.conditioning_trials)
         else:
             pass
+        self.prefix_trial: NativePrefixTrial | None = None
+        prefix_references = json.loads(
+            environ.get("OMNI_NATIVE_PREFIX_REFERENCES", "[]")
+        )
+        if prefix_references:
+            assert len(prefix_references) == 2 and len(self.conditioning_trials) == 1
+            assert conditioning_mode == "hold_prompt_verify_opening"
+            self.prefix_trial = NativePrefixTrial(
+                Path(prefix_references[0]),
+                Path(prefix_references[1]),
+                self.directory / "prefix-trial.json",
+            )
+            assert self.request_ids == {self.prefix_trial.request_id}
+        else:
+            pass
         assert self.directory.is_dir()
 
     def paired_attention_forward(
@@ -158,6 +174,20 @@ class NativeTalkerTrajectory:
         forward_batch: ForwardBatch,
         requests: list[SchedulerRequest],
     ) -> GenerationBatchResult | None:
+        if self.prefix_trial is not None and not self.prefix_trial.applied:
+            for row, request in enumerate(requests):
+                if request.request_id == self.prefix_trial.request_id:
+                    return self.prefix_trial.forward(
+                        worker,
+                        forward_batch,
+                        requests,
+                        row,
+                        self.tensors[request.request_id],
+                    )
+                else:
+                    pass
+        else:
+            pass
         if self.code_trial is not None and not self.code_trial.applied:
             for row, request in enumerate(requests):
                 if (
@@ -516,6 +546,12 @@ class NativeTalkerTrajectory:
             pass
         if self.code_trial is not None and request_id == self.code_trial.request_id:
             assert self.code_trial.applied
+        else:
+            pass
+        if self.prefix_trial is not None:
+            assert (
+                request_id == self.prefix_trial.request_id and self.prefix_trial.applied
+            )
         else:
             pass
         for trial in self.cache_trials.values():

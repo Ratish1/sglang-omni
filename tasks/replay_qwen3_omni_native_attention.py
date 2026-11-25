@@ -66,8 +66,16 @@ def audit_layers(root: Path, fp64_reference: bool) -> None:
     for capture in captures:
         frames = validate(capture.parent)
         steps = json.loads(capture.with_suffix(".json").read_text())["frames"]
-        keys = torch.cat([frame["stored_keys"] for frame in frames], dim=1).cuda()
-        values = torch.cat([frame["stored_values"] for frame in frames], dim=1).cuda()
+        prefixes = {
+            field: torch.cat(
+                [frames[0].get(f"decode_prefix_{field}", frames[0][f"stored_{field}"])]
+                + [frame[f"stored_{field}"] for frame in frames[1:]],
+                dim=1,
+            )
+            for field in ("keys", "values")
+        }
+        keys = prefixes["keys"].cuda()
+        values = prefixes["values"].cuda()
         prefill_tokens = frames[0]["stored_keys"].shape[1]
         assert keys.shape == values.shape
         assert keys.shape[1] == prefill_tokens + len(frames) - 1
@@ -137,10 +145,8 @@ def audit_layers(root: Path, fp64_reference: bool) -> None:
                     )
                 else:
                     pass
-        for field, actual in (("stored_keys", keys), ("stored_values", values)):
-            assert torch.equal(
-                actual.cpu(), torch.cat([frame[field] for frame in frames], dim=1)
-            )
+        for field, actual in (("keys", keys), ("values", values)):
+            assert torch.equal(actual.cpu(), prefixes[field])
         assert all(checked_by_layer)
         report[capture.parent.name] = {
             "capture_sha256": sha256(capture.read_bytes()).hexdigest(),

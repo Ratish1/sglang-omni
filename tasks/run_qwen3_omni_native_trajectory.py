@@ -81,6 +81,7 @@ def main(
     qk_trial: str | None,
     qk_restore_query: list[str],
     conditioning_mode: ConditioningMode,
+    prefix_references: list[Path],
 ) -> None:
     assert all(frame > 0 for frame in layer_frames)
     assert (code_trial_reference is None) == (not code_trial_choice)
@@ -124,6 +125,14 @@ def main(
         sample_id, frame_index, layer_index = qk_restore_query
         assert sample_id in selected_samples
         assert int(frame_index) in layer_frames and int(layer_index) >= 0
+    else:
+        pass
+    if prefix_references:
+        assert len(prefix_references) == 2 and len(selected_samples) == 1
+        assert (
+            conditioning_reference and conditioning_mode == "hold_prompt_verify_opening"
+        )
+        assert qk_trial is None
     else:
         pass
     output.mkdir()
@@ -184,6 +193,9 @@ def main(
                 [str(reference) for reference in conditioning_reference]
             ),
             "OMNI_NATIVE_CONDITIONING_MODE": conditioning_mode,
+            "OMNI_NATIVE_PREFIX_REFERENCES": json.dumps(
+                [str(path) for path in prefix_references]
+            ),
             "OMNI_NATIVE_ATTENTION_TRIAL_SEQUENCES": ",".join(
                 str(value) for value in attention_trial_sequences
             ),
@@ -305,6 +317,10 @@ def main(
         assert selection["layer_index"] == int(qk_restore_query[2])
     else:
         pass
+    if prefix_references:
+        assert (captures / "prefix-trial.json").is_file()
+    else:
+        pass
     print(json.dumps({"seedtts_samples": len(samples), "captures": selected_samples}))
 
 
@@ -319,6 +335,13 @@ if __name__ == "__main__":
     parser.add_argument("--client-concurrency", type=int, default=32)
     parser.add_argument("--layer-frames", type=int, nargs="+", default=[])
     parser.add_argument("--conditioning-reference", type=Path, nargs="+", default=[])
+    parser.add_argument(
+        "--prefix-references",
+        type=Path,
+        nargs=2,
+        default=[],
+        metavar=("CONTROL", "DONOR"),
+    )
     parser.add_argument(
         "--conditioning-mode",
         choices=("verify", "hold_prompt", "hold_prompt_verify_opening"),
@@ -361,6 +384,7 @@ if __name__ == "__main__":
         arguments.qk_trial,
         arguments.qk_restore_query,
         arguments.conditioning_mode,
+        arguments.prefix_references,
     )
 else:
     pass
