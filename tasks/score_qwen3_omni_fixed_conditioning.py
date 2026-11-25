@@ -37,6 +37,7 @@ class ConditioningComparison:
     peer_changed_frames: dict[str, list[int]]
     first_differences: dict[str, int]
     divergence_metadata: list[dict[str, str | int | bool | list[str]]]
+    unpaired_deep_frames: dict[str, list[int]]
     waveform_source: Literal["native", "common_decoder"] = "native"
     rendered_clips: list[RenderedClip] = field(default_factory=list)
     waveform_hashes: dict[str, str] = field(default_factory=dict)
@@ -110,7 +111,26 @@ def compare_conditioning(
             pass
         changed_frames: dict[str, list[int]] = {}
         peer_changed_frames: dict[str, list[int]] = {}
+        unpaired_deep_frames: dict[str, list[int]] = {
+            "baseline": [],
+            "intervention": [],
+        }
         for frame_index, (original, forced) in enumerate(zip(*frames)):
+            captured_layers = [
+                record["frames"][frame_index].get("captured_layers")
+                for record in metadata
+            ]
+            paired_deep_frame = all(count is not None for count in captured_layers)
+            if paired_deep_frame:
+                assert captured_layers[0] == captured_layers[1]
+            else:
+                for arm, count in zip(
+                    unpaired_deep_frames, captured_layers, strict=True
+                ):
+                    if count is not None:
+                        unpaired_deep_frames[arm].append(frame_index)
+                    else:
+                        pass
             for name in (
                 "prefill_embeddings",
                 "input_ids",
@@ -130,7 +150,9 @@ def compare_conditioning(
                 *(
                     name
                     for name in original
-                    if name.startswith("layer") and "_peer_" not in name
+                    if name.startswith("layer")
+                    and "_peer_" not in name
+                    and (paired_deep_frame or name.startswith("layer0_"))
                 ),
             ):
                 if name in original:
@@ -146,6 +168,15 @@ def compare_conditioning(
                 if (
                     name.startswith("layer")
                     and "_peer_" in name
+                    and (
+                        paired_deep_frame
+                        or name
+                        in (
+                            "layer0_peer_mlp_normalized",
+                            "layer0_peer_expert_ids",
+                            "layer0_peer_expert_weights",
+                        )
+                    )
                     and not torch.equal(original[name], forced[name])
                 ):
                     peer_changed_frames.setdefault(name, []).append(frame_index)
@@ -188,6 +219,7 @@ def compare_conditioning(
                     if first_difference is not None
                     else []
                 ),
+                unpaired_deep_frames=unpaired_deep_frames,
             )
         )
     return comparisons
