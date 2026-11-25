@@ -3,6 +3,7 @@
 
 import argparse
 import json
+from dataclasses import asdict
 from hashlib import sha256
 from os import environ
 from pathlib import Path
@@ -25,6 +26,13 @@ def main(arguments: argparse.Namespace) -> None:
     assert not environ.get("OMNI_NATIVE_QK_TRIAL")
     assert arguments.conditioning.name == arguments.capture.name
     environ["OMNI_NATIVE_QK_TRIAL"] = arguments.qk_trial
+    if arguments.restore_query:
+        assert arguments.qk_trial == "fused_checkpoint"
+        environ["OMNI_NATIVE_QK_RESTORE_QUERY"] = ",".join(
+            [arguments.capture.name, *(str(value) for value in arguments.restore_query)]
+        )
+    else:
+        assert not environ.get("OMNI_NATIVE_QK_RESTORE_QUERY")
     environ["OMNI_NATIVE_CONDITIONING_REFERENCES"] = json.dumps(
         [str(arguments.conditioning)]
     )
@@ -44,6 +52,7 @@ def main(arguments: argparse.Namespace) -> None:
     kernel_comparisons: list[dict[str, int | float | str]] = []
     checkpoint_recorded_comparisons = 0
     fused_recorded_comparisons = 0
+    query_restore_graph_checks = 0
     for frame_index, (frame, state) in enumerate(
         zip(frames, metadata["frames"], strict=True)
     ):
@@ -81,6 +90,7 @@ def main(arguments: argparse.Namespace) -> None:
                 dim=-1,
             )[:2]
             expected: list[torch.Tensor] = []
+            checkpoint_expected: list[torch.Tensor] = []
             for operand_name, raw, recorded, normalization in zip(
                 ("query", "key"),
                 raw_operands,
@@ -97,6 +107,7 @@ def main(arguments: argparse.Namespace) -> None:
                     .reshape_as(raw)
                     .clone()
                 )
+                checkpoint_expected.append(expected[-1])
                 if state.get("qk_trial") == "checkpoint":
                     assert torch.equal(recorded[row], expected[-1][row])
                     checkpoint_recorded_comparisons += 1
@@ -166,6 +177,37 @@ def main(arguments: argparse.Namespace) -> None:
                 selected_rows.zero_()
                 graph.replay()
                 assert torch.equal(result[1], query) and torch.equal(result[2], key)
+            if trial.restore_rows is not None:
+                for selected_row in (row, (row + 1) % len(state["request_ids"]), row):
+                    selected_rows.zero_()
+                    selected_rows[selected_row] = True
+                    trial.restore_rows.zero_()
+                    trial.restore_rows[selected_row] = True
+                    graph.replay()
+                    assert torch.equal(
+                        result[1][selected_row], checkpoint_expected[0][selected_row]
+                    )
+                    assert torch.equal(
+                        result[2][selected_row], expected[1][selected_row]
+                    )
+                    assert torch.equal(result[1][~mask], query[~mask])
+                    assert torch.equal(result[2][~mask], key[~mask])
+                    selected_rows.zero_()
+                    graph.replay()
+                    assert torch.equal(result[1], query) and torch.equal(result[2], key)
+                    selected_rows[selected_row] = True
+                    trial.restore_rows.zero_()
+                    graph.replay()
+                    assert torch.equal(
+                        result[1][selected_row], expected[0][selected_row]
+                    )
+                    assert torch.equal(
+                        result[2][selected_row], expected[1][selected_row]
+                    )
+                    selected_rows.zero_()
+                    query_restore_graph_checks += 1
+            else:
+                pass
             for actual, before in zip((projection, query, key), original, strict=True):
                 assert torch.equal(actual, before)
             trial.finish(layer.self_attn, (), frame[prefix + "attention_projection"])
@@ -175,6 +217,10 @@ def main(arguments: argparse.Namespace) -> None:
                 {"frame": frame_index, "layer": layer_index, "batch_rows": len(query)}
             )
     assert comparisons
+    if arguments.restore_query:
+        assert query_restore_graph_checks > 0
+    else:
+        assert query_restore_graph_checks == 0
     report = {
         "capture_sha256": sha256(
             (arguments.capture / "trajectory.pt").read_bytes()
@@ -184,6 +230,12 @@ def main(arguments: argparse.Namespace) -> None:
         "checkpoint_recorded_comparisons": checkpoint_recorded_comparisons,
         "fused_recorded_comparisons": fused_recorded_comparisons,
         "qk_trial": arguments.qk_trial,
+        "query_restore": (
+            asdict(model.native_qk_trial.restore)
+            if model.native_qk_trial.restore is not None
+            else None
+        ),
+        "query_restore_graph_checks": query_restore_graph_checks,
         "distinct_rotary_modules": len(
             {id(layer.self_attn.rotary_emb) for layer in model.model.layers}
         ),
@@ -226,6 +278,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--qk-trial", choices=("control", "fused_checkpoint"), default="control"
     )
+    parser.add_argument("--restore-query", type=int, nargs=2, default=[])
     main(parser.parse_args())
 else:
     pass

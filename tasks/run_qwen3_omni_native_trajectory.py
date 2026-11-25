@@ -78,6 +78,7 @@ def main(
     layer_frames: list[int],
     conditioning_reference: list[Path],
     qk_trial: str | None,
+    qk_restore_query: list[str],
 ) -> None:
     assert all(frame > 0 for frame in layer_frames)
     assert (code_trial_reference is None) == (not code_trial_choice)
@@ -114,6 +115,13 @@ def main(
         pass
     if qk_trial is not None:
         assert conditioning_reference and layer_frames
+    else:
+        pass
+    if qk_restore_query:
+        assert qk_trial == "fused_checkpoint"
+        sample_id, frame_index, layer_index = qk_restore_query
+        assert sample_id in selected_samples
+        assert int(frame_index) in layer_frames and int(layer_index) >= 0
     else:
         pass
     output.mkdir()
@@ -169,6 +177,7 @@ def main(
             "OMNI_NATIVE_TRAJECTORY_SAMPLES": ",".join(selected_samples),
             "OMNI_NATIVE_LAYER_FRAMES": ",".join(str(frame) for frame in layer_frames),
             "OMNI_NATIVE_QK_TRIAL": qk_trial or "",
+            "OMNI_NATIVE_QK_RESTORE_QUERY": ",".join(qk_restore_query),
             "OMNI_NATIVE_CONDITIONING_REFERENCES": json.dumps(
                 [str(reference) for reference in conditioning_reference]
             ),
@@ -286,6 +295,13 @@ def main(
         assert (captures / "continuation-trial.json").is_file()
     else:
         pass
+    if qk_restore_query:
+        selection = json.loads((captures / "query-restore-selection.json").read_text())
+        assert selection["request_id"] == f"feedback-trace-native-{qk_restore_query[0]}"
+        assert selection["frame_index"] == int(qk_restore_query[1])
+        assert selection["layer_index"] == int(qk_restore_query[2])
+    else:
+        pass
     print(json.dumps({"seedtts_samples": len(samples), "captures": selected_samples}))
 
 
@@ -302,6 +318,9 @@ if __name__ == "__main__":
     parser.add_argument("--conditioning-reference", type=Path, nargs="+", default=[])
     parser.add_argument(
         "--qk-trial", choices=("control", "checkpoint", "fused_checkpoint")
+    )
+    parser.add_argument(
+        "--qk-restore-query", nargs=3, default=[], metavar=("SAMPLE", "FRAME", "LAYER")
     )
     parser.add_argument("--attention-trial-sequences", type=int, nargs="*", default=[])
     parser.add_argument("--attention-trial-splits", type=int, choices=(0, 1), default=0)
@@ -332,6 +351,7 @@ if __name__ == "__main__":
         arguments.layer_frames,
         arguments.conditioning_reference,
         arguments.qk_trial,
+        arguments.qk_restore_query,
     )
 else:
     pass
