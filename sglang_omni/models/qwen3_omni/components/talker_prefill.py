@@ -13,6 +13,10 @@ from pathlib import Path
 from typing import TYPE_CHECKING, TypedDict
 
 import torch
+from qwen3_omni_conditioning_provenance import (
+    record_conditioning_boundary,
+    selected_conditioning_request,
+)
 from safetensors import safe_open
 from sglang.srt.utils.common import async_h2d
 
@@ -265,6 +269,29 @@ class TalkerPrefillBuilder:
             im_end_token_id=self.im_end_token_id,
         )
 
+        if selected_conditioning_request(payload.request_id):
+            assert isinstance(captured_positions, list) and captured_positions
+            record_conditioning_boundary(
+                payload.request_id,
+                "talker-prompt",
+                {
+                    "prompt_ids": prompt_ids,
+                    "prompt_embed": prompt_embed,
+                    "prompt_hidden": prompt_hidden,
+                    "multimodal_mask": multimodal_mask,
+                    "assistant_token_ids": assistant_token_ids,
+                    "input_embeds": prefill["input_embeds"],
+                    "input_ids": prefill["input_ids"],
+                    "future_text_rows": prefill["future_text_rows"],
+                },
+                {
+                    "thinker_done": thinker_done,
+                    "speaker_id": speaker_id,
+                    "captured_positions": captured_positions,
+                },
+            )
+        else:
+            pass
         return {
             "input_embeds": prefill["input_embeds"],
             "input_ids": prefill["input_ids"],

@@ -16,6 +16,10 @@ from typing import TYPE_CHECKING, Literal, TypedDict
 
 import torch
 import torch.nn.functional as F
+from qwen3_omni_conditioning_provenance import (
+    record_conditioning_boundary,
+    selected_conditioning_request,
+)
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from transformers import AutoConfig
@@ -273,6 +277,30 @@ def run_single_encoder_payload(
         if result is None:
             with torch.no_grad():
                 result = model(**request.model_inputs)
+            if stage_name == AUDIO_STAGE and selected_conditioning_request(
+                payload.request_id
+            ):
+                record_conditioning_boundary(
+                    payload.request_id,
+                    "audio-encoder",
+                    {
+                        **{
+                            name: value
+                            for name, value in request.model_inputs.items()
+                            if isinstance(value, torch.Tensor)
+                        },
+                        **result,
+                    },
+                    {
+                        "batch_request_ids": [payload.request_id],
+                        "row_start": 0,
+                        "row_count": result["audio_feature_lengths"].numel(),
+                        "token_start": 0,
+                        "token_end": result["audio_embeds"].shape[0],
+                    },
+                )
+            else:
+                pass
             store_cached_encoder_output(
                 request=request,
                 request_id=payload.request_id,
@@ -966,6 +994,27 @@ def batch_audio_encoder_payloads(
             ],
             "audio_output_lengths": req_output_lengths,
         }
+        if selected_conditioning_request(item["payload"].request_id):
+            record_conditioning_boundary(
+                item["payload"].request_id,
+                "audio-encoder",
+                {
+                    "input_features": batched_features,
+                    "feature_attention_mask": batched_mask,
+                    **combined,
+                },
+                {
+                    "batch_request_ids": [
+                        entry["payload"].request_id for entry in normalized
+                    ],
+                    "row_start": row_cursor,
+                    "row_count": item["count"],
+                    "token_start": token_cursor,
+                    "token_end": token_end,
+                },
+            )
+        else:
+            pass
         store_cached_encoder_output(
             request=item["request"],
             request_id=item["payload"].request_id,

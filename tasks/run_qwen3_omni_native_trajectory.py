@@ -82,6 +82,7 @@ def main(
     qk_restore_query: list[str],
     conditioning_mode: ConditioningMode,
     prefix_references: list[Path],
+    conditioning_provenance: bool,
 ) -> None:
     assert all(frame > 0 for frame in layer_frames)
     assert (code_trial_reference is None) == (not code_trial_choice)
@@ -186,6 +187,9 @@ def main(
             "SGLANG_CACHE_DIR": str(output / "cache"),
             "OMNI_NATIVE_TRAJECTORY_DIRECTORY": str(captures),
             "OMNI_NATIVE_TRAJECTORY_SAMPLES": ",".join(selected_samples),
+            "OMNI_NATIVE_CONDITIONING_PROVENANCE": (
+                "1" if conditioning_provenance else "0"
+            ),
             "OMNI_NATIVE_LAYER_FRAMES": ",".join(str(frame) for frame in layer_frames),
             "OMNI_NATIVE_QK_TRIAL": qk_trial or "",
             "OMNI_NATIVE_QK_RESTORE_QUERY": ",".join(qk_restore_query),
@@ -331,6 +335,7 @@ if __name__ == "__main__":
     parser.add_argument("checkpoint", type=Path)
     parser.add_argument("tactic_cache", type=Path)
     parser.add_argument("--mmsu", action="store_true")
+    parser.add_argument("--conditioning-provenance", action="store_true")
     parser.add_argument("--selected-samples", nargs="+", default=list(SELECTED_SAMPLES))
     parser.add_argument("--client-concurrency", type=int, default=32)
     parser.add_argument("--layer-frames", type=int, nargs="+", default=[])
@@ -385,6 +390,7 @@ if __name__ == "__main__":
         arguments.qk_restore_query,
         arguments.conditioning_mode,
         arguments.prefix_references,
+        arguments.conditioning_provenance,
     )
 else:
     pass

@@ -11,6 +11,10 @@ import logging
 from numbers import Integral
 
 import torch
+from qwen3_omni_conditioning_provenance import (
+    record_conditioning_boundary,
+    selected_conditioning_request,
+)
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
@@ -158,6 +162,34 @@ class ThinkerModelRunner(ModelRunner):
         self.prompt_hidden_store.stage(
             slot_ids[batch_rows], result.logits_output.hidden_states[batch_rows]
         )
+        row_start = 0
+        for request, prefix_length, extend_length in zip(
+            schedule_batch.reqs, schedule_batch.prefix_lens, schedule_batch.extend_lens
+        ):
+            if selected_conditioning_request(request.rid):
+                offsets = request.prompt_hidden_offsets(prefix_length, extend_length)
+                selected_rows = (offsets + row_start).to(slot_ids.device)
+                record_conditioning_boundary(
+                    request.rid,
+                    f"thinker-hidden-{prefix_length}",
+                    {
+                        "prompt_positions": offsets + prefix_length,
+                        "hidden_states": result.logits_output.hidden_states[
+                            selected_rows
+                        ],
+                        "slot_ids": slot_ids[selected_rows],
+                    },
+                    {
+                        "prefix_tokens": prefix_length,
+                        "extend_tokens": extend_length,
+                        "batch_request_ids": [
+                            entry.rid for entry in schedule_batch.reqs
+                        ],
+                    },
+                )
+            else:
+                pass
+            row_start += extend_length
 
     # ------------------------------------------------------------------
     # Multimodal embedding injection
@@ -492,6 +524,37 @@ class ThinkerModelRunner(ModelRunner):
         else:
             pass
 
+        for request, start, length, prefix in zip(
+            schedule_batch.reqs, offsets, extend_lens, prefix_lens or [0] * len(offsets)
+        ):
+            if selected_conditioning_request(request.rid):
+                record_conditioning_boundary(
+                    request.rid,
+                    f"thinker-input-{prefix}",
+                    {
+                        "input_ids": forward_batch.input_ids[start : start + length],
+                        "input_embeds": input_embeds[start : start + length],
+                        "positions": forward_batch.positions[start : start + length],
+                        **(
+                            {
+                                "mrope_positions": forward_batch.mrope_positions[
+                                    :, start : start + length
+                                ]
+                            }
+                            if forward_batch.mrope_positions is not None
+                            else {}
+                        ),
+                    },
+                    {
+                        "prefix_tokens": prefix,
+                        "extend_tokens": length,
+                        "batch_request_ids": [
+                            entry.rid for entry in schedule_batch.reqs
+                        ],
+                    },
+                )
+            else:
+                pass
         return input_embeds, ds_embeds_out, visual_masks_out
 
     # ------------------------------------------------------------------
