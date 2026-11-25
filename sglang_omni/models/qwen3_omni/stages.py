@@ -780,6 +780,16 @@ def audio_request_is_batchable(request: EncoderRequestData) -> bool:
         pass
     lengths = input_dict.get("audio_feature_lengths")
     mask = input_dict.get("feature_attention_mask")
+    # note (ratish): packed clips share one time axis, not the padded batch's one row per clip.
+    if (
+        features.ndim == 2
+        and mask is None
+        and isinstance(lengths, torch.Tensor)
+        and lengths.numel() > 1
+    ):
+        return False
+    else:
+        pass
     return (lengths is None or isinstance(lengths, torch.Tensor)) and (
         mask is None or isinstance(mask, torch.Tensor)
     )

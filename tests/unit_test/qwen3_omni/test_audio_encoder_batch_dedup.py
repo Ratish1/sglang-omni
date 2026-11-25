@@ -3,15 +3,28 @@
 
 from __future__ import annotations
 
+from copy import deepcopy
+from pathlib import Path
 from typing import Any
 
 import pytest
 import torch
+from safetensors.torch import save_file
+from transformers.models.qwen3_omni_moe.configuration_qwen3_omni_moe import (
+    Qwen3OmniMoeAudioEncoderConfig,
+    Qwen3OmniMoeConfig,
+)
 
+from sglang_omni.models.qwen3_omni.components.audio_encoder import (
+    AUDIO_TOWER_CLASS,
+    Qwen3OmniAudioEncoder,
+)
 from sglang_omni.models.qwen3_omni.payload_types import Qwen3OmniPipelineState
 from sglang_omni.models.qwen3_omni.stages import (
+    AUDIO_STAGE,
     batch_audio_encoder_payloads,
     encoder_batch_wait_ms,
+    run_single_encoder_payload,
 )
 from sglang_omni.proto import OmniRequest, StagePayload
 
@@ -91,6 +104,60 @@ def test_audio_encoder_batch_without_cache_keys_runs_every_request() -> None:
 
     assert model.calls == [2]
     assert len(out) == 2
+
+
+def test_packed_multiclip_audio_survives_an_encoder_batch(tmp_path: Path) -> None:
+    """Co-scheduling a packed pair of clips must not drop frames or fail encoding."""
+    configuration = Qwen3OmniMoeAudioEncoderConfig(
+        num_mel_bins=4,
+        d_model=16,
+        encoder_layers=1,
+        encoder_attention_heads=4,
+        encoder_ffn_dim=32,
+        downsample_hidden_size=8,
+        output_dim=16,
+    )
+    Qwen3OmniMoeConfig(
+        thinker_config={"audio_config": configuration.to_dict()}
+    ).save_pretrained(tmp_path)
+    with torch.random.fork_rng(devices=[]):
+        torch.manual_seed(17)
+        tower = AUDIO_TOWER_CLASS(configuration)
+    save_file(
+        {
+            f"thinker.audio_tower.{name}": tensor.contiguous()
+            for name, tensor in tower.state_dict().items()
+        },
+        tmp_path / "model.safetensors",
+    )
+    encoder = Qwen3OmniAudioEncoder(
+        str(tmp_path), device="cpu", dtype=torch.float32
+    ).eval()
+    packed_request = make_payload("packed", "packed", 34)
+    packed_inputs = packed_request.data["encoder_inputs"][AUDIO_STAGE]
+    packed_inputs["audio_feature_lengths"] = torch.tensor([13, 21])
+    packed_inputs["input_features"] = torch.linspace(-1, 1, 4 * 34).reshape(4, 34)
+    payloads = [packed_request, make_payload("peer", "peer", 27)]
+    standalone = [
+        run_single_encoder_payload(
+            deepcopy(payload), stage_name=AUDIO_STAGE, model=encoder
+        )
+        for payload in payloads
+    ]
+
+    batched = batch_audio_encoder_payloads(payloads, model=encoder)
+
+    assert [payload.request_id for payload in batched] == ["packed", "peer"]
+    for expected_payload, actual_payload in zip(standalone, batched, strict=True):
+        expected = Qwen3OmniPipelineState.from_dict(expected_payload.data).encoder_outs[
+            AUDIO_STAGE
+        ]
+        actual = Qwen3OmniPipelineState.from_dict(actual_payload.data).encoder_outs[
+            AUDIO_STAGE
+        ]
+        assert isinstance(expected, dict) and isinstance(actual, dict)
+        for name in ("audio_feature_lengths", "audio_output_lengths", "audio_embeds"):
+            assert torch.equal(actual[name], expected[name])
 
 
 def test_audio_encoder_cache_preserves_hits_in_mixed_batch():
