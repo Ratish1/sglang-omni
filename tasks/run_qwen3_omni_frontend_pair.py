@@ -54,7 +54,7 @@ def main(
                 "asr_checkpoint": asr_checkpoint.name,
                 "tactic_cache_sha256": cache_hash,
                 "similarity_sha256": similarity_hash,
-                "comparison": "Q/K candidate versus the same candidate with request-owned audio frontend; not upstream main",
+                "comparison": "stock is the pinned control; fixed adds the request-owned audio frontend",
             },
             receipt,
             indent=2,
