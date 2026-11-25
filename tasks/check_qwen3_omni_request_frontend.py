@@ -15,6 +15,7 @@ import torch
 from compare_qwen3_omni_native_trajectories import difference
 from qwen3_omni_request_frontend import (
     batched_request_frontend,
+    reference_request_frontend,
     request_frontend_forward,
 )
 from torch import nn
@@ -83,6 +84,16 @@ def main(root: Path, checkpoint: Path, sample_id: str, output: Path) -> None:
         ("multi_clip_request", [clips[:2], clips[2:]], original_chunk_limit),
         ("short_with_long_peer", [[short_clip], [clips[1]]], original_chunk_limit),
         (
+            "only_short_requests",
+            [[short_clip], [clips[1][:, :49]]],
+            original_chunk_limit,
+        ),
+        (
+            "multi_clip_only_short",
+            [[short_clip, clips[1][:, :49]], [clips[2][:, :75]]],
+            original_chunk_limit,
+        ),
+        (
             "multi_clip_short_support",
             [[short_clip, clips[1]], [clips[2]]],
             original_chunk_limit,
@@ -131,6 +142,13 @@ def main(root: Path, checkpoint: Path, sample_id: str, output: Path) -> None:
             clip_lengths,
             request_clip_counts,
         )
+        reference = reference_request_frontend(
+            encoder, packed_features, clip_lengths, request_clip_counts
+        )
+        assert torch.equal(frontend.hidden_states, reference.hidden_states), name
+        assert torch.equal(
+            frontend.cumulative_sequence_lengths, reference.cumulative_sequence_lengths
+        ), name
         assert torch.equal(
             frontend.hidden_states.cpu(), torch.cat(expected_frontends)
         ), name

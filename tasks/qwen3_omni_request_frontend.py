@@ -55,7 +55,7 @@ def request_frontend(
     )
 
 
-def batched_request_frontend(
+def reference_request_frontend(
     encoder: Qwen3OmniAudioEncoder,
     input_features: torch.Tensor,
     audio_feature_lengths: torch.Tensor,
@@ -81,6 +81,82 @@ def batched_request_frontend(
         cumulative_sequence_lengths=F.pad(segment_lengths, (1, 0)).cumsum(
             0, dtype=torch.int32
         ),
+    )
+
+
+def batched_request_frontend(
+    encoder: Qwen3OmniAudioEncoder,
+    input_features: torch.Tensor,
+    audio_feature_lengths: torch.Tensor,
+    request_clip_counts: list[int],
+) -> AudioFrontend:
+    assert audio_feature_lengths.device.type == "cpu"
+    assert sum(request_clip_counts) == audio_feature_lengths.numel()
+    assert all(count > 0 for count in request_clip_counts)
+    assert input_features.shape[-1] == int(audio_feature_lengths.sum())
+    tower = encoder.audio_tower
+    padded_features, chunk_lengths = hf_modeling.chunk_and_pad_features(
+        input_features.to(device=encoder.device, dtype=tower.dtype),
+        audio_feature_lengths,
+        tower.n_window,
+    )
+    valid_indices = hf_modeling.get_valid_indices(chunk_lengths, tower.n_window).to(
+        encoder.device, non_blocking=True
+    )
+    cumulative_sequence_lengths = hf_modeling.get_audio_cu_seqlens(
+        chunk_lengths, audio_feature_lengths, tower.n_window_infer, tower.n_window
+    )
+    request_lengths = [
+        lengths.tolist() for lengths in audio_feature_lengths.split(request_clip_counts)
+    ]
+    chunk_frames = tower.n_window * 2
+    request_chunks = [
+        sum((length + chunk_frames - 1) // chunk_frames for length in lengths)
+        for lengths in request_lengths
+    ]
+    max_output_frames = int(
+        encoder.downsample_lengths(chunk_lengths, tower.n_window).max()
+    )
+    request_outputs = []
+    for request_features, lengths in zip(
+        padded_features.split(request_chunks), request_lengths, strict=True
+    ):
+        width = min(max(lengths), chunk_frames)
+        if width != padded_features.shape[-1]:
+            request_features = (
+                request_features[:, :, :width]
+                .transpose(1, 2)
+                .contiguous()
+                .transpose(1, 2)
+            )
+        else:
+            pass
+        convolution_outputs = []
+        for chunk in request_features.unsqueeze(1).split(tower.conv_chunksize, dim=0):
+            hidden_states = F.gelu(tower.conv2d1(chunk))
+            hidden_states = F.gelu(tower.conv2d2(hidden_states))
+            convolution_outputs.append(F.gelu(tower.conv2d3(hidden_states)))
+        convolution_output = torch.cat(convolution_outputs)
+        chunks, channels, frequencies, frames = convolution_output.shape
+        hidden_states = tower.conv_out(
+            convolution_output.permute(0, 3, 1, 2)
+            .contiguous()
+            .view(chunks, frames, channels * frequencies)
+        )
+        hidden_states = hidden_states + tower.positional_embedding.positional_embedding[
+            :frames
+        ].unsqueeze(0).to(hidden_states.dtype)
+        if frames != max_output_frames:
+            hidden_states = F.pad(hidden_states, (0, 0, 0, max_output_frames - frames))
+        else:
+            pass
+        request_outputs.append(hidden_states)
+    padded_output = torch.cat(request_outputs)
+    return AudioFrontend(
+        hidden_states=torch.index_select(
+            padded_output.reshape(-1, padded_output.shape[-1]), 0, valid_indices
+        ),
+        cumulative_sequence_lengths=cumulative_sequence_lengths,
     )
 
 
