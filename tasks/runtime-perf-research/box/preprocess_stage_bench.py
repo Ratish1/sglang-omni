@@ -8,6 +8,7 @@ inbox and outbox, with no server and no GPU. The first pass warms the page cache
 """
 
 import argparse
+import inspect
 import json
 import os
 import resource
@@ -27,6 +28,19 @@ from sglang_omni.scheduling.message import IncomingMessage
 MODEL = "Qwen/Qwen3-Omni-30B-A3B-Instruct"
 VIDEOMME_CI = "zhaochenyang20/Video_MME_ci"
 VIDEO_SETTINGS = {"video_fps": 2.0, "video_max_frames": 128, "video_max_pixels": 401408}
+
+
+def preprocessing_executor(requests: int, **kwargs: object) -> object:
+    """The tree's preprocessing stage with requests at once: max_concurrency on main and the PR head, and on the review
+    fixes max_running_video_requests, where 1 here means every request serial (0 there).
+    """
+    factory = qwen_stages.create_preprocessing_executor
+    if "max_running_video_requests" in inspect.signature(factory).parameters:
+        return factory(
+            MODEL, max_running_video_requests=0 if requests <= 1 else requests, **kwargs
+        )
+    else:
+        return factory(MODEL, max_concurrency=requests, **kwargs)
 
 
 def payload_of(request_id: str, prompt: str, video_path: str) -> StagePayload:

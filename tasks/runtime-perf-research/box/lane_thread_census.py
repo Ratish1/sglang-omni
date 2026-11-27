@@ -13,10 +13,9 @@ import os
 import threading
 import time
 
-from preprocess_stage_bench import MODEL, VIDEO_SETTINGS, VIDEOMME_CI
+from preprocess_stage_bench import VIDEO_SETTINGS, VIDEOMME_CI, preprocessing_executor
 
 import sglang_omni
-import sglang_omni.models.qwen3_omni.stages as qwen_stages
 from benchmarks.dataset.videomme import load_videomme_samples
 from sglang_omni.proto.request import OmniRequest, StagePayload
 from sglang_omni.scheduling.message import IncomingMessage
@@ -44,9 +43,7 @@ def main() -> None:
     paths = [
         sample.video_path for sample in load_videomme_samples(50, repo_id=VIDEOMME_CI)
     ]
-    scheduler = qwen_stages.create_preprocessing_executor(
-        MODEL, max_concurrency=args.max_concurrency, max_seq_len=32768
-    )
+    scheduler = preprocessing_executor(args.max_concurrency, max_seq_len=32768)
     threading.Thread(target=scheduler.start, daemon=True).start()
     peak: collections.Counter[str] = collections.Counter()
     totals: list[int] = []
@@ -93,7 +90,10 @@ def main() -> None:
     sampler.join()
     ordered = sorted(totals)
     print(f"peak by name {dict(peak.most_common(10))}", flush=True)
-    print(f"total threads max {ordered[-1]} median {ordered[len(ordered) // 2]}", flush=True)
+    print(
+        f"total threads max {ordered[-1]} median {ordered[len(ordered) // 2]}",
+        flush=True,
+    )
     print(f"after the load {dict(thread_names().most_common(10))}", flush=True)
     os._exit(0)
 

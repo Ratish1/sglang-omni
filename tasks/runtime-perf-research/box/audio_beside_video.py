@@ -22,10 +22,9 @@ import wave
 
 import numpy as np
 from PIL import Image
-from preprocess_stage_bench import MODEL, VIDEO_SETTINGS, VIDEOMME_CI
+from preprocess_stage_bench import VIDEO_SETTINGS, VIDEOMME_CI, preprocessing_executor
 
 import sglang_omni
-import sglang_omni.models.qwen3_omni.stages as qwen_stages
 from benchmarks.dataset.videomme import load_videomme_samples
 from sglang_omni.proto.request import OmniRequest, StagePayload
 from sglang_omni.scheduling.message import IncomingMessage
@@ -88,9 +87,7 @@ def thread_names() -> dict[str, int]:
 
 class Stage:
     def __init__(self, max_concurrency: int, video_paths: list[str]) -> None:
-        self.scheduler = qwen_stages.create_preprocessing_executor(
-            MODEL, max_concurrency=max_concurrency, max_seq_len=32768
-        )
+        self.scheduler = preprocessing_executor(max_concurrency, max_seq_len=32768)
         self.video_paths = video_paths
         self.sent: dict[str, float] = {}
         self.answered: dict[str, tuple[float, str]] = {}
@@ -193,8 +190,7 @@ def main() -> None:
     args = parser.parse_args()
     print(f"sglang_omni from {sglang_omni.__file__}", flush=True)
     video_paths = [
-        sample.video_path
-        for sample in load_videomme_samples(50, repo_id=VIDEOMME_CI)
+        sample.video_path for sample in load_videomme_samples(50, repo_id=VIDEOMME_CI)
     ]
     stage = Stage(args.max_concurrency, video_paths)
     for index in range(2):
@@ -239,8 +235,7 @@ def main() -> None:
     print(
         f"videos answered {report['videos_per_second_beside']:.2f}/s beside; threads beside videos: "
         + ", ".join(
-            f"{name} {count}"
-            for name, count in list(census_beside.items())[:12]
+            f"{name} {count}" for name, count in list(census_beside.items())[:12]
         ),
         flush=True,
     )

@@ -16,10 +16,14 @@ import time
 
 import numpy as np
 from PIL import Image
-from preprocess_stage_bench import MODEL, VIDEO_SETTINGS, VIDEOMME_CI, tensor_hashes
+from preprocess_stage_bench import (
+    VIDEO_SETTINGS,
+    VIDEOMME_CI,
+    preprocessing_executor,
+    tensor_hashes,
+)
 
 import sglang_omni
-import sglang_omni.models.qwen3_omni.stages as qwen_stages
 from benchmarks.dataset.videomme import load_videomme_samples
 from sglang_omni.proto.request import OmniRequest, StagePayload
 from sglang_omni.scheduling.message import IncomingMessage
@@ -113,9 +117,7 @@ def build_requests(image_path: str) -> dict[str, object]:
 def run_requests(
     threads: int, concurrency: int, requests: dict[str, object]
 ) -> tuple[dict[str, dict[str, str]], float]:
-    scheduler = qwen_stages.create_preprocessing_executor(
-        MODEL, max_concurrency=threads, max_seq_len=32768
-    )
+    scheduler = preprocessing_executor(threads, max_seq_len=32768)
     worker = threading.Thread(target=scheduler.start, daemon=True)
     worker.start()
     names = list(requests)
