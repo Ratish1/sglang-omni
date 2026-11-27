@@ -41,8 +41,10 @@ class BufferReuseCheck:
     execution: Literal["eager", "graph"]
     changed_codes_after_previous_frame: int
     changed_feedback_after_previous_frame: int
+    changed_cache_after_previous_frame: int
     changed_codes_after_nan_fill: int
     changed_feedback_after_nan_fill: int
+    changed_cache_after_nan_fill: int
 
 
 def predictor_snapshot(
@@ -50,7 +52,7 @@ def predictor_snapshot(
     codes: torch.Tensor,
     queries: torch.Tensor,
     execution: Literal["eager", "graph"],
-) -> tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     if execution == "graph":
         result = model.code_predictor_forward_single_token_graph(
             layer0_codes=codes,
@@ -61,7 +63,13 @@ def predictor_snapshot(
         assert result is not None
     else:
         result = model.code_predictor_forward_incremental_eager(codes, queries)
-    return result[0].clone(), result[1].clone()
+    written_slots = model.config.num_code_groups
+    return (
+        result[0].clone(),
+        result[1].clone(),
+        model.predictor_k_cache[:, : codes.shape[0], :written_slots].clone(),
+        model.predictor_v_cache[:, : codes.shape[0], :written_slots].clone(),
+    )
 
 
 def check_buffer_reuse(
@@ -103,7 +111,12 @@ def check_buffer_reuse(
                     assert not fused.counters.count_nonzero()
                     for buffer in scratch:
                         buffer.zero_()
-                    expected_codes, expected_feedback = predictor_snapshot(
+                    (
+                        expected_codes,
+                        expected_feedback,
+                        expected_keys,
+                        expected_values,
+                    ) = predictor_snapshot(
                         model, current_codes, current_queries, execution
                     )
                     predictor_snapshot(
@@ -112,17 +125,26 @@ def check_buffer_reuse(
                         queries[previous_indices],
                         execution,
                     )
-                    after_codes, after_feedback = predictor_snapshot(
-                        model, current_codes, current_queries, execution
+                    after_codes, after_feedback, after_keys, after_values = (
+                        predictor_snapshot(
+                            model, current_codes, current_queries, execution
+                        )
                     )
                     assert not fused.counters.count_nonzero()
                     # note (ratish): only overwritten scratch is poisoned, never the live synchronization counters.
                     for buffer in scratch:
                         buffer.fill_(float("nan"))
-                    poisoned_codes, poisoned_feedback = predictor_snapshot(
+                    (
+                        poisoned_codes,
+                        poisoned_feedback,
+                        poisoned_keys,
+                        poisoned_values,
+                    ) = predictor_snapshot(
                         model, current_codes, current_queries, execution
                     )
                     assert torch.isfinite(poisoned_feedback).all()
+                    assert torch.isfinite(poisoned_keys).all()
+                    assert torch.isfinite(poisoned_values).all()
                     assert not fused.counters.count_nonzero()
                     assert torch.equal(current_queries, queries[indices])
                     assert torch.equal(current_codes, codes[indices])
@@ -137,11 +159,19 @@ def check_buffer_reuse(
                         changed_feedback_after_previous_frame=int(
                             after_feedback.ne(expected_feedback).sum()
                         ),
+                        changed_cache_after_previous_frame=int(
+                            after_keys.ne(expected_keys).sum()
+                            + after_values.ne(expected_values).sum()
+                        ),
                         changed_codes_after_nan_fill=int(
                             poisoned_codes.ne(expected_codes).sum()
                         ),
                         changed_feedback_after_nan_fill=int(
                             poisoned_feedback.ne(expected_feedback).sum()
+                        ),
+                        changed_cache_after_nan_fill=int(
+                            poisoned_keys.ne(expected_keys).sum()
+                            + poisoned_values.ne(expected_values).sum()
                         ),
                     )
                     checks.append(check)
@@ -149,8 +179,10 @@ def check_buffer_reuse(
                         (
                             check.changed_codes_after_previous_frame,
                             check.changed_feedback_after_previous_frame,
+                            check.changed_cache_after_previous_frame,
                             check.changed_codes_after_nan_fill,
                             check.changed_feedback_after_nan_fill,
+                            check.changed_cache_after_nan_fill,
                         )
                     ), asdict(check)
             with (output / "buffer-reuse.json").open("w") as report:
