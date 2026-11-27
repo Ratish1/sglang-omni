@@ -272,6 +272,28 @@ def digest(event_dir: Path, client_rows: list[dict], skip: int) -> str:
     return "\n".join(lines)
 
 
+def first_frames(event_dir: Path) -> str:
+    """How many distinct first codec frames the streams opened with, and the most common ones (probe value codes)."""
+    frames: collections.Counter = collections.Counter()
+    for path in event_dir.glob("events_*.jsonl"):
+        for line in path.read_text().splitlines():
+            event = json.loads(line)
+            codes = (event.get("metadata") or {}).get("first_codes")
+            if event["event_name"] == "qwen3_tts_frames_ingested" and codes is not None:
+                frames[tuple(codes)] += 1
+            else:
+                pass
+    if not frames:
+        return "first frames not recorded"
+    else:
+        pass
+    firsts = collections.Counter(codes[0] for codes in frames.elements())
+    return (
+        f"first frames: {sum(frames.values())} streams, {len(frames)} distinct code vectors, first codebook ids "
+        f"{dict(firsts.most_common(5))}, most common vectors {[(list(codes), count) for codes, count in frames.most_common(2)]}"
+    )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--tree", type=Path, required=True)
@@ -281,6 +303,9 @@ def main() -> None:
     parser.add_argument("--counts", type=int, nargs="*", default=[48, 16])
     parser.add_argument("--loads", nargs="*", default=["c1:1:100", "c16:16:400", "c64:64:1088"])
     parser.add_argument("--extra", default="{}", help="JSON of extra request fields for the loads")
+    parser.add_argument("--bursts", default=None, help="JSON list of [name, extra fields, is_short, rounds] replacing BURSTS")
+    parser.add_argument("--model", default=MODELS["customvoice"][0])
+    parser.add_argument("--probe", default="1", help="QWEN3_TTS_FRAME_PROBE value; codes also records each stream's first frame")
     args = parser.parse_args()
     sys.path.insert(0, str(args.tree))
     from benchmarks.dataset.seedtts import load_seedtts_samples
@@ -291,19 +316,23 @@ def main() -> None:
     report = [f"tree {args.tree} {head[0]} sglang_omni {head[1]}"]
     print(report[0], flush=True)
     url = f"http://127.0.0.1:{args.port}"
-    extra = json.loads(args.extra)
+    extra = {"model": args.model, **json.loads(args.extra)}
+    bursts = BURSTS if args.bursts is None else [tuple(burst) for burst in json.loads(args.bursts)]
     server = serve(
-        args.tree, MODELS["customvoice"][0], args.card, args.port, args.out / "serve.log",
-        {"PYTHONPATH": f"{HERE / 'frame_probe'}:{args.tree}", "QWEN3_TTS_FRAME_PROBE": "1"},
+        args.tree, args.model, args.card, args.port, args.out / "serve.log",
+        {"PYTHONPATH": f"{HERE / 'frame_probe'}:{args.tree}", "QWEN3_TTS_FRAME_PROBE": args.probe},
     )
     (args.out / "serve.pgid").write_text(str(server.pid))
     try:
         wait_healthy(args.port, server)
-        run_pass(url, texts[:WARMUP_REQUESTS], WARMUP_REQUESTS, {})
+        run_pass(url, texts[:WARMUP_REQUESTS], WARMUP_REQUESTS, {"model": args.model})
         for count in args.counts:
-            for name, burst_extra, is_short, rounds in BURSTS:
+            for name, burst_extra, is_short, rounds in bursts:
                 for index in range(rounds):
-                    line = run_burst(url, args.port, name, burst_extra, is_short, count, args.out / "bursts" / f"{count}_{name}_r{index}")
+                    line = run_burst(
+                        url, args.port, name, {"model": args.model, **burst_extra}, is_short, count,
+                        args.out / "bursts" / f"{count}_{name}_r{index}",
+                    )
                     report.append(f"burst count {count} {line}")
                     print(f"{time.strftime('%T')} {report[-1]}", flush=True)
         for load in args.loads:
@@ -336,6 +365,7 @@ def main() -> None:
                 f"{ {thread: round(value / os.sysconf('SC_CLK_TCK') / wall_s, 3) for thread, value in ticks.items()} }"
             )
             report.append(digest(out / "events", rows, 2 * concurrency if concurrency > 1 else 2))
+            report.append(first_frames(out / "events"))
             print(f"{time.strftime('%T')} {report[-2]}\n{report[-1]}", flush=True)
         report.append(f"codec counters {json.dumps(codec_state(url))}")
         print(report[-1], flush=True)

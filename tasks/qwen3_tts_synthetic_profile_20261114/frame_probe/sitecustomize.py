@@ -19,13 +19,20 @@ def patch_vocoder(module) -> None:
     original = cls.ingest
 
     def ingest(self, request_id, state, codes):
+        is_first = state.total_frames == 0
         original(self, request_id, state, codes)
         if get_recorder().is_active():
+            metadata = {"generated_frames": state.total_frames - state.ref_frames}
+            if is_first and os.environ.get("QWEN3_TTS_FRAME_PROBE") == "codes":
+                # reads the frame back to the host, so never in a timed pass
+                metadata["first_codes"] = codes[state.ref_frames].tolist()
+            else:
+                pass
             emit(
                 request_id=request_id,
                 stage=None,
                 event_name="qwen3_tts_frames_ingested",
-                metadata={"generated_frames": state.total_frames - state.ref_frames},
+                metadata=metadata,
             )
         else:
             pass
@@ -53,7 +60,7 @@ class PatchOnImport(importlib.abc.MetaPathFinder):
         return spec
 
 
-if os.environ.get("QWEN3_TTS_FRAME_PROBE") == "1":
+if os.environ.get("QWEN3_TTS_FRAME_PROBE") in ("1", "codes"):
     sys.meta_path.insert(0, PatchOnImport())
 else:
     pass
