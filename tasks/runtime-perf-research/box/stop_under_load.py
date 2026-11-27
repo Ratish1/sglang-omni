@@ -109,23 +109,39 @@ def main() -> None:
         )
     (out / "server.pgid").write_text(f"{server.pid}\n", encoding="utf-8")
     client = None
+    client_passes = 0
     dumped: list[int] = []
     left: list[int] = []
     exit_s = None
     try:
         baseline.wait_healthy(args.port, server)
+        loaded = time.monotonic()
+        # note (ratish): one client pass is 50 videos, which a lane server answers in under the delay, so a pass
+        # that ends is started again until the signal, keeping the videos in flight when it lands.
         with open(out / "client.log", "w", encoding="utf-8") as client_log:
-            client = subprocess.Popen(
-                video_client(args.port, args.videos, out / "video"),
-                cwd=tree,
-                env=dict(os.environ, PYTHONPATH=str(tree)),
-                stdout=client_log,
-                stderr=subprocess.STDOUT,
-                start_new_session=True,
-            )
-        time.sleep(args.after)
+            while time.monotonic() < loaded + args.after:
+                if client is None or client.poll() is not None:
+                    client = subprocess.Popen(
+                        video_client(
+                            args.port, args.videos, out / f"video{client_passes}"
+                        ),
+                        cwd=tree,
+                        env=dict(os.environ, PYTHONPATH=str(tree)),
+                        stdout=client_log,
+                        stderr=subprocess.STDOUT,
+                        start_new_session=True,
+                    )
+                    client_passes += 1
+                else:
+                    pass
+                time.sleep(0.5)
         (out / "processes.txt").write_text(
             baseline.process_table(server.pid), encoding="utf-8"
+        )
+        requests_seen = (
+            (out / "serve.log")
+            .read_text(errors="replace")
+            .count("POST /v1/chat/completions")
         )
         sent = time.monotonic()
         os.killpg(server.pid, signal.SIGINT)
@@ -167,6 +183,8 @@ def main() -> None:
         if "Terminating stuck process" in line
     ]
     result = {
+        "client_passes": client_passes,
+        "requests_before_signal": requests_seen,
         "exit_s": exit_s,
         "left_at_deadline": left if exit_s is None else [],
         "alive_at_dump": dumped,
@@ -174,7 +192,8 @@ def main() -> None:
     }
     (out / "stop.json").write_text(json.dumps(result, indent=2), encoding="utf-8")
     print(
-        f"stop {out.name}: exit {'none' if exit_s is None else f'{exit_s:.1f} s'}, "
+        f"stop {out.name}: {requests_seen} requests in {client_passes} client passes before the signal, "
+        f"exit {'none' if exit_s is None else f'{exit_s:.1f} s'}, "
         f"alive at {args.dump_after:.0f} s {len(dumped)}, stuck {stuck}",
         flush=True,
     )
