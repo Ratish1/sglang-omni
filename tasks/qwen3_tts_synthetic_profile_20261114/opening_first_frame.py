@@ -4,10 +4,13 @@ Per model, one server on card N from TREE. Every SeedTTS EN target text is sent 
 default sampling, PCM) with suppress_bootstrap_silence false, so the first frame's samples arrive as decoded.
 Per request it reads the first 1,920 samples against the vocoder's own silence guard (RMS 0.001, peak 0.0032).
 Then, one request at a time over the first PAIRED texts, the trim on and off alternate, and the time to first
-byte and to first audible sound (DC-removed RMS over 20 ms windows, 10 ms hop, at -45 dBFS for two windows
-in a row) are read for each. Writes OUT/<model>/frames.jsonl and OUT/<model>/paired.jsonl.
+byte and to first audible sound are read for each. The audible sound is the first point where DC-removed RMS
+over 20 ms windows (10 ms hop) reaches -45 dBFS for two windows in a row, timed as a listener hears it: played
+from the first byte, so any leading silence plays first. Writes OUT/<model>/frames.jsonl and
+OUT/<model>/paired.jsonl.
 
 usage: python3 opening_first_frame.py --tree TREE --card 0 --out DIR [--models 0.6b 1.7b] [--paired 100]
+       [--skip-corpus]
 """
 
 import argparse
@@ -111,9 +114,12 @@ def paired(url: str, model: str, text: str, is_trimmed: bool) -> dict:
     else:
         pass
     onset = audible_onset(samples)
+    first_byte_ms = arrivals[0][0] * 1000.0
     return {
-        "status": 200, "is_trimmed": is_trimmed, "first_byte_ms": arrivals[0][0] * 1000.0,
-        "audible_ms": None if onset is None else arrival_of(onset, arrivals) * 1000.0,
+        "status": 200, "is_trimmed": is_trimmed, "first_byte_ms": first_byte_ms,
+        "onset_sample": onset,
+        "audible_arrival_ms": None if onset is None else arrival_of(onset, arrivals) * 1000.0,
+        "audible_ms": None if onset is None else first_byte_ms + 1000.0 * onset / SAMPLE_RATE,
         "samples": int(samples.size),
     }
 
@@ -127,28 +133,37 @@ def quantiles(values: list[float]) -> str:
     return "/".join(f"{values[min(len(values) - 1, int(q * len(values)))]:.1f}" for q in (0.1, 0.5, 0.9))
 
 
-def run_model(tree: Path, name: str, card: int, port: int, paired_count: int, texts: list[str], out: Path) -> None:
+def report_first_frames(url: str, name: str, model: str, texts: list[str], out: Path) -> None:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=CONCURRENCY) as pool:
+        frames = list(pool.map(lambda text: first_frame(url, model, text), texts))
+    with (out / "frames.jsonl").open("w") as handle:
+        for text, row in zip(texts, frames):
+            handle.write(json.dumps({"text": text, **row}) + "\n")
+    served = [row for row in frames if row["status"] == 200]
+    silent = sum(row["is_silent"] for row in served)
+    print(
+        f"{time.strftime('%T')} {name} first frame silent {silent}/{len(served)} of {len(texts)} "
+        f"({100.0 * silent / max(1, len(served)):.2f} %), head rms p50/p99/max "
+        f"{statistics.median(row['head_rms'] for row in served):.6f}/"
+        f"{sorted(row['head_rms'] for row in served)[int(0.99 * (len(served) - 1))]:.6f}/"
+        f"{max(row['head_rms'] for row in served):.6f}, head peak max {max(row['head_peak'] for row in served):.6f}",
+        flush=True,
+    )
+
+
+def run_model(
+    tree: Path, name: str, card: int, port: int, paired_count: int, texts: list[str], out: Path, is_corpus_run: bool
+) -> None:
     out.mkdir(parents=True, exist_ok=True)
     model = MODELS[name]
     url = f"http://127.0.0.1:{port}"
     server = serve(tree, model, card, port, out / "serve.log", {})
     try:
         wait_healthy(port, server)
-        with concurrent.futures.ThreadPoolExecutor(max_workers=CONCURRENCY) as pool:
-            frames = list(pool.map(lambda text: first_frame(url, model, text), texts))
-        with (out / "frames.jsonl").open("w") as handle:
-            for text, row in zip(texts, frames):
-                handle.write(json.dumps({"text": text, **row}) + "\n")
-        served = [row for row in frames if row["status"] == 200]
-        silent = sum(row["is_silent"] for row in served)
-        print(
-            f"{time.strftime('%T')} {name} first frame silent {silent}/{len(served)} of {len(texts)} "
-            f"({100.0 * silent / max(1, len(served)):.2f} %), head rms p50/p99/max "
-            f"{statistics.median(row['head_rms'] for row in served):.6f}/"
-            f"{sorted(row['head_rms'] for row in served)[int(0.99 * (len(served) - 1))]:.6f}/"
-            f"{max(row['head_rms'] for row in served):.6f}, head peak max {max(row['head_peak'] for row in served):.6f}",
-            flush=True,
-        )
+        if is_corpus_run:
+            report_first_frames(url, name, model, texts, out)
+        else:
+            pass
         rows = []
         for index, text in enumerate(texts[:paired_count]):
             order = (True, False) if index % 2 == 0 else (False, True)
@@ -162,7 +177,9 @@ def run_model(tree: Path, name: str, card: int, port: int, paired_count: int, te
             print(
                 f"{time.strftime('%T')} {name} one request at a time, trim {'on ' if is_trimmed else 'off'}: "
                 f"first byte p10/p50/p90 {quantiles([row['first_byte_ms'] for row in arm])} ms, "
-                f"audible {quantiles([row['audible_ms'] for row in arm])} ms, n {len(arm)}",
+                f"audible when played from the first byte {quantiles([row['audible_ms'] for row in arm])} ms, "
+                f"audible sample's arrival {quantiles([row['audible_arrival_ms'] for row in arm])} ms, "
+                f"onset sample {quantiles([row['onset_sample'] for row in arm])}, n {len(arm)}",
                 flush=True,
             )
     finally:
@@ -177,6 +194,7 @@ def main() -> None:
     parser.add_argument("--port", type=int, default=27000)
     parser.add_argument("--models", nargs="+", choices=sorted(MODELS), default=["0.6b", "1.7b"])
     parser.add_argument("--paired", type=int, default=100)
+    parser.add_argument("--skip-corpus", action="store_true", help="run only the paired one-at-a-time requests")
     args = parser.parse_args()
     sys.path.insert(0, str(args.tree))
     from benchmarks.dataset.seedtts import load_seedtts_samples
@@ -184,7 +202,10 @@ def main() -> None:
     texts = [sample.target_text for sample in load_seedtts_samples(SEEDTTS_META, split="en")]
     print(f"{time.strftime('%T')} SeedTTS EN texts {len(texts)}", flush=True)
     for index, name in enumerate(args.models):
-        run_model(args.tree, name, args.card, args.port + 400 * index, args.paired, texts, args.out / name)
+        run_model(
+            args.tree, name, args.card, args.port + 400 * index, args.paired, texts, args.out / name,
+            not args.skip_corpus,
+        )
 
 
 if __name__ == "__main__":
