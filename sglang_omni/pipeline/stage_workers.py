@@ -30,6 +30,7 @@ from sglang_omni.config.runtime import (
     apply_typed_stage_kwargs,
     resolve_factory_signature_args,
 )
+from sglang_omni.model_runner.process_engines import process_engines
 from sglang_omni.pipeline.control_plane import StageControlPlane
 from sglang_omni.pipeline.local_dispatch import LocalStageDispatcher
 from sglang_omni.pipeline.stage.input import AggregatedInput, DirectInput
@@ -1054,7 +1055,8 @@ def construct_stage(
         spec.tp_size,
     )
 
-    scheduler = construct_scheduler(spec, gpu_id, log, startup_lock_wait_callback)
+    with process_engines().stage_construction():
+        scheduler = construct_scheduler(spec, gpu_id, log, startup_lock_wait_callback)
 
     def _target_list(targets: str | list[str] | None) -> list[str]:
         if targets is None:

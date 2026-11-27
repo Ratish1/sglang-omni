@@ -2,19 +2,24 @@
 from __future__ import annotations
 
 import sys
+import threading
+import time
 import types
 from contextlib import contextmanager
 from types import SimpleNamespace
 
 import pytest
 import torch
+from sglang.srt.runtime_context import ParallelContext, RuntimeContext
 
+from sglang_omni.model_runner import base as base_module
 from sglang_omni.model_runner.base import ModelRunner
 from sglang_omni.model_runner.prefill_inputs import (
     OmniPrefillInputs,
     attach_omni_prefill_inputs,
     get_omni_prefill_inputs,
 )
+from sglang_omni.model_runner.process_engines import ProcessEngines
 from tests.unit_test.fakes import FakeExecutionBridge
 
 
@@ -143,6 +148,52 @@ def make_runner(calls: list[str], *, custom_result):
         forward_batch_generation=standard_forward,
     )
     return runner
+
+
+def test_a_step_in_a_shared_process_hands_a_waiting_talker_the_turn_before_its_forward(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A thinker step held the turn from its build through its forward, so a talker ready meanwhile waited the whole step."""
+    engines = ProcessEngines()
+    thinker_context, talker_context = (
+        RuntimeContext(parallel=ParallelContext()) for _ in range(2)
+    )
+    engines.engine_contexts.extend([thinker_context, talker_context])
+    monkeypatch.setattr(base_module, "process_engines", lambda: engines)
+    install_fake_forward_batch_module(monkeypatch)
+    calls: list[str] = []
+    runner = make_runner(calls, custom_result=None)
+
+    def talker() -> None:
+        with engines.hold(talker_context, priority=1):
+            calls.append("talker")
+
+    talker_thread = threading.Thread(target=talker)
+
+    def build_with_a_waiting_talker(scheduler_output):
+        built = ModelRunner.build_forward_batch(runner, scheduler_output)
+        talker_thread.start()
+        while True:
+            with engines.turn_state_lock:
+                if engines.turn_waiters:
+                    break
+                else:
+                    pass
+            time.sleep(0)
+        return built
+
+    runner.build_forward_batch = build_with_a_waiting_talker
+    with engines.hold(thinker_context, priority=0):
+        runner.execute(make_scheduler_output(is_prefill=False))
+    talker_thread.join()
+
+    assert calls == [
+        "talker",
+        "before_decode",
+        "custom_decode",
+        "standard_forward",
+        "post_decode",
+    ]
 
 
 def test_resolve_deferred_prefill_inputs_materializes_staged_ids():

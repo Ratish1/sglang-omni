@@ -25,6 +25,7 @@ from sglang_omni.scheduling.sglang_backend.prompt_hidden import (
     PromptHiddenStore,
 )
 from sglang_omni.scheduling.types import SchedulerRequest
+from sglang_omni.utils.cuda_staging import host_to_device
 
 logger = logging.getLogger(__name__)
 
@@ -148,7 +149,10 @@ class ThinkerModelRunner(ModelRunner):
             return
         else:
             pass
-        batch_rows = torch.cat(request_rows).to(forward_batch.out_cache_loc.device)
+        # note (ratish): a blocking copy here would wait for the whole forward just launched on this stream.
+        batch_rows = host_to_device(
+            torch.cat(request_rows), forward_batch.out_cache_loc.device
+        )
         # note (ratish): req_to_token holds the virtual slot ids when the KV index is translated.
         slot_ids = (
             forward_batch.out_cache_loc
@@ -390,7 +394,9 @@ class ThinkerModelRunner(ModelRunner):
                 visual_pos, visual_order = torch.sort(torch.cat([img_pos, vid_pos]))
                 visual_count = visual_pos.numel()
 
-                if ds_embeds is None:
+                if visual_count == 0:
+                    ds_embeds = None
+                elif ds_embeds is None:
                     if image_ds and video_ds:
                         image_offset, image_count = chunk_offsets.get("image", (0, 0))
                         video_offset, video_count = chunk_offsets.get("video", (0, 0))
@@ -399,8 +405,8 @@ class ThinkerModelRunner(ModelRunner):
                             visual_count, device=slots.device
                         )
                         n_image = img_pos.numel()
-                        img_idx = slots[:n_image].to(device)
-                        vid_idx = slots[n_image:].to(device)
+                        img_idx = host_to_device(slots[:n_image], device)
+                        vid_idx = host_to_device(slots[n_image:], device)
                         merged = []
                         for img_e, vid_e in zip(image_ds, video_ds):
                             img_e = img_e[image_offset : image_offset + image_count]
@@ -426,7 +432,7 @@ class ThinkerModelRunner(ModelRunner):
                         ]
                     else:
                         pass
-                elif visual_count > 0:
+                else:
                     if not img_pos.numel():
                         visual_offset = chunk_offsets.get("video", (0, 0))[0]
                     elif not vid_pos.numel():
@@ -438,8 +444,6 @@ class ThinkerModelRunner(ModelRunner):
                         for layer in ds_embeds
                     ]
                     consumed["_visual"] = visual_offset + visual_count
-                else:
-                    ds_embeds = None
 
                 if ds_embeds is not None:
                     deepstack_visual_embeds_list.append(ds_embeds)
@@ -459,7 +463,7 @@ class ThinkerModelRunner(ModelRunner):
         if scatter_rows:
             # note (chenrui): one index_copy_ keeps the kernel count independent
             # of batch mix; avoid concatenating the common single-source case.
-            row_idx = torch.cat(scatter_rows).to(device=device)
+            row_idx = host_to_device(torch.cat(scatter_rows), device)
             srcs = [
                 s.to(device=device, dtype=input_embeds.dtype, non_blocking=True)
                 for s in scatter_srcs
@@ -475,7 +479,9 @@ class ThinkerModelRunner(ModelRunner):
             combined_mask = torch.zeros(
                 len(forward_batch.input_ids), dtype=torch.bool, device=device
             )
-            combined_mask[torch.cat(visual_rows).to(device=device)] = True
+            combined_mask.index_fill_(
+                0, host_to_device(torch.cat(visual_rows), device), True
+            )
             visual_masks_out = combined_mask
             if len(deepstack_visual_embeds_list) == 1:
                 ds_embeds_out = deepstack_visual_embeds_list[0]

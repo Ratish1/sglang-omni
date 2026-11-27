@@ -22,6 +22,7 @@ from sglang_omni.model_runner.prefill_inputs import (
     clear_omni_prefill_inputs,
     get_omni_prefill_inputs,
 )
+from sglang_omni.model_runner.process_engines import process_engines
 from sglang_omni.model_runner.sglang_execution import SGLangExecutionBridge
 from sglang_omni.platforms import current_platform
 from sglang_omni.sampling.seed import (
@@ -316,7 +317,8 @@ class ModelRunner(Generic[RequestDataInput]):
             result, "_host_token_ids_event", None
         )  # noqa: leading-underscore  # upstream spelling, or the public name is already taken
         if event is not None:
-            event.synchronize()
+            with process_engines().released():
+                event.synchronize()
             result._host_token_ids_event = None  # noqa: leading-underscore  # upstream spelling, or the public name is already taken
         else:
             pass
@@ -463,9 +465,12 @@ class ModelRunner(Generic[RequestDataInput]):
             else:
                 pass
             forward_batch, schedule_batch, is_prefill = built
+            # note (ratish): an engine sharing its process hands a waiting higher-priority engine the turn between phases, so no wait spans a whole step.
+            process_engines().yield_turn()
             batch_result = self.prepare_and_forward(
                 forward_batch, schedule_batch, scheduler_output.requests, is_prefill
             )
+            process_engines().yield_turn()
             if is_prefill:
                 self.post_prefill(
                     batch_result,
@@ -974,6 +979,20 @@ class ModelRunner(Generic[RequestDataInput]):
         next-forward GPU token rail is published through SGLangExecutionBridge;
         async resolve must never stamp its lagged result onto a live batch."""
         host_token_ids = self.resolve_host_token_ids(batch_result)
+        device_token_ids = batch_result.next_token_ids
+        if (
+            host_token_ids is None
+            and process_engines().is_shared
+            and isinstance(device_token_ids, torch.Tensor)
+            and device_token_ids.is_cuda
+        ):
+            # note (ratish): the output processor reads these ids on the host, so in a shared process the wait for the step gives the turn up first.
+            with process_engines().released():
+                torch.get_device_module(device_token_ids.device).current_stream(
+                    device_token_ids.device
+                ).synchronize()
+        else:
+            pass
         if host_token_ids is None:
             outputs = self.output_processor.process(batch_result, scheduler_output)
         else:

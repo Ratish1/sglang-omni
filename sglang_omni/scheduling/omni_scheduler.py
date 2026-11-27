@@ -82,6 +82,7 @@ from sglang_omni.admission import (
 )
 from sglang_omni.model_runner.base import ModelRunner, PendingStep
 from sglang_omni.model_runner.model_worker import ModelWorker
+from sglang_omni.model_runner.process_engines import process_engines
 from sglang_omni.model_runner.weight_checker import WeightCheckResult
 from sglang_omni.pipeline.stage.stream_queue import StreamItem
 from sglang_omni.platforms import current_platform
@@ -362,6 +363,7 @@ class OmniScheduler(Generic[RequestDataT]):
     previous_pending_decode: PendingDecode | None = None
     async_decode_resolve_before_prefill: bool = False
     early_request_builds: bool = False
+    shared_process_priority: Literal["top", "lowest"] = "lowest"
     draft_worker: BaseSpecWorker | None = None
     async_prefill: bool = False
     request_build_admission_wait_s: float = _REQUEST_BUILD_ADMISSION_WAIT_S
@@ -529,6 +531,7 @@ class OmniScheduler(Generic[RequestDataT]):
         self.async_prefill = async_prefill
         # note (ratish): a stage can prioritize compute when sharing the device with other work.
         self.should_run_top_priority_stream = should_run_top_priority_stream
+        self.engine_context = runtime_context.get_context()
         if request_build_admission_wait_s < 0:
             raise ValueError("request_build_admission_wait_s must be nonnegative")
         else:
@@ -1744,7 +1747,8 @@ class OmniScheduler(Generic[RequestDataT]):
                 self.pending_request_builds or self.pending_request_admissions
             )
         if request_admission_pending:
-            time.sleep(0.0001)
+            with process_engines().released():
+                time.sleep(0.0001)
             return
         else:
             pass
@@ -1756,7 +1760,8 @@ class OmniScheduler(Generic[RequestDataT]):
         else:
             pass
         try:
-            self.idle_wait_message = self.inbox.get(timeout=_IDLE_WAIT_S)
+            with process_engines().released():
+                self.idle_wait_message = self.inbox.get(timeout=_IDLE_WAIT_S)
         except _queue_mod.Empty:
             self.idle_wait_message = None
 
@@ -3002,7 +3007,8 @@ class OmniScheduler(Generic[RequestDataT]):
 
     def process_batch_result(self, batch, result) -> None:
         if self.enable_overlap and batch.forward_mode.is_extend():
-            result.copy_done.synchronize()
+            with process_engines().released():
+                result.copy_done.synchronize()
             self.emit_prefill_end_for_batch(batch)
         else:
             pass
@@ -3729,7 +3735,23 @@ class OmniScheduler(Generic[RequestDataT]):
             else:
                 self.scheduler_thread_id = threading.get_ident()
                 self.running = True
+        with process_engines().hold(
+            self.engine_context,
+            priority=1 if self.shared_process_priority == "top" else 0,
+        ):
+            self.run_serving_loop()
+
+    def run_serving_loop(self) -> None:
         model_path_status = "error"
+        if self.should_run_top_priority_stream:
+            loop_priority: int | None = self.device_module.Stream.priority_range()[1]
+        elif process_engines().is_shared:
+            # note (ratish): engines sharing a process share its context, so the talker's steps go first on the card.
+            loop_priority = self.device_module.Stream.priority_range()[
+                1 if self.shared_process_priority == "top" else 0
+            ]
+        else:
+            loop_priority = None
         try:
             if self.enable_overlap:
                 if self.model_runner is None:
@@ -3766,10 +3788,8 @@ class OmniScheduler(Generic[RequestDataT]):
                 else:
                     raise RuntimeError("Unable to allocate a distinct schedule stream")
                 loop_stream_context = self.device_module.stream(self.schedule_stream)
-            elif self.should_run_top_priority_stream:
-                loop_stream = self.device_module.Stream(
-                    priority=self.device_module.Stream.priority_range()[1]
-                )
+            elif loop_priority is not None:
+                loop_stream = self.device_module.Stream(priority=loop_priority)
                 # note (ratish): a new stream does not wait for the default stream, so
                 # the loop's stream waits once for the work it holds.
                 loop_stream.wait_stream(self.device_module.current_stream())
@@ -3889,7 +3909,11 @@ class OmniScheduler(Generic[RequestDataT]):
             self.enable_overlap
             or (
                 self.scheduler_thread_id is not None
-                and (bridge is not None or self.tp_size > 1)
+                and (
+                    bridge is not None
+                    or self.tp_size > 1
+                    or process_engines().is_shared
+                )
             )
         ):
             # note (Richard Wang): every TP rank must drop a request in the same
@@ -4692,7 +4716,8 @@ class OmniScheduler(Generic[RequestDataT]):
             self.process_input_requests(recv_reqs)
             if self._engine_paused:  # noqa: leading-underscore
                 self.process_admin_requests()
-                time.sleep(0.001)
+                with process_engines().released():
+                    time.sleep(0.001)
                 continue
             else:
                 pass
@@ -4743,7 +4768,8 @@ class OmniScheduler(Generic[RequestDataT]):
                 self._engine_paused
             ):  # noqa: leading-underscore  # native scheduler contract
                 self.resolve_pending_async()
-                time.sleep(0.001)
+                with process_engines().released():
+                    time.sleep(0.001)
                 continue
             else:
                 pass
@@ -4893,7 +4919,8 @@ class OmniScheduler(Generic[RequestDataT]):
     def synchronize_launched_decode(self) -> None:
         pending_decode = self.async_pending
         if pending_decode is not None:
-            pending_decode.device_step.event.synchronize()
+            with process_engines().released():
+                pending_decode.device_step.event.synchronize()
         else:
             pass
 
@@ -4912,8 +4939,9 @@ class OmniScheduler(Generic[RequestDataT]):
             device_steps.append(pending_decode.device_step)
         else:
             pass
-        for launched_step in device_steps:
-            launched_step.event.synchronize()
+        with process_engines().released():
+            for launched_step in device_steps:
+                launched_step.event.synchronize()
 
     def resolve_and_process(
         self, batch, sched_output, pending_step, *, is_device_ready: bool = False
@@ -5139,6 +5167,7 @@ class OmniScheduler(Generic[RequestDataT]):
         else:
             pass
         while self.running:
+            process_engines().yield_turn()
             self.process_admin_requests()
             recv_reqs = self.recv_requests()
             recv_reqs.extend(self.take_deferred_request_payloads())
@@ -5146,10 +5175,12 @@ class OmniScheduler(Generic[RequestDataT]):
             if self._engine_paused:  # noqa: leading-underscore
                 self.process_admin_requests()
                 self.resolve_pending_async()
-                time.sleep(0.001)
+                with process_engines().released():
+                    time.sleep(0.001)
                 continue
             else:
                 pass
+            process_engines().yield_turn()
 
             if (
                 self.async_pending is not None
@@ -5173,12 +5204,15 @@ class OmniScheduler(Generic[RequestDataT]):
 
             batch = self.get_next_batch_to_run()
             self.cur_batch = batch
+            process_engines().yield_turn()
 
             # Route through sync when the runner's collect has a sync-only
             # fallback (default True for runners not overriding lookahead_eligible).
             runner = self.model_runner
+            # note (ratish): in a shared process the other engine's kernels fill this one's host gaps, and the next step's setup waits on the launched one inside SGLang (decode mrope deltas), which would hold the turn through it.
             use_lookahead = (
                 batch is not None
+                and not process_engines().is_shared
                 and (
                     (
                         len(batch.reqs) >= self.async_decode_min_batch_size
@@ -5201,6 +5235,7 @@ class OmniScheduler(Generic[RequestDataT]):
                         scheduler_output=sched_output,
                         device_step=pending_step,
                     )
+                    process_engines().yield_turn()
                     if prev_pending is not None:
                         if self.session_bridge is not None:
                             self.previous_pending_decode = prev_pending
@@ -5240,6 +5275,7 @@ class OmniScheduler(Generic[RequestDataT]):
                     pass
                 if batch:
                     result = self.run_batch(batch)
+                    process_engines().yield_turn()
                     if result is not _FAILED_BATCH_RESULT:
                         self.process_batch_result(batch, result)
                     else:

@@ -16,6 +16,7 @@ from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils.common import async_h2d
 from typing_extensions import Unpack
 
+from sglang_omni.model_runner.process_engines import process_engines
 from sglang_omni.models.qwen3_omni.config import TALKER_START_MIN_CHUNKS
 from sglang_omni.models.qwen3_omni.payload_types import NO_SPEECH
 from sglang_omni.pipeline.stage.stream_queue import StreamItem
@@ -58,6 +59,8 @@ class QwenTalkerScheduler(OmniScheduler[SGLangARRequestData]):
 
     excluded_row_steps: int = 0
     excluded_batch: ScheduleBatch | None = None
+    awaits_thinker_text: bool = False
+    shared_process_priority = "top"
 
     def __init__(
         self,
@@ -139,14 +142,32 @@ class QwenTalkerScheduler(OmniScheduler[SGLangARRequestData]):
         del request_id, chunk
         return self.enable_partial_start
 
+    def get_next_batch_to_run(self) -> ScheduleBatch | None:
+        self.awaits_thinker_text = False
+        batch = super().get_next_batch_to_run()
+        # note (ratish): requests still waiting after selection wait for talker capacity, so the talker is the bottleneck and keeps its turn.
+        is_backlogged = bool(self.waiting_queue)
+        process_engines().expedite(self.engine_context, is_expedited=is_backlogged)
+        # note (ratish): otherwise a row waiting on the thinker's text makes the thinker's next step this stream's first audio, so the talker goes after it.
+        process_engines().defer(
+            self.engine_context,
+            is_deferring=self.awaits_thinker_text and not is_backlogged,
+        )
+        return batch
+
     def update_running_batch(self, batch: ScheduleBatch) -> ScheduleBatch | None:
         """Decode the rows whose next input has arrived; the others are excluded from the step and keep their KV."""
         ready_rows = self.model_runner.ready_decode_rows(batch)
+        ready = set(ready_rows)
+        self.awaits_thinker_text = any(
+            self.model_runner.data_awaits_thinker_text(request.omni_data)
+            for row_index, request in enumerate(batch.reqs)
+            if row_index not in ready
+        )
         if len(ready_rows) == batch.batch_size():
             return super().update_running_batch(batch)
         else:
             pass
-        ready = set(ready_rows)
         excluded_rows: list[int] = []
         for row_index, request in enumerate(batch.reqs):
             if row_index in ready:

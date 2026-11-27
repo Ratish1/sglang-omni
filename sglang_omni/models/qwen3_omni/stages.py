@@ -1269,7 +1269,11 @@ def create_sglang_thinker_executor_from_config(
     from sglang_omni.platforms import current_platform
 
     if current_platform.is_cuda():
-        prefill_graph_backend = CudaGraphBackend.BREAKABLE
+        prefill_graph_backend = CudaGraphBackend.FULL
+        server_args_overrides = {
+            **(server_args_overrides or {}),
+            "cuda_graph_config": {"prefill": {"full_prefill_max_req": 64}},
+        }
     else:
         prefill_graph_backend = CudaGraphBackend.DISABLED
     server_args_overrides = disable_torch_compile_on_npu(server_args_overrides)
@@ -1380,6 +1384,7 @@ def create_sglang_thinker_executor_from_config(
     validate_generation_batch_policy(
         model_name="Qwen3-Omni thinker",
         server_args=server_args,
+        allowed_prefill_backends=(CudaGraphBackend.BREAKABLE, CudaGraphBackend.FULL),
     )
     if total_gpu_memory_fraction is None:
         from sglang_omni.scheduling.stage_kv_budget import peek_stage_kv_cache_bytes

@@ -95,7 +95,7 @@ def test_qwen_worker_cpu_policy_and_fallback(
             replica_topology=prep.replica_topology,
         )
         apply_cpu_thread_plan(groups)
-        process_count = (6 if colocated else 7) + replicas - 1
+        process_count = (5 if colocated else 7) + replicas - 1
         fallback_threads = max(1, cpu_quota // process_count)
         assert sum(group.process_count for group in groups) == process_count
         assert f"fallback_threads_per_process={fallback_threads}" in caplog.text
@@ -149,8 +149,9 @@ def test_colocated_topology_is_opt_in_and_uses_one_gpu() -> None:
         "code2wav",
     ):
         assert make_stage(config, stage_name).gpu == 0
-    for stage_name in ("image_encoder", "audio_encoder", "thinker", "talker_ar"):
+    for stage_name in ("image_encoder", "audio_encoder", "talker_ar"):
         assert make_stage(config, stage_name).process == stage_name
+    assert make_stage(config, "thinker").process == "talker_ar"
     assert make_stage(config, "code2wav").process == "talker_ar"
 
 
@@ -217,9 +218,8 @@ def test_colocated_config_passes_with_explicit_budgets_without_ar_mem_fraction()
         "preprocessing",
         "image_encoder",
         "audio_encoder",
-        "thinker",
-        "decode",
         "talker_ar",
+        "decode",
     ]
 
 
