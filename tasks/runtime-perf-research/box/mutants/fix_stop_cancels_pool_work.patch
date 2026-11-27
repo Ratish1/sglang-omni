@@ -1,0 +1,13 @@
+diff --git a/sglang_omni/models/qwen3_omni/stages.py b/sglang_omni/models/qwen3_omni/stages.py
+index 63655bb4f..fc6770ce0 100644
+--- a/sglang_omni/models/qwen3_omni/stages.py
++++ b/sglang_omni/models/qwen3_omni/stages.py
+@@ -1119,7 +1119,7 @@ class PreprocessingScheduler(SimpleScheduler[StagePayload, StagePayload]):
+             self.frame_pool.decode_executor,
+             self.frame_pool.frame_executor,
+         ):
+-            executor.shutdown(wait=False)
++            executor.shutdown(wait=False, cancel_futures=True)
+
+     def run_single(self, msg: IncomingMessage, loop: asyncio.AbstractEventLoop) -> None:
+         request_inputs = read_request_inputs(msg.data)

@@ -1,0 +1,17 @@
+diff --git a/sglang_omni/preprocessing/video.py b/sglang_omni/preprocessing/video.py
+index b931079d9..b725639d6 100644
+--- a/sglang_omni/preprocessing/video.py
++++ b/sglang_omni/preprocessing/video.py
+@@ -479,11 +479,7 @@ def read_video_torchcodec(
+     """The qwen-vl-utils torchcodec reader's frames (T, C, H, W) and sample fps, keyframe groups split across decoders sharing decode_threads FFmpeg threads, on frame_pool when given."""
+     video_path = str(video_options["video"])
+     # note (ratish): every video running on a frame pool opens a reader, so there a reader keeps to its video's share of FFmpeg threads, and at least one, since torchcodec reads 0 as FFmpeg's own count.
+-    reader_thread_count = (
+-        reader_ffmpeg_threads()
+-        if frame_pool is None
+-        else min(reader_ffmpeg_threads(), max(decode_threads, 1))
+-    )
++    reader_thread_count = reader_ffmpeg_threads()
+     first_decoder = VideoDecoder(video_path, num_ffmpeg_threads=reader_thread_count)
+     video_fps = first_decoder.metadata.average_fps
+     start_frame, end_frame, total_frames = qwen_vision.calculate_video_frame_range(

@@ -1,0 +1,13 @@
+diff --git a/sglang_omni/models/qwen3_omni/stages.py b/sglang_omni/models/qwen3_omni/stages.py
+index 63655bb4f..0be1e2c85 100644
+--- a/sglang_omni/models/qwen3_omni/stages.py
++++ b/sglang_omni/models/qwen3_omni/stages.py
+@@ -1070,7 +1070,7 @@ class PreprocessingScheduler(SimpleScheduler[StagePayload, StagePayload]):
+         # note (ratish): the threads share one preprocessor, since the Transformers 5.19 HF processor writes none of its own state while it runs and its tokenizer keeps one padding and truncation setting.
+         self.preprocessor = preprocessor
+         # note (ratish): a running video decodes on at least one of the stage's CPUs, so videos past them would only hold their frames while they wait for one.
+-        video_worker_count = min(video_request_worker_count, stage_cpu_count)
++        video_worker_count = video_request_worker_count
+         # note (ratish): Linux keeps 15 bytes of a thread's name, so the video lane's pools take short prefixes that stay apart in top and traces.
+         self.video_executor = ThreadPoolExecutor(
+             max_workers=video_worker_count,

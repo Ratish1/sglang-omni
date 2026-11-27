@@ -80,7 +80,9 @@ MODELS = {
     # note (ratish): the CI's Video-MME speech pipeline on one card, for a host with one H200.
     "omni_ci_onecard": {
         "path": "Qwen/Qwen3-Omni-30B-A3B-Instruct",
-        "config": str(Path(__file__).resolve().parent / "qwen3_omni_speech_onecard_h200.yaml"),
+        "config": str(
+            Path(__file__).resolve().parent / "qwen3_omni_speech_onecard_h200.yaml"
+        ),
         "placement": "--image_encoder.gpu {card} --audio_encoder.gpu {card} --thinker.gpu {card} "
         "--talker_ar.gpu {card} --code2wav.gpu {card} "
         "--preprocessing.factory.max_seq_len 32768 --thinker.factory.max_seq_len 32768",
@@ -747,6 +749,11 @@ def main() -> None:
     parser.add_argument("--nsys-seconds", type=float, default=10.0)
     parser.add_argument("--serve-extra", default="")
     parser.add_argument(
+        "--server-cpus",
+        default="",
+        help="taskset CPU list for the server alone, so the benchmark clients run outside a small host's CPUs",
+    )
+    parser.add_argument(
         "--probe",
         action="store_true",
         help="boot with hop_probe (queue hops, loop lag, GC) writing to <out>/probe/p.<pid>.jsonl",
@@ -880,6 +887,10 @@ def main() -> None:
             ),
             *serve,
         ]
+    else:
+        pass
+    if args.server_cpus:
+        serve = ["taskset", "-c", args.server_cpus, *serve]
     else:
         pass
     (out / "identity.txt").write_text(
