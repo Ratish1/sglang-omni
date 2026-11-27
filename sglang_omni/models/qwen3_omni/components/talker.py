@@ -869,6 +869,7 @@ class Qwen3OmniTalker(nn.Module):
                 if layer_index > 0
             ]
             if environ.get("OMNI_NATIVE_LAYER_FRAMES")
+            or environ.get("OMNI_NATIVE_ALL_LAYER_FRAMES") == "1"
             else []
         )
         hidden_size = config.text_config.hidden_size

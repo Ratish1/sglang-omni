@@ -77,11 +77,16 @@ def main(
     continuation_target: Path | None,
     continuation_sequences: list[int],
     layer_frames: list[int],
+    all_layer_frames: bool,
     conditioning_reference: list[Path],
     qk_trial: str | None,
     qk_restore_query: list[str],
 ) -> None:
     assert all(frame > 0 for frame in layer_frames)
+    if all_layer_frames:
+        assert not layer_frames and qk_trial is None
+    else:
+        pass
     assert (code_trial_reference is None) == (not code_trial_choice)
     if code_trial_reference is not None:
         assert not attention_trial_sequences
@@ -181,6 +186,7 @@ def main(
             "OMNI_NATIVE_TRAJECTORY_DIRECTORY": str(captures),
             "OMNI_NATIVE_TRAJECTORY_SAMPLES": ",".join(selected_samples),
             "OMNI_NATIVE_LAYER_FRAMES": ",".join(str(frame) for frame in layer_frames),
+            "OMNI_NATIVE_ALL_LAYER_FRAMES": "1" if all_layer_frames else "0",
             "OMNI_NATIVE_QK_TRIAL": qk_trial or "",
             "OMNI_NATIVE_QK_RESTORE_QUERY": ",".join(qk_restore_query),
             "OMNI_NATIVE_CONDITIONING_REFERENCES": json.dumps(
@@ -281,6 +287,14 @@ def main(
         else:
             pass
         assert len(report["frames"]) == len(report["output_ids"])
+        if all_layer_frames:
+            captured_layers = [
+                frame["captured_layers"] for frame in report["frames"][1:]
+            ]
+            assert captured_layers and min(captured_layers) > 0
+            assert len(set(captured_layers)) == 1
+        else:
+            pass
         for sequence_tokens in attention_trial_sequences:
             assert (
                 captures
@@ -321,6 +335,7 @@ if __name__ == "__main__":
     parser.add_argument("--client-concurrency", type=int, default=32)
     parser.add_argument("--gpu-index", type=int, default=0)
     parser.add_argument("--layer-frames", type=int, nargs="+", default=[])
+    parser.add_argument("--all-layer-frames", action="store_true")
     parser.add_argument("--conditioning-reference", type=Path, nargs="+", default=[])
     parser.add_argument(
         "--qk-trial", choices=("control", "checkpoint", "fused_checkpoint")
@@ -356,6 +371,7 @@ if __name__ == "__main__":
         arguments.continuation_target,
         arguments.continuation_sequences,
         arguments.layer_frames,
+        arguments.all_layer_frames,
         arguments.conditioning_reference,
         arguments.qk_trial,
         arguments.qk_restore_query,

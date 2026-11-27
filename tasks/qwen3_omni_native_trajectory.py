@@ -39,6 +39,7 @@ class NativeTalkerTrajectory:
             if frame
         }
         assert all(frame > 0 for frame in self.layer_frames)
+        self.all_layer_frames = environ.get("OMNI_NATIVE_ALL_LAYER_FRAMES") == "1"
         self.attention_trial_sequences = {
             int(value)
             for value in environ.get("OMNI_NATIVE_ATTENTION_TRIAL_SEQUENCES", "").split(
@@ -138,6 +139,16 @@ class NativeTalkerTrajectory:
         else:
             pass
         assert self.directory.is_dir()
+        if self.all_layer_frames:
+            assert not (
+                self.code_trial
+                or self.cache_trials
+                or self.continuation_trial
+                or self.conditioning_trials
+                or self.attention_trial_sequences
+            )
+        else:
+            pass
 
     def paired_attention_forward(
         self,
@@ -372,7 +383,11 @@ class NativeTalkerTrajectory:
                             can_run_cuda_graph,
                         )
                     )
-                    if len(self.tensors[request.request_id]) - 1 in self.layer_frames:
+                    if (
+                        self.all_layer_frames
+                        or len(self.tensors[request.request_id]) - 1
+                        in self.layer_frames
+                    ):
                         probes = (
                             model_runner.model.native_layer_probe,
                             *model_runner.model.native_deeper_layer_probes,
@@ -488,6 +503,12 @@ class NativeTalkerTrajectory:
                 )
                 if is_prefill and request.request_id in self.conditioning_trials:
                     self.conditioning_trials[request.request_id].after_prefill(snapshot)
+                else:
+                    pass
+                if self.all_layer_frames:
+                    snapshot.update(
+                        {name: tensor.cpu() for name, tensor in snapshot.items()}
+                    )
                 else:
                     pass
             else:
