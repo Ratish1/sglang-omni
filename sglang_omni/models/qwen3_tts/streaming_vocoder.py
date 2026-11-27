@@ -2794,20 +2794,19 @@ class Qwen3TTSStreamingVocoderScheduler(
             return None
         else:
             pass
-        deadline = time.monotonic() + self.initial_batch_wait_s
+        # note (ratish): first chunks that arrive during a decode queue up behind it and batch there, so an idle worker takes what is queued and decodes now.
         while True:
             if isinstance(queued, Qwen3TTSWholeRequest):
                 self.whole_requests.append(queued)
                 return batch
             else:
                 batch.append(queued)
-            remaining = deadline - time.monotonic()
-            if len(batch) == self.initial_max_batch_size or remaining <= 0:
+            if len(batch) == self.initial_max_batch_size:
                 return batch
             else:
                 pass
             try:
-                queued = self.initial_queue.get(timeout=remaining)
+                queued = self.initial_queue.get_nowait()
             except queue.Empty:
                 return batch
             if queued is None:
