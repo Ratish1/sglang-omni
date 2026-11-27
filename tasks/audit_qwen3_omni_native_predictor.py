@@ -6,12 +6,14 @@ import json
 from dataclasses import asdict, dataclass
 from hashlib import sha256
 from pathlib import Path
+from typing import Literal
 
 import torch
 from compare_qwen3_omni_native_trajectories import validate
 
 from sglang_omni.config.manager import ConfigManager
 from sglang_omni.config.runtime import resolve_stage_factory_args
+from sglang_omni.models.qwen3_omni.components.talker import Qwen3OmniTalker
 from sglang_omni.models.qwen3_omni.stages import create_talker_ar_executor_from_config
 from sglang_omni.models.qwen3_omni.talker_model_runner import QwenTalkerModelRunner
 from sglang_omni.models.qwen3_omni.talker_scheduler import QwenTalkerScheduler
@@ -29,6 +31,134 @@ class FrameReplay:
     maximum_feedback_difference: float
     codes_sha256: str
     feedback_sha256: str
+
+
+@dataclass(kw_only=True)
+class BufferReuseCheck:
+    sample_id: str
+    frame_index: int
+    live_rows: int
+    execution: Literal["eager", "graph"]
+    changed_codes_after_previous_frame: int
+    changed_feedback_after_previous_frame: int
+    changed_codes_after_nan_fill: int
+    changed_feedback_after_nan_fill: int
+
+
+def predictor_snapshot(
+    model: Qwen3OmniTalker,
+    codes: torch.Tensor,
+    queries: torch.Tensor,
+    execution: Literal["eager", "graph"],
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if execution == "graph":
+        result = model.code_predictor_forward_single_token_graph(
+            layer0_codes=codes,
+            talker_hidden=queries,
+            batch_size=codes.shape[0],
+            code_dtype=codes.dtype,
+        )
+        assert result is not None
+    else:
+        result = model.code_predictor_forward_incremental_eager(codes, queries)
+    return result[0].clone(), result[1].clone()
+
+
+def check_buffer_reuse(
+    model: Qwen3OmniTalker,
+    directories: list[Path],
+    device: torch.device,
+    output: Path,
+) -> None:
+    fused = model.predictor_fused_layers
+    assert fused is not None
+    scratch = (
+        model.predictor_input_buffer,
+        model.predictor_k_cache,
+        model.predictor_v_cache,
+        model.output_embeds,
+        fused.q,
+        fused.attention_output,
+        fused.residual,
+        fused.activated,
+        fused.partials,
+        fused.sum_sq_partials,
+    )
+    checks: list[BufferReuseCheck] = []
+    for directory in directories:
+        frames = validate(directory)[:-1]
+        queries = torch.stack(
+            [frame["predictor_query"].reshape(1, -1) for frame in frames]
+        ).to(device)
+        codes = torch.stack([frame["codec_ids"][:1] for frame in frames]).to(device)
+        for live_rows in range(1, model.predictor_input_buffer.shape[0] + 1):
+            for frame_index in range(len(frames)):
+                indices = (torch.arange(live_rows, device=device) + frame_index) % len(
+                    frames
+                )
+                current_queries = queries[indices]
+                current_codes = codes[indices]
+                previous_indices = (indices + 1) % len(frames)
+                for execution in ("eager", "graph"):
+                    assert not fused.counters.count_nonzero()
+                    for buffer in scratch:
+                        buffer.zero_()
+                    expected_codes, expected_feedback = predictor_snapshot(
+                        model, current_codes, current_queries, execution
+                    )
+                    predictor_snapshot(
+                        model,
+                        codes[previous_indices],
+                        queries[previous_indices],
+                        execution,
+                    )
+                    after_codes, after_feedback = predictor_snapshot(
+                        model, current_codes, current_queries, execution
+                    )
+                    assert not fused.counters.count_nonzero()
+                    # note (ratish): only overwritten scratch is poisoned, never the live synchronization counters.
+                    for buffer in scratch:
+                        buffer.fill_(float("nan"))
+                    poisoned_codes, poisoned_feedback = predictor_snapshot(
+                        model, current_codes, current_queries, execution
+                    )
+                    assert torch.isfinite(poisoned_feedback).all()
+                    assert not fused.counters.count_nonzero()
+                    assert torch.equal(current_queries, queries[indices])
+                    assert torch.equal(current_codes, codes[indices])
+                    check = BufferReuseCheck(
+                        sample_id=directory.name,
+                        frame_index=frame_index,
+                        live_rows=live_rows,
+                        execution=execution,
+                        changed_codes_after_previous_frame=int(
+                            after_codes.ne(expected_codes).sum()
+                        ),
+                        changed_feedback_after_previous_frame=int(
+                            after_feedback.ne(expected_feedback).sum()
+                        ),
+                        changed_codes_after_nan_fill=int(
+                            poisoned_codes.ne(expected_codes).sum()
+                        ),
+                        changed_feedback_after_nan_fill=int(
+                            poisoned_feedback.ne(expected_feedback).sum()
+                        ),
+                    )
+                    checks.append(check)
+                    assert not any(
+                        (
+                            check.changed_codes_after_previous_frame,
+                            check.changed_feedback_after_previous_frame,
+                            check.changed_codes_after_nan_fill,
+                            check.changed_feedback_after_nan_fill,
+                        )
+                    ), asdict(check)
+            with (output / "buffer-reuse.json").open("w") as report:
+                json.dump({"checks": [asdict(check) for check in checks]}, report)
+            print(
+                f"Buffer reuse passed: {directory.name}, live rows {live_rows}",
+                flush=True,
+            )
 
 
 def load_native_talker(
@@ -215,6 +345,15 @@ def main(arguments: argparse.Namespace) -> None:
                 ),
                 flush=True,
             )
+    if arguments.check_buffer_reuse:
+        assert all(
+            not row.changed_codebooks and row.changed_feedback_values == 0
+            for sample in comparisons.values()
+            for row in sample.values()
+        ), "Native capture replay must match before buffer reuse checks"
+        check_buffer_reuse(model, arguments.capture, device, arguments.output)
+    else:
+        pass
     torch.distributed.destroy_process_group()
 
 
@@ -226,6 +365,7 @@ if __name__ == "__main__":
     parser.add_argument("--capture", type=Path, action="append", required=True)
     parser.add_argument("--gpu", type=int, required=True)
     parser.add_argument("--fixed-batch-rows", type=int)
+    parser.add_argument("--check-buffer-reuse", action="store_true")
     main(parser.parse_args())
 else:
     pass
