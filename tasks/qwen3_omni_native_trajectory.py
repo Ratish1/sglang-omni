@@ -290,6 +290,9 @@ class NativeTalkerTrajectory:
                     "generation_steps": request.data.generation_steps,
                     "thinker_done": request.data.thinker_chunks_done,
                     "qk_trial": environ.get("OMNI_NATIVE_QK_TRIAL", ""),
+                    "attention_precision_trial": environ.get(
+                        "OMNI_NATIVE_ATTENTION_PRECISION_TRIAL", ""
+                    ),
                 }
                 if is_prefill:
                     assert prefill_embeddings is not None
@@ -383,6 +386,43 @@ class NativeTalkerTrajectory:
                             can_run_cuda_graph,
                         )
                     )
+                    precision_trial = (
+                        model_runner.model.native_attention_precision_trial
+                    )
+                    if precision_trial is not None:
+                        selected = precision_trial.selected_rows.cpu()
+                        expected = torch.tensor(
+                            [
+                                precision_trial.mode == "scalar"
+                                and peer.request_id in precision_trial.request_ids
+                                for peer in requests
+                            ],
+                            dtype=torch.bool,
+                        )
+                        assert torch.equal(selected[: len(requests)], expected)
+                        assert not bool(selected[len(requests) :].any())
+                        assert bool(
+                            precision_trial.unchanged_unselected[
+                                :, : len(requests)
+                            ].all()
+                        )
+                        probes = (
+                            model_runner.model.native_layer_probe,
+                            *model_runner.model.native_deeper_layer_probes,
+                        )
+                        assert len(probes) == len(pool.k_buffer)
+                        for layer_index, probe in enumerate(probes):
+                            source = probe.snapshot_for_batch(
+                                metadata["graph_batch_rows"], can_run_cuda_graph
+                            )
+                            for name in ("query_after_rope", "attention_context"):
+                                snapshot[f"layer{layer_index}_{name}"] = (
+                                    source[name][request_row].detach().clone()
+                                )
+                        metadata["precision_captured_layers"] = len(probes)
+                        metadata["unselected_attention_unchanged"] = True
+                    else:
+                        pass
                     if (
                         self.all_layer_frames
                         or len(self.tensors[request.request_id]) - 1

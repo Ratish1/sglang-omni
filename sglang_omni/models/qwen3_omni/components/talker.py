@@ -9,6 +9,7 @@ from os import environ
 from typing import Iterable, Optional, Tuple
 
 import torch
+from qwen3_omni_attention_precision_trial import NativeAttentionPrecisionTrial
 from qwen3_omni_native_layer_probe import NativeLayerProbe
 from qwen3_omni_native_qk_trial import NativeQkTrial
 from sglang.kernels.fused_op import get_fused_op_backend
@@ -856,6 +857,28 @@ class Qwen3OmniTalker(nn.Module):
                 get_schedule().max_running_requests,
                 device,
                 [layer.self_attn for layer in self.model.layers],
+            )
+        else:
+            pass
+        attention_precision_mode = environ.get("OMNI_NATIVE_ATTENTION_PRECISION_TRIAL")
+        self.native_attention_precision_trial: NativeAttentionPrecisionTrial | None = (
+            None
+        )
+        if attention_precision_mode:
+            assert attention_precision_mode in ("control", "scalar")
+            assert not normalization_mode
+            assert environ.get("OMNI_NATIVE_CONDITIONING_REFERENCES")
+            self.native_attention_precision_trial = NativeAttentionPrecisionTrial(
+                attention_precision_mode,
+                {
+                    f"feedback-trace-native-{sample_id}"
+                    for sample_id in environ["OMNI_NATIVE_TRAJECTORY_SAMPLES"].split(
+                        ","
+                    )
+                },
+                get_schedule().max_running_requests,
+                device,
+                [layer.self_attn.attn for layer in self.model.layers],
             )
         else:
             pass

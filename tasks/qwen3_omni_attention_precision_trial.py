@@ -106,6 +106,9 @@ class NativeAttentionPrecisionTrial:
             max_batch_rows, device=device, dtype=torch.bool
         )
         self.buffers: dict[tuple[int, int], PrecisionAttentionBuffers] = {}
+        self.unchanged_unselected: torch.Tensor = torch.ones(
+            (len(attentions), max_batch_rows), device=device, dtype=torch.bool
+        )
         assert request_ids and attentions
         for layer_index, attention in enumerate(attentions):
             assert attention.layer_id == layer_index
@@ -140,7 +143,7 @@ class NativeAttentionPrecisionTrial:
         assert isinstance(backend, FlashAttentionBackend)
         assert backend.fa_impl_ver == 3 and backend.page_size == 1
         assert not backend.use_mla and forward_batch.spec_info is None
-        assert layer.sliding_window_size == -1 and not layer.is_cross_attention
+        assert layer.sliding_window_size in (None, -1) and not layer.is_cross_attention
         assert layer.logit_cap == 0 and layer.scaling == layer.head_dim**-0.5
         metadata = backend.forward_metadata
         assert metadata.local_attn_metadata is None and metadata.max_seq_len_q == 1
@@ -173,4 +176,9 @@ class NativeAttentionPrecisionTrial:
             )
             .reshape_as(output)
         )
-        return torch.where(self.selected_rows[:batch_rows, None], reference, output)
+        selected = self.selected_rows[:batch_rows]
+        delivered = torch.where(selected[:, None], reference, output)
+        self.unchanged_unselected[layer.layer_id, :batch_rows].copy_(
+            selected | (delivered == output).all(dim=-1)
+        )
+        return delivered

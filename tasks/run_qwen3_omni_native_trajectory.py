@@ -81,6 +81,7 @@ def main(
     conditioning_reference: list[Path],
     qk_trial: str | None,
     qk_restore_query: list[str],
+    attention_precision_trial: str | None,
 ) -> None:
     assert all(frame > 0 for frame in layer_frames)
     if all_layer_frames:
@@ -121,6 +122,11 @@ def main(
         pass
     if qk_trial is not None:
         assert conditioning_reference and layer_frames
+    else:
+        pass
+    if attention_precision_trial is not None:
+        assert conditioning_reference and layer_frames
+        assert qk_trial is None and not all_layer_frames
     else:
         pass
     if qk_restore_query:
@@ -188,6 +194,7 @@ def main(
             "OMNI_NATIVE_LAYER_FRAMES": ",".join(str(frame) for frame in layer_frames),
             "OMNI_NATIVE_ALL_LAYER_FRAMES": "1" if all_layer_frames else "0",
             "OMNI_NATIVE_QK_TRIAL": qk_trial or "",
+            "OMNI_NATIVE_ATTENTION_PRECISION_TRIAL": attention_precision_trial or "",
             "OMNI_NATIVE_QK_RESTORE_QUERY": ",".join(qk_restore_query),
             "OMNI_NATIVE_CONDITIONING_REFERENCES": json.dumps(
                 [str(reference) for reference in conditioning_reference]
@@ -337,6 +344,7 @@ if __name__ == "__main__":
     parser.add_argument("--layer-frames", type=int, nargs="+", default=[])
     parser.add_argument("--all-layer-frames", action="store_true")
     parser.add_argument("--conditioning-reference", type=Path, nargs="+", default=[])
+    parser.add_argument("--attention-precision-trial", choices=("control", "scalar"))
     parser.add_argument(
         "--qk-trial", choices=("control", "checkpoint", "fused_checkpoint")
     )
@@ -375,6 +383,7 @@ if __name__ == "__main__":
         arguments.conditioning_reference,
         arguments.qk_trial,
         arguments.qk_restore_query,
+        arguments.attention_precision_trial,
     )
 else:
     pass
