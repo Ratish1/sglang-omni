@@ -1,3 +1,12 @@
+# Branch results: #4487 width ownership (11-27, node-radixark-16-0000, H200, GPU 0 only)
+
+The review `tasks/pr4487_e0aa2885/REVIEW.md` (P0: a payload landing after the first chunk resets the bumped first-chunk width). Fix on `dev/qwen3-tts-opening-width-latch`: the payload sets the width only while no codec frame has arrived (`7e69fe193`), and the any-count test goes through the chunk path and the first decode queue in both message orders (`cc8f927c3`).
+
+| Head | sglang_omni tree | Tests | `opening_burst.py`, 48 streamed Ryan/English CustomVoice 1.7B requests released together, per burst | Read |
+|---|---|---|---|---|
+| `cc8f927c3` fix | `e4e5228de` | 105 affected nodes: 158 passed, 1 skipped; device contract 2 passed; the new test fails on `e0aa2885a` in the payload-before-first-decode row (`[0.0]*4`) and on main `dfb6b43b3` in both rows | `max_new_tokens=3`, three rounds: 0 silent openings, all 3,840 samples, every first decode 2 frames, 16 per round finished by the engine before first dispatch, all 16 at width 2; trim off: 48 silent, 5,760 samples, width 1; `max_new_tokens=1`: 48 silent single frames (kept by design); `initial_codec_chunk_frames=4`, `max_new_tokens=8`, three rounds: every first decode 5 frames, 0 / 16 / 16 finished before dispatch, all at width 5; normal sentences: 0 silent, width 2; end: 0 active slots, 0 exhausted, 0 fallbacks | both orders of payload and first decode now give the compensated first chunk |
+| `e0aa2885a` PR head | `90c88252a` | | `max_new_tokens=3`, three rounds: 16 silent openings each, exactly the 16 that the engine finished before first dispatch, all at width 1 and 5,760 samples; the other 32 trimmed at width 2; override rounds: 9 / 16 / 16 of the 10 / 16 / 16 late requests at width 4 (compensating frame lost, no silence); controls as on the fix; end clean | reproduces the review's 16 of 48 and the second symptom |
+
 # Branch results: codec slot wait, #4077 (11-16, host-221, two H100s)
 
 Each head against main `ea8216220` at the same time on the two cards, orders swapped. RTF is fix against main.
