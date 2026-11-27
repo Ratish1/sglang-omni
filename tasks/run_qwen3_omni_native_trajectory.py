@@ -65,6 +65,7 @@ def main(
     tactic_cache: Path,
     selected_samples: list[str],
     client_concurrency: int,
+    gpu_index: int,
     mmsu: bool,
     attention_trial_sequences: list[int],
     attention_trial_splits: int,
@@ -166,7 +167,11 @@ def main(
             "qwen3-omni",
             "--config",
             "examples/configs/qwen3_omni_colocated_h200.yaml",
-            *(argument for stage in STAGES for argument in (f"--{stage}.gpu", "0")),
+            *(
+                argument
+                for stage in STAGES
+                for argument in (f"--{stage}.gpu", str(gpu_index))
+            ),
         ],
         output / "server.log",
         port,
@@ -314,6 +319,7 @@ if __name__ == "__main__":
     parser.add_argument("--mmsu", action="store_true")
     parser.add_argument("--selected-samples", nargs="+", default=list(SELECTED_SAMPLES))
     parser.add_argument("--client-concurrency", type=int, default=32)
+    parser.add_argument("--gpu-index", type=int, default=0)
     parser.add_argument("--layer-frames", type=int, nargs="+", default=[])
     parser.add_argument("--conditioning-reference", type=Path, nargs="+", default=[])
     parser.add_argument(
@@ -338,6 +344,7 @@ if __name__ == "__main__":
         arguments.tactic_cache,
         arguments.selected_samples,
         arguments.client_concurrency,
+        arguments.gpu_index,
         arguments.mmsu,
         arguments.attention_trial_sequences,
         arguments.attention_trial_splits,
