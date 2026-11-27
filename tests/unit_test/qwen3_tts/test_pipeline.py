@@ -7295,16 +7295,20 @@ def test_qwen3_tts_bootstrap_suppression_credits_only_emitted_audio(
     ) / float(scheduler.sample_rate)
 
 
-@pytest.mark.parametrize("is_finished_before_first_decode", [False, True])
+@pytest.mark.parametrize(
+    ("other_live_streams", "is_finished_before_first_decode"),
+    [(64, False), (0, True)],
+)
 def test_qwen3_tts_bootstrap_suppression_trims_the_first_chunk_at_any_stream_count(
     monkeypatch: pytest.MonkeyPatch,
+    other_live_streams: int,
     is_finished_before_first_decode: bool,
 ) -> None:
     """An eligible stream sent its silent opening frame first past 24 live streams, and at any count when its request finished before its first decode ran."""
     scheduler, _ = stateful_qwen3_tts_scheduler(monkeypatch)
     scheduler.initial_worker = object()
     scheduler.followup_worker = object()
-    for index in range(64):
+    for index in range(other_live_streams):
         scheduler.stream_states[str(index)] = scheduler.create_stream_state(str(index))
     payload = make_payload(inputs="target", params={"stream": True})
     payload.request_id = "request"
