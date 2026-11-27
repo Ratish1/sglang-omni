@@ -5,6 +5,7 @@ import argparse
 import json
 from dataclasses import asdict, dataclass
 from hashlib import sha256
+from os import environ
 from pathlib import Path
 from typing import Literal
 
@@ -227,6 +228,10 @@ def load_native_talker(
 @torch.inference_mode()
 def main(arguments: argparse.Namespace) -> None:
     arguments.output.mkdir()
+    environ["OMNI_NATIVE_TRAJECTORY_DIRECTORY"] = str(arguments.output)
+    environ["OMNI_NATIVE_TRAJECTORY_SAMPLES"] = ",".join(
+        directory.name for directory in arguments.capture
+    )
     device = torch.device("cuda", arguments.gpu)
     torch.cuda.set_device(device)
     scheduler = load_native_talker(
