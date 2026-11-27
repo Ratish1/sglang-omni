@@ -250,6 +250,77 @@ def main(root: Path) -> None:
         else:
             changed_rows = torch.empty(0, dtype=torch.long)
             changed_token_ids = []
+        layer_comparisons = []
+        prefix_codes_equal = True
+        prefix_keys_equal = True
+        prefix_values_equal = True
+        for frame_index, (left, right) in enumerate(zip(first, second)):
+            left_metadata = first_metadata["frames"][frame_index]
+            right_metadata = second_metadata["frames"][frame_index]
+            if (
+                "captured_layers" in left_metadata
+                and "captured_layers" in right_metadata
+            ):
+                assert (
+                    left_metadata["captured_layers"]
+                    == right_metadata["captured_layers"]
+                )
+                layer_changes = {}
+                for layer_index in range(left_metadata["captured_layers"]):
+                    prefix = f"layer{layer_index}_"
+                    fields = {
+                        name
+                        for name in left
+                        if name.startswith(prefix)
+                        and not name.startswith(f"{prefix}peer_")
+                    }
+                    assert fields == {
+                        name
+                        for name in right
+                        if name.startswith(prefix)
+                        and not name.startswith(f"{prefix}peer_")
+                    }
+                    changes = {}
+                    for name in sorted(fields):
+                        assert torch.isfinite(left[name]).all(), (
+                            frame_index,
+                            name,
+                            "first",
+                        )
+                        assert torch.isfinite(right[name]).all(), (
+                            frame_index,
+                            name,
+                            "second",
+                        )
+                        if not torch.equal(left[name], right[name]):
+                            changes[name.removeprefix(prefix)] = difference(
+                                left[name], right[name]
+                            )
+                        else:
+                            pass
+                    layer_changes[str(layer_index)] = changes
+                layer_comparisons.append(
+                    {
+                        "frame": frame_index,
+                        "prior_codes_equal": prefix_codes_equal,
+                        "prior_keys_equal": prefix_keys_equal,
+                        "prior_values_equal": prefix_values_equal,
+                        "consumed_input_equal": torch.equal(
+                            left["consumed_input"], right["consumed_input"]
+                        ),
+                        "codes_equal": torch.equal(
+                            left["codec_ids"], right["codec_ids"]
+                        ),
+                        "layers": layer_changes,
+                    }
+                )
+            else:
+                pass
+            prefix_codes_equal &= torch.equal(left["codec_ids"], right["codec_ids"])
+            prefix_keys_equal &= torch.equal(left["stored_keys"], right["stored_keys"])
+            prefix_values_equal &= torch.equal(
+                left["stored_values"], right["stored_values"]
+            )
         report[sample_id] = {
             "frames": [len(first), len(second)],
             "capture_sha256": [
@@ -264,6 +335,7 @@ def main(root: Path) -> None:
             "changed_prefill_rows": changed_rows.tolist(),
             "changed_prefill_token_ids": changed_token_ids,
             "first_differences": first_differences,
+            "layer_comparisons": layer_comparisons,
         }
     destination = root / "trajectory-comparison.json"
     with destination.open("x") as result:
