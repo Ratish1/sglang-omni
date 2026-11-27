@@ -9,6 +9,7 @@ from pathlib import Path
 import torch
 from compare_qwen3_omni_native_trajectories import difference, validate
 from replay_qwen3_omni_scheduler_bounds import physical_schedule
+from sglang.kernels.ops.attention.decode_attention import decode_attention_fwd_normal
 from sglang.kernels.ops.attention.flash_attention import flash_attn_with_kvcache
 
 
@@ -58,7 +59,47 @@ def reference_attention(
 
 
 @torch.inference_mode()
-def audit_precision(root: Path) -> None:
+def scalar_attention(
+    query: torch.Tensor,
+    keys: torch.Tensor,
+    values: torch.Tensor,
+    split_count: int,
+) -> torch.Tensor:
+    output = torch.empty_like(query, dtype=torch.float32)
+    sequence_tokens = keys.shape[0]
+    query_heads = query.shape[1]
+    head_channels = query.shape[2]
+    decode_attention_fwd_normal(
+        q=query.float(),
+        k_buffer=keys,
+        v_buffer=values,
+        o=output,
+        kv_indptr=torch.tensor(
+            [0, sequence_tokens], device=query.device, dtype=torch.int32
+        ),
+        kv_indices=torch.arange(
+            sequence_tokens, device=query.device, dtype=torch.int32
+        ),
+        attn_logits=torch.empty(
+            (1, query_heads, split_count, head_channels),
+            device=query.device,
+            dtype=torch.float32,
+        ),
+        attn_lse=torch.empty(
+            (1, query_heads, split_count), device=query.device, dtype=torch.float32
+        ),
+        num_kv_splits=torch.tensor(
+            [split_count], device=query.device, dtype=torch.int32
+        ),
+        max_kv_splits=split_count,
+        sm_scale_withk=head_channels**-0.5,
+        v_scale=1.0,
+    )
+    return output
+
+
+@torch.inference_mode()
+def audit_precision(root: Path, scalar_replay: bool) -> None:
     torch.set_num_threads(1)
     torch.backends.cuda.matmul.fp32_precision = "ieee"
     captures = sorted(root.glob("captures/*/trajectory.pt"))
@@ -123,14 +164,31 @@ def audit_precision(root: Path) -> None:
                 reference_norm = reference.norm()
                 assert reference_norm > 0
                 measurements = {}
-                for name, output in (
+                outputs = [
                     ("native", native),
                     ("final_bfloat16_store_only", reference.bfloat16()),
                     ("float32_attention", float_output),
                     ("float32_attention_bfloat16_store", float_output.bfloat16()),
                     ("normalized_probability_bfloat16_store", probability_output),
                     ("unnormalized_exponential_bfloat16_store", exponential_output),
-                ):
+                ]
+                if scalar_replay:
+                    for scalar_splits in (1, 2):
+                        scalar_output = scalar_attention(
+                            query, layer_keys, layer_values, scalar_splits
+                        )
+                        assert torch.equal(
+                            scalar_output,
+                            scalar_attention(
+                                query, layer_keys, layer_values, scalar_splits
+                            ),
+                        )
+                        outputs.append(
+                            (f"sglang_scalar_splits_{scalar_splits}", scalar_output)
+                        )
+                else:
+                    pass
+                for name, output in outputs:
                     assert torch.isfinite(output).all()
                     error = output.double() - reference
                     measurements[name] = {
@@ -166,11 +224,17 @@ def audit_precision(root: Path) -> None:
             }
         )
         print(json.dumps({"sample": capture.parent.name, "checks": len(comparisons)}))
-    with (root / "attention-precision-decomposition.json").open("x") as receipt:
+    filename = (
+        "attention-scalar-reference.json"
+        if scalar_replay
+        else "attention-precision-decomposition.json"
+    )
+    with (root / filename).open("x") as receipt:
         json.dump(
             {
                 "scope": "Held native operands only. Final BF16 rounding is separated from FP32 attention and two isolated probability-rounding formulas. The latter use dense FP64 arithmetic outside the named cast and do not recreate FA3's tiled online softmax. No native continuation, speech improvement or performance is measured.",
                 "fp32_matmul_precision": torch.backends.cuda.matmul.fp32_precision,
+                "scalar_replay": scalar_replay,
                 "captures": reports,
             },
             receipt,
@@ -347,12 +411,13 @@ if __name__ == "__main__":
     parser.add_argument("--all-layers", action="store_true")
     parser.add_argument("--fp64-reference", action="store_true")
     parser.add_argument("--precision-decomposition", action="store_true")
+    parser.add_argument("--scalar-replay", action="store_true")
     parser.add_argument("--gpu", type=int, default=0)
     arguments = parser.parse_args()
     torch.cuda.set_device(arguments.gpu)
-    if arguments.precision_decomposition:
+    if arguments.precision_decomposition or arguments.scalar_replay:
         assert not arguments.all_layers and not arguments.fp64_reference
-        audit_precision(arguments.root)
+        audit_precision(arguments.root, arguments.scalar_replay)
     elif arguments.all_layers:
         audit_layers(arguments.root, arguments.fp64_reference)
     elif arguments.fp64_reference:
