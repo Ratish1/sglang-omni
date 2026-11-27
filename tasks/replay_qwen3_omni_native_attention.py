@@ -58,6 +58,127 @@ def reference_attention(
 
 
 @torch.inference_mode()
+def audit_precision(root: Path) -> None:
+    torch.set_num_threads(1)
+    torch.backends.cuda.matmul.fp32_precision = "ieee"
+    captures = sorted(root.glob("captures/*/trajectory.pt"))
+    assert captures
+    reports = []
+    for capture in captures:
+        frames = validate(capture.parent)
+        steps = json.loads(capture.with_suffix(".json").read_text())["frames"]
+        keys = torch.cat([frame["stored_keys"] for frame in frames], dim=1).cuda()
+        values = torch.cat([frame["stored_values"] for frame in frames], dim=1).cuda()
+        comparisons = []
+        for frame_index, (frame, step) in enumerate(zip(frames, steps, strict=True)):
+            if frame_index == 0:
+                continue
+            else:
+                assert step["phase"] == "decode"
+            schedule = physical_schedule(
+                frame["attention_scheduler_metadata"], step["graph_batch_rows"]
+            )
+            split_count = int(schedule[0, step["request_row"]])
+            sequence_tokens = step["sequence_length"]
+            for layer_index in range(step.get("captured_layers", 1)):
+                query = frame[f"layer{layer_index}_query_after_rope"].cuda()
+                query = query.reshape(1, -1, keys.shape[-1])
+                layer_keys = keys[layer_index, :sequence_tokens]
+                layer_values = values[layer_index, :sequence_tokens]
+                native = replay_attention(query, layer_keys, layer_values, split_count)
+                expected = frame[f"layer{layer_index}_attention_context"]
+                assert torch.equal(native.cpu().flatten(), expected.flatten())
+                heads_per_group = query.shape[1] // layer_keys.shape[1]
+                expanded_keys = layer_keys.repeat_interleave(heads_per_group, dim=1)
+                expanded_values = layer_values.repeat_interleave(heads_per_group, dim=1)
+                scores = (
+                    torch.einsum("qhd,khd->hqk", query.double(), expanded_keys.double())
+                    * query.shape[-1] ** -0.5
+                )
+                probabilities = scores.softmax(-1)
+                reference = torch.einsum(
+                    "hqk,khd->qhd", probabilities, expanded_values.double()
+                )
+                assert torch.equal(
+                    reference.cpu(),
+                    reference_attention(query, layer_keys, layer_values),
+                )
+                float_scores = (
+                    torch.einsum("qhd,khd->hqk", query.float(), expanded_keys.float())
+                    * query.shape[-1] ** -0.5
+                )
+                float_output = torch.einsum(
+                    "hqk,khd->qhd", float_scores.softmax(-1), expanded_values.float()
+                )
+                rounded_probabilities = probabilities.bfloat16().double()
+                probability_output = torch.einsum(
+                    "hqk,khd->qhd", rounded_probabilities, expanded_values.double()
+                )
+                exponentials = (scores - scores.max(-1, keepdim=True).values).exp()
+                exponential_output = torch.einsum(
+                    "hqk,khd->qhd",
+                    exponentials.bfloat16().double(),
+                    expanded_values.double(),
+                ) / exponentials.sum(-1).transpose(0, 1).unsqueeze(-1)
+                reference_norm = reference.norm()
+                assert reference_norm > 0
+                measurements = {}
+                for name, output in (
+                    ("native", native),
+                    ("final_bfloat16_store_only", reference.bfloat16()),
+                    ("float32_attention", float_output),
+                    ("float32_attention_bfloat16_store", float_output.bfloat16()),
+                    ("normalized_probability_bfloat16_store", probability_output),
+                    ("unnormalized_exponential_bfloat16_store", exponential_output),
+                ):
+                    assert torch.isfinite(output).all()
+                    error = output.double() - reference
+                    measurements[name] = {
+                        "relative_l2_error": float(error.norm() / reference_norm),
+                        "maximum_absolute_error": float(error.abs().max()),
+                        "bfloat16_values_different_from_native": int(
+                            (output.bfloat16() != native).count_nonzero()
+                        ),
+                        "bfloat16_values_different_from_rounded_reference": int(
+                            (output.bfloat16() != reference.bfloat16()).count_nonzero()
+                        ),
+                    }
+                comparisons.append(
+                    {
+                        "frame": frame_index,
+                        "layer": layer_index,
+                        "sequence_tokens": sequence_tokens,
+                        "native_splits": split_count,
+                        "measurements": measurements,
+                    }
+                )
+        for field, actual in (("stored_keys", keys), ("stored_values", values)):
+            assert torch.equal(
+                actual.cpu(), torch.cat([frame[field] for frame in frames], dim=1)
+            )
+        reports.append(
+            {
+                "sample_id": capture.parent.name,
+                "capture_sha256": sha256(capture.read_bytes()).hexdigest(),
+                "native_replay_exact": True,
+                "cache_unchanged": True,
+                "comparisons": comparisons,
+            }
+        )
+        print(json.dumps({"sample": capture.parent.name, "checks": len(comparisons)}))
+    with (root / "attention-precision-decomposition.json").open("x") as receipt:
+        json.dump(
+            {
+                "scope": "Held native operands only. Final BF16 rounding is separated from FP32 attention and two isolated probability-rounding formulas. The latter use dense FP64 arithmetic outside the named cast and do not recreate FA3's tiled online softmax. No native continuation, speech improvement or performance is measured.",
+                "fp32_matmul_precision": torch.backends.cuda.matmul.fp32_precision,
+                "captures": reports,
+            },
+            receipt,
+            indent=2,
+        )
+
+
+@torch.inference_mode()
 def audit_layers(root: Path, fp64_reference: bool) -> None:
     torch.set_num_threads(1)
     captures = sorted(root.glob("captures/*/trajectory.pt"))
@@ -225,8 +346,14 @@ if __name__ == "__main__":
     parser.add_argument("root", type=Path)
     parser.add_argument("--all-layers", action="store_true")
     parser.add_argument("--fp64-reference", action="store_true")
+    parser.add_argument("--precision-decomposition", action="store_true")
+    parser.add_argument("--gpu", type=int, default=0)
     arguments = parser.parse_args()
-    if arguments.all_layers:
+    torch.cuda.set_device(arguments.gpu)
+    if arguments.precision_decomposition:
+        assert not arguments.all_layers and not arguments.fp64_reference
+        audit_precision(arguments.root)
+    elif arguments.all_layers:
         audit_layers(arguments.root, arguments.fp64_reference)
     elif arguments.fp64_reference:
         parser.error("--fp64-reference requires --all-layers")
