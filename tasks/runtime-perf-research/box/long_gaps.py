@@ -91,7 +91,7 @@ def gap_reads(boot: str, cell: str, low_ms: float, high_ms: float) -> list[dict]
                     "prefill_tokens": sum(
                         step.get("ext", 0)
                         for step in inside
-                        if step["mode"] != "DECODE"
+                        if step.get("mode", "DECODE") != "DECODE"
                     ),
                 }
             )
