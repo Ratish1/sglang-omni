@@ -35,7 +35,9 @@ ROW_BUCKETS = (
 )
 
 
-def load_records(boot: str, cell: str) -> tuple[list[dict], list[list], float, float]:
+def load_records(
+    boot: str, cell: str, kinds: tuple[str, ...] = ("tb", "tr")
+) -> tuple[list[dict], list[list], float, float]:
     with open(os.path.join(boot, cell, "window.json"), encoding="utf-8") as source:
         window = json.load(source)
     start_ns, end_ns = window["start"] * 1e9, window["end"] * 1e9
@@ -45,10 +47,7 @@ def load_records(boot: str, cell: str) -> tuple[list[dict], list[list], float, f
             for line in source:
                 item = json.loads(line)
                 if isinstance(item, dict):
-                    if (
-                        item.get("k") in ("tb", "tr")
-                        and start_ns <= item["ns"] <= end_ns
-                    ):
+                    if item.get("k") in kinds and start_ns <= item["ns"] <= end_ns:
                         events.append(item)
                     else:
                         pass

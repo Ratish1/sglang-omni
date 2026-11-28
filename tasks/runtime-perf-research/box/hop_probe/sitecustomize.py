@@ -20,6 +20,9 @@ clock of the request event recorder, so records join its events per request.
               ids, at the decode prep's start (QwenTalkerModelRunner.before_decode)
   kind "tr"   with OMNI_HOP_PROBE_TALKER_BATCHES=1, each talker step's result processing (decode and prefill): its
               forward mode and rows as it starts (ns0) and its end (ns), after the step's outputs reached the host
+  kind "te"   with OMNI_HOP_PROBE_TALKER_BATCHES=1, each talker decode batch update with a row not ready: its rows and,
+              per row not ready, its request id and what it waits for (its feedback row, its next text, the pad that
+              follows the thinker's last text)
   kind "req"  with OMNI_HOP_PROBE_TALKER_BATCHES=1, each Qwen3-Omni request at preprocessing: its id and the text of
               its last message, which joins a benchmark sample to its request id
   kind "ts"   with OMNI_HOP_PROBE_THINKER_STEPS=1, each thinker step run on the synchronous path (prefill, mixed, and
@@ -526,9 +529,43 @@ def patch_talker_runner(module):
     runner.before_decode = before_decode_recorded
 
 
+def talker_row_wait(data):
+    if data is None:
+        return "data"
+    elif not data.pending_feedback_queue:
+        return "feedback"
+    elif data.pending_text_queue:
+        return None
+    elif not data.thinker_chunks_done:
+        return "text"
+    elif data.tts_pad_embed is None:
+        return "pad"
+    else:
+        return None
+
+
 def patch_talker_scheduler(module):
     scheduler = module.QwenTalkerScheduler
     process = scheduler.process_batch_result
+    update_running_batch = scheduler.update_running_batch
+
+    @functools.wraps(update_running_batch)
+    def update_running_batch_recorded(self, batch):
+        if getattr(self.model_runner, "feedback_enabled", False):
+            waits = [
+                [request.rid, wait]
+                for request in batch.reqs
+                if (wait := talker_row_wait(getattr(request, "omni_data", None)))
+            ]
+            if waits:
+                record({"k": "te", "rows": len(batch.reqs), "waits": waits})
+            else:
+                pass
+        else:
+            pass
+        return update_running_batch(self, batch)
+
+    scheduler.update_running_batch = update_running_batch_recorded
 
     @functools.wraps(process)
     def process_recorded(self, batch, result):

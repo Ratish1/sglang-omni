@@ -5,7 +5,9 @@ usage: python3 long_gaps.py --cell c16_events --min-ms 600 <boot> [<boot> ...]
 Boots run with baseline.py --probe, OMNI_HOP_PROBE_TALKER_BATCHES=1 and OMNI_HOP_PROBE_THINKER_STEPS=1. A gap is the time
 between two code2wav outputs of one stream. Gaps at or over --min-ms are read against gaps under 300 ms: talker decode
 steps inside the gap and how many carried the stream, the longest talker period inside it, whether the stream's thinker
-was still sending text, and the thinker's busy share, longest step and prefill tokens inside it.
+was still sending text, the thinker's busy share, longest step and prefill tokens inside it, and with the hop probe's
+talker row waits ("te"), what each talker step the stream sat out waited for: its feedback row, its next text, or the
+pad that follows the thinker's last text.
 """
 
 import argparse
@@ -15,13 +17,17 @@ import statistics
 
 from chunk_gap_parts import load_records
 
+WAITS = ("feedback", "text", "pad", "data")
+
 
 def gap_reads(boot: str, cell: str, low_ms: float, high_ms: float) -> list[dict]:
-    events, queue, _, _ = load_records(boot, cell)
+    events, queue, _, _ = load_records(boot, cell, kinds=("tb", "tr", "ts", "tz", "te"))
     talker_steps = sorted((e for e in events if e["k"] == "tb"), key=lambda e: e["ns"])
     step_ns = [e["ns"] for e in talker_steps]
+    row_waits = sorted((e for e in events if e["k"] == "te"), key=lambda e: e["ns"])
+    wait_ns = [e["ns"] for e in row_waits]
     thinker_steps = sorted(
-        (e for e in events if e["k"] == "ts"), key=lambda e: e["ns0"]
+        (e for e in events if e["k"] in ("ts", "tz")), key=lambda e: e["ns0"]
     )
     thinker_starts = [e["ns0"] for e in thinker_steps]
     outputs = collections.defaultdict(list)
@@ -57,8 +63,19 @@ def gap_reads(boot: str, cell: str, low_ms: float, high_ms: float) -> list[dict]
             busy_ns = sum(
                 min(step["ns"], out_b) - max(step["ns0"], out_a) for step in inside
             )
+            waited = collections.Counter(
+                wait
+                for record in row_waits[
+                    bisect.bisect_left(wait_ns, out_a) : bisect.bisect_right(
+                        wait_ns, out_b
+                    )
+                ]
+                for wait_rid, wait in record["waits"]
+                if wait_rid == rid
+            )
             reads.append(
                 {
+                    **{f"wait_{wait}": waited[wait] for wait in WAITS},
                     "gap_ms": gap_ms,
                     "talker_steps": len(window),
                     "with_stream": sum(rid in step["rids"] for step in window),
@@ -95,7 +112,8 @@ def summary(label: str, reads: list[dict]) -> None:
         f"  {label}: {len(reads)} gaps, mean {mean('gap_ms'):.0f} ms; talker steps {mean('talker_steps'):.1f}, with the stream "
         f"{mean('with_stream'):.1f}; longest talker period {mean('longest_talker_period_ms'):.0f} ms; thinker still sending "
         f"{100 * mean('thinker_sending'):.0f} %; thinker busy {100 * mean('thinker_busy'):.0f} %, longest step "
-        f"{mean('thinker_longest_ms'):.0f} ms, prefill tokens {mean('prefill_tokens'):.0f}"
+        f"{mean('thinker_longest_ms'):.0f} ms, prefill tokens {mean('prefill_tokens'):.0f}; steps the stream waited for "
+        + ", ".join(f"{wait} {mean('wait_' + wait):.1f}" for wait in WAITS)
     )
 
 
