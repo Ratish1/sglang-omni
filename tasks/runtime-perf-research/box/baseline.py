@@ -63,6 +63,16 @@ MODELS = {
         "placement": "--image_encoder.gpu {card} --audio_encoder.gpu {card} --thinker.gpu {card} "
         "--talker_ar.gpu {card} --code2wav.gpu {card}",
     },
+    # note (ratish): the H20 colocated config's bytes on an H200, with ballast.py holding the card to an H20's free memory.
+    "omni_colocated_h20_on_h200": {
+        "path": "Qwen/Qwen3-Omni-30B-A3B-Instruct",
+        "config": str(
+            Path(__file__).resolve().parent / "qwen3_omni_colocated_h20_on_h200.yaml"
+        ),
+        "placement": "--image_encoder.gpu {card} --audio_encoder.gpu {card} --thinker.gpu {card} "
+        "--talker_ar.gpu {card} --code2wav.gpu {card} --thinker.factory.encoder_mem_reserve 0.03404 "
+        "--preprocessing.factory.max_seq_len 32768 --thinker.factory.max_seq_len 32768",
+    },
     "omni_speech": {
         "path": "Qwen/Qwen3-Omni-30B-A3B-Instruct",
         "config": "",

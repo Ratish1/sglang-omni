@@ -1,0 +1,20 @@
+# SPDX-License-Identifier: Apache-2.0
+# examples/configs/qwen3_omni_colocated_h20.yaml with every fraction scaled by 97871 / 143771 (H20 and H200 NVML totals),
+# so each colocated stage budget, which is the card total times its fraction less its process memory, holds the bytes
+# it holds on an H20. Serve with --thinker.factory.encoder_mem_reserve 0.03404 (0.05 scaled) and ballast.py holding
+# the card down to 97871 MiB free, so the encoders' batches meet an H20's free memory.
+config_cls: Qwen3OmniSpeechColocatedPipelineConfig
+name: qwen3-omni-colocated-h20-on-h200
+model_path: Qwen/Qwen3-Omni-30B-A3B-Instruct
+
+stages:
+  image_encoder:
+    gpu_memory_fraction: 0.01702
+  audio_encoder:
+    gpu_memory_fraction: 0.01702
+  thinker:
+    gpu_memory_fraction: 0.51056
+  talker_ar:
+    gpu_memory_fraction: 0.08169
+  code2wav:
+    gpu_memory_fraction: 0.01362
